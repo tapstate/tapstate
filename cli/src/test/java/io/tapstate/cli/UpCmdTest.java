@@ -47,17 +47,18 @@ class UpCmdTest {
               tapstate logs orders_sync  see what it is doing
               tapstate apply / tapstate start  the same thing, one step at a time
               edit any file above, then tapstate up again  it converges
+            Hint: no project.tap.yml here, so these resources are in the Default project. Add one naming a project to give them a project of their own.
             An AI assistant can take it from here: https://tapstate.dev/docs/first-run
             """;
 
-    private record Run(int code, String out, String err) {
+    record Run(int code, String out, String err) {
         String all() {
             return out + err;
         }
     }
 
     /** Writes the mirrored-table workspace and binds it to the default server, as a first run would. */
-    private static void scaffold(Path home, Path ws) {
+    static void scaffold(Path home, Path ws) {
         NewRecipeTest.Run r = NewRecipeTest.run(home, new ScriptedPrompter(),
                 "new", "mirrored-table", "--yes", "--connector", "mysql",
                 "--set", "host=db", "--set", "username=u", "--set", "password=s",
@@ -77,7 +78,7 @@ class UpCmdTest {
     }
 
     /** Saves a session for the bound context, so the run resumes it exactly as any online verb does. */
-    private static void signIn(Path home) {
+    static void signIn(Path home) {
         ContextDefinition local = ContextConfigStore.underHome(home).load().contexts().get("local");
         AuthSessionRecord record = new AuthSessionRecord(AuthSessionRecord.CURRENT_VERSION,
                 local.authRef(), local.id(), ISSUER, "alice", List.of("read", "write"),
@@ -85,7 +86,7 @@ class UpCmdTest {
         AuthFileStore.underHome(home).save(record, false);
     }
 
-    private static Run up(Path home, FakeUpControlPlane client, UnaryOperator<String> env, String... args) {
+    static Run up(Path home, FakeUpControlPlane client, UnaryOperator<String> env, String... args) {
         LaunchOptions launch = LaunchOptions.parse(args).withEnv(env);
         ContextResolver resolver = new ContextResolver(ContextConfigStore.underHome(home), env);
         AuthService auth = new AuthService(client, AuthFileStore.underHome(home), Clock.fixed(NOW, ZoneOffset.UTC));
@@ -98,7 +99,7 @@ class UpCmdTest {
         return new Run(code, out.toString(), err.toString());
     }
 
-    private static Run up(Path home, FakeUpControlPlane client, String... args) {
+    static Run up(Path home, FakeUpControlPlane client, String... args) {
         return up(home, client, name -> null, args);
     }
 
@@ -124,7 +125,7 @@ class UpCmdTest {
                 "lifecycle start orders_sync",
                 "status orders_sync");
         assertThat(r.out()).isEqualTo(
-                "Project: " + ws.getFileName() + " (" + ws + ")\n"
+                "Project: Default project (" + ws + ")\n"
                         + """
                           pipeline orders_sync: running
                           source orders_src: applied
@@ -153,22 +154,6 @@ class UpCmdTest {
     }
 
     @Test
-    void aDirectoryWithoutAProjectFileIsBroughtUpUnderItsOwnNameAndSaysSo(@TempDir Path home, @TempDir Path ws)
-            throws java.io.IOException {
-        scaffold(home, ws);
-        java.nio.file.Files.delete(ws.resolve("project.tap.yml"));
-        signIn(home);
-        FakeUpControlPlane client = new FakeUpControlPlane();
-
-        Run r = up(home, client, "up", "-w", ws.toString());
-
-        assertThat(r.code()).as(r.all()).isZero();
-        String named = ws.getFileName().toString();
-        assertThat(client.projects).containsOnly(named);
-        assertThat(r.out()).contains("Hint: no project.tap.yml here, so this project is named after its directory.");
-    }
-
-    @Test
     void aSecondRunConvergesWithoutStartingAnythingAndSaysSoPerStage(@TempDir Path home, @TempDir Path ws) {
         scaffold(home, ws);
         signIn(home);
@@ -187,7 +172,7 @@ class UpCmdTest {
                 .doesNotContain("lifecycle start orders_sync")
                 .doesNotContain("discoverSchema orders_src");
         assertThat(r.out()).isEqualTo(
-                "Project: " + ws.getFileName() + " (" + ws + ")\n"
+                "Project: Default project (" + ws + ")\n"
                         + """
                           pipeline orders_sync: running (apply: unchanged; start: already running)
                           source orders_src: applied (apply: unchanged; discover: already discovered)

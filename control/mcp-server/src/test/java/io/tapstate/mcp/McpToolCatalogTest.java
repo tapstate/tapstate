@@ -22,6 +22,7 @@ class McpToolCatalogTest {
             "connector_list", "connector_get",
             "source_draft", "source_list",
             "connection_test_result", "connection_schema", "artifact_validate", "artifact_get",
+            "project_list",
             "pipeline_list", "pipeline_status", "pipeline_metrics", "pipeline_snapshot", "pipeline_logs",
             "pipeline_metrics_history", "pipeline_explain",
             "data_browser_collections", "data_browser_find", "data_browser_stats");

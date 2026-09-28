@@ -21,6 +21,15 @@ public record ProjectManifest(
     /** The kind a project file declares. */
     public static final String KIND = "project";
 
+    /**
+     * The project every server has from its first start, and the one a resource with no project label
+     * belongs to. No project file may declare it: a resource joins it by carrying no label at all.
+     */
+    public static final String DEFAULT = "default";
+
+    /** The name the Default project is shown under. */
+    public static final String DEFAULT_TITLE = "Default project";
+
     /** The file a project root carries. */
     public static final String FILE_NAME = "project.tap.yml";
 

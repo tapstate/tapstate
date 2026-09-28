@@ -899,6 +899,12 @@ class PipelineApiTest {
         // present for the context to stand up. This suite exercises the lifecycle verbs, not the removal,
         // so the dependent stores refuse rather than pretend: a reclaim reached from here is a defect.
         @Bean
+        io.tapstate.control.core.ProjectService projectService(ArtifactStore store,
+                ArtifactMutationService artifactMutationService) {
+            return new io.tapstate.control.core.ProjectService(store, artifactMutationService);
+        }
+
+        @Bean
         ArtifactMutationService artifactMutationService(ArtifactStore store, AuditGate auditGate) {
             return new ArtifactMutationService(
                     store, NoReclaimStores.desired(), NoReclaimStores.state(),

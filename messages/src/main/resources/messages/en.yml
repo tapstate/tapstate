@@ -684,6 +684,9 @@ artifact.version-conflict:
 artifact.project-id-taken:
   message: "The {kind} `{id}` already belongs to project `{owner}` on this server, so project `{project}` cannot apply it."
   solution: "Rename `{id}` in project `{project}`, or remove it from project `{owner}` first."
+artifact.default-project-not-removable:
+  message: "The Default project (`{project}`) cannot be removed: every server keeps it, and it holds every resource that belongs to no other project."
+  solution: "Delete the resources you no longer want one by one, or move them into a project of their own by declaring them in its files."
 artifact.project-claimed:
   message: "The {kind} `{id}` was already on this server with no project; it now belongs to project `{project}`."
   solution: "Nothing to do if `{id}` is this project's. If another project uses it too, give that project its own id for it."

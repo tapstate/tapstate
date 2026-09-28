@@ -174,7 +174,7 @@ final class Repl {
     private static final List<String> ONLINE_VERBS = List.of(
             "apply", "get", "delete", "ls", "start", "stop", "pause", "resume", "restart", "status", "metrics",
             "snapshot", "logs", "position", "test", "test-result", "discover-schema", "schema", "register",
-            "connectors", "cluster", "token", "derived-schema", "explain");
+            "connectors", "projects", "cluster", "token", "derived-schema", "explain");
 
     private final CommandLine commandLine;
 
@@ -824,6 +824,9 @@ final class Repl {
         }
         if (words.get(0).equals("token")) {
             return tokenOnline(words);
+        }
+        if (words.get(0).equals("projects")) {
+            return projectsOnline(words);
         }
         // `delete` and `apply` each carry a precondition of their own (`--if-match <hash>`), so they parse
         // their own words rather than falling into the positional-only guard below, which would refuse it.
@@ -3061,6 +3064,79 @@ final class Repl {
     }
 
     /**
+     * {@code projects [-o text|json|yaml]} lists the server's projects, the Default project first and
+     * listed even when empty; {@code projects remove <id>} removes one project with everything it holds.
+     * The Default project is refused by the server: it can be emptied, never removed.
+     */
+    private int projectsOnline(List<String> words) {
+        PrintWriter err = commandLine.getErr();
+        if (words.size() >= 2 && words.get(1).equals("remove")) {
+            if (words.size() != 3 || words.get(2).startsWith("-")) {
+                err.println("projects: remove needs exactly one project id (usage: projects remove <id>)");
+                err.flush();
+                return Cli.EXIT_USAGE;
+            }
+            String id = words.get(2);
+            DeleteOutcome outcome = withFailover(
+                    () -> controlPlane.projectRemove(session.landingNode(), session.credential(), id),
+                    o -> o instanceof DeleteOutcome.Unreachable);
+            return switch (outcome) {
+                case DeleteOutcome.Removed removed -> {
+                    commandLine.getOut().println("removed project " + removed.id());
+                    commandLine.getOut().flush();
+                    yield Cli.EXIT_OK;
+                }
+                case DeleteOutcome.Rejected rejected ->
+                        renderRejection(rejected.code(), rejected.message(), rejected.params());
+                case DeleteOutcome.Unreachable ignored -> reportRequestFailed();
+            };
+        }
+        OutputFormat format = parseFormatOnly("projects", words);
+        if (format == null) {
+            return Cli.EXIT_USAGE;
+        }
+        ProjectListOutcome outcome = withFailover(
+                () -> controlPlane.projectList(session.landingNode(), session.credential()),
+                o -> o instanceof ProjectListOutcome.Unreachable);
+        return switch (outcome) {
+            case ProjectListOutcome.Listed listed -> {
+                renderProjects(listed.projects(), format);
+                yield Cli.EXIT_OK;
+            }
+            case ProjectListOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case ProjectListOutcome.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+
+    /** One line per project - its name, then what it holds by kind and id - or the machine tree. */
+    private void renderProjects(List<ProjectListOutcome.Project> projects, OutputFormat format) {
+        PrintWriter out = commandLine.getOut();
+        List<Object> rows = new ArrayList<>();
+        for (ProjectListOutcome.Project project : projects) {
+            if (format == OutputFormat.TEXT) {
+                out.println(project.title() + (project.title().equals(project.id()) ? "" : " (" + project.id() + ")")
+                        + ": " + (project.resources().isEmpty() ? "empty" : project.resources().size() + " resources"));
+                for (ProjectListOutcome.Member member : project.resources()) {
+                    out.println("  " + member.kind() + " " + member.id());
+                }
+            }
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("id", project.id());
+            row.put("title", project.title());
+            row.put("removable", project.removable());
+            row.put("resources", project.resources().stream()
+                    .map(m -> Map.of("id", m.id(), "kind", m.kind())).toList());
+            rows.add(row);
+        }
+        if (format == OutputFormat.JSON) {
+            out.println(JsonOut.write(Map.of("projects", rows)));
+        } else if (format == OutputFormat.YAML) {
+            out.println(YamlOut.write(Map.of("projects", rows)));
+        }
+        out.flush();
+    }
+
+    /**
      * Parses {@code [-o text|json|yaml]} for a verb that takes no operand, printing its usage line to err
      * and returning {@code null} on any error (an unknown option or a stray operand). Defaults to TEXT.
      */
@@ -4526,7 +4602,7 @@ final class Repl {
         /** Whether this run made the connection, in which case the connect's probe was the reachability check. */
         private final boolean connectedHere;
         private List<UpDraft> drafts = List.of();
-        /** The project this run brings up: its project file's id, else the directory's name. */
+        /** The project this run brings up: its project file's id, or null for the Default project. */
         private String project;
         /** Whether the project is named by a project file, or only by its directory. */
         private boolean declared;
@@ -4703,7 +4779,7 @@ final class Repl {
             try {
                 Optional<ProjectManifest> manifest = WorkspaceLoader.manifest(workspace);
                 declared = manifest.isPresent();
-                project = manifest.map(ProjectManifest::id).orElseGet(() -> WorkspaceLoader.defaultProjectId(workspace));
+                project = manifest.map(ProjectManifest::id).orElse(null);
             } catch (DslException e) {
                 return failure(UpCmd.STAGE_PREFLIGHT, e.source(), e.code(), e.args());
             }

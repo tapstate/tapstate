@@ -198,7 +198,9 @@ public final class DslParser {
         }
         doc.requireOnly(PROJECT_KEYS);
         doc.requirePresent(REQUIRED_PROJECT_KEYS);
-        return new ProjectManifest(idOf(doc), metadata(doc));
+        String id = idOf(doc);
+        ProjectLabel.requireNotReserved(id, "id");
+        return new ProjectManifest(id, metadata(doc));
     }
 
     /**

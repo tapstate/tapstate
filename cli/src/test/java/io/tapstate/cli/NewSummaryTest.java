@@ -52,7 +52,7 @@ class NewSummaryTest {
         assertThat(r.code()).as(r.all()).isZero();
         assertThat(r.err()).isEmpty();
         assertThat(r.out()).isEqualTo(
-                "Project: " + ws + "\n" + "  project.tap.yml  project " + ws.getFileName() + "\n"
+                "Project: " + ws + "\n"
                         + """
                           source/orders_src.tap.yml  source orders_src: mysql, cdc
                           pipeline/orders_sync.tap.yml  pipeline orders_sync: 1 source, view — assumed primary_key: id; edit if the table is keyed otherwise
@@ -71,7 +71,7 @@ class NewSummaryTest {
         assertThat(r.code()).as(r.all()).isZero();
         assertThat(r.err()).isEmpty();
         assertThat(r.out()).isEqualTo(
-                "Project: " + ws + "\n" + "  project.tap.yml  project " + ws.getFileName() + "\n"
+                "Project: " + ws + "\n"
                         + """
                           source/example_source.tap.yml  source example_source: mysql, cdc
                           pipeline/example_pipeline.tap.yml  pipeline example_pipeline: 1 source, view
@@ -126,8 +126,8 @@ class NewSummaryTest {
         assertThat(r.out().indexOf("\"assumed\"")).isGreaterThan(r.out().indexOf("\"kind\": \"pipeline\""));
         assertThat(r.out().indexOf("\"assumed\"")).isLessThan(r.out().indexOf("\"kind\": \"env\""));
         // the existing keys keep their names and their order
-        assertThat(r.out().indexOf("\"path\"")).isLessThan(r.out().indexOf("\"kind\": \"project\""));
-        assertThat(r.out().indexOf("\"kind\": \"project\"")).isLessThan(r.out().indexOf("\"role\""));
+        assertThat(r.out().indexOf("\"path\"")).isLessThan(r.out().indexOf("\"kind\": \"source\""));
+        assertThat(r.out().indexOf("\"kind\": \"source\"")).isLessThan(r.out().indexOf("\"role\""));
     }
 
     @Test

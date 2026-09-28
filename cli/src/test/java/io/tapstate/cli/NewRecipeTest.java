@@ -159,9 +159,8 @@ class NewRecipeTest {
         assertThat(Files.readString(ws.resolve(".gitignore"))).isEqualTo(".env\n");
         // The skeleton tells its reader to put a password in .env, so the escape hatch must keep that
         // future file out of a routine `git add .` even though it does not create the secret itself.
-        // The two kind directories, the ignore file, and the project file naming the directory.
         try (var entries = Files.list(ws)) {
-            assertThat(entries).hasSize(4);
+            assertThat(entries).hasSize(3);
         }
     }
 
@@ -198,7 +197,7 @@ class NewRecipeTest {
         assertThat(Files.readString(ws.resolve("source/orders_src.tap.yml")))
                 .contains("password: ${ORDERS_SRC_PASSWORD}")
                 .doesNotContain(": s\n");
-        assertThat(r.out()).startsWith("Project: " + ws + "\n" + "  project.tap.yml  project " + ws.getFileName() + "\n"
+        assertThat(r.out()).startsWith("Project: " + ws + "\n"
                 + "  source/orders_src.tap.yml  source orders_src: mysql, cdc\n"
                 + "  pipeline/orders_sync.tap.yml  pipeline orders_sync: 1 source, view — assumed primary_key: id;");
         assertThat(r.out()).contains("\n  .env  ").contains("\n  .gitignore  ");

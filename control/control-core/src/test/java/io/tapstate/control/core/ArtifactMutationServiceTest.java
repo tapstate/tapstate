@@ -742,6 +742,56 @@ class ArtifactMutationServiceTest {
                 .satisfies(thrown -> assertThat(thrown.getSuppressed()).containsExactly(second, third));
     }
 
+    @Test
+    @DisplayName("removing a set removes referrers first and refuses a referrer outside the set before removing any")
+    void deleteAllRemovesReferrersFirstAndRefusesAnOutsideReferrer() {
+        store.save(source("src_a"));
+        store.save(pipelineReading("p_a", "src_a"));
+        store.save(source("src_b"));
+        store.save(pipelineReading("p_b", "src_b"));
+
+        // src_b is read by p_b, which is not in the set: nothing may go.
+        assertThatThrownBy(() -> service.deleteAll(PRINCIPAL, List.of("src_a", "src_b", "p_a")))
+                .isInstanceOfSatisfying(TapstateException.class, refused -> {
+                    assertThat(refused.code()).isEqualTo(ArtifactError.IN_USE);
+                    assertThat(refused.args()).containsEntry("id", "src_b");
+                });
+        assertThat(store.get("src_a")).isPresent();
+        assertThat(store.get("p_a")).isPresent();
+
+        // Listed source first: the pipeline reading it still has to go before it.
+        service.deleteAll(PRINCIPAL, List.of("src_a", "p_a"));
+        assertThat(store.get("src_a")).isEmpty();
+        assertThat(store.get("p_a")).isEmpty();
+        assertThat(store.get("p_b")).isPresent();
+    }
+
+    @Test
+    @DisplayName("the Default project is listed first even when empty and cannot be removed")
+    void theDefaultProjectIsListedFirstAndCannotBeRemoved() {
+        ProjectService projects = new ProjectService(store, service);
+
+        assertThat(projects.list()).extracting(ProjectService.ProjectSummary::id).containsExactly("default");
+        assertThat(projects.list().get(0).removable()).isFalse();
+        assertThat(projects.list().get(0).title()).isEqualTo("Default project");
+
+        store.save(source("shared_conn"));
+        store.save(io.tapstate.core.dsl.ProjectLabel.stamped(source("bank_core"), "bank_c360"));
+        assertThat(projects.list()).extracting(ProjectService.ProjectSummary::id).containsExactly("default", "bank_c360");
+        assertThat(projects.list().get(0).resources()).extracting(ProjectService.Member::id).containsExactly("shared_conn");
+
+        assertThatThrownBy(() -> projects.remove(PRINCIPAL, "default"))
+                .isInstanceOfSatisfying(TapstateException.class, refused ->
+                        assertThat(refused.code()).isEqualTo(ArtifactError.DEFAULT_PROJECT_NOT_REMOVABLE));
+        assertThat(store.get("shared_conn")).isPresent();
+
+        projects.remove(PRINCIPAL, "bank_c360");
+        assertThat(store.get("bank_core")).isEmpty();
+        assertThatThrownBy(() -> projects.remove(PRINCIPAL, "bank_c360"))
+                .isInstanceOfSatisfying(TapstateException.class, refused ->
+                        assertThat(refused.code()).isEqualTo(ArtifactError.NOT_FOUND));
+    }
+
     private static SourceResource source(String id) {
         return new SourceResource(
                 id, null, "mysql",

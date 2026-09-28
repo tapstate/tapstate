@@ -50,6 +50,7 @@ public final class ControlApiSchema {
         Map<String, SchemaRef> refs = new LinkedHashMap<>();
         bind(refs, "system.version", "SystemVersion");
         bind(refs, "connector.list", "ConnectorList");
+        bind(refs, "project.list", "ProjectList");
         bind(refs, "connector.get", "ConnectorGet");
         bind(refs, "source.list", "SourceList");
         bind(refs, "source.get", "SourceGet");
@@ -117,6 +118,7 @@ public final class ControlApiSchema {
                 Map.of("version", string("Product release this server was built from")),
                 true));
         pair(defs, "ConnectorList", empty, opaque);
+        pair(defs, "ProjectList", empty, opaque);
         pair(defs, "ConnectorGet", object(List.of("id"), Map.of("id", id), false), opaque);
         pair(defs, "SourceList", listRequest, sourceListResult);
         pair(defs, "SourceGet", object(List.of("id"), Map.of("id", id), false), opaque);

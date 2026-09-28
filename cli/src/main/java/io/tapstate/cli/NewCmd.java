@@ -83,6 +83,11 @@ final class NewCmd extends SingleResourceOptions implements Callable<Integer> {
             description = "Deprecated alias for `add KIND`: source, pipeline, transform, view or serve.")
     String kind;
 
+    @Option(names = "--project", paramLabel = "ID",
+            description = "Write a project.tap.yml naming this project (default: none, so the files land in "
+                    + "the Default project; sample names its own).")
+    String project;
+
     @Option(names = "--table", paramLabel = "NAME",
             description = "The table to mirror (mirrored-table recipe).")
     String table;
@@ -152,7 +157,7 @@ final class NewCmd extends SingleResourceOptions implements Callable<Integer> {
             return EXIT_USAGE;
         }
         if (hasRecipeShapeFlags()) {
-            err.println(prefix() + ": --keep/--rename/--drop/--where/--root/--key/--child/--child-connector/--child-set/--db"
+            err.println(prefix() + ": --keep/--rename/--drop/--where/--root/--key/--child/--child-connector/--child-set/--db/--project"
                     + " are only valid for the guided first run (new <recipe>)");
             err.flush();
             return EXIT_USAGE;
@@ -228,7 +233,8 @@ final class NewCmd extends SingleResourceOptions implements Callable<Integer> {
     /** Whether any flag that only one of the shaped recipes reads was given. */
     private boolean hasRecipeShapeFlags() {
         return keep != null || rename != null || drop != null || where != null || root != null || key != null
-                || !children.isEmpty() || childConnector != null || !childSet.isEmpty() || !databases.isEmpty();
+                || !children.isEmpty() || childConnector != null || !childSet.isEmpty() || !databases.isEmpty()
+                || project != null;
     }
 
     /** Whether any flag that shapes a single artifact was given; {@code -w} and {@code -o} are not ones. */
@@ -303,7 +309,7 @@ final class NewCmd extends SingleResourceOptions implements Callable<Integer> {
 
     /** The chosen recipe, run. */
     private RecipeRun.Result runRecipe(String chosen, Prompter asker, RecipeRun.Flags flags) {
-        return RecipeRun.run(chosen, workspace.root(), asker, flags, force);
+        return RecipeRun.run(chosen, workspace.root(), asker, flags, force, project);
     }
 
     /**

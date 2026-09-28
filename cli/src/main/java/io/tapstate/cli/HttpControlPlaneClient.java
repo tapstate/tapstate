@@ -773,6 +773,67 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     }
 
     @Override
+    public ProjectListOutcome projectList(URI baseUrl, String credential) {
+        try {
+            HttpRequest request = authed(baseUrl, "/api/projects", credential).GET().build();
+            HttpResponse<String> response =
+                    send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200) {
+                return new ProjectListOutcome.Listed(projects(response.body()));
+            }
+            Rejection r = rejection(response.body(), "The server refused the read.");
+            return new ProjectListOutcome.Rejected(r.code(), r.message());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new ProjectListOutcome.Unreachable();
+        } catch (IOException | RuntimeException e) {
+            return new ProjectListOutcome.Unreachable();
+        }
+    }
+
+    /** Decodes {@code {"items":[{"id","title","removable","resources":[{"id","kind"}]}]}}. */
+    private static List<ProjectListOutcome.Project> projects(String body) {
+        List<ProjectListOutcome.Project> projects = new ArrayList<>();
+        if (JsonReader.parse(body) instanceof Map<?, ?> map && map.get("items") instanceof List<?> items) {
+            for (Object item : items) {
+                if (!(item instanceof Map<?, ?> row) || !(row.get("id") instanceof String id)) {
+                    continue;
+                }
+                List<ProjectListOutcome.Member> members = new ArrayList<>();
+                if (row.get("resources") instanceof List<?> resources) {
+                    for (Object resource : resources) {
+                        if (resource instanceof Map<?, ?> r && r.get("id") instanceof String rid) {
+                            members.add(new ProjectListOutcome.Member(rid, String.valueOf(r.get("kind"))));
+                        }
+                    }
+                }
+                String title = row.get("title") instanceof String t ? t : id;
+                projects.add(new ProjectListOutcome.Project(
+                        id, title, Boolean.TRUE.equals(row.get("removable")), members));
+            }
+        }
+        return projects;
+    }
+
+    @Override
+    public DeleteOutcome projectRemove(URI baseUrl, String credential, String id) {
+        try {
+            HttpRequest request = authed(baseUrl, "/api/projects/" + urlSegment(id), credential).DELETE().build();
+            HttpResponse<String> response =
+                    send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() / 100 == 2) {
+                return new DeleteOutcome.Removed(id);
+            }
+            return rejectedDelete(response.body());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new DeleteOutcome.Unreachable();
+        } catch (IOException | RuntimeException e) {
+            return new DeleteOutcome.Unreachable();
+        }
+    }
+
+    @Override
     public ClusterMembersOutcome clusterMembers(URI baseUrl, String credential) {
         try {
             HttpRequest request = authed(baseUrl, "/api/cluster/members", credential).GET().build();

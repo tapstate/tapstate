@@ -19,6 +19,7 @@ import io.tapstate.control.core.NestSizingAdvisories;
 import io.tapstate.control.core.PlanAdvisories;
 import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.control.core.ArtifactMutationService;
+import io.tapstate.control.core.ProjectService;
 import io.tapstate.control.core.ArtifactQueryService;
 import io.tapstate.control.core.AuditGate;
 import io.tapstate.control.core.BootstrapService;
@@ -362,6 +363,14 @@ class ControlPlaneConfiguration {
                 artifactStore, storePort.desired(), storePort.state(), storePort.observations(),
                 storePort.layouts(), storePort.meta(), storePort.derivedSchemas(), storePort.rateHistory(),
                 auditGate, follows.getIfAvailable(() -> DataBrowserFollows.NONE));
+    }
+
+    @Bean
+    ProjectService projectService(ArtifactStore artifactStore, ArtifactMutationService artifactMutationService) {
+        // Projects are read off the same artifact store apply labels through, and removed through the same
+        // removal a single resource takes, so a project's removal is refused wherever one of its
+        // resources' would be.
+        return new ProjectService(artifactStore, artifactMutationService);
     }
 
     @Bean

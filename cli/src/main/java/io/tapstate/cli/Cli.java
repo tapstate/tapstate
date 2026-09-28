@@ -145,6 +145,10 @@ public final class Cli implements Runnable {
             Map.entry("connection.schema", "schema"),
             Map.entry("connector.register", "register"),
             Map.entry("connector.list", "connectors"),
+            // Both on one verb, as the token operations are: listing projects and removing one are one
+            // subject, and the removal reads as an action on the list.
+            Map.entry("project.list", "projects"),
+            Map.entry("project.remove", "projects"),
             Map.entry("cluster.members", "cluster"),
             Map.entry("token.create", "token"),
             Map.entry("token.list", "token"),
@@ -241,6 +245,8 @@ public final class Cli implements Runnable {
                     "Remove one stored artifact for good; --if-match pins the version removed.")),
             Map.entry("connectors", new VerbHelp("[-o text|json|yaml]",
                     "List the connectors registered on the server.")),
+            Map.entry("projects", new VerbHelp("[remove <id>] [-o text|json|yaml]",
+                    "List the server's projects, Default project first; remove deletes one.")),
             Map.entry("cluster", new VerbHelp("[-o text|json|yaml]",
                     "List the cluster's members, what each one is, and where to reach it.")),
             Map.entry("register", new VerbHelp("<path|connector-id> [-o text|json|yaml]",

@@ -75,8 +75,7 @@ class ApplyServiceProjectTest {
         ApplyResult result = service.apply("author", List.of(draft(source("orders_db"))), "orders_sync");
 
         assertThat(ProjectLabel.of(store.get("orders_db").orElseThrow())).isEqualTo("orders_sync");
-        assertThat(result.warnings()).extracting(ValidationDiagnostic::code)
-                .doesNotContain(ArtifactError.PROJECT_CLAIMED.code());
+        assertThat(result.warnings()).isEmpty();
     }
 
     @Test
@@ -105,6 +104,17 @@ class ApplyServiceProjectTest {
         assertThat(refused.code()).isEqualTo(DslError.RESERVED_LABEL);
         assertThat(refused.args()).containsEntry("value", "billing").containsEntry("expected", "orders_sync");
         assertThat(refused.source()).isEqualTo("file.tap.yml");
+        assertThat(store.get("orders_db")).isEmpty();
+    }
+
+    @Test
+    @DisplayName("nothing is applied as the Default project by name; it holds what carries no label")
+    void theDefaultProjectCannotBeNamedOnApply() {
+        DslException refused = catchThrowableOfType(DslException.class, () -> service.apply("author",
+                List.of(draft(source("orders_db"))), "default"));
+
+        assertThat(refused.code()).isEqualTo(DslError.ILLEGAL_VALUE);
+        assertThat(refused.path()).isEqualTo("project");
         assertThat(store.get("orders_db")).isEmpty();
     }
 

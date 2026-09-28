@@ -15,12 +15,12 @@ import java.util.Map;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Whatever {@code new} writes, it leaves a named project behind: every recipe in the catalog writes a
- * well-formed {@code project.tap.yml}, and a directory that already is a project keeps its own. The
- * answers each recipe needs are listed per recipe; one added to the catalog without an entry here
- * fails the coverage check below rather than going unexamined.
+ * {@code new} writes a project file only when told which project the files belong to: without one the
+ * directory is in the Default project, where a first run belongs. {@code sample} is the exception - it is
+ * the demo, and it names the demo's project. Every recipe in the catalog is run both ways; one added
+ * without an entry here fails the coverage check rather than going unexamined.
  */
-class EveryRecipeWritesAProjectFileTest {
+class NewWritesProjectFileOnlyWhenNamedTest {
 
     private static final List<String> MYSQL = List.of(
             "--connector", "mysql", "--set", "host=db", "--set", "username=u", "--set", "password=s");
@@ -40,29 +40,45 @@ class EveryRecipeWritesAProjectFileTest {
     @Test
     void everyRecipeInTheCatalogIsCovered() {
         assertThat(ANSWERS.keySet())
-                .as("a recipe in the catalog with no answers here is a recipe nobody checked for a project file")
+                .as("a recipe in the catalog with no answers here is a recipe nobody checked")
                 .containsExactlyInAnyOrderElementsOf(Recipe.CATALOG.stream().map(Recipe::id).toList());
     }
 
     @Test
-    void everyRecipeWritesAWellFormedProjectFile(@TempDir Path home, @TempDir Path parent) throws IOException {
+    void withoutANameNoRecipeButSampleWritesAProjectFile(@TempDir Path home, @TempDir Path parent) throws IOException {
         for (Recipe recipe : Recipe.CATALOG) {
-            Path ws = Files.createDirectory(parent.resolve("ws-" + recipe.id()));
+            Path ws = Files.createDirectory(parent.resolve("unnamed-" + recipe.id()));
             NewRecipeTest.Run r = run(home, recipe.id(), ws);
 
             assertThat(r.code()).as("%s: %s", recipe.id(), r.all()).isZero();
             Path file = ws.resolve(ProjectManifest.FILE_NAME);
-            assertThat(file).as("%s leaves a project file behind", recipe.id()).isRegularFile();
-            ProjectManifest manifest = new DslParser().parseProject(Files.readString(file));
             if (recipe.id().equals("sample")) {
-                assertThat(manifest.id()).as("the sample is the demo, named as the demo names it")
-                        .isEqualTo("order_demo");
+                assertThat(declared(file)).as("the sample names the demo's project").isEqualTo("order_demo");
             } else {
-                assertThat(manifest.id()).as("%s names the project after its directory", recipe.id())
-                        .isEqualTo("ws-" + recipe.id());
+                assertThat(file).as("%s wrote a project file nobody asked for", recipe.id()).doesNotExist();
             }
-            assertThat(r.out()).contains(ProjectManifest.FILE_NAME + "  project " + manifest.id());
         }
+    }
+
+    @Test
+    void withANameEveryRecipeWritesThatProject(@TempDir Path home, @TempDir Path parent) throws IOException {
+        for (Recipe recipe : Recipe.CATALOG) {
+            Path ws = Files.createDirectory(parent.resolve("named-" + recipe.id()));
+            NewRecipeTest.Run r = run(home, recipe.id(), ws, "--project", "bank_c360");
+
+            assertThat(r.code()).as("%s: %s", recipe.id(), r.all()).isZero();
+            assertThat(declared(ws.resolve(ProjectManifest.FILE_NAME))).as(recipe.id()).isEqualTo("bank_c360");
+            assertThat(r.out()).contains(ProjectManifest.FILE_NAME + "  project bank_c360");
+        }
+    }
+
+    @Test
+    void theDefaultProjectCannotBeNamed(@TempDir Path home, @TempDir Path ws) {
+        NewRecipeTest.Run r = run(home, "mirrored-table", ws, "--project", "default");
+
+        assertThat(r.code()).isNotZero();
+        assertThat(r.all()).contains("dsl.illegal-value");
+        assertThat(ws.resolve(ProjectManifest.FILE_NAME)).doesNotExist();
     }
 
     @Test
@@ -70,10 +86,15 @@ class EveryRecipeWritesAProjectFileTest {
         String own = "version: tapstate/v1\nkind: project\nid: payments\n";
         Files.writeString(ws.resolve(ProjectManifest.FILE_NAME), own);
 
-        for (String recipe : List.of("sample", "mirrored-table")) {
-            assertThat(run(home, recipe, ws, "--force").code()).isZero();
-            assertThat(Files.readString(ws.resolve(ProjectManifest.FILE_NAME))).as(recipe).isEqualTo(own);
-        }
+        assertThat(run(home, "sample", ws, "--force").code()).isZero();
+        assertThat(run(home, "mirrored-table", ws, "--force", "--project", "payments").code()).isZero();
+        assertThat(Files.readString(ws.resolve(ProjectManifest.FILE_NAME))).isEqualTo(own);
+        assertThat(run(home, "mirrored-table", ws, "--force", "--project", "billing").all())
+                .contains("already project 'payments'");
+    }
+
+    private static String declared(Path file) throws IOException {
+        return new DslParser().parseProject(Files.readString(file)).id();
     }
 
     private static NewRecipeTest.Run run(Path home, String recipe, Path ws, String... extra) {

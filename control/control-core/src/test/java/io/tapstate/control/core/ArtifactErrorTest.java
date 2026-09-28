@@ -36,7 +36,9 @@ class ArtifactErrorTest {
                 // another project on this server already owns the id
                 "artifact.project-id-taken",
                 // a resource stored with no project was adopted by the project that applied it
-                "artifact.project-claimed");
+                "artifact.project-claimed",
+                // the Default project can be emptied, never removed
+                "artifact.default-project-not-removable");
     }
 
     @Test

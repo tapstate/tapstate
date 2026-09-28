@@ -941,6 +941,12 @@ class ControlApiTest {
          * that owns no bookkeeping — a no-op stub would let that pass as green.
          */
         @Bean
+        io.tapstate.control.core.ProjectService projectService(ArtifactStore store,
+                ArtifactMutationService artifactMutationService) {
+            return new io.tapstate.control.core.ProjectService(store, artifactMutationService);
+        }
+
+        @Bean
         ArtifactMutationService artifactMutationService(ArtifactStore store, AuditGate auditGate) {
             return new ArtifactMutationService(
                     store, NoReclaimStores.desired(), NoReclaimStores.state(),

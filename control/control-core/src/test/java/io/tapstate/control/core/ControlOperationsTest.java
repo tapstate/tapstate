@@ -20,6 +20,8 @@ class ControlOperationsTest {
                         "artifact.get",
                         "artifact.list",
                         "artifact.delete",
+                        "project.list",
+                        "project.remove",
                         "source.create",
                         "source.draft",
                         "source.list",
@@ -76,6 +78,9 @@ class ControlOperationsTest {
         // artifact.delete removes a stored resource for good, so it is the most consequential write in
         // the domain rather than a lesser one; nothing about it is read-only.
         assertThat(registry.resolve("artifact.delete").scope()).isEqualTo(Scope.WRITE);
+        assertThat(registry.resolve("project.list").scope()).isEqualTo(Scope.READ);
+        // removing a project deletes every resource it holds, so it is a write like artifact.delete
+        assertThat(registry.resolve("project.remove").scope()).isEqualTo(Scope.WRITE);
         assertThat(registry.resolve("source.create").scope()).isEqualTo(Scope.WRITE);
         assertThat(registry.resolve("source.draft").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("source.list").scope()).isEqualTo(Scope.READ);
@@ -132,6 +137,7 @@ class ControlOperationsTest {
                 List.of(
                         "artifact.apply",
                         "artifact.delete",
+                        "project.remove",
                         "source.create",
                         "source.update",
                         "source.delete",
@@ -189,7 +195,7 @@ class ControlOperationsTest {
         // A scope statement about the registry alone: the CLI face opens every registered operation and
         // clips none of them. Whether each one has a verb behind it is not knowable from here
         // — control-core cannot see the CLI — and is gated where both are visible, in arch-tests.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(51);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(53);
         assertThat(registry.all()).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
     }
@@ -218,6 +224,7 @@ class ControlOperationsTest {
                         "connection.test", "connection.test-result",
                         "connection.discover-schema", "connection.schema",
                         "artifact.validate", "artifact.apply", "artifact.delete", "artifact.get",
+                        "project.list",
                         "pipeline.list", "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
                         "pipeline.status",
                         "pipeline.metrics", "pipeline.snapshot", "pipeline.logs",

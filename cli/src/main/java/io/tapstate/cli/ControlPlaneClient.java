@@ -171,6 +171,22 @@ interface ControlPlaneClient extends AutoCloseable {
     ConnectorListOutcome connectorList(URI baseUrl, String credential);
 
     /**
+     * Lists the server's projects via {@code GET {baseUrl}/api/projects}, the Default project first. A client
+     * that cannot ask answers unreachable; the HTTP client overrides this. Never throws.
+     */
+    default ProjectListOutcome projectList(URI baseUrl, String credential) {
+        return new ProjectListOutcome.Unreachable();
+    }
+
+    /**
+     * Removes one project, every resource labelled with it, via {@code DELETE {baseUrl}/api/projects/{id}}.
+     * A client that cannot ask answers unreachable; the HTTP client overrides this. Never throws.
+     */
+    default DeleteOutcome projectRemove(URI baseUrl, String credential, String id) {
+        return new DeleteOutcome.Unreachable();
+    }
+
+    /**
      * Reads the cluster's members over {@code GET {baseUrl}/api/cluster/members}. Authenticated like every
      * other read: membership is not anonymous, and a client that could read it without a credential would
      * be reading a map of the deployment.

@@ -88,10 +88,10 @@ class ProjectKindAcceptsOnlyIdAndMetadataTest {
     }
 
     @Test
-    @DisplayName("a directory with no project file is named after itself")
-    void aDirectoryWithoutAProjectFileIsNamedAfterItself(@TempDir Path parent) throws IOException {
-        Path dir = Files.createDirectory(parent.resolve("orders.v2 draft"));
+    @DisplayName("a directory with no project file names no project: it is the Default project")
+    void aDirectoryWithoutAProjectFileIsTheDefaultProject(@TempDir Path parent) throws IOException {
+        Path dir = Files.createDirectory(parent.resolve("orders"));
 
-        assertThat(WorkspaceLoader.projectId(dir)).isEqualTo("orders_v2_draft");
+        assertThat(WorkspaceLoader.projectId(dir)).as("not the directory's name").isNull();
     }
 }

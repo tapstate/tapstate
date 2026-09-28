@@ -40,7 +40,12 @@ public enum ArtifactError implements TapstateErrorCode {
      * written a project name, and an adoption nobody was told about is indistinguishable from a
      * resource that was always this project's.
      */
-    PROJECT_CLAIMED("artifact.project-claimed", Set.of("id", "kind", "project"), Severity.WARNING);
+    PROJECT_CLAIMED("artifact.project-claimed", Set.of("id", "kind", "project"), Severity.WARNING),
+    /**
+     * A removal of the Default project. Every server has it and every unlabelled resource belongs to it,
+     * so it can be emptied - its resources deleted one by one - but never removed as a whole.
+     */
+    DEFAULT_PROJECT_NOT_REMOVABLE("artifact.default-project-not-removable", Set.of("project"));
 
     private final String code;
     private final Set<String> placeholders;

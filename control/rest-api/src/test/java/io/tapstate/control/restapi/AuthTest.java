@@ -904,6 +904,12 @@ class AuthTest {
         // present for the context to stand up. This suite exercises the auth matrix, not the removal, so
         // the dependent stores refuse rather than pretend: a reclaim reached from here is a defect.
         @Bean
+        io.tapstate.control.core.ProjectService projectService(InMemoryArtifactStore store,
+                ArtifactMutationService artifactMutationService) {
+            return new io.tapstate.control.core.ProjectService(store, artifactMutationService);
+        }
+
+        @Bean
         ArtifactMutationService artifactMutationService(InMemoryArtifactStore store, AuditGate auditGate) {
             return new ArtifactMutationService(
                     store, NoReclaimStores.desired(), NoReclaimStores.state(),

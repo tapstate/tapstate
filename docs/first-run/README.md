@@ -171,8 +171,12 @@ can rely on it:
 ### What `new` writes
 
 A project directory laid out by kind — `source/<id>.tap.yml`, `pipeline/<id>.tap.yml`,
-and so on — plus `.env` and `.gitignore` when a secret was entered, and a `project.tap.yml`
-at the root that names the project:
+and so on — plus `.env` and `.gitignore` when a secret was entered.
+
+Without anything more, what you bring up lands in the server's **Default project**, which every
+server has from its first start. To give the files a project of their own, pass `--project <id>`:
+`new` then writes a `project.tap.yml` at the root that names it (`sample` always names its own,
+`order_demo`):
 
 ```yaml
 version: tapstate/v1
@@ -180,13 +184,14 @@ kind: project
 id: orders
 ```
 
-The id is the directory's name unless you change it; `sample` names its project `order_demo`.
 The file carries the id and optional `metadata` and nothing else — where the project runs is
-decided when it is brought up, not written here. A directory that already has one keeps it.
-Any command run in a subdirectory of the project acts on the whole project: the CLI looks
-upwards for the nearest `project.tap.yml` (after `-w` and `TAPSTATE_WORKDIR`, and before the
-conventional `tap-work`). A directory without the file still works, named after itself, and
-`up` says so. Existing files are never
+decided when it is brought up, not written here. `default` is reserved for the Default project and
+refused as an id. A directory that already has a project file keeps it. Any command run in a
+subdirectory of the project acts on the whole project: the CLI looks upwards for the nearest
+`project.tap.yml` (after `-w` and `TAPSTATE_WORKDIR`, and before the conventional `tap-work`).
+`tapstate projects` lists the server's projects, the Default project first.
+
+Existing files are never
 overwritten; `--force` is the only way to replace one, and the summary marks the files it
 replaced.
 

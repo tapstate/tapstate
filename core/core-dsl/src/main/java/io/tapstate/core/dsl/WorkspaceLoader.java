@@ -80,23 +80,12 @@ public final class WorkspaceLoader {
         }
     }
 
-    /** The id of the project rooted at {@code dir}: what its project file declares, else its name. */
-    public static String projectId(Path dir) {
-        return manifest(dir).map(ProjectManifest::id).orElseGet(() -> defaultProjectId(dir));
-    }
-
     /**
-     * The id a directory without a project file is known by: its own name. A name carrying the
-     * reserved addressing separator or anything that is not a visible character is spelled with an
-     * underscore in its place, since an id may carry neither.
+     * The id of the project rooted at {@code dir}, as its project file declares it, or null when it has
+     * none: a directory without a project file is in the Default project, which no file names.
      */
-    public static String defaultProjectId(Path directory) {
-        Path name = directory.toAbsolutePath().normalize().getFileName();
-        String raw = name == null ? "" : name.toString();
-        StringBuilder id = new StringBuilder(raw.length());
-        raw.codePoints().forEach(c -> id.appendCodePoint(
-                c == '.' || Character.isWhitespace(c) || Character.isISOControl(c) ? '_' : c));
-        return id.isEmpty() ? ProjectManifest.KIND : id.toString();
+    public static String projectId(Path dir) {
+        return manifest(dir).map(ProjectManifest::id).orElse(null);
     }
 
     private static List<Path> artifacts(Path dir) {

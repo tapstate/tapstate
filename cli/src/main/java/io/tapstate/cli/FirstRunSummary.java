@@ -75,7 +75,7 @@ final class FirstRunSummary {
      */
     static void upText(PrintWriter o, Path root, String project, boolean declared, List<UpPipeline> pipelines,
                        List<UpSource> sources, boolean nothingToDo) {
-        o.println("Project: " + project + " (" + root + ")");
+        o.println("Project: " + (project == null ? ProjectManifest.DEFAULT_TITLE : project) + " (" + root + ")");
         for (UpPipeline pipeline : pipelines) {
             o.println("  pipeline " + pipeline.id() + ": " + pipeline.state() + notes(pipeline.notes()));
         }
@@ -92,8 +92,8 @@ final class FirstRunSummary {
         if (!declared) {
             // Said on every up of such a directory rather than once ever: nothing is written to remember
             // that it was said, and a hint that has to be stored somewhere is a second file to explain.
-            o.println("Hint: no " + ProjectManifest.FILE_NAME + " here, so this project is named after its "
-                    + "directory. Add one with `id: " + project + "` to keep that name if the directory moves.");
+            o.println("Hint: no " + ProjectManifest.FILE_NAME + " here, so these resources are in the Default "
+                    + "project. Add one naming a project to give them a project of their own.");
         }
         o.println(AI_LINE);
     }
@@ -110,7 +110,7 @@ final class FirstRunSummary {
         env.put("status", "up");
         // The key keeps its established name for consumers that select it; the project's id is added.
         env.put("workspace", root.toString());
-        env.put("project", project);
+        env.put("project", project == null ? ProjectManifest.DEFAULT : project);
         List<Map<String, Object>> lines = new ArrayList<>();
         for (UpPipeline pipeline : pipelines) {
             Map<String, Object> entry = new LinkedHashMap<>();

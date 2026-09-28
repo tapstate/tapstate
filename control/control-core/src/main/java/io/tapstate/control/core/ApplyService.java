@@ -151,6 +151,7 @@ public final class ApplyService {
         }
         List<ValidationDiagnostic> claimed = new ArrayList<>();
         if (project != null) {
+            ProjectLabel.requireNotReserved(project, "project");
             for (int index = 0; index < resources.size(); index++) {
                 resources.set(index, owned(drafts.get(index), resources.get(index), project, claimed));
             }

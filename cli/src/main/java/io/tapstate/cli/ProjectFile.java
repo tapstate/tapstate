@@ -8,9 +8,8 @@ import java.nio.file.Path;
 import java.util.regex.Pattern;
 
 /**
- * The project file a scaffolding verb writes when the directory it writes into has none yet. It names
- * the project after the directory - the same name {@code up} would give it without the file - so writing
- * it changes nothing about where the project lands, only that the name now travels with the files.
+ * The project file a scaffolding verb writes when it is told which project the files belong to. Without
+ * one the directory's resources land in the Default project, so the file is never written on a guess.
  */
 final class ProjectFile {
 
@@ -28,9 +27,9 @@ final class ProjectFile {
         return Files.exists(root.resolve(ProjectManifest.FILE_NAME));
     }
 
-    /** A project file naming the project rooted at {@code root} after that directory. */
-    static WorkspaceWrite.File forDirectory(Path root) {
-        return WorkspaceWrite.File.owned(ProjectManifest.FILE_NAME, content(WorkspaceLoader.defaultProjectId(root)));
+    /** The project {@code root}'s project file declares, or null when it has none. */
+    static String declaredIn(Path root) {
+        return WorkspaceLoader.manifest(root).map(ProjectManifest::id).orElse(null);
     }
 
     /** The text of a project file declaring {@code id}. */

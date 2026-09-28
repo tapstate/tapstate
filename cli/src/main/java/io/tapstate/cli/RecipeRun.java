@@ -2,6 +2,8 @@ package io.tapstate.cli;
 
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.dsl.ProjectLabel;
+import io.tapstate.core.model.ProjectManifest;
 import io.tapstate.core.model.Resource;
 
 import java.nio.file.Path;
@@ -69,8 +71,25 @@ final class RecipeRun {
      * @param prompter what asks the recipe's questions, or null to take every answer from {@code flags}
      */
     static Result run(String recipeId, Path root, Prompter prompter, Flags flags, boolean force) {
+        return run(recipeId, root, prompter, flags, force, null);
+    }
+
+    /**
+     * @param project the project the files are written as, which writes a {@code project.tap.yml} naming
+     *                it; null leaves the directory in the Default project, except for {@code sample}, which
+     *                always names its own
+     */
+    static Result run(String recipeId, Path root, Prompter prompter, Flags flags, boolean force, String project) {
+        if (project != null) {
+            ProjectLabel.requireNotReserved(project, "--project");
+            String named = ProjectFile.declaredIn(root);
+            if (named != null && !named.equals(project)) {
+                throw new Usage("this directory is already project '" + named + "' (its " + ProjectManifest.FILE_NAME
+                        + "); leave out --project, or name that project");
+            }
+        }
         List<Output> outputs = switch (recipeId) {
-            case "sample" -> DemoCmd.bundledFiles(root).stream()
+            case "sample" -> DemoCmd.bundledFiles(root, project).stream()
                     .map(file -> new Output(file, kindOf(file), null))
                     .toList();
             case "blank" -> {
@@ -113,12 +132,14 @@ final class RecipeRun {
             }
             default -> throw new IllegalStateException("not a recipe: " + recipeId);
         };
-        // Every recipe leaves a project behind, so every recipe names it - unless the directory already
-        // is one, whose name is the user's and is never replaced.
-        if (!ProjectFile.presentIn(root)
+        // A project file is written only when a project was named: without one the files land in the
+        // Default project, which is where a first run belongs until somebody decides to split things up. A
+        // directory that already is a project keeps its file untouched.
+        if (project != null && !ProjectFile.presentIn(root)
                 && outputs.stream().noneMatch(output -> output.kind().equals(ProjectFile.KIND))) {
             List<Output> named = new ArrayList<>();
-            named.add(new Output(ProjectFile.forDirectory(root), ProjectFile.KIND, null));
+            named.add(new Output(WorkspaceWrite.File.owned(ProjectManifest.FILE_NAME, ProjectFile.content(project)),
+                    ProjectFile.KIND, null));
             named.addAll(outputs);
             outputs = named;
         }

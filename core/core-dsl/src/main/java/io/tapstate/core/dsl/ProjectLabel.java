@@ -2,6 +2,7 @@ package io.tapstate.core.dsl;
 
 import io.tapstate.core.model.Metadata;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.ProjectManifest;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.ServeResource;
 import io.tapstate.core.model.SourceResource;
@@ -26,6 +27,19 @@ public final class ProjectLabel {
     private ProjectLabel() {
     }
 
+    /**
+     * Refuses {@code project} when it is the reserved id of the Default project. Nothing is applied as
+     * the Default project: a resource belongs to it by carrying no label, so a label naming it would be a
+     * second, disagreeing way to say the same thing.
+     */
+    public static void requireNotReserved(String project, String path) {
+        if (ProjectManifest.DEFAULT.equals(project)) {
+            throw new DslException(DslError.ILLEGAL_VALUE, path, 0, 0, null, Map.of("value", project,
+                    "expected", "a project id other than `" + ProjectManifest.DEFAULT
+                            + "`, which is reserved for the Default project"));
+        }
+    }
+
     /** The project {@code resource} is labelled with, or null when it carries no project label. */
     public static String of(Resource resource) {
         Metadata metadata = resource.metadata();
@@ -37,8 +51,17 @@ public final class ProjectLabel {
      * The refusal names both values, so the author can see which one the file got wrong.
      */
     public static void requireConsistent(Resource resource, String project) {
-        Objects.requireNonNull(project, "project");
         String written = of(resource);
+        if (project == null) {
+            // The Default project: a resource belongs to it by carrying no label, so any label is a claim
+            // on a project this directory does not name.
+            if (written != null) {
+                throw new DslException(DslError.RESERVED_LABEL, "metadata.labels." + KEY, 0, 0, null,
+                        Map.of("id", resource.id(), "key", KEY, "value", written,
+                                "expected", ProjectManifest.DEFAULT));
+            }
+            return;
+        }
         if (written != null && !written.equals(project)) {
             throw new DslException(DslError.RESERVED_LABEL, "metadata.labels." + KEY, 0, 0, null,
                     Map.of("id", resource.id(), "key", KEY, "value", written, "expected", project));

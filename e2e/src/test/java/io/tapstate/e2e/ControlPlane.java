@@ -658,6 +658,46 @@ final class ControlPlane {
     }
 
     /** Removes the artifact {@code id}, offering {@code expectedContentHash} as the version the caller read. */
+    /** One project as the server lists it: its id, whether it can be removed, and the ids it holds. */
+    record Project(String id, boolean removable, List<String> resourceIds) {}
+
+    /** The server's projects, in the order it lists them. */
+    List<Project> projects() {
+        HttpResponse<String> response = send(authedGet("/api/projects"));
+        expect(response, 200, "list projects");
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map) || !(map.get("items") instanceof List<?> items)) {
+            throw new AssertionError("project list was not a list: " + response.body());
+        }
+        List<Project> projects = new ArrayList<>();
+        for (Object item : items) {
+            Map<?, ?> row = (Map<?, ?>) item;
+            List<String> ids = ((List<?>) row.get("resources")).stream()
+                    .map(each -> String.valueOf(((Map<?, ?>) each).get("id")))
+                    .toList();
+            projects.add(new Project(String.valueOf(row.get("id")), Boolean.TRUE.equals(row.get("removable")), ids));
+        }
+        return projects;
+    }
+
+    /** Removes a project the product is expected to remove. */
+    void removeProject(String id) {
+        expect(send(authedDeletePath("/api/projects/" + urlSegment(id))), 204, "remove project " + id);
+    }
+
+    /** Attempts a project removal the product is expected to refuse; returns the refusal. */
+    Refusal removeProjectExpectingRefusal(String id) {
+        HttpResponse<String> response = send(authedDeletePath("/api/projects/" + urlSegment(id)));
+        return interpretRefusal(response.statusCode(), response.body(), "removing project " + id);
+    }
+
+    private HttpRequest authedDeletePath(String path) {
+        return HttpRequest.newBuilder(baseUrl.resolve(path))
+                .timeout(TIMEOUT)
+                .header("Authorization", "Bearer " + requireCredential())
+                .DELETE()
+                .build();
+    }
+
     void deleteArtifact(String id, String expectedContentHash) {
         expect(send(authedDelete(id, expectedContentHash)), 204, "delete " + id);
     }

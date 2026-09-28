@@ -171,9 +171,15 @@ final class DemoCmd implements Callable<Integer> {
      * rather than renaming it.
      */
     static List<WorkspaceWrite.File> bundledFiles(Path root) {
+        return bundledFiles(root, null);
+    }
+
+    /** The same, with the project file naming {@code project} instead of the demo's own, when one is given. */
+    static List<WorkspaceWrite.File> bundledFiles(Path root, String project) {
         List<WorkspaceWrite.File> files = new ArrayList<>();
         if (!ProjectFile.presentIn(root)) {
-            files.add(WorkspaceWrite.File.owned(PROJECT_RESOURCE, bundled(PROJECT_RESOURCE)));
+            files.add(WorkspaceWrite.File.owned(PROJECT_RESOURCE,
+                    project == null ? bundled(PROJECT_RESOURCE) : ProjectFile.content(project)));
         }
         files.addAll(bundledFiles());
         return files;
