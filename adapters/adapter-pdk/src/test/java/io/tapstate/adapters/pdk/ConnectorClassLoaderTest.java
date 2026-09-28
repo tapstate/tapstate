@@ -7,6 +7,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.InputStream;
 import java.net.URLConnection;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
@@ -161,6 +162,27 @@ class ConnectorClassLoaderTest {
                 first.close();
                 assertThat(reading.readAllBytes()).isEqualTo(MESSAGES);
             }
+        }
+    }
+
+    /**
+     * A resource that cannot be read answers as absent, the way {@link java.net.URLClassLoader} answers: one
+     * the jar does not hold, and one it holds but that can no longer be opened - here a jar whose file went
+     * away after the loader opened it, so the entry is still found and the jar cannot be opened again to read
+     * it. A caller asking for a resource is not the one to be told about a jar that stopped being readable.
+     */
+    @Test
+    void aResourceThatCannotBeReadIsAbsent(@TempDir Path dir) throws Exception {
+        Path jar = messagesJar(dir);
+        try (ConnectorClassLoader connector = ConnectorClassLoader.open(List.of(jar))) {
+            ClassLoader loader = connector.load("synthetic.Widget").getClassLoader();
+            assertThat(loader.getResourceAsStream("synthetic/absent.properties")).isNull();
+
+            Files.delete(jar);
+            assertThat(loader.getResource(MESSAGES_ENTRY))
+                    .as("the entry, found through the jar the loader already has open")
+                    .isNotNull();
+            assertThat(loader.getResourceAsStream(MESSAGES_ENTRY)).isNull();
         }
     }
 
