@@ -30,6 +30,9 @@ enum BootError implements TapstateErrorCode {
     /** The managed metadata connection is not a MongoDB or MongoDB SRV connection string. */
     CLOUD_ATLAS_URI_INVALID("boot.cloud-atlas-uri-invalid", Set.of()),
 
+    /** The optional on-prem store switch cannot disable managed Cloud metadata persistence. */
+    CLOUD_STORE_REQUIRED("boot.cloud-store-required", Set.of()),
+
     /** The selected member-discovery mode is missing a required, deterministic input. */
     DISCOVERY_CONFIG_INVALID("boot.discovery-config-invalid", Set.of("detail")),
 

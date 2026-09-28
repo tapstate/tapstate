@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.core.common.TapstateException;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.core.env.SystemEnvironmentPropertySource;
@@ -44,6 +45,33 @@ class CloudPropertiesBindingTest {
                 .run(context -> assertBound(context.getBean(CloudProperties.class),
                         "https://jvm.cloud.example", "token-from-jvm",
                         "mongodb://jvm.atlas.example/metadata"));
+    }
+
+    @Test
+    void aCloudTriadCannotDisableItsMandatoryMetadataStore() {
+        runner.withPropertyValues(
+                        "tapstate.cloud.base-url=https://cloud.example",
+                        "tapstate.cloud.token=token-from-properties",
+                        "tapstate.cloud.atlas-uri=mongodb://atlas.example/metadata",
+                        "tapstate.store.mongo.enabled=false")
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure()).hasRootCauseInstanceOf(TapstateException.class);
+                    Throwable cause = context.getStartupFailure();
+                    while (cause.getCause() != null) {
+                        cause = cause.getCause();
+                    }
+                    assertThat(((TapstateException) cause).code()).isEqualTo(BootError.CLOUD_STORE_REQUIRED);
+                });
+    }
+
+    @Test
+    void onPremMayStillDisableTheStoreForASubstrateOnlyRun() {
+        runner.withPropertyValues("tapstate.store.mongo.enabled=false")
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context.getBean(CloudRuntimeSettings.class).cloud()).isFalse();
+                });
     }
 
     private static void assertBound(

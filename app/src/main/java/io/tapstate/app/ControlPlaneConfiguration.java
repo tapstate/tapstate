@@ -55,6 +55,7 @@ import io.tapstate.control.core.PipelineViewService;
 import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.ResourceAttributionPolicy;
+import io.tapstate.control.core.StateDatabasePolicy;
 import io.tapstate.control.core.DataBrowserFollows;
 import io.tapstate.control.core.DerivedSchemas;
 import io.tapstate.control.core.SourceConnectionResolver;
@@ -324,7 +325,7 @@ class ControlPlaneConfiguration {
             ArtifactStore artifactStore, ConnectorCatalogView connectorCatalogView, AuditGate auditGate,
             SchemaStore schemaStore, @Nullable NestSettings nestSettings,
             SchemaDerivation derivation, LivePipelines livePipelines,
-            ResourceAttributionPolicy attribution) {
+            ResourceAttributionPolicy attribution, StateDatabasePolicy stateDatabasePolicy) {
         // The online apply validates against the live catalog view (the bundled snapshot union the
         // connectors registered so far), so a connector registered at runtime is honoured without a restart.
         // It also reads the schema store, which is what lets it judge a row expression against the columns
@@ -349,7 +350,7 @@ class ControlPlaneConfiguration {
                 PlanAdvisories.all(
                         new NestSizingAdvisories(settings.entriesHeldInMemory()),
                         new DocumentKeyAdvisories()),
-                derivation, livePipelines, attribution);
+                derivation, livePipelines, attribution, stateDatabasePolicy);
     }
 
     /** Preserves the direct assembly seam used by focused on-prem wiring tests. */
@@ -358,7 +359,7 @@ class ControlPlaneConfiguration {
             SchemaStore schemaStore, @Nullable NestSettings nestSettings,
             SchemaDerivation derivation, LivePipelines livePipelines) {
         return applyService(artifactStore, connectorCatalogView, auditGate, schemaStore, nestSettings,
-                derivation, livePipelines, ResourceAttributionPolicy.onPrem());
+                derivation, livePipelines, ResourceAttributionPolicy.onPrem(), StateDatabasePolicy.ON_PREM);
     }
 
     @Bean
@@ -366,6 +367,11 @@ class ControlPlaneConfiguration {
         return cloud.cloud()
                 ? ResourceAttributionPolicy.managedCloud()
                 : ResourceAttributionPolicy.onPrem();
+    }
+
+    @Bean
+    StateDatabasePolicy stateDatabasePolicy(CloudRuntimeSettings cloud) {
+        return cloud.cloud() ? StateDatabasePolicy.CLOUD : StateDatabasePolicy.ON_PREM;
     }
 
     @Bean

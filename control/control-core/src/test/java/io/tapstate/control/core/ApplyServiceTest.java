@@ -8,6 +8,10 @@ import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.FromClause;
+import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.Step;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
@@ -116,6 +120,141 @@ class ApplyServiceTest {
                 .isInstanceOfSatisfying(TapstateException.class,
                         error -> assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
         assertThat(store.get("tgt_mg")).isEmpty();
+    }
+
+    @Test
+    void cloudRejectsInlineStatePlacementInValidateAndApplyBeforeAnyBatchWrite() {
+        ApplyService cloud = cloudWithStatePolicy();
+        List<ArtifactDraft> batch = nestBatch("custom_ops");
+
+        ArtifactValidationResult validation = cloud.validate(batch);
+        assertThat(validation.valid()).isFalse();
+        assertThat(validation.diagnostics()).singleElement().extracting(ValidationDiagnostic::code)
+                .isEqualTo(ControlError.STATE_DATABASE_UNAVAILABLE.code());
+        assertThatThrownBy(() -> cloud.apply("verified-cloud-user", batch))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(ControlError.STATE_DATABASE_UNAVAILABLE));
+        assertThat(store.list()).isEmpty();
+        assertThat(auditStore.records).isEmpty();
+    }
+
+    @Test
+    void cloudAcceptsAnImplicitStateDatabaseButEvenAnExplicitDefaultIsRefused() {
+        ApplyService cloud = cloudWithStatePolicy();
+        assertThat(cloud.validate(nestBatch(null)).valid()).isTrue();
+        assertThat(cloud.apply("verified-cloud-user", nestBatch(null)).outcomes())
+                .allSatisfy(outcome -> assertThat(outcome.change()).isEqualTo(ArtifactOutcome.Change.CREATED));
+        assertThat(cloud.validate(nestBatch("tapstate_nest")).valid()).isFalse();
+    }
+
+    @Test
+    void cloudTypedCreateAndReplaceCannotBypassTheStatePlacementGate() {
+        service.apply("local-author", nestBatch(null));
+        Resource explicit = new DslParser().parse(nestPipeline("custom_ops"));
+        ApplyService cloud = cloudWithStatePolicy();
+        String prior = stored("nested_orders");
+
+        assertThatThrownBy(() -> cloud.create("verified-cloud-user", explicit))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(ControlError.STATE_DATABASE_UNAVAILABLE));
+        assertThatThrownBy(() -> cloud.replace("verified-cloud-user", explicit,
+                CanonicalHash.of(store.get(explicit.id()).orElseThrow())))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(ControlError.STATE_DATABASE_UNAVAILABLE));
+        assertThat(stored("nested_orders")).isEqualTo(prior);
+    }
+
+    @Test
+    void cloudRejectsReusableNestPlacementIncludingAStoredUseDependency() {
+        String reusable = """
+                version: tapstate/v1
+                kind: transform
+                id: reusable_nest
+                type: nest
+                state: { database: custom_ops }
+                root: { from: c, key: [id] }
+                """;
+        ApplyService cloud = cloudWithStatePolicy();
+        Resource transform = new DslParser().parse(reusable);
+        assertThat(cloud.validate(List.of(draft(reusable))).valid()).isFalse();
+        assertThatThrownBy(() -> cloud.create("verified-cloud-user", transform))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(ControlError.STATE_DATABASE_UNAVAILABLE));
+        // A stored dependency must not provide an escape hatch through the typed Pipeline path.
+        service.apply("local-author", List.of(draft(NEST_SOURCE), draft(TGT_MG), draft(reusable)));
+        PipelineResource parsed = (PipelineResource) new DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: uses_nest
+                source: src_orders
+                transforms:
+                  - id: doc
+                    use: reusable_nest
+                    from: customers
+                serve:
+                  from: doc
+                  sync: [{ id: out, source: tgt_mg, write_mode: upsert }]
+                """);
+        PipelineResource referring = new PipelineResource(parsed.id(), parsed.metadata(), parsed.sources(),
+                List.of(Step.use("doc", "reusable_nest", FromClause.aliases(Map.of(
+                        "c", FromRef.literal("customers"))))),
+                parsed.view(), parsed.serve(), parsed.settings(), parsed.experimental());
+        assertThatThrownBy(() -> cloud.create("verified-cloud-user", referring))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(ControlError.STATE_DATABASE_UNAVAILABLE));
+        assertThat(store.get("uses_nest")).isEmpty();
+    }
+
+    @Test
+    void onPremStillAcceptsAndPreservesAuthoredStatePlacement() {
+        assertThat(service.validate(nestBatch("custom_ops")).valid()).isTrue();
+        service.apply("local-author", nestBatch("custom_ops"));
+        assertThat(stored("nested_orders")).contains("database: custom_ops");
+    }
+
+    private ApplyService cloudWithStatePolicy() {
+        return new ApplyService(TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK),
+                new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none(), null,
+                ResourceAttributionPolicy.managedCloud(), StateDatabasePolicy.CLOUD);
+    }
+
+    private static final String NEST_SOURCE = """
+            version: tapstate/v1
+            kind: source
+            id: src_orders
+            connector: mysql
+            config: { host: db.example, username: test, password: test }
+            mode: cdc
+            tables: [customers, orders]
+            """;
+
+    private static List<ArtifactDraft> nestBatch(String database) {
+        return List.of(draft(NEST_SOURCE), draft(TGT_MG), draft(nestPipeline(database)));
+    }
+
+    private static String nestPipeline(String database) {
+        return """
+                version: tapstate/v1
+                kind: pipeline
+                id: nested_orders
+                source: src_orders
+                transforms:
+                  - id: doc
+                    type: nest
+                %s    from: { c: customers, o: orders }
+                    root:
+                      from: c
+                      key: [id]
+                      embed:
+                        - from: o
+                          on: { customer_id: id }
+                          as: array
+                          path: orders
+                          arrayKey: [id]
+                serve:
+                  from: doc
+                  sync: [{ id: out, source: tgt_mg, write_mode: upsert }]
+                """.formatted(database == null ? "" : "    state: { database: " + database + " }\n");
     }
 
     @Test

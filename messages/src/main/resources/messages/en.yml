@@ -96,6 +96,9 @@ boot.cloud-base-url-invalid:
 boot.cloud-config-incomplete:
   message: "The managed Cloud startup configuration is incomplete."
   solution: "Set tapstate.cloud.base-url, tapstate.cloud.token, and tapstate.cloud.atlas-uri together, or remove all three for on-prem mode."
+boot.cloud-store-required:
+  message: "Managed Cloud mode requires its metadata store."
+  solution: "Remove tapstate.store.mongo.enabled=false and supply the assigned Cloud Atlas metadata URI."
 boot.cluster-id-required:
   message: "Cluster discovery requires an explicit stable cluster id."
   solution: "Set tapstate.cluster.id to the same stable value on every member."
@@ -570,6 +573,9 @@ control.auth-failed:
 control.auth-mode-unavailable:
   message: "The `{mode}` deployment does not expose this authentication flow."
   solution: "Use the authentication entry point for the selected deployment mode."
+control.state-database-unavailable:
+  message: "Cloud mode does not allow an explicit Nest state.database."
+  solution: "Remove state.database to use the deployment-owned operator-state database. On-prem deployments can still select a database."
 control.bootstrap-closed:
   message: "The initial-admin bootstrap channel is closed because an admin account already exists."
   solution: "Sign in with an existing admin account to create more users."

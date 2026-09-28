@@ -38,6 +38,7 @@ artifact.version-conflict
 boot.cloud-atlas-uri-invalid
 boot.cloud-base-url-invalid
 boot.cloud-config-incomplete
+boot.cloud-store-required
 boot.cluster-id-invalid
 boot.cluster-id-mismatch
 boot.cluster-id-required
@@ -154,6 +155,7 @@ control.bootstrap-forbidden
 control.forbidden
 control.malformed-request
 control.schema-derivation-incomplete
+control.state-database-unavailable
 control.unauthenticated
 control.unreachable
 data-browser.connector-not-browsable

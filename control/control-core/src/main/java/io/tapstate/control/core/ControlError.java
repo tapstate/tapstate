@@ -60,6 +60,9 @@ public enum ControlError implements TapstateErrorCode {
     /** The caller reached an authentication flow that the selected deployment mode does not expose. */
     AUTH_MODE_UNAVAILABLE("control.auth-mode-unavailable", Set.of("mode")),
 
+    /** A Cloud author attempted to select the deployment-owned Nest state database. */
+    STATE_DATABASE_UNAVAILABLE("control.state-database-unavailable", Set.of()),
+
     /**
      * A protected operation was reached with no valid credential — none was presented, or the one
      * presented is malformed, unknown, revoked, expired or unsigned. It carries no placeholder on

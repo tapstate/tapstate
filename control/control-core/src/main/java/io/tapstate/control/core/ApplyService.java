@@ -90,6 +90,7 @@ public final class ApplyService {
     private final PlanAdvisories advisories;
     private final SchemaDerivation derivation;
     private final ResourceAttributionPolicy attribution;
+    private final StateDatabasePolicy stateDatabasePolicy;
 
     /**
      * The reading of which pipelines are up, or null when the caller supplied none -- see the same field
@@ -120,6 +121,14 @@ public final class ApplyService {
             Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
             PlanAdvisories advisories, SchemaDerivation derivation, LivePipelines live,
             ResourceAttributionPolicy attribution) {
+        this(catalog, store, auditGate, schemas, advisories, derivation, live, attribution,
+                StateDatabasePolicy.ON_PREM);
+    }
+
+    public ApplyService(
+            Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
+            PlanAdvisories advisories, SchemaDerivation derivation, LivePipelines live,
+            ResourceAttributionPolicy attribution, StateDatabasePolicy stateDatabasePolicy) {
         this.live = live;
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.store = Objects.requireNonNull(store, "store");
@@ -134,6 +143,7 @@ public final class ApplyService {
         // where nothing was written either.
         this.derivation = Objects.requireNonNull(derivation, "derivation");
         this.attribution = Objects.requireNonNull(attribution, "attribution");
+        this.stateDatabasePolicy = Objects.requireNonNull(stateDatabasePolicy, "stateDatabasePolicy");
     }
 
     /**
@@ -236,6 +246,7 @@ public final class ApplyService {
         candidate.addAll(submitted);
         TapstateCatalog liveCatalog = catalog.get();
         List<Resource> validationResources = validationResources(candidate, submitted, validationScope);
+        stateDatabasePolicy.validate(validationResources);
         Workspace workspace = Workspace.of(validationResources, liveCatalog);
         if (validationScope == ValidationScope.ONLINE_SOURCE) {
             for (Resource resource : submitted) {
