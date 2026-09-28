@@ -4542,6 +4542,7 @@ final class Repl {
         };
     }
 
+    /**
      * {@code snapshot <pipeline-id>} — reads the pipeline's per-table initial-load progress and prints one
      * {@code <table>  <rowsDone>/<rowsTotal> (<pct>%)} line per table in name order (a table with no total
      * shows {@code <rowsDone>/?} — honest partial data), or a benign {@code no snapshot} line when there is

@@ -1911,7 +1911,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         try {
             ws = client().newWebSocketBuilder()
                     .header("Authorization", "Bearer " + credential)
-                    .buildAsync(wsUri, new StreamListener(onFrame, closed, refusal))
+                    .buildAsync(wsUri.get(), new StreamListener(onFrame, closed, refusal))
                     .join();
         } catch (RuntimeException handshakeFailed) {
             // Member selection belongs to the caller; do not retry the same address here.
