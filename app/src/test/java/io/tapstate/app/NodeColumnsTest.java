@@ -115,6 +115,37 @@ class NodeColumnsTest {
         assertThat(NodeColumns.merged(List.of(base, NodeColumns.known(base.columns()))).numericTypes()).isEmpty();
     }
 
+    /**
+     * An expression that only reads a column hands on that column's own value, so it keeps the
+     * descriptors a rename keeps; one that does anything more with the column keeps none. Without the
+     * first, a decimal moved through a map reached its target with no precision, scale or range, and the
+     * target refused to build the column.
+     */
+    @Test
+    void aComputedValueThatOnlyReadsAColumnKeepsItsDescriptors() {
+        var number = new io.tapstate.core.common.NumericType(128, true, false, true,
+                new java.math.BigDecimal("-99999999999999.9999"), new java.math.BigDecimal("99999999999999.9999"), 18, 4);
+        var string = new io.tapstate.core.common.StringType(36L, false, true, 255L, 2);
+        var source = NodeColumns.known(Map.of("amount", JoinSchemaDrift.declaredType(TapstateType.DECIMAL, false),
+                "code", JoinSchemaDrift.declaredType(TapstateType.STRING, false)))
+                .withNumericTypes(Map.of("amount", number))
+                .withStringTypes(Map.of("code", string));
+        Map<String, FieldRule> expressions = new LinkedHashMap<>();
+        expressions.put("moved", FieldRule.computed("after.amount"));
+        expressions.put("prior", FieldRule.computed("before.amount"));
+        expressions.put("label", FieldRule.computed("after.code"));
+        expressions.put("present", FieldRule.computed("has(after.amount)"));
+        expressions.put("raised", FieldRule.computed("after.amount + 1"));
+        expressions.put("coded", FieldRule.computed("after.code + 'x'"));
+
+        var projected = NodeColumns.of(map(expressions), one(source), null);
+
+        assertThat(projected.numericTypes()).containsExactlyInAnyOrderEntriesOf(
+                Map.of("moved", number, "prior", number, "amount", number));
+        assertThat(projected.stringTypes()).containsExactlyInAnyOrderEntriesOf(
+                Map.of("label", string, "code", string));
+    }
+
     @Test
     @DisplayName("every kind of transform reaches an arm of its own")
     void everyKindOfTransformReachesAnArmOfItsOwn() {
