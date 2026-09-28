@@ -130,6 +130,32 @@ is recreated before another sweep. Exported point labels contain the pipeline id
 execution selector. A remote Prometheus or OTLP backend may retain older points until its own retention
 expires; do not use that remote history to decide which incarnation a current store-backed read belongs to.
 
+## Configure observation work and retention
+
+These startup settings use the shipped defaults below. Change one setting at a time and compare the
+corresponding queue, duration, failure, and resource facts on the same workload.
+
+| Property | Default | What it controls |
+|---|---|---|
+| `tapstate.lifecycle.max-concurrency` | `4` | Shared lifecycle coordination slots; one pipeline still has at most one active intent |
+| `tapstate.lifecycle.queue-capacity` | `64` | Bounded accepted lifecycle intent queue; later convergence passes retry refused admission |
+| `tapstate.observability.janitor.batch-size` | `16` | Maximum documents examined by each bounded cold cleanup phase in a pass |
+| `tapstate.observability.janitor.interval` | `PT1M` | Delay between cold janitor passes |
+| `tapstate.metrics.history.sample-interval` | `PT1M` | Minimum interval between retained raw movement samples |
+| `tapstate.metrics.history.retention` | `P15D` | Time-based raw/rollup retention and query clipping; shorter retention also shortens the available window |
+| `tapstate.metrics.history.rollup-read-enabled` | `true` | Allows valid rollups on reads; `false` selects raw aggregation for a same-build diagnostic comparison |
+
+Worker and queue counts must be positive. A larger lifecycle pool does not change pipeline processing
+parallelism or make a slow target finish sooner. Inspect the verb's work duration and capacity wait
+before changing admission limits. Reduce observation cost only after measuring query fallback and
+sampling gaps alongside the resource change.
+
+Telemetry dispatch currently has four latest workers and one worker for each wired history, event, and
+local-export sink, with a queue budget of 64 for each pool. Its write watchdog marks timed-out work after
+the five-second deadline and uses a one-second breaker cooldown. A driver call that cannot be interrupted
+can continue to occupy its bounded slot; a timeout does not prove that remote IO stopped. These are fixed
+budgets in this build. Collector push completion has its own export health boundary.
+
 ## Latest storage and upgrades
 
 Each pipeline has one logical latest observation. Mongo stores its current pointer in a bounded
