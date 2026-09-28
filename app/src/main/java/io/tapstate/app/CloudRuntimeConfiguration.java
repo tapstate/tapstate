@@ -1,9 +1,12 @@
 package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.control.core.CloudStatusReporter;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.env.Environment;
 
 import java.util.Map;
 
@@ -23,6 +26,28 @@ class CloudRuntimeConfiguration {
         return settings;
     }
 
+    @Bean(destroyMethod = "close")
+    CloudStatusLifecycle cloudStatusLifecycle(
+            CloudRuntimeSettings settings, ObjectProvider<CloudStatusReporter> reporters, Environment environment) {
+        String configured = environment.getProperty("SDK_STATUS_SENDER_ENABLED", "false").trim();
+        if (!"true".equalsIgnoreCase(configured) && !"false".equalsIgnoreCase(configured)) {
+            throw new TapstateException(BootError.CLOUD_STATUS_CONFIG_INVALID, Map.of(), null);
+        }
+        if (!Boolean.parseBoolean(configured)) {
+            return new CloudStatusLifecycle(null);
+        }
+        if (!settings.cloud()) {
+            throw new TapstateException(BootError.CLOUD_STATUS_MODE_REQUIRED, Map.of(), null);
+        }
+        CloudStatusReporter reporter = reporters.getIfAvailable();
+        if (reporter == null) {
+            throw new TapstateException(BootError.CLOUD_STATUS_SDK_REQUIRED, Map.of(), null);
+        }
+        return new CloudStatusLifecycle(reporter);
+    }
+
     // TODO Bind CloudCodeExchanger, CloudTokenRefresher and CloudStatusSender to the published SDK
     // once the provider adds stable user-id and refresh contracts and publishes a consumable version.
+    // The SDK adapter must also bind a CloudStatusReporter using its validated deployment identity
+    // and the runtime status provider. Never substitute a no-op sender to make this opt-in pass.
 }

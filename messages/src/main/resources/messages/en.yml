@@ -99,6 +99,15 @@ boot.cloud-config-incomplete:
 boot.cloud-store-required:
   message: "Managed Cloud mode requires its metadata store."
   solution: "Remove tapstate.store.mongo.enabled=false and supply the assigned Cloud Atlas metadata URI."
+boot.cloud-status-config-invalid:
+  message: "The Cloud status sender switch is not a valid boolean."
+  solution: "Set SDK_STATUS_SENDER_ENABLED to true or false."
+boot.cloud-status-mode-required:
+  message: "Cloud status reporting cannot be enabled in on-prem mode."
+  solution: "Disable SDK_STATUS_SENDER_ENABLED or provide the complete managed Cloud configuration."
+boot.cloud-status-sdk-required:
+  message: "Cloud status reporting was enabled without its SDK integration."
+  solution: "Install the SDK-backed reporter integration before enabling SDK_STATUS_SENDER_ENABLED."
 boot.cluster-id-required:
   message: "Cluster discovery requires an explicit stable cluster id."
   solution: "Set tapstate.cluster.id to the same stable value on every member."

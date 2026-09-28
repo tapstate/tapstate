@@ -38,6 +38,9 @@ artifact.version-conflict
 boot.cloud-atlas-uri-invalid
 boot.cloud-base-url-invalid
 boot.cloud-config-incomplete
+boot.cloud-status-config-invalid
+boot.cloud-status-mode-required
+boot.cloud-status-sdk-required
 boot.cloud-store-required
 boot.cluster-id-invalid
 boot.cluster-id-mismatch

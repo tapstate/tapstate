@@ -129,6 +129,7 @@ class StateDatabaseModeBoundaryIT {
         List<String> args = new ArrayList<>(List.of(
                 "--server.address=127.0.0.1", "--server.port=0", "--tapstate.hz.member-port=0",
                 "--tapstate.hz.jet.cooperative-thread-count=2",
+                "--SDK_STATUS_SENDER_ENABLED=false",
                 "--tapstate.connectors.plugins-dir=" + work.resolve("plugins"),
                 "--tapstate.connectors.seed-dir=" + work.resolve("no-optional-seeds"),
                 "--tapstate.store.mongo.uri=" + MONGO.getReplicaSetUrl(database),

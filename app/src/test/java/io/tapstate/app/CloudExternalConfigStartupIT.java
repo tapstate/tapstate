@@ -179,6 +179,25 @@ class CloudExternalConfigStartupIT {
         assertThat(running.output()).doesNotContain("atlas-uri-password-sentinel");
     }
 
+    @Test
+    void anOnPremProcessCannotEnableCloudStatusReporting() throws Exception {
+        Running running = start(Carrier.FILE, Map.of(), MONGO.getReplicaSetUrl(uniqueDatabase("status_onprem")),
+                "--SDK_STATUS_SENDER_ENABLED=true");
+        running.awaitFailure("boot.cloud-status-mode-required");
+        assertThat(cloudRequests.get()).isZero();
+        assertSafeOutput(running, null);
+    }
+
+    @Test
+    void anEnabledCloudStatusProcessRequiresTheActualSdkReporter() throws Exception {
+        String uri = MONGO.getReplicaSetUrl(uniqueDatabase("status_cloud"));
+        Running running = start(Carrier.ENVIRONMENT, cloudValues(uri), uri,
+                "--SDK_STATUS_SENDER_ENABLED=true");
+        running.awaitFailure("boot.cloud-status-sdk-required");
+        assertThat(cloudRequests.get()).as("missing SDK is not replaced with successful fake heartbeats").isZero();
+        assertSafeOutput(running, uri);
+    }
+
     private void assertUntouched(String database) {
         try (var raw = MongoClients.create(MONGO.getReplicaSetUrl())) {
             assertThat(raw.getDatabase(database).listCollectionNames().into(new ArrayList<>())).isEmpty();
@@ -236,6 +255,7 @@ class CloudExternalConfigStartupIT {
                 .redirectErrorStream(true).redirectOutput(log.toFile());
         // Do not inherit a developer's Cloud configuration, Java injection options, or external Spring file.
         builder.environment().keySet().removeIf(key -> key.startsWith("TAPSTATE_") || key.startsWith("SPRING_")
+                || key.equals("SDK_STATUS_SENDER_ENABLED")
                 || key.equals("JAVA_TOOL_OPTIONS") || key.equals("JDK_JAVA_OPTIONS") || key.equals("_JAVA_OPTIONS"));
         if (carrier == Carrier.ENVIRONMENT) {
             values.forEach((key, value) -> builder.environment().put(

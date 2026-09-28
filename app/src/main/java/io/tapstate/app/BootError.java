@@ -33,6 +33,15 @@ enum BootError implements TapstateErrorCode {
     /** The optional on-prem store switch cannot disable managed Cloud metadata persistence. */
     CLOUD_STORE_REQUIRED("boot.cloud-store-required", Set.of()),
 
+    /** The outbound status switch is malformed; its value is deliberately not echoed. */
+    CLOUD_STATUS_CONFIG_INVALID("boot.cloud-status-config-invalid", Set.of()),
+
+    /** An on-prem process attempted to enable managed Cloud status reporting. */
+    CLOUD_STATUS_MODE_REQUIRED("boot.cloud-status-mode-required", Set.of()),
+
+    /** Status reporting was explicitly enabled without the real SDK-backed reporter. */
+    CLOUD_STATUS_SDK_REQUIRED("boot.cloud-status-sdk-required", Set.of()),
+
     /** The selected member-discovery mode is missing a required, deterministic input. */
     DISCOVERY_CONFIG_INVALID("boot.discovery-config-invalid", Set.of("detail")),
 
