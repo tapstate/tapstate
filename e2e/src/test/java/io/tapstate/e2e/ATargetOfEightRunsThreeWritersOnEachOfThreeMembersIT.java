@@ -110,11 +110,17 @@ class ATargetOfEightRunsThreeWritersOnEachOfThreeMembersIT {
 
                     List<String> everyMember = control.clusterMembers().stream()
                             .map(ClusterMemberFacts::memberUuid).toList();
+                    // The wide vertices are waited for as well as their processors: every vertex of none is a
+                    // wait that ends at once, and the cluster can read the run from every member before it says
+                    // which of its vertices the plan gave nine to.
                     Await.until("the cluster's readings of the run to arrive from every member",
                             Duration.ofMinutes(1),
-                            () -> control.membersMeasuring(PIPELINE).containsAll(everyMember)
-                                    && wide(control).stream()
-                                            .allMatch(vertex -> vertex.processors().size() == WRITERS),
+                            () -> {
+                                List<ControlPlane.PlacedVertex> placed = wide(control);
+                                return control.membersMeasuring(PIPELINE).containsAll(everyMember)
+                                        && !placed.isEmpty()
+                                        && placed.stream().allMatch(vertex -> vertex.processors().size() == WRITERS);
+                            },
                             () -> "measured from " + control.membersMeasuring(PIPELINE) + " of " + everyMember
                                     + "; the vertices planned at " + WRITERS + " were " + wide(control));
                     List<ControlPlane.PlacedVertex> wide = wide(control);
