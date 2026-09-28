@@ -624,6 +624,38 @@ class SrsSourceProcessorTest {
     }
 
     /**
+     * A declared load of a table with no rows has all left once it is handed over, and its bound says so. A sink
+     * spreading the table over several writers holds the table's changes until its load has landed at each of
+     * them, and a load whose bound is never promised never lands there: the changes would be held for good.
+     */
+    @Test
+    void promisesADeclaredLoadOfNoRowsOnceItIsHandedOver() throws InterruptedException {
+        SEEN.clear();
+        String ring = "srs.chain.declaredempty";
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        buffer.declareSnapshot(PIPELINE, ring);
+        hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+        Job job = hz.getJet().newJob(recordingDag(ring, "orders", "out-declaredempty", 1024));
+        try {
+            long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+            while (job.getStatus() != JobStatus.RUNNING && System.nanoTime() < deadline) {
+                Thread.sleep(50);
+            }
+            assertThat(job.getStatus()).isEqualTo(JobStatus.RUNNING);
+            Thread.sleep(300);
+            assertThat(SEEN).as("no bound while the load may still arrive").doesNotContain("b:7:0");
+
+            buffer.endSnapshot(PIPELINE, ring);
+
+            awaitSeen("b:7:0");
+        } finally {
+            job.cancel();
+            hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+            hz.getList("out-declaredempty").destroy();
+        }
+    }
+
+    /**
      * A source that starts on a load another instance of it has already taken rows from -- a job restarted
      * part way through the load -- cannot vouch for the rows that instance took and never sent on. It
      * carries on with the rest and promises nothing about the load, so the table stays owed and is read

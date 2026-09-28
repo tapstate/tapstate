@@ -164,6 +164,11 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             SnapshotBuffer.SnapshotState load = buffered.snapshotState(pipelineId, ringName);
             awaitingSnapshot = !load.handedOver();
             vouchesForSnapshot = !load.begun();
+            // A declared load owes its bound once it has been handed over, whether or not it holds a row: a
+            // table with no rows has all left the moment its load ends. Promised only on rows taken, the bound
+            // of an empty load would never be, the table would never read as written, and a sink that holds a
+            // table's changes until its load has landed at every writer would hold them for good.
+            snapshotBoundDue = load.declared() && vouchesForSnapshot;
         }
         if (awaited != null) {
             holding = true;
@@ -350,8 +355,8 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private void take(Envelope row) {
         pending.add(row);
         if (isLoadRow(row)) {
-            // Rows to emit means a bound to promise once they have left. A source that took none owes
-            // nothing: there is no snapshot of this table in this run for a sink to be waiting on.
+            // Rows to emit means a bound to promise once they have left. A declared load owes one already, rows
+            // or none (see init); rows handed over under no declared load owe one all the same.
             snapshotBoundDue = true;
         } else {
             read = row.position().order();
