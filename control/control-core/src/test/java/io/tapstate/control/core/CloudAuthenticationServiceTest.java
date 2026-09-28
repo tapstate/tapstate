@@ -45,7 +45,7 @@ class CloudAuthenticationServiceTest {
             assertThat(cluster).isEqualTo(DEPLOYMENT.clusterId());
             return "raw-cloud-jwt-sentinel";
         }, (jwt, target) -> {
-            order.add("online-validate");
+            order.add("sdk-verify");
             assertThat(jwt).isEqualTo("raw-cloud-jwt-sentinel");
             assertThat(target).isEqualTo(DEPLOYMENT);
             return Optional.of(login("jti-a", NOW.plusSeconds(900)));
@@ -53,7 +53,7 @@ class CloudAuthenticationServiceTest {
 
         CreatedCloudSession created = authentication.exchangeCode("short-code");
 
-        assertThat(order).containsExactly("exchange", "online-validate");
+        assertThat(order).containsExactly("exchange", "sdk-verify");
         assertThat(created.idleExpiresAt()).isEqualTo(NOW.plusSeconds(1800));
         assertThat(created.token()).startsWith("tcs_").doesNotContain("raw-cloud-jwt-sentinel");
         assertThat(created.toString()).doesNotContain(created.token());

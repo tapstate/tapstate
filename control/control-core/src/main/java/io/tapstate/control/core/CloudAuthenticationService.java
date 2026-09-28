@@ -8,7 +8,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 
-/** SDK exchange, then online validation, then local session creation. No later JWT refresh or validation. */
+/** SDK exchange, then SDK verification, then local session creation. No later JWT refresh or validation. */
 public final class CloudAuthenticationService {
 
     private final CloudCodeExchanger exchanger;

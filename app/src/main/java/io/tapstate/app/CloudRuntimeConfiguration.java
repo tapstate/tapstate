@@ -47,7 +47,7 @@ class CloudRuntimeConfiguration {
     }
 
     // TODO Bind CloudCodeExchanger, CloudJwtValidator and CloudSessionCallbackVerifier to the published SDK
-    // once the provider supplies stable user-id, online validation and authenticated invalidation contracts.
+    // with stable user-id and authenticated invalidation contracts. The SDK owns its verification mechanism.
     // Construct CloudAuthenticationService with the validated deployment identity and local session store;
     // subsequent requests must use its 30-minute sliding local session without Cloud calls or JWT refresh.
     // The SDK adapter must also bind a CloudStatusReporter using its validated deployment identity

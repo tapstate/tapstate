@@ -790,6 +790,9 @@ class SourceApiTest {
             return new TokenService(store, secrets, clock);
         }
         @Bean TokenSigner tokenSigner() { return new FixedSigner(); }
+        @Bean CredentialAuthenticator credentialAuthenticator(TokenService tokens, TokenSigner signer) {
+            return new CredentialAuthenticator(tokens, signer);
+        }
         @Bean JsonMapperBuilderCustomizer sourceJsonContract() {
             return new ControlHttpFace().sourceJsonContract();
         }

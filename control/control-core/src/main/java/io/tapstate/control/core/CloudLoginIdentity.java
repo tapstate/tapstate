@@ -5,7 +5,7 @@ import io.tapstate.spi.store.CloudSessionIdentity;
 import java.time.Instant;
 import java.util.Objects;
 
-/** Verified login proof returned only after the SDK's initial online Cloud JWT validation. */
+/** Verified login proof returned only after the SDK's initial JWT verification. */
 public record CloudLoginIdentity(
         CloudSessionIdentity deployment, String userId, String jwtId, Scope scope, Instant jwtExpiresAt) {
 

@@ -317,7 +317,7 @@ class ControlPlaneConfiguration {
         // The managed verifier is supplied by the Cloud SDK integration. Until that provider is wired,
         // refusing every credential is the safe behavior: a Cloud runtime must never fall back to the
         // local issuer or accept an on-prem machine token merely because the external client is absent.
-        // The Cloud credential surface is the local opaque session. SDK online JWT validation is used
+        // The Cloud credential surface is the local opaque session. SDK JWT verification is used
         // only while that session is created; workload requests neither validate nor refresh a Cloud JWT.
         return cloud.cloud()
                 ? new CredentialAuthenticator(credential -> {

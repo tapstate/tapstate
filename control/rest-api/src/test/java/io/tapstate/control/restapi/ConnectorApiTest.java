@@ -599,6 +599,11 @@ class ConnectorApiTest {
         }
 
         @Bean
+        CredentialAuthenticator credentialAuthenticator(TokenService tokens, TokenSigner signer) {
+            return new CredentialAuthenticator(tokens, signer);
+        }
+
+        @Bean
         RecordingAuditStore auditStore() {
             return new RecordingAuditStore();
         }
