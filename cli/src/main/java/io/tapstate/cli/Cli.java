@@ -536,11 +536,28 @@ public final class Cli implements Runnable {
     private static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
                                   Supplier<Prompter> prompter, ContextResolver resolver,
                                   AuthService authService, Function<Repl, Integer> workbench) {
+        Path home = Path.of(System.getProperty("user.home"));
+        return runSession(launch, controlPlane, prompter, resolver, authService, workbench,
+                newCommandLine(), home);
+    }
+
+    /** Test seam for exercising a one-shot session with isolated command output and home state. */
+    static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
+                          Supplier<Prompter> prompter, ContextResolver resolver,
+                          AuthService authService, CommandLine commandLine, Path home) {
+        return runSession(launch, controlPlane, prompter, resolver, authService, Workbench::run,
+                commandLine, home);
+    }
+
+    private static int runSession(LaunchOptions launch, ControlPlaneClient controlPlane,
+                                  Supplier<Prompter> prompter, ContextResolver resolver,
+                                  AuthService authService, Function<Repl, Integer> workbench,
+                                  CommandLine commandLine, Path home) {
         Prompter oneShotPrompter = null;
         PromptOwner launchPrompt = new PromptOwner(prompter);
         try {
             if (launch.hasConflictingTargets()) {
-                Diagnostics.printText(newCommandLine().getErr(), CliError.CONTEXT_SOURCE_CONFLICT, Map.of());
+                Diagnostics.printText(commandLine.getErr(), CliError.CONTEXT_SOURCE_CONFLICT, Map.of());
                 return EXIT_USAGE;
             }
             if (launch.isOneShot() && launch.command().size() >= 2
@@ -561,9 +578,9 @@ public final class Cli implements Runnable {
                     && System.console() != null) {
                 oneShotPrompter = prompter.get();
             }
-            Repl repl = new Repl(newCommandLine(), launch.root(), controlPlane, oneShotPrompter,
+            Repl repl = new Repl(commandLine, launch.root(), controlPlane, oneShotPrompter,
                     launch::environment, resolver, launch.context(), authService,
-                    new ContextManager(ContextConfigStore.underHome(Path.of(System.getProperty("user.home")))));
+                    new ContextManager(ContextConfigStore.underHome(home)));
             repl.prompterSource(launchPrompt::get);
             String machineToken = launch.machineToken();
             if (machineToken != null) {
