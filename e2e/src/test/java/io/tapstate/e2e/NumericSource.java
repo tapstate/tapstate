@@ -50,20 +50,38 @@ final class NumericSource {
     static void seed(MySQLContainer<?> mysql) throws Exception {
         try (Connection connection =
                 DriverManager.getConnection(mysql.getJdbcUrl(), mysql.getUsername(), mysql.getPassword())) {
-            try (Statement statement = connection.createStatement()) {
-                statement.execute("CREATE TABLE " + TABLE
-                        + " (id INT PRIMARY KEY, qty BIGINT, amount DECIMAL(18,4))");
+            seed(connection);
+        }
+    }
+
+    /**
+     * The same table in a database of the caller's own on the shared server, for a witness that reads
+     * the table's changes: that server's user holds the replication grant a change-data-capture read
+     * needs, and a container's default user does not.
+     */
+    static void seed(Map<String, Object> settings) throws Exception {
+        try (Connection connection = SharedMySql.connect(settings)) {
+            seed(connection);
+        }
+    }
+
+    /** One writer for the table whichever server it lands on, so the pair cannot read two tables. */
+    private static void seed(Connection connection) throws Exception {
+        try (Statement statement = connection.createStatement()) {
+            // A database on the shared server outlives the case that made it, so start from nothing.
+            statement.execute("DROP TABLE IF EXISTS " + TABLE);
+            statement.execute("CREATE TABLE " + TABLE
+                    + " (id INT PRIMARY KEY, qty BIGINT, amount DECIMAL(18,4))");
+        }
+        try (PreparedStatement insert = connection.prepareStatement(
+                "INSERT INTO " + TABLE + " (id, qty, amount) VALUES (?, ?, ?)")) {
+            for (int row = 0; row < QUANTITIES.size(); row++) {
+                insert.setLong(1, row + 1L);
+                insert.setLong(2, QUANTITIES.get(row));
+                insert.setBigDecimal(3, AMOUNT);
+                insert.addBatch();
             }
-            try (PreparedStatement insert = connection.prepareStatement(
-                    "INSERT INTO " + TABLE + " (id, qty, amount) VALUES (?, ?, ?)")) {
-                for (int row = 0; row < QUANTITIES.size(); row++) {
-                    insert.setLong(1, row + 1L);
-                    insert.setLong(2, QUANTITIES.get(row));
-                    insert.setBigDecimal(3, AMOUNT);
-                    insert.addBatch();
-                }
-                insert.executeBatch();
-            }
+            insert.executeBatch();
         }
     }
 
