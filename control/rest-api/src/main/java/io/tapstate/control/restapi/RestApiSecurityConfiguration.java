@@ -1,6 +1,7 @@
 package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.CredentialAuthenticator;
+import io.tapstate.control.core.AuthenticationMode;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.messages.MessageCatalog;
 import jakarta.servlet.DispatcherType;
@@ -51,9 +52,10 @@ class RestApiSecurityConfiguration {
             ObjectProvider<HandlerMappingIntrospector> handlers,
             OperationRegistry registry,
             AuthenticationManager authenticationManager,
-            ApiSecurityErrorWriter errors) throws Exception {
+            ApiSecurityErrorWriter errors, ObjectProvider<AuthenticationMode> modes) throws Exception {
         CodedAuthenticationEntryPoint entryPoint = new CodedAuthenticationEntryPoint(errors);
-        AuthenticationFilter bearer = bearerFilter(authenticationManager, entryPoint);
+        AuthenticationFilter bearer = bearerFilter(authenticationManager, entryPoint,
+                modes.getIfAvailable(() -> AuthenticationMode.ON_PREM));
         OperationAuthorizationManager authorization = new OperationAuthorizationManager(handlers, registry);
 
         http
@@ -95,7 +97,8 @@ class RestApiSecurityConfiguration {
                 .exceptionHandling(exceptions -> exceptions.authenticationEntryPoint(entryPoint))
                 .authorizeHttpRequests(authorize -> authorize
                         .requestMatchers("/healthz", "/version", AuthWire.DISCOVERY_PATH, AuthWire.LOGIN_PATH,
-                                AuthWire.SESSION_PATH, AuthWire.LOGOUT_PATH, "/auth/bootstrap", "/connector-icons/*",
+                                AuthWire.SESSION_PATH, AuthWire.LOGOUT_PATH, CloudAuthController.EXCHANGE_PATH,
+                                CloudAuthController.INVALIDATE_PATH, "/auth/bootstrap", "/connector-icons/*",
                                 "/", "/index.html", "/assets/**", "/login", "/pipelines/**", "/sources/**",
                                 "/explorations/**", "/error").permitAll()
                         .anyRequest().denyAll());
@@ -103,8 +106,9 @@ class RestApiSecurityConfiguration {
     }
 
     private static AuthenticationFilter bearerFilter(
-            AuthenticationManager manager, CodedAuthenticationEntryPoint entryPoint) {
-        AuthenticationFilter filter = new AuthenticationFilter(manager, new StrictBearerAuthenticationConverter());
+            AuthenticationManager manager, CodedAuthenticationEntryPoint entryPoint, AuthenticationMode mode) {
+        AuthenticationFilter filter = new AuthenticationFilter(manager, mode == AuthenticationMode.CLOUD
+                ? new CloudCookieAuthenticationConverter() : new StrictBearerAuthenticationConverter());
         filter.setRequestMatcher(new DispatcherTypeRequestMatcher(DispatcherType.REQUEST));
         filter.setSuccessHandler(new ContinuingAuthenticationSuccessHandler());
         filter.setFailureHandler((request, response, failure) -> entryPoint.commence(request, response, failure));

@@ -8,12 +8,14 @@ import io.tapstate.control.core.ClusterIdentityService;
 import io.tapstate.control.core.ClusterIdentityView;
 import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.CreatedSession;
+import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.LoginService;
 import io.tapstate.control.core.Scope;
 import io.tapstate.control.core.SessionService;
 import io.tapstate.core.common.TapstateException;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Controller;
@@ -47,6 +49,7 @@ class AuthController {
     private final ClusterIdentityService clusterIdentityService;
     private final BootstrapService bootstrapService;
     private final AuthenticationMode authenticationMode;
+    private final ObjectProvider<CloudAuthenticationService> cloudAuthentication;
 
     AuthController(
             LoginService loginService,
@@ -54,11 +57,20 @@ class AuthController {
             ClusterIdentityService clusterIdentityService,
             BootstrapService bootstrapService,
             ObjectProvider<AuthenticationMode> authenticationModes) {
+        this(loginService, sessionService, clusterIdentityService, bootstrapService, authenticationModes, null);
+    }
+
+    @Autowired
+    AuthController(
+            LoginService loginService, SessionService sessionService, ClusterIdentityService clusterIdentityService,
+            BootstrapService bootstrapService, ObjectProvider<AuthenticationMode> authenticationModes,
+            ObjectProvider<CloudAuthenticationService> cloudAuthentication) {
         this.loginService = loginService;
         this.sessionService = sessionService;
         this.clusterIdentityService = clusterIdentityService;
         this.bootstrapService = bootstrapService;
         this.authenticationMode = authenticationModes.getIfAvailable(() -> AuthenticationMode.ON_PREM);
+        this.cloudAuthentication = cloudAuthentication;
     }
 
     @PostMapping(AuthWire.LOGIN_PATH)
@@ -98,6 +110,23 @@ class AuthController {
 
     @PostMapping(AuthWire.LOGOUT_PATH)
     ResponseEntity<Void> logout(HttpServletRequest request) {
+        if (authenticationMode == AuthenticationMode.CLOUD) {
+            CloudAuthenticationService cloud = cloudAuthentication == null
+                    ? null : cloudAuthentication.getIfAvailable();
+            if (cloud == null) {
+                throw CloudAuthenticationService.unavailable();
+            }
+            if (request.getHeaders(HttpHeaders.AUTHORIZATION).hasMoreElements()
+                    || !CloudSessionCookies.permitsCookieRequest(request)) {
+                throw unauthenticated();
+            }
+            String cookie = CloudSessionCookies.read(request).orElseThrow(AuthController::unauthenticated);
+            if (!cloud.logout(cookie)) {
+                throw unauthenticated();
+            }
+            return ResponseEntity.noContent().header(HttpHeaders.SET_COOKIE, CloudSessionCookies.clear())
+                    .header(HttpHeaders.CACHE_CONTROL, "no-store").build();
+        }
         requireOnPremAuthentication();
         String token = requiredSessionCredential(request);
         String issuer = clusterIdentityService.identityView().issuer();

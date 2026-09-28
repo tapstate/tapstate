@@ -1,6 +1,7 @@
 package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.CredentialAuthenticator;
+import io.tapstate.control.core.CloudSessionService;
 import io.tapstate.control.core.TapstatePrincipal;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.VerifiedToken;
@@ -26,7 +27,8 @@ final class TapstateCredentialAuthenticationProvider implements AuthenticationPr
                 .orElseThrow(() -> new BadCredentialsException("invalid bearer credential"));
         TapstatePrincipal principal = TokenService.isMachineToken(credential.credential())
                 ? TapstatePrincipal.machineToken(verified)
-                : TapstatePrincipal.humanJwt(verified);
+                : CloudSessionService.isSessionToken(credential.credential())
+                        ? TapstatePrincipal.cloudSession(verified) : TapstatePrincipal.humanJwt(verified);
         return new TapstateAuthentication(principal);
     }
 

@@ -13,6 +13,7 @@ import io.tapstate.adapters.pdk.RegistryConnectorProvisioner;
 import io.tapstate.adapters.pdk.SeedConnectorSweep;
 import io.tapstate.control.core.ApplyService;
 import io.tapstate.control.core.AuthenticationMode;
+import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.LivePipelines;
 import io.tapstate.control.core.AccessTokenService;
 import io.tapstate.control.core.DocumentKeyAdvisories;
@@ -102,6 +103,7 @@ import io.tapstate.spi.store.ConnectorRegistry;
 import io.tapstate.spi.store.SchemaDiscoverer;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SessionStore;
+import io.tapstate.spi.store.CloudSessionStore;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.TokenStore;
@@ -169,6 +171,11 @@ class ControlPlaneConfiguration {
     @Bean
     SessionStore sessionStore(MongoAuthStores authStores) {
         return authStores.sessions();
+    }
+
+    @Bean
+    CloudSessionStore cloudSessionStore(MongoAuthStores authStores, CloudRuntimeSettings cloud) {
+        return cloud.cloud() ? authStores.cloudSessions() : null;
     }
 
     @Bean
@@ -305,13 +312,25 @@ class ControlPlaneConfiguration {
 
     @Bean
     CredentialAuthenticator credentialAuthenticator(
-            TokenService tokenService, TokenSigner tokenSigner, CloudRuntimeSettings cloud) {
+            TokenService tokenService, TokenSigner tokenSigner, CloudRuntimeSettings cloud,
+            ObjectProvider<CloudAuthenticationService> managedAuthentication) {
         // The managed verifier is supplied by the Cloud SDK integration. Until that provider is wired,
         // refusing every credential is the safe behavior: a Cloud runtime must never fall back to the
         // local issuer or accept an on-prem machine token merely because the external client is absent.
-        // TODO Bind the published Cloud SDK's JWKS verifier here once its stable artifact is available.
+        // The Cloud credential surface is the local opaque session. SDK online JWT validation is used
+        // only while that session is created; workload requests neither validate nor refresh a Cloud JWT.
         return cloud.cloud()
-                ? CredentialAuthenticator.refusing()
+                ? new CredentialAuthenticator(credential -> {
+                    CloudAuthenticationService service = managedAuthentication.getIfAvailable();
+                    return service == null ? java.util.Optional.empty() : service.authenticate(credential);
+                })
+                : new CredentialAuthenticator(tokenService, tokenSigner);
+    }
+
+    /** Direct on-prem/absent-SDK seam retained for focused assembly tests. */
+    CredentialAuthenticator credentialAuthenticator(
+            TokenService tokenService, TokenSigner tokenSigner, CloudRuntimeSettings cloud) {
+        return cloud.cloud() ? CredentialAuthenticator.refusing()
                 : new CredentialAuthenticator(tokenService, tokenSigner);
     }
 

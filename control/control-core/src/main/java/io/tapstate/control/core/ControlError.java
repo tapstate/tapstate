@@ -60,6 +60,9 @@ public enum ControlError implements TapstateErrorCode {
     /** The caller reached an authentication flow that the selected deployment mode does not expose. */
     AUTH_MODE_UNAVAILABLE("control.auth-mode-unavailable", Set.of("mode")),
 
+    /** Managed authentication was reached before its real SDK/validated deployment binding was installed. */
+    CLOUD_AUTH_UNAVAILABLE("control.cloud-auth-unavailable", Set.of()),
+
     /** A Cloud author attempted to select the deployment-owned Nest state database. */
     STATE_DATABASE_UNAVAILABLE("control.state-database-unavailable", Set.of()),
 

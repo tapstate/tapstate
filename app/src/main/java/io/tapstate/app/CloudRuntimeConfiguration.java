@@ -46,8 +46,10 @@ class CloudRuntimeConfiguration {
         return new CloudStatusLifecycle(reporter);
     }
 
-    // TODO Bind CloudCodeExchanger, CloudTokenRefresher and CloudStatusSender to the published SDK
-    // once the provider adds stable user-id and refresh contracts and publishes a consumable version.
+    // TODO Bind CloudCodeExchanger, CloudJwtValidator and CloudSessionCallbackVerifier to the published SDK
+    // once the provider supplies stable user-id, online validation and authenticated invalidation contracts.
+    // Construct CloudAuthenticationService with the validated deployment identity and local session store;
+    // subsequent requests must use its 30-minute sliding local session without Cloud calls or JWT refresh.
     // The SDK adapter must also bind a CloudStatusReporter using its validated deployment identity
     // and the runtime status provider. Never substitute a no-op sender to make this opt-in pass.
 }

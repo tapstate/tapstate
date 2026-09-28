@@ -155,6 +155,7 @@ control.auth-failed
 control.auth-mode-unavailable
 control.bootstrap-closed
 control.bootstrap-forbidden
+control.cloud-auth-unavailable
 control.forbidden
 control.malformed-request
 control.schema-derivation-incomplete

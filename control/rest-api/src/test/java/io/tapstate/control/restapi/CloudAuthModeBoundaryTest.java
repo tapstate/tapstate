@@ -20,7 +20,9 @@ class CloudAuthModeBoundaryTest {
 
         assertUnavailable(() -> controller.login(null));
         assertUnavailable(() -> controller.session(null));
-        assertUnavailable(() -> controller.logout(null));
+        assertThatThrownBy(() -> controller.logout(null))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(ControlError.CLOUD_AUTH_UNAVAILABLE));
         assertUnavailable(() -> controller.bootstrap(null, null));
     }
 

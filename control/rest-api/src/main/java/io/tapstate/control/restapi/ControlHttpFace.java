@@ -39,7 +39,7 @@ import tools.jackson.databind.DeserializationFeature;
         PipelineLogsController.class,
         PipelinePositionController.class,
         PipelineStreamConfiguration.class, ClusterController.class, HealthController.class,
-        VersionController.class, AuthController.class, IssuerDiscoveryController.class, TokenController.class,
+        VersionController.class, AuthController.class, CloudAuthController.class, IssuerDiscoveryController.class, TokenController.class,
         SourceController.class,
         ConnectorIconController.class,
         PipelineViewController.class,

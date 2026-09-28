@@ -677,6 +677,8 @@ class AuthTest {
                 "/auth/login",
                 AuthWire.SESSION_PATH,
                 AuthWire.LOGOUT_PATH,
+                CloudAuthController.EXCHANGE_PATH,
+                CloudAuthController.INVALIDATE_PATH,
                 "/auth/bootstrap",
                 "/connector-icons/{id}",
                 "/error");
@@ -701,7 +703,7 @@ class AuthTest {
         });
 
         assertThat(unexpectedRootEndpoints)
-                .as("only the liveness probe, pre-auth entry points, and the anonymous connector icon asset "
+                .as("only the liveness probe, self-guarded local/managed auth entry points, and connector icon asset "
                         + "surface may live outside /api; every other endpoint is a registry verb under the "
                         + "authenticated /api prefix")
                 .isEmpty();

@@ -27,7 +27,7 @@ public final class CredentialAuthenticator {
                 : tokenSigner.verify(presented);
     }
 
-    /** Uses the selected deployment's credential verifier, such as the managed Cloud JWT verifier. */
+    /** Uses the selected deployment's verifier, such as the Cluster-local managed-session verifier. */
     public CredentialAuthenticator(CredentialVerifier verifier) {
         this.verifier = Objects.requireNonNull(verifier, "verifier");
     }

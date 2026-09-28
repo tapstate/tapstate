@@ -82,6 +82,8 @@ class ApiExceptionHandler {
     static HttpStatus statusFor(TapstateErrorCode code) {
         return switch (code.code()) {
             case "control.auth-failed", "control.unauthenticated" -> HttpStatus.UNAUTHORIZED;
+            case "control.cloud-auth-unavailable" -> HttpStatus.SERVICE_UNAVAILABLE;
+            case "control.auth-mode-unavailable" -> HttpStatus.FORBIDDEN;
             case "control.forbidden", "control.bootstrap-forbidden" -> HttpStatus.FORBIDDEN;
             case "control.bootstrap-closed" -> HttpStatus.CONFLICT;
             case "source.id-mismatch" -> HttpStatus.BAD_REQUEST;

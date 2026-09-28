@@ -582,6 +582,9 @@ control.auth-failed:
 control.auth-mode-unavailable:
   message: "The `{mode}` deployment does not expose this authentication flow."
   solution: "Use the authentication entry point for the selected deployment mode."
+control.cloud-auth-unavailable:
+  message: "Managed Cloud authentication is not available."
+  solution: "Install the SDK exchange/online-validation and trusted deployment bindings, then enter from Cloud again."
 control.state-database-unavailable:
   message: "Cloud mode does not allow an explicit Nest state.database."
   solution: "Remove state.database to use the deployment-owned operator-state database. On-prem deployments can still select a database."

@@ -1,8 +1,8 @@
 package io.tapstate.control.core;
 
-/** Provider boundary for the one-time browser code to Cloud user-token exchange. */
+/** Provider boundary for one-time code redemption. The returned JWT is untrusted until online validation. */
 @FunctionalInterface
 public interface CloudCodeExchanger {
 
-    CloudUserToken exchange(String exchangeCode, String clusterId);
+    String exchange(String exchangeCode, String clusterId);
 }
