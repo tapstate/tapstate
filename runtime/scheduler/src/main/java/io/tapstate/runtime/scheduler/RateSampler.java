@@ -61,6 +61,12 @@ public final class RateSampler {
         return new GapHealth(openGaps.get(), gapsOpened.get(), gapsClosed.get(), startedAt);
     }
 
+    /** A successful older sample may leave a newer lost sample unresolved in this execution. */
+    public boolean hasOpenGap(String pipelineId, ObservationStore.Scope scope) {
+        Cadence current = cadence.get(pipelineId);
+        return current != null && Objects.equals(current.scope(), scope) && current.firstFailedAt() != null;
+    }
+
     public RateSampler(RateHistoryStore history, Duration interval) {
         this.history = Objects.requireNonNull(history, "history");
         this.interval = Objects.requireNonNull(interval, "interval");

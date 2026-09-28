@@ -76,10 +76,18 @@ class TelemetryDispatcherTest {
         Instant at = Instant.parse("2026-09-27T10:00:00Z");
         CountDownLatch entered = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch recoveryEntered = new CountDownLatch(1);
+        CountDownLatch releaseRecovery = new CountDownLatch(1);
         InMemoryRateHistoryStore retained = new InMemoryRateHistoryStore();
         RateHistoryStore blocked = new RateHistoryStore() {
             @Override public void append(RateSample sample) { append(sample, null); }
             @Override public void append(RateSample sample, Instant gapFrom) {
+                appendOwned(sample, null, gapFrom);
+            }
+            @Override public void appendScoped(RateSample sample, ObservationStore.Scope scope, Instant gapFrom) {
+                appendOwned(sample, scope, gapFrom);
+            }
+            private void appendOwned(RateSample sample, ObservationStore.Scope scope, Instant gapFrom) {
                 if (sample.observedAt().equals(at.plusSeconds(60))) {
                     entered.countDown();
                     try {
@@ -90,8 +98,22 @@ class TelemetryDispatcherTest {
                         Thread.currentThread().interrupt();
                         throw new IllegalStateException(interrupted);
                     }
+                } else if (sample.observedAt().equals(at.plusSeconds(240))) {
+                    recoveryEntered.countDown();
+                    try {
+                        if (!releaseRecovery.await(5, TimeUnit.SECONDS)) {
+                            throw new IllegalStateException("recovery append was not released");
+                        }
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException(interrupted);
+                    }
                 }
-                retained.append(sample, gapFrom);
+                if (scope == null) {
+                    retained.append(sample, gapFrom);
+                } else {
+                    retained.appendScoped(sample, scope, gapFrom);
+                }
             }
             @Override public Page readPage(String id, Instant from, Instant to, Key after, int limit) {
                 return retained.readPage(id, from, to, after, limit);
@@ -106,28 +128,46 @@ class TelemetryDispatcherTest {
             @Override public void deleteAll(String id) { retained.deleteAll(id); }
             @Override public Duration retention() { return retained.retention(); }
         };
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        ObservationStore.Scope scope = scopes.begin("orders", "inc-a", 41);
+        List<PipelineEvent> boundaryEvents = new java.util.concurrent.CopyOnWriteArrayList<>();
         RateSampler sampler = new RateSampler(blocked, Duration.ofSeconds(60));
-        sampler.appendIfDue(historyFrame(at, 100).observation());
+        sampler.appendIfDue(historyFrame(at, 100).observation(), scope);
         try (TelemetryDispatcher dispatcher = new TelemetryDispatcher(
-                new ObservationPublisher(new InMemoryStateStore(), new InMemoryObservationStore()),
-                sampler, MetricsExport.none(), 1, 1)) {
-            dispatcher.offer(historyFrame(at.plusSeconds(60), 160), null);
+                new ObservationPublisher(new InMemoryStateStore(), TelemetryBoundaryDispatchTest.acceptingLatest()),
+                sampler, MetricsExport.none(), scopes, TelemetryBoundaryDispatchTest.eventStore(boundaryEvents), 1, 1)) {
+            dispatcher.offer(historyFrame(at.plusSeconds(60), 160), scope);
             assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
-            dispatcher.offer(historyFrame(at.plusSeconds(61), 161), null);
-            dispatcher.offer(historyFrame(at.plusSeconds(62), 162), null);
+            dispatcher.offer(historyFrame(at.plusSeconds(120), 220), scope);
+            dispatcher.offer(historyFrame(at.plusSeconds(180), 280), scope);
             assertThat(dispatcher.health().get(TelemetryDispatcher.Sink.HISTORY).dropped()).isEqualTo(1);
             assertHistoryGapFacts(dispatcher, sampler, 1, 1, 0);
+            await(() -> boundaryEvents.size() == 1);
             release.countDown();
-            await(() -> dispatcher.health().get(TelemetryDispatcher.Sink.HISTORY).successes() >= 1);
-            dispatcher.offer(historyFrame(at.plusSeconds(120), 220), null);
             await(() -> dispatcher.health().get(TelemetryDispatcher.Sink.HISTORY).successes() >= 2);
+            dispatcher.offer(historyFrame(at.plusSeconds(240), 340), scope);
+            assertThat(recoveryEntered.await(5, TimeUnit.SECONDS)).isTrue();
+            await(() -> dispatcher.health().get(TelemetryDispatcher.Sink.EVENT).queueDepth() == 0);
+            // FIFO barrier: all boundaries from the older due sample are persisted before this event.
+            dispatcher.offerEvent(event("history-boundary-barrier", Instant.now()));
+            await(() -> boundaryEvents.stream().anyMatch(event -> event.id().equals("history-boundary-barrier")));
+            assertThat(boundaryEvents.stream().filter(event -> event.kind() != PipelineEvent.Kind.STATE_CHANGED))
+                    .extracting(PipelineEvent::kind)
+                    .containsExactly(PipelineEvent.Kind.TELEMETRY_DEGRADED);
+            releaseRecovery.countDown();
+            await(() -> dispatcher.health().get(TelemetryDispatcher.Sink.HISTORY).successes() >= 3);
             assertHistoryGapFacts(dispatcher, sampler, 0, 1, 1);
+            await(() -> boundaryEvents.size() == 3);
+            assertThat(boundaryEvents.stream().filter(event -> event.kind() != PipelineEvent.Kind.STATE_CHANGED))
+                    .extracting(PipelineEvent::kind).containsExactly(
+                    PipelineEvent.Kind.TELEMETRY_DEGRADED, PipelineEvent.Kind.TELEMETRY_RESTORED);
 
-            assertThat(retained.readPage("orders", at, at.plusSeconds(180), null, 10).entries())
+            assertThat(retained.readPage("orders", at, at.plusSeconds(300), null, 10).entries())
                     .extracting(RateHistoryStore.Entry::gapFrom)
-                    .containsExactly(null, null, at.plusSeconds(62));
+                    .containsExactly(null, null, null, at.plusSeconds(180));
         } finally {
             release.countDown();
+            releaseRecovery.countDown();
         }
     }
 

@@ -66,6 +66,15 @@ do not substitute it for the JFR pause reading. Jet executor saturation has no t
 measurement; use job queue depth, stage duration, and sink backpressure to locate pressure instead.
 Do not substitute committed heap for RSS when comparing workloads.
 
+Scoped latest-write, history-sample, and local-export-offer failures can produce a
+`TELEMETRY_DEGRADED` event. Repeated failures stay in one episode per pipeline and sink. A successful
+attempt that began after the latest observed loss can produce `TELEMETRY_RESTORED`; history also waits
+until that execution's sampling gap closes. An older blocked write finishing does not prove recovery.
+Local export-offer recovery does not claim that an OTLP collector received the data; use the exporter's
+asynchronous completion facts for that boundary. Event-store loss continues to persist its gap marker
+before reporting recovery. Legacy frames without execution identity do not invent scoped events.
+The event trail remains best effort, so a missing boundary event cannot prove that no outage happened.
+
 Deleting a pipeline removes its old current points from the local exporter, including when the same id
 is recreated before another sweep. Exported point labels contain the pipeline id but no incarnation or
 execution selector. A remote Prometheus or OTLP backend may retain older points until its own retention

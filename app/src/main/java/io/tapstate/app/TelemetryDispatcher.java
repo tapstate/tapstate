@@ -12,6 +12,7 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.time.Clock;
 import java.util.Collection;
 import java.util.EnumSet;
 import java.util.LinkedHashMap;
@@ -31,6 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.OptionalLong;
 import java.util.Map;
 import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 
 /** Fixed worker budgets keep slow telemetry stores away from convergence and data-plane calls. */
 final class TelemetryDispatcher implements AutoCloseable {
@@ -117,8 +119,15 @@ final class TelemetryDispatcher implements AutoCloseable {
     private static final class Stats {
         private static final class Operation {
             private final long started = System.nanoTime();
+            private final String pipelineId;
+            private final ObservationStore.Scope scope;
             /** 0 running, 1 timed out while running, 2 finished. */
             private final AtomicInteger state = new AtomicInteger();
+
+            private Operation(String pipelineId, ObservationStore.Scope scope) {
+                this.pipelineId = pipelineId;
+                this.scope = scope;
+            }
         }
 
         private final AtomicLong highWater = new AtomicLong();
@@ -133,8 +142,13 @@ final class TelemetryDispatcher implements AutoCloseable {
         private final AtomicLong openUntilNanos = new AtomicLong();
         private final AtomicBoolean probe = new AtomicBoolean();
         private final ConcurrentHashMap<Thread, Operation> inFlight = new ConcurrentHashMap<>();
+        private final AtomicLong lastSuccessStartedNanos = new AtomicLong();
+        private final AtomicLong lastProblemNanos = new AtomicLong();
         private volatile long lastSuccessNanos;
-        private volatile long lastProblemNanos;
+
+        private static long laterTimestamp(long previous, long candidate) {
+            return previous == 0 || candidate - previous > 0 ? candidate : previous;
+        }
 
         private void queueDepth(int depth) {
             highWater.accumulateAndGet(depth, Math::max);
@@ -142,13 +156,13 @@ final class TelemetryDispatcher implements AutoCloseable {
 
         private void dropped() {
             dropped.incrementAndGet();
-            lastProblemNanos = System.nanoTime();
+            lastProblemNanos.accumulateAndGet(System.nanoTime(), Stats::laterTimestamp);
         }
 
         private void dropped(long count) {
             if (count > 0) {
                 dropped.addAndGet(count);
-                lastProblemNanos = System.nanoTime();
+                lastProblemNanos.accumulateAndGet(System.nanoTime(), Stats::laterTimestamp);
             }
         }
 
@@ -161,7 +175,7 @@ final class TelemetryDispatcher implements AutoCloseable {
                 }
             }
             timeouts.addAndGet(newlyTimedOut);
-            lastProblemNanos = now;
+            lastProblemNanos.accumulateAndGet(now, Stats::laterTimestamp);
         }
 
         private boolean allow() {
@@ -176,7 +190,11 @@ final class TelemetryDispatcher implements AutoCloseable {
         }
 
         private Operation begin() {
-            Operation operation = new Operation();
+            return begin(null, null);
+        }
+
+        private Operation begin(String pipelineId, ObservationStore.Scope scope) {
+            Operation operation = new Operation(pipelineId, scope);
             inFlight.put(Thread.currentThread(), operation);
             return operation;
         }
@@ -190,13 +208,15 @@ final class TelemetryDispatcher implements AutoCloseable {
             }
         }
 
-        private void completed(Operation operation, boolean success) {
+        private boolean completed(Operation operation, boolean success) {
             boolean timedOut = operation.state.getAndSet(2) == 1;
+            boolean recordedSuccess = success && !timedOut;
             inFlight.remove(Thread.currentThread(), operation);
             maxDurationNanos.accumulateAndGet(System.nanoTime() - operation.started, Math::max);
-            if (success && !timedOut) {
+            if (recordedSuccess) {
                 successes.incrementAndGet();
                 lastSuccessNanos = System.nanoTime();
+                lastSuccessStartedNanos.accumulateAndGet(operation.started, Stats::laterTimestamp);
                 consecutiveFailures.set(0);
                 if (openUntilNanos.getAndSet(0) != 0) {
                     breakerRecoveries.incrementAndGet();
@@ -204,23 +224,27 @@ final class TelemetryDispatcher implements AutoCloseable {
                 probe.set(false);
             } else {
                 failures.incrementAndGet();
-                lastProblemNanos = System.nanoTime();
+                lastProblemNanos.accumulateAndGet(System.nanoTime(), Stats::laterTimestamp);
                 if (timedOut || probe.get() || consecutiveFailures.incrementAndGet() >= 3) {
                     openUntilNanos.set(System.nanoTime() + BREAKER_COOLDOWN.toNanos());
                     probe.set(false);
                 }
             }
+            return recordedSuccess;
         }
 
-        private void watch(String sink, Duration deadline) {
+        private void watch(String sink, Duration deadline, Consumer<Operation> onTimeout) {
             long now = System.nanoTime();
             for (Operation operation : inFlight.values()) {
                 if (now - operation.started >= deadline.toNanos()
                         && operation.state.compareAndSet(0, 1)) {
                     timeouts.incrementAndGet();
-                    lastProblemNanos = now;
+                    lastProblemNanos.accumulateAndGet(now, Stats::laterTimestamp);
                     openUntilNanos.set(now + BREAKER_COOLDOWN.toNanos());
                     probe.set(false);
+                    if (onTimeout != null) {
+                        onTimeout.accept(operation);
+                    }
                     LOG.warn("{} telemetry write exceeded its {} ms deadline", sink, deadline.toMillis());
                 }
             }
@@ -228,6 +252,8 @@ final class TelemetryDispatcher implements AutoCloseable {
 
         private Health snapshot(int queueDepth) {
             long successfulAt = lastSuccessNanos;
+            long successfulStart = lastSuccessStartedNanos.get();
+            long problemAt = lastProblemNanos.get();
             boolean timedOutInFlight = inFlight.values().stream().anyMatch(op -> op.state.get() == 1);
             BreakerState breakerState = openUntilNanos.get() == 0 ? BreakerState.CLOSED
                     : probe.get() ? BreakerState.HALF_OPEN : BreakerState.OPEN;
@@ -236,13 +262,14 @@ final class TelemetryDispatcher implements AutoCloseable {
                     TimeUnit.NANOSECONDS.toMillis(maxDurationNanos.get()),
                     successfulAt == 0 ? OptionalLong.empty()
                             : OptionalLong.of(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - successfulAt)),
-                    timedOutInFlight || (lastProblemNanos != 0
-                            && (successfulAt == 0 || lastProblemNanos - successfulAt > 0)), 0, 0, 0, 0,
+                    timedOutInFlight || (problemAt != 0
+                            && (successfulStart == 0 || problemAt - successfulStart > 0)), 0, 0, 0, 0,
                     breakerState, breakerRecoveries.get(), null);
         }
     }
 
     private sealed interface Frame permits ObservationFrame, ReconcileFailureFrame {
+        ObservationStore.Scope scope();
     }
 
     private record ObservationFrame(ObservationPublisher.Prepared prepared, ObservationStore.Scope scope)
@@ -258,6 +285,7 @@ final class TelemetryDispatcher implements AutoCloseable {
     private final MetricsExport export;
     private final ObservationScopeRegistry scopes;
     private final PipelineEventStore events;
+    private final TelemetryBoundaryEvents boundaryEvents;
     private final ThreadPoolExecutor latestWorkers;
     private final ThreadPoolExecutor historyWorker;
     private final ThreadPoolExecutor exportWorker;
@@ -331,6 +359,9 @@ final class TelemetryDispatcher implements AutoCloseable {
         historyWorker = workers("history", 1, queueCapacity);
         exportWorker = workers("export", 1, queueCapacity);
         eventWorker = events == null ? null : workers("event", 1, queueCapacity);
+        boundaryEvents = events == null ? null : new TelemetryBoundaryEvents(eventGapCapacity,
+                Clock.systemUTC(), this::stillCurrent, this::enqueueEvent,
+                event -> lostEvent(event, PipelineEvent.GapReason.QUEUE_FULL));
         watchdog = Executors.newSingleThreadScheduledExecutor(task -> {
             Thread thread = new Thread(task, "tapstate-telemetry-watchdog");
             thread.setDaemon(true);
@@ -338,11 +369,11 @@ final class TelemetryDispatcher implements AutoCloseable {
         });
         long periodMillis = Math.max(10, Math.min(1000, writeDeadline.toMillis() / 4));
         watchdog.scheduleWithFixedDelay(() -> {
-            latestStats.watch("latest", writeDeadline);
-            historyStats.watch("history", writeDeadline);
-            exportStats.watch("export", writeDeadline);
+            latestStats.watch("latest", writeDeadline, op -> boundaryFailed(op.pipelineId, op.scope, Sink.LATEST));
+            historyStats.watch("history", writeDeadline, op -> boundaryFailed(op.pipelineId, op.scope, Sink.HISTORY));
+            exportStats.watch("export", writeDeadline, op -> boundaryFailed(op.pipelineId, op.scope, Sink.EXPORT));
             if (eventWorker != null) {
-                eventStats.watch("event", writeDeadline);
+                eventStats.watch("event", writeDeadline, null);
                 retryOpenGap();
             }
         }, periodMillis, periodMillis, TimeUnit.MILLISECONDS);
@@ -369,6 +400,13 @@ final class TelemetryDispatcher implements AutoCloseable {
         if (event.kind() == PipelineEvent.Kind.TELEMETRY_GAP
                 || event.kind() == PipelineEvent.Kind.TELEMETRY_RESTORED) {
             throw new IllegalArgumentException("event gap recovery is owned by the dispatcher");
+        }
+        enqueueEvent(event);
+    }
+
+    private void enqueueEvent(PipelineEvent event) {
+        if (eventWorker == null) {
+            return;
         }
         if (closed.get()) {
             lostEvent(event, PipelineEvent.GapReason.SHUTDOWN);
@@ -594,7 +632,7 @@ final class TelemetryDispatcher implements AutoCloseable {
         Observation observation = frame.observation();
         offerLatest(observation.pipelineId(), new ObservationFrame(frame, scope));
         if (sampler != null) {
-            offerSide(historyWorker, historyStats, observation.pipelineId(), "history",
+            offerSide(historyWorker, historyStats, observation.pipelineId(), Sink.HISTORY, scope,
                     () -> stillCurrent(observation.pipelineId(), scope)
                             && sampler.appendIfDue(observation, scope),
                     () -> {
@@ -604,7 +642,7 @@ final class TelemetryDispatcher implements AutoCloseable {
                     });
         }
         if (export != MetricsExport.none()) {
-            offerSide(exportWorker, exportStats, observation.pipelineId(), "export", () -> {
+            offerSide(exportWorker, exportStats, observation.pipelineId(), Sink.EXPORT, scope, () -> {
                 if (!stillCurrent(observation.pipelineId(), scope)) {
                     return false;
                 }
@@ -633,6 +671,23 @@ final class TelemetryDispatcher implements AutoCloseable {
 
     private boolean stillCurrent(String pipelineId, ObservationStore.Scope scope) {
         return scopes == null || (scope != null && scopes.current(pipelineId).filter(scope::equals).isPresent());
+    }
+
+    private void boundaryFailed(String id, ObservationStore.Scope scope, Sink sink) {
+        if (boundaryEvents != null) {
+            boundaryEvents.failed(id, scope, sink);
+        }
+    }
+
+    private void successfulCompletion(Stats stats, Stats.Operation operation, Sink sink) {
+        if (stats.completed(operation, true)) {
+            if (boundaryEvents != null && (sink != Sink.HISTORY
+                    || !sampler.hasOpenGap(operation.pipelineId, operation.scope))) {
+                boundaryEvents.succeeded(operation.pipelineId, operation.scope, sink, operation.started);
+            }
+        } else {
+            boundaryFailed(operation.pipelineId, operation.scope, sink);
+        }
     }
 
     Map<Sink, Health> health() {
@@ -681,6 +736,7 @@ final class TelemetryDispatcher implements AutoCloseable {
             }
             if (!latestCapacity.tryAcquire()) {
                 latestStats.dropped();
+                boundaryFailed(pipelineId, frame.scope(), Sink.LATEST);
                 LOG.warn("Latest observation for pipeline {} was dropped: telemetry queue is full", pipelineId);
                 return;
             }
@@ -700,30 +756,34 @@ final class TelemetryDispatcher implements AutoCloseable {
                 }
                 latestCapacity.release();
                 latestStats.dropped();
+                boundaryFailed(pipelineId, frame.scope(), Sink.LATEST);
                 LOG.warn("Latest observation for pipeline {} was dropped: telemetry workers stopped", pipelineId);
             }
             return;
         }
     }
 
-    private static void offerSide(ThreadPoolExecutor workers, Stats stats, String pipelineId, String sink,
+    private void offerSide(ThreadPoolExecutor workers, Stats stats, String pipelineId, Sink sink,
+            ObservationStore.Scope scope,
             BooleanSupplier write, Runnable onDrop) {
         try {
             workers.execute(() -> {
                 if (!stats.allow()) {
                     stats.dropped();
-                    dropped(onDrop, sink, pipelineId);
+                    dropped(onDrop, sink.name(), pipelineId);
+                    boundaryFailed(pipelineId, scope, sink);
                     return;
                 }
-                Stats.Operation operation = stats.begin();
+                Stats.Operation operation = stats.begin(pipelineId, scope);
                 try {
                     if (write.getAsBoolean()) {
-                        stats.completed(operation, true);
+                        successfulCompletion(stats, operation, sink);
                     } else {
                         stats.skipped(operation);
                     }
                 } catch (RuntimeException failed) {
                     stats.completed(operation, false);
+                    boundaryFailed(pipelineId, scope, sink);
                     LOG.warn("Could not write {} telemetry for pipeline {}", sink, pipelineId, failed);
                 } catch (Error defect) {
                     stats.completed(operation, false);
@@ -733,7 +793,8 @@ final class TelemetryDispatcher implements AutoCloseable {
             stats.queueDepth(workers.getQueue().size());
         } catch (java.util.concurrent.RejectedExecutionException saturated) {
             stats.dropped();
-            dropped(onDrop, sink, pipelineId);
+            dropped(onDrop, sink.name(), pipelineId);
+            boundaryFailed(pipelineId, scope, sink);
             LOG.warn("{} telemetry for pipeline {} was dropped: queue is full", sink, pipelineId);
         }
     }
@@ -751,6 +812,9 @@ final class TelemetryDispatcher implements AutoCloseable {
 
     void retain(Collection<String> pipelineIds) {
         offeredScopes.keySet().retainAll(pipelineIds);
+        if (boundaryEvents != null) {
+            boundaryEvents.retain(pipelineIds);
+        }
         for (String id : latestByPipeline.keySet()) {
             if (!pipelineIds.contains(id)) {
                 LatestSlot slot = latestByPipeline.get(id);
@@ -870,26 +934,28 @@ final class TelemetryDispatcher implements AutoCloseable {
                 }
                 if (!latestStats.allow()) {
                     latestStats.dropped();
+                    boundaryFailed(pipelineId, frame.scope(), Sink.LATEST);
                     continue;
                 }
-                Stats.Operation operation = latestStats.begin();
+                Stats.Operation operation = latestStats.begin(pipelineId, frame.scope());
                 try {
                     if (frame instanceof ObservationFrame observation) {
                         if (publisher.commit(observation.prepared(), observation.scope()).isPresent()) {
-                            latestStats.completed(operation, true);
+                            successfulCompletion(latestStats, operation, Sink.LATEST);
                         } else {
                             latestStats.skipped(operation);
                         }
                     } else if (frame instanceof ReconcileFailureFrame failure) {
                         if (publisher.commitReconcileFailure(failure.pipelineId(), failure.failures(),
                                 failure.scope())) {
-                            latestStats.completed(operation, true);
+                            successfulCompletion(latestStats, operation, Sink.LATEST);
                         } else {
                             latestStats.skipped(operation);
                         }
                     }
                 } catch (RuntimeException failed) {
                     latestStats.completed(operation, false);
+                    boundaryFailed(pipelineId, frame.scope(), Sink.LATEST);
                     LOG.warn("Could not write latest observation for pipeline {}", pipelineId, failed);
                 } catch (Error defect) {
                     latestStats.completed(operation, false);
