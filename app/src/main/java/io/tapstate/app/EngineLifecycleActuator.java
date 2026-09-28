@@ -138,6 +138,12 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // snapshot, so an apply cannot move one without the others. Said after the drop above, which is the
         // one thing entitled to clear what earlier runs said.
         stateTeardown.willKeepStateAt(pipelineId, prepared.stateLocations());
+        // The run is worked out before its capture opens - how wide each node runs among the members, and every
+        // shape it records - so a start refused here, for a width it cannot honour or anything else found on the
+        // way, has opened no source connector and left the pipeline on no mining chain. A consumer left there
+        // holds back every other pipeline reading the same table on that chain. Worked out after placement and
+        // teardown, from the same frozen artifacts, so any shape record it writes stays named if it refuses.
+        DagSource.PlannedStart planned = prepared.plan();
         // A capture still open here while no job carries the pipeline was left by a run that ended with no stop:
         // a job lost with a member, which this member can replace before it can see that job fail. That run's
         // sources had begun taking the load the capture handed them, and a source of this run cannot vouch for a
@@ -156,10 +162,9 @@ final class EngineLifecycleActuator implements LifecycleActuator {
             // being opened on another member, and how long that may take is bounded where it is decided.
             return;
         }
-        // Capture opens the SRS generation that source vertices compile into the DAG. Build only now, but
-        // from the same frozen artifacts used above; placement and teardown were already fixed, so any
-        // shape record this writes remains named even if construction refuses the start.
-        DagSource.StartPlan plan = prepared.build(execution.fence());
+        // Capture opens the SRS generation that source vertices compile into the DAG, so the topology is built
+        // only now, from the plan worked out above.
+        DagSource.StartPlan plan = planned.build(execution.fence());
         // Written down before the run is submitted, so a reader never finds a run executing on a plan nobody
         // recorded; a run that goes on to fail keeps its plan until the next start replaces it or a stop lets go.
         // Compared with the plan of the run before - lost to a failed member, a stop or a restart - so a node

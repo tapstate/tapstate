@@ -171,28 +171,66 @@ interface DagSource {
     }
 
     /**
-     * The validated, artifact-derived inputs available before placement is configured. DAG construction is
-     * deferred until after placement and pending teardown because it may inspect and record operator shape.
+     * The validated, artifact-derived inputs available before placement is configured. The run itself is worked
+     * out later, in two steps a start takes on either side of opening its capture: {@link #plan()} once placement
+     * and pending teardown are settled, because planning may inspect and record operator shape; the topology once
+     * the capture is open, because its source vertices read what the capture opens.
      */
     record StartPreparation(
             NestCapacity capacity,
             Set<OperatorStateLocation> stateLocations,
             Optional<ArtifactStore> artifactSnapshot,
-            Function<ExecutionFence, PlannedDag> dagBuilder,
+            Planner planner,
             Map<String, String> sinkConnectors) {
 
         public StartPreparation {
             Objects.requireNonNull(capacity, "capacity");
             stateLocations = Set.copyOf(Objects.requireNonNull(stateLocations, "stateLocations"));
             Objects.requireNonNull(artifactSnapshot, "artifactSnapshot");
-            Objects.requireNonNull(dagBuilder, "dagBuilder");
+            Objects.requireNonNull(planner, "planner");
             sinkConnectors = Map.copyOf(Objects.requireNonNull(sinkConnectors, "sinkConnectors"));
+        }
+
+        /** A preparation that works nothing out ahead of the capture: its whole run is planned as it is built. */
+        StartPreparation(NestCapacity capacity, Set<OperatorStateLocation> stateLocations,
+                Optional<ArtifactStore> artifactSnapshot, Function<ExecutionFence, PlannedDag> dagBuilder,
+                Map<String, String> sinkConnectors) {
+            this(capacity, stateLocations, artifactSnapshot, () -> dagBuilder, sinkConnectors);
         }
 
         /** A preparation whose sinks open no connector. */
         StartPreparation(NestCapacity capacity, Set<OperatorStateLocation> stateLocations,
                 Optional<ArtifactStore> artifactSnapshot, Function<ExecutionFence, PlannedDag> dagBuilder) {
             this(capacity, stateLocations, artifactSnapshot, dagBuilder, Map.of());
+        }
+
+        /**
+         * Works out what the run can be before anything is opened for it - how wide each node runs, and whatever
+         * else does not wait on its capture - and answers the builder of its topology. A start asks this before
+         * it opens its capture, so a start refused here has opened no connector and joined no mining chain.
+         */
+        PlannedStart plan() {
+            return new PlannedStart(this, Objects.requireNonNull(planner.plan(), "planned topology"));
+        }
+
+        /** Plans the run and builds its topology in one go, for a caller that opens nothing in between. */
+        StartPlan build(ExecutionFence fence) {
+            return plan().build(fence);
+        }
+    }
+
+    /** Works out a run ahead of its capture, answering the builder of the run's topology. */
+    @FunctionalInterface
+    interface Planner {
+        Function<ExecutionFence, PlannedDag> plan();
+    }
+
+    /** A start whose run has been planned, and whose topology is built once its capture is open. */
+    record PlannedStart(StartPreparation preparation, Function<ExecutionFence, PlannedDag> dagBuilder) {
+
+        public PlannedStart {
+            Objects.requireNonNull(preparation, "preparation");
+            Objects.requireNonNull(dagBuilder, "dagBuilder");
         }
 
         /**
@@ -207,7 +245,8 @@ interface DagSource {
          * anything in the call saying so.
          */
         StartPlan build(ExecutionFence fence) {
-            return new StartPlan(dagBuilder.apply(fence), capacity, stateLocations, artifactSnapshot);
+            return new StartPlan(dagBuilder.apply(fence), preparation.capacity(), preparation.stateLocations(),
+                    preparation.artifactSnapshot());
         }
     }
 

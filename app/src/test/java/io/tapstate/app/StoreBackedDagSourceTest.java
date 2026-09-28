@@ -982,6 +982,34 @@ class StoreBackedDagSourceTest {
         assertThat(source.prepareStart("p", "tapstate").sinkConnectors()).isEqualTo(bySink);
     }
 
+    /**
+     * How wide a run is worked out when its start is planned, which a start does before it opens anything for the
+     * run: a width it cannot honour is refused there, and nothing is left to build. Refused only while building the
+     * topology, it would already have opened the capture the topology reads from.
+     */
+    @Test
+    void aWidthTheRunCannotHonourIsRefusedWhenItsStartIsPlanned() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("src", "orders"));
+        store.artifacts().save(connectionSupplier("dest"));
+        store.artifacts().save(new PipelineResource("too_wide", null, List.of(SourceRef.spec("src", true)),
+                List.of(Step.inline("w", FromClause.list(FromRef.literal("orders")), new TransformBody.Filter("true"),
+                        new ExecutionSpec(1000, null), null)),
+                null, serve(FromRef.literal("w"), sync("sync_1", "dest")), null, null));
+        // Keyed, so the rows reaching the step could be spread by key: what is refused is the width alone.
+        store.schemas.save(new DiscoveredSourceModel("src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders",
+                        List.of(new SourceField("id", "bigint", TapstateType.INT64)), List.of("id"), List.of())))));
+
+        DagSource.StartPreparation prepared = new StoreBackedDagSource(store).prepareStart("too_wide", "tapstate");
+
+        assertThatThrownBy(prepared::plan)
+                .isInstanceOfSatisfying(TapstateException.class, refused -> {
+                    assertThat(refused.code()).isEqualTo(ActuationError.NO_SAFE_PARALLELISM);
+                    assertThat(refused.args()).containsEntry("node", "w").containsEntry("requested", 1000);
+                });
+    }
+
     // ---- fixtures ----------------------------------------------------------------------
 
     private static SourceResource cdcSource(String id, String table) {

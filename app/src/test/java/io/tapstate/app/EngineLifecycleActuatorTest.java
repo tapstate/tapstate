@@ -164,6 +164,47 @@ class EngineLifecycleActuatorTest {
     }
 
     /**
+     * A start works its run out before it opens the capture: a start refused there - for a width it cannot honour
+     * - has opened no capture, so it has joined no mining chain and left no consumer on one to hold back the other
+     * pipelines reading the same tables.
+     */
+    @Test
+    void aStartRefusedWhileItsRunIsPlannedOpensNoCapture() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        RecordingDagSource dagSource = new RecordingDagSource(events);
+        dagSource.planning = () -> {
+            throw new TapstateException(ActuationError.NO_SAFE_PARALLELISM, Map.of(
+                    "pipeline", PIPE, "node", "w", "requested", 1000, "members", 1,
+                    "candidates", "1000 per member breaks max-local-parallelism"), null);
+        };
+        LifecycleActuator actuator =
+                new EngineLifecycleActuator(new Engine(member), dagSource, coordinator, teardown());
+
+        assertThatThrownBy(() -> actuator.start(PIPE))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        refused -> assertThat(refused.code()).isEqualTo(ActuationError.NO_SAFE_PARALLELISM));
+
+        assertThat(events).as("nothing was opened for a start refused while its run was planned").isEmpty();
+        assertThat(member.getJet().getJob(PIPE)).isNull();
+    }
+
+    /** A start that plans its run does so before it opens the capture its topology is then built over. */
+    @Test
+    void aStartPlansItsRunBeforeItOpensTheCapture() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        RecordingDagSource dagSource = new RecordingDagSource(events);
+        dagSource.planning = () -> events.add("planStart:" + PIPE);
+        LifecycleActuator actuator =
+                new EngineLifecycleActuator(new Engine(member), dagSource, coordinator, teardown());
+
+        actuator.start(PIPE);
+
+        assertThat(events).containsExactly("planStart:" + PIPE, "startCapture:" + PIPE, "buildDag:" + PIPE);
+    }
+
+    /**
      * A second start while a job carries the pipeline leaves its open capture alone: the capture is that job's,
      * and closing it would take the load from under a run that is reading it.
      */
@@ -492,6 +533,8 @@ class EngineLifecycleActuatorTest {
         private Runnable validation = () -> {
         };
         private ArtifactStore artifactSnapshot;
+        /** Run as the start is planned, when set: what a store-backed source works out before the capture. */
+        private Runnable planning;
 
         RecordingDagSource(List<String> events) {
             this.events = events;
@@ -504,6 +547,16 @@ class EngineLifecycleActuatorTest {
 
         @Override
         public StartPreparation prepareStart(String pipelineId, String defaultDatabase) {
+            if (planning != null) {
+                validateStart(pipelineId);
+                return new StartPreparation(
+                        capacityOf(pipelineId), stateLocations(pipelineId, defaultDatabase), Optional.empty(),
+                        () -> {
+                            planning.run();
+                            return fence -> plannedDagFor(pipelineId, fence);
+                        },
+                        Map.of());
+            }
             if (artifactSnapshot == null) {
                 return DagSource.super.prepareStart(pipelineId, defaultDatabase);
             }

@@ -182,7 +182,7 @@ final class StoreBackedDagSource implements DagSource {
         Set<OperatorStateLocation> locations = captured.stateLocations(pipelineId, defaultDatabase);
         return new StartPreparation(
                 capacity, locations, Optional.of(snapshot),
-                fence -> captured.plannedDagFor(pipelineId, fence), captured.sinkConnectors(pipelineId));
+                () -> captured.plannedTopology(pipelineId), captured.sinkConnectors(pipelineId));
     }
 
     /**
@@ -303,6 +303,19 @@ final class StoreBackedDagSource implements DagSource {
      */
     @Override
     public PlannedDag plannedDagFor(String pipelineId, ExecutionFence fence) {
+        return plannedTopology(pipelineId).apply(fence);
+    }
+
+    /**
+     * Works out {@code pipelineId}'s run as far as it can be without the run's capture - each step's recorded
+     * shape, the table every stream lands in, and how wide each node runs among the members taking part - and
+     * answers the builder of its topology, held to a fence's run. A start asks this before it opens its capture,
+     * so a start refused here, for a width it cannot honour or for anything else found on the way, has opened no
+     * connector and left the pipeline on no mining chain: a consumer left there would hold back every pipeline
+     * reading the same table from it. The topology itself waits for the capture, because its source vertices read
+     * the ring generation the capture opens and how far into each ring the pipeline is done.
+     */
+    Function<ExecutionFence, PlannedDag> plannedTopology(String pipelineId) {
         // Expanded before anything reads the blocks, so every later step - target resolution included -
         // sees one shape rather than having to know a reference from a body.
         PipelineResource pipeline = PipelineInlining.inline(
@@ -393,15 +406,17 @@ final class StoreBackedDagSource implements DagSource {
                                 nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices))::get),
                         sourceExecutions(sourceVertices)),
                 sinksOf(pipeline, targets, serveStreams, viewStreams));
-        NodeVertices drawn = new NodeVertices();
-        DAG dag = PipelineDagBuilder.build(
-                builtPipeline,
-                bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets, viewTargets,
-                        serveStreams, viewStreams, stepIds, frontier, compiledJoins, fence),
-                FencedSinkAckFactory.heldTo(sinkAckFactory(pipeline, pipelineId, fence), fence), frontier, shape,
-                drawn);
-        return new PlannedDag(dag, shape, planned, nodeBatches(pipeline, sourceVertices), drawn.byNode(),
-                drawn.feedingByNode());
+        return fence -> {
+            NodeVertices drawn = new NodeVertices();
+            DAG dag = PipelineDagBuilder.build(
+                    builtPipeline,
+                    bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets, viewTargets,
+                            serveStreams, viewStreams, stepIds, frontier, compiledJoins, fence),
+                    FencedSinkAckFactory.heldTo(sinkAckFactory(pipeline, pipelineId, fence), fence), frontier,
+                    shape, drawn);
+            return new PlannedDag(dag, shape, planned, nodeBatches(pipeline, sourceVertices), drawn.byNode(),
+                    drawn.feedingByNode());
+        };
     }
 
     /**
