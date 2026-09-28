@@ -1,5 +1,9 @@
 package io.tapstate.runtime.engine;
 
+import com.hazelcast.internal.metrics.DynamicMetricsProvider;
+import com.hazelcast.internal.metrics.MetricDescriptor;
+import com.hazelcast.internal.metrics.MetricsCollectionContext;
+
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.Traversers;
@@ -34,7 +38,12 @@ import java.util.Objects;
  * <p>The vertex runs at total parallelism one: a sink downstream acks an ordered position stream, and
  * a parallelism-greater-than-one transform would re-lane events and break that order.
  */
-public final class TransformProcessor extends AbstractProcessor implements Staged {
+public final class TransformProcessor extends AbstractProcessor implements Staged, DynamicMetricsProvider {
+
+    @Override
+    public void provideDynamicMetrics(MetricDescriptor descriptor, MetricsCollectionContext collection) {
+        timer.provideDynamicMetrics(descriptor, collection);
+    }
 
     @Override
     public Stage stage() {
@@ -45,7 +54,7 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
     private final LevelBounds bounds;
     // Times each row through the port, which is this stage's unit of work. Counts for nobody until init
     // says whether there is a job to report into.
-    private StageTimer timer = StageTimer.none(Stage.TRANSFORM);
+    private volatile StageTimer timer = StageTimer.none(Stage.TRANSFORM);
 
     // Resolved at init from the running job — see reapSettled's counterpart in SinkProcessor and
     // JobFailureRegistry for why this is captured here rather than reconstructed after the job fails.

@@ -1,5 +1,7 @@
 package io.tapstate.runtime.engine;
 
+import io.tapstate.core.lifecycle.Stage;
+
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Edge;
@@ -273,7 +275,7 @@ public final class PipelineDagBuilder {
      */
     public static DAG build(PipelineResource pipeline, DagBindings bindings, SinkAckFactory sinkAck,
             FrontierBinding frontier) {
-        DAG dag = new DAG();
+        DAG dag = new StageWorkDag();
         Map<String, Vertex> byKey = new HashMap<>();
         // Whether anything in this graph gathers several chains into one stream. It settles which shape of
         // frontier the sinks are given, and it is a property of the graph rather than of what flows through
@@ -293,7 +295,8 @@ public final class PipelineDagBuilder {
                 throw new IllegalStateException("source '" + sourceId + "' has no source vertex keys");
             }
             for (String sourceKey : sourceKeys) {
-                byKey.put(sourceKey, dag.newVertex(sourceKey, bindings.sourceVertices().apply(sourceKey)));
+                byKey.put(sourceKey, StageWorkDag.measured(dag,
+                        dag.newVertex(sourceKey, bindings.sourceVertices().apply(sourceKey)), Stage.SOURCE, true));
                 // Per vertex rather than per source: a source reading several tables reads several chains,
                 // and a bound carrying one of their names for all of them would say how far one table had
                 // travelled about changes of a table nobody had read.
@@ -392,6 +395,7 @@ public final class PipelineDagBuilder {
             String viewName = VIEW_VERTEX_PREFIX + view.id();
             Vertex vertex = dag.newVertex(viewName,
                     sinkVertex(viewName, bindings.viewSinks().apply(view), sinkAck, axes, assembled));
+            StageWorkDag.measured(dag, vertex, Stage.SINK, true);
             connect(dag, upstream, vertex, outboundOrdinal, inboundOrdinal);
             readsAs.put(view.id(), upstream);
         }
@@ -408,6 +412,7 @@ public final class PipelineDagBuilder {
                 String name = SERVE_VERTEX_PREFIX + (element.id() != null ? element.id() : i);
                 Vertex vertex = dag.newVertex(name,
                         sinkVertex(name, bindings.sinkWriters().apply(element), sinkAck, axes, assembled));
+                StageWorkDag.measured(dag, vertex, Stage.SINK, true);
                 connect(dag, upstream, vertex, outboundOrdinal, inboundOrdinal);
             }
         }
@@ -470,8 +475,8 @@ public final class PipelineDagBuilder {
             return dag.newVertex(step.id(),
                     PassthroughProcessor.metaSupplier(step.id(), axes, chainsByOrdinal));
         }
-        return dag.newVertex(step.id(), TransformProcessor.metaSupplier(step.id(),
-                bindings.transformPorts().apply(step), axes, chainsByOrdinal));
+        return StageWorkDag.measured(dag, dag.newVertex(step.id(), TransformProcessor.metaSupplier(step.id(),
+                bindings.transformPorts().apply(step), axes, chainsByOrdinal)), Stage.TRANSFORM, true);
     }
 
     /**

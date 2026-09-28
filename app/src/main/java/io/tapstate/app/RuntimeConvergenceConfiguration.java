@@ -112,6 +112,7 @@ class RuntimeConvergenceConfiguration {
                 engine::sinkBatchReading,
                 engine::queueReading,
                 engine::stateStoreCostReadings,
+                engine::activeWork,
                 Clock.systemUTC());
     }
 

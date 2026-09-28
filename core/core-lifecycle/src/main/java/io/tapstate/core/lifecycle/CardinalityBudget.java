@@ -47,9 +47,9 @@ import java.util.Set;
  *
  * <p>{@link #EXPORT_SERIES_LIMIT} is the backstop behind this, for the dimension the fold leaves alone:
  * the pipeline id is bounded by the deployment rather than by any one pipeline's definition, and an export
- * across every pipeline of a process can only be bounded where every pipeline is visible. It is the number
- * an exporter configures its SDK's per-instrument limit to, and it is sized so that one pipeline at its
- * full budget fits under it whole.
+ * across every pipeline of a process can only be bounded where every pipeline is visible. The exporter
+ * applies this separate per-instrument limit before handing points to the SDK. One pipeline at its table
+ * budget may still be folded at export when its closed dimensions produce more series than this limit.
  */
 public enum CardinalityBudget {
 
@@ -61,6 +61,8 @@ public enum CardinalityBudget {
             Fold.ADDED),
     /** Broken down by stage only, and the stages are a closed set: nothing here can grow, so nothing folds. */
     PROCESS_DURATION("tapstate.pipeline.process.duration", null, Stage.values().length, Fold.ADDED),
+    PROCESS_ACTIVE("tapstate.pipeline.process.active", null, Stage.values().length, Fold.ADDED),
+    PIPELINE_WORK_ACTIVE("tapstate.pipeline.work.active", null, 1, Fold.ADDED),
     /** Job queue readings have only the pipeline id; Jet vertex and processor tags are summed locally. */
     PIPELINE_QUEUE_DEPTH("tapstate.pipeline.queue.depth", null, 1, Fold.ADDED),
     PIPELINE_QUEUE_CAPACITY("tapstate.pipeline.queue.capacity", null, 1, Fold.ADDED),

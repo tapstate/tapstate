@@ -28,9 +28,15 @@ final class JetStageGauge implements StageGauge {
     static final String SUM_MICROS = ".sumMicros";
     static final String BUCKET = ".bucket.";
     static final String SINCE = ".since";
+    static final String ACTIVE = ".active";
+    static final String READY = ".ready";
+    static final String EXPECTED = ".expected";
+    static final String MEMBERS = ".members";
+
 
     private final Map<String, JobStatistic> parts = new HashMap<>();
     private final Map<Stage, JobStatistic[]> bucketsByStage = new EnumMap<>(Stage.class);
+
 
     @Override
     public void took(Stage stage, long count, long sumNanos, long[] bucketCounts, long countingSinceMillis) {
@@ -75,7 +81,8 @@ final class JetStageGauge implements StageGauge {
         }
         String stage = rest.substring(0, split);
         String tail = rest.substring(split);
-        if (tail.equals(COUNT) || tail.equals(SUM_MICROS) || tail.equals(SINCE)) {
+        if (tail.equals(COUNT) || tail.equals(SUM_MICROS) || tail.equals(SINCE)
+                || tail.equals(ACTIVE) || tail.equals(READY) || tail.equals(EXPECTED) || tail.equals(MEMBERS)) {
             return new Part(stage, tail, -1);
         }
         if (tail.startsWith(BUCKET)) {

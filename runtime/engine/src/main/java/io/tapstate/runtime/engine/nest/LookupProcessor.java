@@ -1,5 +1,9 @@
 package io.tapstate.runtime.engine.nest;
 
+import com.hazelcast.internal.metrics.DynamicMetricsProvider;
+import com.hazelcast.internal.metrics.MetricDescriptor;
+import com.hazelcast.internal.metrics.MetricsCollectionContext;
+
 import io.tapstate.runtime.engine.StageTimer;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Inbox;
@@ -47,7 +51,12 @@ import java.util.Set;
  * The second kind is for the rows that word goes to nobody about: filed, named by no document, and so
  * carried to a sink by nothing - see {@link #sayWhatOwesNothing()} for why a chain needs telling.
  */
-final class LookupProcessor extends AbstractProcessor implements Staged {
+final class LookupProcessor extends AbstractProcessor implements Staged, DynamicMetricsProvider {
+
+    @Override
+    public void provideDynamicMetrics(MetricDescriptor descriptor, MetricsCollectionContext collection) {
+        timer.provideDynamicMetrics(descriptor, collection);
+    }
 
     @Override
     public Stage stage() {
@@ -116,7 +125,7 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
      * and what it produced waits in the queue instead.
      */
     // Times each drain of arrivals, which is this stage's unit of work.
-    private StageTimer timer = StageTimer.none(Stage.NEST);
+    private volatile StageTimer timer = StageTimer.none(Stage.NEST);
 
     @Override
     public void process(int ordinal, Inbox inbox) {

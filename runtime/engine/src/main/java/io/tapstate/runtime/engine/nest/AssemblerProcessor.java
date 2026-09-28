@@ -1,5 +1,9 @@
 package io.tapstate.runtime.engine.nest;
 
+import com.hazelcast.internal.metrics.DynamicMetricsProvider;
+import com.hazelcast.internal.metrics.MetricDescriptor;
+import com.hazelcast.internal.metrics.MetricsCollectionContext;
+
 import io.tapstate.runtime.engine.StageTimer;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Inbox;
@@ -44,7 +48,12 @@ import java.util.Set;
  * nothing later removes. A root that is deleted is the one thing that still goes out, because the sink
  * has a document to remove; it carries the key and nothing else, and is not an assembled document.
  */
-public final class AssemblerProcessor extends AbstractProcessor implements Staged {
+public final class AssemblerProcessor extends AbstractProcessor implements Staged, DynamicMetricsProvider {
+
+    @Override
+    public void provideDynamicMetrics(MetricDescriptor descriptor, MetricsCollectionContext collection) {
+        timer.provideDynamicMetrics(descriptor, collection);
+    }
 
     @Override
     public Stage stage() {
@@ -567,7 +576,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
     }
 
     // Times each drain of arrivals, which is this stage's unit of work.
-    private StageTimer timer = StageTimer.none(Stage.NEST);
+    private volatile StageTimer timer = StageTimer.none(Stage.NEST);
 
     @Override
     public void process(int ordinal, Inbox inbox) {

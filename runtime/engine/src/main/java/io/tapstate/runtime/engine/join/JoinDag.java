@@ -14,6 +14,8 @@ import io.tapstate.core.sql.JoinKey;
 import io.tapstate.core.sql.JoinPlan;
 import io.tapstate.core.sql.JoinTree;
 import io.tapstate.runtime.engine.PassthroughProcessor;
+import io.tapstate.runtime.engine.StageWorkDag;
+import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.runtime.engine.SettledPositions;
 import io.tapstate.runtime.engine.ChainAxes;
 
@@ -98,6 +100,7 @@ public final class JoinDag {
                 plan, pipelineId, nodeId, factKeyColumns, dimensionRowKeyColumns,
                 Map.copyOf(sourceByOrdinal), axes, Map.copyOf(chainsByOrdinal), allChains,
                 stores, displaced, false)));
+        StageWorkDag.measured(dag, vertex, Stage.JOIN);
         sourceByOrdinal.forEach((edge, source) -> {
             List<Vertex> producers = sourceUpstream.apply(source);
             if (producers == null || producers.isEmpty()) {
@@ -112,6 +115,7 @@ public final class JoinDag {
                 plan, pipelineId, nodeId, factKeyColumns, Map.of(), Map.of(), axes,
                 Map.of(), allChains, stores,
                 displaced, true)));
+        StageWorkDag.measured(dag, projection, Stage.JOIN);
         dag.edge(Edge.from(vertex, nextOutbound.applyAsInt(vertex)).to(projection)
                 .partitioned(item -> item instanceof JoinUpdate update
                         ? update.factKey() : SETTLEMENT_PARTITION).distributed());

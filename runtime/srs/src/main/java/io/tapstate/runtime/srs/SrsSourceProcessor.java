@@ -1,5 +1,9 @@
 package io.tapstate.runtime.srs;
 
+import com.hazelcast.internal.metrics.DynamicMetricsProvider;
+import com.hazelcast.internal.metrics.MetricDescriptor;
+import com.hazelcast.internal.metrics.MetricsCollectionContext;
+
 import io.tapstate.runtime.engine.StageTimer;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.core.AbstractProcessor;
@@ -44,7 +48,12 @@ import java.util.function.LongConsumer;
  * and replayed from the durable source offset. A configured ring and read-cursor sink are resolved on the
  * member the processor runs on, so nothing but serializable coordinates crosses the wire.
  */
-public final class SrsSourceProcessor extends AbstractProcessor implements Staged {
+public final class SrsSourceProcessor extends AbstractProcessor implements Staged, DynamicMetricsProvider {
+
+    @Override
+    public void provideDynamicMetrics(MetricDescriptor descriptor, MetricsCollectionContext collection) {
+        timer.provideDynamicMetrics(descriptor, collection);
+    }
 
     @Override
     public Stage stage() {
@@ -99,7 +108,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     }
 
     // Times each read of the ring that produced something, which is this stage's unit of work.
-    private StageTimer timer = StageTimer.none(Stage.SOURCE);
+    private volatile StageTimer timer = StageTimer.none(Stage.SOURCE);
 
     @Override
     protected void init(Context context) {
@@ -166,29 +175,35 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         }
         // Reading and projecting what arrived is this stage's unit of work; a pass that finds nothing is
         // not a unit and is not timed, or the distribution would be swamped by the idle polls between rows.
-        long started = timer.begin();
+        long started = timer.beginInactive();
         int pendingBefore = pending.size();
-        // Whatever the capture has handed over since the last pass, ahead of the ring as always.
-        drainBuffered();
-        // The ring's sequence pairs with the generation this reader runs under to give each change its
-        // order. The sequence alone is not comparable across generations: a rebuilt ring numbers from zero
-        // again, so a change of the new ring would otherwise read as older than one of the ring before it.
-        if (ringTail != null && openReader()) {
-            try {
-                reader.fill((item, seq) -> {
-                    SourceOrder order = orderOf(seq);
-                    pending.add(SrsProjection.toEnvelope(item, src, order));
-                    read = order;
-                }, FILL_BATCH);
-                refused = false;
-            } catch (RingWriteRefusedException refusal) {
-                // Whatever this pass read before the refusal is already pending, and the reader stands at
-                // the first change it did not read, so the next pass carries on from there.
-                waitOut(refusal);
+        try {
+            // Whatever the capture has handed over since the last pass, ahead of the ring as always.
+            drainBuffered(true);
+            // The ring's sequence pairs with the generation this reader runs under to give each change its
+            // order. The sequence alone is not comparable across generations: a rebuilt ring numbers from zero
+            // again, so a change of the new ring would otherwise read as older than one of the ring before it.
+            if (ringTail != null && openReader()) {
+                try {
+                    reader.fill((item, seq) -> {
+                        timer.activate();
+                        SourceOrder order = orderOf(seq);
+                        pending.add(SrsProjection.toEnvelope(item, src, order));
+                        read = order;
+                    }, FILL_BATCH);
+                    refused = false;
+                } catch (RingWriteRefusedException refusal) {
+                    // Whatever this pass read before the refusal is already pending, and the reader stands at
+                    // the first change it did not read, so the next pass carries on from there.
+                    waitOut(refusal);
+                }
             }
-        }
-        if (pending.size() > pendingBefore) {
-            timer.end(started);
+        } finally {
+            if (timer.isActive() || pending.size() > pendingBefore) {
+                timer.end(started);
+            } else {
+                timer.discard(started);
+            }
         }
         if (emitPending()) {
             stampWhatHasLeft();
@@ -276,10 +291,17 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
      * they have all left.
      */
     private void drainBuffered() {
+        drainBuffered(false);
+    }
+
+    private void drainBuffered(boolean measured) {
         if (buffered == null) {
             return;
         }
         for (Envelope row : buffered.drain(pipelineId, ringName)) {
+            if (measured) {
+                timer.activate();
+            }
             pending.add(row);
             ChainPosition at = row.position();
             if (at == null || at.order() == null || at.order().seq() == SourceOrder.SNAPSHOT_SEQ) {
@@ -293,29 +315,44 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     }
 
     private void drainSnapshotSession() {
-        if (buffered == null) {
-            throw new IllegalStateException("streaming snapshot source has no member-local buffer");
-        }
-        SnapshotBuffer.SessionDrain drained = buffered.drainSnapshot(
-                pipelineId, ringName, snapshotToken, FILL_BATCH);
-        if (drained.state() == SnapshotBuffer.SessionState.FAILED) {
-            Throwable failure = drained.failure();
-            if (failure instanceof Error defect) {
-                throw defect;
+        long started = timer.beginInactive();
+        int pendingBefore = pending.size();
+        try {
+            if (buffered == null) {
+                throw new IllegalStateException("streaming snapshot source has no member-local buffer");
             }
-            if (failure instanceof RuntimeException runtime) {
-                throw runtime;
+            SnapshotBuffer.SessionDrain drained = buffered.drainSnapshot(
+                    pipelineId, ringName, snapshotToken, FILL_BATCH);
+            if (drained.state() == SnapshotBuffer.SessionState.FAILED) {
+                Throwable failure = drained.failure();
+                if (failure instanceof Error defect) {
+                    throw defect;
+                }
+                if (failure instanceof RuntimeException runtime) {
+                    throw runtime;
+                }
+                throw new IllegalStateException("snapshot producer failed", failure);
             }
-            throw new IllegalStateException("snapshot producer failed", failure);
+            if (drained.state() == SnapshotBuffer.SessionState.CANCELLED) {
+                throw new CancellationException("snapshot hand-off was cancelled or replaced");
+            }
+            for (Envelope row : drained.rows()) {
+                timer.activate();
+                pending.add(row);
+                snapshotBoundDue = true;
+            }
+            snapshotDone = drained.state() == SnapshotBuffer.SessionState.DONE;
+        } finally {
+            if (timer.isActive() || pending.size() > pendingBefore) {
+                timer.end(started);
+            } else {
+                timer.discard(started);
+            }
         }
-        if (drained.state() == SnapshotBuffer.SessionState.CANCELLED) {
-            throw new CancellationException("snapshot hand-off was cancelled or replaced");
-        }
-        for (Envelope row : drained.rows()) {
-            pending.add(row);
-            snapshotBoundDue = true;
-        }
-        snapshotDone = drained.state() == SnapshotBuffer.SessionState.DONE;
+    }
+
+    StageTimer timing() {
+        return timer;
     }
 
     /**

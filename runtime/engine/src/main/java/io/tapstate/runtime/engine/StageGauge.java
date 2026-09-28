@@ -23,6 +23,10 @@ interface StageGauge {
      */
     void took(Stage stage, long count, long sumNanos, long[] bucketCounts, long countingSinceMillis);
 
+    /** The current count of units entered through this processor's work boundary. */
+    default void active(Stage stage, long active) {
+    }
+
     /** A gauge nothing reads, for a processor driven outside a running job. */
     static StageGauge none() {
         return (stage, count, sumNanos, bucketCounts, countingSinceMillis) -> {

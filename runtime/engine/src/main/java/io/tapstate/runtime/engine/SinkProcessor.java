@@ -1,5 +1,9 @@
 package io.tapstate.runtime.engine;
 
+import com.hazelcast.internal.metrics.DynamicMetricsProvider;
+import com.hazelcast.internal.metrics.MetricDescriptor;
+import com.hazelcast.internal.metrics.MetricsCollectionContext;
+
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.core.AbstractProcessor;
@@ -58,7 +62,12 @@ import java.util.concurrent.atomic.AtomicLong;
  * durable offset is the source's, not Jet's, so a restart replays from the source rather than
  * resuming a sink snapshot.
  */
-public final class SinkProcessor extends AbstractProcessor implements Staged {
+public final class SinkProcessor extends AbstractProcessor implements Staged, DynamicMetricsProvider {
+
+    @Override
+    public void provideDynamicMetrics(MetricDescriptor descriptor, MetricsCollectionContext collection) {
+        timer.provideDynamicMetrics(descriptor, collection);
+    }
 
     @Override
     public Stage stage() {
@@ -102,7 +111,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     private final LongSupplier clock;
     private final LongSupplier nanoClock;
     // Times each batch this sink forms and issues, which is this stage's unit of work.
-    private StageTimer timer = StageTimer.none(Stage.SINK);
+    private volatile StageTimer timer = StageTimer.none(Stage.SINK);
     private final int maxInFlight;
     private final int maxBatchSize;
     private final List<InFlightBatch> inFlight = new ArrayList<>();

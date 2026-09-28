@@ -83,6 +83,8 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.lag",
                         "tapstate.pipeline.record.delivery.duration",
                         "tapstate.pipeline.process.duration",
+                        "tapstate.pipeline.process.active",
+                        "tapstate.pipeline.work.active",
                         "tapstate.pipeline.queue.depth",
                         "tapstate.pipeline.queue.capacity",
                         "tapstate.pipeline.queue.high_water",
@@ -184,6 +186,8 @@ class WhatHappensPastTheCardinalityBudgetTest {
         assertThat(CardinalityBudget.ERRORS.distinctValues()).isEqualTo(200);
         assertThat(CardinalityBudget.PROCESS_DURATION.openDimension()).isEmpty();
         assertThat(CardinalityBudget.PROCESS_DURATION.distinctValues()).isEqualTo(Stage.values().length);
+        assertThat(CardinalityBudget.PROCESS_ACTIVE.distinctValues()).isEqualTo(5);
+        assertThat(CardinalityBudget.PROCESS_ACTIVE.openDimension()).isEmpty();
         for (CardinalityBudget budget : List.of(CardinalityBudget.SINK_BATCH_ISSUED,
                 CardinalityBudget.SINK_BATCH_RECORDS, CardinalityBudget.SINK_BATCH_RECORDS_MAX,
                 CardinalityBudget.SINK_BATCH_PENDING, CardinalityBudget.SINK_BATCH_LIMIT,

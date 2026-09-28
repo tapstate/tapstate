@@ -1,6 +1,11 @@
 package io.tapstate.runtime.engine;
 
 import com.hazelcast.jet.core.Processor;
+import com.hazelcast.jet.core.metrics.MetricTags;
+import com.hazelcast.internal.metrics.MetricDescriptor;
+import com.hazelcast.internal.metrics.MetricsCollectionContext;
+import com.hazelcast.internal.metrics.ProbeLevel;
+import com.hazelcast.internal.metrics.ProbeUnit;
 import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.Stage;
@@ -40,13 +45,24 @@ public final class StageTimer {
     private final long countingSinceMillis;
     private long count;
     private long sumNanos;
+    private volatile boolean active;
+    private boolean entered;
+    private final int expected;
+    private final int members;
     private final long[] buckets = new long[BOUNDS.buckets()];
 
     StageTimer(Stage stage, StageGauge gauge, LongSupplier nanoClock, long countingSinceMillis) {
+        this(stage, gauge, nanoClock, countingSinceMillis, 0, 0);
+    }
+
+    private StageTimer(Stage stage, StageGauge gauge, LongSupplier nanoClock, long countingSinceMillis,
+            int expected, int members) {
         this.stage = Objects.requireNonNull(stage, "stage");
         this.gauge = Objects.requireNonNull(gauge, "gauge");
         this.nanoClock = Objects.requireNonNull(nanoClock, "nanoClock");
         this.countingSinceMillis = countingSinceMillis;
+        this.expected = expected;
+        this.members = members;
     }
 
     /**
@@ -56,8 +72,16 @@ public final class StageTimer {
      */
     public static StageTimer of(Stage stage, Processor.Context context) {
         boolean inAJob = context != null && context.hazelcastInstance() != null;
+        java.util.Set<String> single = inAJob && context.jobConfig() != null
+                ? context.jobConfig().getArgument(StageWorkDag.SINGLE_ARGUMENT) : null;
+        boolean pinned = single != null && single.contains(context.vertexName());
+        // A single-business vertex is compiled at local parallelism one; its other member slots are inert.
+        int expected = !inAJob ? 0 : pinned
+                ? context.localParallelism() == 1 && context.totalParallelism() == context.memberCount() ? 1 : 0
+                : context.totalParallelism();
         return new StageTimer(stage, inAJob ? new JetStageGauge() : StageGauge.none(),
-                System::nanoTime, System.currentTimeMillis());
+                System::nanoTime, System.currentTimeMillis(),
+                expected, inAJob ? context.memberCount() : 0);
     }
 
     /** A timer that counts and reports to nobody, for a processor not yet initialised. */
@@ -67,16 +91,59 @@ public final class StageTimer {
 
     /** The moment a unit begins, to be handed back to {@link #end(long)}. */
     public long begin() {
+        enter();
+        active = true;
+        gauge.active(stage, 1);
         return nanoClock.getAsLong();
+    }
+
+    /** Starts a source read whose result may be empty; only a known row makes it active business work. */
+    public long beginInactive() {
+        enter();
+        gauge.active(stage, 0);
+        return nanoClock.getAsLong();
+    }
+
+    private void enter() {
+        if (entered) {
+            throw new IllegalStateException("a processor cannot enter a second business unit before leaving its first");
+        }
+        entered = true;
+    }
+
+    /** Activates a source unit immediately before projecting its first known item. */
+    public void activate() {
+        if (!entered) {
+            throw new IllegalStateException("business work must be entered before activating");
+        }
+        if (!active) {
+            active = true;
+            gauge.active(stage, 1);
+        }
     }
 
     /** Ends the unit begun at {@code startedNanos}, counting it into the distribution and reporting. */
     public void end(long startedNanos) {
+        leave();
         long nanos = Math.max(0L, nanoClock.getAsLong() - startedNanos);
         count++;
         sumNanos += nanos;
         buckets[bucketOf(nanos / 1_000_000_000.0)]++;
         gauge.took(stage, count, sumNanos, buckets, countingSinceMillis);
+    }
+
+    /** Releases an empty source poll without calling it a completed business unit. */
+    public void discard(long startedNanos) {
+        leave();
+    }
+
+    private void leave() {
+        if (!entered) {
+            throw new IllegalStateException("business work must be entered before leaving");
+        }
+        entered = false;
+        active = false;
+        gauge.active(stage, 0);
     }
 
     /** The distribution so far. */
@@ -90,6 +157,30 @@ public final class StageTimer {
 
     public Stage stage() {
         return stage;
+    }
+
+    /** The state of this business-work boundary, also observable when driven outside a job. */
+    public boolean isActive() {
+        return active;
+    }
+
+    /** Copies one collection snapshot independently of whether this processor has received its first row. */
+    public void provideDynamicMetrics(MetricDescriptor descriptor, MetricsCollectionContext collection) {
+        if (expected <= 0 || members <= 0) {
+            return;
+        }
+        long current = active ? 1 : 0;
+        String prefix = JetStageGauge.PREFIX + stage.attributeValue();
+        collectWork(collection, descriptor, prefix + JetStageGauge.ACTIVE, current);
+        collectWork(collection, descriptor, prefix + JetStageGauge.EXPECTED, expected);
+        collectWork(collection, descriptor, prefix + JetStageGauge.MEMBERS, members);
+        collectWork(collection, descriptor, prefix + JetStageGauge.READY, 1);
+    }
+
+    private static void collectWork(MetricsCollectionContext collection, MetricDescriptor descriptor,
+            String name, long value) {
+        collection.collect(descriptor.copy().withTag(MetricTags.USER, "true"), name,
+                ProbeLevel.INFO, ProbeUnit.COUNT, value);
     }
 
     /** The first bucket whose upper bound the value does not exceed; the last bucket for everything above. */

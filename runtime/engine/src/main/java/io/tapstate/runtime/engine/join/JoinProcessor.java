@@ -1,5 +1,9 @@
 package io.tapstate.runtime.engine.join;
 
+import com.hazelcast.internal.metrics.DynamicMetricsProvider;
+import com.hazelcast.internal.metrics.MetricDescriptor;
+import com.hazelcast.internal.metrics.MetricsCollectionContext;
+
 import com.hazelcast.jet.core.Processor;
 import io.tapstate.runtime.engine.StageTimer;
 import com.hazelcast.jet.core.AbstractProcessor;
@@ -42,7 +46,12 @@ import java.util.Objects;
  * remove. The re-offer rule is unchanged and simply applies to the delivery: it is absorbed once, and
  * the items stay where they are until everything they meant has gone out.
  */
-public final class JoinProcessor extends AbstractProcessor implements Staged {
+public final class JoinProcessor extends AbstractProcessor implements Staged, DynamicMetricsProvider {
+
+    @Override
+    public void provideDynamicMetrics(MetricDescriptor descriptor, MetricsCollectionContext collection) {
+        timer.provideDynamicMetrics(descriptor, collection);
+    }
 
     @Override
     public Stage stage() {
@@ -85,7 +94,7 @@ public final class JoinProcessor extends AbstractProcessor implements Staged {
      * meantime - the substrate refills only once it has been emptied - so the two cannot interleave.
      */
     // Times each drain of arrivals, which is this stage's unit of work.
-    private StageTimer timer = StageTimer.none(Stage.JOIN);
+    private volatile StageTimer timer = StageTimer.none(Stage.JOIN);
 
     @Override
     protected void init(Processor.Context context) {

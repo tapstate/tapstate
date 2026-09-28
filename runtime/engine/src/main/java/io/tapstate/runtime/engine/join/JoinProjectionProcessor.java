@@ -1,5 +1,9 @@
 package io.tapstate.runtime.engine.join;
 
+import com.hazelcast.internal.metrics.DynamicMetricsProvider;
+import com.hazelcast.internal.metrics.MetricDescriptor;
+import com.hazelcast.internal.metrics.MetricsCollectionContext;
+
 import com.hazelcast.jet.core.Processor;
 import io.tapstate.runtime.engine.StageTimer;
 import com.hazelcast.jet.core.AbstractProcessor;
@@ -22,7 +26,12 @@ import java.util.List;
 import java.util.Map;
 
 /** Publishes each fact key from one ordered processor, after reading its current joined value. */
-final class JoinProjectionProcessor extends AbstractProcessor implements Staged {
+final class JoinProjectionProcessor extends AbstractProcessor implements Staged, DynamicMetricsProvider {
+
+    @Override
+    public void provideDynamicMetrics(MetricDescriptor descriptor, MetricsCollectionContext collection) {
+        timer.provideDynamicMetrics(descriptor, collection);
+    }
 
     @Override
     public Stage stage() {
@@ -44,7 +53,7 @@ final class JoinProjectionProcessor extends AbstractProcessor implements Staged 
     }
 
     // Times each drain of arrivals, which is this stage's unit of work.
-    private StageTimer timer = StageTimer.none(Stage.JOIN);
+    private volatile StageTimer timer = StageTimer.none(Stage.JOIN);
 
     @Override
     protected void init(Processor.Context context) {

@@ -19,6 +19,7 @@ import io.tapstate.core.lifecycle.QueueReading;
 import io.tapstate.core.lifecycle.SinkBatchReading;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.StageReading;
+import io.tapstate.core.lifecycle.StageWorkReading;
 import io.tapstate.core.lifecycle.StateStoreCostReading;
 import io.tapstate.runtime.engine.StateStoreCostMetricNames.Kind;
 import io.tapstate.runtime.engine.join.JoinRecomputeMetricNames;
@@ -71,6 +72,8 @@ public final class Engine {
 
     /** A fixed ceiling on high-water accounts, including recently stopped jobs. */
     private static final int MAX_QUEUE_ACCOUNTS = 4096;
+    private static final Set<String> WORK_PARTS = Set.of(JetStageGauge.ACTIVE, JetStageGauge.READY,
+            JetStageGauge.EXPECTED, JetStageGauge.MEMBERS);
 
     private final HazelcastInstance member;
 
@@ -159,6 +162,8 @@ public final class Engine {
         awaitPreviousRunOver(pipelineId);
         JobConfig config = new JobConfig()
                 .setName(pipelineId)
+                .setArgument(StageWorkDag.ARGUMENT, StageWorkDag.vertices(dag))
+                .setArgument(StageWorkDag.SINGLE_ARGUMENT, StageWorkDag.singleVertices(dag))
                 .setProcessingGuarantee(ProcessingGuarantee.NONE)
                 .setSplitBrainProtection(true)
                 // Who re-plans a run for a changed cluster is a decision this product makes, not one the
@@ -599,6 +604,171 @@ public final class Engine {
     public StageReading stageDurations(String pipelineId) {
         Job job = liveJob(pipelineId);
         return job == null ? StageReading.NONE : stageDurationsIn(job.getMetrics());
+    }
+
+    /** Complete current-job business work only; sampled processor slots are not scheduler utilization. */
+    public StageWorkReading activeWork(String pipelineId) {
+        Job job = liveJob(pipelineId);
+        if (job == null || job.getStatus() != JobStatus.RUNNING) {
+            return StageWorkReading.NONE;
+        }
+        JobConfig config = job.getConfig();
+        Map<String, String> expected = config.getArgument(StageWorkDag.ARGUMENT);
+        Set<String> single = config.getArgument(StageWorkDag.SINGLE_ARGUMENT);
+        if (expected == null || expected.isEmpty()) {
+            return StageWorkReading.NONE;
+        }
+        Set<String> members = memberIds();
+        JobMetrics collected = job.getMetrics();
+        Job current = liveJob(pipelineId);
+        if (current == null || current.getId() != job.getId() || job.getStatus() != JobStatus.RUNNING
+                || !members.equals(memberIds())) {
+            return StageWorkReading.NONE;
+        }
+        long maxAge = Math.max(1, member.getConfig().getMetricsConfig().getCollectionFrequencySeconds()) * 2_000L;
+        return activeWorkIn(collected, job.getIdString(), expected, single == null ? Set.of() : single,
+                members, System.currentTimeMillis(), maxAge);
+    }
+
+    private record WorkProcessor(String member, String vertex, String processor) { }
+
+    static StageWorkReading activeWorkIn(JobMetrics collected, String jobId, Map<String, String> expected,
+            Set<String> members, long now, long maxAge) {
+        return activeWorkIn(collected, jobId, expected, Set.of(), members, now, maxAge);
+    }
+
+    static StageWorkReading activeWorkIn(JobMetrics collected, String jobId, Map<String, String> expected,
+            Set<String> single, Set<String> members, long now, long maxAge) {
+        if (expected.isEmpty() || members.isEmpty()
+                || !expected.keySet().containsAll(single)
+                || expected.values().stream().anyMatch(stage -> !Stage.attributeValues().contains(stage))) {
+            return StageWorkReading.NONE;
+        }
+        String execution = null;
+        Set<String> reportingMembers = new java.util.HashSet<>();
+        Map<String, Long> collectionTimes = new HashMap<>();
+        for (Measurement reading : collected.get(MetricNames.EXECUTION_START_TIME)) {
+            String source = reading.tag(MetricTags.MEMBER);
+            String observedExecution = reading.tag(MetricTags.EXECUTION);
+            if (!jobId.equals(reading.tag(MetricTags.JOB)) || source == null || !members.contains(source)
+                    || observedExecution == null || reading.timestamp() <= 0
+                    || !reportingMembers.add(source)
+                    || execution != null && !execution.equals(observedExecution)) {
+                return StageWorkReading.NONE;
+            }
+            execution = observedExecution;
+            collectionTimes.put(source, reading.timestamp());
+        }
+        if (execution == null) {
+            return StageWorkReading.NONE;
+        }
+        Map<WorkProcessor, Measurement> roster = new HashMap<>();
+        Map<String, List<WorkProcessor>> byVertex = new HashMap<>();
+        for (Measurement reading : collected.get(MetricNames.QUEUES_CAPACITY)) {
+            String vertex = reading.tag(MetricTags.VERTEX);
+            if (vertex == null) {
+                return StageWorkReading.NONE;
+            }
+            if (!expected.containsKey(vertex)) {
+                continue;
+            }
+            WorkProcessor key = workProcessor(reading, jobId, execution, members, now, Long.MAX_VALUE);
+            if (key == null || roster.putIfAbsent(key, reading) != null) {
+                return StageWorkReading.NONE;
+            }
+            byVertex.computeIfAbsent(vertex, ignored -> new ArrayList<>()).add(key);
+        }
+        Map<WorkProcessor, Map<String, Measurement>> parts = new HashMap<>();
+        for (String name : collected.metrics()) {
+            JetStageGauge.Part part = JetStageGauge.partOf(name);
+            if (part == null || !WORK_PARTS.contains(part.kind())) {
+                continue;
+            }
+            for (Measurement reading : collected.get(name)) {
+                String vertex = reading.tag(MetricTags.VERTEX);
+                if (vertex == null) {
+                    return StageWorkReading.NONE;
+                }
+                String stage = expected.get(vertex);
+                if (stage == null) {
+                    continue;
+                }
+                WorkProcessor key = workProcessor(reading, jobId, execution, members, now, maxAge);
+                if (key == null || !"true".equals(reading.tag(MetricTags.USER))
+                        || !stage.equals(part.stage()) || !roster.containsKey(key)
+                        || parts.computeIfAbsent(key, ignored -> new HashMap<>())
+                                .putIfAbsent(part.kind(), reading) != null) {
+                    return StageWorkReading.NONE;
+                }
+            }
+        }
+        Map<String, Long> byStage = new HashMap<>();
+        long oldest = Long.MAX_VALUE;
+        for (Map.Entry<String, String> vertex : expected.entrySet()) {
+            boolean pinned = single.contains(vertex.getKey());
+            List<WorkProcessor> processors = byVertex.getOrDefault(vertex.getKey(), List.of());
+            if (pinned) {
+                // The compiler declares one business processor; inert Jet stand-ins have no business provider.
+                processors = processors.stream().filter(parts::containsKey).toList();
+            }
+            long declared = -1;
+            Set<Integer> indexes = new java.util.HashSet<>();
+            for (WorkProcessor key : processors) {
+                Measurement slot = roster.get(key);
+                try {
+                    if (!indexes.add(Integer.parseInt(key.processor()))) {
+                        return StageWorkReading.NONE;
+                    }
+                } catch (NumberFormatException invalid) {
+                    return StageWorkReading.NONE;
+                }
+                Map<String, Measurement> measured = parts.get(key);
+                if (measured == null || measured.size() != 4) {
+                    return StageWorkReading.NONE;
+                }
+                long timestamp = measured.get(JetStageGauge.ACTIVE).timestamp();
+                if (measured.values().stream().anyMatch(value -> value.timestamp() != timestamp)
+                        || !Objects.equals(collectionTimes.get(key.member()), timestamp)
+                        || !freshWorkReading(slot, now, maxAge)
+                        || slot.timestamp() != timestamp || measured.get(JetStageGauge.READY).value() != 1
+                        || measured.get(JetStageGauge.MEMBERS).value() != members.size()) {
+                    return StageWorkReading.NONE;
+                }
+                long count = measured.get(JetStageGauge.EXPECTED).value();
+                if (count <= 0 || pinned && count != 1 || declared != -1 && declared != count) {
+                    return StageWorkReading.NONE;
+                }
+                declared = count;
+                long active = measured.get(JetStageGauge.ACTIVE).value();
+                if (active < 0 || active > 1) {
+                    return StageWorkReading.NONE;
+                }
+                byStage.merge(vertex.getValue(), active, Long::sum);
+                oldest = Math.min(oldest, timestamp);
+            }
+            int limit = pinned ? members.size() : processors.size();
+            if (declared != processors.size() || indexes.size() != declared
+                    || indexes.stream().anyMatch(index -> index < 0 || index >= limit)) {
+                return StageWorkReading.NONE;
+            }
+        }
+        byStage.values().removeIf(value -> value == 0);
+        return byStage.isEmpty() ? StageWorkReading.NONE
+                : new StageWorkReading(byStage, Instant.ofEpochMilli(oldest));
+    }
+
+    private static WorkProcessor workProcessor(Measurement reading, String job, String execution,
+            Set<String> members, long now, long maxAge) {
+        String source = reading.tag(MetricTags.MEMBER);
+        String vertex = reading.tag(MetricTags.VERTEX);
+        String processor = reading.tag(MetricTags.PROCESSOR);
+        return job.equals(reading.tag(MetricTags.JOB)) && execution.equals(reading.tag(MetricTags.EXECUTION))
+                && source != null && members.contains(source) && vertex != null && processor != null
+                && freshWorkReading(reading, now, maxAge) ? new WorkProcessor(source, vertex, processor) : null;
+    }
+
+    private static boolean freshWorkReading(Measurement reading, long now, long maxAge) {
+        return reading.timestamp() > 0 && reading.timestamp() <= now && now - reading.timestamp() <= maxAge;
     }
 
     /** Batch handoff, write completion and sink-side backpressure measured by the live job. */

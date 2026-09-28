@@ -42,6 +42,15 @@ import org.junit.jupiter.api.Test;
 class PipelineDagBuilderTest {
 
     @Test
+    void recordingBusinessMetadataDoesNotChangeTheVertexSchedulingChoice() {
+        DAG dag = new StageWorkDag();
+        Vertex source = dag.newVertex("source", stubMeta()).localParallelism(3);
+        StageWorkDag.measured(dag, source, io.tapstate.core.lifecycle.Stage.SOURCE, true);
+        assertThat(source.getLocalParallelism()).isEqualTo(3);
+        assertThat(StageWorkDag.singleVertices(dag)).containsExactly("source");
+    }
+
+    @Test
     void source_to_serve_without_transforms_is_a_source_then_sink() {
         PipelineResource pipeline = new PipelineResource(
                 "p", null,
@@ -56,6 +65,9 @@ class PipelineDagBuilderTest {
 
         assertThat(vertexNames(dag)).containsExactlyInAnyOrder("orders_src", "serve.sync_1");
         assertThat(edges(dag)).containsExactly(edge("orders_src", "serve.sync_1"));
+        assertThat(StageWorkDag.vertices(dag)).containsExactlyInAnyOrderEntriesOf(
+                Map.of("orders_src", "source", "serve.sync_1", "sink"));
+        assertThat(StageWorkDag.singleVertices(dag)).containsExactlyInAnyOrder("orders_src", "serve.sync_1");
     }
 
     @Test

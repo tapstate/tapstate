@@ -11,6 +11,8 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.runtime.engine.ChainAxes;
 import io.tapstate.runtime.engine.LevelBounds;
 import io.tapstate.runtime.engine.PassthroughProcessor;
+import io.tapstate.runtime.engine.StageWorkDag;
+import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.runtime.engine.ReplayFloor;
 import io.tapstate.runtime.engine.ReplayFloorFactory;
 import io.tapstate.runtime.engine.SettledPositions;
@@ -94,6 +96,7 @@ public final class NestDag {
             Vertex vertex = dag.newVertex(spec.name(), processorFor(spec, topology, binding, outputStream,
                     frontier, chainsInto(spec, carried, frontier)))
                     .localParallelism(STATE_VERTEX_LOCAL_PARALLELISM);
+            StageWorkDag.measured(dag, vertex, Stage.NEST);
             built.put(spec.pathId(), vertex);
             for (NestInbound edge : spec.inbound()) {
                 connect(dag, vertex, edge, built, upstream, nextOutbound, frontier);
@@ -141,6 +144,7 @@ public final class NestDag {
                         binding.settings().referrersAllowedIn(lookup.mapName()),
                         frontier == null ? null : frontier.axes(), chainsIntoLookup(lookup, frontier))))
                 .localParallelism(STATE_VERTEX_LOCAL_PARALLELISM);
+        StageWorkDag.measured(dag, vertex, Stage.NEST);
         Vertex source = sources.size() == 1
                 ? sources.get(0)
                 : gatheredInto(dag, vertex, lookup.alias(), sources, nextOutbound, frontier);

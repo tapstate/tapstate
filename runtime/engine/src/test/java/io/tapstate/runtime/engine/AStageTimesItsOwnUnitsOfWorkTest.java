@@ -36,6 +36,12 @@ class AStageTimesItsOwnUnitsOfWorkTest {
         private final List<Stage> stages = new ArrayList<>();
         private final List<HistogramValue> distributions = new ArrayList<>();
         private final List<Long> starts = new ArrayList<>();
+        private final List<Long> active = new ArrayList<>();
+
+        @Override
+        public void active(Stage stage, long value) {
+            active.add(value);
+        }
 
         @Override
         public void took(Stage stage, long count, long sumNanos, long[] bucketCounts, long countingSinceMillis) {
@@ -54,6 +60,45 @@ class AStageTimesItsOwnUnitsOfWorkTest {
         HistogramValue latest() {
             return distributions.get(distributions.size() - 1);
         }
+    }
+
+    @Test
+    void workSlotsAreReleasedOnCompletionExceptionAndDiscardWithoutTimingAnIdlePoll() {
+        FakeNanos clock = new FakeNanos();
+        RecordingStageGauge gauge = new RecordingStageGauge();
+        StageTimer timer = new StageTimer(Stage.TRANSFORM, gauge, clock::read, 1);
+        long completed = timer.begin();
+        timer.end(completed);
+        long failed = timer.begin();
+        try {
+            throw new IllegalStateException("business callback failed");
+        } catch (IllegalStateException expected) {
+            assertThat(expected.getMessage()).isEqualTo("business callback failed");
+        } finally {
+            timer.end(failed);
+        }
+        timer.discard(timer.begin());
+        assertThat(gauge.active).containsExactly(1L, 0L, 1L, 0L, 1L, 0L);
+        assertThat(timer.value().count()).isEqualTo(2);
+    }
+
+    @Test
+    void aHeldEmptySourceReadStaysInactiveUntilAnActualItemIsKnown() {
+        FakeNanos clock = new FakeNanos();
+        RecordingStageGauge gauge = new RecordingStageGauge();
+        StageTimer timer = new StageTimer(Stage.SOURCE, gauge, clock::read, 1);
+        long empty = timer.beginInactive();
+        clock.advanceMicros(10_000_000);
+        assertThat(gauge.active).containsExactly(0L);
+        assertThat(timer.value().count()).isZero();
+        timer.discard(empty);
+        long item = timer.beginInactive();
+        timer.activate();
+        timer.activate();
+        assertThat(gauge.active.getLast()).isEqualTo(1);
+        timer.end(item);
+        assertThat(timer.value().count()).isEqualTo(1);
+        assertThat(gauge.active).containsExactly(0L, 0L, 0L, 1L, 0L);
     }
 
     @Test
