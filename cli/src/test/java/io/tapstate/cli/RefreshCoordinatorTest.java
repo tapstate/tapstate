@@ -342,6 +342,7 @@ class RefreshCoordinatorTest {
             closeReturned.countDown();
         }, "test-close-during-failure-observer");
         closeThread.start();
+        awaitWaiting(closeThread);
 
         assertThatIllegalStateException()
                 .isThrownBy(() -> coordinator.refresh(
@@ -428,6 +429,17 @@ class RefreshCoordinatorTest {
         assertThat(latch.await(2, TimeUnit.SECONDS))
                 .as("the coordinated step completed before the bounded wait elapsed")
                 .isTrue();
+    }
+
+    private static void awaitWaiting(Thread thread) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (thread.isAlive() && thread.getState() != Thread.State.WAITING
+                && System.nanoTime() < deadline) {
+            Thread.sleep(1);
+        }
+        assertThat(thread.getState())
+                .as("the close thread reached the callback barrier before the bounded wait elapsed")
+                .isEqualTo(Thread.State.WAITING);
     }
 
     private static void expect(

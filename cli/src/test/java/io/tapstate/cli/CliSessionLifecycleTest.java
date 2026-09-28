@@ -43,6 +43,8 @@ class CliSessionLifecycleTest {
                     case "discover" -> new DiscoveryOutcome.Discovered(
                             "urn:tapstate:cluster:test-cluster", "test-cluster", "tapstate/v1",
                             List.of("password", "machine_token"));
+                    case "clusterMembers" -> new ClusterMembersOutcome.Listed(
+                            "test-cluster", 0L, List.of(), List.of());
                     case "login" -> {
                         logins.add(arguments[1] + ":" + arguments[2] + "@" + arguments[0]);
                         yield new LoginOutcome.Success("test-token");
