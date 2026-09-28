@@ -90,6 +90,7 @@ class AHundredTablesShareTheSinksWritersIT {
                                 Collectors.toSet())));
                 assertThat(tablesByBatch.values())
                         .as("every batch a writer handed its connector held rows of one table")
+                        .isNotEmpty()
                         .allSatisfy(inOneBatch -> assertThat(inOneBatch).hasSize(1));
                 assertThat(tables)
                         .as("and every table came out whole")
