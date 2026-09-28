@@ -60,25 +60,23 @@ class SessionResumePtyIT {
             import os, pty, select, signal, sys, termios, time
 
             data = os.environ.pop("TAPSTATE_PTY_INPUT").encode()
-            wait_for_password_prompt = os.environ.pop("TAPSTATE_PTY_WAIT_PASSWORD_PROMPT", "0") == "1"
+            wait_no_echo = os.environ.pop("TAPSTATE_PTY_WAIT_NO_ECHO", "0") == "1"
             pid, fd = pty.fork()
             if pid == 0:
-                # Exercise the supported basic terminal profile consistently in CI.
-                os.environ["TERM"] = "linux"
-                # Terminal query replies are input bytes without a newline. Keep echo enabled so
-                # the masked-password assertion still exercises JLine, but avoid canonical buffering.
-                attrs = termios.tcgetattr(0)
-                attrs[3] &= ~termios.ICANON
-                attrs[6][termios.VMIN] = 1
-                attrs[6][termios.VTIME] = 0
-                termios.tcsetattr(0, termios.TCSANOW, attrs)
+                if os.environ.get("TERM", "") in ("", "dumb"):
+                    os.environ["TERM"] = "linux"
                 os.execvp(sys.argv[1], sys.argv[1:])
 
             output = bytearray()
             sent = False
             status = None
-            answered_queries = set()
             deadline = time.time() + 30
+
+            def no_echo():
+                try:
+                    return not (termios.tcgetattr(fd)[3] & termios.ECHO)
+                except (OSError, termios.error):
+                    return False
 
             while time.time() < deadline:
                 readable, _, _ = select.select([fd], [], [], 0.25)
@@ -90,27 +88,7 @@ class SessionResumePtyIT {
                     if not chunk:
                         break
                     output.extend(chunk)
-                # Answer JLine's terminal probes as an ordinary Linux console would: unsupported
-                # private modes, no Kitty keyboard mode, and a basic VT100 device-attributes reply.
-                for query, response in (
-                    (b"\\x1b[?2026$p", b"\\x1b[?2026;0$y"),
-                    (b"\\x1b[?2027$p", b"\\x1b[?2027;0$y"),
-                    (b"\\x1b[?2048$p", b"\\x1b[?2048;0$y"),
-                    (b"\\x1b[?u", b"\\x1b[?0u"),
-                    (b"\\x1b[c", b"\\x1b[?1;0c"),
-                ):
-                    if query in output and query not in answered_queries:
-                        os.write(fd, response)
-                        answered_queries.add(query)
-                # JLine may emit terminal-capability probes before it has installed the reader.
-                # A password is sent only after its prompt is visible; the transcript assertion below
-                # verifies that masked input never exposes the secret.
-                ready = (
-                    b"Password: " in output
-                    if wait_for_password_prompt
-                    else b"\\x1b[?2004h>" in output
-                )
-                if not sent and ready:
+                if not sent and (no_echo() if wait_no_echo else bool(output)):
                     os.write(fd, data)
                     sent = True
                 done, child_status = os.waitpid(pid, os.WNOHANG)
@@ -120,7 +98,7 @@ class SessionResumePtyIT {
             else:
                 os.kill(pid, signal.SIGKILL)
                 _, status = os.waitpid(pid, 0)
-                reason = b" waiting for password prompt" if wait_for_password_prompt and not sent else b""
+                reason = b" waiting for terminal no-echo mode" if wait_no_echo and not sent else b""
                 output.extend(b"\\nPTY timeout" + reason + b"\\n")
 
             try:
@@ -271,7 +249,7 @@ class SessionResumePtyIT {
     }
 
     private static ProcessResult runInPty(
-            Path home, Path workspace, boolean waitForPasswordPrompt, String input, String... arguments)
+            Path home, Path workspace, boolean waitForNoEcho, String input, String... arguments)
             throws Exception {
         List<String> cli = cliCommand(home, arguments);
         List<String> command = new ArrayList<>(List.of("python3", "-c", PTY_DRIVER));
@@ -279,7 +257,7 @@ class SessionResumePtyIT {
         Path transcriptFile = Files.createTempFile(home, "tapstate-pty-", ".log");
         ProcessBuilder builder = process(command, workspace).redirectErrorStream(true);
         builder.environment().put("TAPSTATE_PTY_INPUT", input);
-        builder.environment().put("TAPSTATE_PTY_WAIT_PASSWORD_PROMPT", waitForPasswordPrompt ? "1" : "0");
+        builder.environment().put("TAPSTATE_PTY_WAIT_NO_ECHO", waitForNoEcho ? "1" : "0");
         builder.redirectOutput(transcriptFile.toFile());
         Process process = null;
         try {
