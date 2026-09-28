@@ -64,6 +64,42 @@ assert '-Dsonar.projectVersion=${GITHUB_REF_NAME#v}' in analyze
 assert 'steps.analyze.outcome' in build and 'steps.guard.outputs.run' in build
 comment=step(build,'Comment quality gate on PR')
 assert "steps.analyze.outcome != 'skipped'" in comment and 'always()' in comment
+assert 'types=BUG' not in comment, 'PR comment must not hide non-BUG findings'
+assert 'resolved=false&ps=100' in comment
+with tempfile.TemporaryDirectory() as tmp:
+    tmp=Path(tmp)
+    curl=tmp/'curl'
+    curl.write_text('''#!/usr/bin/env bash
+case "${*: -1}" in
+  *project_status*)
+    printf '%s' '{"projectStatus":{"status":"ERROR","conditions":[{"status":"ERROR","metricKey":"new_maintainability_rating","actualValue":"3","comparator":"GT","errorThreshold":"1"}]}}'
+    ;;
+  *issues/search*)
+    printf '%s' '{"issues":[{"rule":"java:S3776","severity":"CRITICAL","type":"CODE_SMELL","component":"tapstate:runtime/srs/CaptureRunUnit.java","line":164,"message":"Reduce cognitive complexity."},{"rule":"java:S2095","severity":"BLOCKER","type":"BUG","component":"tapstate:runtime/srs/Resource.java","line":20,"message":"Close the resource."},{"rule":"java:S3649","severity":"CRITICAL","type":"VULNERABILITY","component":"tapstate:runtime/srs/Query.java","line":30,"message":"Validate this query."}]}'
+    ;;
+  *) exit 2 ;;
+esac
+''')
+    curl.chmod(0o755)
+    gh=tmp/'gh'
+    gh.write_text('''#!/usr/bin/env bash
+for arg in "$@"; do
+  case "$arg" in
+    body=*) printf '%s' "${arg#body=}" > "$CAPTURED_COMMENT" ;;
+  esac
+done
+''')
+    gh.chmod(0o755)
+    captured=tmp/'captured-comment'
+    env=dict(os.environ,PATH=str(tmp)+os.pathsep+os.environ['PATH'],SONAR_TOKEN='token',
+             SONAR_HOST_URL='https://sonar.example.invalid',GH_TOKEN='token',PR_NUMBER='540',
+             GITHUB_REPOSITORY='tapstate/tapstate',CAPTURED_COMMENT=str(captured))
+    run=subprocess.run(['bash','-e','-c',script(comment)],env=env,cwd=tmp,capture_output=True,text=True)
+    assert run.returncode==0,run.stdout+run.stderr
+    body=captured.read_text()
+    assert 'Open unresolved issues:' in body
+    for finding in ['java:S3776','java:S2095','java:S3649']:
+        assert finding in body, 'PR comment omitted '+finding
 command=script(step(reporter,'Report analysis outcome'))
 with tempfile.TemporaryDirectory() as tmp:
     for build_result, enabled, outcome, expect in [
@@ -114,5 +150,5 @@ with tempfile.TemporaryDirectory() as tmp:
     recorder.write_text('#!/usr/bin/env bash\nexit 23\n')
     run=subprocess.run(['bash','-e','-c',script(analyze)],env=env,capture_output=True,text=True)
     assert run.returncode!=0, 'scanner failure was suppressed before the required check could see it'
-print('sonar-workflow smoke: 7 event/ref cases and 13 runtime cases passed')
+print('sonar-workflow smoke: 7 event/ref cases and 14 runtime cases passed')
 PY
