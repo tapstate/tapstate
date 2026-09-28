@@ -15,6 +15,8 @@ import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.SinkBatchReading;
 import io.tapstate.core.lifecycle.QueueReading;
 import io.tapstate.core.lifecycle.StageWorkReading;
+import io.tapstate.core.lifecycle.StageQueueReading;
+import io.tapstate.core.lifecycle.StageRuntimeReading;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
@@ -48,7 +50,8 @@ class AssemblyObservationPublisherTest {
         InMemoryStorePort store = new InMemoryStorePort(new InMemoryArtifactStore());
         store.state().create(PIPELINE, StateJson.of(PipelineState.RUNNING), T0);
         Engine engine = mock(Engine.class);
-        when(engine.activeWork(PIPELINE)).thenReturn(new StageWorkReading(Map.of("transform", 1L), T0));
+        when(engine.stageRuntimeReading(PIPELINE)).thenReturn(new StageRuntimeReading(
+                new StageWorkReading(Map.of("transform", 1L), T0), StageQueueReading.NONE));
         ObservationPublisher publisher = new RuntimeConvergenceConfiguration()
                 .observationPublisher(store, engine, new NoOpCaptureCoordinator());
         publisher.publish(PIPELINE);
@@ -58,7 +61,7 @@ class AssemblyObservationPublisherTest {
                     assertThat(fact.points().getFirst().value()).isEqualTo(1);
                     assertThat(fact.points().getFirst().observedAt()).isEqualTo(T0);
                 });
-        when(engine.activeWork(PIPELINE)).thenReturn(StageWorkReading.NONE);
+        when(engine.stageRuntimeReading(PIPELINE)).thenReturn(StageRuntimeReading.NONE);
         publisher.publish(PIPELINE);
         assertThat(store.observations().read(PIPELINE).orElseThrow().facts())
                 .noneMatch(fact -> fact.name().equals("tapstate.pipeline.work.active"));

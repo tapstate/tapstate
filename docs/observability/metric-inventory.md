@@ -44,6 +44,7 @@ records. An overflow point preserves the instrument's aggregate and has `otel.me
 | `tapstate.pipeline.process.active` | G / `{work}` | Processor slots currently inside those timed business units at one complete current-job collection | Fixed `stage`: 5 | Compare active work with stage duration and pipeline queue pressure |
 | `tapstate.pipeline.work.active` | G / `{work}` | Total active business slots only after every expected staged vertex is represented in the same execution collection | None: 1 | Distinguish synchronous stage work from pending asynchronous target batches |
 | `tapstate.pipeline.queue.depth`, `tapstate.pipeline.queue.capacity`, `tapstate.pipeline.queue.high_water` | G / `{item}` | Paired built-in Jet input queue size/capacity for the current job; high-water is the highest collected sample | None: 1 each; highest-value high-water overflow | Compare sampled depth with capacity and sink pending limits |
+| `tapstate.pipeline.stage.queue.depth`, `tapstate.pipeline.stage.queue.capacity`, `tapstate.pipeline.stage.queue.high_water` | G / `{item}` | Complete same-collection business-processor input queues summed by stage; peak is the highest collected stage sum in this job/execution | Fixed `stage`: 5 each; added depth/capacity, highest-value high-water overflow | Compare the stage's input occupancy with active work, duration, and downstream sink pending limits |
 | `tapstate.pipeline.sink.batch.issued` | C / `{batch}` | Actual batch handoff, not completion | None: 1 | Compare with completed output and pending batches |
 | `tapstate.pipeline.sink.batch.records` | C / `{record}` | Records handed to issued batches | None: 1 | Compare batch size and durable output |
 | `tapstate.pipeline.sink.batch.records.max` | G / `{record}` | Largest issued batch in this job | None: 1; highest-value overflow | Check whether batching reaches the configured size |
@@ -64,6 +65,12 @@ is represented by pending batches, rather than an active processor slot. Empty s
 duration. Quiet, unwired, missing-processor, mixed-execution, or incomplete stage accounts are absent.
 State-store totals likewise require every current member's complete reading from the same job execution;
 one surviving member's cost is not a pipeline total.
+
+Stage queue peaks reset with the job or physical execution. An entirely quiet queue is absent until
+occupancy has been observed; a later empty queue can report measured depth zero beside its retained
+sampled peak. Cancelled, superseded, missing, or older same-scope collections cannot restore old peaks.
+Each point keeps the actual stage collection time. These are input queues of declared business
+processors; pass-through framework queues can remain part of the separate pipeline total.
 
 ## Process facts
 
@@ -139,7 +146,6 @@ generic trustworthy source and remain absent. A shared physical snapshot call is
 subscribing pipeline's counters. Member-local connector facts cannot apportion that shared cost by
 pipeline. Use pipeline sink batch duration/pending/limit for the owning target path.
 
-Queue depth and high-water are currently pipeline totals, rather than a per-stage queue decomposition.
 Full cooperative/blocking executor saturation is unimplemented: tasklet counts, idle iterations, and a
 blocking cached pool's worker count do not supply busy time, runnable waiting, or finite pool capacity.
 Stage active work and backpressure remain accurately named pressure evidence. No automatic tuning or

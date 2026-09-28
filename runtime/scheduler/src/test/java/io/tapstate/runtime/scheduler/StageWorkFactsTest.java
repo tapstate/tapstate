@@ -3,6 +3,7 @@ package io.tapstate.runtime.scheduler;
 import io.tapstate.core.lifecycle.MetricAttributes;
 import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.StageWorkReading;
+import io.tapstate.core.lifecycle.Stage;
 import java.time.Instant;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
@@ -10,6 +11,19 @@ import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class StageWorkFactsTest {
+
+    @Test
+    void activeStagePointsUseTheFixedStageOrderDespiteReversedInputInsertion() {
+        Map<String, Long> reversed = new java.util.LinkedHashMap<>();
+        Stage[] stages = Stage.values();
+        for (int index = stages.length - 1; index >= 0; index--) {
+            reversed.put(stages[index].attributeValue(), 1L);
+        }
+        var facts = ObservationPublisher.activeWorkFacts("orders",
+                new StageWorkReading(reversed, Instant.parse("2026-09-29T08:00:00Z")));
+        assertThat(facts.getFirst().points()).extracting(point -> point.attributes().get(MetricAttributes.STAGE))
+                .containsExactly(java.util.Arrays.stream(stages).map(Stage::attributeValue).toArray(String[]::new));
+    }
 
     @Test
     void completeWorkKeepsItsActualCollectionTimeAndClosedStageLabels() {

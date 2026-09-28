@@ -129,7 +129,7 @@ class StageWorkCompletenessTest {
                 Set.of("member-a", "member-b"), NOW, 2_000);
     }
 
-    private static Map<String, String> tagsOf(Measurement reading) {
+    static Map<String, String> tagsOf(Measurement reading) {
         Map<String, String> tags = new HashMap<>();
         for (String tag : List.of(MetricTags.JOB, MetricTags.EXECUTION, MetricTags.MEMBER,
                 MetricTags.VERTEX, MetricTags.PROCESSOR, MetricTags.PROCESSOR_TYPE)) {
@@ -143,7 +143,7 @@ class StageWorkCompletenessTest {
         return tags;
     }
 
-    private static Map<String, List<Measurement>> fixture() {
+    static Map<String, List<Measurement>> fixture() {
         Map<String, List<Measurement>> fixture = new HashMap<>();
         for (int index = 0; index < 2; index++) {
             String member = index == 0 ? "member-a" : "member-b";

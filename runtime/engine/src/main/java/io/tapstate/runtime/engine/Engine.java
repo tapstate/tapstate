@@ -20,6 +20,8 @@ import io.tapstate.core.lifecycle.SinkBatchReading;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.StageReading;
 import io.tapstate.core.lifecycle.StageWorkReading;
+import io.tapstate.core.lifecycle.StageQueueReading;
+import io.tapstate.core.lifecycle.StageRuntimeReading;
 import io.tapstate.core.lifecycle.StateStoreCostReading;
 import io.tapstate.runtime.engine.StateStoreCostMetricNames.Kind;
 import io.tapstate.runtime.engine.join.JoinRecomputeMetricNames;
@@ -83,6 +85,8 @@ public final class Engine {
      */
     private final OperatorStateStores operatorStateStores;
     private final StoredCountSampler storedCountSampler;
+
+    private final StageQueueAccounts stageQueueAccounts = new StageQueueAccounts(MAX_QUEUE_ACCOUNTS);
 
     private final Map<String, QueueAccount> queueAccounts = new LinkedHashMap<>(16, 0.75f, true);
 
@@ -246,6 +250,7 @@ public final class Engine {
                 trimQueueAccounts();
             }
         }
+        stageQueueAccounts.cancel(pipelineId, job == null ? null : job.getId());
         JobFailureRegistry.of(member).clear(pipelineId);
         if (storedCountSampler != null) {
             storedCountSampler.forget(pipelineId);
@@ -608,29 +613,218 @@ public final class Engine {
 
     /** Complete current-job business work only; sampled processor slots are not scheduler utilization. */
     public StageWorkReading activeWork(String pipelineId) {
+        return stageRuntimeReading(pipelineId).activeWork();
+    }
+
+    /** Shares one complete native collection between active work and stage queue projections. */
+    public StageRuntimeReading stageRuntimeReading(String pipelineId) {
         Job job = liveJob(pipelineId);
         if (job == null || job.getStatus() != JobStatus.RUNNING) {
-            return StageWorkReading.NONE;
+            if (job == null) {
+                stageQueueAccounts.forget(pipelineId);
+            }
+            return StageRuntimeReading.NONE;
         }
         JobConfig config = job.getConfig();
         Map<String, String> expected = config.getArgument(StageWorkDag.ARGUMENT);
         Set<String> single = config.getArgument(StageWorkDag.SINGLE_ARGUMENT);
         if (expected == null || expected.isEmpty()) {
-            return StageWorkReading.NONE;
+            return StageRuntimeReading.NONE;
         }
+        StageQueueAccounts.ReadTicket ticket = stageQueueAccounts.ticket(pipelineId, job.getId());
         Set<String> members = memberIds();
         JobMetrics collected = job.getMetrics();
         Job current = liveJob(pipelineId);
         if (current == null || current.getId() != job.getId() || job.getStatus() != JobStatus.RUNNING
                 || !members.equals(memberIds())) {
-            return StageWorkReading.NONE;
+            return StageRuntimeReading.NONE;
         }
         long maxAge = Math.max(1, member.getConfig().getMetricsConfig().getCollectionFrequencySeconds()) * 2_000L;
-        return activeWorkIn(collected, job.getIdString(), expected, single == null ? Set.of() : single,
-                members, System.currentTimeMillis(), maxAge);
+        long now = System.currentTimeMillis();
+        Optional<WorkSnapshot> snapshot = validatedWorkIn(collected, job.getIdString(), expected,
+                single == null ? Set.of() : single, members, now, maxAge);
+        if (snapshot.isEmpty()) {
+            return StageRuntimeReading.NONE;
+        }
+        WorkSnapshot complete = snapshot.orElseThrow();
+        Optional<StageQueuesSample> queues = stageQueuesIn(collected, complete, job.getIdString(), members, now, maxAge);
+        if (queues.isEmpty()) {
+            return new StageRuntimeReading(complete.work(), StageQueueReading.NONE);
+        }
+        return stageQueueAccounts.accept(pipelineId, job.getId(), queues.orElseThrow(), ticket)
+                .map(reading -> new StageRuntimeReading(complete.work(), reading)).orElse(StageRuntimeReading.NONE);
     }
 
     private record WorkProcessor(String member, String vertex, String processor) { }
+
+    record WorkSnapshot(String executionId, long sampledAt, Map<String, Long> activeByStage,
+            Map<WorkProcessor, String> business, Map<WorkProcessor, Measurement> capacity,
+            Set<WorkProcessor> nativeRoster) {
+        StageWorkReading work() {
+            Map<String, Long> active = new HashMap<>(activeByStage);
+            active.values().removeIf(value -> value == 0);
+            return active.isEmpty() ? StageWorkReading.NONE
+                    : new StageWorkReading(active, Instant.ofEpochMilli(sampledAt));
+        }
+    }
+
+    record StageQueuesSample(String executionId, long sampledAt, Map<String, QueueSample> byStage) {
+        StageQueuesSample {
+            byStage = Map.copyOf(byStage);
+        }
+    }
+
+    /** A bounded process account for sampled peaks, never a source of current occupancy. */
+    static final class StageQueueAccounts {
+        private record Account(long jobId, String executionId, long sampledAt,
+                Map<String, Long> highWater, Map<String, Long> stageTimes, boolean cancelled) { }
+
+        private final int limit;
+        private final Map<String, Account> accounts = new LinkedHashMap<>(16, 0.75f, true);
+
+        static final class ReadTicket {
+            private final Account expected;
+            private ReadTicket(Account expected) { this.expected = expected; }
+        }
+
+        StageQueueAccounts(int limit) {
+            if (limit < 1) {
+                throw new IllegalArgumentException("stage queue account limit must be positive");
+            }
+            this.limit = limit;
+        }
+
+        synchronized Optional<StageQueueReading> accept(String pipeline, long jobId, StageQueuesSample sample) {
+            return accept(pipeline, jobId, sample, ticket(pipeline, jobId));
+        }
+
+        synchronized ReadTicket ticket(String pipeline, long jobId) {
+            Account current = accounts.get(pipeline);
+            if (current == null) {
+                current = new Account(jobId, "", 0, Map.of(), Map.of(), false);
+                accounts.put(pipeline, current);
+                trim();
+            }
+            return new ReadTicket(current);
+        }
+
+        synchronized Optional<StageQueueReading> accept(String pipeline, long jobId, StageQueuesSample sample,
+                ReadTicket ticket) {
+            Account previous = accounts.get(pipeline);
+            if (previous != ticket.expected || previous.cancelled() && previous.jobId() == jobId) {
+                return Optional.empty();
+            }
+            boolean same = previous != null && !previous.cancelled() && previous.jobId() == jobId
+                    && previous.executionId().equals(sample.executionId());
+            if (same && sample.sampledAt() < previous.sampledAt()) {
+                return Optional.empty();
+            }
+            Map<String, Long> highs = new HashMap<>(same ? previous.highWater() : Map.of());
+            Map<String, Long> times = new HashMap<>();
+            Map<String, StageQueueReading.Sample> output = new HashMap<>();
+            for (Map.Entry<String, QueueSample> entry : sample.byStage().entrySet()) {
+                String stage = entry.getKey();
+                QueueSample queue = entry.getValue();
+                if (same && previous.stageTimes().getOrDefault(stage, 0L) > queue.sampledAt()) {
+                    return Optional.empty();
+                }
+                long high = Math.max(highs.getOrDefault(stage, 0L), queue.depth());
+                highs.put(stage, high);
+                times.put(stage, queue.sampledAt());
+                if (high > 0) {
+                    output.put(stage, new StageQueueReading.Sample(
+                            new QueueReading(queue.depth(), queue.capacity(), high), Instant.ofEpochMilli(queue.sampledAt())));
+                }
+            }
+            highs.keySet().retainAll(sample.byStage().keySet());
+            accounts.put(pipeline, new Account(jobId, sample.executionId(), sample.sampledAt(),
+                    Map.copyOf(highs), Map.copyOf(times), false));
+            trim();
+            return Optional.of(output.isEmpty() ? StageQueueReading.NONE : new StageQueueReading(output));
+        }
+
+        synchronized void cancel(String pipeline, Long jobId) {
+            Account previous = accounts.get(pipeline);
+            Long fenced = jobId != null ? jobId : previous == null ? null : previous.jobId();
+            if (fenced != null) {
+                accounts.put(pipeline, new Account(fenced, "", Long.MAX_VALUE, Map.of(), Map.of(), true));
+                trim();
+            }
+        }
+
+        synchronized void forget(String pipeline) {
+            Account previous = accounts.get(pipeline);
+            if (previous != null && !previous.cancelled()) {
+                accounts.remove(pipeline);
+            }
+        }
+
+        private void trim() {
+            if (accounts.size() > limit) {
+                accounts.remove(accounts.keySet().iterator().next());
+            }
+        }
+
+        synchronized int size() {
+            return accounts.size();
+        }
+    }
+
+    /** Adds native input queues only after their business roster and collection identity are complete. */
+    static Optional<StageQueuesSample> stageQueuesIn(JobMetrics collected, WorkSnapshot snapshot, String jobId,
+            Set<String> members, long now, long maxAge) {
+        Map<WorkProcessor, Measurement> sizes = new HashMap<>();
+        Set<String> vertices = snapshot.business().keySet().stream().map(WorkProcessor::vertex).collect(Collectors.toSet());
+        for (Measurement reading : collected.get(MetricNames.QUEUES_SIZE)) {
+            String vertex = reading.tag(MetricTags.VERTEX);
+            if (vertex == null) {
+                return Optional.empty();
+            }
+            if (!vertices.contains(vertex)) {
+                continue;
+            }
+            WorkProcessor key = workProcessor(reading, jobId, snapshot.executionId(), members, now, Long.MAX_VALUE);
+            if (key == null) {
+                return Optional.empty();
+            }
+            if (!snapshot.business().containsKey(key)) {
+                if (!snapshot.nativeRoster().contains(key)) {
+                    return Optional.empty();
+                }
+                continue;
+            }
+            Measurement capacity = snapshot.capacity().get(key);
+            if (!freshWorkReading(reading, now, maxAge) || reading.timestamp() != capacity.timestamp()
+                    || reading.value() < 0 || capacity.value() < 0 || reading.value() > capacity.value()
+                    || sizes.putIfAbsent(key, reading) != null) {
+                return Optional.empty();
+            }
+        }
+        if (!sizes.keySet().equals(snapshot.business().keySet())) {
+            return Optional.empty();
+        }
+        Map<String, Long> depth = new HashMap<>();
+        Map<String, Long> capacity = new HashMap<>();
+        Map<String, Long> sampledAt = new HashMap<>();
+        try {
+            for (Map.Entry<WorkProcessor, String> entry : snapshot.business().entrySet()) {
+                Measurement slot = snapshot.capacity().get(entry.getKey());
+                if (slot.value() == 0) {
+                    continue;
+                }
+                String stage = entry.getValue();
+                depth.merge(stage, sizes.get(entry.getKey()).value(), Math::addExact);
+                capacity.merge(stage, slot.value(), Math::addExact);
+                sampledAt.merge(stage, slot.timestamp(), Math::min);
+            }
+        } catch (ArithmeticException overflow) {
+            return Optional.empty();
+        }
+        Map<String, QueueSample> output = new HashMap<>();
+        depth.forEach((stage, value) -> output.put(stage,
+                new QueueSample(snapshot.executionId(), value, capacity.get(stage), sampledAt.get(stage))));
+        return Optional.of(new StageQueuesSample(snapshot.executionId(), snapshot.sampledAt(), output));
+    }
 
     static StageWorkReading activeWorkIn(JobMetrics collected, String jobId, Map<String, String> expected,
             Set<String> members, long now, long maxAge) {
@@ -639,10 +833,16 @@ public final class Engine {
 
     static StageWorkReading activeWorkIn(JobMetrics collected, String jobId, Map<String, String> expected,
             Set<String> single, Set<String> members, long now, long maxAge) {
+        return validatedWorkIn(collected, jobId, expected, single, members, now, maxAge)
+                .map(WorkSnapshot::work).orElse(StageWorkReading.NONE);
+    }
+
+    static Optional<WorkSnapshot> validatedWorkIn(JobMetrics collected, String jobId, Map<String, String> expected,
+            Set<String> single, Set<String> members, long now, long maxAge) {
         if (expected.isEmpty() || members.isEmpty()
                 || !expected.keySet().containsAll(single)
                 || expected.values().stream().anyMatch(stage -> !Stage.attributeValues().contains(stage))) {
-            return StageWorkReading.NONE;
+            return Optional.empty();
         }
         String execution = null;
         Set<String> reportingMembers = new java.util.HashSet<>();
@@ -654,27 +854,27 @@ public final class Engine {
                     || observedExecution == null || reading.timestamp() <= 0
                     || !reportingMembers.add(source)
                     || execution != null && !execution.equals(observedExecution)) {
-                return StageWorkReading.NONE;
+                return Optional.empty();
             }
             execution = observedExecution;
             collectionTimes.put(source, reading.timestamp());
         }
         if (execution == null) {
-            return StageWorkReading.NONE;
+            return Optional.empty();
         }
         Map<WorkProcessor, Measurement> roster = new HashMap<>();
         Map<String, List<WorkProcessor>> byVertex = new HashMap<>();
         for (Measurement reading : collected.get(MetricNames.QUEUES_CAPACITY)) {
             String vertex = reading.tag(MetricTags.VERTEX);
             if (vertex == null) {
-                return StageWorkReading.NONE;
+                return Optional.empty();
             }
             if (!expected.containsKey(vertex)) {
                 continue;
             }
             WorkProcessor key = workProcessor(reading, jobId, execution, members, now, Long.MAX_VALUE);
             if (key == null || roster.putIfAbsent(key, reading) != null) {
-                return StageWorkReading.NONE;
+                return Optional.empty();
             }
             byVertex.computeIfAbsent(vertex, ignored -> new ArrayList<>()).add(key);
         }
@@ -687,7 +887,7 @@ public final class Engine {
             for (Measurement reading : collected.get(name)) {
                 String vertex = reading.tag(MetricTags.VERTEX);
                 if (vertex == null) {
-                    return StageWorkReading.NONE;
+                    return Optional.empty();
                 }
                 String stage = expected.get(vertex);
                 if (stage == null) {
@@ -698,12 +898,14 @@ public final class Engine {
                         || !stage.equals(part.stage()) || !roster.containsKey(key)
                         || parts.computeIfAbsent(key, ignored -> new HashMap<>())
                                 .putIfAbsent(part.kind(), reading) != null) {
-                    return StageWorkReading.NONE;
+                    return Optional.empty();
                 }
             }
         }
         Map<String, Long> byStage = new HashMap<>();
         long oldest = Long.MAX_VALUE;
+        Map<WorkProcessor, String> business = new HashMap<>();
+        Map<WorkProcessor, Measurement> businessCapacity = new HashMap<>();
         for (Map.Entry<String, String> vertex : expected.entrySet()) {
             boolean pinned = single.contains(vertex.getKey());
             List<WorkProcessor> processors = byVertex.getOrDefault(vertex.getKey(), List.of());
@@ -717,14 +919,14 @@ public final class Engine {
                 Measurement slot = roster.get(key);
                 try {
                     if (!indexes.add(Integer.parseInt(key.processor()))) {
-                        return StageWorkReading.NONE;
+                        return Optional.empty();
                     }
                 } catch (NumberFormatException invalid) {
-                    return StageWorkReading.NONE;
+                    return Optional.empty();
                 }
                 Map<String, Measurement> measured = parts.get(key);
                 if (measured == null || measured.size() != 4) {
-                    return StageWorkReading.NONE;
+                    return Optional.empty();
                 }
                 long timestamp = measured.get(JetStageGauge.ACTIVE).timestamp();
                 if (measured.values().stream().anyMatch(value -> value.timestamp() != timestamp)
@@ -732,29 +934,30 @@ public final class Engine {
                         || !freshWorkReading(slot, now, maxAge)
                         || slot.timestamp() != timestamp || measured.get(JetStageGauge.READY).value() != 1
                         || measured.get(JetStageGauge.MEMBERS).value() != members.size()) {
-                    return StageWorkReading.NONE;
+                    return Optional.empty();
                 }
                 long count = measured.get(JetStageGauge.EXPECTED).value();
                 if (count <= 0 || pinned && count != 1 || declared != -1 && declared != count) {
-                    return StageWorkReading.NONE;
+                    return Optional.empty();
                 }
                 declared = count;
                 long active = measured.get(JetStageGauge.ACTIVE).value();
                 if (active < 0 || active > 1) {
-                    return StageWorkReading.NONE;
+                    return Optional.empty();
                 }
                 byStage.merge(vertex.getValue(), active, Long::sum);
+                business.put(key, vertex.getValue());
+                businessCapacity.put(key, slot);
                 oldest = Math.min(oldest, timestamp);
             }
             int limit = pinned ? members.size() : processors.size();
             if (declared != processors.size() || indexes.size() != declared
                     || indexes.stream().anyMatch(index -> index < 0 || index >= limit)) {
-                return StageWorkReading.NONE;
+                return Optional.empty();
             }
         }
-        byStage.values().removeIf(value -> value == 0);
-        return byStage.isEmpty() ? StageWorkReading.NONE
-                : new StageWorkReading(byStage, Instant.ofEpochMilli(oldest));
+        return Optional.of(new WorkSnapshot(execution, oldest, Map.copyOf(byStage),
+                Map.copyOf(business), Map.copyOf(businessCapacity), Set.copyOf(roster.keySet())));
     }
 
     private static WorkProcessor workProcessor(Measurement reading, String job, String execution,

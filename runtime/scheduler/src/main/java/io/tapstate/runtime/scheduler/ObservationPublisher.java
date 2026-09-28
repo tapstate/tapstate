@@ -22,6 +22,9 @@ import io.tapstate.core.lifecycle.SinkBatchReading;
 import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.core.lifecycle.StageReading;
 import io.tapstate.core.lifecycle.StageWorkReading;
+import io.tapstate.core.lifecycle.StageQueueReading;
+import io.tapstate.core.lifecycle.StageRuntimeReading;
+import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.StateStoreCostReading;
 import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.core.lifecycle.StateJson;
@@ -399,7 +402,12 @@ public final class ObservationPublisher {
     private final Function<String, CaptureReading> captures;
     private final Function<String, DeliveryReading> deliveries;
     private final Function<String, StageReading> stages;
-    private final Function<String, StageWorkReading> activeWork;
+    @FunctionalInterface
+    public interface StageRuntimeFacts {
+        StageRuntimeReading read(String pipelineId);
+    }
+
+    private final StageRuntimeFacts stageRuntime;
     private final Function<String, SinkBatchReading> sinkBatches;
     private final Function<String, Optional<QueueReading>> queues;
     private final Function<String, Map<String, StateStoreCostReading>> stateCosts;
@@ -761,7 +769,7 @@ public final class ObservationPublisher {
         this(state, observations, recordCounts, positions, snapshots, frontierGaps, nestStateReadings,
                 coldLayer, frontierStalls, frontierStall, nestDeadLetters, joinRecomputeDone,
                 joinRecomputeExpected, captures, deliveries, stages, sinkBatches, queues, stateCosts,
-                id -> StageWorkReading.NONE, clock);
+                (Function<String, StageWorkReading>) id -> StageWorkReading.NONE, clock);
     }
 
     /** Also consumes complete current-job active business-work readings. */
@@ -777,7 +785,26 @@ public final class ObservationPublisher {
             Function<String, SinkBatchReading> sinkBatches, Function<String, Optional<QueueReading>> queues,
             Function<String, Map<String, StateStoreCostReading>> stateCosts,
             Function<String, StageWorkReading> activeWork, Clock clock) {
-        this.activeWork = Objects.requireNonNull(activeWork, "activeWork");
+        this(state, observations, recordCounts, positions, snapshots, frontierGaps, nestStateReadings,
+                coldLayer, frontierStalls, frontierStall, nestDeadLetters, joinRecomputeDone,
+                joinRecomputeExpected, captures, deliveries, stages, sinkBatches, queues, stateCosts,
+                workOnly(activeWork), clock);
+    }
+
+    /** Reads active work and stage queues from one complete native job collection. */
+    public ObservationPublisher(StateStore state, ObservationStore observations,
+            Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
+            Function<String, SnapshotReading> snapshots, Function<String, Map<String, Long>> frontierGaps,
+            Function<String, Map<String, NestStateReading>> nestStateReadings, NestColdLayerWatch coldLayer,
+            Function<String, Map<String, Long>> frontierStalls, FrontierStallWatch frontierStall,
+            Function<String, Map<String, Long>> nestDeadLetters,
+            Function<String, Map<String, Long>> joinRecomputeDone,
+            Function<String, Map<String, Long>> joinRecomputeExpected, Function<String, CaptureReading> captures,
+            Function<String, DeliveryReading> deliveries, Function<String, StageReading> stages,
+            Function<String, SinkBatchReading> sinkBatches, Function<String, Optional<QueueReading>> queues,
+            Function<String, Map<String, StateStoreCostReading>> stateCosts,
+            StageRuntimeFacts stageRuntime, Clock clock) {
+        this.stageRuntime = Objects.requireNonNull(stageRuntime, "stageRuntime");
         this.captures = Objects.requireNonNull(captures, "captures");
         this.deliveries = Objects.requireNonNull(deliveries, "deliveries");
         this.stages = Objects.requireNonNull(stages, "stages");
@@ -802,6 +829,11 @@ public final class ObservationPublisher {
         this.coldLayer = Objects.requireNonNull(coldLayer, "coldLayer");
         this.frontierStalls = Objects.requireNonNull(frontierStalls, "frontierStalls");
         this.frontierStall = Objects.requireNonNull(frontierStall, "frontierStall");
+    }
+
+    private static StageRuntimeFacts workOnly(Function<String, StageWorkReading> activeWork) {
+        Objects.requireNonNull(activeWork, "activeWork");
+        return id -> new StageRuntimeReading(activeWork.apply(id), StageQueueReading.NONE);
     }
 
     /**
@@ -1168,7 +1200,11 @@ public final class ObservationPublisher {
         movement(pipelineId, at, captures.apply(pipelineId), deliveries.apply(pipelineId))
                 .forEach(facts::add);
         spent(pipelineId, at, stages.apply(pipelineId)).ifPresent(facts::add);
-        facts.addAll(activeWorkFacts(pipelineId, activeWork.apply(pipelineId)));
+        StageRuntimeReading runtime = stageRuntime.read(pipelineId);
+        if (runtime != null) {
+            facts.addAll(activeWorkFacts(pipelineId, runtime.activeWork()));
+            facts.addAll(stageQueueFacts(pipelineId, runtime.queues()));
+        }
         sinkBatchFacts(pipelineId, at, sinkBatches.apply(pipelineId)).forEach(facts::add);
         queues.apply(pipelineId).ifPresent(reading -> queueFacts(pipelineId, at, reading).forEach(facts::add));
         load(pipelineId, at, loaded).forEach(facts::add);
@@ -1177,14 +1213,39 @@ public final class ObservationPublisher {
 
     static List<MetricFact> activeWorkFacts(String pipelineId, StageWorkReading work) {
         if (work != null && !work.activeByStage().isEmpty()) {
-            List<MetricPoint> active = work.activeByStage().entrySet().stream().map(entry ->
-                    MetricPoint.reading(Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, STAGE_ATTRIBUTE, entry.getKey()),
-                            work.observedAt(), entry.getValue())).toList();
+            List<MetricPoint> active = java.util.Arrays.stream(Stage.values())
+                    .map(Stage::attributeValue).filter(work.activeByStage()::containsKey)
+                    .map(stage -> MetricPoint.reading(Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, STAGE_ATTRIBUTE, stage),
+                            work.observedAt(), work.activeByStage().get(stage))).toList();
             return List.of(new MetricFact("tapstate.pipeline.process.active", MetricType.GAUGE, "{work}", active),
                     MetricFact.single("tapstate.pipeline.work.active", MetricType.GAUGE, "{work}",
                             MetricPoint.reading(Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId), work.observedAt(), work.totalActive())));
         }
         return List.of();
+    }
+
+    static List<MetricFact> stageQueueFacts(String pipelineId, StageQueueReading queues) {
+        if (queues == null || queues.byStage().isEmpty()) {
+            return List.of();
+        }
+        List<MetricPoint> depth = new ArrayList<>();
+        List<MetricPoint> capacity = new ArrayList<>();
+        List<MetricPoint> high = new ArrayList<>();
+        for (Stage kind : Stage.values()) {
+            String stage = kind.attributeValue();
+            StageQueueReading.Sample sample = queues.byStage().get(stage);
+            if (sample == null) {
+                continue;
+            }
+            Map<String, String> attributes = Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, STAGE_ATTRIBUTE, stage);
+            depth.add(MetricPoint.reading(attributes, sample.observedAt(), sample.queue().depth()));
+            capacity.add(MetricPoint.reading(attributes, sample.observedAt(), sample.queue().capacity()));
+            high.add(MetricPoint.reading(attributes, sample.observedAt(), sample.queue().highWater()));
+        }
+        return List.of(
+                new MetricFact("tapstate.pipeline.stage.queue.depth", MetricType.GAUGE, "{item}", depth),
+                new MetricFact("tapstate.pipeline.stage.queue.capacity", MetricType.GAUGE, "{item}", capacity),
+                new MetricFact("tapstate.pipeline.stage.queue.high_water", MetricType.GAUGE, "{item}", high));
     }
 
     static List<MetricFact> stateCostFacts(String pipelineId, Instant at,
