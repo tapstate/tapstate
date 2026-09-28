@@ -63,13 +63,21 @@ class SessionResumePtyIT {
             wait_no_echo = os.environ.pop("TAPSTATE_PTY_WAIT_NO_ECHO", "0") == "1"
             pid, fd = pty.fork()
             if pid == 0:
-                if os.environ.get("TERM", "") in ("", "dumb"):
-                    os.environ["TERM"] = "linux"
+                # Exercise the supported basic terminal profile consistently in CI.
+                os.environ["TERM"] = "linux"
+                # Terminal query replies are input bytes without a newline. Keep echo enabled so
+                # the masked-password assertion still exercises JLine, but avoid canonical buffering.
+                attrs = termios.tcgetattr(0)
+                attrs[3] &= ~termios.ICANON
+                attrs[6][termios.VMIN] = 1
+                attrs[6][termios.VTIME] = 0
+                termios.tcsetattr(0, termios.TCSANOW, attrs)
                 os.execvp(sys.argv[1], sys.argv[1:])
 
             output = bytearray()
             sent = False
             status = None
+            answered_queries = set()
             deadline = time.time() + 30
 
             def no_echo():
@@ -88,7 +96,20 @@ class SessionResumePtyIT {
                     if not chunk:
                         break
                     output.extend(chunk)
-                if not sent and (no_echo() if wait_no_echo else bool(output)):
+                # Answer JLine's terminal probes as an ordinary Linux console would: unsupported
+                # private modes, no Kitty keyboard mode, and a basic VT100 device-attributes reply.
+                for query, response in (
+                    (b"\\x1b[?2026$p", b"\\x1b[?2026;0$y"),
+                    (b"\\x1b[?2027$p", b"\\x1b[?2027;0$y"),
+                    (b"\\x1b[?2048$p", b"\\x1b[?2048;0$y"),
+                    (b"\\x1b[?u", b"\\x1b[?0u"),
+                    (b"\\x1b[c", b"\\x1b[?1;0c"),
+                ):
+                    if query in output and query not in answered_queries:
+                        os.write(fd, response)
+                        answered_queries.add(query)
+                ready = no_echo() if wait_no_echo else b"\\x1b[?2004h>" in output
+                if not sent and ready:
                     os.write(fd, data)
                     sent = True
                 done, child_status = os.waitpid(pid, os.WNOHANG)
