@@ -67,6 +67,7 @@ class TargetTapTableTest {
     @Test
     void oldAndIncompleteDecimalModelsRequireRediscovery() {
         for (var target : List.of(
+                new TargetField("amount", null, false, io.tapstate.core.common.TapstateType.DECIMAL),
                 new TargetField("amount", "source_decimal", false, io.tapstate.core.common.TapstateType.DECIMAL),
                 new TargetField("amount", "source_decimal", false, io.tapstate.core.common.TapstateType.DECIMAL,
                         new io.tapstate.core.common.NumericType(null, true, null, null, null, null, 18, 4)))) {
