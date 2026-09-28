@@ -93,6 +93,9 @@ An interrupted or stale publish leaves the last committed observation and its or
 visible. Normal advancing inline writes use one conditional Mongo update. The first format transition
 checks and fences any legacy latest document in a bounded transaction; an incomplete transition keeps
 that legacy value readable under the existing identity checks.
+Once scoped current authority is committed, removing its descriptor does not revive the old value.
+Compatibility writes remain behind that authority. Legacy deletion and residue tracking commit
+together, so an empty unowned manifest can be removed after its legacy residue is gone.
 
 Readers verify the committed payload's version, order, byte count and digests before returning it.
 Missing or corrupt committed chunks produce `io.document-unreadable`; they do not expose a partial

@@ -770,7 +770,7 @@ final class TelemetryDispatcher implements AutoCloseable {
             workers.execute(() -> {
                 if (!stats.allow()) {
                     stats.dropped();
-                    dropped(onDrop, sink.name(), pipelineId);
+                    dropped(onDrop, sink.name().toLowerCase(java.util.Locale.ROOT), pipelineId);
                     boundaryFailed(pipelineId, scope, sink);
                     return;
                 }
@@ -784,7 +784,8 @@ final class TelemetryDispatcher implements AutoCloseable {
                 } catch (RuntimeException failed) {
                     stats.completed(operation, false);
                     boundaryFailed(pipelineId, scope, sink);
-                    LOG.warn("Could not write {} telemetry for pipeline {}", sink, pipelineId, failed);
+                    LOG.warn("Could not write {} telemetry for pipeline {}",
+                            sink.name().toLowerCase(java.util.Locale.ROOT), pipelineId, failed);
                 } catch (Error defect) {
                     stats.completed(operation, false);
                     throw defect;
@@ -793,9 +794,10 @@ final class TelemetryDispatcher implements AutoCloseable {
             stats.queueDepth(workers.getQueue().size());
         } catch (java.util.concurrent.RejectedExecutionException saturated) {
             stats.dropped();
-            dropped(onDrop, sink.name(), pipelineId);
+            dropped(onDrop, sink.name().toLowerCase(java.util.Locale.ROOT), pipelineId);
             boundaryFailed(pipelineId, scope, sink);
-            LOG.warn("{} telemetry for pipeline {} was dropped: queue is full", sink, pipelineId);
+            LOG.warn("{} telemetry for pipeline {} was dropped: queue is full",
+                    sink.name().toLowerCase(java.util.Locale.ROOT), pipelineId);
         }
     }
 
