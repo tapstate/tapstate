@@ -124,6 +124,7 @@ try:
         "pipeline_metrics",
         "pipeline_metrics_history",
         "pipeline_snapshot",
+        "project_list",
         "pipeline_status",
         "source_draft",
         "source_list",
