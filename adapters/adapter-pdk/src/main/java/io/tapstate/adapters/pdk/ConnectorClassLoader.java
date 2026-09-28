@@ -90,16 +90,17 @@ public final class ConnectorClassLoader implements AutoCloseable {
     }
 
     /**
-     * A connector's jar, with every resource read through a file of the read's own.
+     * A connector's jar, whose close reaches no read but the loader's own.
      *
-     * <p>{@link URLClassLoader#getResourceAsStream} opens a resource through a connection that shares one
-     * cached jar file per jar path with every other loader in the process, and records that file as the
-     * loader's own, so {@link URLClassLoader#close()} closes it. Two connectors over the same jar - the two
-     * sources of one pipeline - then read through one file, and closing the first closes it under the second:
-     * a resource the second is part way through fails with "Stream closed". A driver reading its messages in
-     * a static initializer fails that initializer, and a class whose initializer failed stays unusable in its
-     * loader, so the connector cannot connect at all. Read uncached, each stream opens the jar for itself and
-     * closes it with the stream, and no loader's close reaches another's read.
+     * <p>A resource read through its URL - the way a resource bundle loads its text - goes through one cached
+     * jar file per jar path, shared by every reader in the process. {@link URLClassLoader#getResourceAsStream}
+     * reads through that same shared file and records it as the loader's own, so {@link URLClassLoader#close()}
+     * closes it under every other reader. Two connectors over the same jar - the two sources of one pipeline -
+     * then meet: closing the first ends a read the second is part way through with "Stream closed". A driver
+     * reading its messages in a static initializer fails that initializer, and a class whose initializer
+     * failed stays unusable in its loader, so the connector cannot connect at all. Read uncached here, each of
+     * this loader's streams opens the jar for itself and closes it with the stream; the loader records nothing
+     * it does not own, and the shared file stays open for the readers sharing it.
      */
     private static final class ConnectorJarLoader extends URLClassLoader {
 

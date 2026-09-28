@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.InputStream;
+import java.net.URLConnection;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
@@ -102,30 +103,63 @@ class ConnectorClassLoaderTest {
                 .isInstanceOf(ClassNotFoundException.class);
     }
 
+    /** A resource long enough that reading it spans several reads of the jar. */
+    private static final byte[] MESSAGES = "message.key=a message text long enough to span several reads\n"
+            .repeat(1024).getBytes(StandardCharsets.ISO_8859_1);
+
+    private static final String MESSAGES_ENTRY = "synthetic/messages.properties";
+
+    /** A jar holding a class, to open a loader through, and {@link #MESSAGES}. */
+    private static Path messagesJar(Path dir) {
+        return SyntheticJar.jarWithEntries(dir, Map.of(
+                "synthetic/Widget.class", SyntheticJar.classBytes(dir, "synthetic.Widget",
+                        "package synthetic; public class Widget { }"),
+                MESSAGES_ENTRY, MESSAGES), Map.of());
+    }
+
     /**
-     * Two connectors over one jar - the two sources of one pipeline, say - each read a resource through a
-     * file of its own, so closing one while the other is part way through a resource leaves that read whole.
-     * Read through a file both shared, the close ended the other read with "Stream closed", and a driver
-     * that loads its messages that way in a static initializer failed it for good.
+     * Two connectors over one jar - the two sources of one pipeline, say: closing one while the other is part
+     * way through a resource leaves that read whole. Both reading through one file the first had recorded as
+     * its own, the close ended the other read with "Stream closed", and a driver that loads its messages in a
+     * static initializer failed it for good.
      */
     @Test
     void closingOneConnectorLeavesAResourceAnotherIsReadingWhole(@TempDir Path dir) throws Exception {
-        byte[] messages = "message.key=a message text long enough to span several reads\n"
-                .repeat(1024).getBytes(StandardCharsets.ISO_8859_1);
-        Path jar = SyntheticJar.jarWithEntries(dir, Map.of(
-                "synthetic/Widget.class", SyntheticJar.classBytes(dir, "synthetic.Widget",
-                        "package synthetic; public class Widget { }"),
-                "synthetic/messages.properties", messages), Map.of());
+        Path jar = messagesJar(dir);
         ConnectorClassLoader first = ConnectorClassLoader.open(List.of(jar));
         try (ConnectorClassLoader second = ConnectorClassLoader.open(List.of(jar))) {
             ClassLoader firstLoader = first.load("synthetic.Widget").getClassLoader();
             ClassLoader secondLoader = second.load("synthetic.Widget").getClassLoader();
-            try (InputStream earlier = firstLoader.getResourceAsStream("synthetic/messages.properties")) {
-                assertThat(earlier.readAllBytes()).hasSize(messages.length);
+            try (InputStream earlier = firstLoader.getResourceAsStream(MESSAGES_ENTRY)) {
+                assertThat(earlier.readAllBytes()).hasSize(MESSAGES.length);
             }
-            try (InputStream reading = secondLoader.getResourceAsStream("synthetic/messages.properties")) {
+            try (InputStream reading = secondLoader.getResourceAsStream(MESSAGES_ENTRY)) {
                 first.close();
-                assertThat(reading.readAllBytes()).isEqualTo(messages);
+                assertThat(reading.readAllBytes()).isEqualTo(MESSAGES);
+            }
+        }
+    }
+
+    /**
+     * The same meeting, with the second read made the way a resource bundle makes it: through the resource's
+     * URL, over the jar file the whole process shares - the MySQL driver's messages load this way. Closing a
+     * connector that had read a resource of the jar itself closed that shared file under the read.
+     */
+    @Test
+    void closingOneConnectorLeavesAReadThroughTheSharedJarFileWhole(@TempDir Path dir) throws Exception {
+        Path jar = messagesJar(dir);
+        ConnectorClassLoader first = ConnectorClassLoader.open(List.of(jar));
+        try (ConnectorClassLoader second = ConnectorClassLoader.open(List.of(jar))) {
+            ClassLoader firstLoader = first.load("synthetic.Widget").getClassLoader();
+            ClassLoader secondLoader = second.load("synthetic.Widget").getClassLoader();
+            try (InputStream earlier = firstLoader.getResourceAsStream(MESSAGES_ENTRY)) {
+                assertThat(earlier.readAllBytes()).hasSize(MESSAGES.length);
+            }
+            URLConnection shared = secondLoader.getResource(MESSAGES_ENTRY).openConnection();
+            assertThat(shared.getUseCaches()).as("the read goes through the shared file").isTrue();
+            try (InputStream reading = shared.getInputStream()) {
+                first.close();
+                assertThat(reading.readAllBytes()).isEqualTo(MESSAGES);
             }
         }
     }
