@@ -353,10 +353,7 @@ public class CsvConnector implements TapConnector {
                     consumer.accept(fresh, null);
                 }
             }
-            try {
-                Thread.sleep(POLL_MILLIS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+            if (!pausedBetweenPolls(POLL_MILLIS)) {
                 break;
             }
         }
@@ -801,14 +798,28 @@ public class CsvConnector implements TapConnector {
                 if (System.currentTimeMillis() > deadline) {
                     throw new IllegalStateException("a held resource read was never told to go on");
                 }
-                Thread.sleep(20);
+                if (!pausedBetweenPolls(20)) {
+                    throw new IllegalStateException("a held resource read was interrupted");
+                }
             }
             in.readAllBytes();
         } catch (IOException failure) {
             throw new UncheckedIOException("reading this connector's own " + resource, failure);
+        }
+    }
+
+    /**
+     * The one pause this connector takes, between two looks at something it is waiting for: the tail's next
+     * look at its files, and a held read's next look for the signal to go on. Answers false when interrupted,
+     * with the interrupt kept for whoever asks next.
+     */
+    private static boolean pausedBetweenPolls(long millis) {
+        try {
+            Thread.sleep(millis);
+            return true;
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
-            throw new IllegalStateException("a held resource read was interrupted", interrupted);
+            return false;
         }
     }
 
