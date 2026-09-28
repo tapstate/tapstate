@@ -11,6 +11,7 @@ import org.bson.Document;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowable;
@@ -140,6 +141,30 @@ class MongoArtifactStoreTest {
                     .as("a stored %s reconstructs to the same canonical form", fixture.label())
                     .isEqualTo(canonical);
         }
+    }
+
+    @Test
+    void managedAttributionSurvivesTheStructuredMongoDocumentRoundTrip() {
+        Resource attributed = PARSER.parse("""
+                version: tapstate/v1
+                kind: source
+                id: cloud_source
+                metadata:
+                  cloud: true
+                  user_id: cloud-user-7
+                connector: mongodb-atlas
+                config: {}
+                """);
+
+        Document document = MongoArtifactStore.toDocument(attributed);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> metadata = (Map<String, Object>) document.get("body", Document.class).get("metadata");
+        Resource reconstructed = MongoArtifactStore.toResource(document);
+
+        assertThat(metadata.get("cloud")).isEqualTo(true);
+        assertThat(metadata.get("user_id")).isEqualTo("cloud-user-7");
+        assertThat(reconstructed.metadata().cloud()).isTrue();
+        assertThat(reconstructed.metadata().userId()).isEqualTo("cloud-user-7");
     }
 
     @Test

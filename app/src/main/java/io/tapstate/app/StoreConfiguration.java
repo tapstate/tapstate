@@ -29,14 +29,14 @@ import org.springframework.context.annotation.Import;
  */
 @Configuration
 @EnableConfigurationProperties({MongoProperties.class, MetricsHistoryProperties.class})
-@Import(ClusterMembershipConfiguration.class)
+@Import({ClusterMembershipConfiguration.class, CloudRuntimeConfiguration.class})
 class StoreConfiguration {
 
     @Bean(destroyMethod = "close")
     @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
-    MongoConnection storeConnection(MongoProperties properties) {
+    MongoConnection storeConnection(MongoProperties properties, CloudRuntimeSettings cloud) {
         MongoConnection connection = new MongoConnection(new MongoConnectionSettings(
-                properties.getUri(), properties.getTlsCaFile(),
+                cloud.metadataUri(properties.getUri()), properties.getTlsCaFile(),
                 properties.getServerSelectionTimeout()));
         // Fail fast at startup: a coded diagnostic surfaces through CodedFailureAnalyzer if the
         // store is unreachable or is not a replica-set, rather than a bare driver stack trace.

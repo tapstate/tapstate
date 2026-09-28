@@ -57,6 +57,9 @@ public enum ControlError implements TapstateErrorCode {
      */
     AUTH_FAILED("control.auth-failed", Set.of()),
 
+    /** The caller reached an authentication flow that the selected deployment mode does not expose. */
+    AUTH_MODE_UNAVAILABLE("control.auth-mode-unavailable", Set.of("mode")),
+
     /**
      * A protected operation was reached with no valid credential — none was presented, or the one
      * presented is malformed, unknown, revoked, expired or unsigned. It carries no placeholder on

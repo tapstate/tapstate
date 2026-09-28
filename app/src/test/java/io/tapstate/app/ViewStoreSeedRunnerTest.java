@@ -33,6 +33,25 @@ class ViewStoreSeedRunnerTest {
     }
 
     @Test
+    void cloudAssemblyDerivesTheManagedViewStoreFromTheAtlasMetadataUri() {
+        InMemoryStorePort store = new InMemoryStorePort();
+        MongoProperties mongo = new MongoProperties();
+        CloudProperties properties = new CloudProperties();
+        properties.setBaseUrl("https://cloud.example");
+        properties.setToken("sentinel-token");
+        properties.setAtlasUri("mongodb+srv://user:sentinel-password@atlas.example/metadata");
+
+        new ControlPlaneConfiguration()
+                .viewStoreSeedRunner(store.artifacts(), mongo, CloudRuntimeSettings.resolve(properties))
+                .seed();
+
+        SourceResource source = (SourceResource)
+                store.artifacts().get(ViewTargetResolver.STATE_STORE_SOURCE_ID).orElseThrow();
+        assertThat(source.config().get("uri"))
+                .isEqualTo("mongodb+srv://user:sentinel-password@atlas.example/views?authSource=metadata");
+    }
+
+    @Test
     void an_author_who_declared_their_own_store_keeps_it() {
         // The seed runs on every boot, so overwriting would silently undo a deliberate change on restart --
         // the kind of loss whose cause is a week away from its effect.

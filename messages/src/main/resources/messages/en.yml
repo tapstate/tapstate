@@ -87,6 +87,15 @@ actuation.from-regex-invalid:
 actuation.from-regex-empty:
   message: "The pipeline `from` regex `{regex}` matches no upstream vertex."
   solution: "Use a regex matching a selected source table or an earlier transform step."
+boot.cloud-atlas-uri-invalid:
+  message: "The managed Cloud metadata URI is not a valid MongoDB connection string."
+  solution: "Set tapstate.cloud.atlas-uri to a mongodb:// or mongodb+srv:// connection string."
+boot.cloud-base-url-invalid:
+  message: "The managed Cloud base URL is not a valid absolute HTTP(S) URL."
+  solution: "Set tapstate.cloud.base-url to the Global Control Plane origin without credentials, a query, or a fragment."
+boot.cloud-config-incomplete:
+  message: "The managed Cloud startup configuration is incomplete."
+  solution: "Set tapstate.cloud.base-url, tapstate.cloud.token, and tapstate.cloud.atlas-uri together, or remove all three for on-prem mode."
 boot.cluster-id-required:
   message: "Cluster discovery requires an explicit stable cluster id."
   solution: "Set tapstate.cluster.id to the same stable value on every member."
@@ -558,6 +567,9 @@ control.audit-blocked:
 control.auth-failed:
   message: "Authentication failed: invalid username or password."
   solution: "Check the username and password are correct, then sign in again."
+control.auth-mode-unavailable:
+  message: "The `{mode}` deployment does not expose this authentication flow."
+  solution: "Use the authentication entry point for the selected deployment mode."
 control.bootstrap-closed:
   message: "The initial-admin bootstrap channel is closed because an admin account already exists."
   solution: "Sign in with an existing admin account to create more users."

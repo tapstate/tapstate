@@ -1,8 +1,7 @@
 package io.tapstate.control.restapi;
 
+import io.tapstate.control.core.CredentialAuthenticator;
 import io.tapstate.control.core.OperationRegistry;
-import io.tapstate.control.core.TokenService;
-import io.tapstate.control.core.TokenSigner;
 import io.tapstate.messages.MessageCatalog;
 import jakarta.servlet.DispatcherType;
 import org.springframework.beans.factory.ObjectProvider;
@@ -41,9 +40,8 @@ class RestApiSecurityConfiguration {
     }
 
     @Bean
-    AuthenticationManager tapstateAuthenticationManager(TokenService tokens, TokenSigner signer) {
-        return new ProviderManager(List.of(
-                new MachineTokenAuthenticationProvider(tokens), new HumanJwtAuthenticationProvider(signer)));
+    AuthenticationManager tapstateAuthenticationManager(CredentialAuthenticator credentials) {
+        return new ProviderManager(List.of(new TapstateCredentialAuthenticationProvider(credentials)));
     }
 
     @Bean

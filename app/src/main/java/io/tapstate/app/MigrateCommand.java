@@ -62,7 +62,8 @@ final class MigrateCommand {
         application.setBannerMode(Banner.Mode.OFF);
         try (ConfigurableApplicationContext context = application.run(args)) {
             MongoProperties properties = context.getBean(MongoProperties.class);
-            report(args, properties, out);
+            CloudRuntimeSettings cloud = CloudRuntimeSettings.resolve(context.getBean(CloudProperties.class));
+            report(args, properties, cloud, out);
             return 0;
         } catch (TapstateException e) {
             MessageCatalog.Rendered rendered = MessageCatalog.bundled().render(e.code(), e.args());
@@ -74,7 +75,8 @@ final class MigrateCommand {
         }
     }
 
-    private static void report(String[] args, MongoProperties properties, PrintStream out) {
+    private static void report(
+            String[] args, MongoProperties properties, CloudRuntimeSettings cloud, PrintStream out) {
         List<String> given = Arrays.asList(args);
         if (given.contains(LIST)) {
             // Answerable without a store at all, and deliberately so: at release time this is what one
@@ -84,7 +86,8 @@ final class MigrateCommand {
             return;
         }
         try (MongoConnection connection = new MongoConnection(new MongoConnectionSettings(
-                properties.getUri(), properties.getTlsCaFile(), properties.getServerSelectionTimeout()))) {
+                cloud.metadataUri(properties.getUri()),
+                properties.getTlsCaFile(), properties.getServerSelectionTimeout()))) {
             connection.verifyConnectivity();
             MigrationRunner.Status status = connection.systemDataStatus();
             out.println("installed: " + status.installed());
@@ -123,7 +126,7 @@ final class MigrateCommand {
      * refuses to come up on, so it must not bring that context up to find out.
      */
     @Configuration(proxyBeanMethods = false)
-    @EnableConfigurationProperties(MongoProperties.class)
+    @EnableConfigurationProperties({MongoProperties.class, CloudProperties.class})
     static class SettingsOnly {
     }
 }

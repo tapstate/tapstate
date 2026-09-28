@@ -190,7 +190,7 @@
     },
     "Metadata": {
       "type": "object",
-      "description": "Optional annotation block: labels plus a free-text description. Never carries identity.",
+      "description": "Optional metadata: labels, description, and server-managed provenance. Never carries resource identity.",
       "properties": {
         "labels": {
           "description": "Arbitrary key/value labels attached to the resource for grouping and selection.",
@@ -201,6 +201,14 @@
         },
         "description": {
           "description": "Free-text description of the resource; never identity.",
+          "type": "string"
+        },
+        "cloud": {
+          "description": "Server-managed marker carried by resources created in a managed Cloud Cluster.",
+          "type": "boolean"
+        },
+        "user_id": {
+          "description": "Server-managed stable user id of the authenticated creator, when one is known.",
           "type": "string"
         }
       },

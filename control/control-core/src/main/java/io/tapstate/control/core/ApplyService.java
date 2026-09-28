@@ -89,6 +89,7 @@ public final class ApplyService {
     private final SchemaStore schemas;
     private final PlanAdvisories advisories;
     private final SchemaDerivation derivation;
+    private final ResourceAttributionPolicy attribution;
 
     /**
      * The reading of which pipelines are up, or null when the caller supplied none -- see the same field
@@ -104,12 +105,21 @@ public final class ApplyService {
     public ApplyService(
             Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
             PlanAdvisories advisories, SchemaDerivation derivation) {
-        this(catalog, store, auditGate, schemas, advisories, derivation, null);
+        this(catalog, store, auditGate, schemas, advisories, derivation, null,
+                ResourceAttributionPolicy.onPrem());
     }
 
     public ApplyService(
             Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
             PlanAdvisories advisories, SchemaDerivation derivation, LivePipelines live) {
+        this(catalog, store, auditGate, schemas, advisories, derivation, live,
+                ResourceAttributionPolicy.onPrem());
+    }
+
+    public ApplyService(
+            Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
+            PlanAdvisories advisories, SchemaDerivation derivation, LivePipelines live,
+            ResourceAttributionPolicy attribution) {
         this.live = live;
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.store = Objects.requireNonNull(store, "store");
@@ -123,6 +133,7 @@ public final class ApplyService {
         // exactly like one whose pipelines were all up to date, and the case this exists for is the one
         // where nothing was written either.
         this.derivation = Objects.requireNonNull(derivation, "derivation");
+        this.attribution = Objects.requireNonNull(attribution, "attribution");
     }
 
     /**
@@ -400,7 +411,8 @@ public final class ApplyService {
         Objects.requireNonNull(principal, "principal");
         Objects.requireNonNull(resource, "resource");
         Objects.requireNonNull(operation, "operation");
-        ApplyPlan plan = planResources(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE);
+        Resource attributed = attribution.attribute(principal, resource, store.get(resource.id()).orElse(null));
+        ApplyPlan plan = planResources(List.of(attributed), Map.of(), ValidationScope.ONLINE_SOURCE);
         PreparedArtifact prepared = plan.artifacts().getFirst();
         if (live != null) {
             ReadableArtifactInventory.Snapshot inventory = ReadableArtifactInventory.scan(store);
@@ -432,6 +444,9 @@ public final class ApplyService {
         final ApplyPlan planned;
         try {
             planned = plan(drafts);
+            for (PreparedArtifact artifact : planned.artifacts()) {
+                attribution.validate(artifact.resource(), store.get(artifact.id()).orElse(null));
+            }
         } catch (TapstateException diagnostic) {
             return new ArtifactValidationResult(
                     false,
@@ -462,7 +477,7 @@ public final class ApplyService {
      */
     public ApplyResult apply(String principal, List<ArtifactDraft> drafts) {
         Objects.requireNonNull(principal, "principal");
-        ApplyPlan plan = plan(drafts);
+        ApplyPlan plan = attributed(principal, plan(drafts));
         List<ArtifactOutcome> outcomes = new ArrayList<>();
         List<Resource> toWrite = new ArrayList<>();
         List<AuditContext> audited = new ArrayList<>();
@@ -529,6 +544,17 @@ public final class ApplyService {
             }
         }
         return new ApplyResult(result.outcomes(), warnings);
+    }
+
+    private ApplyPlan attributed(String principal, ApplyPlan planned) {
+        List<PreparedArtifact> attributed = new ArrayList<>();
+        for (PreparedArtifact prepared : planned.artifacts()) {
+            Resource resource = attribution.attribute(
+                    principal, prepared.resource(), store.get(prepared.id()).orElse(null));
+            attributed.add(new PreparedArtifact(resource, writer.write(resource), CanonicalHash.of(resource)));
+        }
+        return new ApplyPlan(
+                attributed, planned.warnings(), planned.preconditions(), planned.workspacePreconditions());
     }
 
     private static PipelineResource storedPipeline(List<Resource> stored, String id) {

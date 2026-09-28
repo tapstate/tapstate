@@ -357,11 +357,11 @@ class AuthTest {
     }
 
     @Test
-    void securityConfigurationRefusesToStartWithoutTheHumanCredentialVerifier() {
+    void securityConfigurationRefusesToStartWithoutTheSelectedCredentialVerifier() {
         assertThatThrownBy(() -> new SpringApplicationBuilder(MissingHumanVerifierApp.class)
                 .properties("server.port=0")
                 .run())
-                .hasStackTraceContaining("TokenSigner");
+                .hasStackTraceContaining("CredentialAuthenticator");
     }
 
     // ---- login is a pre-authentication entry point that issues a working credential ----

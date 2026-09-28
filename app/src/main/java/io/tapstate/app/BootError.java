@@ -21,6 +21,15 @@ enum BootError implements TapstateErrorCode {
     /** The embedded Hazelcast member could not be started (e.g. its loopback port is in use). */
     HAZELCAST_UNAVAILABLE("boot.hazelcast-unavailable", Set.of()),
 
+    /** A managed Cloud runtime must receive its three external settings as one complete unit. */
+    CLOUD_CONFIG_INCOMPLETE("boot.cloud-config-incomplete", Set.of()),
+
+    /** The configured Global Control Plane address is not an absolute HTTP(S) base URL. */
+    CLOUD_BASE_URL_INVALID("boot.cloud-base-url-invalid", Set.of()),
+
+    /** The managed metadata connection is not a MongoDB or MongoDB SRV connection string. */
+    CLOUD_ATLAS_URI_INVALID("boot.cloud-atlas-uri-invalid", Set.of()),
+
     /** The selected member-discovery mode is missing a required, deterministic input. */
     DISCOVERY_CONFIG_INVALID("boot.discovery-config-invalid", Set.of("detail")),
 

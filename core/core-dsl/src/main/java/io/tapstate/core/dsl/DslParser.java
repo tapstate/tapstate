@@ -99,7 +99,7 @@ public final class DslParser {
     static final Set<String> PIPELINE_KEYS = Set.of(
             VERSION_FIELD, "kind", "id", METADATA_FIELD, SOURCE_TOKEN, TRANSFORMS_FIELD, "view", SERVE_TOKEN,
             "settings", EXPERIMENTAL_FIELD);
-    static final Set<String> METADATA_KEYS = Set.of("labels", "description");
+    static final Set<String> METADATA_KEYS = Set.of("labels", "description", "cloud", "user_id");
     static final Set<String> SRS_KEYS = Set.of("key", "retention", "schema_evolution", "queryable", "enabled");
     /**
      * The engine options a source accepts. Options are the engine's own configuration, so the key
@@ -823,7 +823,9 @@ public final class DslParser {
             return null;
         }
         md.requireOnly(METADATA_KEYS);
-        return new Metadata(stringMap(md, "labels"), md.string("description"));
+        return new Metadata(
+                stringMap(md, "labels"), md.string("description"),
+                boolValue(md, "cloud"), md.string("user_id"));
     }
 
     // ---- definition bodies (kind: transform / view / serve) -----------------------

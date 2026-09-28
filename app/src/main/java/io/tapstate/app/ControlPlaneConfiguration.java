@@ -12,6 +12,7 @@ import io.tapstate.adapters.pdk.PdkSchemaDiscoverer;
 import io.tapstate.adapters.pdk.RegistryConnectorProvisioner;
 import io.tapstate.adapters.pdk.SeedConnectorSweep;
 import io.tapstate.control.core.ApplyService;
+import io.tapstate.control.core.AuthenticationMode;
 import io.tapstate.control.core.LivePipelines;
 import io.tapstate.control.core.AccessTokenService;
 import io.tapstate.control.core.DocumentKeyAdvisories;
@@ -53,6 +54,7 @@ import io.tapstate.control.core.PipelineRepresentation;
 import io.tapstate.control.core.PipelineViewService;
 import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
+import io.tapstate.control.core.ResourceAttributionPolicy;
 import io.tapstate.control.core.DataBrowserFollows;
 import io.tapstate.control.core.DerivedSchemas;
 import io.tapstate.control.core.SourceConnectionResolver;
@@ -301,15 +303,28 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    CredentialAuthenticator credentialAuthenticator(TokenService tokenService, TokenSigner tokenSigner) {
-        return new CredentialAuthenticator(tokenService, tokenSigner);
+    CredentialAuthenticator credentialAuthenticator(
+            TokenService tokenService, TokenSigner tokenSigner, CloudRuntimeSettings cloud) {
+        // The managed verifier is supplied by the Cloud SDK integration. Until that provider is wired,
+        // refusing every credential is the safe behavior: a Cloud runtime must never fall back to the
+        // local issuer or accept an on-prem machine token merely because the external client is absent.
+        // TODO Bind the published Cloud SDK's JWKS verifier here once its stable artifact is available.
+        return cloud.cloud()
+                ? CredentialAuthenticator.refusing()
+                : new CredentialAuthenticator(tokenService, tokenSigner);
+    }
+
+    @Bean
+    AuthenticationMode authenticationMode(CloudRuntimeSettings cloud) {
+        return cloud.cloud() ? AuthenticationMode.CLOUD : AuthenticationMode.ON_PREM;
     }
 
     @Bean
     ApplyService applyService(
             ArtifactStore artifactStore, ConnectorCatalogView connectorCatalogView, AuditGate auditGate,
             SchemaStore schemaStore, @Nullable NestSettings nestSettings,
-            SchemaDerivation derivation, LivePipelines livePipelines) {
+            SchemaDerivation derivation, LivePipelines livePipelines,
+            ResourceAttributionPolicy attribution) {
         // The online apply validates against the live catalog view (the bundled snapshot union the
         // connectors registered so far), so a connector registered at runtime is honoured without a restart.
         // It also reads the schema store, which is what lets it judge a row expression against the columns
@@ -334,7 +349,23 @@ class ControlPlaneConfiguration {
                 PlanAdvisories.all(
                         new NestSizingAdvisories(settings.entriesHeldInMemory()),
                         new DocumentKeyAdvisories()),
-                derivation, livePipelines);
+                derivation, livePipelines, attribution);
+    }
+
+    /** Preserves the direct assembly seam used by focused on-prem wiring tests. */
+    ApplyService applyService(
+            ArtifactStore artifactStore, ConnectorCatalogView connectorCatalogView, AuditGate auditGate,
+            SchemaStore schemaStore, @Nullable NestSettings nestSettings,
+            SchemaDerivation derivation, LivePipelines livePipelines) {
+        return applyService(artifactStore, connectorCatalogView, auditGate, schemaStore, nestSettings,
+                derivation, livePipelines, ResourceAttributionPolicy.onPrem());
+    }
+
+    @Bean
+    ResourceAttributionPolicy resourceAttributionPolicy(CloudRuntimeSettings cloud) {
+        return cloud.cloud()
+                ? ResourceAttributionPolicy.managedCloud()
+                : ResourceAttributionPolicy.onPrem();
     }
 
     @Bean
@@ -451,13 +482,15 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    ViewStoreSeedRunner viewStoreSeedRunner(ArtifactStore artifactStore, MongoProperties mongoProperties) {
+    ViewStoreSeedRunner viewStoreSeedRunner(
+            ArtifactStore artifactStore, MongoProperties mongoProperties, CloudRuntimeSettings cloud) {
         // The managed ArtifactStore, not the raw one behind it. Reaching past the decorator would make
         // this the one write in the process that skips secret tracking -- and the resource it writes is
         // built from the deployment's own store URI, which is the last one that should be the exception.
         // It changes nothing observable while the mongodb catalog marks `uri` non-secret; what it
         // removes is a seam where a later change to that marking would silently not apply here.
-        return new ViewStoreSeedRunner(artifactStore, mongoProperties.getUri(), mongoProperties.getTlsCaFile());
+        return new ViewStoreSeedRunner(
+                artifactStore, cloud.metadataUri(mongoProperties.getUri()), mongoProperties.getTlsCaFile());
     }
 
     @Bean

@@ -217,6 +217,8 @@ public final class CanonicalWriter {
                 m.freeMap("labels", new TreeMap<>(md.labels()));
             }
             m.scalar("description", md.description());
+            m.scalar("cloud", md.cloud());
+            m.scalar("user_id", md.userId());
             b.put("metadata", m.build());
         }
     }

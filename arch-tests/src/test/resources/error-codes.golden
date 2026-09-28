@@ -35,6 +35,9 @@ artifact.pipeline-not-stopped
 artifact.precondition-required
 artifact.reclaim-incomplete
 artifact.version-conflict
+boot.cloud-atlas-uri-invalid
+boot.cloud-base-url-invalid
+boot.cloud-config-incomplete
 boot.cluster-id-invalid
 boot.cluster-id-mismatch
 boot.cluster-id-required
@@ -145,6 +148,7 @@ connector.test-failed
 connector.write-failed
 control.audit-blocked
 control.auth-failed
+control.auth-mode-unavailable
 control.bootstrap-closed
 control.bootstrap-forbidden
 control.forbidden

@@ -84,6 +84,41 @@ class ApplyServiceTest {
             """;
 
     @Test
+    void managedCloudApplyPersistsServerGeneratedAttributionAndKeepsItOnReplay() {
+        ApplyService cloud = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
+                PlanAdvisories.none(), SchemaDerivation.none(), null,
+                ResourceAttributionPolicy.managedCloud());
+
+        ApplyResult created = cloud.apply("cloud-user-7", List.of(draft(TGT_MG)));
+        SourceResource stored = (SourceResource) store.get("tgt_mg").orElseThrow();
+        String readBack = new ArtifactQueryService(store).get("tgt_mg").orElseThrow().canonicalForm();
+
+        assertThat(created.outcomes()).singleElement().extracting(ArtifactOutcome::change)
+                .isEqualTo(ArtifactOutcome.Change.CREATED);
+        assertThat(stored.metadata().cloud()).isTrue();
+        assertThat(stored.metadata().userId()).isEqualTo("cloud-user-7");
+        assertThat(readBack).contains("cloud: true", "user_id: cloud-user-7");
+        assertThat(cloud.apply("cloud-user-7", List.of(draft(readBack))).outcomes())
+                .singleElement().extracting(ArtifactOutcome::change)
+                .isEqualTo(ArtifactOutcome.Change.UNCHANGED);
+    }
+
+    @Test
+    void managedCloudApplyRejectsCallerChosenAttributionBeforeAnyWrite() {
+        ApplyService cloud = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
+                PlanAdvisories.none(), SchemaDerivation.none(), null,
+                ResourceAttributionPolicy.managedCloud());
+        String forged = TGT_MG + "metadata: { cloud: true, user_id: forged-user }\n";
+
+        assertThatThrownBy(() -> cloud.apply("cloud-user-7", List.of(draft(forged))))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
+        assertThat(store.get("tgt_mg")).isEmpty();
+    }
+
+    @Test
     void reapplyingAConfigOmittingSourceReadKeepsItsConnectionAndIsANoOp() {
         service.apply("author", List.of(draft(TGT_MG)));
         SourceResource original = (SourceResource) store.get("tgt_mg").orElseThrow();
