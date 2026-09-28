@@ -32,7 +32,9 @@ class UnlabeledIsDefaultAndDeclaringMovesIT {
 
             ControlPlane.Project before = control.projects().get(0);
             assertThat(before.id()).as("the Default project is listed first").isEqualTo("default");
-            assertThat(before.resourceIds()).containsExactlyInAnyOrder("orders_db", "cluster_atlas");
+            // The server holds unlabelled resources of its own (the managed store's connection), so the
+            // assertion is about the two applied here, not about everything the Default project holds.
+            assertThat(before.resourceIds()).contains("orders_db", "cluster_atlas");
 
             // Declared by bank_c360 (orders_db is in its batch), referred to only (cluster_atlas is not).
             control.applyAsProject("bank_c360", batch(
@@ -43,7 +45,8 @@ class UnlabeledIsDefaultAndDeclaringMovesIT {
             assertThat(projectOf(control, "cluster_atlas")).as("referred to, so left").isNull();
             assertThat(control.projects().get(0).resourceIds())
                     .as("what the Default project holds afterwards")
-                    .containsExactly("cluster_atlas");
+                    .contains("cluster_atlas")
+                    .doesNotContain("orders_db", "customer_360");
         }
     }
 }
