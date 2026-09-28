@@ -138,6 +138,14 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // snapshot, so an apply cannot move one without the others. Said after the drop above, which is the
         // one thing entitled to clear what earlier runs said.
         stateTeardown.willKeepStateAt(pipelineId, prepared.stateLocations());
+        // A capture still open here while no job carries the pipeline was left by a run that ended with no stop:
+        // a job lost with a member, which this member can replace before it can see that job fail. That run's
+        // sources had begun taking the load the capture handed them, and a source of this run cannot vouch for a
+        // load another run began, so the table would never land in this run. Closed first, keeping the pipeline's
+        // position, the capture opens a load for this run. A second start over a running job leaves it alone.
+        if (captureCoordinator.isCapturing(pipelineId) && !engine.hasLiveJob(pipelineId)) {
+            captureCoordinator.stopCapture(pipelineId, false);
+        }
         try {
             prepared.artifactSnapshot().ifPresentOrElse(
                     snapshot -> captureCoordinator.startCapture(pipelineId, snapshot),

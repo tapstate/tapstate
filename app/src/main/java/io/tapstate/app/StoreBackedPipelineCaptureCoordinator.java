@@ -1204,8 +1204,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 .findFirst();
     }
 
-    /** Whether this pipeline currently has a live capture -- a test-visible view of the retained handles. */
-    synchronized boolean isActive(String pipelineId) {
+    @Override
+    public synchronized boolean isCapturing(String pipelineId) {
         return runsByPipeline.containsKey(pipelineId);
     }
 

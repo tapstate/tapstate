@@ -189,7 +189,7 @@ class CaptureToSinkDataFlowTest {
         Job job = member.getJet().getJob(PIPELINE);
         assertThat(job).isNotNull();
         awaitTerminal(job); // cancel is asynchronous, so poll for terminal rather than racing the check
-        assertThat(((StoreBackedPipelineCaptureCoordinator) coordinator).isActive(PIPELINE))
+        assertThat(((StoreBackedPipelineCaptureCoordinator) coordinator).isCapturing(PIPELINE))
                 .as("stop drops the capture handle").isFalse();
     }
 

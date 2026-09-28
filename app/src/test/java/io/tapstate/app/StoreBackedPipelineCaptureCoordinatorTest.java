@@ -547,14 +547,14 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         coordinator.startCapture("p");
 
         MiningChainId chainId = MiningChainId.resolve(startedSpec.get().config(), startedSpec.get().srsKey());
-        assertThat(coordinator.isActive("p")).as("start retains a live handle for the pipeline").isTrue();
+        assertThat(coordinator.isCapturing("p")).as("start retains a live handle for the pipeline").isTrue();
         assertThat(srsCoordinator.isProvisioned(chainId)).isTrue();
 
         coordinator.stopCapture("p", true);
 
         assertThat(subscriptionClosed).as("stop closes the capture subscription, stopping the daemon").isTrue();
         assertThat(srsCoordinator.isProvisioned(chainId)).as("stop tears the source chain down").isFalse();
-        assertThat(coordinator.isActive("p")).as("stop drops the handle").isFalse();
+        assertThat(coordinator.isCapturing("p")).as("stop drops the handle").isFalse();
     }
 
     @Test
@@ -767,7 +767,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                     assertThat(exception.code().code()).isEqualTo("capture.event-table-not-selected");
                     assertThat(exception.args()).containsEntry("table", "customers");
                 });
-        assertThat(coordinator.isActive("p")).isFalse();
+        assertThat(coordinator.isCapturing("p")).isFalse();
     }
 
     @Test
@@ -1495,7 +1495,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
 
         coordinator.stopCapture("never-started", true);
 
-        assertThat(coordinator.isActive("never-started")).isFalse();
+        assertThat(coordinator.isCapturing("never-started")).isFalse();
     }
 
     @Test
@@ -1604,7 +1604,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         MiningChainId firstChain = MiningChainId.resolve(firstSpec.get().config(), firstSpec.get().srsKey());
         assertThat(firstSubscriptionClosed).isTrue();
         assertThat(srsCoordinator.isProvisioned(firstChain)).isFalse();
-        assertThat(coordinator.isActive("p")).isFalse();
+        assertThat(coordinator.isCapturing("p")).isFalse();
     }
 
     /**
@@ -1633,7 +1633,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                 .isInstanceOfSatisfying(TapstateException.class, refused -> assertThat(refused.code().code())
                         .isEqualTo("actuation.source-schema-not-discovered"));
         assertThat(opened).isEmpty();
-        assertThat(coordinator.isActive("p")).isFalse();
+        assertThat(coordinator.isCapturing("p")).isFalse();
     }
 
     @Test

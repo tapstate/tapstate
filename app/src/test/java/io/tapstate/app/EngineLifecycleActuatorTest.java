@@ -137,6 +137,53 @@ class EngineLifecycleActuatorTest {
         assertThat(actuator.isCarryingAJob(PIPE)).isFalse();
     }
 
+    /**
+     * A start on a member that still has a capture open for the pipeline, with no job carrying it, closes that
+     * capture before it opens one. The capture was left by a run that ended without a stop -- a job lost with a
+     * member, replaced by this member before it can see that job failed -- whose sources had begun taking the
+     * load it handed them. A source of the new run cannot vouch for a load another run began, so the table
+     * would never land in it; closed first, and keeping the pipeline's position, the capture opens a load for
+     * this run.
+     */
+    @Test
+    void aStartOverACaptureARunLeftOpenWithNoStopClosesItFirst() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        coordinator.capturing = true;
+        coordinator.jobTerminalProbe = () -> member.getJet().getJob(PIPE) == null;
+        RecordingDagSource dagSource = new RecordingDagSource(events);
+        LifecycleActuator actuator =
+                new EngineLifecycleActuator(new Engine(member), dagSource, coordinator, teardown());
+
+        actuator.start(PIPE);
+
+        assertThat(events).containsExactly(
+                "stopCapture:" + PIPE + "[keep][jobTerminal]", "startCapture:" + PIPE, "buildDag:" + PIPE);
+        assertThat(member.getJet().getJob(PIPE)).as("the run was submitted after the capture was opened again")
+                .isNotNull();
+    }
+
+    /**
+     * A second start while a job carries the pipeline leaves its open capture alone: the capture is that job's,
+     * and closing it would take the load from under a run that is reading it.
+     */
+    @Test
+    void aStartOverACaptureARunningJobReadsLeavesItOpen() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        RecordingDagSource dagSource = new RecordingDagSource(events);
+        LifecycleActuator actuator =
+                new EngineLifecycleActuator(new Engine(member), dagSource, coordinator, teardown());
+        actuator.start(PIPE);
+        awaitStatus(member.getJet().getJob(PIPE), JobStatus.RUNNING);
+        coordinator.capturing = true;
+
+        actuator.start(PIPE);
+
+        assertThat(events).containsExactly(
+                "startCapture:" + PIPE, "buildDag:" + PIPE, "startCapture:" + PIPE, "buildDag:" + PIPE);
+    }
+
     @Test
     void surfacesACaptureFailureThroughTheSeamWhenTheEngineJobReportsNone() {
         RuntimeException boom = new RuntimeException("cdc tail died");
@@ -393,9 +440,15 @@ class EngineLifecycleActuatorTest {
         private Supplier<Boolean> jobAbsentProbe = () -> true;
         private boolean jobWasAbsentAtStart;
         private boolean givesTheStartBack;
+        private boolean capturing;
 
         RecordingCaptureCoordinator(List<String> events) {
             this.events = events;
+        }
+
+        @Override
+        public boolean isCapturing(String pipelineId) {
+            return capturing;
         }
 
         @Override
