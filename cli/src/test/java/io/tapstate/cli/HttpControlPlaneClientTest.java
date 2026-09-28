@@ -1302,6 +1302,79 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void anApplyFromAProjectNamesItAndOneFromNoneLeavesTheFieldOut() throws Exception {
+        AtomicReference<CapturedRequest> seen = new AtomicReference<>();
+        HttpServer server = apiServer("/api/artifacts:apply", 200, "{\"outcomes\":[]}", seen);
+        try {
+            List<LocalDraft> drafts = List.of(new LocalDraft("a.tap.yml", "version: tapstate/v1\n"));
+            new HttpControlPlaneClient().apply(baseOf(server), "tok", drafts, "bank_c360");
+            assertThat(((Map<?, ?>) JsonReader.parse(seen.get().body())).get("project")).isEqualTo("bank_c360");
+
+            new HttpControlPlaneClient().apply(baseOf(server), "tok", drafts);
+            assertThat(((Map<?, ?>) JsonReader.parse(seen.get().body())).containsKey("project"))
+                    .as("the Default project is said by naming none, so the key is absent rather than null")
+                    .isFalse();
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void projectListDecodesEachProjectAndWhatItHolds() throws Exception {
+        AtomicReference<CapturedRequest> seen = new AtomicReference<>();
+        HttpServer server = apiServer("/api/projects", 200,
+                "{\"items\":[{\"id\":\"default\",\"title\":\"Default project\",\"removable\":false,"
+                        + "\"resources\":[{\"id\":\"cluster_atlas\",\"kind\":\"source\"}]},"
+                        + "{\"id\":\"bank_c360\",\"title\":\"bank_c360\",\"removable\":true,\"resources\":[]},"
+                        + "\"not an object\"]}", seen);
+        try {
+            ProjectListOutcome outcome = new HttpControlPlaneClient().projectList(baseOf(server), "tok-1");
+
+            assertThat(outcome).isEqualTo(new ProjectListOutcome.Listed(List.of(
+                    new ProjectListOutcome.Project("default", "Default project", false,
+                            List.of(new ProjectListOutcome.Member("cluster_atlas", "source"))),
+                    new ProjectListOutcome.Project("bank_c360", "bank_c360", true, List.of()))));
+            assertThat(seen.get().method()).isEqualTo("GET");
+            assertThat(seen.get().authorization()).isEqualTo("Bearer tok-1");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void projectListAndRemoveCarryTheServersRefusal() throws Exception {
+        HttpServer server = apiServer("/api/projects", 409,
+                "{\"code\":\"artifact.default-project-not-removable\",\"params\":{\"project\":\"default\"},"
+                        + "\"message\":\"The Default project cannot be removed.\"}", new AtomicReference<>());
+        try {
+            assertThat(new HttpControlPlaneClient().projectList(baseOf(server), "tok"))
+                    .isEqualTo(new ProjectListOutcome.Rejected("artifact.default-project-not-removable",
+                            "The Default project cannot be removed."));
+            DeleteOutcome removed = new HttpControlPlaneClient().projectRemove(baseOf(server), "tok", "default");
+            assertThat(removed).isInstanceOfSatisfying(DeleteOutcome.Rejected.class, rejected -> {
+                assertThat(rejected.code()).isEqualTo("artifact.default-project-not-removable");
+                assertThat(rejected.params()).containsEntry("project", "default");
+            });
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void projectRemoveDeletesTheNamedProject() throws Exception {
+        AtomicReference<CapturedRequest> seen = new AtomicReference<>();
+        HttpServer server = apiServer("/api/projects", 204, null, seen);
+        try {
+            assertThat(new HttpControlPlaneClient().projectRemove(baseOf(server), "tok", "c360_sample"))
+                    .isEqualTo(new DeleteOutcome.Removed("c360_sample"));
+            assertThat(seen.get().method()).isEqualTo("DELETE");
+            assertThat(seen.get().path()).isEqualTo("/api/projects/c360_sample");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void connectorListReturnsTheConnectorsWithOriginTagsAndSendsTheCredential() throws Exception {
         AtomicReference<CapturedRequest> seen = new AtomicReference<>();
         HttpServer server = apiServer("/api/connectors", 200,
