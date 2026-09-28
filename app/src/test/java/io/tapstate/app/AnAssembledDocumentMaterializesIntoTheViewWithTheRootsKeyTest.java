@@ -5,6 +5,10 @@ import io.tapstate.core.model.PipelineNode;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.hazelcast.function.SupplierEx;
+import io.tapstate.adapters.pdk.ConnectorRef;
+import io.tapstate.adapters.pdk.PdkSinkPort;
+import io.tapstate.adapters.pdk.SyntheticSinkJars;
+import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.FromClause;
@@ -20,7 +24,9 @@ import io.tapstate.core.model.Step;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
+import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.sink.DdlPolicy;
+import io.tapstate.spi.sink.SinkConfig;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.TargetField;
 import io.tapstate.spi.sink.TargetTable;
@@ -29,11 +35,15 @@ import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
+import java.math.BigDecimal;
+import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 /**
  * A nest's assembled documents materialize into a declared view carrying the root's key, so a
@@ -61,6 +71,33 @@ class AnAssembledDocumentMaterializesIntoTheViewWithTheRootsKeyTest {
     private static final String PIPELINE = "nested_orders";
     private static final String VIEW = "order_state";
     private static final String EMBED_PATH = "items";
+
+    @Test
+    void aQuickstartViewResumesWithAPreviousReleaseDecimalSchema(@TempDir Path dir) throws Exception {
+        // The previous release stored the resolved DECIMAL and source spelling, but no numeric
+        // descriptor. The nest carries amount unchanged into the view after the stack is upgraded.
+        InMemoryStorePort store = seedStore();
+        store.schemas().save(discovered(PARENT_SOURCE, new SourceTable(PARENT_TABLE,
+                List.of(new SourceField("id", "int", TapstateType.INT64),
+                        new SourceField("amount", "decimal(10,2)", TapstateType.DECIMAL)),
+                List.of("id"), List.of())));
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+        new StoreBackedDagSource(store, capturing(bound)).dagFor(PIPELINE);
+
+        TargetTable view = bound.get().get(STEP);
+        assertThat(view.name()).isEqualTo(VIEW);
+        assertThat(view.fields()).extracting(TargetField::name).contains("amount");
+
+        ConnectorRef connector = new ConnectorRef(List.of(SyntheticSinkJars.stateRecordingSink(dir)),
+                "synthetic.StateRecordingSink", "2.0.8", null);
+        try (SinkWriter writer = new PdkSinkPort(id -> connector).open(
+                new SinkConfig("mongodb", Map.of(), WriteMode.UPSERT, DdlPolicy.FAIL),
+                Map.of(STEP, view))) {
+            var row = Envelope.insert(1L, STEP, Map.of("id", 7, "amount", new BigDecimal("70.00")), null);
+            assertThat(writer.write(List.of(row)).toCompletableFuture().get(5, TimeUnit.SECONDS).written()).isZero();
+            assertThat(writer.write(List.of(row)).toCompletableFuture().get(5, TimeUnit.SECONDS).written()).isEqualTo(1);
+        }
+    }
 
     @Test
     void theViewSinkIsToldWhatKeyTheAssembledDocumentsConvergeOn() {

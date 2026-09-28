@@ -8,8 +8,6 @@ import org.bson.types.Decimal128;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
-import org.testcontainers.containers.MySQLContainer;
-import org.testcontainers.utility.DockerImageName;
 
 import java.math.BigDecimal;
 import java.time.Duration;
@@ -62,42 +60,41 @@ class LosslessNumericTypeIsAcceptedIT {
     @ParameterizedTest
     @EnumSource(Tiers.class)
     void anIntegralColumnIsComputedAndTheDecimalBesideItArrivesUnchanged(Tiers tier) throws Exception {
-        try (MySQLContainer<?> mysql = new MySQLContainer<>(DockerImageName.parse("mysql:8.0"))) {
-            mysql.start();
-            NumericSource.seed(mysql);
+        String suffix = tier.name().toLowerCase(Locale.ROOT);
+        // A database of this tier's own on the shared server: the pipeline reads the table's changes, and
+        // only that server's user holds the replication grant such a read needs.
+        Map<String, Object> config = SharedMySql.settings("lossless_" + suffix);
+        NumericSource.seed(config);
 
-            String suffix = tier.name().toLowerCase(Locale.ROOT);
-            String targetUri = SharedMongo.replicaSetUrl("lossless_target_" + suffix);
+        String targetUri = SharedMongo.replicaSetUrl("lossless_target_" + suffix);
 
-            try (ServerHandle server = tier.launch(SharedMongo.replicaSetUrl("lossless_store_" + suffix));
-                    MongoEndpoints mongo = new MongoEndpoints()) {
-                ControlPlane control = NumericSource.connected(server);
-                Map<String, Object> config = NumericSource.config(mysql);
+        try (ServerHandle server = tier.launch(SharedMongo.replicaSetUrl("lossless_store_" + suffix));
+                MongoEndpoints mongo = new MongoEndpoints()) {
+            ControlPlane control = NumericSource.connected(server);
 
-                control.discoverSchema(NumericSource.SOURCE_ID, "mysql", config);
-                control.apply(NumericSource.workspace(
-                        config,
-                        targetUri,
-                        PIPELINE_ID,
-                        // One expression computes, the other only moves. Both are allowed, for reasons
-                        // that are not the same reason, and the two assertions below are those reasons.
-                        "{ doubled: \"=after.qty * 2\", moved: \"=after.amount\" }"));
+            control.discoverSchema(NumericSource.SOURCE_ID, "mysql", config);
+            control.apply(NumericSource.workspace(
+                    config,
+                    targetUri,
+                    PIPELINE_ID,
+                    // One expression computes, the other only moves. Both are allowed, for reasons
+                    // that are not the same reason, and the two assertions below are those reasons.
+                    "{ doubled: \"=after.qty * 2\", moved: \"=after.amount\" }"));
 
-                control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
+            control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
 
-                List<Document> landed = awaitRows(mongo, targetUri);
+            List<Document> landed = awaitRows(mongo, targetUri);
 
-                assertThat(landed)
-                        .as("the computed column, per row, read back out of the target")
-                        .extracting(document -> document.get("doubled"))
-                        .containsExactlyInAnyOrderElementsOf(
-                                NumericSource.QUANTITIES.stream().map(qty -> qty * 2).toList());
+            assertThat(landed)
+                    .as("the computed column, per row, read back out of the target")
+                    .extracting(document -> document.get("doubled"))
+                    .containsExactlyInAnyOrderElementsOf(
+                            NumericSource.QUANTITIES.stream().map(qty -> qty * 2).toList());
 
-                assertThat(landed)
-                        .as("the decimal every row carried, digit for digit and scale included")
-                        .allSatisfy(document -> assertThat(decimalOf(document, "moved"))
-                                .isEqualTo(NumericSource.AMOUNT));
-            }
+            assertThat(landed)
+                    .as("the decimal every row carried, digit for digit and scale included")
+                    .allSatisfy(document -> assertThat(decimalOf(document, "moved"))
+                            .isEqualTo(NumericSource.AMOUNT));
         }
     }
 
