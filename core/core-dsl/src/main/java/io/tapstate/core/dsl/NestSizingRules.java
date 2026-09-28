@@ -148,7 +148,7 @@ public final class NestSizingRules {
                     continue;
                 }
                 List<String> path = new ArrayList<>(parentPath);
-                path.addAll(List.of(embed.path().split("\\" + PATH_SEPARATOR, -1)));
+                path.addAll(List.of(embed.treeSegment().split("\\" + PATH_SEPARATOR, -1)));
                 level(String.join(PATH_SEPARATOR, path), embed.from());
                 descend(embed.embed(), path);
             }

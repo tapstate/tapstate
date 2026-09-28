@@ -22,8 +22,9 @@ import java.util.TreeMap;
  * {@code control.malformed-request} refused at the boundary) is a 400; the authentication codes map to
  * 401 / 403 / 409; a lifecycle verb on an unknown pipeline is a 404 and a forbidden transition or stale
  * revision is a 409; a status / metrics / snapshot read of a pipeline that has published no observation is a
- * 404; any other coded error keeps the structured body but answers 500, since the surface has no
- * client-attributable mapping for it yet. That mapping is the seam later slices extend as more
+ * 404; a member that cannot read the cluster right now is a 503, because it is neither the caller's
+ * fault nor a failure but a window the member passes through; any other coded error keeps the structured
+ * body but answers 500, since the surface has no client-attributable mapping for it yet. That mapping is the seam later slices extend as more
  * client-attributable codes land.
  *
  * <p>Only {@link TapstateException} is handled here. A programmer error / invariant violation (a bare NPE or
@@ -147,6 +148,13 @@ class ApiExceptionHandler {
             // back as a 500 blaming the server for it.
             case "position.chain-not-read", "position.field-not-editable", "position.nothing-to-write" ->
                     HttpStatus.BAD_REQUEST;
+            // A member that cannot read the cluster is the one refusal here that is neither the
+            // caller's fault nor a failure: it is this member being unable to answer for a moment,
+            // which is what 503 means and what nothing else on this face has meant so far. Left to the
+            // default it would be a 500, telling a caller the server broke over a window the product is
+            // designed to pass through -- and the reading it is kept apart from is the worse one still,
+            // a 200 saying the cluster is empty.
+            case "cluster.membership-unreadable" -> HttpStatus.SERVICE_UNAVAILABLE;
             default -> switch (domainOf(code.code())) {
                 case "dsl" -> HttpStatus.BAD_REQUEST;
                 default -> HttpStatus.INTERNAL_SERVER_ERROR;

@@ -25,7 +25,7 @@ import java.util.Map;
 final class RunningPipeline {
 
     /** Rows seeded into the source table, enough that a run has something to carry. */
-    private static final long SEEDED_ROWS = 4;
+    static final long SEEDED_ROWS = 4;
 
     private static final String TABLE = "orders";
 

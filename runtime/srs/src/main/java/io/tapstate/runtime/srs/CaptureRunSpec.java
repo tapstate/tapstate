@@ -3,6 +3,7 @@ package io.tapstate.runtime.srs;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.ReadMode;
+import io.tapstate.spi.store.WorkloadClaimFence;
 
 import java.util.Objects;
 
@@ -20,6 +21,8 @@ import java.util.Objects;
  *       pass-through retention config seeded on a new chain (may be null).</li>
  *   <li>{@code schemaVer} — the schema version stamped on ring items; {@code snapshotEpoch} — the
  *       generation assigned to a bounded read that has no change chain of its own.</li>
+ *   <li>{@code captureFence} — the cluster claim generation a durable append must still match, or null on
+ *       the unchanged single-member path.</li>
  * </ul>
  *
  * <p>No connector position is carried here. Both a run's seam and its per-change positions are the
@@ -39,7 +42,8 @@ public record CaptureRunSpec(
         StartFrom startFrom,
         String retention,
         long schemaVer,
-        long snapshotEpoch) {
+        long snapshotEpoch,
+        WorkloadClaimFence captureFence) {
 
     /**
      * The ordinary construction used by callers that do not allocate a chainless snapshot generation.
@@ -57,6 +61,33 @@ public record CaptureRunSpec(
             String retention,
             long schemaVer) {
         this(config, readMode, srsKey, srsEnabled, sourceId, pipelineId, startFrom, retention, schemaVer, 0L);
+    }
+
+    /**
+     * The same, for a caller that allocates a chainless snapshot generation but holds the run to no claim.
+     * A single-member run is fenced against nobody: there is one member and one run, so there is no second
+     * one for an append to be checked against.
+     */
+    public CaptureRunSpec(
+            CaptureConfig config,
+            ReadMode readMode,
+            String srsKey,
+            boolean srsEnabled,
+            String sourceId,
+            String pipelineId,
+            StartFrom startFrom,
+            String retention,
+            long schemaVer,
+            long snapshotEpoch) {
+        this(config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
+                startFrom, retention, schemaVer, snapshotEpoch, null);
+    }
+
+    /** The same spec, with every durable append it drives held to {@code fence}'s claim generation. */
+    public CaptureRunSpec withCaptureFence(WorkloadClaimFence fence) {
+        return new CaptureRunSpec(
+                config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
+                startFrom, retention, schemaVer, snapshotEpoch, fence);
     }
 
     public CaptureRunSpec {

@@ -22,8 +22,8 @@ import java.util.Set;
 /**
  * The {@code nested-json} recipe: several tables assembled into one document per root row. It asks
  * for the root table - connector, connection, table, key column - then for one or more child tables,
- * each with the columns that join it to the root, whether one root row has one or many of it, and the
- * path it lands under; and it writes one {@code nest} step whose view is keyed by the root's key.
+ * each with the columns that join it to the root and whether it lands at a path or contributes flat
+ * fields; and it writes one {@code nest} step whose view is keyed by the root's key.
  *
  * <p>A child that sits in the root's database is a second table of the root's source, so one source
  * reads both; a child in another database gets a source of its own, {@code <table>_src}, with its own
@@ -38,13 +38,15 @@ final class NestedJsonRecipe {
     static final String RECIPE = "nested-json";
     static final String ROOT_QUESTION = "Root table";
     static final String CHILD_QUESTION = "Child table";
-    static final String AS_QUESTION = "Embed as (array = one root row has many, object = has one)";
+    static final String AS_QUESTION =
+            "Embed as (array = many at a path, object = one at a path, flat = one merged into parent)";
     static final String PATH_QUESTION = "Path under the root document";
     static final String ANOTHER_QUESTION = "Add another table? [y/N]";
     static final String VIEW_QUESTION = "View id";
     static final String DEFAULT_KEY = "id";
 
-    static final String CHILD_USAGE = "--child is <table>:<childcol>=<rootcol>[:array|object][:<path>]";
+    static final String CHILD_USAGE =
+            "--child is <table>:<childcol>=<rootcol>[:array|object|flat][:<path>] (flat has no path)";
     static final String ON_USAGE = "the join columns are childcol=rootcol, comma-separated (--child in scripts)";
 
     /** What the summary says beside the pipeline, because the children's keys were not discovered. */
@@ -113,8 +115,10 @@ final class NestedJsonRecipe {
             if (on.isEmpty()) {
                 throw new RecipeRun.Usage(ON_USAGE);
             }
-            EmbedAs as = embedAs(prompter.choose(AS_QUESTION, List.of("array", "object"), "array"));
-            String path = RecipeSupport.orDefault(prompter.ask(PATH_QUESTION, table), table);
+            EmbedAs as = embedAs(prompter.choose(AS_QUESTION, List.of("array", "object", "flat"), "array"));
+            String path = as == EmbedAs.FLAT
+                    ? null
+                    : RecipeSupport.orDefault(prompter.ask(PATH_QUESTION, table), table);
             children.add(new Child(table, on, as, path, database));
         } while (RecipeSupport.yes(prompter, ANOTHER_QUESTION, false));
         return children;
@@ -151,7 +155,10 @@ final class NestedJsonRecipe {
         return children;
     }
 
-    /** {@code <table>:<childcol>=<rootcol>[,...][:array|object][:<path>]}; the two optional parts come in either order. */
+    /**
+     * {@code <table>:<childcol>=<rootcol>[,...][:array|object|flat][:<path>]}; the optional shape and
+     * path come in either order, while flat refuses a path.
+     */
     static Child parseChild(String spec, Database database) {
         String[] parts = spec.split(":");
         if (parts.length < 2 || parts[0].isBlank()) {
@@ -164,19 +171,31 @@ final class NestedJsonRecipe {
         }
         EmbedAs as = EmbedAs.ARRAY;
         String path = table;
+        boolean explicitPath = false;
         for (int i = 2; i < parts.length; i++) {
             String part = parts[i].trim();
-            if (part.equals("array") || part.equals("object")) {
+            if (part.equals("array") || part.equals("object") || part.equals("flat")) {
                 as = embedAs(part);
             } else if (!part.isEmpty()) {
                 path = part;
+                explicitPath = true;
             }
+        }
+        if (as == EmbedAs.FLAT) {
+            if (explicitPath) {
+                throw new RecipeRun.Usage("a flat child has no path; " + CHILD_USAGE);
+            }
+            path = null;
         }
         return new Child(table, on, as, path, database);
     }
 
     private static EmbedAs embedAs(String answer) {
-        return "object".equals(answer) ? EmbedAs.OBJECT : EmbedAs.ARRAY;
+        return switch (answer) {
+            case "object" -> EmbedAs.OBJECT;
+            case "flat" -> EmbedAs.FLAT;
+            default -> EmbedAs.ARRAY;
+        };
     }
 
     /**

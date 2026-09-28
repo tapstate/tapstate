@@ -9,7 +9,7 @@ import java.util.Map;
  * The {@code from:} wiring of a transform step (§5): list form for streaming
  * steps (multi-item = per-table group), alias-map form for nest / join named upstreams.
  */
-@Doc("The upstream wiring of a transform step: either a list of references for streaming steps, or a map of named upstreams for nest and join.")
+@Doc("The upstream wiring of a transform step: either a list of references for streaming steps, or a map of named upstreams for nest and join. A join's map names one source table per alias - never another step, and never a /…/ pattern.")
 public sealed interface FromClause {
 
     static Flow list(FromRef... refs) {

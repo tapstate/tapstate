@@ -20,12 +20,16 @@
 // The weekly capture job folds these files into one JSONL, which is the shape the report counts from.
 
 export const STORED_FIELDS = [
-  'installation_id', 'version', 'os', 'arch', 'entrypoint', 'country', 'timestamp',
+  'installation_id', 'version', 'os', 'arch', 'entrypoint', 'channel', 'country', 'timestamp',
 ];
 
 const OS = new Set(['darwin', 'linux']);
 const ARCH = new Set(['arm64', 'x64']);
 const ENTRYPOINT = new Set(['cli', 'quickstart']);
+// Which side of the denominator an install falls on. 'internal' is our own test harnesses, and the
+// report never counts them into the figure it divides by. Absent is a third answer, derived below --
+// it is not one an installer may send.
+const CHANNEL = new Set(['community', 'internal']);
 
 // The client's clock is the client's, and the timestamp decides which week an install is counted in.
 // Unbounded, a wrong clock -- or anyone at all, the endpoint being public -- writes into a week that
@@ -63,6 +67,18 @@ export function buildEvent(body, headers, now = Date.now()) {
   if (!ARCH.has(body.arch)) return { error: 'bad arch' };
   if (!ENTRYPOINT.has(body.entrypoint)) return { error: 'bad entrypoint' };
 
+  // Absent is recorded as 'unknown', never as 'community'. An installer older than this field cannot
+  // say which side it is on, and filing that as community puts whatever it was -- including a test
+  // lane running a previous release -- inside the one figure the funnel divides by, which is the
+  // thing this field exists to prevent. Derived here rather than sent, exactly like country's 'ZZ':
+  // "nobody said" and "somebody said community" are different facts and a default renders them alike.
+  // A value that is neither is refused rather than folded into one of them.
+  let channel = 'unknown';
+  if (body.channel !== undefined) {
+    if (!CHANNEL.has(body.channel)) return { error: 'bad channel' };
+    channel = body.channel;
+  }
+
   const timestamp = body.timestamp;
   if (typeof timestamp !== 'string' || !TS_RE.test(timestamp)) return { error: 'bad timestamp' };
   const at = Date.parse(timestamp);
@@ -80,6 +96,7 @@ export function buildEvent(body, headers, now = Date.now()) {
       os: body.os,
       arch: body.arch,
       entrypoint: body.entrypoint,
+      channel,
       country,
       timestamp,
     },

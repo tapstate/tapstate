@@ -1,0 +1,46 @@
+# The witness that a real Mongo collection syncs to a real Mongo target, snapshot and change stream both.
+#
+# Mongo is witnessed elsewhere as a source only into the managed store, and as a sync target only from
+# MySQL or Postgres. The two halves are never joined, and the joined shape is among the first somebody
+# tries on their own databases: if it broke, no other example would notice. This one drives it with
+# real connectors on both sides - a real Mongo is seeded, the product discovers its model, derives the
+# target from it, creates the collection in a second real Mongo and writes into it, and the rows are
+# read back out by a driver that is not the product.
+#
+# The first await proves the snapshot half before any change is made, and anchors what the second one
+# witnesses: the filter admits a snapshot read (op=r) and a change insert (op=i), so the count crosses
+# from the seeded five to eight only if the change stream delivers rows written after the snapshot was
+# counted. The closing read is a document, located by id and read field by field, because a count
+# cannot tell a row that landed intact from one that landed in some other shape.
+#
+# A stalled await against a Mongo source is not re-emitted into: a change stream resumes from a token
+# the store issues, so the positioning window a binlog tail has is not known to exist here. A crossing
+# that stops therefore runs its bound out and fails with its reading.
+#
+# Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips
+# this example, naming a directory whose jars do not resolve fails it.
+#
+# Mutation evidence: in TapEventCodec.registered, hand on the source driver's own object in place of
+# the converted carrier. This case fails on both tiers at its first await, "tgt_mongo.orders expected
+# 5, found 0", and the runtime reports connector.write-failed from the sink: the target's codec
+# registry cannot encode the source's ObjectId, which is the same driver's class from another class
+# loader. a-real-change-stream-carries-rows-written-after-start passes on both tiers in the same run,
+# because MySQL rows carry no driver-typed value and never reach the carrier. Restoring the carrier
+# passes this case on both tiers.
+name: a-real-mongo-collection-syncs-to-a-real-mongo-target
+setup:
+  databases:
+    src: { kind: mongo }
+    tgt: { kind: mongo }
+  connectors: [mongodb]
+  apply: [src_mongo.tap.yml, tgt_mongo.tap.yml, pipeline.tap.yml]
+  discover: [src_mongo]
+pipeline: pipeline.tap.yml
+seed:
+  src_mongo.orders: { rows: 5 }
+steps:
+  - start
+  - await: { count: { tgt_mongo.orders: 5 } }
+  - cdc: { src_mongo.orders: insert 3 }
+  - await: { count: { tgt_mongo.orders: 8 } }
+  - assert: { doc: { tgt_mongo.orders: { where: { id: 7 }, expect: { seq: 7 } } } }

@@ -12,24 +12,24 @@
 # Re-recording on a laptop puts every F row over its threshold on the next run.
 # ratio '-' means this row's cost is not held to a threshold, only its counts.
 # scenario	tier	batchReads	singleReads	keysRead	writes	ratio
-F1	cold	2	0	2000	6000	621.7
-F1	hot	2	0	2000	6000	699.4
-F1	mixed	2	0	2000	6000	550.6
-F2	cold	20	0	20000	42000	138.9
-F2	hot	20	0	20000	42000	100.4
-F2	mixed	20	0	20000	42000	100.3
-I1	cold	5	0	2500	5000	-
-I1	hot	5	0	2500	5000	-
-I1	mixed	5	0	2500	5000	-
-I2	cold	5	0	1665	4165	-
-I2	hot	5	0	1665	4165	-
-I2	mixed	5	0	1665	4165	-
-I3	cold	0	0	0	7500	-
-I3	hot	0	0	0	7500	-
-I3	mixed	0	0	0	7500	-
-I4	cold	5	0	2500	5000	-
-I4	hot	5	0	2500	5000	-
-I4	mixed	5	0	2500	5000	-
+F1	cold	2	0	2000	6002	621.7
+F1	hot	2	0	2000	6002	699.4
+F1	mixed	2	0	2000	6002	550.6
+F2	cold	20	0	20000	42020	138.9
+F2	hot	20	0	20000	42020	100.4
+F2	mixed	20	0	20000	42020	100.3
+I1	cold	5	0	2500	5005	-
+I1	hot	5	0	2500	5005	-
+I1	mixed	5	0	2500	5005	-
+I2	cold	5	0	1665	4170	-
+I2	hot	5	0	1665	4170	-
+I2	mixed	5	0	1665	4170	-
+I3	cold	0	0	0	7505	-
+I3	hot	0	0	0	7505	-
+I3	mixed	0	0	0	7505	-
+I4	cold	5	0	2500	5005	-
+I4	hot	5	0	2500	5005	-
+I4	mixed	5	0	2500	5005	-
 R1	cold	5	0	50	5	-
 R1	hot	5	0	50	5	-
 R1	mixed	5	0	50	5	-

@@ -58,6 +58,18 @@ class ConvergenceDriverTest {
     }
 
     @Test
+    void aMemberWithoutCommittedMembershipDoesNotActuateDesiredWork() {
+        desired.save(new DesiredState("orders", RUNNING, "rev-1"));
+        ConvergenceDriver gated = new ConvergenceDriver(
+                converger, desired, new ObservationPublisher(state, observations), () -> false);
+
+        gated.reconcile();
+
+        assertThat(state.read("orders")).isEmpty();
+        assertThat(observations.read("orders")).isEmpty();
+    }
+
+    @Test
     void reconcileIsolatesAPerPipelineFailure() {
         desired.save(new DesiredState("broken", RUNNING, "rev-1"));
         desired.save(new DesiredState("healthy", RUNNING, "rev-1"));
@@ -375,6 +387,11 @@ class ConvergenceDriverTest {
         @Override
         public Optional<Throwable> failure(String pipelineId) {
             return Optional.ofNullable(failure);
+        }
+
+        @Override
+        public Optional<Throwable> lost(String pipelineId) {
+            return Optional.empty();
         }
 
         /** Always carrying: these cases are about what the driver does with a converge result. */

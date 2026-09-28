@@ -47,7 +47,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * handed, so the reading is a reading of the engine.
  *
  * <p>Liveness before the reading, in the case that asserts nought. A run that never started has read
- * nothing either, and the snapshot face of a pipeline with no live run answers nothing at all -- which a
+ * nothing either, and the run-local snapshot metric of a pipeline with no live run answers nothing at all -- which a
  * reading defaulted to nought reports as a collection that was never read. So the restarted run is first
  * made to carry a document written after the restart, and beside the claim stands a guard reading the
  * state and the run's own record count. Both have to hold, and the claim is asserted first on purpose --
@@ -111,6 +111,13 @@ class RestartKeepsThePositionIT {
             // The pair the terminal composes for the plain word: a stop that keeps, then a start.
             control.stop(fixture.pipelineId(), false);
             control.lifecycle(fixture.pipelineId(), LifecycleVerb.START);
+
+            // Both words are answered once they are recorded, so the run before this one can still be going
+            // when they return. A document written in that gap is that run's to carry: it carries it and
+            // confirms it, and the run replacing it then rightly carries on past it with nothing left to
+            // drive -- which reads as nought below, the reading kept for documents that went some other way.
+            // So the liveness document waits for the new run to be up.
+            awaitTheRunThatReplacedTheOneBefore(control, fixture.pipelineId(), droveBefore);
 
             // Liveness before the reading. A run that has not begun its full load has read nought too,
             // so without a document that actually crosses after the restart the assertion is vacuous.
@@ -280,7 +287,7 @@ class RestartKeepsThePositionIT {
     /**
      * Says that the reading just taken is a reading of a run that is there and is a new one. Two
      * situations answer "it read nought" while the claim resting on it is false: a pipeline with no live
-     * run answers the snapshot face with nothing, and the default that reading takes for a missing
+     * run answers the run-local snapshot metric with nothing, and the default that reading takes for a missing
      * collection turns that into the very value the claim asserts; and a restart that did not restart
      * leaves the run before it delivering, so the documents the case waited for arrive on time while
      * saying nothing about a run that was never built.
@@ -305,7 +312,7 @@ class RestartKeepsThePositionIT {
                         + "would have answered just the same", pipelineId, read)
                 .contains(PipelineState.RUNNING);
         assertThat(control.snapshotRowsRead(pipelineId))
-                .as("the snapshot face of %s: with no live run it answers nothing at all, which the "
+                .as("the run-local snapshot metric of %s: with no live run it answers nothing at all, which the "
                         + "reading taken from it would report as a collection that was never read",
                         pipelineId)
                 .containsKey(COLLECTION);
@@ -315,6 +322,18 @@ class RestartKeepsThePositionIT {
                         + "count of nought is documents that reached the target by some other route",
                         pipelineId, droveBefore)
                 .isStrictlyBetween(0L, droveBefore);
+    }
+
+    /**
+     * Waits until the live run is a new one: its record count reads below what the run before it reached.
+     * That run's count only climbs, and a run replacing it begins again at nought, so no reading of the old
+     * run passes this, and neither does a pipeline with no run at all, which reads nothing.
+     */
+    private static void awaitTheRunThatReplacedTheOneBefore(
+            ControlPlane control, String pipelineId, long droveBefore) {
+        Await.until("a run of %s replacing the one that drove %d".formatted(pipelineId, droveBefore), TIMEOUT,
+                () -> control.recordCount(pipelineId).filter(count -> count < droveBefore).isPresent(),
+                () -> String.valueOf(control.recordCount(pipelineId)));
     }
 
     /**

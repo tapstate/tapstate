@@ -3,6 +3,7 @@ package io.tapstate.app;
 import com.hazelcast.core.HazelcastException;
 import io.tapstate.core.common.TapstateException;
 import org.junit.jupiter.api.Test;
+import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -17,6 +18,26 @@ import static org.assertj.core.api.Assertions.catchThrowable;
  * crashes bare.
  */
 class HazelcastStartupTest {
+
+    private final ApplicationContextRunner context = new ApplicationContextRunner()
+            .withUserConfiguration(HazelcastConfiguration.class)
+            .withPropertyValues(
+                    "tapstate.hz.discovery.mode=tcp-ip",
+                    "tapstate.hz.discovery.tcp-ip.seeds[0]=127.0.0.1:5781",
+                    "tapstate.hz.member-port=5781",
+                    "tapstate.hz.bind-address=10.20.0.11",
+                    "tapstate.cluster.profile=process-failure-only",
+                    "tapstate.cluster.bootstrap-min-members=2");
+
+    @Test
+    void clusterDiscoveryCannotStartWithoutStableIdentity() {
+        context.run(started -> {
+            assertThat(started).hasFailed();
+            Throwable root = rootCause(started.getStartupFailure());
+            assertThat(root).isInstanceOfSatisfying(TapstateException.class,
+                    coded -> assertThat(coded.code()).isEqualTo(BootError.CLUSTER_ID_REQUIRED));
+        });
+    }
 
     @Test
     void memberStartupFailureBecomesACodedDiagnostic() {
@@ -40,5 +61,13 @@ class HazelcastStartupTest {
         assertThatThrownBy(() -> HazelcastConfiguration.startMember(() -> {
             throw bug;
         })).isSameAs(bug);
+    }
+
+    private static Throwable rootCause(Throwable failure) {
+        Throwable root = failure;
+        while (root.getCause() != null) {
+            root = root.getCause();
+        }
+        return root;
     }
 }

@@ -71,6 +71,16 @@ class NestStateSitsOnThePartitionItsEventsArriveOnTest {
 
     private static final List<String> ALIASES = List.of("customer", "policy", "claim", "order", "item");
 
+    /**
+     * A tree whose root points at a row rather than gathering rows under itself, which is what compiles to
+     * the third kind of state-carrying vertex. It needs a root of its own: the direction is read off the
+     * keys, and a root identified by the very column it joins on is gathering by that reading.
+     */
+    private static final TransformBody.Nest POINTING_TREE = nest("order", List.of("order_id"),
+            embed("customer", "customer_id", "customer_id", EmbedAs.OBJECT, "customer", null));
+
+    private static final List<String> POINTING_ALIASES = List.of("order", "customer");
+
     private HazelcastInstance member;
     private NestTopology topology;
     private DAG dag;
@@ -88,15 +98,28 @@ class NestStateSitsOnThePartitionItsEventsArriveOnTest {
         member = Hazelcast.newHazelcastInstance(config);
 
         topology = NestTopology.compile("p", "doc", TREE, tables());
-        dag = new DAG();
+        dag = drawn(topology, ALIASES, "customer");
+    }
+
+    /**
+     * {@code tree} drawn onto a graph of its own, with one source vertex per alias.
+     *
+     * <p>Outbound ordinals are handed out as they are asked for rather than always being zero. A stream
+     * whose rows are also delivered to be recorded against what they point at leaves its source more than
+     * once, and a graph that answers zero every time refuses the second edge outright.
+     */
+    private static DAG drawn(NestTopology tree, List<String> aliases, String rootAlias) {
+        DAG graph = new DAG();
         Map<String, Vertex> sources = new java.util.LinkedHashMap<>();
-        for (String alias : ALIASES) {
-            sources.put(alias, dag.newVertex(alias, Processors.noopP()));
+        for (String alias : aliases) {
+            sources.put(alias, graph.newVertex(alias, Processors.noopP()));
         }
-        NestDag.attach(dag, topology, "doc", "customer", "doc",
+        Map<Vertex, Integer> handedOut = new java.util.HashMap<>();
+        NestDag.attach(graph, tree, "doc", rootAlias, "doc",
                 alias -> List.of(sources.get(alias)),
                 new NestBinding(tables(), HeapNestStores.onHeap(), (from, released) -> { }),
-                vertex -> 0, null);
+                vertex -> handedOut.merge(vertex, 1, Integer::sum) - 1, null);
+        return graph;
     }
 
     @AfterEach
@@ -129,6 +152,70 @@ class NestStateSitsOnThePartitionItsEventsArriveOnTest {
                 .hasSize(3);
         aligned(assembler, ordinalOf(assembler, List.of("policies")), upFromPolicies);
         aligned(assembler, ordinalOf(assembler, List.of("orders")), upFromOrders);
+    }
+
+    /**
+     * The same comparison for the vertex that files the rows a level points at. It keeps two kinds of
+     * entry rather than one - the rows themselves, and which identities point at each of them, spread over
+     * a fixed number of buckets - and only the first is filed under the key the edge routed on. The second
+     * is what the bucket number is appended to, so it is the half that can be scattered away from the row
+     * it belongs to while every document still renders correctly.
+     */
+    @Test
+    void theVertexFilingPointedAtRowsKeepsBothKindsOfEntryWhereItsEventsArrive() {
+        NestTopology pointing = NestTopology.compile("p", "doc", POINTING_TREE, tables());
+        DAG graph = drawn(pointing, POINTING_ALIASES, "order");
+        assertThat(pointing.lookups())
+                .describedAs("the tree really did compile to one of these - read as a gathering embed "
+                        + "instead, every assertion below would walk an empty list")
+                .hasSize(1);
+        NestLookup customers = pointing.lookups().get(0);
+
+        lookupAligned(graph, customers, LookupProcessor.ROWS, events(3, seq -> event(seq,
+                "customer_id", "C" + seq, "name", "Ada " + seq)));
+        lookupAligned(graph, customers, LookupProcessor.REGISTRATIONS, events(3, seq -> event(seq,
+                "order_id", "O" + seq, "customer_id", "C" + seq)));
+        // An order that used to point somewhere else: the departing edge is keyed off the row it was,
+        // and an edit that points where it already pointed leaves nothing to take out.
+        lookupAligned(graph, customers, LookupProcessor.DEPARTED_REGISTRATIONS,
+                events(3, seq -> update(seq,
+                        row("order_id", "O" + seq, "customer_id", "WAS-C" + seq),
+                        row("order_id", "O" + seq, "customer_id", "C" + seq))));
+    }
+
+    /**
+     * Feeds each of {@code items} to {@code lookup} on {@code ordinal} and asserts that every entry it
+     * touched - of either kind - is on the partition the edge routed that item to.
+     */
+    private void lookupAligned(DAG graph, NestLookup lookup, int ordinal, List<Object> items) {
+        for (Object item : items) {
+            RecordingStore<Map<String, Object>> rows = new RecordingStore<>();
+            RecordingStore<Set<Object>> references = new RecordingStore<>();
+            LookupProcessor processor = new LookupProcessor(lookup, rows, references, 1000L, null);
+            TestOutbox outbox = new TestOutbox(128);
+            try {
+                processor.init(outbox, new TestProcessorContext());
+            } catch (Exception cause) {
+                throw new IllegalStateException("could not start " + lookup.name(), cause);
+            }
+            TestInbox inbox = new TestInbox();
+            inbox.queue().add(item);
+            processor.process(ordinal, inbox);
+
+            Set<Object> touched = new LinkedHashSet<>(rows.touched);
+            touched.addAll(references.touched);
+            assertThat(touched)
+                    .describedAs("%s touched state while handling what arrived on ordinal %d, so there is "
+                            + "something to compare", lookup.name(), ordinal)
+                    .isNotEmpty();
+            int routedTo = partitionOfEdge(graph, lookup.name(), ordinal, item);
+            for (Object key : touched) {
+                assertThat(partitionOf(key))
+                        .describedAs("%s reaches %s from where its event arrived, rather than across the "
+                                + "cluster", lookup.name(), key)
+                        .isEqualTo(routedTo);
+            }
+        }
     }
 
     /**
@@ -187,18 +274,22 @@ class NestStateSitsOnThePartitionItsEventsArriveOnTest {
         return emitted;
     }
 
-    /** The partition the edge into {@code vertex} on {@code ordinal} routes {@code item} to. */
-    @SuppressWarnings("unchecked")
     private int partitionOfEdge(NestVertex vertex, int ordinal, Object item) {
-        Edge edge = dag.getInboundEdges(vertex.name()).stream()
+        return partitionOfEdge(dag, vertex.name(), ordinal, item);
+    }
+
+    /** The partition the edge into {@code vertexName} on {@code ordinal} routes {@code item} to. */
+    @SuppressWarnings("unchecked")
+    private int partitionOfEdge(DAG graph, String vertexName, int ordinal, Object item) {
+        Edge edge = graph.getInboundEdges(vertexName).stream()
                 .filter(candidate -> candidate.getDestOrdinal() == ordinal)
                 .findFirst()
                 .orElseThrow(() -> new IllegalArgumentException(
-                        "no edge into " + vertex.name() + " on ordinal " + ordinal));
+                        "no edge into " + vertexName + " on ordinal " + ordinal));
         Partitioner<Object> partitioner = (Partitioner<Object>) edge.getPartitioner();
         assertThat(partitioner)
                 .describedAs("the edge into %s on ordinal %d is partitioned at all - an unpartitioned one "
-                        + "would send every item everywhere", vertex.name(), ordinal)
+                        + "would send every item everywhere", vertexName, ordinal)
                 .isNotNull();
         partitioner.init(this::partitionOf);
         return partitioner.getPartition(item, member.getPartitionService().getPartitions().size());
@@ -215,6 +306,11 @@ class NestStateSitsOnThePartitionItsEventsArriveOnTest {
 
     private static Envelope event(long seq, Object... pairs) {
         return Envelope.insert(seq, "src", row(pairs), null).withOrder(new SourceOrder(1L, seq));
+    }
+
+    /** An edit from {@code was} to {@code now}, which is the only shape the departing edge has a key for. */
+    private static Envelope update(long seq, Map<String, Object> was, Map<String, Object> now) {
+        return Envelope.update(seq, "src", now, was, null).withOrder(new SourceOrder(1L, seq));
     }
 
     /** A store that answers like any other and remembers which keys it was asked about. */

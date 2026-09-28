@@ -799,10 +799,44 @@ class StoreBackedDagSourceTest {
         DAG dag = new StoreBackedDagSource(store).dagFor("players");
 
         assertThat(vertexNames(dag)).containsExactlyInAnyOrder(
-                "players_src.Player", "players_src.PlayerCard", "players_src.Orders", "serve.sync_1");
+                "players_src.Player", "players_src.PlayerCard", "serve.sync_1");
         assertThat(edges(dag)).containsExactlyInAnyOrder(
                 edge("players_src.Player", "serve.sync_1"),
                 "players_src.PlayerCard->serve.sync_1#0,1");
+    }
+
+    @Test
+    void qualified_from_regex_reaches_a_single_selected_table() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(new SourceResource("src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null));
+        store.artifacts().save(connectionSupplier("dest"));
+        store.artifacts().save(new PipelineResource(
+                "selected", null, List.of(SourceRef.spec("src", true)), null, null,
+                serve(FromRef.regex("src\\.orders"), sync("sync_1", "dest")), null, null));
+        discovered(store, "src", "orders", "customers");
+
+        DAG dag = new StoreBackedDagSource(store).dagFor("selected");
+
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("src", "serve.sync_1");
+        assertThat(edges(dag)).containsExactly(edge("src", "serve.sync_1"));
+    }
+
+    @Test
+    void aSourceWithNoReferencedTableOpensNoVertex() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("src_a", "orders"));
+        store.artifacts().save(cdcSource("src_b", "customers"));
+        store.artifacts().save(connectionSupplier("dest"));
+        store.artifacts().save(new PipelineResource(
+                "selected", null, List.of(SourceRef.spec("src_a", true), SourceRef.spec("src_b", true)),
+                null, null, serve(FromRef.literal("orders"), sync("sync_1", "dest")), null, null));
+        discovered(store, "src_a", "orders");
+        discovered(store, "src_b", "customers");
+
+        DAG dag = new StoreBackedDagSource(store).dagFor("selected");
+
+        assertThat(vertexNames(dag)).containsExactlyInAnyOrder("src_a", "serve.sync_1");
     }
 
     @Test

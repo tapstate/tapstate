@@ -48,6 +48,12 @@ final class NestStateKeys {
 
     /** The name {@code key} is stored under - injective over keys, and readable at a glance. */
     static String nameOf(Object key) {
+        // A bucket of the identities pointing at a row says which row places it, so that every bucket of
+        // one row is held where that row is. What it is named by is the other question, and the answer is
+        // the one it always had: the values it carries, flat.
+        if (key instanceof NestLookup.At bucket) {
+            return nameOf(bucket.flattened());
+        }
         if (key instanceof ParkedSubtree.At at) {
             String address = nameOf(at.pathId(), at.elementKey());
             return at.piece() == 0 ? address : address + PIECE + at.piece();

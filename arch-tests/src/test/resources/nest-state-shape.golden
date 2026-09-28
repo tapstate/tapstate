@@ -59,6 +59,9 @@ io.tapstate.runtime.engine.nest.ResolverState$Waiting :: record :: uid=0
 io.tapstate.runtime.engine.nest.RootAssembly :: class :: uid=2
 io.tapstate.runtime.engine.nest.RootAssembly :: field :: byIdentity :: java.util.Map<java.util.List<java.lang.String>, java.util.Map<java.lang.Object, io.tapstate.runtime.engine.nest.RootAssembly$ElementNode>>
 io.tapstate.runtime.engine.nest.RootAssembly :: field :: children :: java.util.Map<java.lang.String, java.util.Map<java.util.List<java.lang.Object>, io.tapstate.runtime.engine.nest.RootAssembly$ElementNode>>
+# Builds before flat embeds had no field to write here. A missing value therefore means no flat field
+# was ever emitted and is safely initialized to an empty map on first use.
+io.tapstate.runtime.engine.nest.RootAssembly :: field :: flatFields :: java.util.Map<java.lang.String, java.util.Set<java.lang.String>>
 io.tapstate.runtime.engine.nest.RootAssembly :: field :: fromRoot :: io.tapstate.runtime.engine.nest.RootAssembly$Absorbed
 io.tapstate.runtime.engine.nest.RootAssembly :: field :: heldElements :: java.util.List<io.tapstate.runtime.engine.nest.NestElement>
 io.tapstate.runtime.engine.nest.RootAssembly :: field :: rootFields :: java.util.Map<java.lang.String, java.lang.Object>

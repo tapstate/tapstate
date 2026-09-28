@@ -11,6 +11,7 @@ import io.tapstate.spi.store.DesiredStore;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.BooleanSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
@@ -31,6 +32,8 @@ final class ConvergenceDriver {
     private final PipelineConverger converger;
     private final DesiredStore desired;
     private final ObservationPublisher publisher;
+    private final BooleanSupplier businessEligible;
+    private final PipelineActuationOwnership actuation;
 
     // Consecutive failed-reconcile passes per pipeline, so a pipeline that keeps throwing surfaces as a
     // climbing errorCount rather than an empty read face. Reconcile runs on a single scheduler thread with a
@@ -44,7 +47,7 @@ final class ConvergenceDriver {
 
     /** A driver that keeps no history, for the cases that are about convergence alone. */
     ConvergenceDriver(PipelineConverger converger, DesiredStore desired, ObservationPublisher publisher) {
-        this(converger, desired, publisher, null);
+        this(converger, desired, publisher, (RateSampler) null);
     }
 
     ConvergenceDriver(PipelineConverger converger, DesiredStore desired, ObservationPublisher publisher,
@@ -54,21 +57,53 @@ final class ConvergenceDriver {
 
     ConvergenceDriver(PipelineConverger converger, DesiredStore desired, ObservationPublisher publisher,
             RateSampler sampler, MetricsExport export) {
+        this(converger, desired, publisher, sampler, export, () -> true,
+                PipelineActuationOwnership.single());
+    }
+
+    /** A driver on a member that only acts while the cluster says this member may. */
+    ConvergenceDriver(PipelineConverger converger, DesiredStore desired, ObservationPublisher publisher,
+            BooleanSupplier businessEligible) {
+        this(converger, desired, publisher, businessEligible, PipelineActuationOwnership.single());
+    }
+
+    /** The same, driving only the pipelines this member holds the actuation claim for. */
+    ConvergenceDriver(PipelineConverger converger, DesiredStore desired, ObservationPublisher publisher,
+            BooleanSupplier businessEligible, PipelineActuationOwnership actuation) {
+        this(converger, desired, publisher, null, MetricsExport.none(), businessEligible, actuation);
+    }
+
+    ConvergenceDriver(PipelineConverger converger, DesiredStore desired, ObservationPublisher publisher,
+            RateSampler sampler, MetricsExport export, BooleanSupplier businessEligible,
+            PipelineActuationOwnership actuation) {
         this.converger = converger;
         this.desired = desired;
         this.publisher = publisher;
         this.sampler = sampler;
         this.export = export == null ? MetricsExport.none() : export;
+        this.businessEligible = businessEligible;
+        this.actuation = actuation;
     }
 
     @Scheduled(fixedDelayString = "${tapstate.converge.interval-ms:1000}")
     void reconcile() {
+        if (!businessEligible.getAsBoolean()) {
+            return;
+        }
         List<String> pipelineIds = desired.pipelineIds();
         for (String pipelineId : pipelineIds) {
             // Attribute every line logged while reconciling this pipeline to it, so the logs read face can
             // tail per pipeline. Cleared per pipeline so the slot never leaks onto the next one or an idle tick.
             MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, pipelineId);
             try {
+                if (!actuation.permit(pipelineId).granted()) {
+                    // Another member drives this pipeline. Observe desired and actual; drive neither. Both
+                    // halves matter: converging here would call the same lifecycle verb a second time --
+                    // this member is carrying no job, which is exactly the condition the converge side
+                    // starts one in -- and publishing here would overwrite the driver's observation with
+                    // this member's own run statistics, which are absent because the run is not here.
+                    continue;
+                }
                 ConvergeResult result = converger.converge(pipelineId);
                 ObservationFailure failure = null;
                 if (result.status() == ConvergeStatus.FAILED) {
@@ -114,6 +149,9 @@ final class ConvergenceDriver {
         // pipeline: the control ring's synchronous surface into the runtime is a closed set, and this set
         // is already crossing once a tick with the same answer in it.
         reconcileFailures.keySet().retainAll(pipelineIds);
+        // Same for the claims: a pipeline that is gone still has this member named as its driver until the
+        // lease runs out, which delays nothing but reads as an owner over something that no longer exists.
+        actuation.retain(pipelineIds);
         publisher.forgetPipelinesOutside(pipelineIds);
         if (sampler != null) {
             sampler.forgetPipelinesOutside(pipelineIds);

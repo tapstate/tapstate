@@ -11,7 +11,8 @@ import java.util.Objects;
  * One change as the durable change log holds it: the source's own position token, the change kind and
  * event time, the before/after row images, and the schema version in force. The sequence it sits at is
  * the log's key rather than a field of the record -- the ring assigns it, and the store writes it as
- * half of the key.
+ * half of the key. A clustered record also carries the capture fence copied from the hot-buffer item;
+ * the store validates it in the same transaction as the append instead of trusting an old process to stop.
  *
  * <p>The position travels as its opaque token, never as a connector object. A record written by one run
  * is read back by another, possibly a later build, and only the connector that issued the offset can
@@ -29,7 +30,18 @@ public record SrsLogRecord(
         long ts,
         Map<String, Object> before,
         Map<String, Object> after,
-        long schemaVer) {
+        long schemaVer,
+        WorkloadClaimFence captureFence) {
+
+    public SrsLogRecord(
+            String srcToken,
+            Op op,
+            long ts,
+            Map<String, Object> before,
+            Map<String, Object> after,
+            long schemaVer) {
+        this(srcToken, op, ts, before, after, schemaVer, null);
+    }
 
     public SrsLogRecord {
         Objects.requireNonNull(op, "op");

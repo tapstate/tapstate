@@ -11,6 +11,10 @@ import io.tapstate.core.event.Op;
 import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.store.SrsLogRecord;
 import io.tapstate.spi.store.SrsLogStore;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
+import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -99,6 +103,22 @@ class SrsLogRingbufferStoreTest {
             member.getRingbuffer(RING).add(new SrsItem(null, Op.INSERT, 5L, null, Map.of("id", 1), 0L));
 
             assertThat(log.load(RING, 0L).orElseThrow().srcToken()).isNull();
+        });
+    }
+
+    @Test
+    @DisplayName("carries the capture owner generation through the ring store and its serializer")
+    void carriesTheCaptureFenceThroughTheDurableRecord() {
+        RecordingLog log = new RecordingLog();
+        WorkloadClaimFence fence = new WorkloadClaimFence(
+                new WorkloadClaimKey("cluster-a", WorkloadClaimType.CAPTURE, "capture-orders"),
+                new WorkloadOwner("node-a", "boot-a"), 3, 0, 2);
+        withMember(log, member -> {
+            member.getRingbuffer(RING).add(new SrsItem(
+                    new SourcePosition("a"), Op.INSERT, 1L, null, Map.of("id", 1), 0L, fence));
+
+            assertThat(log.load(RING, 0L).orElseThrow().captureFence()).isEqualTo(fence);
+            assertThat(new SrsRingbuffer(member.getRingbuffer(RING)).readOne(0).captureFence()).isEqualTo(fence);
         });
     }
 

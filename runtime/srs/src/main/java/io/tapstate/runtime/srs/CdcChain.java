@@ -2,6 +2,7 @@ package io.tapstate.runtime.srs;
 
 import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.store.SrsMetaStore;
+import io.tapstate.spi.store.WorkloadClaimFence;
 
 import java.util.Objects;
 import java.util.function.Supplier;
@@ -27,7 +28,17 @@ public record CdcChain(
         SrsMetaStore meta,
         String miningChainId,
         long epoch,
-        long schemaVer) {
+        long schemaVer,
+        WorkloadClaimFence captureFence) {
+
+    public CdcChain(
+            SrsWriteGate gate,
+            SrsMetaStore meta,
+            String miningChainId,
+            long epoch,
+            long schemaVer) {
+        this(gate, meta, miningChainId, epoch, schemaVer, null);
+    }
 
     public CdcChain {
         Objects.requireNonNull(gate, "gate");

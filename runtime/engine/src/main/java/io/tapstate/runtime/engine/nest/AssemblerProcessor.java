@@ -1125,7 +1125,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
                                     // field this tree never had are the same document downstream - and a
                                     // target applies one by setting what is in it, so what is gone from it
                                     // stays there at its last value unless the emission names it.
-                                    .withRemoved(RootAssembly.embedsNotRendered(slots, rendered)));
+                                    .withRemoved(document.assembly.embedsNotRendered(slots, rendered)));
                             document.assembly.documentSent();
                         } else {
                             windows.get(key).holds(document.ts, unsent);
@@ -1323,7 +1323,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
                     // As on the drain's own path. A document released by the window is the same document
                     // and needs the same saying-so - and this is the path a deployment with a window open
                     // sends most of them on, so leaving it out would fix nothing where it matters.
-                    .withRemoved(RootAssembly.embedsNotRendered(slots, rendered.get())));
+                    .withRemoved(assembly.embedsNotRendered(slots, rendered.get())));
             assembly.documentSent();
             store.save(entry.getKey(), assembly);
             window.reopen(now);
