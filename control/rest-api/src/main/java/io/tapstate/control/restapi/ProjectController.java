@@ -6,17 +6,16 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
 
 /**
  * The projects face: which projects this server holds, read off the label their resources carry, and the
- * removal of one project as a whole. The Default project is always listed and never removable.
+ * removal of one project as a whole. The Default project is always listed and never removable. Mounted
+ * under the {@code /api} prefix by the path configuration.
  */
 @RestController
-@RequestMapping("/api")
 class ProjectController {
 
     /** The project list the HTTP face returns. */

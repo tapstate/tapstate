@@ -398,6 +398,23 @@ class ControlApiTest {
     }
 
     @Test
+    void theProjectsAreListedDefaultFirstAndTheDefaultProjectIsNotRemovable() {
+        applyDrafts(SRC_ORA);
+
+        Map<?, ?> listed = client().get().uri("/api/projects").retrieve().body(Map.class);
+        List<?> items = (List<?>) listed.get("items");
+        assertThat(items).hasSize(1);
+        Map<?, ?> first = (Map<?, ?>) items.get(0);
+        assertThat(first.get("id")).isEqualTo("default");
+        assertThat(first.get("removable")).isEqualTo(false);
+        assertThat((List<?>) first.get("resources")).hasSize(1);
+
+        HttpStatusCode refused = client().delete().uri("/api/projects/default")
+                .exchange((request, response) -> response.getStatusCode());
+        assertThat(refused).isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    @Test
     void aListedArtifactCarriesTheSameHashItsOwnReadReturns() {
         // A caller that lists and then removes must not need a second round trip to re-read each one.
         applyDrafts(SRC_ORA, TGT_MG, PIPELINE);
@@ -856,7 +873,7 @@ class ControlApiTest {
     @SpringBootConfiguration
     @EnableAutoConfiguration
     @Import({RestApiConfiguration.class, SourceDraftTestConfiguration.class,
-            ClusterTopologyTestConfiguration.class, ArtifactController.class,
+            ClusterTopologyTestConfiguration.class, ArtifactController.class, ProjectController.class,
             SourceDraftController.class, ConnectionController.class,
             ClusterController.class, HealthController.class, VersionController.class,
             ApiExceptionHandler.class, FaultController.class})
