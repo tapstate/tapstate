@@ -82,7 +82,8 @@ class CloudExternalConfigStartupIT {
         String selected = uniqueDatabase("cloud_selected");
         String ignored = uniqueDatabase("onprem_ignored");
         Map<String, String> values = cloudValues(MONGO.getReplicaSetUrl(selected));
-        Running first = start(carrier, values, MONGO.getReplicaSetUrl(ignored));
+        String seed = "--tapstate.connectors.seed-dir=" + CloudConnectorTestInputs.seedDirectory();
+        Running first = start(carrier, values, MONGO.getReplicaSetUrl(ignored), seed);
         first.awaitHealth();
         assertVersion(first);
         Document managedView;
@@ -96,7 +97,7 @@ class CloudExternalConfigStartupIT {
             assertThat(raw.getDatabase(ignored).listCollectionNames().into(new ArrayList<>())).isEmpty();
         }
         first.close();
-        Running restarted = start(carrier, values, MONGO.getReplicaSetUrl(ignored));
+        Running restarted = start(carrier, values, MONGO.getReplicaSetUrl(ignored), seed);
         restarted.awaitHealth();
         assertVersion(restarted);
         try (var raw = MongoClients.create(MONGO.getReplicaSetUrl())) {
@@ -121,6 +122,15 @@ class CloudExternalConfigStartupIT {
         }
         assertThat(cloudRequests.get()).isZero();
         assertSafeOutput(running, null);
+    }
+
+    @Test
+    void cloudCannotStartWithoutItsMandatoryConnectorRelease() throws Exception {
+        String uri = MONGO.getReplicaSetUrl(uniqueDatabase("missing_cloud_seeds"));
+        Running running = start(Carrier.FILE, cloudValues(uri), uri);
+        running.awaitFailure("boot.cloud-connectors-invalid");
+        assertThat(cloudRequests.get()).isZero();
+        assertSafeOutput(running, uri);
     }
 
     @Test
@@ -240,6 +250,7 @@ class CloudExternalConfigStartupIT {
         }
         command.addAll(List.of("-jar", bootJar.toString(), "--server.address=127.0.0.1", "--server.port=0",
                 "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2",
+                "--tapstate.connectors.plugins-dir=" + directory.resolve("plugins"),
                 "--tapstate.store.mongo.uri=" + onPremUri,
                 "--tapstate.store.mongo.operator-state-database=" + uniqueDatabase("operator_state"),
                 "--tapstate.store.mongo.server-selection-timeout=500ms"));

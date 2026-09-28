@@ -96,6 +96,9 @@ boot.cloud-base-url-invalid:
 boot.cloud-config-incomplete:
   message: "The managed Cloud startup configuration is incomplete."
   solution: "Set tapstate.cloud.base-url, tapstate.cloud.token, and tapstate.cloud.atlas-uri together, or remove all three for on-prem mode."
+boot.cloud-connectors-invalid:
+  message: "Cloud connector `{connector}` failed its required startup check: {reason}."
+  solution: "Restore the matching release, lock, and licenses; repair the stored artifact or plugin cache if mismatched, then confirm every connector can register and load."
 boot.cloud-store-required:
   message: "Managed Cloud mode requires its metadata store."
   solution: "Remove tapstate.store.mongo.enabled=false and supply the assigned Cloud Atlas metadata URI."

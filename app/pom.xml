@@ -274,6 +274,13 @@
         <directory>src/main/resources</directory>
       </resource>
       <resource>
+        <directory>${project.basedir}/../deploy/cloud</directory>
+        <targetPath>META-INF/tapstate</targetPath>
+        <includes>
+          <include>connectors.lock.json</include>
+        </includes>
+      </resource>
+      <resource>
         <directory>${project.build.directory}/generated-resources/tapstate-web</directory>
       </resource>
     </resources>

@@ -11,7 +11,9 @@ import tarfile
 import tempfile
 import unittest
 import zipfile
+from types import SimpleNamespace
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).with_name("stage-connectors.py")
@@ -24,6 +26,10 @@ IMAGE_SPEC = importlib.util.spec_from_file_location("verify_image", IMAGE_SCRIPT
 assert IMAGE_SPEC is not None and IMAGE_SPEC.loader is not None
 IMAGE = importlib.util.module_from_spec(IMAGE_SPEC)
 IMAGE_SPEC.loader.exec_module(IMAGE)
+PREPARE_SPEC = importlib.util.spec_from_file_location("prepare_test_inputs", Path(__file__).with_name("prepare-test-inputs.py"))
+assert PREPARE_SPEC is not None and PREPARE_SPEC.loader is not None
+PREPARE = importlib.util.module_from_spec(PREPARE_SPEC)
+PREPARE_SPEC.loader.exec_module(PREPARE)
 
 
 class StageConnectorsTest(unittest.TestCase):
@@ -85,6 +91,49 @@ class StageConnectorsTest(unittest.TestCase):
             "connectors": self.entries,
             "licenseFiles": self.license_files,
         }), encoding="utf-8")
+
+    def test_public_test_inputs_stage_only_the_locked_downloaded_bytes(self) -> None:
+        def response(command, **options):
+            self.assertIn("--max-filesize", command)
+            self.assertIn("--proto-redir", command)
+            self.assertNotIn("--insecure", command)
+            destination = Path(command[command.index("--output") + 1])
+            destination.write_bytes((self.jars / command[-1].rsplit("/", 1)[-1]).read_bytes())
+            return SimpleNamespace(returncode=0)
+        with patch.object(PREPARE.subprocess, "run", side_effect=response) as downloaded:
+            PREPARE.prepare(self.lock, self.staged)
+        self.assertEqual(downloaded.call_count, 9)
+        self.assertEqual((self.staged / "release/connectors.lock.json").read_bytes(), self.lock.read_bytes())
+
+    def test_tampered_public_test_input_fails_without_producing_output(self) -> None:
+        def response(command, **options):
+            data = (self.jars / command[-1].rsplit("/", 1)[-1]).read_bytes()
+            Path(command[command.index("--output") + 1]).write_bytes(b"!" + data[1:])
+            return SimpleNamespace(returncode=0)
+        with patch.object(PREPARE.subprocess, "run", side_effect=response):
+            with self.assertRaisesRegex(PREPARE.STAGE.StageError, "bytes differ"):
+                PREPARE.prepare(self.lock, self.staged)
+        self.assertFalse(self.staged.exists())
+
+    def test_oversized_public_input_is_bounded_and_does_not_stage(self) -> None:
+        data = (self.jars / "mysql-connector.jar").read_bytes() + b"!"
+        def response(command, **options):
+            self.assertEqual(int(command[command.index("--max-filesize") + 1]), len(data) - 1)
+            Path(command[command.index("--output") + 1]).write_bytes(data)
+            return SimpleNamespace(returncode=0)
+        with patch.object(PREPARE.subprocess, "run", side_effect=response):
+            with self.assertRaisesRegex(PREPARE.STAGE.StageError, "exceed lock length"):
+                PREPARE.prepare(self.lock, self.staged)
+        self.assertFalse(self.staged.exists())
+
+    def test_public_input_transport_failure_does_not_echo_transport_details(self) -> None:
+        with patch.object(PREPARE.subprocess, "run", return_value=SimpleNamespace(
+                returncode=35, stderr=b"transport-secret-sentinel")):
+            with self.assertRaises(PREPARE.STAGE.StageError) as failure:
+                PREPARE.prepare(self.lock, self.staged)
+        self.assertNotIn("transport-secret-sentinel", str(failure.exception))
+        self.assertIsNone(failure.exception.__cause__)
+        self.assertFalse(self.staged.exists())
 
     def make_oci(self, *, architectures: tuple[str, ...] = ("amd64", "arm64"),
                  tamper: str | None = None, license_label: str | None = "NOASSERTION",

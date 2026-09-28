@@ -66,7 +66,7 @@ class ManagedCloudSessionAssemblyIT {
                 "--tapstate.cloud.atlas-uri=" + uri,
                 "--tapstate.store.mongo.operator-state-database=managed_auth_ops_" + Long.toUnsignedString(System.nanoTime(), 16),
                 "--tapstate.connectors.plugins-dir=" + work.resolve("plugins"),
-                "--tapstate.connectors.seed-dir=" + work.resolve("optional-seeds"))) {
+                "--tapstate.connectors.seed-dir=" + CloudConnectorTestInputs.seedDirectory())) {
             int port = ((WebServerApplicationContext) context).getWebServer().getPort();
             RestClient client = RestClient.builder().baseUrl("http://127.0.0.1:" + port)
                     .requestFactory(new JdkClientHttpRequestFactory(HttpClient.newBuilder()

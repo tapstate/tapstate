@@ -76,6 +76,11 @@ jobs:
         run: .github/scripts/ci-maven-cache.sh seed "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
       - name: Build the reactor without running tests
         run: mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install
+      - name: Prepare pinned public inputs for Cloud startup witnesses
+        if: matrix.shard == 'rest'
+        run: |
+          python3 deploy/cloud/prepare-test-inputs.py --output "$RUNNER_TEMP/cloud-test-release"
+          echo "TAPSTATE_TEST_CLOUD_RELEASE_DIR=$RUNNER_TEMP/cloud-test-release" >> "$GITHUB_ENV"
       - name: Execute exactly this shard
         env:
           SHARD: ${{ matrix.shard }}
@@ -387,6 +392,8 @@ jobs:
         run: bash scripts/prepare-web-assets-smoke.sh
       - name: Web release provenance cases
         run: python3 .github/scripts/web-provenance-smoke.py
+      - name: Cloud connector input and test-preparation cases
+        run: python3 deploy/cloud/stage-connectors-test.py
       - name: install-site verifier smoke
         run: bash deploy/install-site/verify-smoke.sh
 

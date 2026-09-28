@@ -42,6 +42,9 @@ enum BootError implements TapstateErrorCode {
     /** Status reporting was explicitly enabled without the real SDK-backed reporter. */
     CLOUD_STATUS_SDK_REQUIRED("boot.cloud-status-sdk-required", Set.of()),
 
+    /** A Cloud connector release is missing, mismatched, or cannot be fully registered and loaded. */
+    CLOUD_CONNECTORS_INVALID("boot.cloud-connectors-invalid", Set.of("connector", "reason")),
+
     /** The selected member-discovery mode is missing a required, deterministic input. */
     DISCOVERY_CONFIG_INVALID("boot.discovery-config-invalid", Set.of("detail")),
 

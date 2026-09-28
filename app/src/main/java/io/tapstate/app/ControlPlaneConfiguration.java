@@ -502,8 +502,14 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    SeedSweepRunner seedSweepRunner(SeedConnectorSweep sweep, ConnectorPluginProperties properties) {
-        return new SeedSweepRunner(sweep, properties.getSeedDir());
+    SeedSweepRunner seedSweepRunner(
+            SeedConnectorSweep sweep, ConnectorPluginProperties properties, CloudRuntimeSettings cloud,
+            ConnectorRegistry registry, ConnectorCatalogStore catalog, ConnectorSpecStore specs, CapabilityDeriver deriver) {
+        var readiness = cloud.cloud()
+                ? CloudConnectorSeedReadiness.checkedRelease(
+                        properties.getSeedDir(), properties.getPluginsDir(), registry, catalog, specs, deriver)
+                : null;
+        return new SeedSweepRunner(sweep, properties.getSeedDir(), readiness);
     }
 
     @Bean

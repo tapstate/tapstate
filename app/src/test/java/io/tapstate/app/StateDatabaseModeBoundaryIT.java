@@ -131,7 +131,8 @@ class StateDatabaseModeBoundaryIT {
                 "--tapstate.hz.jet.cooperative-thread-count=2",
                 "--SDK_STATUS_SENDER_ENABLED=false",
                 "--tapstate.connectors.plugins-dir=" + work.resolve("plugins"),
-                "--tapstate.connectors.seed-dir=" + work.resolve("no-optional-seeds"),
+                "--tapstate.connectors.seed-dir=" + (mode == CloudRuntimeSettings.Mode.CLOUD
+                        ? CloudConnectorTestInputs.seedDirectory() : work.resolve("no-optional-seeds")),
                 "--tapstate.store.mongo.uri=" + MONGO.getReplicaSetUrl(database),
                 "--tapstate.store.mongo.operator-state-database=" + deploymentDatabase));
         if (mode == CloudRuntimeSettings.Mode.CLOUD) {
