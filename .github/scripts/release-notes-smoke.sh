@@ -127,6 +127,12 @@ has  "the positioning window is disclosed" "Changes lost while the change stream
 has  "delivery is not claimed exactly-once" "at-least-once"
 has  "the measured macOS floor is in"      "Recommended macOS: 15.0 or newer."
 has  "the measured glibc floor is in"      "Recommended glibc: 2.34 or newer."
+has  "cluster mode is disclosed as a preview" "cluster mode is an opt-in preview"
+has  "the unauthenticated member port is disclosed" "Cluster members talk over an unauthenticated port"
+# The runtime as it was before cluster mode and persisted state. Every body carried this line until
+# one was corrected by hand, and nothing about a release says when its fixed prose stopped being true.
+hasnt "the runtime is not called single-node" "single-node"
+hasnt "the runtime is not called in-memory"   "in-memory"
 
 # Layer 2 -- harvested, verbatim.
 has  "a written note is carried over verbatim" "* You can assemble tables from MySQL and PostgreSQL into one object, without creating a view."
