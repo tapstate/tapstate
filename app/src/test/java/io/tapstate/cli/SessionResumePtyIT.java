@@ -57,7 +57,7 @@ class SessionResumePtyIT {
             "  (cli " + Cli.VERSION_NUMBER + ", server " + Cli.VERSION_NUMBER + ")",
             "");
     private static final String PTY_DRIVER = """
-            import os, pty, select, signal, sys, time
+            import os, pty, select, signal, sys, termios, time
 
             data = os.environ.pop("TAPSTATE_PTY_INPUT").encode()
             wait_for_password_prompt = os.environ.pop("TAPSTATE_PTY_WAIT_PASSWORD_PROMPT", "0") == "1"
@@ -65,6 +65,13 @@ class SessionResumePtyIT {
             if pid == 0:
                 # Exercise the supported basic terminal profile consistently in CI.
                 os.environ["TERM"] = "linux"
+                # Terminal query replies are input bytes without a newline. Keep echo enabled so
+                # the masked-password assertion still exercises JLine, but avoid canonical buffering.
+                attrs = termios.tcgetattr(0)
+                attrs[3] &= ~termios.ICANON
+                attrs[6][termios.VMIN] = 1
+                attrs[6][termios.VTIME] = 0
+                termios.tcsetattr(0, termios.TCSANOW, attrs)
                 os.execvp(sys.argv[1], sys.argv[1:])
 
             output = bytearray()
