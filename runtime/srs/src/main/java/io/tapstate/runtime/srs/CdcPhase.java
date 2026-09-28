@@ -182,16 +182,17 @@ public final class CdcPhase {
     }
 
     /**
-     * The slowest consumer's read cursor into one table's ring — how far ahead of its readers the ring may
-     * be written. {@link Long#MAX_VALUE} when nothing constrains it (no consumer has a durable cursor yet),
-     * and {@code -1} for a consumer that has read nothing of the table.
+     * The slowest subscribed consumer's read cursor into one table's ring — how far ahead of its readers
+     * the ring may be written. {@link Long#MAX_VALUE} when no consumer subscribes to the table, and
+     * {@code -1} for a subscribed consumer that has read nothing of it.
      *
      * <p>Derived here rather than fetched separately because it is a function of the same cursors the
      * durable frontier is: asking a store for it on its own means reading one record twice per run.
      */
     static long headroomBound(Collection<ConsumerOffset> offsets, String table) {
         return offsets.stream()
-                .mapToLong(offset -> offset.perTableSeq().getOrDefault(table, -1L))
+                .filter(offset -> offset.perTableSeq().containsKey(table))
+                .mapToLong(offset -> offset.perTableSeq().get(table))
                 .min()
                 .orElse(Long.MAX_VALUE);
     }

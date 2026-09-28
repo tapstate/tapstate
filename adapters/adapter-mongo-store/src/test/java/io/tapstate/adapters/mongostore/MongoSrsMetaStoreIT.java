@@ -270,13 +270,29 @@ class MongoSrsMetaStoreIT {
     void advanceConsumerReadSeqCreatesTheCursorWhenTheConsumerHasNoneYet() {
         withStore(store -> {
             store.create(CHAIN, null);
-            // A reader may advance before the pipeline's sink first acks: the deep set creates the consumer
+            // A reader may advance before the pipeline's sink first acks: the deep max creates the consumer
             // entry, and its acked position stays absent until a sink writes one.
             store.advanceConsumerReadSeq(CHAIN, "p1", "orders", 7L);
 
             ConsumerOffset p1 = onlyConsumer(store);
             assertThat(p1.perTableSeq()).containsEntry("orders", 7L);
             assertThat(p1.sinkAckedSrcpos()).isNull();
+        });
+    }
+
+    @Test
+    void unreadRegistrationKeepsAdvancedCursorsAndNamesOnlySelectedTables() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.advanceConsumerReadSeq(CHAIN, "nest", "bench_nest_items", -1L);
+            store.advanceConsumerReadSeq(CHAIN, "nest", "bench_nest_items", 7L);
+            store.advanceConsumerReadSeq(CHAIN, "nest", "bench_nest_items", -1L);
+            store.advanceConsumerReadSeq(CHAIN, "join", "bench_join_orders", -1L);
+
+            Map<String, ConsumerOffset> consumers = store.consumerOffsets(CHAIN).stream()
+                    .collect(java.util.stream.Collectors.toMap(ConsumerOffset::pipelineId, offset -> offset));
+            assertThat(consumers.get("nest").perTableSeq()).containsExactly(Map.entry("bench_nest_items", 7L));
+            assertThat(consumers.get("join").perTableSeq()).containsExactly(Map.entry("bench_join_orders", -1L));
         });
     }
 
@@ -345,6 +361,9 @@ class MongoSrsMetaStoreIT {
 
             assertThat(store.ringDoneThrough(CHAIN, "p1"))
                     .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 3L, "items", 20L));
+            assertThat(onlyConsumer(store).perTableSeq())
+                    .as("the first arrival registers the table in the same consumer update")
+                    .containsEntry("items", 20L);
         });
     }
 

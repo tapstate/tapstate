@@ -259,8 +259,23 @@ jobs:
           ps="$(curl -s -u "$SONAR_TOKEN:" "$host/api/qualitygates/project_status?projectKey=tapstate&pullRequest=${PR_NUMBER}" || true)"
           status="$(printf '%s' "$ps" | jq -r '.projectStatus.status // "UNKNOWN"' 2>/dev/null || echo UNKNOWN)"
           details="$(printf '%s' "$ps" | jq -r '.projectStatus.conditions[]? | select(.status=="ERROR") | "- `\(.metricKey)`: \(.actualValue) (fails \(.comparator) \(.errorThreshold))"' 2>/dev/null || true)"
-          bugs="$(curl -s -u "$SONAR_TOKEN:" "$host/api/issues/search?componentKeys=tapstate&pullRequest=${PR_NUMBER}&resolved=false&types=BUG&ps=100" || true)"
-          bug_details="$(printf '%s' "$bugs" | jq -r '.issues[]? | "- `\(.rule)` [\(.severity)]: `\(.component | sub("^tapstate:"; "")):\(.line // "?")` — \(.message)"' 2>/dev/null || true)"
+          issue_details=""
+          page=1
+          while :; do
+            issues="$(curl -s -u "$SONAR_TOKEN:" "$host/api/issues/search?componentKeys=tapstate&pullRequest=${PR_NUMBER}&resolved=false&ps=100&p=${page}" || true)"
+            page_details="$(printf '%s' "$issues" | jq -r '.issues[]? | "- `\(.rule)` [\(.severity)]: `\(.component | sub("^tapstate:"; "")):\(.line // "?")` — \(.message)"' 2>/dev/null || true)"
+            if [ -n "$page_details" ]; then
+              if [ -n "$issue_details" ]; then
+                issue_details="${issue_details}"$'\n'
+              fi
+              issue_details="${issue_details}${page_details}"
+            fi
+            next_page="$(printf '%s' "$issues" | jq -r '.paging | select((.pageIndex * .pageSize) < .total) | (.pageIndex + 1)' 2>/dev/null || true)"
+            if ! [[ "$next_page" =~ ^[0-9]+$ ]] || [ "$next_page" -le "$page" ]; then
+              break
+            fi
+            page="$next_page"
+          done
 
           case "$status" in
             OK)    emoji="white_check_mark";   verdict="passed" ;;
@@ -278,8 +293,8 @@ jobs:
             if [ -n "${details:-}" ]; then
               printf 'Failing conditions:\n%s\n\n' "$details"
             fi
-            if [ -n "${bug_details:-}" ]; then
-              printf 'Open reliability issues:\n%s\n\n' "$bug_details"
+            if [ -n "${issue_details:-}" ]; then
+              printf 'Open unresolved issues:\n%s\n\n' "$issue_details"
             fi
             printf '[Open the pull-request dashboard](%s)\n\n' "$dashboard"
             printf '_Posted by CI from the SonarQube pull-request quality gate._\n'
