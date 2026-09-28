@@ -116,10 +116,12 @@ class TelemetryDispatcherTest {
             dispatcher.offer(historyFrame(at.plusSeconds(61), 161), null);
             dispatcher.offer(historyFrame(at.plusSeconds(62), 162), null);
             assertThat(dispatcher.health().get(TelemetryDispatcher.Sink.HISTORY).dropped()).isEqualTo(1);
+            assertHistoryGapFacts(dispatcher, sampler, 1, 1, 0);
             release.countDown();
             await(() -> dispatcher.health().get(TelemetryDispatcher.Sink.HISTORY).successes() >= 1);
             dispatcher.offer(historyFrame(at.plusSeconds(120), 220), null);
             await(() -> dispatcher.health().get(TelemetryDispatcher.Sink.HISTORY).successes() >= 2);
+            assertHistoryGapFacts(dispatcher, sampler, 0, 1, 1);
 
             assertThat(retained.readPage("orders", at, at.plusSeconds(180), null, 10).entries())
                     .extracting(RateHistoryStore.Entry::gapFrom)
@@ -127,6 +129,29 @@ class TelemetryDispatcherTest {
         } finally {
             release.countDown();
         }
+    }
+
+    private static void assertHistoryGapFacts(TelemetryDispatcher dispatcher, RateSampler sampler,
+            long open, long opened, long closed) {
+        Instant sampledAt = Instant.now();
+        List<MetricFact> facts = TelemetryProcessFacts.snapshot(dispatcher.health(),
+                java.util.Set.of(TelemetryDispatcher.Sink.HISTORY), sampledAt, sampledAt);
+        for (var expected : Map.of("open", open, "opened", opened, "closed", closed).entrySet()) {
+            MetricFact fact = facts.stream().filter(item -> item.name().equals(
+                    "tapstate.process.telemetry.gap." + expected.getKey())).findFirst().orElseThrow();
+            assertThat(fact.unit()).isEqualTo("{gap}");
+            assertThat(fact.type()).isEqualTo(expected.getKey().equals("open")
+                    ? io.tapstate.core.lifecycle.MetricType.GAUGE : io.tapstate.core.lifecycle.MetricType.COUNTER);
+            assertThat(fact.points()).singleElement().satisfies(point -> {
+                assertThat(point.attributes()).containsExactlyEntriesOf(Map.of("sink", "history"));
+                assertThat(point.value()).isEqualTo(expected.getValue());
+                if (!expected.getKey().equals("open")) {
+                    assertThat(point.startTime()).isEqualTo(sampler.gapHealth().startedAt());
+                }
+            });
+        }
+        assertThat(facts).noneMatch(fact -> fact.name().equals(
+                "tapstate.process.telemetry.restoration.pending"));
     }
 
     private static ObservationPublisher.Prepared historyFrame(Instant at, long out) {

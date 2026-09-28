@@ -75,22 +75,30 @@ final class TelemetryProcessFacts {
                 reading -> reading.breakerState().value(), observedAt));
         facts.add(counter("tapstate.process.telemetry.breaker.recovered", "{recovery}", active,
                 TelemetryDispatcher.Health::breakerRecoveries, startedAt, observedAt));
+        List<Reading> gaps = active.stream().filter(reading -> reading.sink() == TelemetryDispatcher.Sink.HISTORY
+                || reading.sink() == TelemetryDispatcher.Sink.EVENT).toList();
+        if (!gaps.isEmpty()) {
+            facts.add(gauge("tapstate.process.telemetry.gap.open", "{gap}", gaps,
+                    TelemetryDispatcher.Health::openGaps, observedAt));
+            facts.add(gapCounter("tapstate.process.telemetry.gap.opened", gaps,
+                    TelemetryDispatcher.Health::gapsOpened, observedAt));
+            facts.add(gapCounter("tapstate.process.telemetry.gap.closed", gaps,
+                    TelemetryDispatcher.Health::gapsClosed, observedAt));
+        }
         active.stream().filter(reading -> reading.sink() == TelemetryDispatcher.Sink.EVENT)
                 .findFirst().ifPresent(event -> {
-                    facts.add(new MetricFact("tapstate.process.telemetry.gap.open", MetricType.GAUGE,
-                            "{gap}", List.of(MetricPoint.reading(event.attributes(), observedAt,
-                                    event.health().openGaps()))));
                     facts.add(new MetricFact("tapstate.process.telemetry.restoration.pending", MetricType.GAUGE,
                             "{event}", List.of(MetricPoint.reading(event.attributes(), observedAt,
                                     event.health().pendingRestorations()))));
-                    facts.add(new MetricFact("tapstate.process.telemetry.gap.opened", MetricType.COUNTER,
-                            "{gap}", List.of(MetricPoint.accumulated(event.attributes(), startedAt,
-                                    observedAt, event.health().gapsOpened()))));
-                    facts.add(new MetricFact("tapstate.process.telemetry.gap.closed", MetricType.COUNTER,
-                            "{gap}", List.of(MetricPoint.accumulated(event.attributes(), startedAt,
-                                    observedAt, event.health().gapsClosed()))));
                 });
         return List.copyOf(facts);
+    }
+
+    private static MetricFact gapCounter(String name, List<Reading> active,
+            ToLongFunction<TelemetryDispatcher.Health> value, Instant at) {
+        return new MetricFact(name, MetricType.COUNTER, "{gap}", active.stream().map(reading ->
+                MetricPoint.accumulated(reading.attributes(), reading.health().gapsStartedAt(), at,
+                        value.applyAsLong(reading.health()))).toList());
     }
 
     private static MetricFact gauge(String name, String unit, List<Reading> active,

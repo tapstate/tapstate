@@ -220,7 +220,13 @@ class RateSamplerTest {
                 .hasMessage("injected append failure");
         org.assertj.core.api.Assertions.assertThatThrownBy(() -> sampler.appendIfDue(moving(T0.plusSeconds(1), 2)))
                 .hasMessage("injected append failure");
+        assertThat(sampler.gapHealth().open()).isEqualTo(1);
+        assertThat(sampler.gapHealth().opened()).isEqualTo(1);
+        assertThat(sampler.gapHealth().closed()).isZero();
         assertThat(sampler.appendIfDue(moving(T0.plusSeconds(2), 3))).isTrue();
+        assertThat(sampler.gapHealth().open()).isZero();
+        assertThat(sampler.gapHealth().opened()).isEqualTo(1);
+        assertThat(sampler.gapHealth().closed()).isEqualTo(1);
         assertThat(history.gapStarts).containsExactly(T0);
         assertThat(history.appended).hasSize(1);
     }
@@ -269,7 +275,52 @@ class RateSamplerTest {
                 .hasMessage("injected append failure");
 
         assertThat(sampler.appendIfDue(moving(T0.plusSeconds(61), 3), next)).isTrue();
+        assertThat(sampler.gapHealth().open()).isZero();
+        assertThat(sampler.gapHealth().opened()).isEqualTo(1);
+        assertThat(sampler.gapHealth().closed()).as("new execution is not recovery of the old gap").isZero();
         assertThat(history.scopes).containsExactly(old, next);
         assertThat(history.gapStarts).containsExactly(null, null);
+    }
+
+    @Test
+    void droppingMoreFramesExtendsOneGapAndForgettingItDoesNotClaimRecovery() {
+        RateSampler sampler = new RateSampler(new RecordingHistory(), Duration.ofSeconds(60));
+        ObservationStore.Scope run = new ObservationStore.Scope("inc-a", 41);
+        sampler.markDropped(moving(T0, 1), run);
+        sampler.markDropped(moving(T0.plusSeconds(1), 2), run);
+        assertThat(sampler.gapHealth().open()).isEqualTo(1);
+        assertThat(sampler.gapHealth().opened()).isEqualTo(1);
+        assertThat(sampler.gapHealth().closed()).isZero();
+
+        sampler.forgetPipelinesOutside(List.of());
+        assertThat(sampler.gapHealth().open()).isZero();
+        assertThat(sampler.gapHealth().closed()).isZero();
+        sampler.markDropped(moving(T0.plusSeconds(2), 3), run);
+        assertThat(sampler.gapHealth().open()).isEqualTo(1);
+        assertThat(sampler.gapHealth().opened()).isEqualTo(2);
+        assertThat(sampler.gapHealth().closed()).isZero();
+    }
+
+    @Test
+    void aNewExecutionsFailureStartsItsOwnGapWithoutRecoveringTheOldOne() {
+        RecordingHistory history = new RecordingHistory();
+        RateSampler sampler = new RateSampler(history, Duration.ofSeconds(60));
+        ObservationStore.Scope old = new ObservationStore.Scope("inc-a", 41);
+        ObservationStore.Scope next = new ObservationStore.Scope("inc-a", 42);
+        history.failuresRemaining = 2;
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> sampler.appendIfDue(moving(T0, 1), old))
+                .hasMessage("injected append failure");
+        org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+                sampler.appendIfDue(moving(T0.plusSeconds(1), 2), next))
+                .hasMessage("injected append failure");
+        assertThat(sampler.gapHealth().open()).isEqualTo(1);
+        assertThat(sampler.gapHealth().opened()).isEqualTo(2);
+        assertThat(sampler.gapHealth().closed()).isZero();
+
+        assertThat(sampler.appendIfDue(moving(T0.plusSeconds(2), 3), next)).isTrue();
+        assertThat(sampler.gapHealth().open()).isZero();
+        assertThat(sampler.gapHealth().opened()).isEqualTo(2);
+        assertThat(sampler.gapHealth().closed()).isEqualTo(1);
+        assertThat(history.gapStarts).containsExactly(T0.plusSeconds(1));
     }
 }

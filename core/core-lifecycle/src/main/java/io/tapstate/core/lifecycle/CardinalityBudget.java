@@ -131,10 +131,10 @@ public enum CardinalityBudget {
     TELEMETRY_DEGRADED("tapstate.process.telemetry.degraded", null, 4, Fold.HIGHEST),
     TELEMETRY_BREAKER_STATE("tapstate.process.telemetry.breaker.state", null, 4, Fold.HIGHEST),
     TELEMETRY_BREAKER_RECOVERED("tapstate.process.telemetry.breaker.recovered", null, 4, Fold.ADDED),
-    TELEMETRY_GAPS_OPEN("tapstate.process.telemetry.gap.open", null, 1, Fold.HIGHEST),
+    TELEMETRY_GAPS_OPEN("tapstate.process.telemetry.gap.open", null, 2, Fold.HIGHEST),
     TELEMETRY_RESTORATIONS_PENDING("tapstate.process.telemetry.restoration.pending", null, 1, Fold.HIGHEST),
-    TELEMETRY_GAPS_OPENED("tapstate.process.telemetry.gap.opened", null, 1, Fold.ADDED),
-    TELEMETRY_GAPS_CLOSED("tapstate.process.telemetry.gap.closed", null, 1, Fold.ADDED),
+    TELEMETRY_GAPS_OPENED("tapstate.process.telemetry.gap.opened", null, 2, Fold.ADDED),
+    TELEMETRY_GAPS_CLOSED("tapstate.process.telemetry.gap.closed", null, 2, Fold.ADDED),
     /** Cold cleanup has no pipeline-derived process label. */
     OBSERVATION_JANITOR_SCANNED("tapstate.process.observation_janitor.scanned", null, 1, Fold.ADDED),
     OBSERVATION_JANITOR_DELETED("tapstate.process.observation_janitor.deleted", null, 1, Fold.ADDED),

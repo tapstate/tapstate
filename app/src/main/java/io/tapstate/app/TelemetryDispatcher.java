@@ -64,13 +64,13 @@ final class TelemetryDispatcher implements AutoCloseable {
             long successes, long failures, long timeouts, long maxDurationMillis,
             OptionalLong lastSuccessAgeMillis,
             boolean degraded, int openGaps, int pendingRestorations, long gapsOpened, long gapsClosed,
-            BreakerState breakerState, long breakerRecoveries) {
+            BreakerState breakerState, long breakerRecoveries, Instant gapsStartedAt) {
 
-        private Health withGaps(int open, int pending, long opened, long closed) {
+        private Health withGaps(int open, int pending, long opened, long closed, Instant countingSince) {
             return new Health(queueDepth, highWater, inFlight, coalesced, dropped, successes,
                     failures, timeouts, maxDurationMillis, lastSuccessAgeMillis,
                     degraded || open > 0 || pending > 0, open, pending, opened, closed,
-                    breakerState, breakerRecoveries);
+                    breakerState, breakerRecoveries, Objects.requireNonNull(countingSince, "countingSince"));
         }
     }
 
@@ -238,7 +238,7 @@ final class TelemetryDispatcher implements AutoCloseable {
                             : OptionalLong.of(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - successfulAt)),
                     timedOutInFlight || (lastProblemNanos != 0
                             && (successfulAt == 0 || lastProblemNanos - successfulAt > 0)), 0, 0, 0, 0,
-                    breakerState, breakerRecoveries.get());
+                    breakerState, breakerRecoveries.get(), null);
         }
     }
 
@@ -638,12 +638,17 @@ final class TelemetryDispatcher implements AutoCloseable {
     Map<Sink, Health> health() {
         Map<Sink, Health> readings = new java.util.EnumMap<>(Sink.class);
         readings.put(Sink.LATEST, latestStats.snapshot(latestWorkers.getQueue().size() + latestPending.get()));
-        readings.put(Sink.HISTORY, historyStats.snapshot(historyWorker.getQueue().size()));
+        Health history = historyStats.snapshot(historyWorker.getQueue().size());
+        if (sampler != null) {
+            RateSampler.GapHealth gap = sampler.gapHealth();
+            history = history.withGaps(gap.open(), 0, gap.opened(), gap.closed(), gap.startedAt());
+        }
+        readings.put(Sink.HISTORY, history);
         readings.put(Sink.EXPORT, exportStats.snapshot(exportWorker.getQueue().size()));
         if (eventWorker != null) {
             readings.put(Sink.EVENT, eventStats.snapshot(eventWorker.getQueue().size())
                     .withGaps(openEventGaps(), pendingEventRestorations(),
-                            gapsOpened.get(), gapsClosed.get()));
+                            gapsOpened.get(), gapsClosed.get(), startedAt));
         }
         return Map.copyOf(readings);
     }
@@ -876,13 +881,12 @@ final class TelemetryDispatcher implements AutoCloseable {
                             latestStats.skipped(operation);
                         }
                     } else if (frame instanceof ReconcileFailureFrame failure) {
-                        if (failure.scope() == null) {
-                            publisher.publishReconcileFailure(failure.pipelineId(), failure.failures());
+                        if (publisher.commitReconcileFailure(failure.pipelineId(), failure.failures(),
+                                failure.scope())) {
+                            latestStats.completed(operation, true);
                         } else {
-                            publisher.publishReconcileFailureScoped(
-                                    failure.pipelineId(), failure.failures(), failure.scope());
+                            latestStats.skipped(operation);
                         }
-                        latestStats.completed(operation, true);
                     }
                 } catch (RuntimeException failed) {
                     latestStats.completed(operation, false);

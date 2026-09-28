@@ -978,16 +978,17 @@ public final class ObservationPublisher {
      * read it from, unlike positions and failure which are simply carried forward from the last observation.
      */
     public void publishReconcileFailure(String pipelineId, long consecutiveFailures) {
-        publishReconcileFailureInternal(pipelineId, consecutiveFailures, null);
+        commitReconcileFailure(pipelineId, consecutiveFailures, null);
     }
 
     /** Keeps an error projection from a failed pass within the same execution identity. */
     public void publishReconcileFailureScoped(String pipelineId, long consecutiveFailures,
             ObservationStore.Scope scope) {
-        publishReconcileFailureInternal(pipelineId, consecutiveFailures, Objects.requireNonNull(scope, "scope"));
+        commitReconcileFailure(pipelineId, consecutiveFailures, Objects.requireNonNull(scope, "scope"));
     }
 
-    private void publishReconcileFailureInternal(String pipelineId, long consecutiveFailures,
+    /** Returns false for a fenced stale projection, which did not update the retained observation. */
+    public boolean commitReconcileFailure(String pipelineId, long consecutiveFailures,
             ObservationStore.Scope scope) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Observation previous = previous(pipelineId, scope).orElse(null);
@@ -997,7 +998,7 @@ public final class ObservationPublisher {
         Instant at = observedNow();
         List<MetricFact> measured = List.of(
                 readAt(pipelineId, RECONCILE_STREAK_METRIC, "{pass}", at, consecutiveFailures));
-        save(new Observation(pipelineId, lastState,
+        return save(new Observation(pipelineId, lastState,
                 FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
                 null, lastPositions, lastFailure, at, measured), scope);
     }

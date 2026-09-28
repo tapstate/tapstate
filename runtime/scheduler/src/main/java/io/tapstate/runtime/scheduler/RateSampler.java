@@ -16,6 +16,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Keeps a history of a pipeline's movement by taking a sample off one measured observation frame,
@@ -47,6 +49,17 @@ public final class RateSampler {
     private record Cadence(ObservationStore.Scope scope, Instant lastWrittenAt, Instant firstFailedAt) { }
 
     private final Map<String, Cadence> cadence = new ConcurrentHashMap<>();
+    private final AtomicInteger openGaps = new AtomicInteger();
+    private final AtomicLong gapsOpened = new AtomicLong();
+    private final AtomicLong gapsClosed = new AtomicLong();
+    private final Instant startedAt = Instant.now();
+
+    /** Local sampling loss evidence; deletion or identity replacement is not a successful recovery. */
+    public record GapHealth(int open, long opened, long closed, Instant startedAt) { }
+
+    public GapHealth gapHealth() {
+        return new GapHealth(openGaps.get(), gapsOpened.get(), gapsClosed.get(), startedAt);
+    }
 
     public RateSampler(RateHistoryStore history, Duration interval) {
         this.history = Objects.requireNonNull(history, "history");
@@ -107,7 +120,8 @@ public final class RateSampler {
                 Cadence same = current == null || !Objects.equals(current.scope(), scope) ? null : current;
                 Instant first = same == null || same.firstFailedAt() == null
                         ? sample.observedAt() : min(same.firstFailedAt(), sample.observedAt());
-                return new Cadence(scope, same == null ? null : same.lastWrittenAt(), first);
+                return trackGapChange(current,
+                        new Cadence(scope, same == null ? null : same.lastWrittenAt(), first), false);
             });
             throw failed;
         }
@@ -124,7 +138,7 @@ public final class RateSampler {
                     ? same.firstFailedAt() != null && same.firstFailedAt().isAfter(sample.observedAt())
                             ? same.firstFailedAt() : null
                     : same.firstFailedAt();
-            return new Cadence(scope, last, unresolved);
+            return trackGapChange(current, new Cadence(scope, last, unresolved), true);
         });
         return true;
     }
@@ -136,6 +150,7 @@ public final class RateSampler {
             return;
         }
         cadence.compute(observation.pipelineId(), (id, current) -> {
+            Cadence original = current;
             if (current != null && !Objects.equals(current.scope(), scope)) {
                 if (olderThan(scope, current.scope())) {
                     return current;
@@ -148,13 +163,36 @@ public final class RateSampler {
             }
             Instant first = current == null || current.firstFailedAt() == null
                     ? observation.observedAt() : min(current.firstFailedAt(), observation.observedAt());
-            return new Cadence(scope, current == null ? null : current.lastWrittenAt(), first);
+            return trackGapChange(original,
+                    new Cadence(scope, current == null ? null : current.lastWrittenAt(), first), false);
         });
     }
 
     /** Drops the cadence bookkeeping of every pipeline outside {@code live}, which is the set that still exists. */
     public void forgetPipelinesOutside(Collection<String> live) {
-        cadence.keySet().retainAll(live);
+        Objects.requireNonNull(live, "live");
+        cadence.forEach((id, ignored) -> {
+            if (!live.contains(id)) {
+                cadence.computeIfPresent(id, (key, current) -> trackGapChange(current, null, false));
+            }
+        });
+    }
+
+    private Cadence trackGapChange(Cadence previous, Cadence next, boolean written) {
+        boolean wasOpen = previous != null && previous.firstFailedAt() != null;
+        boolean nowOpen = next != null && next.firstFailedAt() != null;
+        boolean sameScope = previous != null && next != null
+                && Objects.equals(previous.scope(), next.scope());
+        if (wasOpen != nowOpen) {
+            openGaps.addAndGet(nowOpen ? 1 : -1);
+        }
+        if (nowOpen && (!wasOpen || !sameScope)) {
+            gapsOpened.incrementAndGet();
+        }
+        if (wasOpen && !nowOpen && sameScope && written) {
+            gapsClosed.incrementAndGet();
+        }
+        return next;
     }
 
     private static Instant min(Instant left, Instant right) {
