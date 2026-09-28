@@ -3,12 +3,15 @@ package io.tapstate.adapters.pdk;
 import io.tapdata.pdk.apis.TapConnector;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLClassLoader;
+import java.net.URLConnection;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Objects;
 
 /**
  * A live, isolated class loader for one connector.
@@ -47,7 +50,7 @@ public final class ConnectorClassLoader implements AutoCloseable {
         URL[] urls = classpath.stream().map(ConnectorClassLoader::toUrl).toArray(URL[]::new);
         ClassLoader host = ConnectorClassLoader.class.getClassLoader();
         ClassLoader sharedContract = new SharedContractClassLoader(host);
-        return new ConnectorClassLoader(new URLClassLoader(urls, sharedContract));
+        return new ConnectorClassLoader(new ConnectorJarLoader(urls, sharedContract));
     }
 
     /** Loads {@code className} in isolation (from the connector jar or the shared PDK contract). */
@@ -83,6 +86,47 @@ public final class ConnectorClassLoader implements AutoCloseable {
             return jar.toUri().toURL();
         } catch (MalformedURLException e) {
             throw new IllegalArgumentException("bad connector jar path " + jar, e);
+        }
+    }
+
+    /**
+     * A connector's jar, whose close reaches no read but the loader's own.
+     *
+     * <p>A resource read through its URL - the way a resource bundle loads its text - goes through one cached
+     * jar file per jar path, shared by every reader in the process. {@link URLClassLoader#getResourceAsStream}
+     * reads through that same shared file and records it as the loader's own, so {@link URLClassLoader#close()}
+     * closes it under every other reader. Two connectors over the same jar - the two sources of one pipeline -
+     * then meet: closing the first ends a read the second is part way through with "Stream closed". A driver
+     * reading its messages in a static initializer fails that initializer, and a class whose initializer
+     * failed stays unusable in its loader, so the connector cannot connect at all. Read uncached here, each of
+     * this loader's streams opens the jar for itself and closes it with the stream; the loader records nothing
+     * it does not own, and the shared file stays open for the readers sharing it.
+     */
+    private static final class ConnectorJarLoader extends URLClassLoader {
+
+        static {
+            // As its superclass is: without this a subclass loads one class at a time per loader.
+            ClassLoader.registerAsParallelCapable();
+        }
+
+        private ConnectorJarLoader(URL[] urls, ClassLoader parent) {
+            super(urls, parent);
+        }
+
+        @Override
+        public InputStream getResourceAsStream(String name) {
+            URL url = getResource(Objects.requireNonNull(name, "name"));
+            if (url == null) {
+                return null;
+            }
+            try {
+                URLConnection connection = url.openConnection();
+                connection.setUseCaches(false);
+                return connection.getInputStream();
+            } catch (IOException unreadable) {
+                // The superclass's answer to a resource it found but could not open: there is none to read.
+                return null;
+            }
         }
     }
 

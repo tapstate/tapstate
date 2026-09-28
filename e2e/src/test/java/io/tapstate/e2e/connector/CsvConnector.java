@@ -25,6 +25,7 @@ import io.tapdata.pdk.apis.functions.connection.TableInfo;
 
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
@@ -132,6 +133,20 @@ public class CsvConnector implements TapConnector {
      * read of nothing, and counting polls would make the ledger a measure of how long the case ran.
      */
     private static final String READ_WITNESS = "read_witness";
+    /**
+     * A test affordance naming a directory through which a case holds a schema discovery part way through
+     * reading a resource of this connector's own jar: the discovery reads the resource's first bytes,
+     * creates {@code paused} in the directory, waits for {@code resume} to appear there, then reads the rest
+     * and fails if it cannot.
+     *
+     * <p>It exists because a driver reads its own messages this way, from a static initializer, while its
+     * connector starts; and a pipeline's second source can be starting just as its first closes. Holding the
+     * read open is what puts two connectors on one jar in that state every time, instead of whenever the two
+     * happen to line up.
+     */
+    private static final String PAUSE_RESOURCE_READ = "pause_resource_read";
+    /** How long a held read waits to be told to go on before it gives up. */
+    private static final long PAUSE_LIMIT_MILLIS = 60_000;
 
     /**
      * A test affordance naming a directory this connector notes every row it writes into: which process and which
@@ -309,6 +324,7 @@ public class CsvConnector implements TapConnector {
         if (passwordRequired(context) && !passwordPresent(context)) {
             throw new IllegalArgumentException("this connector requires the 'password' setting");
         }
+        readOwnResourceWhenAsked(context);
         List<TapTable> discovered = new ArrayList<>();
         for (String name : tables.isEmpty() ? tableNames(context) : tables) {
             List<String> header = header(file(context, name));
@@ -388,10 +404,7 @@ public class CsvConnector implements TapConnector {
                     consumer.accept(fresh, null);
                 }
             }
-            try {
-                Thread.sleep(POLL_MILLIS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+            if (!pausedBetweenPolls(POLL_MILLIS)) {
                 break;
             }
         }
@@ -970,6 +983,56 @@ public class CsvConnector implements TapConnector {
                 ? null
                 : context.getNodeConfig().getObject(FAIL_CDC);
         return flag != null && Boolean.parseBoolean(String.valueOf(flag));
+    }
+
+    /**
+     * Reads this connector's own class file out of its jar, held part way through while the connection
+     * names a {@link #PAUSE_RESOURCE_READ} directory; a connection that names none reads nothing, so every
+     * other specification driving this connector is untouched.
+     */
+    private static void readOwnResourceWhenAsked(TapConnectionContext context) {
+        Object configured = context.getConnectionConfig() == null
+                ? null
+                : context.getConnectionConfig().getObject(PAUSE_RESOURCE_READ);
+        if (configured == null || String.valueOf(configured).isBlank()) {
+            return;
+        }
+        Path signals = Path.of(String.valueOf(configured));
+        String resource = CsvConnector.class.getName().replace('.', '/') + ".class";
+        try (InputStream in = CsvConnector.class.getClassLoader().getResourceAsStream(resource)) {
+            if (in == null) {
+                throw new IllegalStateException("this connector's jar carries no " + resource);
+            }
+            in.readNBytes(64);
+            Files.writeString(signals.resolve("paused"), "");
+            long deadline = System.currentTimeMillis() + PAUSE_LIMIT_MILLIS;
+            while (!Files.exists(signals.resolve("resume"))) {
+                if (System.currentTimeMillis() > deadline) {
+                    throw new IllegalStateException("a held resource read was never told to go on");
+                }
+                if (!pausedBetweenPolls(20)) {
+                    throw new IllegalStateException("a held resource read was interrupted");
+                }
+            }
+            in.readAllBytes();
+        } catch (IOException failure) {
+            throw new UncheckedIOException("reading this connector's own " + resource, failure);
+        }
+    }
+
+    /**
+     * The one pause this connector takes, between two looks at something it is waiting for: the tail's next
+     * look at its files, and a held read's next look for the signal to go on. Answers false when interrupted,
+     * with the interrupt kept for whoever asks next.
+     */
+    private static boolean pausedBetweenPolls(long millis) {
+        try {
+            Thread.sleep(millis);
+            return true;
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
     }
 
     private static boolean passwordRequired(TapConnectionContext context) {

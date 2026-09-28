@@ -554,8 +554,11 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
                         out.put(output, JoinSchemaDrift.declaredType(literalType(literal.value()), false));
                 // Nullable, always: an expression over a column that may be absent may itself yield
                 // nothing, and no part of the expression language says otherwise.
-                case FieldRule.Computed computed -> out.put(output, JoinSchemaDrift.declaredType(
-                        RowExpressions.typedValueType(computed.celExpr(), upstreamTypes), true));
+                case FieldRule.Computed computed -> {
+                    out.put(output, JoinSchemaDrift.declaredType(
+                            RowExpressions.typedValueType(computed.celExpr(), upstreamTypes), true));
+                    keepMovedDescriptors(output, computed.celExpr(), upstream, numbers, strings);
+                }
             }
         });
         upstream.columns().forEach((name, type) -> {
@@ -591,6 +594,26 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         }
         return new NodeColumns(out, projectedKey(rules, upstream.key(), out), null,
                 origins, upstream.expanded(), numbers, unchanged, strings);
+    }
+
+    /**
+     * Hands {@code output} the descriptors of the upstream column {@code expr} does nothing but read. Such
+     * a value is that column's own, so it keeps what a rename keeps; without them a moved decimal has no
+     * precision, scale or range, and a target cannot build the column the value is written to. Any other
+     * expression produces a value nothing was declared about, and hands on nothing.
+     */
+    private static void keepMovedDescriptors(String output, String expr, NodeColumns upstream,
+            Map<String, NumericType> numbers, Map<String, StringType> strings) {
+        String moved = RowExpressions.movedColumn(expr);
+        if (moved == null || !upstream.columns().containsKey(moved)) {
+            return;
+        }
+        if (upstream.stringTypes().containsKey(moved)) {
+            strings.put(output, upstream.stringTypes().get(moved));
+        }
+        if (upstream.numericTypes().containsKey(moved)) {
+            numbers.put(output, upstream.numericTypes().get(moved));
+        }
     }
 
     /**

@@ -165,4 +165,22 @@ class RowExpressionsTest {
         assertThat(RowExpressions.typedValueType("after.n + 'x'", Map.of("n", TapstateType.INT64)))
                 .isEqualTo(TapstateType.UNKNOWN);
     }
+
+    /**
+     * A read of one column, from either image, is that column's value; every other expression produces
+     * a value of its own, including one that reads a single column and does anything at all with it.
+     */
+    @Test
+    @DisplayName("only an expression that does nothing but read one row column names the column it moves")
+    void onlyABareColumnReadIsAMove() {
+        assertThat(RowExpressions.movedColumn("after.amount")).isEqualTo("amount");
+        assertThat(RowExpressions.movedColumn("before.amount")).isEqualTo("amount");
+
+        assertThat(RowExpressions.movedColumn("after.amount + 1")).isNull();
+        assertThat(RowExpressions.movedColumn("has(after.amount)")).isNull();
+        assertThat(RowExpressions.movedColumn("after.detail.amount")).isNull();
+        assertThat(RowExpressions.movedColumn("string(after.amount)")).isNull();
+        assertThat(RowExpressions.movedColumn("src")).isNull();
+        assertThat(RowExpressions.movedColumn("afterr.amount")).isNull();
+    }
 }

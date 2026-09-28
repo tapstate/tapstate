@@ -136,6 +136,23 @@ class CdcPhaseTest {
     }
 
     @Test
+    void disjointTableConsumerDoesNotPinHeadroom() {
+        ConsumerOffset nest = new ConsumerOffset("nest",
+                Map.of("bench_nest_orders", 7L, "bench_nest_items", 7L), null);
+        ConsumerOffset unreadNest = new ConsumerOffset("unread-nest",
+                Map.of("bench_nest_items", -1L), null);
+        ConsumerOffset join = new ConsumerOffset("join",
+                Map.of("bench_join_orders", -1L), null);
+
+        assertThat(CdcPhase.headroomBound(List.of(nest, unreadNest), "bench_nest_items"))
+                .as("a subscribed consumer that has read nothing still protects its table")
+                .isEqualTo(-1L);
+        assertThat(CdcPhase.headroomBound(List.of(nest, join), "bench_nest_items"))
+                .as("a Join-only consumer cannot hold back Nest's item ring")
+                .isEqualTo(7L);
+    }
+
+    @Test
     void projectsEachCdcChangeToTheRingInOrder() throws Exception {
         Ringbuffer<SrsItem> ring = hz.getRingbuffer("srs.chain.order");
         SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(ring));
@@ -573,7 +590,7 @@ class CdcPhaseTest {
         // on the first poll and has reached seq 0 by the next. It has acked nothing, which is why no offset
         // is written here: this case is about the refused write being retried, not about the frontier.
         Supplier<Collection<ConsumerOffset>> minRead = () -> List.of(new ConsumerOffset(
-                "p1", polls.getAndIncrement() == 0 ? Map.of() : Map.of("orders", 0L), null));
+                "p1", Map.of("orders", polls.getAndIncrement() == 0 ? -1L : 0L), null));
         CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of(Envelope.insert(9, "orders", Map.of("id", 9), Map.of())));
 
@@ -597,7 +614,7 @@ class CdcPhaseTest {
         // The slowest consumer reads nothing until the test frees a slot: the write stays backpressured.
         AtomicBoolean freed = new AtomicBoolean(false);
         Supplier<Collection<ConsumerOffset>> minRead = () -> List.of(new ConsumerOffset(
-                "p1", freed.get() ? Map.of("orders", 0L) : Map.of(), null));
+                "p1", Map.of("orders", freed.get() ? 0L : -1L), null));
         CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of(Envelope.insert(9, "orders", Map.of("id", 9), Map.of())));
 
