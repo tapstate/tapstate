@@ -71,6 +71,10 @@ final class TelemetryProcessFacts {
         }
         facts.add(gauge("tapstate.process.telemetry.degraded", "1", active,
                 reading -> reading.degraded() ? 1L : 0L, observedAt));
+        facts.add(gauge("tapstate.process.telemetry.breaker.state", "1", active,
+                reading -> reading.breakerState().value(), observedAt));
+        facts.add(counter("tapstate.process.telemetry.breaker.recovered", "{recovery}", active,
+                TelemetryDispatcher.Health::breakerRecoveries, startedAt, observedAt));
         active.stream().filter(reading -> reading.sink() == TelemetryDispatcher.Sink.EVENT)
                 .findFirst().ifPresent(event -> {
                     facts.add(new MetricFact("tapstate.process.telemetry.gap.open", MetricType.GAUGE,

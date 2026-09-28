@@ -46,15 +46,31 @@ final class TelemetryDispatcher implements AutoCloseable {
         LATEST, HISTORY, EXPORT, EVENT
     }
 
+    enum BreakerState {
+        CLOSED(0), OPEN(1), HALF_OPEN(2);
+
+        private final long value;
+
+        BreakerState(long value) {
+            this.value = value;
+        }
+
+        long value() {
+            return value;
+        }
+    }
+
     record Health(int queueDepth, long highWater, int inFlight, long coalesced, long dropped,
             long successes, long failures, long timeouts, long maxDurationMillis,
             OptionalLong lastSuccessAgeMillis,
-            boolean degraded, int openGaps, int pendingRestorations, long gapsOpened, long gapsClosed) {
+            boolean degraded, int openGaps, int pendingRestorations, long gapsOpened, long gapsClosed,
+            BreakerState breakerState, long breakerRecoveries) {
 
         private Health withGaps(int open, int pending, long opened, long closed) {
             return new Health(queueDepth, highWater, inFlight, coalesced, dropped, successes,
                     failures, timeouts, maxDurationMillis, lastSuccessAgeMillis,
-                    degraded || open > 0 || pending > 0, open, pending, opened, closed);
+                    degraded || open > 0 || pending > 0, open, pending, opened, closed,
+                    breakerState, breakerRecoveries);
         }
     }
 
@@ -111,6 +127,7 @@ final class TelemetryDispatcher implements AutoCloseable {
         private final AtomicLong successes = new AtomicLong();
         private final AtomicLong failures = new AtomicLong();
         private final AtomicLong timeouts = new AtomicLong();
+        private final AtomicLong breakerRecoveries = new AtomicLong();
         private final AtomicLong maxDurationNanos = new AtomicLong();
         private final AtomicInteger consecutiveFailures = new AtomicInteger();
         private final AtomicLong openUntilNanos = new AtomicLong();
@@ -181,7 +198,9 @@ final class TelemetryDispatcher implements AutoCloseable {
                 successes.incrementAndGet();
                 lastSuccessNanos = System.nanoTime();
                 consecutiveFailures.set(0);
-                openUntilNanos.set(0);
+                if (openUntilNanos.getAndSet(0) != 0) {
+                    breakerRecoveries.incrementAndGet();
+                }
                 probe.set(false);
             } else {
                 failures.incrementAndGet();
@@ -210,13 +229,16 @@ final class TelemetryDispatcher implements AutoCloseable {
         private Health snapshot(int queueDepth) {
             long successfulAt = lastSuccessNanos;
             boolean timedOutInFlight = inFlight.values().stream().anyMatch(op -> op.state.get() == 1);
+            BreakerState breakerState = openUntilNanos.get() == 0 ? BreakerState.CLOSED
+                    : probe.get() ? BreakerState.HALF_OPEN : BreakerState.OPEN;
             return new Health(queueDepth, highWater.get(), inFlight.size(), coalesced.get(), dropped.get(),
                     successes.get(), failures.get(), timeouts.get(),
                     TimeUnit.NANOSECONDS.toMillis(maxDurationNanos.get()),
                     successfulAt == 0 ? OptionalLong.empty()
                             : OptionalLong.of(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - successfulAt)),
                     timedOutInFlight || (lastProblemNanos != 0
-                            && (successfulAt == 0 || lastProblemNanos - successfulAt > 0)), 0, 0, 0, 0);
+                            && (successfulAt == 0 || lastProblemNanos - successfulAt > 0)), 0, 0, 0, 0,
+                    breakerState, breakerRecoveries.get());
         }
     }
 

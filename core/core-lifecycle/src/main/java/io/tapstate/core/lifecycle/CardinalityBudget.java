@@ -129,6 +129,8 @@ public enum CardinalityBudget {
     TELEMETRY_WRITE_DURATION_MAX("tapstate.process.telemetry.write.duration.max", null, 4, Fold.HIGHEST),
     TELEMETRY_LAST_SUCCESS_AGE("tapstate.process.telemetry.last_success.age", null, 4, Fold.HIGHEST),
     TELEMETRY_DEGRADED("tapstate.process.telemetry.degraded", null, 4, Fold.HIGHEST),
+    TELEMETRY_BREAKER_STATE("tapstate.process.telemetry.breaker.state", null, 4, Fold.HIGHEST),
+    TELEMETRY_BREAKER_RECOVERED("tapstate.process.telemetry.breaker.recovered", null, 4, Fold.ADDED),
     TELEMETRY_GAPS_OPEN("tapstate.process.telemetry.gap.open", null, 1, Fold.HIGHEST),
     TELEMETRY_RESTORATIONS_PENDING("tapstate.process.telemetry.restoration.pending", null, 1, Fold.HIGHEST),
     TELEMETRY_GAPS_OPENED("tapstate.process.telemetry.gap.opened", null, 1, Fold.ADDED),
