@@ -14,7 +14,7 @@ final class SourceReadProjection {
     static final String REDACTED = "<redacted>";
 
     private static final Pattern MONGO_URI =
-            Pattern.compile("(?i)mongodb(?:\\+srv)?://[^\\s\\\"']+");
+            Pattern.compile("(?i)mongodb(?:\\+srv)?://[^\\s\\\"]+");
 
     private final CanonicalWriter writer = new CanonicalWriter();
 

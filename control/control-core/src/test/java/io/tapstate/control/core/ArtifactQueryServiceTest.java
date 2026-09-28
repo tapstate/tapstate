@@ -160,6 +160,19 @@ class ArtifactQueryServiceTest {
     }
 
     @Test
+    void genericArtifactReadsRedactMongoDbCredentialsContainingAnApostrophe() {
+        apply.apply("alice", List.of(draft(ATLAS_WITH_APOSTROPHE)));
+
+        String got = query.get("atlas-apostrophe").orElseThrow().canonicalForm();
+        String listed = query.list("source").getFirst().canonicalForm();
+
+        assertThat(List.of(got, listed)).allSatisfy(canonical ->
+                assertThat(canonical)
+                        .contains("cluster.example/test")
+                        .doesNotContain("probe", "sentinel'secret"));
+    }
+
+    @Test
     void listIsEmptyWhenNothingIsStored() {
         assertThat(query.list()).isEmpty();
     }
@@ -296,6 +309,14 @@ class ArtifactQueryServiceTest {
             id: atlas
             connector: mongodb-atlas
             config: { uri: "mongodb+srv://probe:sentinel-secret@cluster.example/test" }
+            """;
+
+    private static final String ATLAS_WITH_APOSTROPHE = """
+            version: tapstate/v1
+            kind: source
+            id: atlas-apostrophe
+            connector: mongodb-atlas
+            config: { uri: "mongodb://probe:sentinel'secret@cluster.example/test" }
             """;
 
     private static final String SRC_ORA = """
