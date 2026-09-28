@@ -159,6 +159,7 @@ final class Repl {
     private static final Set<String> RESTART_OPTIONS = Set.of("--rerun", "-y", "--non-interactive");
     private static final String STOP_USAGE = "stop <pipeline-id> [--keep-state] [-y]";
     private static final String RESTART_USAGE = "restart <pipeline-id> [--rerun] [-y]";
+    private static final String POSITION_USAGE = "position <pipeline-id> [-f <file>]";
     private static final String INCOMPATIBLE_REVISION = "lifecycle.incompatible-revision";
 
     /** The server's own code for a connector that is not registered. */
@@ -4627,6 +4628,11 @@ final class Repl {
     }
 
     private static String derivedCell(String value) {
+        return value == null ? "-" : value;
+    }
+
+    /** Renders an absent topology field explicitly instead of presenting it as an empty value. */
+    private static String cell(String value) {
         return value == null ? "-" : value;
     }
 
