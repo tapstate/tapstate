@@ -6,17 +6,18 @@ target: https://tapstate.dev/docs/guides/observe-a-pipeline
 
 # Observe a pipeline
 
-Tapstate exposes two views of pipeline activity:
+Tapstate exposes three views of pipeline activity:
 
 - current observation reads answer what the server last saw;
-- bounded history answers how target-acknowledged output and lag changed over time.
+- bounded history answers how target-acknowledged output and lag changed over time;
+- retained events show best-effort lifecycle, failure, recovery, and telemetry boundaries.
 
 The server also exposes one shared explanation of the current observation. Use it instead of
 reimplementing diagnosis from status, metrics, and snapshot responses in each client.
 
 All of these operations require an authenticated credential with read scope. They do not change the
-pipeline. The history and explanation responses, including coded errors, carry
-`Cache-Control: no-store`.
+pipeline. Observability GET responses, including coded and authentication errors, carry
+`Cache-Control: no-store`. Keep them out of persistent HTTP or local caches.
 
 ## Choose the read that answers your question
 
@@ -27,14 +28,53 @@ pipeline. The history and explanation responses, including coded errors, carry
 | How far has the initial snapshot loaded? | `GET /api/pipelines/{id}/snapshot` | `snapshot <id>` | `pipeline_snapshot` |
 | What did this node log for the pipeline? | `GET /api/pipelines/{id}/logs` | `logs <id>` | `pipeline_logs` |
 | How did output rate and selected table lag change? | `GET /api/pipelines/{id}/metrics/history` | `metrics <id> --from ... --to ...` | `pipeline_metrics_history` |
+| Which retained lifecycle or telemetry events occurred? | `GET /api/pipelines/{id}/events` | `events <id> --from ... --to ...` | `pipeline_events` |
 | Why does the latest observation look this way? | `GET /api/pipelines/{id}/explain` | `explain <id>` or `status <id>` | `pipeline_explain` |
 
 `pipeline.explain` requires a current observation. A newly started pipeline may return
 `monitor.no-observation` until its first observation is published. History is independent of the
-latest observation and can still return retained samples for a stopped pipeline.
+latest observation and can still return retained samples for a stopped pipeline. Events also do not
+require a current observation: an existing pipeline can have retained events while its current reads
+are pending.
+
+Check the deployed server's version and supported operation set before enabling these views. Earlier
+builds may provide history and explain without events or scoped logs. The examples and schemas in this
+guide do not establish what an older deployment exposes. Treat an unsupported operation as an
+unavailable capability, never as a successful empty event page. MCP clients can inspect `tools/list`;
+direct REST clients use `/version` and the compatibility information for the installed build, not an
+unrelated 404 as capability discovery.
 
 The current read faces are separate requests, not one transactional snapshot. If you need a diagnostic
 conclusion, read `pipeline.explain`; do not join the other responses and copy its rules.
+
+## Keep lifecycle boundaries visible
+
+The backend distinguishes a resource's incarnation from each physical execution. Editing or applying
+the same pipeline preserves its incarnation; deleting and recreating the id creates a new one. A new
+start, restart, rebuilding resume, or ownership takeover changes execution. These identities belong to
+the backend's storage and dispatch envelope; events, history, and logs do not expose identity selectors
+for clients to reconstruct.
+
+| Action | Current observation and counters | Retained history, events, and local logs |
+|---|---|---|
+| Pause | Keep the observation and publish `PAUSED` freshness. Preserve cumulative counters and their start. Quiet measurements remain absent. | Keep history and the bounded log tail; do not invent samples or zeros for the pause. |
+| Resume without rebuilding | Keep incarnation and execution; continue cumulative values and counter start. | Continue sampling at real intervals. |
+| Resume with a rebuilt job | Keep incarnation, take a new execution, and carry the known counter/histogram baseline and start. Gauges are measured again. | History can begin a new segment to avoid differences across physical executions; that boundary alone is not a counter reset. |
+| Stop | Keep the final `STOPPED` observation; do not keep advancing old execution counters. | Keep history and events until retention expires, and keep the bounded local log tail. |
+| Start or restart after stop | Use a fresh counter start. Until the new execution publishes, current reads return 404 `monitor.no-observation` rather than the previous run's numbers. | Keep earlier executions of the same incarnation within retention; counter reset is expressed by counter start and `COUNTER_RESET`. |
+| Delete and recreate the id | New scoped reads belong to the new incarnation; old scoped data cannot become its current observation. | Clear client state for that id. Cleanup of the old identity is conditional and best effort; physical residue may remain until TTL, capacity/LRU, or a bounded janitor reclaims it. |
+
+An extreme failure can lose an unsaved statistics tail. An unknown continuation baseline stays unknown;
+it is not repaired with a fabricated zero or a per-record statistics transaction. Legacy history written
+before identity envelopes remains readable under its original pipeline-id semantics and ages out within
+the history retention window. Once a current resource has scoped identity, legacy latest data cannot
+stand in for its missing current observation.
+
+Physical cleanup is not a transaction across observation, history, event, log, and remote exporter
+stores. A delayed cleanup uses the old identity so it cannot remove the new resource's telemetry.
+History, events, and rollups use the bounded retention policy; local logs use bounded tail capacity/LRU.
+Cleanup failure is an operational diagnostic and does not undo an already completed artifact deletion.
+Remote exporter retention has the separate boundary described below.
 
 ## Read performance and telemetry health facts
 
@@ -43,10 +83,13 @@ and each point's measurement time. A missing measurement means it was quiet or u
 with zero. When a per-table, code, chain, or namespace series exceeds its budget, an
 `otel.metric.overflow=true` point keeps the folded value; the dimension name is no longer available for
 that point. The exporter also applies a process-wide 10,000-series ceiling.
+The complete types, units, attribute budgets, measurement boundaries, and absence rules are maintained
+in the [metric inventory](metric-inventory.md).
 
 | Reading | First check when it worsens |
 |---|---|
 | `tapstate.pipeline.queue.depth`, `.capacity`, `.high_water` | Compare depth with capacity, then inspect the stage durations and sink pending batches. High-water is the highest collected Jet sample, so a shorter peak between scrapes may not appear. |
+| `tapstate.pipeline.process.active` and `tapstate.pipeline.work.active` | Compare active business units with queue depth, stage duration, and sink pending batches. Both are gauges in `{work}`. The first has pipeline id and `stage=source/transform/nest/join/sink`; the pipeline total has only pipeline id and requires a complete reading from the current job/execution. Missing points remain unknown. These gauges do not measure CPU busy time or executor saturation. |
 | `tapstate.pipeline.sink.batch.pending`, `.limit`, `.write.duration`, and `tapstate.pipeline.sink.backpressure.duration` | A full pending limit with increasing write time points toward target delivery. Compare target-acknowledged `records.out` with issued batches; an issued batch is not an acknowledgement. |
 | `tapstate.pipeline.nest.cold_layer.over_threshold` and `nestStateColdLayerOverThreshold.<namespace>` | A measured value of 1 means at least 100 state accesses in the decision window and at least half served from the cold layer. Compare access/backfill deltas, in-memory entries, stored entries, and backfill time before changing state memory. A quiet window has no threshold fact; it is not a measured 0. |
 | `tapstate.pipeline.state.store.operation.count`, `.duration.sum`, `.payload.bytes`, and `.serialization.count/bytes` | Compare changes between samples by compiled state namespace and the fixed operation, outcome, or codec. Rising load calls and duration point to cold-layer work; compare actual payload and Java serialization bytes before blaming network transfer. These job counters are absent when the cold store is unwired, the job is quiet, or a member's current reading is missing. They never include state keys or row values as labels. |
@@ -65,6 +108,13 @@ occupancy have no general measurement yet. JVM GC collection time is not an exac
 do not substitute it for the JFR pause reading. Jet executor saturation has no trustworthy built-in
 measurement; use job queue depth, stage duration, and sink backpressure to locate pressure instead.
 Do not substitute committed heap for RSS when comparing workloads.
+
+Active work counts the existing timed business units. A transform covers its synchronous
+`port.transform` call and releases active work before the later outbox drain. A sink covers its processor
+drain, excluding time waiting on an asynchronous target future; use pending batches for that wait.
+Empty source polls produce no duration sample and release active work. Points keep the real Jet
+collection timestamp. Quiet, unwired, partial, and mixed-job readings are absent. Expected staged
+vertices are registered by DAG compilation; the total is not guessed from an unknown graph.
 
 Scoped latest-write, history-sample, and local-export-offer failures can produce a
 `TELEMETRY_DEGRADED` event. Repeated failures stay in one episode per pipeline and sink. A successful
@@ -190,6 +240,11 @@ may differ from a cached result for up to five minutes from the cache's first in
 the query must descend or refresh; it cannot serve the expired bucket as if it were current. Rollups add
 about 26% as many retained documents as one-minute raw history over a fully populated 15-day window.
 This is a document-count ratio; bucket fragments and indexes can make the byte and disk cost higher.
+The five layers add at most 5,580 bucket documents per pipeline to 21,600 one-minute raw documents in
+that window. Coarser buckets inherit the earliest input deadline, so cascading layers cannot extend
+stale data by another five minutes each. A partial bucket is recomputed for the actual interval; the
+server does not prorate a whole bucket's peak or delta. Rollups are produced by bounded background
+batches, not by synchronously writing all five layers on every raw append.
 For a same-build diagnostic comparison, set `tapstate.metrics.history.rollup-read-enabled=false` at
 startup. The same request resolution then aggregates raw samples without reading the rollup cache; the
 default is `true`. This switch does not remove cached documents or stop the background worker, and a raw
@@ -318,6 +373,203 @@ values, not the CLI aliases. `pipeline_explain` accepts only `{"id":"order_pipel
 return the same structured JSON fields and coded errors as REST; an agent does not need a separate
 diagnostic or rate algorithm.
 
+## Read retained events
+
+Use `pipeline.events` for low-frequency state changes, coded failures, execution restart/recovery,
+telemetry degraded/restored boundaries, cleanup diagnostics, and telemetry-gap markers. The event
+trail is retained for 15 days by default and is always `completeness: "BEST_EFFORT"`. It has no durable
+outbox or audit-level completeness guarantee. An empty page, no `FAILURE` event, or a completed cursor
+walk cannot prove that an event never happened.
+
+The REST request has required `from` and `to` RFC 3339 timestamps with an offset, with `from < to` and
+a maximum 15-day half-open range `[from,to)`. `limit` defaults to 100 and accepts 1 through 500. It
+counts events in this page; gap markers count as events too. There is no event `resolution`, table
+selector, or execution selector.
+
+```sh
+curl -sS --get "$TAPSTATE_URL/api/pipelines/orders/events" \
+  -H "Authorization: Bearer $TAPSTATE_TOKEN" \
+  --data-urlencode 'from=2026-09-20T10:00:00Z' \
+  --data-urlencode 'to=2026-09-20T11:00:00Z' \
+  --data-urlencode 'limit=100'
+```
+
+The CLI accepts paired `--from` and `--to`, plus optional `--limit` and `--cursor`:
+
+```console
+tapstate(admin@127.0.0.1:8080)> events orders --from 2026-09-20T10:00:00Z --to 2026-09-20T11:00:00Z --limit 100
+tapstate(admin@127.0.0.1:8080)> events orders --from 2026-09-20T10:00:00Z --to 2026-09-20T11:00:00Z --limit 100 --cursor <nextCursor>
+```
+
+`pipeline_events` takes the same arguments as REST, with the pipeline path value named `id`:
+
+```json
+{
+  "id": "orders",
+  "from": "2026-09-20T10:00:00Z",
+  "to": "2026-09-20T11:00:00Z",
+  "limit": 100
+}
+```
+
+Events are ordered by `(occurredAt,id)` ascending. The event id is opaque: use it for deduplication,
+not as a run id or a value to parse. Keep server order, including events with equal timestamps.
+The server normalizes times to UTC and clips the first page to retention and server time. Its
+`effectiveFrom`, `effectiveTo`, and `retentionCutoff` stay frozen for the cursor walk. A window with no
+effective overlap still succeeds with empty arrays and equal effective bounds.
+
+`nextCursor` is always present; only `null` means there is no next page. For another page, repeat the
+original pipeline, `from`, `to`, and `limit` unchanged and add the returned `cursor`. The opaque token
+is bound to that operation, query, and current resource; it expires after 10 minutes. A changed query
+or invalid token returns `monitor.invalid-cursor`; expiry returns HTTP 410 `monitor.cursor-expired`.
+Start a new first-page query instead of splicing a new walk onto the old one. Pagination is eventual,
+not a database snapshot: late events before a passed cursor and events removed by retention are not
+revisited. Refresh with a new query.
+
+Each event has `id`, `occurredAt`, `kind`, and `message`. Optional `beforeState`/`afterState` use only
+`NEW`, `RUNNING`, `PAUSED`, `STOPPED`, `COMPLETED`, and `FAILED`. The event kinds are
+`STATE_CHANGED`, `FAILURE`, `EXECUTION_RESTARTED`, `EXECUTION_RECOVERED`, `TELEMETRY_DEGRADED`,
+`TELEMETRY_RESTORED`, `CLEANUP_INCOMPLETE`, and `TELEMETRY_GAP`. A failure preserves its
+`{code,params,message}`; use code and named parameters for machine decisions, not rendered text.
+An optional `reason` is display text, not another state or decision vocabulary.
+
+`knownGaps` is strictly the projection of `TELEMETRY_GAP` markers in this page. It performs no extra
+whole-window gap query. Merge only pages already fetched and deduplicate gaps by `eventId`; reasons
+are the fixed `QUEUE_FULL`, `WRITE_FAILURE`, and `SHUTDOWN` values. A marker is selected by its own
+`occurredAt`, while the gap's `from`/`to` retain their real boundaries. A marker outside the request
+window is absent even if its gap overlaps that window. `knownGaps: []` does not establish completeness,
+and event gaps do not replace the rate-history `gaps` used to break a graph line.
+
+### Event response examples
+
+These three independent fixtures use the request above. They are copied from the
+[event goldens](../../control/rest-api/src/test/resources/golden/observability-events/) and validated
+against the [event OpenAPI schema](../../control/rest-api/src/test/resources/golden/observability-events/pipeline-events.openapi.json).
+
+A retained failure followed by recovery:
+
+```json
+{
+  "pipelineId": "orders",
+  "from": "2026-09-20T10:00:00Z",
+  "to": "2026-09-20T11:00:00Z",
+  "effectiveFrom": "2026-09-20T10:00:00Z",
+  "effectiveTo": "2026-09-20T11:00:00Z",
+  "retentionCutoff": "2026-09-05T11:00:00Z",
+  "completeness": "BEST_EFFORT",
+  "events": [
+    {
+      "id": "ev-a7",
+      "occurredAt": "2026-09-20T10:10:00Z",
+      "kind": "FAILURE",
+      "message": "Pipeline orders stopped because its job failed: sink refused the batch.",
+      "beforeState": "RUNNING",
+      "afterState": "FAILED",
+      "failure": {
+        "code": "engine.job-failed",
+        "params": {"pipeline": "orders", "cause": "sink refused the batch"},
+        "message": "Pipeline orders stopped because its job failed: sink refused the batch."
+      }
+    },
+    {
+      "id": "ev-b2",
+      "occurredAt": "2026-09-20T10:12:00Z",
+      "kind": "EXECUTION_RECOVERED",
+      "message": "Pipeline execution recovered.",
+      "beforeState": "FAILED",
+      "afterState": "RUNNING"
+    }
+  ],
+  "knownGaps": [],
+  "nextCursor": null
+}
+```
+
+A page containing a known loss marker; its gap begins before the requested window:
+
+```json
+{
+  "pipelineId": "orders",
+  "from": "2026-09-20T10:00:00Z",
+  "to": "2026-09-20T11:00:00Z",
+  "effectiveFrom": "2026-09-20T10:00:00Z",
+  "effectiveTo": "2026-09-20T11:00:00Z",
+  "retentionCutoff": "2026-09-05T11:00:00Z",
+  "completeness": "BEST_EFFORT",
+  "events": [
+    {
+      "id": "ev-g4",
+      "occurredAt": "2026-09-20T10:20:00Z",
+      "kind": "TELEMETRY_GAP",
+      "message": "Some pipeline events could not be recorded."
+    }
+  ],
+  "knownGaps": [
+    {
+      "eventId": "ev-g4",
+      "from": "2026-09-20T09:58:00Z",
+      "to": "2026-09-20T10:19:00Z",
+      "reasons": ["QUEUE_FULL", "WRITE_FAILURE"]
+    }
+  ],
+  "nextCursor": null
+}
+```
+
+A valid range with no retained events:
+
+```json
+{
+  "pipelineId": "orders",
+  "from": "2026-09-20T10:00:00Z",
+  "to": "2026-09-20T11:00:00Z",
+  "effectiveFrom": "2026-09-20T10:00:00Z",
+  "effectiveTo": "2026-09-20T11:00:00Z",
+  "retentionCutoff": "2026-09-05T11:00:00Z",
+  "completeness": "BEST_EFFORT",
+  "events": [],
+  "knownGaps": [],
+  "nextCursor": null
+}
+```
+
+An empty event response has no history `NO_RETAINED_SAMPLES` status and is not a
+`monitor.no-observation` error.
+
+## Read node-local logs
+
+`GET /api/pipelines/{id}/logs` accepts optional positive `limit` and
+`scope=current|incarnation`, defaulting to `current`:
+
+```sh
+curl -sS --get "$TAPSTATE_URL/api/pipelines/orders/logs" \
+  -H "Authorization: Bearer $TAPSTATE_TOKEN" \
+  --data-urlencode 'limit=100' \
+  --data-urlencode 'scope=incarnation'
+```
+
+The CLI accepts `logs <id> [--scope current|incarnation]`. MCP `pipeline_logs` accepts `id`, optional
+`scope`, and optional `limit` (its adapter clamps a supplied limit to 1 through 200):
+
+```console
+tapstate(admin@127.0.0.1:8080)> logs orders --scope incarnation
+```
+
+```json
+{"id":"orders","scope":"incarnation","limit":100}
+```
+
+`current` reads this node's retained lines for the current execution. `incarnation` reads this node's
+retained lines across executions of the current resource. Both resolve identity on the backend;
+neither accepts an execution selector or includes an older resource recreated under the same id.
+The response shape stays `{pipelineId,lines:[{timestampMillis,level,message}]}`, with epoch-millisecond
+timestamps and lines ordered oldest to newest. `limit` selects from the bounded local tail; it does
+not use the event API's 100/500 pagination limits.
+
+No retained lines on this node, or a pipeline unknown here, retains the existing HTTP 200 empty
+`lines` behavior. It is not current-observation pending. Local logs are not a cross-node collection or
+permanent history; use an external log backend when that retention or routing is required.
+
 ## Interpret an explanation
 
 An explanation reads one observation once and applies a fixed first-match order:
@@ -345,18 +597,39 @@ Every coded REST error is `{code, params, message}` and carries `Cache-Control: 
 
 | HTTP | Code | Response |
 |---|---|---|
-| 400 | `control.malformed-request` | Correct timestamps, range, resolution, limit, or selectors. |
+| 400 | `control.malformed-request` | Correct timestamps, range, resolution, limit, selectors, or log scope. |
 | 400 | `monitor.invalid-cursor` | Repeat the exact query or start a new first page. |
 | 400 | `monitor.query-budget-exceeded` | Narrow the range or select fewer table series. |
 | 401/403 | `control.unauthenticated` / `control.forbidden` | Supply a valid read-scoped credential. |
 | 404 | `lifecycle.unknown-pipeline` | Check the id and apply the pipeline first. |
 | 404 | `monitor.no-observation` | The pipeline exists; wait for its first observation and retry current reads. |
-| 410 | `monitor.cursor-expired` | Start a new history query; do not resume the old walk. |
+| 410 | `monitor.cursor-expired` | Start a new history or events query; do not resume the old walk. |
 
 A 200 `NO_RETAINED_SAMPLES` history response is different from every error above. So is an absent
-metric in an otherwise valid page. Keep those states distinct in dashboards and automation.
+metric in an otherwise valid page, or a 200 empty `BEST_EFFORT` event page. Keep those states distinct
+in dashboards and automation. A current read's 404 `monitor.no-observation` is pending for an existing
+resource; a successful response with an old `observedAt` is stale data. A fresh HTTP response does not
+make the underlying observation fresh.
+
+## Maintain client request and cache state
+
+Use one in-flight request per active view/query, pause hidden views, and back off after failed polls.
+Give each resource/query selection a client request version. Increment it on a resource switch,
+query-argument change, or lifecycle mutation; apply a response only when it still matches the current
+version. Cancel older requests where possible and ignore their late responses. An old successful
+request must not repopulate numbers or events after a later restart, deletion, or recreation.
+
+After delete/recreate of an id, discard its latest/history/events/logs data, pagination cursors, and
+selection state. After an accepted start/restart, stop showing the prior execution's current numbers
+while the new read is pending. These are client actions on public lifecycle/query state; they do not
+require parsing backend incarnation or execution identifiers.
 
 For live displays, poll current reads and `pipeline.explain` as independent observations. Refresh
-history by fetching a new first page instead of caching or extending a completed cursor walk. Respect
-`no-store`, keep gaps as gaps, and leave an absent value unknown. These rules prevent a stopped
-publisher, reset counter, expired sample, and measured zero from collapsing into the same graph.
+history or events with a new first page and replace the displayed window after the refresh completes.
+Do not permanently append only the newest points or extend a completed cursor walk. Respect
+`no-store`, keep gaps as gaps, and leave an absent value unknown. Unsupported capabilities, request
+failures, pending observations, stale observations, and legitimate empty windows remain distinct.
+
+Performance facts support a measured diagnosis; this observability surface does not automatically tune
+parallelism, batch sizes, or caches. Benchmark results describe their named machine, JDK, connectors,
+workload, and configuration. They are not a throughput or latency SLO across hardware.

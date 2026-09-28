@@ -95,9 +95,12 @@ class PipelineLogsApiTest {
 
     @Test
     void logsReturnsTheTailedLinesForAReadCredential() {
-        PipelineLogs body = client().get().uri("/api/pipelines/pl1/logs")
+        var response = client().get().uri("/api/pipelines/pl1/logs")
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))
-                .retrieve().toEntity(PipelineLogs.class).getBody();
+                .retrieve().toEntity(PipelineLogs.class);
+
+        assertThat(response.getHeaders().getCacheControl()).contains("no-store");
+        PipelineLogs body = response.getBody();
 
         assertThat(body.pipelineId()).isEqualTo("pl1");
         assertThat(body.lines()).extracting(LogLine::message)
@@ -121,9 +124,12 @@ class PipelineLogsApiTest {
 
     @Test
     void logsAcceptsIncarnationScopeWithoutChangingTheResponseShape() {
-        PipelineLogs body = client().get().uri("/api/pipelines/pl1/logs?scope=incarnation")
+        var response = client().get().uri("/api/pipelines/pl1/logs?scope=incarnation")
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))
-                .retrieve().toEntity(PipelineLogs.class).getBody();
+                .retrieve().toEntity(PipelineLogs.class);
+
+        assertThat(response.getHeaders().getCacheControl()).contains("no-store");
+        PipelineLogs body = response.getBody();
 
         assertThat(body.pipelineId()).isEqualTo("pl1");
         assertThat(body.lines()).extracting(LogLine::message)

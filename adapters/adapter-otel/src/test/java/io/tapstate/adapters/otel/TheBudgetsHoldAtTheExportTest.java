@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 import static io.tapstate.adapters.otel.Facts.AT;
 import static io.tapstate.adapters.otel.Facts.RECORDS;
@@ -90,6 +91,41 @@ class TheBudgetsHoldAtTheExportTest {
         assertThat(namedTables(recordsPoints(producer.produce(Resource.empty()))))
                 .hasSize(CardinalityBudget.RECORDS.distinctValues())
                 .allSatisfy(table -> assertThat(table).startsWith("new"));
+    }
+
+    @Test
+    void sixOperationsCanReachTheExportLimitWithinOnePipelinesTableBudget() {
+        List<MetricPoint> points = new ArrayList<>();
+        for (int table = 0; table < CardinalityBudget.RECORDS.distinctValues(); table++) {
+            for (String direction : MetricAttributes.DIRECTIONS) {
+                for (String operation : MetricAttributes.OPS) {
+                    points.add(MetricPoint.accumulated(Map.of(
+                            MetricAttributes.PIPELINE_ID, "orders",
+                            MetricAttributes.TABLE_ID, "t" + table,
+                            MetricAttributes.DIRECTION, direction,
+                            MetricAttributes.OP, operation), START, AT, 1L));
+                }
+            }
+        }
+        MetricFact folded = CardinalityBudget.folder().fold(
+                new MetricFact(RECORDS, MetricType.COUNTER, "{record}", points));
+        assertThat(folded.points()).hasSize(12_000)
+                .noneMatch(point -> point.attributes().containsKey(MetricAttributes.OVERFLOW));
+
+        producer.offerFolded("orders", PipelineState.RUNNING, AT, List.of(folded));
+        Collection<MetricData> produced = producer.produce(Resource.empty());
+        Collection<LongPointData> exported = recordsPoints(produced);
+        assertThat(exported).hasSize(CardinalityBudget.EXPORT_SERIES_LIMIT);
+        assertThat(exported.stream().mapToLong(LongPointData::getValue).sum()).isEqualTo(12_000L);
+        assertThat(exported.stream().filter(point -> "true".equals(point.getAttributes().get(OVERFLOW))))
+                .singleElement().satisfies(point -> {
+                    assertThat(point.getAttributes().asMap()).hasSize(1);
+                    assertThat(point.getValue()).isEqualTo(2_001L);
+                });
+        assertThat(overflowHealth(produced, FactsMetricProducer.OVERFLOW_INSTRUMENTS)).isEqualTo(1);
+        assertThat(overflowHealth(produced, FactsMetricProducer.OVERFLOW_SERIES)).isEqualTo(1);
+        System.out.printf(Locale.ROOT, "one-pipeline records series offered=%d exported=%d total=%d%n",
+                points.size(), exported.size(), exported.stream().mapToLong(LongPointData::getValue).sum());
     }
 
     @Test

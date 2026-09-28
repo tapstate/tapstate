@@ -214,6 +214,33 @@ class PipelineObservationApiTest {
     }
 
     @Test
+    void currentReadsAndTheirPendingResponsesCannotBeCached() {
+        String bearer = "Bearer " + machineToken(Scope.READ);
+        for (String face : List.of("status", "metrics", "snapshot")) {
+            ResponseEntity<Map<String, Object>> response = client().get()
+                    .uri("/api/pipelines/pl1/" + face)
+                    .header("Authorization", bearer)
+                    .retrieve().toEntity(new ParameterizedTypeReference<Map<String, Object>>() {});
+
+            assertThat(response.getHeaders().getCacheControl()).as(face).contains("no-store");
+            assertThat(response.getBody()).containsEntry("pipelineId", "pl1");
+        }
+
+        context.getBean(FakeObservationStore.class).clear();
+        for (String face : List.of("status", "metrics", "snapshot")) {
+            ApiError error = client().get().uri("/api/pipelines/pl1/" + face)
+                    .header("Authorization", bearer)
+                    .exchange((request, response) -> {
+                        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+                        assertThat(response.getHeaders().getCacheControl()).as(face).contains("no-store");
+                        return response.bodyTo(ApiError.class);
+                    });
+            assertThat(error.code()).isEqualTo("monitor.no-observation");
+            assertThat(error.params()).containsEntry("pipeline", "pl1");
+        }
+    }
+
+    @Test
     void statusOfAFailedPipelineCarriesTheCodedReasonAndItsRenderedMessage() {
         // The code is the stable machine identity and the params are the variable data; the message is
         // rendered here, where the catalog lives, so every face prints one wording rather than each
