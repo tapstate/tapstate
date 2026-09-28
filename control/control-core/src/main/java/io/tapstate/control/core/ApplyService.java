@@ -162,6 +162,14 @@ public final class ApplyService {
         Objects.requireNonNull(submitted, "submitted");
         Objects.requireNonNull(preconditions, "preconditions");
         Objects.requireNonNull(validationScope, "validationScope");
+        for (Resource resource : submitted) {
+            if (resource instanceof SourceResource source
+                    && SourceReadProjection.containsDisplayMarker(source.config())) {
+                throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                        Map.of("reason", "redacted Source settings cannot be applied; provide complete credentials"),
+                        null);
+            }
+        }
         Set<String> submittedIds = submitted.stream().map(Resource::id).collect(java.util.stream.Collectors.toSet());
         List<Resource> storedResources = ReadableArtifactInventory.list(store);
         List<Resource> candidate = new ArrayList<>();

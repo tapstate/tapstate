@@ -140,6 +140,26 @@ class ArtifactQueryServiceTest {
     }
 
     @Test
+    void genericArtifactReadsDoNotExposeMongoDbAtlasUriCredentials() {
+        apply.apply("alice", List.of(draft(ATLAS)));
+        store.putUnreadable("unreadable-atlas", "source", ATLAS + "not: [valid");
+
+        String got = query.get("atlas").orElseThrow().canonicalForm();
+        List<ArtifactListEntry> listed = query.list("source");
+        String readable = listed.stream()
+                .filter(row -> row.id().equals("atlas"))
+                .findFirst().orElseThrow().canonicalForm();
+        String unreadable = listed.stream()
+                .filter(row -> row.id().equals("unreadable-atlas"))
+                .findFirst().orElseThrow().canonicalForm();
+
+        assertThat(List.of(got, readable, unreadable)).allSatisfy(canonical ->
+                assertThat(canonical)
+                        .contains("cluster.example/test")
+                        .doesNotContain("probe", "sentinel-secret"));
+    }
+
+    @Test
     void listIsEmptyWhenNothingIsStored() {
         assertThat(query.list()).isEmpty();
     }
@@ -268,6 +288,14 @@ class ArtifactQueryServiceTest {
             id: tgt_mg
             connector: mongodb
             config: { uri: "mongodb://10.30.0.12:27017/ods" }
+            """;
+
+    private static final String ATLAS = """
+            version: tapstate/v1
+            kind: source
+            id: atlas
+            connector: mongodb-atlas
+            config: { uri: "mongodb+srv://probe:sentinel-secret@cluster.example/test" }
             """;
 
     private static final String SRC_ORA = """

@@ -3,16 +3,16 @@ package io.tapstate.control.core;
 import java.util.Objects;
 
 /**
- * The truth-layer view of one stored artifact returned by a read: its id, kind, canonical form as held
- * by the store, and the content hash of exactly those canonical bytes. This is what a face shows for the
- * artifact read verbs — the server, not a local draft, is the source of what an artifact is
- * (server-as-truth). The read peer of {@link PreparedArtifact}.
+ * The truth-layer view of one stored artifact returned by a read: its id, kind, public canonical
+ * representation, and the content hash of the authoritative resource. A Source presentation can carry
+ * redacted URI userinfo, so its bytes do not determine the hash and cannot be applied as authored input.
+ * The server, not a local draft, remains the source of the stored resource (server-as-truth).
  *
  * <p>The hash travels with the read because it is the precondition an edit or a removal must supply, and
  * not every caller can compute it: a remote model driving the tool surface cannot take a SHA-256 of the
  * text it just received. Handing it over here is what makes read-then-remove a closed loop on every face
- * rather than only on the ones that can hash locally. It is the same value the write side issues for the
- * same bytes, so the two never need reconciling.
+ * rather than only on the ones that can hash locally. It is the value the write side issued for the
+ * authoritative resource; redacting its public representation never weakens that precondition.
  */
 public record StoredArtifact(String id, String kind, String canonicalForm, String contentHash) {
 

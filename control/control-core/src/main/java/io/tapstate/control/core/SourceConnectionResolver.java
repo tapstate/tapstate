@@ -2,6 +2,7 @@ package io.tapstate.control.core;
 
 import io.tapstate.core.catalog.ConfigField;
 import io.tapstate.core.catalog.TapstateCatalog;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ConnectionConfig;
@@ -29,9 +30,10 @@ public final class SourceConnectionResolver {
     }
 
     /**
-     * Preserves request values and restores only secret fields omitted from a redacted saved-Source view.
-     * A stored Source is eligible only when its connector agrees with the request; otherwise the request
-     * remains an ad hoc connection. A null settings map is treated as an empty request.
+     * Preserves request values and restores secret fields omitted from a redacted saved-Source view. Mongo
+     * URI userinfo is restored only when the displayed location still matches the stored URI. A stored
+     * Source is eligible only when its connector agrees with the request; otherwise the request remains an
+     * ad hoc connection. A null settings map is treated as an empty request.
      */
     public ConnectionConfig resolve(
             String connectionId, String connectorId, Map<String, Object> settings) {
@@ -48,6 +50,17 @@ public final class SourceConnectionResolver {
                                 && source.config().get(secret) != null) {
                             resolved.put(secret, source.config().get(secret));
                         }
+                    }
+                    Object supplied = resolved.get("uri");
+                    if (supplied instanceof String displayed
+                            && SourceReadProjection.isRedactedUri(displayed)) {
+                        Object saved = source.config().get("uri");
+                        if (!(saved instanceof String savedUri)
+                                || !displayed.equals(SourceReadProjection.redactUserInfo(savedUri))) {
+                            throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                                    Map.of("reason", "a redacted URI cannot address a different connection"), null);
+                        }
+                        resolved.put("uri", savedUri);
                     }
                     return new ConnectionConfig(source.id(), connectorId, resolved);
                 })
