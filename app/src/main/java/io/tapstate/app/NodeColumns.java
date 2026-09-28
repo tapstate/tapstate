@@ -557,18 +557,7 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
                 case FieldRule.Computed computed -> {
                     out.put(output, JoinSchemaDrift.declaredType(
                             RowExpressions.typedValueType(computed.celExpr(), upstreamTypes), true));
-                    // An expression that only reads one column hands on that column's own value, so
-                    // it keeps what a rename keeps. Without it a moved decimal has no precision, scale
-                    // or range, and a target cannot build the column the value is written to.
-                    String moved = RowExpressions.movedColumn(computed.celExpr());
-                    if (moved != null && upstream.columns().containsKey(moved)) {
-                        if (upstream.stringTypes().containsKey(moved)) {
-                            strings.put(output, upstream.stringTypes().get(moved));
-                        }
-                        if (upstream.numericTypes().containsKey(moved)) {
-                            numbers.put(output, upstream.numericTypes().get(moved));
-                        }
-                    }
+                    keepMovedDescriptors(output, computed.celExpr(), upstream, numbers, strings);
                 }
             }
         });
@@ -605,6 +594,26 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         }
         return new NodeColumns(out, projectedKey(rules, upstream.key(), out), null,
                 origins, upstream.expanded(), numbers, unchanged, strings);
+    }
+
+    /**
+     * Hands {@code output} the descriptors of the upstream column {@code expr} does nothing but read. Such
+     * a value is that column's own, so it keeps what a rename keeps; without them a moved decimal has no
+     * precision, scale or range, and a target cannot build the column the value is written to. Any other
+     * expression produces a value nothing was declared about, and hands on nothing.
+     */
+    private static void keepMovedDescriptors(String output, String expr, NodeColumns upstream,
+            Map<String, NumericType> numbers, Map<String, StringType> strings) {
+        String moved = RowExpressions.movedColumn(expr);
+        if (moved == null || !upstream.columns().containsKey(moved)) {
+            return;
+        }
+        if (upstream.stringTypes().containsKey(moved)) {
+            strings.put(output, upstream.stringTypes().get(moved));
+        }
+        if (upstream.numericTypes().containsKey(moved)) {
+            numbers.put(output, upstream.numericTypes().get(moved));
+        }
     }
 
     /**
