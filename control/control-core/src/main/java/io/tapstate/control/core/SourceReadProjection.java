@@ -79,7 +79,7 @@ final class SourceReadProjection {
         Objects.requireNonNull(uri, "uri");
         UserInfo userInfo = findUserInfo(uri);
         if (userInfo == null) {
-            return uri.indexOf('@') >= 0 ? REDACTED : uri;
+            return uri;
         }
         return uri.substring(0, userInfo.start()) + REDACTED + uri.substring(userInfo.end());
     }

@@ -173,6 +173,18 @@ class ArtifactQueryServiceTest {
     }
 
     @Test
+    void credentialFreeMongoDbAtCharactersSurviveGenericReadsAndReapply() {
+        apply.apply("alice", List.of(draft(MONGO_WITH_AT_IN_PATH), draft(MONGO_WITH_AT_IN_QUERY)));
+
+        String path = query.get("mongo-at-path").orElseThrow().canonicalForm();
+        String queryValue = query.get("mongo-at-query").orElseThrow().canonicalForm();
+
+        assertThat(path).isEqualTo(offlineCanonical(MONGO_WITH_AT_IN_PATH));
+        assertThat(queryValue).isEqualTo(offlineCanonical(MONGO_WITH_AT_IN_QUERY));
+        apply.apply("alice", List.of(draft(path), draft(queryValue)));
+    }
+
+    @Test
     void listIsEmptyWhenNothingIsStored() {
         assertThat(query.list()).isEmpty();
     }
@@ -317,6 +329,22 @@ class ArtifactQueryServiceTest {
             id: atlas-apostrophe
             connector: mongodb-atlas
             config: { uri: "mongodb://probe:sentinel'secret@cluster.example/test" }
+            """;
+
+    private static final String MONGO_WITH_AT_IN_PATH = """
+            version: tapstate/v1
+            kind: source
+            id: mongo-at-path
+            connector: mongodb
+            config: { uri: "mongodb://cluster.example/test@archive" }
+            """;
+
+    private static final String MONGO_WITH_AT_IN_QUERY = """
+            version: tapstate/v1
+            kind: source
+            id: mongo-at-query
+            connector: mongodb
+            config: { uri: "mongodb://cluster.example/test?appName=ops@example.com" }
             """;
 
     private static final String SRC_ORA = """
