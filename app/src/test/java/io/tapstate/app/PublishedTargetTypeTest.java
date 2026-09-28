@@ -7,6 +7,7 @@ import io.tapstate.spi.sink.TargetTable;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -129,6 +130,19 @@ class PublishedTargetTypeTest {
         TargetTable published = StoreBackedDagSource.publishedAs(source(), widened, atTheSource());
 
         assertThat(typesOf(published)).containsEntry("o_id", "bigint");
+    }
+
+    @Test
+    void aComputedDecimalWithTheSameTypeCannotBorrowAnOlderSourcesBounds() {
+        TargetTable base = new TargetTable("orders", List.of(
+                new TargetField("amount", "decimal(10,2)", false)));
+        NodeColumns source = shared("amount", "DECIMAL NULL");
+        NodeColumns computed = source.withUnchangedFields(Set.of());
+
+        assertThat(typesOf(StoreBackedDagSource.publishedAs(base, source, source)))
+                .containsEntry("amount", "decimal(10,2)");
+        assertThat(typesOf(StoreBackedDagSource.publishedAs(base, computed, source)))
+                .containsEntry("amount", null);
     }
 
     /**
