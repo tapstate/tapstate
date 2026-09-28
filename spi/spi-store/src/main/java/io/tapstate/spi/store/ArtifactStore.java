@@ -235,6 +235,11 @@ public interface ArtifactStore {
         throw new UnsupportedOperationException("pipeline incarnation reads are not implemented");
     }
 
+    /** Reverse lookup used only by bounded cold-path cleanup of digest-keyed pipeline data. */
+    default Optional<String> pipelineIdForIncarnation(String incarnationId) {
+        throw new UnsupportedOperationException("pipeline incarnation reverse lookup is not implemented");
+    }
+
     /**
      * Reads the current pipeline's history scope in one operation. Legacy-only stores may use the
      * pipeline id; persistent stores must distinguish lazily upgraded resources from new creations.

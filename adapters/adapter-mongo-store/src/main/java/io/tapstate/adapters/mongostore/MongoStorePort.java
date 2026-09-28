@@ -58,8 +58,10 @@ public final class MongoStorePort implements StorePort {
     public static final String PIPELINE_STATE = "pipeline_state";
     /** The collection holding one plain-upsert desired-intent doc per pipeline. */
     public static final String PIPELINE_DESIRED = "pipeline_desired";
-    /** The collection holding one plain-upsert observation doc per pipeline. */
+    /** Legacy latest documents and the one digest-keyed current manifest per pipeline. */
     public static final String PIPELINE_OBSERVATION = "pipeline_observation";
+    /** Immutable payload chunks referenced by the bounded latest-observation manifest. */
+    public static final String PIPELINE_OBSERVATION_CHUNKS = "pipeline_observation_chunks";
     /** Cluster-scoped owner leases, one durable document per workload identity. */
     public static final String WORKLOAD_CLAIMS = "workload_claims";
     /** The last majority-committed ACTIVE node set per cluster. */
@@ -178,7 +180,9 @@ public final class MongoStorePort implements StorePort {
         this.connectorSpecs = new MongoConnectorSpecStore(SystemCollections.CONNECTOR_SPECS.on(database));
         this.connectionTestResults =
                 new MongoConnectionTestResultStore(SystemCollections.CONNECTION_TEST_RESULTS.on(database));
-        this.observations = new MongoObservationStore(SystemCollections.PIPELINE_OBSERVATION.on(database));
+        this.observations = new MongoObservationStore(connection.client(),
+                SystemCollections.PIPELINE_OBSERVATION.on(database),
+                SystemCollections.PIPELINE_OBSERVATION_CHUNKS.on(database));
         this.rateHistory = new MongoRateHistoryStore(
                 database, SystemCollections.PIPELINE_RATE_HISTORY.on(database), rateHistoryRetention);
         this.historyRollups = new MongoHistoryRollupStore(

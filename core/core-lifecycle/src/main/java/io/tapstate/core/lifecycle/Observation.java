@@ -9,8 +9,9 @@ import java.util.Set;
 
 /**
  * The per-pipeline observation: the latest read-only projection of a running pipeline's state,
- * metrics and snapshot progress, keyed by pipeline id. One doc per pipeline, overwritten in place
- * (latest wins, not a time series). The runtime publishes it; the control read faces read it. The
+ * metrics and snapshot progress, keyed by pipeline id. One logical current value exists per pipeline
+ * (latest wins, not a time series); a store may represent that value with a bounded manifest and chunks.
+ * The runtime publishes it; the control read faces read it. The
  * shape is an external contract — adding a metric is a map entry, not a shape change; adding a field
  * is backward compatible, changing or removing one is breaking. The real Mongo serialization lives in
  * an adapter; this record is the shape.
@@ -69,9 +70,9 @@ public record Observation(
         // A state-only observation is normal before metric / snapshot / position sources are wired: null
         // reads as an empty (unavailable) map, and the copy makes the stored projection immutable. A null
         // failure is the healthy case and stays null — absence, not an empty-coded failure.
-        metrics = metrics == null ? Map.of() : Map.copyOf(metrics);
-        snapshot = snapshot == null ? Map.of() : Map.copyOf(snapshot);
-        positions = positions == null ? Map.of() : Map.copyOf(positions);
+        metrics = ObservationMaps.copyOf(metrics);
+        snapshot = ObservationMaps.copyOf(snapshot);
+        positions = ObservationMaps.copyOf(positions);
         facts = facts == null ? List.of() : List.copyOf(facts);
         // One fact per instrument. Two facts under one name are two answers to one question, and a reader
         // taking either takes one arbitrarily; a fact's own points are already unique by attributes.

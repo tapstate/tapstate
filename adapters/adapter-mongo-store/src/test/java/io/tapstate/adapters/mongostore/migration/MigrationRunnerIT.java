@@ -306,13 +306,56 @@ class MigrationRunnerIT {
                         "V4DiscardInventedPositions", "V5SplitSourceSchemas", "V6SplitDerivedSchemas",
                         "V7RepairBlankPipelines", "V8DiscardViewSchemaPolicies", "V9RateHistoryIndexes",
                         "V10SrsConsumerOffsetIndexes", "V11RateHistoryKeysetIndex",
-                        "V12PipelineEventIndexes", "V13HistoryRollupIndexes");
+                        "V12PipelineEventIndexes", "V13HistoryRollupIndexes",
+                        "V14LatestObservationChunkIndexes");
 
         MigrationRunner.migrate(database);
 
         MigrationRunner.Status after = MigrationRunner.inspect(database);
         assertThat(after.installed()).isEqualTo(MigrationRunner.SUPPORTED_VERSION);
         assertThat(after.pending()).isEmpty();
+    }
+
+    @Test
+    void aBinaryBeforeTheLatestManifestFormatRefusesTheMigratedStore() {
+        MongoDatabase database = freshDatabase("runner_latest_format_refusal");
+        List<ChangeSet> manifestBinary = MigrationRunner.changeSets().stream()
+                .filter(change -> change.version() <= 14).toList();
+        MigrationRunner.migrate(database, manifestBinary, LOCK_TTL, PATIENT, CLOCK);
+        List<ChangeSet> previousBinary = MigrationRunner.changeSets().stream()
+                .filter(change -> change.version() <= 13).toList();
+
+        TapstateException refusal = catchThrowableOfType(() -> MigrationRunner.migrate(
+                database, previousBinary, LOCK_TTL, PATIENT, CLOCK), TapstateException.class);
+
+        assertThat(refusal).isNotNull();
+        assertThat(refusal.code().code()).isEqualTo("migration.data-newer-than-binary");
+        assertThat(refusal.args()).containsEntry("installed", "14").containsEntry("supported", "13");
+    }
+
+    @Test
+    void latestFormatMigrationAddsOnlyIndexesAndDoesNotRewriteLegacyObservations() {
+        MongoDatabase database = freshDatabase("runner_latest_format_no_rewrite");
+        seedSchemaDocument(database, 13, null);
+        Document legacy = new Document("_id", "orders").append("state", "RUNNING")
+                .append("metrics", new Document("records.out", 10L));
+        SystemCollections.PIPELINE_OBSERVATION.on(database).insertOne(legacy);
+        List<ChangeSet> manifestBinary = MigrationRunner.changeSets().stream()
+                .filter(change -> change.version() <= 14).toList();
+
+        MigrationRunner.migrate(database, manifestBinary, LOCK_TTL, PATIENT, CLOCK);
+        MigrationRunner.migrate(database, manifestBinary, LOCK_TTL, PATIENT, CLOCK);
+
+        assertThat(installedVersion(database)).isEqualTo(14);
+        assertThat(SystemCollections.PIPELINE_OBSERVATION.on(database).find(new Document("_id", "orders")).first())
+                .isEqualTo(legacy);
+        assertThat(indexNames(database, SystemCollections.ARTIFACTS))
+                .contains("pipelineIncarnationId_idx");
+        assertThat(indexNames(database, SystemCollections.PIPELINE_OBSERVATION))
+                .contains("pending.publishUntil__id_idx");
+        assertThat(indexNames(database, SystemCollections.PIPELINE_OBSERVATION_CHUNKS))
+                .contains("manifestKey_publicationToken_ordinal_idx", "state__id_idx",
+                        "state_deleteAfter__id_idx");
     }
 
     // ---- the one guard no shipped declaration reaches yet ----

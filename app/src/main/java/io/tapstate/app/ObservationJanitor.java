@@ -39,8 +39,12 @@ final class ObservationJanitor implements AutoCloseable {
     private final AtomicLong failures = new AtomicLong();
     private final AtomicLong maxDurationNanos = new AtomicLong();
     private volatile long lastSuccessNanos;
-    private volatile long lastFailureNanos;
+    private volatile int failedPhases;
     private Optional<String> after = Optional.empty();
+    private Optional<String> manifestAfter = Optional.empty();
+    private Phase phase = Phase.LEGACY;
+
+    private enum Phase { LEGACY, MANIFEST, CHUNKS }
 
     ObservationJanitor(ObservationStore observations, ArtifactStore artifacts,
             ExecutionGenerationStore generations, String clusterId, int batchSize,
@@ -84,38 +88,91 @@ final class ObservationJanitor implements AutoCloseable {
     /** One cold scan batch; a failed owner lookup keeps its cursor so the next run retries that id. */
     synchronized void runOneBatch() {
         long started = System.nanoTime();
+        Phase selected = Phase.LEGACY;
         try {
-            List<LatestSnapshot> page = observations.scanLatestAfter(after, batchSize);
-            if (page.size() > batchSize) {
-                throw new IllegalStateException("observation store returned an unbounded cleanup page");
+            if (observations.supportsManifestStorage()) {
+                selected = phase;
+                phase = switch (phase) {
+                    case LEGACY -> Phase.MANIFEST;
+                    case MANIFEST -> Phase.CHUNKS;
+                    case CHUNKS -> Phase.LEGACY;
+                };
             }
-            String previousId = after.orElse(null);
-            for (LatestSnapshot snapshot : page) {
-                if (previousId != null && snapshot.pipelineId().compareTo(previousId) <= 0) {
-                    throw new IllegalStateException("observation cleanup page is not in ascending id order");
-                }
-                scanned.incrementAndGet();
-                if (orphan(snapshot) && observations.deleteIfUnchanged(snapshot)) {
-                    deleted.incrementAndGet();
-                }
-                after = Optional.of(snapshot.pipelineId());
-                previousId = snapshot.pipelineId();
+            switch (selected) {
+                case LEGACY -> runLegacyBatch();
+                case MANIFEST -> runManifestBatch();
+                case CHUNKS -> runChunkBatch();
             }
-            if (page.size() < batchSize) {
-                after = Optional.empty();
-            }
+            failedPhases &= ~(1 << selected.ordinal());
             lastSuccessNanos = System.nanoTime();
         } catch (RuntimeException failed) {
             failures.incrementAndGet();
-            lastFailureNanos = System.nanoTime();
+            failedPhases |= 1 << selected.ordinal();
             LOG.warn("Could not complete a bounded observation cleanup batch; retrying", failed);
         } finally {
             maxDurationNanos.accumulateAndGet(System.nanoTime() - started, Math::max);
         }
     }
 
+    private void runLegacyBatch() {
+        List<LatestSnapshot> page = observations.scanLatestAfter(after, batchSize);
+        if (page.size() > batchSize) {
+            throw new IllegalStateException("observation store returned an unbounded cleanup page");
+        }
+        String previousId = after.orElse(null);
+        for (LatestSnapshot snapshot : page) {
+            if (previousId != null && snapshot.pipelineId().compareTo(previousId) <= 0) {
+                throw new IllegalStateException("observation cleanup page is not in ascending id order");
+            }
+            scanned.incrementAndGet();
+            if (orphan(snapshot) && observations.deleteIfUnchanged(snapshot)) {
+                deleted.incrementAndGet();
+            }
+            after = Optional.of(snapshot.pipelineId());
+            previousId = snapshot.pipelineId();
+        }
+        if (page.size() < batchSize) {
+            after = Optional.empty();
+        }
+    }
+
+    private void runManifestBatch() {
+        List<ObservationStore.ManifestSnapshot> page = observations.scanManifestsAfter(
+                manifestAfter, batchSize);
+        if (page.size() > batchSize) {
+            throw new IllegalStateException("observation store returned an unbounded manifest page");
+        }
+        String previous = manifestAfter.orElse(null);
+        for (ObservationStore.ManifestSnapshot snapshot : page) {
+            if (snapshot.cursor().equals(previous)) {
+                throw new IllegalStateException("observation manifest cleanup cursor did not advance");
+            }
+            scanned.incrementAndGet();
+            if (manifestOrphan(snapshot) && observations.deleteManifestIfUnchanged(snapshot)) {
+                deleted.incrementAndGet();
+            }
+            manifestAfter = Optional.of(snapshot.cursor());
+            previous = snapshot.cursor();
+        }
+        if (page.size() < batchSize) {
+            manifestAfter = Optional.empty();
+        }
+    }
+
+    private void runChunkBatch() {
+        ObservationStore.ReclaimResult result = observations.reclaimChunks(batchSize);
+        if (result.scanned() > batchSize) {
+            throw new IllegalStateException("observation store reclaimed an unbounded chunk page");
+        }
+        scanned.addAndGet(result.scanned());
+        deleted.addAndGet(result.deleted());
+    }
+
     private boolean orphan(LatestSnapshot snapshot) {
         String id = snapshot.pipelineId();
+        if (observations.hasCommittedManifest(id)) {
+            return true;
+        }
         Optional<String> incarnation = artifacts.pipelineIncarnationId(id);
         if (incarnation.isEmpty()) {
             boolean legacyPipeline = artifacts.get(id)
@@ -132,14 +189,31 @@ final class ObservationJanitor implements AutoCloseable {
                 && current.getAsLong() != snapshot.scope().orElseThrow().executionGeneration();
     }
 
+    private boolean manifestOrphan(ObservationStore.ManifestSnapshot snapshot) {
+        if (snapshot.scopes().isEmpty()) {
+            return true;
+        }
+        for (ObservationStore.Scope scope : snapshot.scopes()) {
+            Optional<String> id = artifacts.pipelineIdForIncarnation(scope.pipelineIncarnationId());
+            if (id.isEmpty()) {
+                continue;
+            }
+            OptionalLong current = generations.currentGeneration(clusterId, id.orElseThrow());
+            // A missing generation is insufficient evidence during startup or a mode switch.
+            if (current.isEmpty() || current.getAsLong() == scope.executionGeneration()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     Health health() {
         long success = lastSuccessNanos;
-        long failure = lastFailureNanos;
         return new Health(scanned.get(), deleted.get(), failures.get(),
                 TimeUnit.NANOSECONDS.toMillis(maxDurationNanos.get()),
                 success == 0 ? OptionalLong.empty()
                         : OptionalLong.of(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - success)),
-                failure != 0 && (success == 0 || failure - success > 0));
+                failedPhases != 0);
     }
 
     @Override

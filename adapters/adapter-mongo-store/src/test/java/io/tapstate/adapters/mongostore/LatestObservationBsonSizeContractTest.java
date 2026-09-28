@@ -7,7 +7,9 @@ import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.ObservationStore;
 import org.bson.Document;
+import org.bson.types.Binary;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayOutputStream;
@@ -26,9 +28,30 @@ import static org.assertj.core.api.Assertions.assertThat;
 class LatestObservationBsonSizeContractTest {
 
     private static final long LATEST_BUDGET_BYTES = 12L * 1024 * 1024;
+    private static final ObservationStore.Scope SCOPE =
+            new ObservationStore.Scope("01234567-89ab-cdef-0123-456789abcdef", 1L);
 
     @Test
-    void aSharedConnectorOffsetRepeatedAcrossSelectedTablesStaysWithinTheLatestBudget() throws IOException {
+    void inlineBoundaryStillFitsBesideTheMaximumPendingDescriptor() {
+        Observation observation = new Observation("pipeline", PipelineState.RUNNING,
+                Map.of(), Map.of(), Map.of("orders", "x".repeat(400 * 1024)), null,
+                Instant.parse("2026-09-27T00:00:00Z"));
+        LatestObservationPayloadCodec.Encoded encoded = LatestObservationPayloadCodec.encode(
+                observation, new LatestObservationPayloadCodec.ChunkWriter() {
+                    @Override public void begin() { throw new AssertionError("payload should stay inline"); }
+                    @Override public void write(LatestObservationPayloadCodec.Chunk chunk) {
+                        throw new AssertionError("payload should stay inline");
+                    }
+                });
+
+        assertThat(encoded.inline()).isTrue();
+        assertThat(StoredBytes.bsonSize(MongoLatestObservationStorage.inlineManifestForSize(
+                observation.pipelineId(), SCOPE, observation.observedAt(), encoded)))
+                .isLessThanOrEqualTo(LATEST_BUDGET_BYTES);
+    }
+
+    @Test
+    void aSharedConnectorOffsetRepeatedAcrossSelectedTablesUsesBoundedChunks() throws IOException {
         // Connector offsets are serialized to opaque Base64 tokens. One source can select many tables,
         // and the current-position projection repeats its sink-acknowledged token for every selected table.
         byte[] offset = new byte[768 * 1024];
@@ -40,18 +63,12 @@ class LatestObservationBsonSizeContractTest {
         }
         Observation observation = new Observation("pipeline", PipelineState.RUNNING,
                 Map.of(), Map.of(), positions, null, Instant.parse("2026-09-27T00:00:00Z"));
-        Document stored = MongoObservationStore.toDocument(observation)
-                .append("pipelineIncarnationId", "01234567-89ab-cdef-0123-456789abcdef")
-                .append("executionGeneration", 1L);
-
-        long encoded = StoredBytes.bsonSize(stored);
-        assertThat(encoded).isLessThan(StoredBytes.DOCUMENT_CEILING);
-        assertThat(encoded).as("BSON bytes with a %s-byte connector token copied across 13 tables",
-                token.length()).isLessThanOrEqualTo(LATEST_BUDGET_BYTES);
+        assertChunkedAndBounded(observation, 13_632_353L,
+                "BSON bytes with a %s-byte connector token copied across 13 tables".formatted(token.length()));
     }
 
     @Test
-    void aLegalPipelineIdAndFullyBudgetedRecordFactStayWithinTheLatestBudget() {
+    void aLegalPipelineIdAndFullyBudgetedRecordFactUsesBoundedChunks() {
         String pipelineId = "p".repeat(950);
         Instant at = Instant.parse("2026-09-27T00:00:00Z");
         List<MetricPoint> points = new ArrayList<>();
@@ -73,14 +90,40 @@ class LatestObservationBsonSizeContractTest {
         Observation observation = new Observation(pipelineId, PipelineState.RUNNING,
                 Map.of("tapstate.pipeline.records", 12_000L), Map.of(), Map.of(), null, at,
                 List.of(budgeted));
-        Document stored = MongoObservationStore.toDocument(observation)
-                .append("pipelineIncarnationId", "01234567-89ab-cdef-0123-456789abcdef")
-                .append("executionGeneration", 1L);
+        assertChunkedAndBounded(observation, 13_494_853L,
+                "BSON bytes with %s fully budgeted record points and a %s-byte pipeline id"
+                        .formatted(budgeted.points().size(), pipelineId.length()));
+    }
 
-        long encoded = StoredBytes.bsonSize(stored);
-        assertThat(encoded).isLessThan(StoredBytes.DOCUMENT_CEILING);
-        assertThat(encoded).as("BSON bytes with %s fully budgeted record points and a %s-byte pipeline id",
-                budgeted.points().size(), pipelineId.length()).isLessThanOrEqualTo(LATEST_BUDGET_BYTES);
+    private static void assertChunkedAndBounded(Observation observation, long oldBytes, String description) {
+        Document legacy = MongoObservationStore.toDocument(observation)
+                .append("pipelineIncarnationId", SCOPE.pipelineIncarnationId())
+                .append("executionGeneration", SCOPE.executionGeneration());
+        assertThat(StoredBytes.bsonSize(legacy)).as(description).isEqualTo(oldBytes)
+                .isLessThan(StoredBytes.DOCUMENT_CEILING)
+                .isGreaterThan(LATEST_BUDGET_BYTES);
+
+        List<LatestObservationPayloadCodec.Chunk> chunks = new ArrayList<>();
+        LatestObservationPayloadCodec.Encoded encoded = LatestObservationPayloadCodec.encode(
+                observation, new LatestObservationPayloadCodec.ChunkWriter() {
+                    @Override public void begin() { }
+                    @Override public void write(LatestObservationPayloadCodec.Chunk chunk) { chunks.add(chunk); }
+                });
+        assertThat(encoded.inline()).isFalse();
+        assertThat(encoded.chunkCount()).isEqualTo(chunks.size());
+        String token = "00000000-0000-0000-0000-000000000000";
+        Document manifest = MongoLatestObservationStorage.chunkedManifestForSize(
+                observation.pipelineId(), SCOPE, observation.observedAt(), token, encoded);
+        assertThat(StoredBytes.bsonSize(manifest)).as("manifest with maximum pending descriptor")
+                .isLessThanOrEqualTo(LATEST_BUDGET_BYTES);
+        Binary key = MongoLatestObservationStorage.manifestKey(observation.pipelineId());
+        Binary owner = MongoLatestObservationStorage.ownerDigest(observation.pipelineId());
+        assertThat(chunks).allSatisfy(chunk -> assertThat(StoredBytes.bsonSize(
+                MongoLatestObservationStorage.chunkDocument(key, owner, token, chunk)))
+                .as("chunk %s", chunk.ordinal()).isLessThanOrEqualTo(LATEST_BUDGET_BYTES));
+        Observation decoded = LatestObservationPayloadCodec.decodeChunks(chunks, encoded.chunkCount(),
+                encoded.encodedBytes(), encoded.payloadDigest());
+        assertThat(decoded).isEqualTo(observation);
     }
 
     private static String serializedToken(byte[] offset) throws IOException {

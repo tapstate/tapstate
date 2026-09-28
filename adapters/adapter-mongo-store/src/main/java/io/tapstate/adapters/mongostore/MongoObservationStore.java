@@ -1,6 +1,7 @@
 package io.tapstate.adapters.mongostore;
 
 import com.mongodb.MongoException;
+import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.model.ReplaceOptions;
 import com.mongodb.client.result.UpdateResult;
@@ -29,10 +30,11 @@ import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 
 /**
- * The MongoDB per-pipeline observation store: one observation document per pipeline, keyed by the
- * pipeline id (as {@code _id}), carrying the lifecycle state and the metrics / per-table snapshot
- * progress / per-table position sub-documents. Scoped writes compare the execution owner and observation
- * time in the same Mongo operation; the legacy save method remains an unfenced upsert.
+ * The MongoDB per-pipeline observation store. Scoped writes publish one digest-keyed manifest: small
+ * versioned payloads stay inline and larger ones stream into immutable bounded chunks before the
+ * manifest fence advances. Legacy string-keyed documents remain readable until a committed manifest
+ * exists. Compatibility writes touch the same manifest fence and remain hidden once scoped current
+ * authority has been committed; they cannot promote an unfenced value into that current.
  *
  * <p>Driver IO failures are translated into coded io diagnostics, so no driver type escapes the module
  * (rule R3). A stored document whose state is missing or unrecognized, or whose metric / snapshot / position
@@ -40,7 +42,7 @@ import java.util.concurrent.TimeUnit;
  * while reconstructing. A document written before positions existed simply has no positions field and reads
  * back with empty positions; one written before the measured facts travelled reads back with none.
  *
- * <p><strong>The facts are stored as the fact type lays them out</strong> — one array element per metric,
+ * <p><strong>The logical facts are encoded as the fact type lays them out</strong> — one array element per metric,
  * each with its points, each point with its attributes, its instants as BSON dates and either a value or
  * the four parts of a distribution — and reconstructed through the fact type's own constructor. So a stored
  * fact this version would refuse to build (a distribution over bounds no longer registered, a closed
@@ -53,14 +55,27 @@ public final class MongoObservationStore implements ObservationStore {
     private static final long IO_DEADLINE_SECONDS = 5;
 
     private final MongoCollection<Document> collection;
+    private final MongoLatestObservationStorage latest;
 
     public MongoObservationStore(MongoCollection<Document> collection) {
         this.collection = Objects.requireNonNull(collection, "collection");
+        this.latest = null;
+    }
+
+    public MongoObservationStore(MongoClient client, MongoCollection<Document> collection,
+            MongoCollection<Document> chunks) {
+        this.collection = Objects.requireNonNull(collection, "collection");
+        this.latest = new MongoLatestObservationStorage(Objects.requireNonNull(client, "client"), collection,
+                Objects.requireNonNull(chunks, "chunks"));
     }
 
     @Override
     public void save(Observation observation) {
         Objects.requireNonNull(observation, "observation");
+        if (latest != null) {
+            latest.saveLegacy(observation);
+            return;
+        }
         // Upsert by the pipeline id (the document _id): a re-publish overwrites the latest projection in
         // place (last write wins) rather than accumulating documents. An observation is not fenced.
         StoreIo.run(() -> collection.withTimeout(IO_DEADLINE_SECONDS, TimeUnit.SECONDS).replaceOne(
@@ -69,6 +84,9 @@ public final class MongoObservationStore implements ObservationStore {
 
     @Override
     public boolean saveScoped(Observation observation, Scope scope) {
+        if (latest != null) {
+            return latest.save(observation, scope);
+        }
         Objects.requireNonNull(observation, "observation");
         Objects.requireNonNull(scope, "scope");
         Instant observedAt = Objects.requireNonNull(observation.observedAt(), "observedAt");
@@ -112,6 +130,9 @@ public final class MongoObservationStore implements ObservationStore {
     @Override
     public Optional<Observation> read(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
+        if (latest != null) {
+            return latest.read(pipelineId).map(Stored::observation);
+        }
         Document document = StoreIo.call(() -> collection.withTimeout(IO_DEADLINE_SECONDS, TimeUnit.SECONDS)
                 .find(new Document("_id", pipelineId)).first());
         return document == null ? Optional.empty() : Optional.of(toObservation(document));
@@ -120,6 +141,9 @@ public final class MongoObservationStore implements ObservationStore {
     @Override
     public Optional<Stored> readStored(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
+        if (latest != null) {
+            return latest.read(pipelineId);
+        }
         Document document = StoreIo.call(() -> collection.withTimeout(IO_DEADLINE_SECONDS, TimeUnit.SECONDS)
                 .find(new Document("_id", pipelineId)).first());
         if (document == null) {
@@ -143,6 +167,10 @@ public final class MongoObservationStore implements ObservationStore {
     @Override
     public void delete(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
+        if (latest != null) {
+            latest.delete(pipelineId);
+            return;
+        }
         // deleteOne on a missing _id removes nothing and reports so without failing, which is the no-op
         // an unpublished observation is meant to be.
         StoreIo.run(() -> collection.deleteOne(new Document("_id", pipelineId)));
@@ -152,6 +180,10 @@ public final class MongoObservationStore implements ObservationStore {
     public void deleteIncarnation(String pipelineId, String incarnationId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(incarnationId, "incarnationId");
+        if (latest != null) {
+            latest.deleteIncarnation(pipelineId, incarnationId);
+            return;
+        }
         if (incarnationId.isBlank()) {
             throw new IllegalArgumentException("observation incarnation must not be blank");
         }
@@ -162,6 +194,10 @@ public final class MongoObservationStore implements ObservationStore {
     @Override
     public void deleteLegacy(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
+        if (latest != null) {
+            latest.deleteLegacy(pipelineId);
+            return;
+        }
         StoreIo.run(() -> collection.withTimeout(IO_DEADLINE_SECONDS, TimeUnit.SECONDS)
                 .deleteOne(new Document("_id", pipelineId)
                         .append("pipelineIncarnationId", new Document("$exists", false))
@@ -178,9 +214,8 @@ public final class MongoObservationStore implements ObservationStore {
         if (afterPipelineId.filter(String::isBlank).isPresent()) {
             throw new IllegalArgumentException("observation scan cursor must not be blank");
         }
-        Document filter = afterPipelineId
-                .map(id -> new Document("_id", new Document("$gt", id)))
-                .orElseGet(Document::new);
+        Document filter = new Document("_id", new Document("$type", "string"));
+        afterPipelineId.ifPresent(id -> filter.append("_id", new Document("$type", "string").append("$gt", id)));
         Document projection = new Document("_id", 1)
                 .append("pipelineIncarnationId", 1)
                 .append("executionGeneration", 1)
@@ -198,6 +233,9 @@ public final class MongoObservationStore implements ObservationStore {
     @Override
     public boolean deleteIfUnchanged(LatestSnapshot snapshot) {
         Objects.requireNonNull(snapshot, "snapshot");
+        if (latest != null) {
+            return latest.deleteLegacyIfUnchanged(snapshot);
+        }
         Document filter = new Document("_id", snapshot.pipelineId());
         if (snapshot.scope().isPresent()) {
             Scope scope = snapshot.scope().orElseThrow();
@@ -211,6 +249,37 @@ public final class MongoObservationStore implements ObservationStore {
                 .<Object>map(Date::from).orElseGet(() -> new Document("$exists", false)));
         return StoreIo.call(snapshot.pipelineId(), () -> collection.withTimeout(IO_DEADLINE_SECONDS, TimeUnit.SECONDS)
                 .deleteOne(filter).getDeletedCount() != 0);
+    }
+
+    @Override
+    public boolean hasCommittedManifest(String pipelineId) {
+        return latest != null && latest.hasCommittedManifest(pipelineId);
+    }
+
+    @Override
+    public boolean supportsManifestStorage() {
+        return latest != null;
+    }
+
+    @Override
+    public List<ManifestSnapshot> scanManifestsAfter(Optional<String> afterCursor, int limit) {
+        if (latest == null) {
+            return ObservationStore.super.scanManifestsAfter(afterCursor, limit);
+        }
+        return latest.scanManifestsAfter(afterCursor, limit);
+    }
+
+    @Override
+    public boolean deleteManifestIfUnchanged(ManifestSnapshot snapshot) {
+        if (latest == null) {
+            return ObservationStore.super.deleteManifestIfUnchanged(snapshot);
+        }
+        return latest.deleteManifestIfUnchanged(snapshot);
+    }
+
+    @Override
+    public ReclaimResult reclaimChunks(int limit) {
+        return latest == null ? ObservationStore.super.reclaimChunks(limit) : latest.reclaimChunks(limit);
     }
 
     private static LatestSnapshot toLatestSnapshot(Document document) {

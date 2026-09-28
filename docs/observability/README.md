@@ -80,6 +80,32 @@ is recreated before another sweep. Exported point labels contain the pipeline id
 execution selector. A remote Prometheus or OTLP backend may retain older points until its own retention
 expires; do not use that remote history to decide which incarnation a current store-backed read belongs to.
 
+## Latest storage and upgrades
+
+Each pipeline has one logical latest observation. Mongo stores its current pointer in a bounded
+manifest and keeps payloads up to 512 KiB inline. Larger payloads stream into immutable chunks of at
+most 1 MiB; every physical BSON document stays below the 12 MiB evolution budget. A large connector
+position or failure detail is retained in full. History and events remain separate expiring documents.
+
+Chunk writes and manifest transitions require majority and journal acknowledgement. A chunked publish
+holds one renewable publication lease, writes all chunks, then advances the current pointer atomically.
+An interrupted or stale publish leaves the last committed observation and its original `observedAt`
+visible. Normal advancing inline writes use one conditional Mongo update. The first format transition
+checks and fences any legacy latest document in a bounded transaction; an incomplete transition keeps
+that legacy value readable under the existing identity checks.
+
+Readers verify the committed payload's version, order, byte count and digests before returning it.
+Missing or corrupt committed chunks produce `io.document-unreadable`; they do not expose a partial
+observation or substitute an older legacy value. Reads have a 10-second total deadline with at most
+one retry. The cold janitor keeps current and pending chunks, retires unreferenced chunks, and waits
+15 seconds before conditionally deleting them. Its failure delays space reclamation and appears in
+process health; it does not change which incarnation owns a read.
+
+This representation installs system-data version 14 at startup. Stop the previous binaries before
+upgrading: binaries supporting an older data version refuse the migrated store before serving requests
+or joining the cluster. Keep an upgrade backup for recovery; the first new observation is independent
+of this startup version boundary.
+
 ## What history measures
 
 History contains samples, not stored rates. By default the server samples no more often than once per

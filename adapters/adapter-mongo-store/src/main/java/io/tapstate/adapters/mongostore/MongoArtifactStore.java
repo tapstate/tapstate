@@ -338,6 +338,24 @@ public final class MongoArtifactStore implements ArtifactStore {
     }
 
     @Override
+    public Optional<String> pipelineIdForIncarnation(String incarnationId) {
+        Objects.requireNonNull(incarnationId, "incarnationId");
+        if (incarnationId.isBlank()) {
+            throw new IllegalArgumentException("pipeline incarnation must not be blank");
+        }
+        return StoreIo.call(() -> {
+            List<Document> matches = collection.find(new Document("kind", "pipeline")
+                            .append("pipelineIncarnationId", incarnationId))
+                    .projection(new Document("_id", 1)).limit(2).into(new ArrayList<>(2));
+            if (matches.size() > 1) {
+                throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                        Map.of("id", incarnationId, "field", "pipelineIncarnationId"), null);
+            }
+            return matches.stream().findFirst().map(document -> document.getString("_id"));
+        });
+    }
+
+    @Override
     public Optional<HistoryOwner> pipelineHistoryOwner(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         return StoreIo.call(() -> Optional.ofNullable(collection.find(pipelineFilter(pipelineId))

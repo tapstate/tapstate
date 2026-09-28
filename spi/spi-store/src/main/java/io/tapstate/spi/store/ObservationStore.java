@@ -7,14 +7,14 @@ import java.util.Objects;
 import java.util.Optional;
 
 /**
- * The per-pipeline observation store: persists one observation doc per pipeline — the latest read-only
- * projection of its state, metrics and snapshot progress. A pure interface over the observation model
- * in the core ring (rule R2); it exposes the persistence surface only.
+ * The per-pipeline observation store: persists one logical latest read-only projection of state,
+ * metrics and snapshot progress. A pure interface over the observation model in the core ring (rule
+ * R2); physical manifests and payload chunks remain an adapter concern.
  *
- * <p>An observation is a latest-state projection, not a time series. Scoped writes keep one document
- * by pipeline id and conditionally replace it only for a newer execution or observation time. A
- * control reader compares its stored owner with the current artifact and execution before returning it.
- * The plain save/read methods retain the pre-identity compatibility path.
+ * <p>An observation is a latest-state projection, not a time series. Scoped writes conditionally
+ * replace its one current pointer only for a newer execution or observation time. A control reader
+ * compares its stored owner with the current artifact and execution before returning it. The plain
+ * save/read methods retain the pre-identity compatibility path.
  */
 public interface ObservationStore {
 
@@ -47,6 +47,27 @@ public interface ObservationStore {
             Objects.requireNonNull(observedAt, "observedAt");
             if (pipelineId.isBlank()) {
                 throw new IllegalArgumentException("an observation snapshot needs a pipeline id");
+            }
+        }
+    }
+
+    /** Digest-keyed manifest snapshot for bounded cold cleanup; cursor and revision are opaque. */
+    record ManifestSnapshot(String cursor, String revision, List<Scope> scopes) {
+        public ManifestSnapshot {
+            Objects.requireNonNull(cursor, "cursor");
+            Objects.requireNonNull(revision, "revision");
+            scopes = List.copyOf(Objects.requireNonNull(scopes, "scopes"));
+            if (cursor.isBlank() || revision.isBlank()) {
+                throw new IllegalArgumentException("a manifest snapshot needs cursor and revision");
+            }
+        }
+    }
+
+    /** Work performed by one bounded physical-chunk cleanup batch. */
+    record ReclaimResult(long scanned, long deleted) {
+        public ReclaimResult {
+            if (scanned < 0 || deleted < 0 || deleted > scanned) {
+                throw new IllegalArgumentException("reclaim counts are non-negative and deleted is scanned");
             }
         }
     }
@@ -104,5 +125,30 @@ public interface ObservationStore {
      */
     default boolean deleteIfUnchanged(LatestSnapshot snapshot) {
         throw new UnsupportedOperationException("conditional observation cleanup is unavailable");
+    }
+
+    /** Whether a committed digest-keyed current makes the legacy string document cold residue. */
+    default boolean hasCommittedManifest(String pipelineId) {
+        return false;
+    }
+
+    /** Whether this implementation owns the digest-keyed manifest/chunk physical format. */
+    default boolean supportsManifestStorage() {
+        return false;
+    }
+
+    /** Bounded keyset scan of digest-keyed manifests, independent of legacy string ids. */
+    default List<ManifestSnapshot> scanManifestsAfter(Optional<String> afterCursor, int limit) {
+        throw new UnsupportedOperationException("bounded manifest scans are unavailable");
+    }
+
+    /** Removes only the manifest revision observed by a cold scan. */
+    default boolean deleteManifestIfUnchanged(ManifestSnapshot snapshot) {
+        throw new UnsupportedOperationException("conditional manifest cleanup is unavailable");
+    }
+
+    /** Expires pending leases and retires/deletes at most {@code limit} physical chunk rows. */
+    default ReclaimResult reclaimChunks(int limit) {
+        return new ReclaimResult(0, 0);
     }
 }

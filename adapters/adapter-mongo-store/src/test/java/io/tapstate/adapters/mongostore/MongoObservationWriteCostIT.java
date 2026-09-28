@@ -52,18 +52,57 @@ class MongoObservationWriteCostIT {
             var database = client.getDatabase(databaseName);
             database.drop();
             MongoCollection<Document> collection = database.getCollection(MongoStorePort.PIPELINE_OBSERVATION);
-            MongoObservationStore store = new MongoObservationStore(collection);
+            MongoObservationStore store = new MongoObservationStore(client, collection,
+                    database.getCollection(MongoStorePort.PIPELINE_OBSERVATION_CHUNKS));
             ObservationStore.Scope scope = new ObservationStore.Scope("inc-a", 7);
             Instant first = Instant.parse("2026-09-27T10:00:00Z");
 
             assertThat(store.saveScoped(observation(first), scope)).isTrue();
-            assertSingleConditionalReplacement(commands, scope);
             commands.clear();
 
             assertThat(store.saveScoped(observation(first.plusSeconds(1)), scope)).isTrue();
             assertSingleConditionalReplacement(commands, scope);
             assertThat(store.readStored("orders").orElseThrow().observation().observedAt())
                     .isEqualTo(first.plusSeconds(1));
+        }
+    }
+
+    @Test
+    void preparedChunksAreMajorityJournaledBeforeManifestPromotion() {
+        String databaseName = "observation_chunk_durability_it";
+        List<BsonDocument> commands = new CopyOnWriteArrayList<>();
+        CommandListener listener = new CommandListener() {
+            @Override
+            public void commandStarted(CommandStartedEvent event) {
+                if (databaseName.equals(event.getDatabaseName()) && "insert".equals(event.getCommandName())) {
+                    commands.add(event.getCommand().clone());
+                }
+            }
+        };
+        MongoClientSettings settings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl()))
+                .addCommandListener(listener).build();
+        try (MongoClient client = MongoClients.create(settings)) {
+            var database = client.getDatabase(databaseName);
+            database.drop();
+            MongoObservationStore store = new MongoObservationStore(client,
+                    database.getCollection(MongoStorePort.PIPELINE_OBSERVATION),
+                    database.getCollection(MongoStorePort.PIPELINE_OBSERVATION_CHUNKS));
+            Observation large = new Observation("orders", PipelineState.RUNNING, Map.of(), Map.of(),
+                    Map.of("orders", "x".repeat(3 * 1024 * 1024)), null,
+                    Instant.parse("2026-09-27T10:00:00Z"));
+
+            assertThat(store.saveScoped(large, new ObservationStore.Scope("inc-a", 7))).isTrue();
+
+            List<BsonDocument> chunkInserts = commands.stream()
+                    .filter(command -> MongoStorePort.PIPELINE_OBSERVATION_CHUNKS.equals(
+                            command.getString("insert").getValue()))
+                    .toList();
+            assertThat(chunkInserts).isNotEmpty().allSatisfy(command -> {
+                BsonDocument concern = command.getDocument("writeConcern");
+                assertThat(concern.getString("w").getValue()).isEqualTo("majority");
+                assertThat(concern.getBoolean("j").getValue()).isTrue();
+            });
         }
     }
 
@@ -74,13 +113,15 @@ class MongoObservationWriteCostIT {
         assertThat(update.getString("update").getValue()).isEqualTo(MongoStorePort.PIPELINE_OBSERVATION);
         assertThat(update.getArray("updates")).hasSize(1);
         BsonDocument replacement = update.getArray("updates").get(0).asDocument();
-        assertThat(replacement.getBoolean("upsert").getValue()).isTrue();
-        assertThat(replacement.getDocument("q").getString("_id").getValue()).isEqualTo("orders");
-        assertThat(replacement.getDocument("q").getArray("$or")).isNotEmpty();
-        assertThat(replacement.getDocument("u").getString("pipelineIncarnationId").getValue())
-                .isEqualTo(scope.pipelineIncarnationId());
-        assertThat(replacement.getDocument("u").getInt64("executionGeneration").getValue())
-                .isEqualTo(scope.executionGeneration());
+        assertThat(replacement.getBoolean("upsert", org.bson.BsonBoolean.FALSE).getValue()).isFalse();
+        assertThat(replacement.getDocument("q").getBinary("_id").getData()).hasSize(32);
+        assertThat(replacement.getDocument("q").getArray("$and")).hasSize(2);
+        assertThat(replacement.getArray("u")).isNotEmpty();
+        assertThat(update.getDocument("writeConcern").getString("w").getValue()).isEqualTo("majority");
+        assertThat(update.getDocument("writeConcern").getBoolean("j").getValue()).isTrue();
+        assertThat(replacement.toJson()).contains(scope.pipelineIncarnationId())
+                .contains(Long.toString(scope.executionGeneration()))
+                .contains("inlinePayload");
     }
 
     private static Observation observation(Instant at) {

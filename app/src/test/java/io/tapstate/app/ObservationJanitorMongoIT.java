@@ -54,8 +54,9 @@ class ObservationJanitorMongoIT {
 
             try (ObservationJanitor janitor = new ObservationJanitor(latest, artifacts, generations,
                     "cluster", 2, Duration.ofMinutes(1), false)) {
-                janitor.runOneBatch();
-                janitor.runOneBatch();
+                for (int batch = 0; batch < 5; batch++) {
+                    janitor.runOneBatch();
+                }
 
                 assertThat(latest.readStored("current").orElseThrow().scope())
                         .contains(new ObservationStore.Scope(currentIncarnation, currentGeneration));

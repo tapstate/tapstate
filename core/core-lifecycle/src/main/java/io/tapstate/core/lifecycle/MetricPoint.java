@@ -38,7 +38,7 @@ public record MetricPoint(Map<String, String> attributes, Instant startTime, Ins
                     "a point carries exactly one of a value and a histogram, never both and never "
                             + "neither");
         }
-        attributes = attributes == null ? Map.of() : Map.copyOf(attributes);
+        attributes = ObservationMaps.copyOf(attributes);
         for (Map.Entry<String, String> attribute : attributes.entrySet()) {
             if (attribute.getKey().isBlank()) {
                 throw new IllegalArgumentException("an attribute key must not be blank");

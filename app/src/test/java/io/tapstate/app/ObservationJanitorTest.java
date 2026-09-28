@@ -118,6 +118,66 @@ class ObservationJanitorTest {
         }
     }
 
+    @Test
+    void manifestLegacyAndChunkPhasesShareOneFixedBatchBudget() {
+        ManifestLatest latest = new ManifestLatest();
+        latest.putLegacy("shadow", "inc-live", 2);
+        latest.manifests.put("a", new ObservationStore.ManifestSnapshot(
+                "a", "rev-a", List.of(new ObservationStore.Scope("inc-live", 2))));
+        latest.manifests.put("b", new ObservationStore.ManifestSnapshot(
+                "b", "rev-b", List.of(new ObservationStore.Scope("inc-gone", 1))));
+        MemoryArtifacts artifacts = new MemoryArtifacts(Map.of("live", "inc-live"), Set.of());
+        try (ObservationJanitor janitor = new ObservationJanitor(
+                latest, artifacts, new MemoryGenerations(Map.of("live", 2L)),
+                "cluster", 2, Duration.ofMinutes(1), false)) {
+            janitor.runOneBatch();
+            janitor.runOneBatch();
+            janitor.runOneBatch();
+
+            assertThat(latest.rows).isEmpty();
+            assertThat(latest.manifests.keySet()).containsExactly("a");
+            assertThat(latest.chunkLimits).containsExactly(2);
+            assertThat(janitor.health().scanned()).isEqualTo(5);
+            assertThat(janitor.health().deleted()).isEqualTo(3);
+            assertThat(janitor.health().failures()).isZero();
+        }
+    }
+
+    @Test
+    void persistentFailureInTwoPhasesDoesNotStarveChunksOrDisappearAfterTheirSuccess() {
+        AtomicBoolean unavailable = new AtomicBoolean(true);
+        ManifestLatest latest = new ManifestLatest() {
+            @Override public List<LatestSnapshot> scanLatestAfter(Optional<String> after, int limit) {
+                if (unavailable.get()) {
+                    throw new IllegalStateException("legacy lookup unavailable");
+                }
+                return super.scanLatestAfter(after, limit);
+            }
+            @Override public List<ManifestSnapshot> scanManifestsAfter(Optional<String> after, int limit) {
+                if (unavailable.get()) {
+                    throw new IllegalStateException("manifest lookup unavailable");
+                }
+                return super.scanManifestsAfter(after, limit);
+            }
+        };
+        try (ObservationJanitor janitor = new ObservationJanitor(latest,
+                new MemoryArtifacts(Map.of(), Set.of()), new MemoryGenerations(Map.of()),
+                "cluster", 2, Duration.ofMinutes(1), false)) {
+            for (int pass = 0; pass < 6; pass++) {
+                janitor.runOneBatch();
+            }
+
+            assertThat(latest.chunkLimits).containsExactly(2, 2);
+            assertThat(janitor.health().failures()).isEqualTo(4);
+            assertThat(janitor.health().degraded()).isTrue();
+            unavailable.set(false);
+            for (int pass = 0; pass < 3; pass++) {
+                janitor.runOneBatch();
+            }
+            assertThat(janitor.health().degraded()).isFalse();
+        }
+    }
+
     private static final class MemoryLatest implements ObservationStore {
         private final TreeMap<String, LatestSnapshot> rows = new TreeMap<>();
         private final List<Integer> requestedLimits = new ArrayList<>();
@@ -145,6 +205,41 @@ class ObservationJanitorTest {
         }
     }
 
+    private static class ManifestLatest implements ObservationStore {
+        private final TreeMap<String, LatestSnapshot> rows = new TreeMap<>();
+        private final TreeMap<String, ManifestSnapshot> manifests = new TreeMap<>();
+        private final List<Integer> chunkLimits = new ArrayList<>();
+
+        void putLegacy(String id, String incarnation, long generation) {
+            rows.put(id, new LatestSnapshot(id, Optional.of(new Scope(incarnation, generation)),
+                    Optional.of(AT)));
+        }
+
+        @Override public void save(Observation observation) { throw new UnsupportedOperationException(); }
+        @Override public Optional<Observation> read(String id) { return Optional.empty(); }
+        @Override public void delete(String id) { throw new UnsupportedOperationException(); }
+        @Override public boolean supportsManifestStorage() { return true; }
+        @Override public boolean hasCommittedManifest(String id) { return id.equals("shadow"); }
+        @Override public List<LatestSnapshot> scanLatestAfter(Optional<String> after, int limit) {
+            return rows.values().stream().filter(row -> after.map(id ->
+                    row.pipelineId().compareTo(id) > 0).orElse(true)).limit(limit).toList();
+        }
+        @Override public boolean deleteIfUnchanged(LatestSnapshot snapshot) {
+            return rows.remove(snapshot.pipelineId(), snapshot);
+        }
+        @Override public List<ManifestSnapshot> scanManifestsAfter(Optional<String> after, int limit) {
+            return manifests.values().stream().filter(row -> after.map(cursor ->
+                    row.cursor().compareTo(cursor) > 0).orElse(true)).limit(limit).toList();
+        }
+        @Override public boolean deleteManifestIfUnchanged(ManifestSnapshot snapshot) {
+            return manifests.remove(snapshot.cursor(), snapshot);
+        }
+        @Override public ReclaimResult reclaimChunks(int limit) {
+            chunkLimits.add(limit);
+            return new ReclaimResult(2, 1);
+        }
+    }
+
     private static class MemoryArtifacts implements ArtifactStore {
         private final Map<String, String> incarnations;
         private final Set<String> legacy;
@@ -163,6 +258,10 @@ class ObservationJanitorTest {
         @Override public List<Resource> list() { return List.of(); }
         @Override public Optional<String> pipelineIncarnationId(String id) {
             return Optional.ofNullable(incarnations.get(id));
+        }
+        @Override public Optional<String> pipelineIdForIncarnation(String incarnationId) {
+            return incarnations.entrySet().stream().filter(entry -> entry.getValue().equals(incarnationId))
+                    .map(Map.Entry::getKey).findFirst();
         }
     }
 

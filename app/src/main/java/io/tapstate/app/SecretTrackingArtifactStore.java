@@ -151,6 +151,11 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
     }
 
     @Override
+    public Optional<String> pipelineIdForIncarnation(String incarnationId) {
+        return delegate.pipelineIdForIncarnation(incarnationId);
+    }
+
+    @Override
     public Optional<HistoryOwner> pipelineHistoryOwner(String pipelineId) {
         return delegate.pipelineHistoryOwner(pipelineId);
     }

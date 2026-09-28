@@ -42,11 +42,13 @@ public enum SystemCollections {
      * workspace to keep a fraction of them.
      */
     ARTIFACTS(MongoStorePort.ARTIFACTS, Database.STORE, MongoArtifactStore.class, Strategy.MIGRATED, 0,
-            new IndexSpec(List.of("kind"), false)),
+            new IndexSpec(List.of("kind"), false),
+            new IndexSpec(List.of("pipelineIncarnationId"), false)),
     PIPELINE_STATE(MongoStorePort.PIPELINE_STATE, Database.STORE, MongoStateStore.class, Strategy.MIGRATED, 0),
     PIPELINE_DESIRED(MongoStorePort.PIPELINE_DESIRED, Database.STORE, MongoDesiredStore.class, Strategy.MIGRATED, 0),
     PIPELINE_OBSERVATION(
-            MongoStorePort.PIPELINE_OBSERVATION, Database.STORE, MongoObservationStore.class, Strategy.MIGRATED, 0),
+            MongoStorePort.PIPELINE_OBSERVATION, Database.STORE, MongoObservationStore.class, Strategy.MIGRATED, 0,
+            new IndexSpec(List.of("pending.publishUntil", "_id"), false)),
     WORKLOAD_CLAIMS(
             MongoStorePort.WORKLOAD_CLAIMS, Database.STORE, MongoWorkloadClaimStore.class,
             Strategy.OWNED_ELSEWHERE, 0),
@@ -166,6 +168,13 @@ public enum SystemCollections {
             MongoHistoryRollupStore.class, Strategy.MIGRATED, 13,
             new IndexSpec(List.of("bucketStart"), false, MongoHistoryRollupStore.DEFAULT_RETENTION.toSeconds()),
             new IndexSpec(List.of("pipelineId", "scopeKey", "resolution", "bucketStart"), false)),
+
+    PIPELINE_OBSERVATION_CHUNKS(
+            MongoStorePort.PIPELINE_OBSERVATION_CHUNKS, Database.STORE, MongoObservationStore.class,
+            Strategy.MIGRATED, 14,
+            new IndexSpec(List.of("manifestKey", "publicationToken", "ordinal"), true),
+            new IndexSpec(List.of("state", "_id"), false),
+            new IndexSpec(List.of("state", "deleteAfter", "_id"), false)),
 
     // ---- the operator-state database: not versioned here, but still taken from here ----
 

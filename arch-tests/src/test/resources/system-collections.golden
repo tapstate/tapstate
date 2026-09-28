@@ -1,8 +1,8 @@
 # collection | database | owner | strategy | introducedIn | indexes
-artifacts | store | MongoArtifactStore | migrated | 0 | kind
+artifacts | store | MongoArtifactStore | migrated | 0 | kind, pipelineIncarnationId
 pipeline_state | store | MongoStateStore | migrated | 0 | -
 pipeline_desired | store | MongoDesiredStore | migrated | 0 | -
-pipeline_observation | store | MongoObservationStore | migrated | 0 | -
+pipeline_observation | store | MongoObservationStore | migrated | 0 | pending.publishUntil+_id
 workload_claims | store | MongoWorkloadClaimStore | owned-elsewhere | 0 | -
 cluster_membership | store | MongoClusterMembershipStore | owned-elsewhere | 0 | -
 connections | store | MongoCatalogStore | migrated | 0 | -
@@ -25,5 +25,6 @@ pipeline_rate_history | store | MongoRateHistoryStore | migrated | 9 | observedA
 srs_consumer_offsets | store | MongoSrsMetaStore | migrated | 10 | miningChainId, pipelineId
 pipeline_events | store | MongoPipelineEventStore | migrated | 12 | occurredAt (ttl 1296000s), pipelineId+pipelineIncarnationId+occurredAt+_id
 pipeline_history_rollups | store | MongoHistoryRollupStore | migrated | 13 | bucketStart (ttl 1296000s), pipelineId+scopeKey+resolution+bucketStart
+pipeline_observation_chunks | store | MongoObservationStore | migrated | 14 | manifestKey+publicationToken+ordinal (unique), state+_id, state+deleteAfter+_id
 operator_state | nest | MongoKeyedStateStore | nest-excluded | 0 | -
 nest_dead_letters | nest | MongoNestDeadLetterStore | nest-excluded | 0 | -

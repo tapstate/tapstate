@@ -84,7 +84,8 @@ class MongoObservationJanitorIT {
                 assertThat(projection.keySet()).containsExactlyInAnyOrder(
                         "_id", "pipelineIncarnationId", "executionGeneration", "observedAt");
             }
-            assertThat(finds.get(0).getDocument("filter")).isEmpty();
+            assertThat(finds.get(0).getDocument("filter").getDocument("_id")
+                    .getString("$type").getValue()).isEqualTo("string");
             assertThat(finds.get(1).getDocument("filter").getDocument("_id")
                     .getString("$gt").getValue()).isEqualTo("b");
         }

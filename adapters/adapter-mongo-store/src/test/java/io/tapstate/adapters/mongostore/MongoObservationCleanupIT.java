@@ -29,8 +29,9 @@ class MongoObservationCleanupIT {
         try (MongoClient client = MongoClients.create(MONGO.getReplicaSetUrl())) {
             MongoDatabase database = client.getDatabase("observation_cleanup_it");
             database.drop();
-            MongoObservationStore store = new MongoObservationStore(
-                    database.getCollection(MongoStorePort.PIPELINE_OBSERVATION));
+            MongoObservationStore store = new MongoObservationStore(client,
+                    database.getCollection(MongoStorePort.PIPELINE_OBSERVATION),
+                    database.getCollection(MongoStorePort.PIPELINE_OBSERVATION_CHUNKS));
             ObservationStore.Scope old = new ObservationStore.Scope("inc-old", 41);
             ObservationStore.Scope current = new ObservationStore.Scope("inc-new", 42);
 

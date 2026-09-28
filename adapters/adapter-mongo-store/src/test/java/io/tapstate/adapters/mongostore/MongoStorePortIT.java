@@ -116,7 +116,7 @@ class MongoStorePortIT {
     }
 
     @Test
-    void scopedLatestRejectsDelayedExecutionsAndKeepsOneDocument() {
+    void scopedLatestRejectsDelayedExecutionsAndKeepsOneLogicalCurrent() {
         String uri = REPLICA_SET.getReplicaSetUrl();
         MongoConnectionSettings settings = new MongoConnectionSettings(uri, null, Duration.ofSeconds(5));
         try (MongoConnection connection = new MongoConnection(settings)) {
@@ -148,7 +148,7 @@ class MongoStorePortIT {
             String databaseName = new ConnectionString(uri).getDatabase();
             try (MongoClient raw = MongoClients.create(uri)) {
                 assertThat(raw.getDatabase(databaseName)
-                        .getCollection(MongoStorePort.PIPELINE_OBSERVATION).countDocuments()).isEqualTo(1);
+                        .getCollection(MongoStorePort.PIPELINE_OBSERVATION).countDocuments()).isEqualTo(2);
             }
         }
     }
@@ -214,7 +214,7 @@ class MongoStorePortIT {
                 assertThat(database.getCollection(MongoStorePort.ARTIFACTS).countDocuments()).isEqualTo(1);
                 assertThat(database.getCollection(MongoStorePort.PIPELINE_STATE).countDocuments()).isEqualTo(1);
                 assertThat(database.getCollection(MongoStorePort.PIPELINE_DESIRED).countDocuments()).isEqualTo(1);
-                assertThat(database.getCollection(MongoStorePort.PIPELINE_OBSERVATION).countDocuments()).isEqualTo(1);
+                assertThat(database.getCollection(MongoStorePort.PIPELINE_OBSERVATION).countDocuments()).isEqualTo(2);
                 assertThat(database.getCollection(MongoStorePort.PIPELINE_LAYOUTS).countDocuments()).isEqualTo(1);
                 assertThat(database.getCollection(MongoStorePort.CONNECTIONS).countDocuments()).isEqualTo(1);
                 // Two, not one: a discovery is an envelope naming the generation plus a document per table it

@@ -26,6 +26,6 @@ public record ObservationFailure(String code, Map<String, String> params) {
         Objects.requireNonNull(code, "code");
         // A code with no arguments is normal; null reads as empty, and the copy makes the stored
         // projection immutable.
-        params = params == null ? Map.of() : Map.copyOf(params);
+        params = ObservationMaps.copyOf(params);
     }
 }

@@ -155,6 +155,7 @@ class MongoArtifactStoreIT {
                         assertThat(row.contentHash()).isEqualTo(hash);
                     });
             assertThat(store.pipelineIncarnationId(pipeline.id())).contains(incarnation);
+            assertThat(store.pipelineIdForIncarnation(incarnation)).contains(pipeline.id());
             assertThat(store.ensurePipelineIncarnationId(source.id(), "unused")).isEmpty();
         });
     }
