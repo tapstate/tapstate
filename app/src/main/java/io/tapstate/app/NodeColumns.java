@@ -554,8 +554,22 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
                         out.put(output, JoinSchemaDrift.declaredType(literalType(literal.value()), false));
                 // Nullable, always: an expression over a column that may be absent may itself yield
                 // nothing, and no part of the expression language says otherwise.
-                case FieldRule.Computed computed -> out.put(output, JoinSchemaDrift.declaredType(
-                        RowExpressions.typedValueType(computed.celExpr(), upstreamTypes), true));
+                case FieldRule.Computed computed -> {
+                    out.put(output, JoinSchemaDrift.declaredType(
+                            RowExpressions.typedValueType(computed.celExpr(), upstreamTypes), true));
+                    // An expression that only reads one column hands on that column's own value, so
+                    // it keeps what a rename keeps. Without it a moved decimal has no precision, scale
+                    // or range, and a target cannot build the column the value is written to.
+                    String moved = RowExpressions.movedColumn(computed.celExpr());
+                    if (moved != null && upstream.columns().containsKey(moved)) {
+                        if (upstream.stringTypes().containsKey(moved)) {
+                            strings.put(output, upstream.stringTypes().get(moved));
+                        }
+                        if (upstream.numericTypes().containsKey(moved)) {
+                            numbers.put(output, upstream.numericTypes().get(moved));
+                        }
+                    }
+                }
             }
         });
         upstream.columns().forEach((name, type) -> {

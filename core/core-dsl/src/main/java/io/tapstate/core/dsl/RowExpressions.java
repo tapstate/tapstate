@@ -155,6 +155,33 @@ public final class RowExpressions {
     }
 
     /**
+     * The row column {@code expr} does nothing but read - {@code amount} for {@code after.amount} or
+     * {@code before.amount} - or {@code null} when it does anything more.
+     *
+     * <p>Such a value is that column's own value under another name, so whatever was declared about the
+     * column still describes it: for a decimal, the precision, scale and range a target needs before it
+     * can build the column at all. Anything beyond the read - arithmetic, a function, a presence test -
+     * produces a value nothing was declared about. An expression that does not compile answers
+     * {@code null} as well, since it cannot be shown to read anything.
+     */
+    public static String movedColumn(String expr) {
+        CelValidationResult result = VALUE.compile(expr);
+        if (result.hasError()) {
+            return null;
+        }
+        CelExpr root = checked(result).getExpr();
+        if (root.getKind() != CelExpr.ExprKind.Kind.SELECT || root.select().testOnly()) {
+            return null;
+        }
+        CelExpr operand = root.select().operand();
+        if (operand.getKind() != CelExpr.ExprKind.Kind.IDENT) {
+            return null;
+        }
+        String image = operand.ident().name();
+        return image.equals("after") || image.equals("before") ? root.select().field() : null;
+    }
+
+    /**
      * Checks a predicate against the row columns' resolved types; returns the diagnostic, or
      * {@code null} when it compiles to {@code bool}. {@code columns} maps a column name to what the
      * source resolved it to; a column the map omits stays {@code dyn}.
