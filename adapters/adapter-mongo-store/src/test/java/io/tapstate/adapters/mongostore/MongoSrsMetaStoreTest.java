@@ -200,6 +200,16 @@ class MongoSrsMetaStoreTest {
     }
 
     @Test
+    void consumerArrivalPublishesTheResumePointAndHeadroomCursorInOneUpdate() {
+        Document update = MongoSrsMetaStore.consumerArrivalUpdate("orders", 42L);
+
+        assertThat(update).containsOnlyKeys("$max");
+        assertThat(update.get("$max", Document.class)).containsExactly(
+                Map.entry("perTableRingDone.orders", 42L),
+                Map.entry("perTableSeq.orders", 42L));
+    }
+
+    @Test
     void sinkAckedUpdateTargetsOnlyThatConsumersAckPathNotThePerTableCursor() {
         // The sink's ack advance is a path-scoped $set: it touches only that consumer's acked position, so a
         // sink advancing it never clobbers the per-table read cursor the reader writes to the same consumer

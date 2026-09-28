@@ -361,6 +361,9 @@ class MongoSrsMetaStoreIT {
 
             assertThat(store.ringDoneThrough(CHAIN, "p1"))
                     .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 3L, "items", 20L));
+            assertThat(onlyConsumer(store).perTableSeq())
+                    .as("the first arrival registers the table in the same consumer update")
+                    .containsEntry("items", 20L);
         });
     }
 

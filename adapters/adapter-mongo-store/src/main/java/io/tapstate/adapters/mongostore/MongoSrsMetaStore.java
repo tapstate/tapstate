@@ -297,14 +297,23 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     @Override
     public void startRingAfter(String miningChainId, String pipelineId, String table, long seq) {
         Objects.requireNonNull(table, "table");
-        // Read, then write only when there is nothing: a pipeline arrives on a ring from one member at a
-        // time, so nothing races this, and a raise here over a place the pipeline already has would carry it
+        // Read, then write only when there is no arrival yet: a pipeline arrives on a ring from one member
+        // at a time, so nothing races this, and a raise over a place the pipeline already has would carry it
         // past changes it has not received.
         if (ringDoneThrough(miningChainId, pipelineId).containsKey(table)) {
             return;
         }
-        updateConsumer(miningChainId, pipelineId,
-                new Document("$max", new Document(PER_TABLE_RING_DONE + "." + table, seq)));
+        // The completed place and the read cursor are one arrival fact. Publishing only the former leaves
+        // the consumer absent from the write-side headroom minimum until a later registration write lands;
+        // enough concurrent changes can then overwrite the first changes written after this arrival.
+        updateConsumer(miningChainId, pipelineId, consumerArrivalUpdate(table, seq));
+    }
+
+    /** The one update that publishes both halves of a consumer's first arrival on a table ring. */
+    static Document consumerArrivalUpdate(String table, long seq) {
+        Objects.requireNonNull(table, "table");
+        return new Document("$max", new Document(PER_TABLE_RING_DONE + "." + table, seq)
+                .append("perTableSeq." + table, seq));
     }
 
     @Override

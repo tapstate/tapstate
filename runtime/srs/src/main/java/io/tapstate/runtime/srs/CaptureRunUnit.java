@@ -148,8 +148,8 @@ public final class CaptureRunUnit {
      * the load -- and then starting the tail -- on a thread of the run's own.
      *
      * <p>Everything a job assembled from this run reads is done before this returns, in the order
-     * {@link #start} does it: the chain and its generation, where this pipeline arrives on each ring, its
-     * membership of the chain, and the seam its load began at. Only the rows are left, and the rows are what
+     * {@link #start} does it: the chain and its generation, its membership of the chain, where this pipeline
+     * arrives on each ring, and the seam its load began at. Only the rows are left, and the rows are what
      * a large load cannot afford to read before the job that takes them is running: they go into a hand-off
      * that holds a few thousand of them, and it is the job that makes room. Read here, they would fill it
      * and wait for a job nobody can submit until this returns.
@@ -172,12 +172,11 @@ public final class CaptureRunUnit {
         OpenState state = new OpenState();
         try {
             provisionChain(spec, plan, startTail, state);
-            markPipelineArrival(spec, plan, tables, state.chainId);
-
             // Opened before the load, not with the tail: the load's rows are this run's too, and an
             // account opened after them would report a run that had read nothing until its first change.
             CaptureHealth health = new CaptureHealth();
             attachConsumer(spec, plan, startTail, tables, state);
+            markPipelineArrival(spec, plan, tables, state.chainId);
             Optional<StreamSource<SrsItem>> ringSource = ringSource(spec, plan, tables, state.chainId);
             state.load = openLoad(spec, plan, tables, state.chainId, state.epoch);
             // The seam this run's own load began at, for the tail that follows it -- null when no load ran
@@ -257,8 +256,10 @@ public final class CaptureRunUnit {
         if (plan.sharedRing()) {
             coordinator.attachConsumer(state.chainId, spec.pipelineId());
             state.consumerAttached = true;
-            // A selected table protects its ring before the reader's first progress report. Raising
-            // the floor to -1 also leaves an already advanced cursor where a returning run left it.
+            // A selected table protects its ring before arrival is sampled. If a writer gets there first,
+            // the later sample moves arrival past what it wrote; once this registration lands, the writer
+            // is constrained until that sample and its cursor are published together. Raising the floor
+            // to -1 also leaves an already advanced cursor where a returning run left it.
             registerConsumerTables(state.chainId.value(), spec.pipelineId(), tables);
         } else if (plan.directTail() && startTail) {
             coordinator.attachConsumer(

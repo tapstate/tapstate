@@ -160,6 +160,11 @@ public interface SrsMetaStore {
      * Records that a pipeline arriving on {@code table}'s change ring starts just past {@code seq} -- where
      * the ring stood as it arrived -- unless the pipeline already has a place in that ring, which it keeps:
      * a run coming back carries on from where it was, not from wherever the ring has got to since.
+     * A newly recorded arrival also registers the table in that consumer's {@code perTableSeq}, at the
+     * same sequence and in the same atomic write. The arrival says the consumer owes nothing through that
+     * sequence, so those changes must not pin write headroom; publishing the arrival without the cursor,
+     * however, leaves a gap in which the write path mistakes the consumer for one that does not subscribe
+     * to the table and may overwrite changes written after it arrived.
      *
      * <p>The mark is taken before the pipeline's own load reads anything and before any tail this run opens
      * has mined anything, so every change the pipeline is owed lands above it, and everything below it is
