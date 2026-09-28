@@ -1,15 +1,20 @@
 package io.tapstate.runtime.engine;
 
+import com.hazelcast.cluster.Address;
+import com.hazelcast.cluster.Cluster;
 import com.hazelcast.config.Config;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.jet.Job;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.DAG;
+import com.hazelcast.jet.core.Outbox;
+import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.metrics.Measurement;
 import com.hazelcast.jet.core.metrics.MetricTags;
+import com.hazelcast.jet.core.test.TestProcessorContext;
 import io.tapstate.core.lifecycle.StateStoreCostReading;
 import io.tapstate.runtime.engine.StateStoreCostMetricNames.Kind;
 import io.tapstate.runtime.engine.join.JoinMaps;
@@ -17,10 +22,12 @@ import io.tapstate.runtime.engine.join.JoinStateMapStoreFactory;
 import io.tapstate.runtime.engine.nest.HeapKeyedStateStore;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Proxy;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
@@ -34,6 +41,32 @@ class StateStoreCostBridgeTest {
     private static final String NAMESPACE = JoinMaps.factMirror("orders", "widen");
     private static final AtomicInteger NEXT_PORT = new AtomicInteger(
             20_000 + 2 * new java.util.Random().nextInt(1_000));
+
+    @Test
+    void unwiredMetricSetupCompletesWithoutEmittingOrLoadingBusinessData() throws Exception {
+        Cluster cluster = onlyReturns(Cluster.class, Map.of("getMembers", Set.of()));
+        HazelcastInstance member = onlyReturns(HazelcastInstance.class, Map.of(
+                "getCluster", cluster, "getUserContext", new ConcurrentHashMap<String, Object>()));
+        var context = new TestProcessorContext().setHazelcastInstance(member);
+        Address address = new Address("127.0.0.1", 5701);
+        var supplier = StateStoreCostBridge.metaSupplier(Set.of(NAMESPACE)).get(List.of(address)).apply(address);
+        Processor setup = supplier.get(1).iterator().next();
+        Outbox outbox = onlyReturns(Outbox.class, Map.of("bucketCount", 1, "hasUnfinishedItem", false));
+        setup.init(outbox, context);
+
+        assertThat(setup.complete()).as("metric setup must not remain as a polling tasklet").isTrue();
+        assertThat(StateStoreCostStats.of(member).reading(NAMESPACE)).isEmpty();
+    }
+
+    /** Every undeclared call, including a business map access or an outbox offer, fails the witness. */
+    private static <T> T onlyReturns(Class<T> type, Map<String, ?> answers) {
+        return type.cast(Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[] {type}, (proxy, method, arguments) -> {
+            if (answers.containsKey(method.getName())) {
+                return answers.get(method.getName());
+            }
+            throw new AssertionError("unwired metric setup unexpectedly called " + type.getSimpleName() + "." + method.getName());
+        }));
+    }
 
     @Test
     void remoteColdStoreWorkRemainsInJobMetricsAfterBridgeCompletionAndResetsForTheNextJob()

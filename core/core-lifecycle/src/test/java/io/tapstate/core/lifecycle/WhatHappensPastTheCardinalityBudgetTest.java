@@ -88,6 +88,8 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.stage.queue.depth",
                         "tapstate.pipeline.stage.queue.capacity",
                         "tapstate.pipeline.stage.queue.high_water",
+                        "tapstate.pipeline.stage.output.refused",
+                        "tapstate.pipeline.stage.output.retry.duration",
                         "tapstate.pipeline.queue.depth",
                         "tapstate.pipeline.queue.capacity",
                         "tapstate.pipeline.queue.high_water",
@@ -194,6 +196,8 @@ class WhatHappensPastTheCardinalityBudgetTest {
         assertThat(CardinalityBudget.STAGE_QUEUE_DEPTH.distinctValues()).isEqualTo(5);
         assertThat(CardinalityBudget.STAGE_QUEUE_CAPACITY.distinctValues()).isEqualTo(5);
         assertThat(CardinalityBudget.STAGE_QUEUE_HIGH_WATER.distinctValues()).isEqualTo(5);
+        assertThat(CardinalityBudget.STAGE_OUTPUT_REFUSED.distinctValues()).isEqualTo(5);
+        assertThat(CardinalityBudget.STAGE_OUTPUT_RETRY_DURATION.distinctValues()).isEqualTo(5);
         for (CardinalityBudget budget : List.of(CardinalityBudget.SINK_BATCH_ISSUED,
                 CardinalityBudget.SINK_BATCH_RECORDS, CardinalityBudget.SINK_BATCH_RECORDS_MAX,
                 CardinalityBudget.SINK_BATCH_PENDING, CardinalityBudget.SINK_BATCH_LIMIT,

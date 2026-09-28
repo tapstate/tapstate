@@ -128,11 +128,11 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
         Objects.requireNonNull(vertexName, "vertexName");
         Objects.requireNonNull(portFactory, "portFactory");
         SupplierEx<Processor> supplier = axes == null
-                ? () -> new TransformProcessor(portFactory.get())
+                ? () -> StageOutputPressureProcessor.wrap(new TransformProcessor(portFactory.get()))
                 // Holding nothing back is the whole of this level's own contribution: what it may promise
                 // is exactly the lowest of what its edges promised.
-                : () -> new TransformProcessor(portFactory.get(),
-                        new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING));
+                : () -> StageOutputPressureProcessor.wrap(new TransformProcessor(portFactory.get(),
+                        new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING)));
         return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier), vertexName);
     }
 

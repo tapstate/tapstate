@@ -15,6 +15,7 @@ import io.tapstate.core.sql.JoinPlan;
 import io.tapstate.core.sql.JoinTree;
 import io.tapstate.runtime.engine.PassthroughProcessor;
 import io.tapstate.runtime.engine.StageWorkDag;
+import io.tapstate.runtime.engine.StageOutputPressureProcessor;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.runtime.engine.SettledPositions;
 import io.tapstate.runtime.engine.ChainAxes;
@@ -307,12 +308,12 @@ public final class JoinDag {
         public Collection<? extends Processor> get(int count) {
             List<Processor> processors = new ArrayList<>(count);
             for (int i = 0; i < count; i++) {
-                processors.add(projection
+                processors.add(StageOutputPressureProcessor.wrap(projection
                         ? new JoinProjectionProcessor(
                                 new JoinProjection(plan, factKeyColumns, stepId, stores), axes, allChains)
                         : new JoinProcessor(new JoinDriver(plan, factKeyColumns, stepId, stores,
                                 JoinDriver.DEFAULT_KEYS_PER_READ, gauge, dimensionRowKeyColumns,
-                                boundDisplaced), sourceByOrdinal, axes, chainsByOrdinal));
+                                boundDisplaced), sourceByOrdinal, axes, chainsByOrdinal)));
             }
             return processors;
         }

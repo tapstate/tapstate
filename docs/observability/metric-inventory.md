@@ -45,6 +45,8 @@ records. An overflow point preserves the instrument's aggregate and has `otel.me
 | `tapstate.pipeline.work.active` | G / `{work}` | Total active business slots only after every expected staged vertex is represented in the same execution collection | None: 1 | Distinguish synchronous stage work from pending asynchronous target batches |
 | `tapstate.pipeline.queue.depth`, `tapstate.pipeline.queue.capacity`, `tapstate.pipeline.queue.high_water` | G / `{item}` | Paired built-in Jet input queue size/capacity for the current job; high-water is the highest collected sample | None: 1 each; highest-value high-water overflow | Compare sampled depth with capacity and sink pending limits |
 | `tapstate.pipeline.stage.queue.depth`, `tapstate.pipeline.stage.queue.capacity`, `tapstate.pipeline.stage.queue.high_water` | G / `{item}` | Complete same-collection business-processor input queues summed by stage; peak is the highest collected stage sum in this job/execution | Fixed `stage`: 5 each; added depth/capacity, highest-value high-water overflow | Compare the stage's input occupancy with active work, duration, and downstream sink pending limits |
+| `tapstate.pipeline.stage.output.refused` | C / `{offer}` | Actual ordinary data, frontier, control, or watermark outbox offers returning false; starts with the current stage's processor accounts | Fixed `stage`: 5 | Compare refusals with stage input queues and downstream sink pending limits; quota yields also count |
+| `tapstate.pipeline.stage.output.retry.duration` | H / `s` | First refused ordinary offer to the next accepted ordinary offer on that processor; only completed intervals | Fixed `stage`: 5; registered process-duration buckets | Compare completed retry time with refusals and delivery latency; the interval includes scheduling, backoff, and blocking waits |
 | `tapstate.pipeline.sink.batch.issued` | C / `{batch}` | Actual batch handoff, not completion | None: 1 | Compare with completed output and pending batches |
 | `tapstate.pipeline.sink.batch.records` | C / `{record}` | Records handed to issued batches | None: 1 | Compare batch size and durable output |
 | `tapstate.pipeline.sink.batch.records.max` | G / `{record}` | Largest issued batch in this job | None: 1; highest-value overflow | Check whether batching reaches the configured size |
@@ -71,6 +73,17 @@ occupancy has been observed; a later empty queue can report measured depth zero 
 sampled peak. Cancelled, superseded, missing, or older same-scope collections cannot restore old peaks.
 Each point keeps the actual stage collection time. These are input queues of declared business
 processors; pass-through framework queues can remain part of the separate pipeline total.
+
+Output refusals and retry intervals cover owned source, transform, join, and nest processors. The sink's
+pending-batch and backpressure facts retain their separate boundary. Each actual outbox offer is observed:
+a flat-map retry that accepts an earlier item and refuses a later one closes one interval and opens
+another. Repeated refusals do not restart an open interval. Snapshot persistence offers are excluded;
+cancellation discards an unfinished interval instead of reporting a successful retry. Histogram sum,
+count, and all buckets come from one processor snapshot, and pipeline stage totals require the complete
+current execution's business-processor collection. Quiet or incomplete output accounts are absent,
+without hiding independently measured active work or queues. After a refusal, its measured counter can
+appear before any retry completes. These facts cannot distinguish a full downstream queue from Jet's
+callback quota or scheduler delay, and they do not measure executor saturation.
 
 ## Process facts
 

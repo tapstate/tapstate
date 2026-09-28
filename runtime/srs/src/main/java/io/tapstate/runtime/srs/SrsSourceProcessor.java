@@ -5,6 +5,7 @@ import com.hazelcast.internal.metrics.MetricDescriptor;
 import com.hazelcast.internal.metrics.MetricsCollectionContext;
 
 import io.tapstate.runtime.engine.StageTimer;
+import io.tapstate.runtime.engine.StageOutputPressureProcessor;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Processor;
@@ -487,9 +488,9 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         if (epoch < 0) {
             throw new IllegalArgumentException("a ring generation is never negative, got " + epoch);
         }
-        SupplierEx<Processor> supplier = () -> new SrsSourceProcessor(
+        SupplierEx<Processor> supplier = () -> StageOutputPressureProcessor.wrap(new SrsSourceProcessor(
                 pipelineId, ringName, src, epoch, stamp,
-                new RingTail(start, resumeAfter, publisherFactory), snapshotToken);
+                new RingTail(start, resumeAfter, publisherFactory), snapshotToken));
         return placement.place(ProcessorSupplier.of(supplier));
     }
 
@@ -517,7 +518,8 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             throw new IllegalArgumentException("a snapshot generation is never negative, got " + epoch);
         }
         SupplierEx<Processor> supplier =
-                () -> new SrsSourceProcessor(pipelineId, ringName, src, epoch, stamp, null, snapshotToken);
+                () -> StageOutputPressureProcessor.wrap(
+                        new SrsSourceProcessor(pipelineId, ringName, src, epoch, stamp, null, snapshotToken));
         return placement.place(ProcessorSupplier.of(supplier));
     }
 

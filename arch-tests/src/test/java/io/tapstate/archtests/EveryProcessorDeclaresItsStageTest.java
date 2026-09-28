@@ -1,6 +1,7 @@
 package io.tapstate.archtests;
 
 import com.hazelcast.jet.core.Processor;
+import com.hazelcast.jet.impl.processor.ProcessorWrapper;
 import com.tngtech.archunit.core.domain.JavaClass;
 import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.domain.JavaModifier;
@@ -38,6 +39,11 @@ class EveryProcessorDeclaresItsStageTest {
      * in it that a reader would want to see on its own.
      */
     private static final String PASSTHROUGH = "io.tapstate.runtime.engine.PassthroughProcessor";
+    /** Installs metric handles once and completes; it neither drains nor produces business data. */
+    private static final String COST_SETUP = "io.tapstate.runtime.engine.StateStoreCostBridge";
+    private static final Set<String> UNSTAGED = Set.of(PASSTHROUGH, COST_SETUP);
+    /** Decorates the existing business family and inherits its timed callbacks. */
+    private static final String OUTPUT_DECORATOR = "io.tapstate.runtime.engine.StageOutputPressureProcessor";
 
     private static JavaClasses tapstateClasses;
 
@@ -48,7 +54,7 @@ class EveryProcessorDeclaresItsStageTest {
                 .importPackages("io.tapstate");
     }
 
-    /** Every concrete processor the product wires into a graph. */
+    /** Every concrete processor, including topology and measurement setup vertices. */
     private static List<JavaClass> processors() {
         return tapstateClasses.stream()
                 .filter(candidate -> candidate.isAssignableTo(Processor.class))
@@ -58,19 +64,20 @@ class EveryProcessorDeclaresItsStageTest {
     }
 
     @Test
-    @DisplayName("every processor family the engine wires declares its stage, except the passthrough")
+    @DisplayName("every business processor declares its stage; topology and measurement setup stay unstaged")
     void everyProcessorDeclaresItsStage() {
         List<JavaClass> processors = processors();
 
-        assertThat(processors).extracting(JavaClass::getName).contains(PASSTHROUGH);
+        assertThat(processors).extracting(JavaClass::getName).containsAll(UNSTAGED);
         assertThat(processors)
-                .filteredOn(processor -> !processor.getName().equals(PASSTHROUGH))
+                .filteredOn(processor -> !UNSTAGED.contains(processor.getName()))
                 .allSatisfy(processor -> assertThat(processor.isAssignableTo(Staged.class))
                         .as("%s declares the stage its time is measured under", processor.getName())
                         .isTrue());
-        assertThat(tapstateClasses.get(PASSTHROUGH).isAssignableTo(Staged.class))
-                .as("a passthrough spends no time a reader would want to see on its own")
-                .isFalse();
+        assertThat(processors.stream().filter(processor -> !processor.isAssignableTo(Staged.class))
+                .map(JavaClass::getName).toList())
+                .as("only the explicit topology and one-time measurement setup vertices are unstaged")
+                .containsExactlyInAnyOrderElementsOf(UNSTAGED);
     }
 
     @Test
@@ -78,6 +85,7 @@ class EveryProcessorDeclaresItsStageTest {
     void everyStageIsRunBySomeFamily() {
         Set<String> declared = processors().stream()
                 .filter(processor -> processor.isAssignableTo(Staged.class))
+                .filter(processor -> !processor.getName().equals(OUTPUT_DECORATOR))
                 .map(EveryProcessorDeclaresItsStageTest::stageDeclaredBy)
                 .collect(Collectors.toSet());
 
@@ -99,10 +107,24 @@ class EveryProcessorDeclaresItsStageTest {
         // one handed to a flat-mapper is doing it correctly.
         assertThat(processors())
                 .filteredOn(processor -> processor.isAssignableTo(Staged.class))
+                .filteredOn(processor -> !processor.getName().equals(OUTPUT_DECORATOR))
                 .allSatisfy(processor -> assertThat(stageTimerCallsFrom(processor))
                         .as("%s obtains a stage timer and ends timed units of work with it",
                                 processor.getName())
                         .contains("of", "end"));
+    }
+
+    @Test
+    @DisplayName("the output decorator inherits business callbacks instead of creating untimed work")
+    void outputDecorationKeepsBusinessCallbacksInherited() {
+        JavaClass decorator = tapstateClasses.get(OUTPUT_DECORATOR);
+        assertThat(decorator.isAssignableTo(Staged.class)).isTrue();
+        assertThat(decorator.getRawSuperclass()).isPresent()
+                .get().satisfies(parent -> assertThat(parent.isEquivalentTo(ProcessorWrapper.class)).isTrue());
+        assertThat(decorator.getMethods()).extracting(method -> method.getName()).doesNotContain(
+                "process", "tryProcess", "tryProcessWatermark", "completeEdge", "complete",
+                "saveToSnapshot", "snapshotCommitPrepare", "snapshotCommitFinish",
+                "restoreFromSnapshot", "finishSnapshotRestore");
     }
 
     /** The stage-timer methods {@code processor} calls, anywhere in the class, its lambdas included. */

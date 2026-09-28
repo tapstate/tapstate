@@ -82,7 +82,7 @@ The current metrics response carries a flat numeric `metrics` map and typed `fac
 and each point's measurement time. A missing measurement means it was quiet or unavailable. Do not fill it
 with zero. When a per-table, code, chain, or namespace series exceeds its budget, an
 `otel.metric.overflow=true` point keeps the folded value; the dimension name is no longer available for
-that point. The exporter also applies a process-wide 10,000-series ceiling.
+that point. The exporter also applies a 10,000-series ceiling per instrument across the process.
 The complete types, units, attribute budgets, measurement boundaries, and absence rules are maintained
 in the [metric inventory](metric-inventory.md).
 
@@ -90,6 +90,7 @@ in the [metric inventory](metric-inventory.md).
 |---|---|
 | `tapstate.pipeline.queue.depth`, `.capacity`, `.high_water` | Compare depth with capacity, then inspect the stage durations and sink pending batches. High-water is the highest collected Jet sample, so a shorter peak between scrapes may not appear. |
 | `tapstate.pipeline.stage.queue.depth`, `.capacity`, `.high_water` | Compare the fixed stage's input queue with its active work and duration, then check downstream sink pending/limit. The sampled peak belongs to the current job/execution and resets on replacement; quiet queues stay absent until occupancy is observed. Missing or mismatched processor/member collections are unknown. Framework pass-through queues can still contribute to the separate pipeline total. |
+| `tapstate.pipeline.stage.output.refused` and `.retry.duration` | Compare actual refused offers and completed retry intervals with the stage's input queue, sink pending/limit, and delivery duration. Retry time includes callback quota, scheduler delay, backoff, and blocking waits; these facts alone cannot identify downstream-full pressure. Quiet or incomplete output accounts remain absent. |
 | `tapstate.pipeline.process.active` and `tapstate.pipeline.work.active` | Compare active business units with queue depth, stage duration, and sink pending batches. Both are gauges in `{work}`. The first has pipeline id and `stage=source/transform/nest/join/sink`; the pipeline total has only pipeline id and requires a complete reading from the current job/execution. Missing points remain unknown. These gauges do not measure CPU busy time or executor saturation. |
 | `tapstate.pipeline.sink.batch.pending`, `.limit`, `.write.duration`, and `tapstate.pipeline.sink.backpressure.duration` | A full pending limit with increasing write time points toward target delivery. Compare target-acknowledged `records.out` with issued batches; an issued batch is not an acknowledgement. |
 | `tapstate.pipeline.nest.cold_layer.over_threshold` and `nestStateColdLayerOverThreshold.<namespace>` | A measured value of 1 means at least 100 state accesses in the decision window and at least half served from the cold layer. Compare access/backfill deltas, in-memory entries, stored entries, and backfill time before changing state memory. A quiet window has no threshold fact; it is not a measured 0. |

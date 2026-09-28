@@ -66,6 +66,8 @@ public enum CardinalityBudget {
     STAGE_QUEUE_DEPTH("tapstate.pipeline.stage.queue.depth", null, Stage.values().length, Fold.ADDED),
     STAGE_QUEUE_CAPACITY("tapstate.pipeline.stage.queue.capacity", null, Stage.values().length, Fold.ADDED),
     STAGE_QUEUE_HIGH_WATER("tapstate.pipeline.stage.queue.high_water", null, Stage.values().length, Fold.HIGHEST),
+    STAGE_OUTPUT_REFUSED("tapstate.pipeline.stage.output.refused", null, Stage.values().length, Fold.ADDED),
+    STAGE_OUTPUT_RETRY_DURATION("tapstate.pipeline.stage.output.retry.duration", null, Stage.values().length, Fold.ADDED),
     /** Job queue readings have only the pipeline id; Jet vertex and processor tags are summed locally. */
     PIPELINE_QUEUE_DEPTH("tapstate.pipeline.queue.depth", null, 1, Fold.ADDED),
     PIPELINE_QUEUE_CAPACITY("tapstate.pipeline.queue.capacity", null, 1, Fold.ADDED),

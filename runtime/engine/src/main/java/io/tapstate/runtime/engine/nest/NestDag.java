@@ -12,6 +12,7 @@ import io.tapstate.runtime.engine.ChainAxes;
 import io.tapstate.runtime.engine.LevelBounds;
 import io.tapstate.runtime.engine.PassthroughProcessor;
 import io.tapstate.runtime.engine.StageWorkDag;
+import io.tapstate.runtime.engine.StageOutputPressureProcessor;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.runtime.engine.ReplayFloor;
 import io.tapstate.runtime.engine.ReplayFloorFactory;
@@ -388,9 +389,9 @@ public final class NestDag {
             for (int i = 0; i < count; i++) {
                 // A level's bounds are worked out per instance, so each processor gets its own: sharing
                 // one would combine what different partitions have seen into a single promise.
-                processors.add(new LookupProcessor(lookup, bound.forLookup(lookup),
+                processors.add(StageOutputPressureProcessor.wrap(new LookupProcessor(lookup, bound.forLookup(lookup),
                         bound.forReferences(lookup), referrersAllowed, axes == null ? null
-                                : new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING)));
+                                : new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING))));
             }
             return processors;
         }
@@ -506,12 +507,12 @@ public final class NestDag {
         public Collection<? extends Processor> get(int count) {
             List<Processor> processors = new ArrayList<>(count);
             for (int i = 0; i < count; i++) {
-                processors.add(spec.isAssembler()
+                processors.add(StageOutputPressureProcessor.wrap(spec.isAssembler()
                         ? new AssemblerProcessor(spec, slots, bound.forAssembler(spec), outputStream,
                                 axes, chainsByOrdinal, floor, settings, clock, sending,
                                 bound.forParking(spec), boundDeadLetter, referenced())
                         : new ResolverProcessor(spec, bound.forResolver(spec), boundDeadLetter, axes,
-                                chainsByOrdinal, floor, clock, settings, bound.forParking(spec)));
+                                chainsByOrdinal, floor, clock, settings, bound.forParking(spec))));
             }
             return processors;
         }

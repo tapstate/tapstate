@@ -24,6 +24,7 @@ import io.tapstate.core.lifecycle.StageReading;
 import io.tapstate.core.lifecycle.StageWorkReading;
 import io.tapstate.core.lifecycle.StageQueueReading;
 import io.tapstate.core.lifecycle.StageRuntimeReading;
+import io.tapstate.core.lifecycle.StageOutputReading;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.StateStoreCostReading;
 import io.tapstate.core.lifecycle.TableSnapshot;
@@ -1204,6 +1205,7 @@ public final class ObservationPublisher {
         if (runtime != null) {
             facts.addAll(activeWorkFacts(pipelineId, runtime.activeWork()));
             facts.addAll(stageQueueFacts(pipelineId, runtime.queues()));
+            facts.addAll(stageOutputFacts(pipelineId, runtime.output()));
         }
         sinkBatchFacts(pipelineId, at, sinkBatches.apply(pipelineId)).forEach(facts::add);
         queues.apply(pipelineId).ifPresent(reading -> queueFacts(pipelineId, at, reading).forEach(facts::add));
@@ -1246,6 +1248,37 @@ public final class ObservationPublisher {
                 new MetricFact("tapstate.pipeline.stage.queue.depth", MetricType.GAUGE, "{item}", depth),
                 new MetricFact("tapstate.pipeline.stage.queue.capacity", MetricType.GAUGE, "{item}", capacity),
                 new MetricFact("tapstate.pipeline.stage.queue.high_water", MetricType.GAUGE, "{item}", high));
+    }
+
+    static List<MetricFact> stageOutputFacts(String pipelineId, StageOutputReading output) {
+        if (output == null || output.byStage().isEmpty()) {
+            return List.of();
+        }
+        List<MetricPoint> refused = new ArrayList<>();
+        List<MetricPoint> retries = new ArrayList<>();
+        for (Stage kind : Stage.values()) {
+            String stage = kind.attributeValue();
+            StageOutputReading.Sample sample = output.byStage().get(stage);
+            if (sample == null) {
+                continue;
+            }
+            Map<String, String> attributes = Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, STAGE_ATTRIBUTE, stage);
+            if (sample.refused() > 0) {
+                refused.add(MetricPoint.accumulated(attributes, sample.countingSince(), sample.observedAt(), sample.refused()));
+            }
+            if (sample.retryDuration() != null) {
+                retries.add(MetricPoint.distribution(attributes, sample.countingSince(), sample.observedAt(), sample.retryDuration()));
+            }
+        }
+        List<MetricFact> facts = new ArrayList<>();
+        if (!refused.isEmpty()) {
+            facts.add(new MetricFact("tapstate.pipeline.stage.output.refused", MetricType.COUNTER, "{offer}", refused));
+        }
+        if (!retries.isEmpty()) {
+            facts.add(new MetricFact(HistogramBounds.STAGE_OUTPUT_RETRY_DURATION.instrument(),
+                    MetricType.HISTOGRAM, HistogramBounds.UNIT, retries));
+        }
+        return facts;
     }
 
     static List<MetricFact> stateCostFacts(String pipelineId, Instant at,

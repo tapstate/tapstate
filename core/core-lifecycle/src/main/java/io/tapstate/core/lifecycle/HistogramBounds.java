@@ -34,6 +34,9 @@ public enum HistogramBounds {
             0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
             5.0, 10.0)),
 
+    /** An observed ordinary-output refusal through the next successful retry, including quota and scheduling. */
+    STAGE_OUTPUT_RETRY_DURATION("tapstate.pipeline.stage.output.retry.duration", PROCESS_DURATION.bounds()),
+
     /** From handing one nonempty batch to the writer until its successful completion. */
     SINK_BATCH_WRITE_DURATION("tapstate.pipeline.sink.batch.write.duration", List.of(
             0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0)),

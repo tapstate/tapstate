@@ -17,6 +17,8 @@ import io.tapstate.core.lifecycle.QueueReading;
 import io.tapstate.core.lifecycle.StageWorkReading;
 import io.tapstate.core.lifecycle.StageQueueReading;
 import io.tapstate.core.lifecycle.StageRuntimeReading;
+import io.tapstate.core.lifecycle.StageOutputReading;
+import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
@@ -65,6 +67,39 @@ class AssemblyObservationPublisherTest {
         publisher.publish(PIPELINE);
         assertThat(store.observations().read(PIPELINE).orElseThrow().facts())
                 .noneMatch(fact -> fact.name().equals("tapstate.pipeline.work.active"));
+    }
+
+    @Test
+    void bindsCompleteOutputRetryFactsAndRetainsOtherStageFactsWhenOutputBecomesUnavailable() {
+        InMemoryStorePort store = new InMemoryStorePort(new InMemoryArtifactStore());
+        store.state().create(PIPELINE, StateJson.of(PipelineState.RUNNING), T0);
+        Engine engine = mock(Engine.class);
+        StageWorkReading work = new StageWorkReading(Map.of("transform", 1L), T0);
+        StageQueueReading queues = new StageQueueReading(Map.of("transform", new StageQueueReading.Sample(
+                new QueueReading(2, 16, 4), T0)));
+        var buckets = new java.util.ArrayList<>(java.util.Collections.nCopies(
+                HistogramBounds.STAGE_OUTPUT_RETRY_DURATION.buckets(), 0L));
+        buckets.set(0, 1L);
+        Instant since = T0.minusSeconds(30);
+        StageOutputReading output = new StageOutputReading(Map.of("transform", new StageOutputReading.Sample(
+                3, HistogramBounds.STAGE_OUTPUT_RETRY_DURATION.value(1, 0.0001, buckets), since, T0)));
+        when(engine.stageRuntimeReading(PIPELINE)).thenReturn(new StageRuntimeReading(work, queues, output));
+        ObservationPublisher publisher = new RuntimeConvergenceConfiguration()
+                .observationPublisher(store, engine, new NoOpCaptureCoordinator());
+        publisher.publish(PIPELINE);
+        assertThat(store.observations().read(PIPELINE).orElseThrow().facts())
+                .filteredOn(fact -> fact.name().startsWith("tapstate.pipeline.stage.output."))
+                .hasSize(2).allSatisfy(fact -> {
+                    assertThat(fact.points().getFirst().startTime()).isEqualTo(since);
+                    assertThat(fact.points().getFirst().observedAt()).isEqualTo(T0);
+                });
+        org.mockito.Mockito.verify(engine).stageRuntimeReading(PIPELINE);
+        when(engine.stageRuntimeReading(PIPELINE)).thenReturn(new StageRuntimeReading(work, queues));
+        publisher.publish(PIPELINE);
+        var facts = store.observations().read(PIPELINE).orElseThrow().facts();
+        assertThat(facts).noneMatch(fact -> fact.name().startsWith("tapstate.pipeline.stage.output."));
+        assertThat(facts).extracting(fact -> fact.name()).contains("tapstate.pipeline.work.active",
+                "tapstate.pipeline.stage.queue.depth", "tapstate.pipeline.stage.queue.high_water");
     }
 
     @Test

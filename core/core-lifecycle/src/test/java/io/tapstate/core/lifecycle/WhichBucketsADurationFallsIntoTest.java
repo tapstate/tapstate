@@ -56,11 +56,31 @@ class WhichBucketsADurationFallsIntoTest {
     }
 
     @Test
+    void completedOutputRetriesUseTheStageDurationBoundsAndSeconds() {
+        HistogramBounds bounds = HistogramBounds.STAGE_OUTPUT_RETRY_DURATION;
+        assertThat(bounds.instrument()).isEqualTo("tapstate.pipeline.stage.output.retry.duration");
+        assertThat(HistogramBounds.forInstrument(bounds.instrument())).contains(bounds);
+        assertThat(bounds.bounds()).containsExactly(
+                0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+                5.0, 10.0);
+        assertThat(bounds.buckets()).isEqualTo(17);
+        MetricFact fact = MetricFact.single(bounds.instrument(), MetricType.HISTOGRAM, HistogramBounds.UNIT,
+                MetricPoint.distribution(Map.of(MetricAttributes.PIPELINE_ID, "orders", MetricAttributes.STAGE, "transform"),
+                        STARTED, OBSERVED, observations(bounds, 1)));
+        assertThat(fact.unit()).isEqualTo("s");
+        assertThat(fact.points().getFirst().histogram().bucketCounts()).hasSize(17);
+        assertThatThrownBy(() -> MetricFact.single(bounds.instrument(), MetricType.HISTOGRAM, "ns",
+                MetricPoint.distribution(Map.of(), STARTED, OBSERVED, observations(bounds, 1))))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("own unit");
+    }
+
+    @Test
     @DisplayName("all registered histogram instruments have bounds in seconds")
     void onlyRegisteredHistogramInstrumentsHaveBounds() {
         assertThat(Arrays.stream(HistogramBounds.values()).map(HistogramBounds::instrument))
                 .containsExactlyInAnyOrder("tapstate.pipeline.record.delivery.duration",
                         "tapstate.pipeline.process.duration",
+                        "tapstate.pipeline.stage.output.retry.duration",
                         "tapstate.pipeline.sink.batch.write.duration",
                         "tapstate.pipeline.sink.backpressure.duration",
                         "tapstate.process.lifecycle.capacity.wait.duration",

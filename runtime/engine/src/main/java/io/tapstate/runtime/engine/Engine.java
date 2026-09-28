@@ -19,6 +19,7 @@ import io.tapstate.core.lifecycle.QueueReading;
 import io.tapstate.core.lifecycle.SinkBatchReading;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.StageReading;
+import io.tapstate.core.lifecycle.StageOutputReading;
 import io.tapstate.core.lifecycle.StageWorkReading;
 import io.tapstate.core.lifecycle.StageQueueReading;
 import io.tapstate.core.lifecycle.StageRuntimeReading;
@@ -616,7 +617,7 @@ public final class Engine {
         return stageRuntimeReading(pipelineId).activeWork();
     }
 
-    /** Shares one complete native collection between active work and stage queue projections. */
+    /** Shares one complete native collection between the stage runtime projections. */
     public StageRuntimeReading stageRuntimeReading(String pipelineId) {
         Job job = liveJob(pipelineId);
         if (job == null || job.getStatus() != JobStatus.RUNNING) {
@@ -647,19 +648,20 @@ public final class Engine {
             return StageRuntimeReading.NONE;
         }
         WorkSnapshot complete = snapshot.orElseThrow();
+        StageOutputReading output = outputPressureIn(collected, complete, job.getIdString(), members, now, maxAge);
         Optional<StageQueuesSample> queues = stageQueuesIn(collected, complete, job.getIdString(), members, now, maxAge);
         if (queues.isEmpty()) {
-            return new StageRuntimeReading(complete.work(), StageQueueReading.NONE);
+            return new StageRuntimeReading(complete.work(), StageQueueReading.NONE, output);
         }
         return stageQueueAccounts.accept(pipelineId, job.getId(), queues.orElseThrow(), ticket)
-                .map(reading -> new StageRuntimeReading(complete.work(), reading)).orElse(StageRuntimeReading.NONE);
+                .map(reading -> new StageRuntimeReading(complete.work(), reading, output)).orElse(StageRuntimeReading.NONE);
     }
 
     private record WorkProcessor(String member, String vertex, String processor) { }
 
     record WorkSnapshot(String executionId, long sampledAt, Map<String, Long> activeByStage,
             Map<WorkProcessor, String> business, Map<WorkProcessor, Measurement> capacity,
-            Set<WorkProcessor> nativeRoster) {
+            Set<WorkProcessor> nativeRoster, Map<String, Long> executionStarts) {
         StageWorkReading work() {
             Map<String, Long> active = new HashMap<>(activeByStage);
             active.values().removeIf(value -> value == 0);
@@ -826,6 +828,139 @@ public final class Engine {
         return Optional.of(new StageQueuesSample(snapshot.executionId(), snapshot.sampledAt(), output));
     }
 
+    /** Completed ordinary-output retries require the same complete business collection as native queues. */
+    static StageOutputReading outputPressureIn(JobMetrics collected, WorkSnapshot snapshot, String jobId,
+            Set<String> members, long now, long maxAge) {
+        Map<WorkProcessor, String> wrapped = new HashMap<>(snapshot.business());
+        wrapped.values().removeIf(Stage.SINK.attributeValue()::equals);
+        if (wrapped.isEmpty()) {
+            return StageOutputReading.NONE;
+        }
+        Set<String> vertices = wrapped.keySet().stream().map(WorkProcessor::vertex).collect(Collectors.toSet());
+        Map<WorkProcessor, OutputParts> parts = new HashMap<>();
+        for (String name : collected.metrics()) {
+            if (!name.startsWith("stage.") || !name.contains(".output.")) {
+                continue;
+            }
+            OutputPressureMetricNames.Part part = OutputPressureMetricNames.partOf(name);
+            for (Measurement reading : collected.get(name)) {
+                String vertex = reading.tag(MetricTags.VERTEX);
+                if (vertex == null) {
+                    return StageOutputReading.NONE;
+                }
+                if (!vertices.contains(vertex)) {
+                    continue;
+                }
+                WorkProcessor key = workProcessor(reading, jobId, snapshot.executionId(), members, now, Long.MAX_VALUE);
+                if (key == null || !snapshot.nativeRoster().contains(key)) {
+                    return StageOutputReading.NONE;
+                }
+                if (!wrapped.containsKey(key)) {
+                    continue;
+                }
+                if (part == null || !part.stage().equals(wrapped.get(key))
+                        || !"true".equals(reading.tag(MetricTags.USER))
+                        || !freshWorkReading(reading, now, maxAge)
+                        || reading.timestamp() != snapshot.capacity().get(key).timestamp()
+                        || reading.value() < 0
+                        || !parts.computeIfAbsent(key, ignored -> new OutputParts()).add(part, reading.value())) {
+                    return StageOutputReading.NONE;
+                }
+            }
+        }
+        if (!parts.keySet().equals(wrapped.keySet())) {
+            return StageOutputReading.NONE;
+        }
+        Map<String, OutputAggregate> totals = new HashMap<>();
+        try {
+            for (Map.Entry<WorkProcessor, String> entry : wrapped.entrySet()) {
+                WorkProcessor key = entry.getKey();
+                OutputParts tuple = parts.get(key);
+                long at = snapshot.capacity().get(key).timestamp();
+                if (!tuple.complete(at, snapshot.executionStarts().get(key.member()))) {
+                    return StageOutputReading.NONE;
+                }
+                totals.computeIfAbsent(entry.getValue(), ignored -> new OutputAggregate()).add(tuple, at);
+            }
+        } catch (ArithmeticException overflow) {
+            return StageOutputReading.NONE;
+        }
+        Map<String, StageOutputReading.Sample> output = new HashMap<>();
+        totals.forEach((stage, total) -> {
+            if (total.refused > 0) {
+                List<Long> buckets = new ArrayList<>(total.buckets.length);
+                for (long value : total.buckets) {
+                    buckets.add(value);
+                }
+                HistogramValue histogram = total.count == 0 ? null
+                        : HistogramBounds.STAGE_OUTPUT_RETRY_DURATION.value(total.count,
+                                total.sumNanos / 1_000_000_000.0, buckets);
+                output.put(stage, new StageOutputReading.Sample(total.refused, histogram,
+                        Instant.ofEpochMilli(total.since), Instant.ofEpochMilli(total.at)));
+            }
+        });
+        return output.isEmpty() ? StageOutputReading.NONE : new StageOutputReading(output);
+    }
+
+    private static final class OutputParts {
+        private final Map<OutputPressureMetricNames.Kind, Long> scalars = new EnumMap<>(OutputPressureMetricNames.Kind.class);
+        private final long[] buckets = new long[HistogramBounds.STAGE_OUTPUT_RETRY_DURATION.buckets()];
+        private final boolean[] seen = new boolean[buckets.length];
+        private int bucketCount;
+
+        boolean add(OutputPressureMetricNames.Part part, long value) {
+            if (part.kind() != OutputPressureMetricNames.Kind.BUCKET) {
+                return scalars.putIfAbsent(part.kind(), value) == null;
+            }
+            if (seen[part.bucket()]) {
+                return false;
+            }
+            seen[part.bucket()] = true;
+            buckets[part.bucket()] = value;
+            bucketCount++;
+            return true;
+        }
+
+        long value(OutputPressureMetricNames.Kind kind) {
+            return scalars.get(kind);
+        }
+
+        boolean complete(long at, long executionStart) {
+            if (scalars.size() != OutputPressureMetricNames.Kind.values().length - 1 || bucketCount != buckets.length) {
+                return false;
+            }
+            long count = value(OutputPressureMetricNames.Kind.COUNT);
+            long since = value(OutputPressureMetricNames.Kind.SINCE);
+            long total = 0;
+            for (long bucket : buckets) {
+                total = Math.addExact(total, bucket);
+            }
+            return value(OutputPressureMetricNames.Kind.READY) == 1 && since > 0 && since >= executionStart && since <= at
+                    && count <= value(OutputPressureMetricNames.Kind.REFUSED) && total == count
+                    && (count > 0 || value(OutputPressureMetricNames.Kind.SUM_NANOS) == 0);
+        }
+    }
+
+    private static final class OutputAggregate {
+        private long refused;
+        private long count;
+        private long sumNanos;
+        private long since = Long.MAX_VALUE;
+        private long at = Long.MAX_VALUE;
+        private final long[] buckets = new long[HistogramBounds.STAGE_OUTPUT_RETRY_DURATION.buckets()];
+
+        void add(OutputParts tuple, long sampledAt) {
+            refused = Math.addExact(refused, tuple.value(OutputPressureMetricNames.Kind.REFUSED));
+            count = Math.addExact(count, tuple.value(OutputPressureMetricNames.Kind.COUNT));
+            sumNanos = Math.addExact(sumNanos, tuple.value(OutputPressureMetricNames.Kind.SUM_NANOS));
+            since = Math.min(since, tuple.value(OutputPressureMetricNames.Kind.SINCE));
+            at = Math.min(at, sampledAt);
+            for (int index = 0; index < buckets.length; index++) {
+                buckets[index] = Math.addExact(buckets[index], tuple.buckets[index]);
+            }
+        }
+    }
+
     static StageWorkReading activeWorkIn(JobMetrics collected, String jobId, Map<String, String> expected,
             Set<String> members, long now, long maxAge) {
         return activeWorkIn(collected, jobId, expected, Set.of(), members, now, maxAge);
@@ -847,6 +982,7 @@ public final class Engine {
         String execution = null;
         Set<String> reportingMembers = new java.util.HashSet<>();
         Map<String, Long> collectionTimes = new HashMap<>();
+        Map<String, Long> executionStarts = new HashMap<>();
         for (Measurement reading : collected.get(MetricNames.EXECUTION_START_TIME)) {
             String source = reading.tag(MetricTags.MEMBER);
             String observedExecution = reading.tag(MetricTags.EXECUTION);
@@ -858,6 +994,7 @@ public final class Engine {
             }
             execution = observedExecution;
             collectionTimes.put(source, reading.timestamp());
+            executionStarts.put(source, reading.value());
         }
         if (execution == null) {
             return Optional.empty();
@@ -957,7 +1094,7 @@ public final class Engine {
             }
         }
         return Optional.of(new WorkSnapshot(execution, oldest, Map.copyOf(byStage),
-                Map.copyOf(business), Map.copyOf(businessCapacity), Set.copyOf(roster.keySet())));
+                Map.copyOf(business), Map.copyOf(businessCapacity), Set.copyOf(roster.keySet()), Map.copyOf(executionStarts)));
     }
 
     private static WorkProcessor workProcessor(Measurement reading, String job, String execution,
