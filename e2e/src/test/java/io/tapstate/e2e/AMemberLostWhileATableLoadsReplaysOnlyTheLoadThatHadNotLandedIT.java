@@ -33,7 +33,9 @@ import org.junit.jupiter.api.io.TempDir;
  * <p>The loading table's read is held until the landed table's load has landed, so the landed table cannot be
  * caught behind it; then a writer is held after writing one of the loading table's rows and before answering, and
  * the member that writer runs on is killed. How often each table was read is taken from the connector, which notes
- * every load it reads in a file of its process's own, so a read on the member that died is counted too.
+ * every load it reads in a file of its process's own, so a read on the member that died is counted too. The reads
+ * are counted from the kill on: a start that is retried before it, on a busy host, reads again a load that has not
+ * landed yet, as it should, and that is no part of what losing the member costs.
  *
  * <p>Each table is read by a source of its own. A source hands its tables' loads over once it has read all of them,
  * so two tables of one source are handed over together, and the read held on the loading table would hold the other
@@ -114,6 +116,8 @@ class AMemberLostWhileATableLoadsReplaysOnlyTheLoadThatHadNotLandedIT {
                 String victim = memberRunning(cluster, holder);
                 ControlPlane survivor = cluster.memberOtherThan(victim);
                 long generation = survivor.executionGenerationOf(PIPELINE).orElseThrow();
+                long landedReadsBefore = loadsRead(reads, LANDED);
+                long loadingReadsBefore = loadsRead(reads, LOADING);
                 cluster.processCarrying(victim).kill();
                 holds.releaseAfter(LOADING, HELD);
 
@@ -130,10 +134,10 @@ class AMemberLostWhileATableLoadsReplaysOnlyTheLoadThatHadNotLandedIT {
                 assertThat(survivor.state(PIPELINE)).contains(PipelineState.RUNNING);
                 assertThat(survivor.executionGenerationOf(PIPELINE).orElseThrow())
                         .as("the run that died was replaced").isGreaterThan(generation);
-                assertThat(loadsRead(reads, LANDED))
-                        .as("the table whose load had landed is not read again").isEqualTo(1);
-                assertThat(loadsRead(reads, LOADING))
-                        .as("the load that had not landed is read again, once").isEqualTo(2);
+                assertThat(loadsRead(reads, LANDED) - landedReadsBefore)
+                        .as("the table whose load had landed is not read again").isZero();
+                assertThat(loadsRead(reads, LOADING) - loadingReadsBefore)
+                        .as("the load that had not landed is read again, once").isEqualTo(1);
                 Await.until("both loads to read as landed", Duration.ofMinutes(1),
                         () -> landed(survivor, LANDED) && landed(survivor, LOADING),
                         () -> "the snapshot read says " + survivor.snapshotTables(PIPELINE));
