@@ -37,6 +37,17 @@ final class SourceReadProjection {
         return changed ? result.toString() : canonical;
     }
 
+    /**
+     * Whether a Source contains a display-only value that must never return to the truth layer.
+     * Config also has standalone secret markers; Mongo URI markers are sought in the complete
+     * canonical form because {@link #canonicalForRead(String)} projects that same complete form.
+     */
+    static boolean containsDisplayMarker(SourceResource source) {
+        Objects.requireNonNull(source, "source");
+        return containsDisplayMarker(source.config())
+                || containsRedactedMongoUri(new CanonicalWriter().write(source));
+    }
+
     static boolean containsDisplayMarker(Object value) {
         if (value instanceof String text) {
             return REDACTED.equals(text) || isRedactedUri(text);
@@ -49,6 +60,16 @@ final class SourceReadProjection {
                 if (containsDisplayMarker(item)) {
                     return true;
                 }
+            }
+        }
+        return false;
+    }
+
+    private static boolean containsRedactedMongoUri(String canonical) {
+        Matcher matcher = MONGO_URI.matcher(canonical);
+        while (matcher.find()) {
+            if (isRedactedUri(matcher.group())) {
+                return true;
             }
         }
         return false;
