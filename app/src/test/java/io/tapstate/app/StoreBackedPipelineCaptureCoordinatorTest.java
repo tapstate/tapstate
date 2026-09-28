@@ -454,6 +454,73 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     // ---- handle lifecycle ------------------------------------------------------------------------
 
     @Test
+    void fifteenPipelinesResumingOnePostgresBacklogOpenOneSharedCdcTail() {
+        List<String> tableNames = java.util.stream.IntStream.range(0, 27)
+                .mapToObj(index -> "table_" + index).toList();
+        SourceResource source = new SourceResource("shared_postgres", null, "postgres",
+                Map.of("host", "postgres"), SourceMode.CDC,
+                tableNames.stream().<TableRef>map(TableRef::literal).toList(), null, null);
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(source);
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        String chainId = SourceCaptureResolution.of(source).chainId().value();
+        store.meta().create(chainId, null);
+        store.meta().rewindSourceReadOffset(chainId, "before-backlog");
+        for (int index = 0; index < 15; index++) {
+            String pipelineId = "pipeline_" + index;
+            artifacts.save(pipelineWithReadMode(pipelineId, source.id(), ReadMode.SNAPSHOT_AND_CDC));
+            for (String table : tableNames) {
+                store.meta().markSnapshotComplete(chainId, pipelineId, table);
+            }
+        }
+
+        AtomicInteger liveTails = new AtomicInteger();
+        List<CaptureStart> starts = new ArrayList<>();
+        CapturePort port = new CapturePort() {
+            @Override
+            public CaptureBatch snapshot(CaptureConfig config) {
+                throw new AssertionError("completed snapshots must not run again");
+            }
+
+            @Override
+            public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+                assertThat(config.streams()).containsExactlyElementsOf(tableNames);
+                starts.add(start);
+                liveTails.incrementAndGet();
+                return liveTails::decrementAndGet;
+            }
+
+            @Override
+            public ConnectionReport testConnection(CaptureConfig config) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public DiscoveredSchema discoverSchema(CaptureConfig config) {
+                throw new UnsupportedOperationException();
+            }
+        };
+        HazelcastInstance member = mock(HazelcastInstance.class);
+        when(member.getUserContext()).thenReturn(new java.util.concurrent.ConcurrentHashMap<>());
+        when(member.getRingbuffer(any())).thenReturn(mock(com.hazelcast.ringbuffer.Ringbuffer.class));
+        SrsCoordinator chains = new SrsCoordinator(store.meta());
+        CaptureRunUnit runs = new CaptureRunUnit(port, chains, store.meta(), member);
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, runs::begin, chains, new SnapshotBuffer());
+
+        for (int index = 0; index < 15; index++) {
+            coordinator.startCapture("pipeline_" + index);
+        }
+
+        assertThat(starts).as("at least one tail resumes the recorded backlog").isNotEmpty()
+                .allSatisfy(start -> assertThat(start)
+                        .isEqualTo(CaptureStart.resume(new SourcePosition("before-backlog"))));
+        assertThat(liveTails.get())
+                .as("15 pipelines over one source must not decode the same WAL backlog 15 times at once")
+                .isEqualTo(1);
+    }
+
+    @Test
     void startRetainsALiveHandleAndStopClosesItThenTearsTheChainDown() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(cdcSource("orders_src", "orders", null));

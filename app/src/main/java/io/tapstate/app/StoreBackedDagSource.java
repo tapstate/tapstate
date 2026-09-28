@@ -833,9 +833,12 @@ final class StoreBackedDagSource implements DagSource {
                 published.put(stream, publishedAs(base, produced, atTheSource(pipelineId, stream,
                         sourceVertices)));
             } else if (produced != null) {
-                // Unknown lineage cannot preserve source attributes or secondary uniqueness.
+                // Unknown lineage cannot preserve source attributes or secondary uniqueness. A decimal
+                // type token also declares bounds, so it cannot survive a script that may replace it.
                 published.put(stream, TargetModelResolver.keyedOn(new TargetTable(base.name(), base.fields().stream()
-                        .map(field -> new TargetField(field.name(), field.type(), field.primaryKey(), field.inferredType()))
+                        .map(field -> new TargetField(field.name(),
+                                field.inferredType() == io.tapstate.core.common.TapstateType.DECIMAL
+                                        ? null : field.type(), field.primaryKey(), field.inferredType()))
                         .toList(), List.of()), base.fields().stream().filter(TargetField::primaryKey)
                         .map(TargetField::name).toList()));
             }
@@ -1194,9 +1197,15 @@ final class StoreBackedDagSource implements DagSource {
         produced.origins().forEach((output, origin) -> parentNames.put(origin, output));
         for (String column : produced.columns().keySet()) {
             TargetField carried = declared.get(column);
-            boolean spellingStillHolds = carried != null && !retyped(column, produced, atTheSource);
+            var inferred = JoinSchemaDrift.typeOf(produced.columns().get(column));
+            // A decimal without a descriptor can reuse an older source spelling only while the value
+            // is unchanged. A computed value with the same name has no declared source range.
+            boolean spellingStillHolds = carried != null && !retyped(column, produced, atTheSource)
+                    && (inferred != io.tapstate.core.common.TapstateType.DECIMAL
+                    || produced.numericTypes().containsKey(column)
+                    || produced.unchangedFields().contains(column));
             fields.add(new TargetField(column, spellingStillHolds ? carried.type() : null, false,
-                    JoinSchemaDrift.typeOf(produced.columns().get(column)),
+                    inferred,
                     produced.numericTypes().get(column), produced.stringTypes().get(column)));
             TargetField identity = produced.expanded()
                     ? declared.get(produced.origins().get(column)) : carried;
