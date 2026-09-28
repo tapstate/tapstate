@@ -57,13 +57,16 @@ class ADottedColumnIsReportedAtApplyIT {
             // Discovered first, or the batch would be judged against a source nobody has looked at and
             // there would be no column names to report on at all.
             control.discoverSchema(SOURCE_ID, "mysql", config);
+
+            List<ControlPlane.Warning> warnings = control.apply(workspace(config, target));
+
+            // Read once the batch has created the Source: its schema answers only for an applied Source,
+            // and what it answers is the discovery narrowed to the Source's tables - the same reading the
+            // batch was judged against.
             assertThat(control.sourceSchemaFields(SOURCE_ID, TABLE))
                     .as("the name a real MySQL column reaches the product under, which is what the "
                             + "finding is computed from")
                     .contains(DOTTED_COLUMN);
-
-            List<ControlPlane.Warning> warnings = control.apply(workspace(config, target));
-
             assertThat(control.artifactIds())
                     .as("the batch is applied, not refused: the rows cross correctly and refusing here "
                             + "would refuse every pipeline whose data already sits in a collection this way")

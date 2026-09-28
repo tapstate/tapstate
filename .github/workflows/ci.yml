@@ -226,6 +226,7 @@ jobs:
             -Dsonar.host.url="$SONAR_HOST_URL"
             -Dsonar.login="$SONAR_TOKEN"
             -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=1800
           )
           # On a release tag (e.g. v1.2.3) stamp the analysis with the release version (strip the
           # leading v), so it creates a version event. With the "previous version" New Code
@@ -440,6 +441,7 @@ jobs:
           bash .github/scripts/ci-maven-cache-smoke.sh
           bash .github/scripts/sonar-inputs-smoke.sh
           bash .github/scripts/sonar-workflow-smoke.sh
+          python3 .github/scripts/sonar-main-gate-timeout-test.py
           bash .github/scripts/sonar-cache-smoke.sh
       - name: CI timing cases
         run: bash .github/scripts/ci-timing-smoke.sh
