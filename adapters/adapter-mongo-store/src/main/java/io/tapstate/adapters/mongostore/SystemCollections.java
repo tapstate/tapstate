@@ -113,8 +113,8 @@ public enum SystemCollections {
     /** The authoring document kept independently from the artifact it compiles into. */
     PIPELINE_DRAFTS(MongoStorePort.PIPELINE_DRAFTS, Database.STORE, MongoPipelineDraftStore.class,
             Strategy.MIGRATED, 0,
-            new IndexSpec(List.of("revision"), false),
-            new IndexSpec(List.of("updatedAt"), false)),
+            new IndexSpec(List.of("revision"), false, "pipeline_drafts_revision"),
+            new IndexSpec(List.of("updatedAt"), false, "pipeline_drafts_updated_at")),
 
     /**
      * The durable change log, one document per change, keyed by the ring it was written to and the
@@ -187,23 +187,36 @@ public enum SystemCollections {
      * An index a query shape needs. Keys are in order and all ascending: nothing here sorts, and a
      * descending key would only matter to a query that did.
      */
-    public record IndexSpec(List<String> keys, boolean unique, Long expireAfterSeconds) {
+    public record IndexSpec(List<String> keys, boolean unique, Long expireAfterSeconds, String declaredName) {
         public IndexSpec {
             keys = List.copyOf(keys);
             if (expireAfterSeconds != null && (expireAfterSeconds < 0 || keys.size() != 1)) {
                 throw new IllegalArgumentException("an expiring index is over one date field and a non-negative"
                         + " number of seconds: " + keys + " / " + expireAfterSeconds);
             }
+            if (declaredName != null && declaredName.isBlank()) {
+                throw new IllegalArgumentException("an explicit index name must not be blank");
+            }
+        }
+
+        /** An index whose existing name is part of the persisted MongoDB contract. */
+        public IndexSpec(List<String> keys, boolean unique, String declaredName) {
+            this(keys, unique, null, declaredName);
+        }
+
+        /** An index with expiry and the conventional name derived from its keys. */
+        public IndexSpec(List<String> keys, boolean unique, Long expireAfterSeconds) {
+            this(keys, unique, expireAfterSeconds, null);
         }
 
         /** An index with no expiry, which is every index but the one the sample history expires on. */
         public IndexSpec(List<String> keys, boolean unique) {
-            this(keys, unique, null);
+            this(keys, unique, null, null);
         }
 
-        /** The index name, derived from the keys so two declarations of the same index cannot differ. */
+        /** The persisted name, or the conventional name derived from the keys. */
         public String indexName() {
-            return String.join("_", keys) + "_idx";
+            return declaredName == null ? String.join("_", keys) + "_idx" : declaredName;
         }
     }
 

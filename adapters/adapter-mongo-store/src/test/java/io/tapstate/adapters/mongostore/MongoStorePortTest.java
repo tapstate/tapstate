@@ -16,6 +16,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 class MongoStorePortTest {
 
     @Test
+    void pipelineDraftIndexRegistryKeepsThePersistedNames() {
+        assertThat(SystemCollections.PIPELINE_DRAFTS.indexes())
+                .extracting(SystemCollections.IndexSpec::indexName)
+                .containsExactly("pipeline_drafts_revision", "pipeline_drafts_updated_at");
+    }
+
+    @Test
     void bindsEachConcernToItsOwnDistinctNamedStorage() {
         assertThat(List.of(
                 MongoStorePort.ARTIFACTS,
