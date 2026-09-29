@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+JARS=("$ROOT"/lib/app-*-boot.jar)
+if [[ ${#JARS[@]} -ne 1 || ! -f "${JARS[0]}" ]]; then
+  printf 'expected exactly one server jar in %s/lib\n' "$ROOT" >&2
+  exit 1
+fi
+
+if [[ -n "${JAVA_HOME:-}" ]]; then
+  JAVA="$JAVA_HOME/bin/java"
+else
+  JAVA=java
+fi
+
+exec "$JAVA" \
+  --add-opens java.base/java.lang=ALL-UNNAMED \
+  -jar "${JARS[0]}" \
+  --spring.config.additional-location="optional:file:$ROOT/conf/" \
+  "$@"
