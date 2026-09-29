@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -106,7 +107,7 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
         WriterBinding writer = writerId == null
                 ? bindResolvedWriter()
                 : new WriterBinding(writerId, writerStreams, writerIdsByStream);
-        Set<String> configuredMiningChains = ConcurrentHashMap.newKeySet();
+        ConcurrentMap<String, Boolean> configuredMiningChains = new ConcurrentHashMap<>();
         Map<String, ChainPosition> recorded = new ConcurrentHashMap<>();
         return (chain, position) -> {
             String miningChainId = chainIdByTable.get(chain);
@@ -158,14 +159,8 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
             SrsMetaStore meta,
             WriterBinding writer,
             String miningChainId,
-            Set<String> configuredMiningChains) {
-        if (configuredMiningChains.contains(miningChainId)) {
-            return;
-        }
-        synchronized (configuredMiningChains) {
-            if (configuredMiningChains.contains(miningChainId)) {
-                return;
-            }
+            ConcurrentMap<String, Boolean> configuredMiningChains) {
+        configuredMiningChains.computeIfAbsent(miningChainId, ignored -> {
             Map<String, List<String>> plan = writer.plan();
             if (plan == null) {
                 synchronized (resolvedWriterIdsByStream) {
@@ -173,8 +168,8 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                 }
             }
             configure(meta, miningChainId, plan);
-            configuredMiningChains.add(miningChainId);
-        }
+            return Boolean.TRUE;
+        });
     }
 
     /** Registers the complete table-to-writer plan for {@code miningChainId} without touching another. */
