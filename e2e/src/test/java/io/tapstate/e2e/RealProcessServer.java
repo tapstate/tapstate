@@ -170,6 +170,14 @@ final class RealProcessServer implements ServerHandle {
         return launching(storeUri, jar, LOOPBACK, extraArguments);
     }
 
+    /** Launches an explicit artifact with JVM options before the application arguments. */
+    static RealProcessServer launchingWithJvmArguments(String storeUri, Path jar,
+            List<String> jvmArguments, List<String> applicationArguments) {
+        List<String> applicationOptions = List.copyOf(applicationArguments);
+        return launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, jar, LOOPBACK,
+                port -> applicationOptions, List.copyOf(jvmArguments));
+    }
+
     /**
      * The same, listening on {@code listenAddress} rather than the loopback, with the jar this reactor
      * built -- what a member of a cluster needs, since one that binds the loopback is refused.
@@ -187,6 +195,11 @@ final class RealProcessServer implements ServerHandle {
 
     private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
             String listenAddress, IntFunction<List<String>> extraArguments) {
+        return launching(storeUri, operatorStateDatabase, jar, listenAddress, extraArguments, List.of());
+    }
+
+    private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
+            String listenAddress, IntFunction<List<String>> extraArguments, List<String> jvmArguments) {
         int port = freePort();
         // The literal address, not the name: "localhost" resolves to both 127.0.0.1 and ::1, and the
         // launch below binds only the first.
@@ -194,7 +207,7 @@ final class RealProcessServer implements ServerHandle {
         Path workingDirectory = workingDirectory();
         Path output = workingDirectory.resolve("server.out");
         Process process = launch(jar, port, listenAddress, storeUri, operatorStateDatabase,
-                workingDirectory, output, extraArguments.apply(port));
+                workingDirectory, output, extraArguments.apply(port), jvmArguments);
         return new RealProcessServer(process, baseUrl, output);
     }
 
@@ -271,7 +284,8 @@ final class RealProcessServer implements ServerHandle {
     }
 
     private static Process launch(Path jar, int port, String listenAddress, String storeUri,
-            String operatorStateDatabase, Path workingDirectory, Path output, List<String> extraArguments) {
+            String operatorStateDatabase, Path workingDirectory, Path output, List<String> extraArguments,
+            List<String> jvmArguments) {
         List<String> command = new ArrayList<>(List.of(
                 javaBinary(),
                 "-jar",
@@ -296,6 +310,7 @@ final class RealProcessServer implements ServerHandle {
         // is joined with the earlier one by comma rather than winning over it, so anything a case needs
         // to set differently is a parameter above instead of an argument here.
         command.addAll(extraArguments);
+        command.addAll(1, jvmArguments);
         try {
             return new ProcessBuilder(command)
                     .directory(workingDirectory.toFile())

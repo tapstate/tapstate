@@ -78,6 +78,12 @@ final class BenchmarkJdiCostObserver {
         OBSERVATION_DOCUMENT_BUILD,
         RATE_DOCUMENT_BUILD,
         BSON_BINARY_ENCODER_INVOCATION,
+        BSON_DOCUMENT_BINARY_ENCODER_INVOCATION,
+        BSON_REPRESENTATION_CONVERSION,
+        WIRE_COMMAND_BINARY_ENCODER_INVOCATION,
+        ROLLUP_DOCUMENT_BUILD,
+        EVENT_DOCUMENT_BUILD,
+        OBSERVATION_CHUNK_DOCUMENT_BUILD,
         LATEST_OBSERVATION_BINARY_ENCODER_INVOCATION,
         SYNC_COMMAND_SEND
     }
@@ -91,7 +97,8 @@ final class BenchmarkJdiCostObserver {
     }
 
     enum Namespace {
-        OBSERVATION, OBSERVATION_CHUNKS, RAW_HISTORY, HISTORY_ROLLUPS, EVENTS, CONTROL
+        OBSERVATION, OBSERVATION_CHUNKS, RAW_HISTORY, HISTORY_ROLLUPS, EVENTS, CONTROL,
+        ARTIFACTS, DESIRED, WORKLOAD_CLAIMS
     }
 
     enum Operation {
@@ -196,7 +203,7 @@ final class BenchmarkJdiCostObserver {
                     + "Lcom/mongodb/internal/async/SingleResultCallback;)V", null, true);
     private static final List<String> LIBRARIES = List.of(
             "adapter-mongo-store-0.5.0.jar", "spi-store-0.5.0.jar", "core-common-0.5.0.jar", "core-lifecycle-0.5.0.jar",
-            "core-model-0.5.0.jar", "core-event-0.5.0.jar", "bson-5.8.0.jar",
+            "core-model-0.5.0.jar", "core-event-0.5.0.jar", "spi-metrics-0.5.0.jar", "bson-5.8.0.jar",
             "bson-record-codec-5.8.0.jar", "mongodb-driver-core-5.8.0.jar",
             "mongodb-driver-sync-5.8.0.jar", "slf4j-api-2.0.18.jar");
     private static final List<String> TARGET_CLASSES = List.of(TARGET, LATEST_TARGET, LATEST_TARGET + "$Chunks");
@@ -207,13 +214,15 @@ final class BenchmarkJdiCostObserver {
 
     static final class Artifact implements AutoCloseable {
         final Arm arm;
+        final Path bootJar;
         final Path directory;
         final List<Path> libraries;
         final Path targets;
         final Map<String, ClassImage> images = new ConcurrentHashMap<>();
 
-        private Artifact(Arm arm, Path directory, List<Path> libraries, Path targets) {
+        private Artifact(Arm arm, Path bootJar, Path directory, List<Path> libraries, Path targets) {
             this.arm = arm;
+            this.bootJar = bootJar;
             this.directory = directory;
             this.libraries = List.copyOf(libraries);
             this.targets = targets;
@@ -224,7 +233,7 @@ final class BenchmarkJdiCostObserver {
                 throw invalid("immutable artifact hash did not match its selected arm");
             }
             Path directory = Files.createTempDirectory("benchmark-jdi-cost-");
-            Artifact result = new Artifact(arm, directory, LIBRARIES.stream()
+            Artifact result = new Artifact(arm, input.toRealPath(), directory, LIBRARIES.stream()
                     .map(directory::resolve).toList(), directory.resolve("targets"));
             try {
                 try (ZipFile boot = new ZipFile(input.toFile())) {
@@ -278,13 +287,24 @@ final class BenchmarkJdiCostObserver {
             }
         }
 
-        private ClassImage image(String type) throws Exception {
+        ClassImage image(String type) throws Exception {
             ClassImage cached = images.get(type);
             if (cached != null) {
                 return cached;
             }
             String resource = type.replace('.', '/') + ".class";
             ClassImage found = null;
+            try (ZipFile boot = new ZipFile(bootJar.toFile())) {
+                ZipEntry entry = boot.getEntry("BOOT-INF/classes/" + resource);
+                if (entry != null) {
+                    if (entry.getSize() < 0 || entry.getSize() > 1_048_576) {
+                        throw invalid("an oversized whitelisted boot class was found");
+                    }
+                    try (InputStream stream = boot.getInputStream(entry)) {
+                        found = new ClassImage(bootJar, parseMethods(stream.readAllBytes()));
+                    }
+                }
+            }
             for (Path library : libraries) {
                 try (ZipFile jar = new ZipFile(library.toFile())) {
                     ZipEntry entry = jar.getEntry(resource);
@@ -315,6 +335,11 @@ final class BenchmarkJdiCostObserver {
 
         boolean latestAvailable() throws Exception {
             return image(LATEST) != null;
+        }
+
+        byte[] methodCode(String type, String method, String descriptor) throws Exception {
+            ClassImage image = image(type);
+            return image == null ? null : image.methods().get(method + descriptor);
         }
 
         String classpath() {
@@ -492,7 +517,7 @@ final class BenchmarkJdiCostObserver {
     private record Signature(String type, String method, String descriptor, Unit unit, boolean rejectAsync) {
     }
 
-    private record ClassImage(Path origin, Map<String, byte[]> methods) {
+    record ClassImage(Path origin, Map<String, byte[]> methods) {
     }
 
     private record Site(Signature signature, boolean entry) {
@@ -768,7 +793,8 @@ final class BenchmarkJdiCostObserver {
                     }
                     requestId = id.value();
                     connectionId = frame.thisObject().uniqueID();
-                    wire = wireKey(event, requestId, connectionId);
+                    wire = wireKey(event, requestId, connectionId,
+                            Set.of("jdi_cost_witness", "admin", "local", "config"));
                     wireCounts.computeIfAbsent(wire, ignored -> new MutableCount()).entries++;
                 } else {
                     encoderArguments(signature.unit(), arguments);
@@ -813,7 +839,8 @@ final class BenchmarkJdiCostObserver {
             }
         }
 
-        private static WireKey wireKey(BreakpointEvent event, int requestId, long connectionId) throws Exception {
+        private static WireKey wireKey(BreakpointEvent event, int requestId, long connectionId,
+                Set<String> databases) throws Exception {
             ObjectReference message = null;
             for (int i = 1; i < Math.min(event.thread().frameCount(), 64); i++) {
                 StackFrame ancestor = event.thread().frame(i);
@@ -834,8 +861,15 @@ final class BenchmarkJdiCostObserver {
             if (message == null) {
                 throw invalid("a synchronous send lacked its exact command ancestor");
             }
+            return messageKey(message, databases);
+        }
+
+        private static WireKey messageKey(ObjectReference message, Set<String> databases) {
+            if (!message.referenceType().name().equals(COMMAND)) {
+                throw invalid("a command header used an unmapped exact type");
+            }
             String database = string(field(message, "database"));
-            if (!Set.of("jdi_cost_witness", "admin", "local", "config").contains(database)) {
+            if (!databases.contains(database)) {
                 throw invalid("a wire command used an unmapped database");
             }
             ObjectReference document = object(field(message, "command"));
@@ -851,7 +885,8 @@ final class BenchmarkJdiCostObserver {
             }
             ObjectReference first = object(field(map, "head"));
             String name = string(field(first, "key"));
-            if (Set.of("hello", "isMaster", "ismaster", "ping", "endSessions", "killCursors").contains(name)) {
+            if (Set.of("hello", "isMaster", "ismaster", "ping", "endSessions", "killCursors",
+                    "commitTransaction", "abortTransaction").contains(name)) {
                 return new WireKey(Namespace.CONTROL, Operation.CONTROL);
             }
             Operation operation = switch (name) {
@@ -865,6 +900,7 @@ final class BenchmarkJdiCostObserver {
                 case "distinct" -> Operation.DISTINCT;
                 case "create" -> Operation.CREATE;
                 case "drop" -> Operation.DROP;
+                case "findAndModify" -> Operation.UPDATE;
                 default -> throw invalid("a wire command used an unmapped operation");
             };
             Value collectionValue = field(first, "value");
@@ -890,6 +926,9 @@ final class BenchmarkJdiCostObserver {
                 case "pipeline_rate_history" -> Namespace.RAW_HISTORY;
                 case "pipeline_history_rollups" -> Namespace.HISTORY_ROLLUPS;
                 case "pipeline_events" -> Namespace.EVENTS;
+                case "artifacts" -> Namespace.ARTIFACTS;
+                case "pipeline_desired" -> Namespace.DESIRED;
+                case "workload_claims" -> Namespace.WORKLOAD_CLAIMS;
                 default -> throw invalid("a wire command used an unmapped namespace");
             };
             return new WireKey(namespace, operation);
@@ -1076,7 +1115,16 @@ final class BenchmarkJdiCostObserver {
         }
     }
 
-    private static Value field(ObjectReference object, String name) {
+    static WireKey telemetryWireKey(BreakpointEvent event, int requestId, long connectionId,
+            Set<String> databases) throws Exception {
+        return Pump.wireKey(event, requestId, connectionId, databases);
+    }
+
+    static WireKey telemetryCommandKey(ObjectReference message, Set<String> databases) {
+        return Pump.messageKey(message, databases);
+    }
+
+    static Value field(ObjectReference object, String name) {
         Field field = object.referenceType().fieldByName(name);
         if (field == null || field.isStatic()) {
             throw invalid("a whitelisted wire metadata field was unavailable");
@@ -1084,14 +1132,14 @@ final class BenchmarkJdiCostObserver {
         return object.getValue(field);
     }
 
-    private static ObjectReference object(Value value) {
+    static ObjectReference object(Value value) {
         if (!(value instanceof ObjectReference object)) {
             throw invalid("a whitelisted wire metadata object was unavailable");
         }
         return object;
     }
 
-    private static String string(Value value) {
+    static String string(Value value) {
         if (!(value instanceof StringReference string) || string.value().length() > 128) {
             throw invalid("a whitelisted wire metadata string was unavailable or oversized");
         }
@@ -1183,7 +1231,7 @@ final class BenchmarkJdiCostObserver {
     }
 
     /** Instruction decoding avoids mistaking an operand byte for a RETURN opcode. */
-    private static List<Integer> returnOffsets(byte[] code) {
+    static List<Integer> returnOffsets(byte[] code) {
         List<Integer> returns = new ArrayList<>();
         for (int pc = 0; pc < code.length;) {
             int opcode = Byte.toUnsignedInt(code[pc]);

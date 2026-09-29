@@ -98,11 +98,11 @@ class HistoryRollupQueryCostMongoIT {
             PipelineHistoryQueryService cached = new PipelineHistoryQueryService(
                     artifacts, raw, rollups, SAMPLE_INTERVAL, clock, codec);
 
-            compareWindow(forcedRaw, cached, trace, rollupCollection, now,
+            compareWindow(forcedRaw, cached, trace, rawCollection, rollupCollection, now,
                     Duration.ofHours(1), null);
-            compareWindow(forcedRaw, cached, trace, rollupCollection, now,
+            compareWindow(forcedRaw, cached, trace, rawCollection, rollupCollection, now,
                     Duration.ofDays(1), HistoryRollupStore.Resolution.PT30M);
-            compareWindow(forcedRaw, cached, trace, rollupCollection, now,
+            compareWindow(forcedRaw, cached, trace, rawCollection, rollupCollection, now,
                     RETENTION, HistoryRollupStore.Resolution.PT6H);
 
             // The same explain gate must turn red if the scoped range index disappears.
@@ -118,7 +118,7 @@ class HistoryRollupQueryCostMongoIT {
 
     private static void compareWindow(PipelineHistoryQueryService forcedRaw,
             PipelineHistoryQueryService cached, CommandTrace trace,
-            MongoCollection<Document> rollupCollection, Instant now,
+            MongoCollection<Document> rawCollection, MongoCollection<Document> rollupCollection, Instant now,
             Duration span, HistoryRollupStore.Resolution resolution) {
         Instant from = now.minus(span);
         PipelineHistoryQuery query = new PipelineHistoryQuery("orders", from, now,
@@ -127,7 +127,7 @@ class HistoryRollupQueryCostMongoIT {
         Measurement coldCached = measure(cached, query, trace);
         sameOutput(coldRaw.response(), coldCached.response());
         if (resolution != null) {
-            assertThat(coldCached.commands().rawReads()).isZero();
+            assertNoRawReads(coldCached.commands());
             assertThat(coldCached.commands().rollupReads()).isBetween(1L, 128L);
             assertIndexBounds(rollupCollection, coldCached.commands(), span, resolution);
         }
@@ -145,7 +145,7 @@ class HistoryRollupQueryCostMongoIT {
             rawNanos[i] = rawRun.nanos();
             cachedNanos[i] = cachedRun.nanos();
             if (resolution != null) {
-                assertThat(cachedRun.commands().rawReads()).isZero();
+                assertNoRawReads(cachedRun.commands());
             }
         }
         report("raw", span, coldRaw, rawNanos);
@@ -153,6 +153,20 @@ class HistoryRollupQueryCostMongoIT {
 
         if (resolution == null) {
             return;
+        }
+        if (resolution == HistoryRollupStore.Resolution.PT6H) {
+            Measurement extra = measure(cached, query, trace, () -> {
+                Document row = rawCollection.find(Filters.and(Filters.eq("pipelineId", "orders"),
+                        Filters.gte("observedAt", Date.from(from)),
+                        Filters.lt("observedAt", Date.from(from.plus(resolution.duration())))))
+                        .limit(1).first();
+                assertThat(row).as("the unused raw read executed").isNotNull();
+            });
+            sameOutput(coldCached.response(), extra.response());
+            assertThat(extra.commands().rawReads()).isEqualTo(1);
+            assertThatThrownBy(() -> assertNoRawReads(extra.commands()))
+                    .isInstanceOf(AssertionError.class)
+                    .hasMessageContaining("complete rollup hit reads no raw history");
         }
         Instant missing = from.plus(resolution.duration().multipliedBy(
                 span.dividedBy(resolution.duration()) / 2));
@@ -179,15 +193,25 @@ class HistoryRollupQueryCostMongoIT {
 
     private static Measurement measure(PipelineHistoryQueryService service,
             PipelineHistoryQuery query, CommandTrace trace) {
+        return measure(service, query, trace, () -> { });
+    }
+
+    private static Measurement measure(PipelineHistoryQueryService service,
+            PipelineHistoryQuery query, CommandTrace trace, Runnable extraRead) {
         trace.start();
         long started = System.nanoTime();
         try {
             PipelineMetricsHistory response = service.query(query);
+            extraRead.run();
             return new Measurement(response, System.nanoTime() - started, trace.stop());
         } catch (RuntimeException | Error failure) {
             trace.stop();
             throw failure;
         }
+    }
+
+    private static void assertNoRawReads(Commands commands) {
+        assertThat(commands.rawReads()).as("complete rollup hit reads no raw history").isZero();
     }
 
     private static void assertOnlyMissingRawRange(Commands commands, Instant from, Instant to) {

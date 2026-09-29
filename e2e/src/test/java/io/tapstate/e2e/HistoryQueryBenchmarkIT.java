@@ -8,6 +8,7 @@ import io.tapstate.adapters.mongostore.MongoHistoryRollupStore;
 import io.tapstate.adapters.mongostore.MongoRateHistoryStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.core.common.JsonReader;
+import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.control.core.HistoryAggregator;
 import io.tapstate.control.core.PipelineMetricsHistory;
@@ -39,6 +40,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.NavigableMap;
 import java.util.Optional;
@@ -184,6 +186,9 @@ class HistoryQueryBenchmarkIT {
             compare(raw.frozen(), cached.frozen());
             compare(raw.aligned(), cached.aligned());
             compare(raw.aligned(), cached.missing());
+            for (WindowRun run : cached.frozen()) {
+                reportPair("requested", matching(raw.frozen(), run.window()), run);
+            }
             for (WindowRun run : cached.aligned()) {
                 reportPair("full-hit", matching(raw.aligned(), run.window()), run);
             }
@@ -471,6 +476,7 @@ class HistoryQueryBenchmarkIT {
         for (Window window : windows) {
             URI uri = query(server.baseUrl(), to.minus(window.span()), to, window.resolution());
             WindowRun run;
+            var samplingAnchor = BenchmarkForkEnvironment.ClockAnchor.capture();
             try (BenchmarkResourceSampler sampler = BenchmarkResourceSampler.open(
                     server.pid(), Duration.ofMillis(5))) {
                 sampler.start();
@@ -486,12 +492,16 @@ class HistoryQueryBenchmarkIT {
                     hot.add(reading);
                 }
                 run = new WindowRun(window, cold, List.copyOf(hot), sampler.finish());
+            } catch (BenchmarkResourceSampler.SamplingFailure failure) {
+                throw failure.inPhase(mode + "/" + window.name());
             }
             runs.add(run);
             if (frozen && "raw-frozen".equals(mode)) {
                 reportFrozen(window, run.cold(), run.hot());
             }
             reportPath(mode, run);
+            System.out.println("history-query-evidence=" + JsonWriter.write(
+                    windowEvidence(mode, run, to, samplingAnchor)));
         }
         return List.copyOf(runs);
     }
@@ -541,9 +551,57 @@ class HistoryQueryBenchmarkIT {
                 operations);
     }
 
-    private static long count(Document document, String field) {
+    static long count(Document document, String field) {
         Object value = document.get(field);
-        return value instanceof Number number ? number.longValue() : 0;
+        assertThat(value).as("profiled read field %s must be an integral count", field)
+                .isInstanceOfAny(Integer.class, Long.class);
+        long count = ((Number) value).longValue();
+        assertThat(count).as("profiled read field %s must be nonnegative", field)
+                .isGreaterThanOrEqualTo(0);
+        return count;
+    }
+
+    private static Map<String, Object> windowEvidence(String mode, WindowRun run, Instant to,
+            BenchmarkForkEnvironment.ClockAnchor samplingAnchor) {
+        Map<String, Object> evidence = new LinkedHashMap<>();
+        evidence.put("mode", mode); evidence.put("window", run.window().name());
+        evidence.put("requestedFrom", to.minus(run.window().span()).toString());
+        evidence.put("requestedTo", to.toString());
+        evidence.put("mongoCostSource", "PROFILER_READ_OPERATIONS");
+        evidence.put("mongoReplyBytesSource", "PROFILER_RESPONSE_LENGTH");
+        evidence.put("coldScope", "FIRST_QUERY_FOR_WINDOW");
+        evidence.put("memoryScope", "WINDOW_COLD_WARMUP_HOT_AND_PROFILE_SETUP");
+        evidence.put("cold", readingEvidence(run.cold()));
+        evidence.put("hot", readingsEvidence(run.hot()));
+        evidence.put("clock", Map.of("utc", samplingAnchor.utc().toString(),
+                "monotonicBeforeNanos", samplingAnchor.beforeNanos(),
+                "monotonicAfterNanos", samplingAnchor.afterNanos()));
+        evidence.put("resources", PipelineBenchmarkLiveRunIT.resourceEvidence(run.resources(), samplingAnchor));
+        return evidence;
+    }
+
+    static List<Map<String, Object>> readingsEvidence(List<Reading> readings) {
+        return readings.stream().map(HistoryQueryBenchmarkIT::readingEvidence).toList();
+    }
+
+    private static Map<String, Object> readingEvidence(Reading reading) {
+        Map<String, Object> evidence = new LinkedHashMap<>();
+        evidence.put("elapsedNanos", reading.elapsedNanos());
+        evidence.put("httpBytes", reading.responseBytes());
+        evidence.put("httpBytesSource", "HTTP_RESPONSE_ENTITY_BODY");
+        evidence.put("httpBytesScope", "PAYLOAD_ONLY");
+        for (String field : List.of("effectiveFrom", "effectiveTo", "retentionCutoff")) {
+            assertThat(reading.response().get(field)).as("history response field %s", field).isInstanceOf(String.class);
+            evidence.put(field, reading.response().get(field));
+        }
+        evidence.put("raw", collectionEvidence(reading.raw()));
+        evidence.put("rollup", collectionEvidence(reading.rollup()));
+        return evidence;
+    }
+
+    private static Map<String, Object> collectionEvidence(CollectionCost cost) {
+        return Map.of("readOperations", cost.commands(), "keysExamined", cost.keysExamined(),
+                "docsExamined", cost.docsExamined(), "replyBytes", cost.replyBytes());
     }
 
     @SuppressWarnings("unchecked")
@@ -609,8 +667,8 @@ class HistoryQueryBenchmarkIT {
                         + " coldMs=%.3f hotP50Ms=%.3f hotP95Ms=%.3f"
                         + " coldRawCommands=%d coldRawKeys=%d coldRawDocs=%d coldRawReplyBytes=%d"
                         + " coldRollupCommands=%d coldRollupKeys=%d coldRollupDocs=%d coldRollupReplyBytes=%d"
-                        + " coldHttpBytes=%d hotRawCommands=%d hotRawKeys=%d hotRawDocs=%d"
-                        + " hotRollupCommands=%d hotRollupKeys=%d hotRollupDocs=%d hotHttpBytes=%d"
+                        + " coldHttpBytes=%d hotRawCommands=%d hotRawKeys=%d hotRawDocs=%d hotRawReplyBytes=%d"
+                        + " hotRollupCommands=%d hotRollupKeys=%d hotRollupDocs=%d hotRollupReplyBytes=%d hotHttpBytes=%d"
                         + " processPeakHeapBytes=%d processPeakRssBytes=%d resourceSamples=%d%n",
                 mode, run.window().name(), run.window().span(), run.window().effectiveResolution(),
                 millis(cold.elapsedNanos()), millis(percentile(latencies, 0.50)),
@@ -621,9 +679,11 @@ class HistoryQueryBenchmarkIT {
                 median(hot.stream().map(reading -> reading.raw().commands()).toList()),
                 median(hot.stream().map(reading -> reading.raw().keysExamined()).toList()),
                 median(hot.stream().map(reading -> reading.raw().docsExamined()).toList()),
+                median(hot.stream().map(reading -> reading.raw().replyBytes()).toList()),
                 median(hot.stream().map(reading -> reading.rollup().commands()).toList()),
                 median(hot.stream().map(reading -> reading.rollup().keysExamined()).toList()),
                 median(hot.stream().map(reading -> reading.rollup().docsExamined()).toList()),
+                median(hot.stream().map(reading -> reading.rollup().replyBytes()).toList()),
                 median(hot.stream().map(Reading::responseBytes).toList()),
                 run.resources().peakHeapBytes(), run.resources().peakRssBytes(),
                 run.resources().sampleCount());
@@ -659,9 +719,9 @@ class HistoryQueryBenchmarkIT {
     private record WindowRun(Window window, Reading cold, List<Reading> hot,
             BenchmarkResourceSampler.Summary resources) {}
 
-    private record CollectionCost(int commands, long keysExamined, long docsExamined,
+    record CollectionCost(int commands, long keysExamined, long docsExamined,
             long replyBytes, List<Document> operations) {}
 
-    private record Reading(Map<String, Object> response, long elapsedNanos, int responseBytes,
+    record Reading(Map<String, Object> response, long elapsedNanos, int responseBytes,
             CollectionCost raw, CollectionCost rollup) {}
 }
