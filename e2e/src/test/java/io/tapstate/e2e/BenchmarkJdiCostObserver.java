@@ -843,8 +843,9 @@ final class BenchmarkJdiCostObserver {
         private static WireKey wireKey(BreakpointEvent event, int requestId, long connectionId,
                 Set<String> databases) throws Exception {
             ObjectReference message = null;
-            for (int i = 1; i < Math.min(event.thread().frameCount(), 64); i++) {
-                StackFrame ancestor = event.thread().frame(i);
+            int count = Math.min(event.thread().frameCount() - 1, 63);
+            if (count <= 0) { throw invalid("a synchronous send lacked its exact command ancestor"); }
+            for (StackFrame ancestor : event.thread().frames(1, count)) {
                 Method method = ancestor.location().method();
                 if (method.declaringType().name().equals(CONNECTION) && method.name().equals("trySendMessage")
                         && method.signature().equals(TRY_SEND_SIGNATURE)) {

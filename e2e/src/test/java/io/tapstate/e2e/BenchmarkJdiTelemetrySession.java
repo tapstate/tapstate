@@ -500,13 +500,14 @@ final class BenchmarkJdiTelemetrySession implements AutoCloseable {
             if (state.calls.size() >= 128) { throw invalid("nested call budget exceeded"); }
             Namespace namespace = spec.namespace() == null ? state.scopes.peek().spec().namespace() : spec.namespace();
             Unit unit = spec.unit();
-            List<Value> arguments = event.thread().frame(0).getArgumentValues();
+            List<Value> arguments = null;
             if (unit == Unit.WIRE_COMMAND_BINARY_ENCODER_INVOCATION) {
                 ObjectReference message = event.thread().frame(0).thisObject();
                 if (message == null) { throw invalid("root command receiver unavailable"); }
                 namespace = BenchmarkJdiCostObserver.telemetryCommandKey(message, databases).namespace();
             }
             if (unit == Unit.BSON_BINARY_ENCODER_INVOCATION || unit == Unit.BSON_DOCUMENT_BINARY_ENCODER_INVOCATION) {
+                arguments = event.thread().frame(0).getArgumentValues();
                 if (arguments.size() != 3 || !(arguments.getFirst() instanceof ObjectReference writer)) {
                     throw invalid("typed BSON writer unavailable");
                 }
@@ -523,6 +524,7 @@ final class BenchmarkJdiTelemetrySession implements AutoCloseable {
             BenchmarkInvocationCohorts.Invocation<WireCostKey> wire = null;
             int requestId = -1; long receiver = -1;
             if (unit == Unit.SYNC_COMMAND_SEND) {
+                arguments = event.thread().frame(0).getArgumentValues();
                 ObjectReference actual = event.thread().frame(0).thisObject();
                 if (arguments.size() != 3 || !(arguments.get(1) instanceof IntegerValue number) || actual == null) {
                     throw invalid("send arguments unavailable");
