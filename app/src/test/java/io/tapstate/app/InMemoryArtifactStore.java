@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.spi.store.ArtifactMutation;
 import io.tapstate.spi.store.ArtifactStore;
 import java.util.Collections;
@@ -26,6 +27,18 @@ final class InMemoryArtifactStore implements ArtifactStore {
         for (Resource artifact : artifacts) {
             byId.put(artifact.id(), artifact);
         }
+    }
+
+    @Override
+    public Optional<String> saveAll(List<Resource> artifacts, Map<String, String> expectedContentHashes) {
+        for (Map.Entry<String, String> expected : expectedContentHashes.entrySet()) {
+            Resource stored = byId.get(expected.getKey());
+            if (stored == null || !expected.getValue().equals(CanonicalHash.of(stored))) {
+                return Optional.of(expected.getKey());
+            }
+        }
+        saveAll(artifacts);
+        return Optional.empty();
     }
 
     /**
