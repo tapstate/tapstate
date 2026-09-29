@@ -638,6 +638,43 @@ class CdcPhaseTest {
         }
     }
 
+    @Test
+    void aBackpressuredCdcWriteStopsWhenItsThreadIsInterrupted() throws Exception {
+        Ringbuffer<SrsItem> raw = hz.getRingbuffer("srs.chain.interrupted-park");
+        SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(raw));
+        for (int i = 0; i < 8; i++) {
+            assertThat(gate.append(cdcItem("f" + i), -1L)).isPresent();
+        }
+        AtomicBoolean freed = new AtomicBoolean(false);
+        Supplier<Collection<ConsumerOffset>> minRead = () -> List.of(new ConsumerOffset(
+                "p1", Map.of("orders", freed.get() ? 0L : -1L), null));
+        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
+        FakeCdcPort port = new FakeCdcPort(
+                List.of(Envelope.insert(9, "orders", Map.of("id", 9), Map.of())));
+        Thread writer = new Thread(
+                () -> CdcPhase.run(port, config(), chain, minRead, new CaptureHealth()),
+                "interrupted-cdc-writer");
+        writer.setDaemon(true);
+
+        try {
+            writer.start();
+            assertThat(awaitState(writer, Thread.State.TIMED_WAITING, Duration.ofSeconds(2)))
+                    .as("the writer reached the headroom park before teardown interrupted it")
+                    .isTrue();
+
+            writer.interrupt();
+            writer.join(2_000);
+
+            assertThat(writer.isAlive())
+                    .as("an interrupted backpressured writer stops within the subscription close join")
+                    .isFalse();
+        } finally {
+            freed.set(true);
+            writer.interrupt();
+            writer.join(2_000);
+        }
+    }
+
     /**
      * A cluster that refuses the write for a moment pauses it; it does not end the capture.
      *
