@@ -203,6 +203,7 @@ io.document-too-large
 io.document-unreadable
 io.schema-read-contention
 io.schema-write-contention
+io.sink-writer-progress-ambiguous
 io.store-unauthorized
 io.store-unavailable
 io.workload-claim-fenced

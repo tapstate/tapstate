@@ -23,7 +23,9 @@ import io.tapstate.runtime.engine.nest.NestStateLedger;
 import io.tapstate.runtime.engine.nest.NestTable;
 import io.tapstate.runtime.engine.nest.NestTopology;
 import io.tapstate.spi.sink.SinkWriter;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -381,14 +383,14 @@ public final class PipelineDagBuilder {
         // this the parser's own default - serve.from = the view's id - resolves to no vertex at all.
         Map<String, List<Vertex>> readsAs = new HashMap<>();
 
+        List<SinkPlan> sinkPlans = new ArrayList<>();
         if (pipeline.view() instanceof ViewBlock.Inline view) {
             // A declared view IS its own instruction to materialize: the pipeline needs no serve block
             // to reach the state store, and the vertex is a terminal sink like any other.
             List<Vertex> upstream = upstreamOf(view.from(), byKey, bindings);
             String viewName = VIEW_VERTEX_PREFIX + view.id();
-            Vertex vertex = dag.newVertex(viewName,
-                    sinkVertex(viewName, bindings.viewSinks().apply(view), sinkAck, axes, assembled));
-            connect(dag, upstream, vertex, outboundOrdinal, inboundOrdinal);
+            sinkPlans.add(new SinkPlan(viewName, writerIdFor(viewName), bindings.viewSinks().apply(view), upstream,
+                    chainsOf(upstream, byKey, chains)));
             readsAs.put(view.id(), upstream);
         }
 
@@ -402,13 +404,70 @@ public final class PipelineDagBuilder {
             for (int i = 0; i < sync.size(); i++) {
                 SyncElement element = sync.get(i);
                 String name = SERVE_VERTEX_PREFIX + (element.id() != null ? element.id() : i);
-                Vertex vertex = dag.newVertex(name,
-                        sinkVertex(name, bindings.sinkWriters().apply(element), sinkAck, axes, assembled));
-                connect(dag, upstream, vertex, outboundOrdinal, inboundOrdinal);
+                sinkPlans.add(new SinkPlan(name, writerIdFor(name), bindings.sinkWriters().apply(element), upstream,
+                        chainsOf(upstream, byKey, chains)));
             }
         }
 
+        Map<String, List<String>> writerIdsByStream = new LinkedHashMap<>();
+        for (SinkPlan plan : sinkPlans) {
+            for (String stream : plan.streams()) {
+                writerIdsByStream.computeIfAbsent(stream, ignored -> new ArrayList<>()).add(plan.writerId());
+            }
+        }
+        writerIdsByStream.replaceAll((stream, writers) -> List.copyOf(writers));
+        Map<String, List<String>> writerPlan = Map.copyOf(writerIdsByStream);
+        if (sinkAck != null) {
+            sinkAck.prepareWriterPlan(writerPlan);
+        }
+        for (SinkPlan plan : sinkPlans) {
+            SinkAckFactory writerAck = sinkAck == null
+                    ? null
+                    : sinkAck.forWriter(plan.writerId(), plan.streams(), writerPlan);
+            Vertex vertex = dag.newVertex(plan.vertexName(),
+                    sinkVertex(plan.vertexName(), plan.writerFactory(), writerAck, axes, assembled));
+            connect(dag, plan.upstream(), vertex, outboundOrdinal, inboundOrdinal);
+        }
+
         return dag;
+    }
+
+    /** One terminal writer and the source streams the graph proves can reach it. */
+    private record SinkPlan(
+            String vertexName,
+            String writerId,
+            SupplierEx<? extends SinkWriter> writerFactory,
+            List<Vertex> upstream,
+            List<String> streams) {
+    }
+
+    /**
+     * A durable writer key from the terminal's stable identity. URL-safe Base64 preserves every byte
+     * while keeping author-chosen ids, including a leading {@code $}, inside one Mongo field name.
+     */
+    private static String writerIdFor(String sinkIdentity) {
+        String encoded = Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(sinkIdentity.getBytes(StandardCharsets.UTF_8));
+        return "sink-" + encoded;
+    }
+
+    /** The source streams carried by {@code upstream}, or none when frontier binding is absent. */
+    private static List<String> chainsOf(
+            List<Vertex> upstream, Map<String, Vertex> byKey, PipelineChains chains) {
+        if (chains == null) {
+            return List.of();
+        }
+        List<String> keys = new ArrayList<>();
+        for (Vertex vertex : upstream) {
+            String key = byKey.entrySet().stream()
+                    .filter(entry -> entry.getValue() == vertex)
+                    .map(Map.Entry::getKey)
+                    .findFirst()
+                    .orElseThrow(() -> new IllegalStateException(
+                            "upstream vertex '" + vertex.getName() + "' has no pipeline key"));
+            keys.add(key);
+        }
+        return chains.union(keys);
     }
 
     /**
