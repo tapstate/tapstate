@@ -29,6 +29,7 @@ import io.tapdata.pdk.apis.consumer.StreamReadConsumer;
 import io.tapdata.pdk.apis.functions.connector.source.BatchReadFunction;
 import io.tapdata.pdk.apis.functions.connector.source.StreamReadFunction;
 import io.tapdata.pdk.apis.functions.connector.source.TimestampToStreamOffsetFunction;
+import io.tapdata.pdk.apis.functions.connector.target.FlushOffsetFunction;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -45,6 +46,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongSupplier;
 
 /**
  * The PDK implementation of the read-side capture port: it provisions a connector, refuses it with a
@@ -60,6 +62,10 @@ import java.util.concurrent.atomic.AtomicReference;
  * stream runs on a background thread that delivers each decoded change to the listener; how a
  * stream failure reaches the caller and the backpressure that bounds the stream belong to the runtime that
  * owns stream execution, not to this port.
+ *
+ * <p>A running cdc stream can also be told how far its source may release its change log. Its subscription
+ * only records the latest position it is told; the stream's own delivery hands that to the connector, because
+ * the thread a connector delivers on is the one thread any connector can safely be told on.
  */
 public final class PdkCapturePort implements CapturePort, SnapshotSession.Provider {
 
@@ -72,9 +78,26 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
     /** The longest an Oracle LogMiner start waits for connector initialization and schema discovery. */
     public static final Duration DEFAULT_PREFLIGHT_TIMEOUT = Duration.ofSeconds(30);
 
+    /**
+     * How often, at most, a cdc subscription hands its connector the latest position it was told is
+     * durable. Often enough that what a source keeps past that position stays a few seconds' worth, and
+     * seldom enough that re-handing an unchanged position -- which is what most intervals do -- costs the
+     * source one small write every few seconds.
+     */
+    private static final Duration DEFAULT_ACKNOWLEDGE_INTERVAL = Duration.ofSeconds(5);
+
+    /**
+     * The least time between two warnings about one subscription's acknowledgements failing. A source that
+     * refuses one usually refuses each one after it, once an interval, and a line per refusal would bury
+     * the log under a single fact; the listener still hears every one of them.
+     */
+    private static final long ACKNOWLEDGE_WARNING_INTERVAL_NANOS = Duration.ofMinutes(1).toNanos();
+
     private final ConnectorProvisioner provisioner;
     private final KeyedStateStore stateStore;
     private final Duration preflightTimeout;
+    private final long acknowledgeIntervalNanos;
+    private final LongSupplier nanoClock;
 
     /** For the drives that keep nothing: no store, so nothing a connector writes is filed anywhere. */
     public PdkCapturePort(ConnectorProvisioner provisioner) {
@@ -87,17 +110,29 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
 
     public PdkCapturePort(
             ConnectorProvisioner provisioner, KeyedStateStore stateStore, Duration preflightTimeout) {
-        this.provisioner = provisioner;
-        this.stateStore = stateStore;
-        this.preflightTimeout = requirePositive(preflightTimeout);
+        this(provisioner, stateStore, preflightTimeout, DEFAULT_ACKNOWLEDGE_INTERVAL, System::nanoTime);
     }
 
-    private static Duration requirePositive(Duration timeout) {
-        Objects.requireNonNull(timeout, "preflightTimeout");
-        if (timeout.isZero() || timeout.isNegative()) {
-            throw new IllegalArgumentException("preflightTimeout must be positive");
+    /**
+     * As above, with how often a cdc subscription hands its connector the latest acknowledged position, and
+     * the clock that interval is measured on -- for a case that has to cross the interval without waiting
+     * it out.
+     */
+    PdkCapturePort(ConnectorProvisioner provisioner, KeyedStateStore stateStore, Duration preflightTimeout,
+            Duration acknowledgeInterval, LongSupplier nanoClock) {
+        this.provisioner = provisioner;
+        this.stateStore = stateStore;
+        this.preflightTimeout = requirePositive(preflightTimeout, "preflightTimeout");
+        this.acknowledgeIntervalNanos = requirePositive(acknowledgeInterval, "acknowledgeInterval").toNanos();
+        this.nanoClock = Objects.requireNonNull(nanoClock, "nanoClock");
+    }
+
+    private static Duration requirePositive(Duration value, String name) {
+        Objects.requireNonNull(value, name);
+        if (value.isZero() || value.isNegative()) {
+            throw new IllegalArgumentException(name + " must be positive");
         }
-        return timeout;
+        return value;
     }
 
     @Override
@@ -213,6 +248,10 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
      * <p>A recorded position this connector can no longer read is a coded refusal, raised before anything
      * is opened. Beginning at the present instead would be the silent form of the same failure — every
      * change made since the position was recorded dropped, with nothing thrown and nothing logged.
+     *
+     * <p>The subscription's {@link Subscription#acknowledge acknowledge} records the position and returns;
+     * the stream's next delivery hands it to the connector's flush function, on the connector's own delivery
+     * thread, and reports the outcome to {@code listener} -- see {@code Acknowledgements}.
      */
     @Override
     public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
@@ -252,21 +291,35 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
         // refuses the start instead of letting the pipeline report RUNNING before its tail fails.
         CompletableFuture<Void> preflight = OracleLogMinerIdentifiers.appliesTo(config)
                 ? new CompletableFuture<>() : null;
+        Acknowledgements acknowledgements = new Acknowledgements(connector, listener,
+                connector.functions().getFlushOffsetFunction(), acknowledgeIntervalNanos, nanoClock);
         Thread thread = new Thread(
-                () -> streamLoop(connector, config, resumeAt, startAt, listener, stream, preflight),
+                () -> streamLoop(connector, config, resumeAt, startAt, listener, stream, preflight,
+                        acknowledgements),
                 "tapstate-cdc-" + connector.connectorId());
         thread.setDaemon(true);
         thread.start();
         awaitPreflight(preflight, connector, thread);
         AtomicBoolean closed = new AtomicBoolean();
-        return () -> {
-            if (!closed.compareAndSet(false, true)) {
-                return;
+        return new Subscription() {
+            @Override
+            public void acknowledge(SourcePosition durable) {
+                acknowledgements.offer(durable);
             }
-            thread.interrupt();
-            connector.stopQuietly();
-            joinQuietly(thread);
-            connector.close();
+
+            @Override
+            public void close() {
+                if (!closed.compareAndSet(false, true)) {
+                    return;
+                }
+                // Before the connector is told to stop: a source may still deliver on its way down, and a
+                // delivery made after close must hand it nothing.
+                acknowledgements.close();
+                thread.interrupt();
+                connector.stopQuietly();
+                joinQuietly(thread);
+                connector.close();
+            }
         };
     }
 
@@ -535,7 +588,8 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
     }
 
     private void streamLoop(PdkConnector connector, CaptureConfig config, Object resumeAt, Long startAt,
-            CaptureListener listener, StreamReadFunction stream, CompletableFuture<Void> preflight) {
+            CaptureListener listener, StreamReadFunction stream, CompletableFuture<Void> preflight,
+            Acknowledgements acknowledgements) {
         try {
             connector.underLoader(() -> {
                 // streamRead is handed only stream names, so the connector reads each changed table's
@@ -558,6 +612,13 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
                 listener.onStart(position(connector, startOffset));
                 Map<String, Map<String, String>> declared = declaredTypes(tables);
                 StreamReadConsumer consumer = StreamReadConsumer.create((events, offset) -> {
+                    // Every delivery is the moment to hand the connector what its source may release: this
+                    // is the connector's own delivery thread, the one thread any connector can safely be
+                    // told on. A delivery of heartbeats alone counts too, which keeps a quiet stream
+                    // releasing.
+                    // Before the batch rather than after it, because handing a batch over can hold this
+                    // thread for as long as the recipient needs room, and the release is due regardless.
+                    acknowledgements.applyIfDue();
                     // A change stream also carries control events (heartbeats and the like) that signal
                     // the tail is alive but carry no row; they are not decodable changes, so skip them.
                     List<TapEvent> changes = new ArrayList<>(events.size());
@@ -604,6 +665,139 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
             }
             LOG.warn("cdc stream for connector {} stopped on a failure", connector.connectorId(), t);
             listener.onError(reported);
+        }
+    }
+
+    /**
+     * What one cdc subscription has been told its source may release, and when that was last handed to the
+     * connector.
+     *
+     * <p><b>One slot, holding the latest.</b> A durable position covers every one before it, so a newer one
+     * replaces one not yet handed over, and a queue would only replay positions already superseded.
+     *
+     * <p><b>Handed over on the connector's own delivery thread, and on no other.</b> A source releases its log
+     * over the connection it reads it from -- Postgres confirms a position on the very replication stream it
+     * is polling -- and that connection is not safe to drive from a second thread while the first reads it.
+     * The thread that acknowledges is the runtime's, which must not wait on a source either. So
+     * acknowledging only fills the slot, and the next delivery hands it over. A quiet source still delivers
+     * heartbeats, so a stream with no changes to pass on does not stop releasing.
+     *
+     * <p><b>As the connector's own offset.</b> A connector recognizes only a position of its own making and
+     * passes over anything else in silence, so the token is read back into the object it was made from,
+     * exactly as a resume reads it.
+     *
+     * <p><b>Again every interval, even unchanged.</b> A connector gives no sign that it acted on a position,
+     * and some drop one without a word -- handed over before the source has started streaming, say -- so the
+     * latest is handed over again every interval rather than once. That is harmless: it names the same
+     * place. An attempt is timed whether it went through or failed, so a source that refuses is asked once
+     * an interval rather than on every delivery.
+     *
+     * <p><b>Never at the stream's expense.</b> A position that cannot be handed over is reported, coded, to
+     * the listener and in a rate-limited warning, and the delivery goes on as if nothing had happened: a
+     * source that has not released yet keeps some log a while longer, and failing the stream over that
+     * would make an outage of a delay.
+     */
+    private static final class Acknowledgements {
+
+        private final PdkConnector connector;
+        private final CaptureListener listener;
+        /** The connector's flush function, or null when it registered none: then nothing is ever handed over. */
+        private final FlushOffsetFunction flush;
+        private final long intervalNanos;
+        private final LongSupplier clock;
+
+        /** The latest position acknowledged: set by whoever acknowledges, read by the delivery. */
+        private final AtomicReference<SourcePosition> latest = new AtomicReference<>();
+
+        /** Set by close and read by the delivery, so a delivery the source makes on its way down does nothing. */
+        private volatile boolean closed;
+
+        // The delivery's own bookkeeping, guarded by this so that it holds even for a source that delivers
+        // from more than one thread over its life.
+        private boolean attempted;
+        private long lastAttemptNanos;
+        private boolean warned;
+        private long lastWarningNanos;
+        private long failuresSinceWarning;
+
+        Acknowledgements(PdkConnector connector, CaptureListener listener, FlushOffsetFunction flush,
+                long intervalNanos, LongSupplier clock) {
+            this.connector = connector;
+            this.listener = listener;
+            this.flush = flush;
+            this.intervalNanos = intervalNanos;
+            this.clock = clock;
+        }
+
+        /** Makes {@code durable} the latest, for the next delivery to hand over; does nothing once closed. */
+        void offer(SourcePosition durable) {
+            Objects.requireNonNull(durable, "durable");
+            if (!closed) {
+                latest.set(durable);
+            }
+        }
+
+        void close() {
+            closed = true;
+        }
+
+        /**
+         * Hands the latest position to the connector when one is due: the subscription is open, the connector
+         * registered a flush function, a position has been acknowledged, and an interval has passed since the
+         * last attempt. Called on the delivery thread, before the batch is passed on.
+         */
+        synchronized void applyIfDue() {
+            if (flush == null || closed) {
+                return;
+            }
+            SourcePosition position = latest.get();
+            if (position == null) {
+                return;
+            }
+            long now = clock.getAsLong();
+            if (attempted && now - lastAttemptNanos < intervalNanos) {
+                return;
+            }
+            attempted = true;
+            lastAttemptNanos = now;
+            try {
+                // Through the connector's own seam, for its loader and its pipeline attribution. A delivery
+                // on the stream's own thread already carries both; one from a thread the connector started
+                // for itself may not, and whatever the connector logs while it releases is this pipeline's.
+                connector.underLoader(() -> {
+                    flush.flushOffset(connector.context(), ConnectorOffsetCodec.fromToken(
+                            connector.connectorId(), position.token(),
+                            connector.connector().getClass().getClassLoader()));
+                    return null;
+                });
+            } catch (VirtualMachineError fatal) {
+                // Not a position the source refused but a process in trouble, which this bridge lets crash
+                // bare wherever it surfaces.
+                throw fatal;
+            } catch (Throwable failure) {
+                if (failure instanceof InterruptedException) {
+                    // The stream is being closed, and the interrupt that says so is the connector's to see.
+                    Thread.currentThread().interrupt();
+                }
+                failed(failure, now);
+                return;
+            }
+            listener.onAcknowledged(position);
+        }
+
+        private void failed(Throwable failure, long now) {
+            TapstateException coded = new TapstateException(ConnectorError.ACKNOWLEDGE_FAILED,
+                    Map.of("connector", connector.connectorId(), "detail", detail(failure)), failure);
+            failuresSinceWarning++;
+            if (!warned || now - lastWarningNanos >= ACKNOWLEDGE_WARNING_INTERVAL_NANOS) {
+                LOG.warn("cdc stream for connector {} could not tell its source how far it may release its change "
+                        + "log; the stream carries on and retries (failures since the last warning: {})",
+                        connector.connectorId(), failuresSinceWarning, coded);
+                warned = true;
+                lastWarningNanos = now;
+                failuresSinceWarning = 0;
+            }
+            listener.onAcknowledgeFailed(coded);
         }
     }
 
