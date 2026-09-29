@@ -36,6 +36,7 @@ import org.junit.jupiter.api.Test;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -1209,8 +1210,8 @@ class CaptureRunUnitTest {
                     meta.read(chainId).orElseThrow().epoch(), 0L);
             Thread beforeArrival = new Thread(() -> {
                 try {
-                    CdcPhase.run(new FakeSource(List.of(), beforeArrivalChanges), config(), chain,
-                            () -> meta.consumerOffsets(chainId), new CaptureHealth());
+                    writeThroughTheRing(new FakeSource(List.of(), beforeArrivalChanges), chain,
+                            () -> meta.consumerOffsets(chainId));
                 } catch (Throwable failure) {
                     beforeArrivalFailure.set(failure);
                 }
@@ -1240,8 +1241,8 @@ class CaptureRunUnitTest {
             }
             afterArrival = new Thread(() -> {
                 try {
-                    CdcPhase.run(new FakeSource(List.of(), afterArrivalChanges), config(), chain,
-                            () -> meta.consumerOffsets(chainId), new CaptureHealth());
+                    writeThroughTheRing(new FakeSource(List.of(), afterArrivalChanges), chain,
+                            () -> meta.consumerOffsets(chainId));
                 } catch (Throwable failure) {
                     afterArrivalFailure.set(failure);
                 }
@@ -1546,6 +1547,24 @@ class CaptureRunUnitTest {
                 MiningChainId.ofKey("chain-released").value(), List.of(new PipelineNode("pipe-1", "src-1"))));
         assertThat(source.released.get(1).sharedNotes()).isNull();
         assertThat(source.released.get(1).node()).isEqualTo(new PipelineNode("pipe-1", "src-1"));
+    }
+
+    /**
+     * Writes {@code source}'s changes into {@code chain}'s ring for {@code config()}'s table, bounded by
+     * {@code consumers}, through a reader whose account is kept in a store of its own -- the cases using this
+     * read the ring, not what the chain lets go of -- and stops the reader once its source has handed
+     * everything over.
+     */
+    private static void writeThroughTheRing(
+            CapturePort source, CdcChain chain, Supplier<Collection<ConsumerOffset>> consumers) {
+        InMemoryMeta account = new InMemoryMeta();
+        account.create(chain.miningChainId(), null);
+        long epoch = account.openEpoch(chain.miningChainId());
+        CaptureHealth health = new CaptureHealth();
+        PhysicalSourcePrefix prefix = PhysicalSourcePrefix.shared(
+                account, chain.miningChainId(), epoch, List.of("orders"), health, (table, seq) -> { });
+        CdcPhase.run(source, config(), CaptureStart.present(),
+                Map.of("orders", new CdcPhase.TableRoute(chain, consumers)), health, prefix).close();
     }
 
     private static CaptureConfig configOver(String... tables) {

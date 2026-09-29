@@ -57,10 +57,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /**
  * The cdc phase drives an unbounded change stream through the headroom gate into the per-table change
  * ring: each change event (ops {@code i} / {@code u} / {@code d} / {@code ddl}) is projected to a ring
- * item, admitted only while a consumer's unread change is not at risk, and the source read offset is
- * advanced — clamped to the slowest consumer's sink-acked position — as writes land. The ring runs over a
- * single embedded Hazelcast member sized to the L1 hot-buffer shape (capacity 8), matching the write-gate
- * tests.
+ * item, admitted only while a consumer's unread change is not at risk, and each run is handed to the
+ * reader's account, which alone decides what the chain may let go of. The ring runs over a single embedded
+ * Hazelcast member sized to the L1 hot-buffer shape (capacity 8), matching the write-gate tests.
  *
  * <p>The per-event source position is threaded here at the cdc seam: the event envelope carries no
  * position slot, so at L1 a mock monotonic watermark supplies each change its opaque position (D10); real
@@ -135,6 +134,40 @@ class CdcPhaseTest {
         return thread.getState() == target;
     }
 
+    /**
+     * Starts {@code chain}'s reader over the one table these cases write, the way a capture runs it: every
+     * change goes into the ring through the admission these cases are about, bounded by {@code consumers}.
+     */
+    private static Reader readerOf(
+            CapturePort port, CdcChain chain, Supplier<Collection<ConsumerOffset>> consumers, CaptureHealth health) {
+        return readerOf(port, Map.of("orders", new CdcPhase.TableRoute(chain, consumers)), health);
+    }
+
+    /**
+     * The same over {@code routes}. What the chain may let go of is decided by the reader's account, kept here
+     * in a store of its own with nobody owed anything, so every run is let go of as soon as it is written: what
+     * an account waits for is its own cases' subject, and these read only what reaches the ring and what the
+     * account was handed.
+     */
+    private static Reader readerOf(CapturePort port, Map<String, CdcPhase.TableRoute> routes, CaptureHealth health) {
+        CaptureRunUnitTest.InMemoryMeta account = new CaptureRunUnitTest.InMemoryMeta();
+        String chainId = "account";
+        account.create(chainId, null);
+        long epoch = account.openEpoch(chainId);
+        PhysicalSourcePrefix prefix = PhysicalSourcePrefix.shared(
+                account, chainId, epoch, List.copyOf(routes.keySet()), health, (table, seq) -> { });
+        return new Reader(CdcPhase.run(port, config(), CaptureStart.present(), routes, health, prefix), account);
+    }
+
+    /** A running reader, and the store its account wrote down what it let go of in. */
+    private record Reader(Subscription subscription, CaptureRunUnitTest.InMemoryMeta account) {
+
+        /** The positions the account let go of, in order. */
+        List<String> released() {
+            return account.releasedSourceReads.stream().map(ChainPosition::token).toList();
+        }
+    }
+
     @Test
     void disjointTableConsumerDoesNotPinHeadroom() {
         ConsumerOffset nest = new ConsumerOffset("nest",
@@ -162,7 +195,7 @@ class CdcPhaseTest {
                 Envelope.update(2, "orders", Map.of("id", 1), Map.of("id", 1, "n", 9), Map.of()),
                 Envelope.delete(3, "orders", Map.of("id", 1), Map.of())));
 
-        CdcPhase.run(port, config(), chain, () -> List.of(keepingUp()), new CaptureHealth());
+        readerOf(port, chain, () -> List.of(keepingUp()), new CaptureHealth());
 
         assertThat(ring.tailSequence()).isEqualTo(2L);
         SrsItem first = ring.readOne(0);
@@ -189,32 +222,10 @@ class CdcPhaseTest {
                 new SrsWriteGate(new SrsRingbuffer(ring)), new RecordingMeta(),
                 "chain", RING_GENERATION, 0L, fence);
 
-        CdcPhase.run(
-                new FakeCdcPort(List.of(Envelope.insert(1, "orders", Map.of("id", 1), Map.of()))),
-                config(), chain, () -> List.of(keepingUp()), new CaptureHealth());
+        readerOf(new FakeCdcPort(List.of(Envelope.insert(1, "orders", Map.of("id", 1), Map.of()))),
+                chain, () -> List.of(keepingUp()), new CaptureHealth());
 
         assertThat(ring.readOne(0).captureFence()).isEqualTo(fence);
-    }
-
-    @Test
-    void advancesTheSourceReadOffsetClampedToTheSlowestSinkAckedPosition() {
-        SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.chain.offset")));
-        RecordingMeta meta = new RecordingMeta();
-        // One consumer has durably acked its sink up to w2; the persisted read offset must never pass it.
-        List<ConsumerOffset> consumers = List.of(new ConsumerOffset("p1", Map.of("orders", 9L), new ChainPosition(new SourceOrder(RING_GENERATION, 1), "w2")));
-        CdcChain chain = new CdcChain(gate, meta, "chain", RING_GENERATION, 0L);
-        FakeCdcPort port = new FakeCdcPort(List.of(
-                Envelope.insert(1, "orders", Map.of("id", 1), Map.of()),
-                Envelope.insert(2, "orders", Map.of("id", 2), Map.of()),
-                Envelope.insert(3, "orders", Map.of("id", 3), Map.of())));
-
-        CdcPhase.run(port, config(), chain, () -> consumers, new CaptureHealth());
-
-        // Written at w1, then clamped to the slowest sink-acked position w2 -- the persisted offset never
-        // passes a change no consumer has durably landed. The third change resolves that same clamped
-        // position again, and writing it a second time would tell the record what it already holds, so
-        // nothing is written for it: three changes, two writes.
-        assertThat(meta.advances).containsExactly("w1", "w2");
     }
 
     @Test
@@ -233,7 +244,7 @@ class CdcPhaseTest {
 
         // Wired the way the runtime wires it: the cursors are fetched through the store, not handed in
         // as a constant. A supplier that closed over a list would make this case unable to see a read.
-        CdcPhase.run(port, config(), chain, () -> meta.consumerOffsets("chain"), new CaptureHealth());
+        readerOf(port, chain, () -> meta.consumerOffsets("chain"), new CaptureHealth());
 
         assertThat(meta.cursorReads)
                 .as("one cursor read per change, and no more: this is the figure a machine's speed cannot "
@@ -243,21 +254,17 @@ class CdcPhaseTest {
                 .as("and never the whole record, which carries a schema history that grows per DDL and is "
                         + "not read on this path; falling back to it is a cost that grows with the chain")
                 .isZero();
-        assertThat(meta.writes)
-                .as("at most one write per change, and fewer once a position resolves to what the record "
-                        + "already holds")
-                .isLessThanOrEqualTo(5);
     }
 
 
     /**
-     * A burst larger than the buffer is carried whole, and costs one durable write rather than one per
-     * change.
+     * A burst larger than the buffer is carried whole, and is handed to the reader's account as one run
+     * rather than one per change.
      *
      * <p>This is the shape a cleanup transaction makes: a source hands over thousands of changes in a
      * single delivery. Two things have to be true of it and they pull in opposite directions -- every
-     * change has to get through, and getting them through must not cost a round trip each. An
-     * implementation that wrote per change satisfies the first and fails the second; one that dropped
+     * change has to get through, and getting them through must not cost the account an entry each. An
+     * implementation that recorded per change satisfies the first and fails the second; one that dropped
      * what would not fit satisfies the second and fails the first. Neither reading alone is worth
      * anything, which is why both are here.
      *
@@ -268,71 +275,68 @@ class CdcPhaseTest {
      * green, which is the wrong site rather than an absent one: the pieces are cut to the buffer's size,
      * so no append ever does not fit.
      *
-     * <p>The second half is not witnessed and this says so. It rests on where the advance sits -- outside
-     * the loop over a delivery's changes, so it happens once however many there are -- and moving it
+     * <p>The second half is not witnessed and this says so. It rests on where the run is handed over --
+     * outside the loop over a delivery's changes, so it happens once however many there are -- and moving it
      * inside is a restructuring rather than an edit. For that half this is a regression guard on a shape
      * that is currently right, which is less than a witness and is not written up as one.
      *
      * <p>Counted rather than timed. What a burst costs in microseconds is a fact about the machine that
-     * ran it, and the figure it would be compared against is from another one; what it costs in writes to
-     * the record is the same everywhere. And that every change got through is read off the sequence the
+     * ran it, and the figure it would be compared against is from another one; what it costs in entries
+     * the account lets go of is the same everywhere. And that every change got through is read off the sequence the
      * buffer assigned, not off a clock: it says all of them were admitted whether or not any is still in
      * memory, which for a burst past the buffer's size is the only honest way to ask.
      */
     @Test
-    void aBurstPastTheBufferGetsThroughWholeAndCostsOneWrite() {
+    void aBurstPastTheBufferGetsThroughWholeAsOneRun() {
         SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer("srs.chain.burst"));
         SrsWriteGate gate = new SrsWriteGate(ring);
-        // A consumer that is well ahead of anything this delivers. Without one the frontier has nothing
-        // to take a minimum over and never moves at all -- measured: with no consumers both readings
-        // below are nought, which would read as "it wrote nothing" and mean "nobody asked it to".
+        // A consumer that is well ahead of anything this delivers, so room is never what the burst waits on.
         CountingMeta meta = new CountingMeta(List.of(keepingUp()));
         CdcChain chain = new CdcChain(gate, meta, "chain", RING_GENERATION, 0L);
 
         int burst = (int) ring.capacity() * 6;
         BatchingCdcPort port = new BatchingCdcPort(burst, burst);
 
-        CdcPhase.run(port, config(), chain, () -> meta.consumerOffsets("chain"), new CaptureHealth());
+        Reader reader = readerOf(port, chain, () -> meta.consumerOffsets("chain"), new CaptureHealth());
 
         assertThat(ring.tailSequence() + 1)
                 .as("changes the buffer took in from a burst of %d -- %d is its whole capacity, so this "
                         + "asks whether the delivery got through rather than whether it still fits",
                         burst, ring.capacity())
                 .isEqualTo(burst);
-        assertThat(meta.writes)
-                .as("writes to the record that burst cost: the offset is advanced once at the close of a "
-                        + "delivery, so a burst is one write however many changes it carries. One per "
-                        + "change would be %d", burst)
-                .isEqualTo(1);
+        assertThat(reader.released())
+                .as("positions the account let go of for that burst: it is handed over once at the close of a "
+                        + "delivery, so a burst is one run however many changes it carries. One per change "
+                        + "would be %d", burst)
+                .hasSize(1);
     }
 
     /**
-     * The offset is written at the close of every delivery, which is what bounds how much a restart redoes.
+     * Every delivery is its own run in the reader's account, which is what bounds how much a restart redoes.
      *
-     * <p>A run that stops carries on from the last offset it wrote, so everything after that one is
-     * delivered a second time. What that costs is therefore decided entirely by how often the offset is
-     * written: at the close of each delivery, the most that can be redone is the delivery that was in
-     * flight. Written once at the end of the whole run instead, everything since the run began is redone
-     * -- unbounded in the only sense that matters, since a tail does not end.
+     * <p>A run that stops carries on from the last position its account let go of, so everything after
+     * that one is delivered a second time. What that costs is therefore decided by how finely runs are
+     * recorded: one per delivery, and once everything before it has landed the most that can be redone is
+     * the delivery in flight. One for the whole of a tail's life instead, everything since it began is
+     * redone -- unbounded in the only sense that matters, since a tail does not end.
      *
-     * <p>So the reading is the number of advances against the number of deliveries. It is the mechanism
-     * rather than the consequence, and deliberately: measuring the redo directly needs a run to be cut at
-     * a chosen instant, and an instant chosen by a test is not the one a failure picks. The count of
-     * advances says the bound holds wherever the cut lands.
+     * <p>So the reading is the number of positions let go of against the number of deliveries. It is the
+     * mechanism rather than the consequence, and deliberately: measuring the redo directly needs a run to be
+     * cut at a chosen instant, and an instant chosen by a test is not the one a failure picks. The count
+     * says the bound holds wherever the cut lands.
      */
     @Test
-    void theOffsetIsWrittenPerDeliveryWhichIsWhatBoundsARedo() {
+    void everyDeliveryIsARunOfItsOwnWhichIsWhatBoundsARedo() {
         SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.chain.redo")));
-        RecordingMeta meta = new RecordingMeta();
-        CdcChain chain = new CdcChain(gate, meta, "chain", RING_GENERATION, 0L);
+        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
 
         int perDelivery = 4;
         int deliveries = 5;
         BatchingCdcPort port = new BatchingCdcPort(perDelivery * deliveries, perDelivery);
 
-        CdcPhase.run(port, config(), chain, () -> List.of(keepingUp()), new CaptureHealth());
+        Reader reader = readerOf(port, chain, () -> List.of(keepingUp()), new CaptureHealth());
 
-        assertThat(meta.advances)
+        assertThat(reader.released())
                 .as("positions written over %d deliveries of %d changes each: one at the close of each, so "
                         + "a run cut anywhere redoes at most the %d that were in flight. Written once at "
                         + "the end instead, this is a single entry and the redo is the whole run",
@@ -383,7 +387,7 @@ class CdcPhaseTest {
                     new ChainPosition(new SourceOrder(RING_GENERATION, readTo), "w" + readTo)));
         };
 
-        CdcPhase.run(new BatchingCdcPort(burst, burst), config(), chain, reader, new CaptureHealth());
+        readerOf(new BatchingCdcPort(burst, burst), chain, reader, new CaptureHealth());
 
         assertThat(looks.get())
                 .as("times the writer asked what the reader had reached, over %d pieces: it re-reads on "
@@ -423,6 +427,7 @@ class CdcPhaseTest {
 
         @Override
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+            listener.onStart(Optional.of(new SourcePosition("w0")));
             List<Envelope> delivery = new ArrayList<>(perDelivery);
             for (int change = 1; change <= changes; change++) {
                 delivery.add(Envelope.insert(change, "orders", Map.of("id", change), Map.of()));
@@ -549,31 +554,6 @@ class CdcPhaseTest {
         }
     }
 
-    @Test
-    void cutsTheDurableLogBackToWhatEveryConsumerHasLanded() {
-        SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.chain.trim")));
-        RecordingMeta meta = new RecordingMeta();
-        // One consumer, durably acked at ring sequence 1.
-        List<ConsumerOffset> consumers = List.of(new ConsumerOffset(
-                "p1", Map.of("orders", 9L), new ChainPosition(new SourceOrder(RING_GENERATION, 1), "w2")));
-        CdcChain chain = new CdcChain(gate, meta, "chain", RING_GENERATION, 0L);
-        List<Long> cuts = new ArrayList<>();
-        Map<String, CdcPhase.TableRoute> routes = Map.of("orders", new CdcPhase.TableRoute(
-                chain, () -> consumers, cuts::add));
-        FakeCdcPort port = new FakeCdcPort(List.of(
-                Envelope.insert(1, "orders", Map.of("id", 1), Map.of()),
-                Envelope.insert(2, "orders", Map.of("id", 2), Map.of()),
-                Envelope.insert(3, "orders", Map.of("id", 3), Map.of())));
-
-        CdcPhase.run(port, config(), routes, new CaptureHealth());
-
-        // The cut is the same clamped frontier the offset advance uses: sequence 0 while the reader is
-        // still behind the ack, then the ack itself once it is not. A log that is never cut grows without
-        // bound, and a cut that ran ahead of this would delete a change a consumer has not landed.
-        assertThat(cuts)
-                .as("the cut rides the frontier, so it is asked for whenever that moves and never passes it")
-                .containsExactly(0L, 1L);
-    }
 
     @Test
     void backpressuresARefusedWriteAndRetriesRatherThanDropIt() throws Exception {
@@ -587,14 +567,14 @@ class CdcPhaseTest {
         // seq 0 on the next -- modeling the source read pausing until a consumer frees a slot.
         AtomicLong polls = new AtomicLong();
         // The bound is read off the consumer cursors, so this is a consumer that has read nothing of orders
-        // on the first poll and has reached seq 0 by the next. It has acked nothing, which is why no offset
-        // is written here: this case is about the refused write being retried, not about the frontier.
+        // on the first poll and has reached seq 0 by the next. This case is about the refused write being
+        // retried, not about what the chain may let go of.
         Supplier<Collection<ConsumerOffset>> minRead = () -> List.of(new ConsumerOffset(
                 "p1", Map.of("orders", polls.getAndIncrement() == 0 ? -1L : 0L), null));
         CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of(Envelope.insert(9, "orders", Map.of("id", 9), Map.of())));
 
-        CdcPhase.run(port, config(), chain, minRead, new CaptureHealth());
+        readerOf(port, chain, minRead, new CaptureHealth());
 
         // The change is not dropped: it lands at seq 8 once headroom frees, and the write was retried
         // (polled more than once) rather than silently overwriting the still-unread seq 0.
@@ -618,7 +598,7 @@ class CdcPhaseTest {
         CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of(Envelope.insert(9, "orders", Map.of("id", 9), Map.of())));
 
-        Thread writer = new Thread(() -> CdcPhase.run(port, config(), chain, minRead, new CaptureHealth()), "cdc-writer");
+        Thread writer = new Thread(() -> readerOf(port, chain, minRead, new CaptureHealth()), "cdc-writer");
         writer.setDaemon(true);
         try {
             writer.start();
@@ -663,7 +643,7 @@ class CdcPhaseTest {
         FakeCdcPort port = new FakeCdcPort(
                 List.of(Envelope.insert(1, "orders", Map.of("id", 1), Map.of())));
 
-        CdcPhase.run(port, config(), chain, List::of, health);
+        readerOf(port, chain, List::of, health);
 
         assertThat(refusing.refusalsServed)
                 .as("refusals the cluster served before it agreed -- without them this case asserts "
@@ -697,7 +677,7 @@ class CdcPhaseTest {
         FakeCdcPort port = new FakeCdcPort(
                 List.of(Envelope.insert(1, "orders", Map.of("id", 1), Map.of())));
 
-        CdcPhase.run(port, config(), chain, List::of, health);
+        readerOf(port, chain, List::of, health);
 
         assertThat(refusing.refusalsServed)
                 .as("refusals served, all of them on the capacity read")
@@ -764,7 +744,7 @@ class CdcPhaseTest {
 
         Thread.currentThread().interrupt();
         try {
-            assertThatThrownBy(() -> CdcPhase.run(port, config(), chain, List::of, new CaptureHealth()))
+            assertThatThrownBy(() -> readerOf(port, chain, List::of, new CaptureHealth()))
                     .as("the refusal itself, rather than a wait that cannot wait")
                     .isInstanceOf(RingWriteRefusedException.class);
         } finally {
@@ -779,7 +759,7 @@ class CdcPhaseTest {
         CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of());
 
-        Subscription sub = CdcPhase.run(port, config(), chain, List::of, new CaptureHealth());
+        Subscription sub = readerOf(port, chain, List::of, new CaptureHealth()).subscription();
         sub.close();
 
         // The phase hands back the port's own subscription; closing it stops the stream.
@@ -792,7 +772,7 @@ class CdcPhaseTest {
         CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of(Envelope.insert(1, "orders", Map.of("id", 1), Map.of())));
 
-        assertThatThrownBy(() -> CdcPhase.run(port, config(), chain, null, new CaptureHealth()))
+        assertThatThrownBy(() -> readerOf(port, chain, null, new CaptureHealth()))
                 .isInstanceOf(NullPointerException.class);
 
         // Args are validated up front: the stream is never started when the wiring is incomplete.
@@ -806,7 +786,7 @@ class CdcPhaseTest {
         SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.chain.fail")));
         CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
 
-        CdcPhase.run(FakeCdcPort.failing(boom), config(), chain, List::of, health);
+        readerOf(FakeCdcPort.failing(boom), chain, List::of, health);
 
         // The stream reported a failure rather than a change; the phase records it on the health so the run
         // can surface a dead tail that the change ring merely going quiet would otherwise hide.
@@ -817,7 +797,7 @@ class CdcPhaseTest {
     void rejectsCdcEventsForTablesOutsideTheConfiguredSelection() {
         FakeCdcPort port = new FakeCdcPort(List.of(Envelope.insert(1, "customers", Map.of("id", 1), Map.of())));
 
-        assertThatThrownBy(() -> CdcPhase.run(port, config(), Map.of(), new CaptureHealth()))
+        assertThatThrownBy(() -> readerOf(port, Map.of(), new CaptureHealth()))
                 .isInstanceOfSatisfying(TapstateException.class, exception -> {
                     assertThat(exception.code()).isEqualTo(CaptureError.EVENT_TABLE_NOT_SELECTED);
                     assertThat(exception.args()).containsEntry("table", "customers");
@@ -856,6 +836,7 @@ class CdcPhaseTest {
                 listener.onError(error);
                 return () -> closed = true;
             }
+            listener.onStart(Optional.of(new SourcePosition("w0")));
             // Each change is handed over as a run of its own, each with its own position -- the shape a
             // source that names a position per change produces.
             for (Envelope e : events) {
@@ -1008,7 +989,10 @@ class CdcPhaseTest {
         }
     }
 
-    /** A meta store that records the sequence of source-read-offset advances; the other facets are unused here. */
+    /**
+     * The chain's record, which nothing on this path writes: a position is the reader's account's to write
+     * down, so every facet here is a wiring mistake if it is reached.
+     */
     private static final class RecordingMeta implements SrsMetaStore {
         @Override
         public java.util.List<String> miningChainIdsWithConsumer(String pipelineId) {
@@ -1026,8 +1010,6 @@ class CdcPhaseTest {
             throw new UnsupportedOperationException("consumer detachment is not exercised by this double");
         }
 
-        final List<String> advances = new ArrayList<>();
-
         @Override
         public void rewindSourceReadOffset(String miningChainId, String token) {
             // No test on this double writes a position back; a call here is a wiring mistake, not a case.
@@ -1036,7 +1018,7 @@ class CdcPhaseTest {
 
         @Override
         public void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
-            advances.add(position.token());
+            throw new UnsupportedOperationException("advanceSourceReadOffset");
         }
 
         @Override

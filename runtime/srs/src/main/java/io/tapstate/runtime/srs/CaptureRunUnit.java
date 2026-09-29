@@ -571,7 +571,7 @@ public final class CaptureRunUnit {
                 SrsWriteGate gate = new SrsWriteGate(
                         new SrsRingbuffer(hz.getRingbuffer(SrsRingbuffer.ringName(chainId, table))));
                 CdcChain chain = new CdcChain(gate, meta, chainId, epoch, spec.schemaVer(), spec.captureFence());
-                routes.put(table, new CdcPhase.TableRoute(chain, consumers, seq -> { }));
+                routes.put(table, new CdcPhase.TableRoute(chain, consumers));
             }
             CaptureConfig physical = spec.config().over(selection.tables()).sharing(notes);
             stream = CdcPhase.run(port, physical, start, routes, health, prefix);
