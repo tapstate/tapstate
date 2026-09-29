@@ -414,6 +414,42 @@ class PdkCapturePortTest {
     // ---- where the tail is told to begin ----------------------------------------------------------
 
     /**
+     * The stream says where it begins before it hands over its first change.
+     *
+     * <p>A reader that buffers changes only in memory has nothing else to resume from until one of them has
+     * landed, so the position has to be in its hands first. Heard after the first batch it is too late: a
+     * process that stops in between resumes from wherever the record said before, which may be nowhere.
+     */
+    @Test
+    void cdcReportsWhereItBeginsBeforeTheFirstChange(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.timestampEchoingSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.TimestampEchoingSource", null));
+        List<String> callbacks = new CopyOnWriteArrayList<>();
+        AtomicReference<Optional<SourcePosition>> start = new AtomicReference<>();
+        CountDownLatch firstBatch = new CountDownLatch(1);
+        CaptureListener listener = new CaptureListener() {
+            @Override
+            public void onStart(Optional<SourcePosition> position) {
+                start.set(position);
+                callbacks.add("start");
+            }
+
+            @Override
+            public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                callbacks.add("batch");
+                firstBatch.countDown();
+            }
+        };
+
+        try (Subscription ignored = port.cdc(config("t1"), CaptureStart.present(), listener)) {
+            assertThat(firstBatch.await(5, TimeUnit.SECONDS)).as("the tail delivered its first batch").isTrue();
+        }
+
+        assertThat(start.get()).as("the start position the connector named").isPresent();
+        assertThat(callbacks).startsWith("start", "batch");
+    }
+
+    /**
      * The mark the echoing source stamps on the first row it emits: what it was asked to resolve, and so
      * what actually reached the connector rather than what the caller believed it had said.
      */

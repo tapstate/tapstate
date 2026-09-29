@@ -13,6 +13,22 @@ import java.util.Optional;
 public interface CaptureListener {
 
     /**
+     * Called once, before the first run of changes, with the position the stream actually begins at: the
+     * connector's own start boundary, rendered the way every later position is.
+     *
+     * <p>A reader that keeps changes only in a volatile buffer needs this to be recoverable at all. Until a
+     * change has been durably landed, the only position it can resume from is one that sits before every
+     * change it is about to be handed, and the source is the only party that can name one. A recipient that
+     * needs it records it before it accepts anything else from the stream.
+     *
+     * <p>Empty when the source named no start position. That is a statement about the source rather than a
+     * gap: a recipient that needs a start position refuses the stream instead of inventing one, because an
+     * invented one resumes somewhere nothing was ever read from. The default ignores the call.
+     */
+    default void onStart(Optional<SourcePosition> position) {
+    }
+
+    /**
      * Called once per run of changes the source hands over, with the position it reported for that run.
      *
      * <p><strong>The run is the source's own, and it is delivered whole.</strong> A source reads a batch

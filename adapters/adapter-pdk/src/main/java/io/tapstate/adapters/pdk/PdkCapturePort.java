@@ -553,6 +553,9 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
                 // schema-only recovery with no stored offset to recover from. Which position it names is
                 // the instant it is handed: none for the present, the caller's for an instant start.
                 Object startOffset = resumeAt != null ? resumeAt : startOffset(connector, startAt);
+                // Where the stream begins, said before it hands over anything: a reader that buffers only in
+                // memory can resume from nothing else until one of its changes has landed.
+                listener.onStart(position(connector, startOffset));
                 Map<String, Map<String, String>> declared = declaredTypes(tables);
                 StreamReadConsumer consumer = StreamReadConsumer.create((events, offset) -> {
                     // A change stream also carries control events (heartbeats and the like) that signal

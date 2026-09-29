@@ -128,6 +128,11 @@ public final class CaptureHealth {
     public CaptureListener recording(CaptureListener onBatch) {
         return new CaptureListener() {
             @Override
+            public void onStart(Optional<SourcePosition> position) {
+                onBatch.onStart(position);
+            }
+
+            @Override
             public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
                 events.forEach(CaptureHealth.this::received);
                 onBatch.onBatch(events, position);
