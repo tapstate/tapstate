@@ -116,6 +116,18 @@ class TelemetryCleanupHealthTest {
                 "tapstate.process.telemetry.cleanup.degraded");
         assertThat(process.get().get()).allSatisfy(fact ->
                 assertThat(fact.points()).allSatisfy(point -> assertThat(point.attributes()).isEmpty()));
+
+        health.removed("flow", "inc-later");
+        assertThat(health.health()).as("a later artifact removal does not prove old residue was reclaimed")
+                .isEqualTo(new TelemetryCleanupHealth.Health(1, 1, true));
+        assertThat(process.get().get()).extracting(fact -> fact.points().getFirst().value())
+                .containsExactly(1L, 1L, 1L);
+        assertThat(offered).singleElement().satisfies(event -> {
+            assertThat(event.kind()).isEqualTo(PipelineEvent.Kind.CLEANUP_INCOMPLETE);
+            assertThat(event.beforeState()).isNull();
+            assertThat(event.afterState()).isNull();
+            assertThat(event.failure()).isNull();
+        });
     }
 
     @Test

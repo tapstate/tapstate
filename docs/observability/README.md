@@ -76,6 +76,13 @@ History, events, and rollups use the bounded retention policy; local logs use bo
 Cleanup failure is an operational diagnostic and does not undo an already completed artifact deletion.
 Remote exporter retention has the separate boundary described below.
 
+After deletion, a valid events request returns 404 `lifecycle.unknown-pipeline`, including when old
+events remain physically stored. An earlier cursor cannot authorize a read of the removed identity.
+Recreating the same id exposes only the new incarnation's scoped events. Diagnose incomplete cleanup
+with the process cleanup metrics and local logs. Without external metrics or centralized logs, process
+exit can lose those local diagnostic signals. A later successful cleanup does not establish that all
+earlier residue was reclaimed.
+
 ## Read performance and telemetry health facts
 
 The current metrics response carries a flat numeric `metrics` map and typed `facts` with units, attributes,
@@ -408,6 +415,11 @@ telemetry degraded/restored boundaries, cleanup diagnostics, and telemetry-gap m
 trail is retained for 15 days by default and is always `completeness: "BEST_EFFORT"`. It has no durable
 outbox or audit-level completeness guarantee. An empty page, no `FAILURE` event, or a completed cursor
 walk cannot prove that an event never happened.
+
+`CLEANUP_INCOMPLETE` remains an event kind. A cleanup failure for a deleted incarnation may be retained
+until TTL, but this does not provide a deleted-resource query route. The deleted pipeline's events API
+returns `lifecycle.unknown-pipeline`; a recreated pipeline cannot inherit that event. Process cleanup
+health and logs provide the operational signal.
 
 The REST request has required `from` and `to` RFC 3339 timestamps with an offset, with `from < to` and
 a maximum 15-day half-open range `[from,to)`. `limit` defaults to 100 and accepts 1 through 500. It

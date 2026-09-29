@@ -143,6 +143,12 @@ them merely because Prometheus scraped them.
 | `tapstate.process.jvm.gc.pause.observed.duration.sum` | C / `ns` | Observed JFR `GCPhasePause` durations from stream start; absent before first pause or after known loss/failure; no labels | Compare deltas with latency; the bounded stream is not a lossless lifetime account |
 | `tapstate.process.metrics.overflow.instruments`, `tapstate.process.metrics.overflow.series` | G / `{instrument}`, `{series}` | Distinct names and visible aggregate points currently folded by export; no labels | Inspect dimensions and budgets; these counts do not reveal the number of original series |
 
+Cleanup counters and the degraded gauge remain local process diagnostics after artifact deletion. A
+retained `CLEANUP_INCOMPLETE` event has the removed identity and grants no events read route for that
+deleted resource or a recreated one. Inspect process logs and the configured exporter; without external
+retention, process exit can lose the local signals. A successful later cleanup leaves earlier known
+incomplete cleanup unresolved.
+
 ## Bounds and unsupported readings
 
 The pipeline fold preserves totals, fixed dimensions, and histogram buckets. It removes only the open

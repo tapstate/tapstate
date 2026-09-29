@@ -55,6 +55,9 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.logging.Handler;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -607,9 +610,36 @@ class ArtifactMutationServiceTest {
         store.save(pipeline("flow"));
         store.assignIncarnation("flow", "inc-new");
         localScope.set(new ObservationStore.Scope("inc-new", 8));
-        pending.forEach(Runnable::run);
+        desired.put("flow", PipelineState.RUNNING);
+        state.put("flow", PipelineState.RUNNING);
+        observations.saveScoped(new Observation("flow", PipelineState.RUNNING, Map.of(), Map.of()), localScope.get());
+        List<LogRecord> diagnostics = new ArrayList<>();
+        Logger logger = Logger.getLogger(ArtifactMutationService.class.getName());
+        Handler capture = new Handler() {
+            @Override public void publish(LogRecord record) { diagnostics.add(record); }
+            @Override public void flush() { }
+            @Override public void close() { }
+        };
+        logger.addHandler(capture);
+        try {
+            pending.forEach(Runnable::run);
+        } finally {
+            logger.removeHandler(capture);
+        }
 
         assertThat(store.pipelineIncarnationId("flow")).contains("inc-new");
+        assertThat(desired.read("flow").orElseThrow().targetState()).isEqualTo(PipelineState.RUNNING);
+        assertThat(StateJson.parse(state.read("flow").orElseThrow().stateJson())).isEqualTo(PipelineState.RUNNING);
+        assertThat(observations.readStored("flow").orElseThrow()).satisfies(stored -> {
+            assertThat(stored.scope()).contains(localScope.get());
+            assertThat(stored.observation().state()).isEqualTo(PipelineState.RUNNING);
+        });
+        assertThat(diagnostics).anySatisfy(record -> {
+            assertThat(record.getLevel()).isEqualTo(java.util.logging.Level.WARNING);
+            assertThat(record.getMessage()).isEqualTo("Could not complete event-history cleanup for flow");
+            assertThat(record.getThrown()).isInstanceOf(IllegalStateException.class)
+                    .hasMessage("event store unavailable");
+        });
         assertThat(failures).singleElement().satisfies(failure -> {
             assertThat(failure.incarnationId()).isEqualTo("inc-old");
             assertThat(failure.executionGeneration()).isEqualTo(OptionalLong.of(7));

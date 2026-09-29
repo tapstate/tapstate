@@ -189,6 +189,7 @@ class PipelineObservationApiTest {
         history.append(new RateSample("pl1", NOW.minusSeconds(60),
                 Map.of("records.out", 700L, "bytes.out", 13_000L), Map.of("orders", 2L), COUNTING_SINCE));
         context.getBean(FakePipelineEventStore.class).clear();
+        context.getBean(FakeEventArtifacts.class).reset();
         context.getBean(FakeChainStore.class).reset();
         context.getBean(FakeStoppedPipelines.class).reset();
     }
@@ -607,11 +608,88 @@ class PipelineObservationApiTest {
         assertThat(unauthenticated.code()).isEqualTo("control.unauthenticated");
     }
 
+    @Test
+    void retainedCleanupEventsAndOldCursorCannotOutliveArtifactDeletionOrCrossSameIdRecreation() {
+        String id = "cleanup-residue";
+        Instant from = NOW.minusSeconds(60);
+        String bearer = "Bearer " + machineToken(Scope.READ);
+        FakeEventArtifacts artifacts = context.getBean(FakeEventArtifacts.class);
+        FakePipelineEventStore events = context.getBean(FakePipelineEventStore.class);
+        artifacts.put(id, "inc-old");
+        events.append(new PipelineEvent("ev-old-a", id, "inc-old", 41,
+                PipelineEvent.Kind.STATE_CHANGED, from.plusSeconds(1),
+                PipelineState.STOPPED, PipelineState.RUNNING, null, null, null));
+        events.append(new PipelineEvent("ev-old-b", id, "inc-old", 41,
+                PipelineEvent.Kind.STATE_CHANGED, from.plusSeconds(2),
+                PipelineState.RUNNING, PipelineState.STOPPED, null, null, null));
+        Map<String, Object> first = eventPage(id, from, NOW, 1, null, bearer);
+        String oldCursor = (String) first.get("nextCursor");
+        assertThat(oldCursor).isNotBlank();
+        assertThat(events.reads).isEqualTo(1);
+
+        artifacts.remove(id);
+        PipelineEvent residue = new PipelineEvent("ev-old-cleanup", id, "inc-old", 41,
+                PipelineEvent.Kind.CLEANUP_INCOMPLETE, from.plusSeconds(3), null, null,
+                null, "event-history", null);
+        events.append(residue);
+        assertThat(events.rows).contains(residue);
+        for (String cursor : new String[] {null, oldCursor}) {
+            ApiError missing = client().get().uri(uri -> {
+                        uri.path("/api/pipelines/" + id + "/events")
+                                .queryParam("from", from.toString()).queryParam("to", NOW.toString())
+                                .queryParam("limit", 1);
+                        if (cursor != null) {
+                            uri.queryParam("cursor", cursor);
+                        }
+                        return uri.build();
+                    })
+                    .header("Authorization", bearer)
+                    .exchange((request, response) -> {
+                        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+                        assertThat(response.getHeaders().getCacheControl()).isEqualTo("no-store");
+                        return response.bodyTo(ApiError.class);
+                    });
+            assertThat(missing.code()).isEqualTo("lifecycle.unknown-pipeline");
+            assertThat(missing.params()).containsEntry("pipeline", id);
+        }
+        assertThat(events.reads).as("retained rows and cursor do not authorize a deleted artifact read").isEqualTo(1);
+
+        artifacts.put(id, "inc-new");
+        Map<String, Object> quiet = eventPage(id, from, NOW, 1, null, bearer);
+        assertThat((List<?>) quiet.get("events")).isEmpty();
+        assertThat(quiet).containsEntry("completeness", "BEST_EFFORT");
+        assertThat(events.rows).contains(residue);
+        events.append(new PipelineEvent("ev-new", id, "inc-new", 42,
+                PipelineEvent.Kind.STATE_CHANGED, from.plusSeconds(4),
+                PipelineState.STOPPED, PipelineState.RUNNING, null, null, null));
+        Map<String, Object> current = eventPage(id, from, NOW, 1, null, bearer);
+        assertThat((List<Map<String, Object>>) current.get("events")).singleElement().satisfies(event ->
+                assertThat(event).containsEntry("id", "ev-new").containsEntry("kind", "STATE_CHANGED")
+                        .doesNotContainKeys("pipelineIncarnationId", "executionGeneration"));
+        ApiError obsolete = client().get().uri(uri -> uri.path("/api/pipelines/" + id + "/events")
+                        .queryParam("from", from.toString()).queryParam("to", NOW.toString())
+                        .queryParam("limit", 1).queryParam("cursor", oldCursor).build())
+                .header("Authorization", bearer)
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(obsolete.code()).isEqualTo("monitor.invalid-cursor");
+        assertThat(obsolete.params()).containsEntry("reason", "QUERY_MISMATCH");
+        assertThat(events.reads).isEqualTo(3);
+    }
+
     private Map<String, Object> eventPage(String id, Instant from, Instant to, int limit,
             String cursor, String bearer) {
-        return client().get().uri(uri -> uri.path("/api/pipelines/" + id + "/events")
-                        .queryParam("from", from.toString()).queryParam("to", to.toString())
-                        .queryParam("limit", limit).queryParam("cursor", cursor).build())
+        return client().get().uri(uri -> {
+                    uri.path("/api/pipelines/" + id + "/events")
+                            .queryParam("from", from.toString()).queryParam("to", to.toString())
+                            .queryParam("limit", limit);
+                    if (cursor != null) {
+                        uri.queryParam("cursor", cursor);
+                    }
+                    return uri.build();
+                })
                 .header("Authorization", bearer)
                 .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
     }
@@ -747,19 +825,15 @@ class PipelineObservationApiTest {
         }
 
         @Bean
-        PipelineEventsQueryService pipelineEventsQueryService(FakePipelineEventStore events, Clock clock) {
-            ArtifactStore base = appliedPipelines();
-            ArtifactStore scoped = new ArtifactStore() {
-                @Override public void saveAll(List<Resource> resources) { base.saveAll(resources); }
-                @Override public Optional<Resource> get(String id) { return base.get(id); }
-                @Override public List<Resource> list() { return base.list(); }
-                @Override public Optional<HistoryOwner> pipelineHistoryOwner(String id) {
-                    return base.get(id).map(ignored -> new HistoryOwner(
-                            new RateHistoryStore.Visibility("inc-test", false)));
-                }
-            };
+        FakeEventArtifacts eventArtifacts() {
+            return new FakeEventArtifacts();
+        }
+
+        @Bean
+        PipelineEventsQueryService pipelineEventsQueryService(FakePipelineEventStore events,
+                FakeEventArtifacts artifacts, Clock clock) {
             EventCatalog messages = EventCatalog.bundled();
-            return new PipelineEventsQueryService(new ArtifactQueryService(scoped), events,
+            return new PipelineEventsQueryService(new ArtifactQueryService(artifacts), events,
                     new EventsCursorCodec("test-events-secret".getBytes(), clock), clock, messages::render);
         }
 
@@ -866,6 +940,39 @@ class PipelineObservationApiTest {
                             .thenComparing(PipelineEvent::id))
                     .toList();
             return new Page(matching.subList(0, Math.min(limit, matching.size())), matching.size() > limit);
+        }
+    }
+
+    /** One atomic fixture row holds the current resource and its private event visibility scope. */
+    static final class FakeEventArtifacts implements ArtifactStore {
+        private record Entry(Resource resource, String incarnation) { }
+        private final Map<String, Entry> byId = new java.util.concurrent.ConcurrentHashMap<>();
+
+        FakeEventArtifacts() { reset(); }
+
+        void reset() {
+            byId.clear();
+            appliedPipelines().list().forEach(resource -> byId.put(resource.id(), new Entry(resource, "inc-test")));
+        }
+
+        void put(String id, String incarnation) {
+            byId.put(id, new Entry(new PipelineResource(id, null, List.of(SourceRef.bare("src_x")),
+                    null, null, null, null, null), incarnation));
+        }
+
+        void remove(String id) { byId.remove(id); }
+
+        @Override public void saveAll(List<Resource> resources) {
+            resources.forEach(resource -> byId.compute(resource.id(), (id, old) ->
+                    new Entry(resource, old == null ? "inc-test" : old.incarnation())));
+        }
+        @Override public Optional<Resource> get(String id) {
+            return Optional.ofNullable(byId.get(id)).map(Entry::resource);
+        }
+        @Override public List<Resource> list() { return byId.values().stream().map(Entry::resource).toList(); }
+        @Override public Optional<HistoryOwner> pipelineHistoryOwner(String id) {
+            return Optional.ofNullable(byId.get(id)).map(entry -> new HistoryOwner(
+                    new RateHistoryStore.Visibility(entry.incarnation(), false)));
         }
     }
 
