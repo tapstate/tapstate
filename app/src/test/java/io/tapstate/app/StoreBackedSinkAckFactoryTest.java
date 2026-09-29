@@ -188,6 +188,23 @@ class StoreBackedSinkAckFactoryTest {
     }
 
     @Test
+    void anInitialRingCursorCanPrepareTwoWritersBeforeEitherSinkRuns() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        store.startRingAfter("mc-orders", "pipe-1", "orders", 40);
+        StoreBackedSinkAckFactory factory = new StoreBackedSinkAckFactory(
+                Map.of("orders", "mc-orders"), "pipe-1", store);
+
+        factory.prepareWriterPlan(Map.of("orders", List.of("fast", "slow")));
+        store.advanceSinkWriterAcked("mc-orders", "pipe-1", "fast", "orders", at(41, "w41"));
+
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1"))
+                .containsEntry("orders", 40L);
+        assertThat(store.read("mc-orders").orElseThrow().consumerOffset("pipe-1").orElseThrow().sinkAcked())
+                .isNull();
+    }
+
+    @Test
     void snapshotCompletionWaitsForEverySink() {
         InMemorySrsMetaStore store = new InMemorySrsMetaStore();
         store.create("mc-orders", null);

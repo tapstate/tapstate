@@ -275,7 +275,6 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         writerIdsByTable.values().forEach(allWriterIds::addAll);
         SinkWriters priorPlan = writers(miningChainId, pipelineId);
         boolean hasAggregateProgress = (existing != null && existing.sinkAcked() != null)
-                || !completedRing.isEmpty()
                 || !completedSnapshots.isEmpty();
         if (priorPlan == null && allWriterIds.size() > 1 && hasAggregateProgress) {
             throw new TapstateException(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS,

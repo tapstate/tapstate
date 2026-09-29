@@ -473,9 +473,10 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         Document ringDone = nestedDocument(consumer, PER_TABLE_RING_DONE, pipelineId, false);
         ChainPosition aggregateAck = sinkAckedFrom(consumer);
         List<String> completed = snapshotCompletedFrom(consumer);
-        boolean hasAggregateProgress = aggregateAck != null
-                || (ringDone != null && !ringDone.isEmpty())
-                || !completed.isEmpty();
+        // startRingAfter publishes a table's initial ring cursor before the DAG is assembled. That cursor
+        // is a common baseline for every writer, not evidence that any sink has written a change. Actual
+        // legacy sink progress always carries an aggregate acknowledgement or snapshot completion too.
+        boolean hasAggregateProgress = aggregateAck != null || !completed.isEmpty();
         if (priorPlan == null && allWriterIds.size() > 1 && hasAggregateProgress) {
             throw new TapstateException(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS,
                     Map.of("pipeline", pipelineId), null);

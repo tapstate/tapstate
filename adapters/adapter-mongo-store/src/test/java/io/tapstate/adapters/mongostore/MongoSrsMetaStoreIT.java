@@ -410,6 +410,23 @@ class MongoSrsMetaStoreIT {
     }
 
     @Test
+    void initialRingCursorSeedsEveryWriterWithoutClaimingSinkProgress() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.startRingAfter(CHAIN, "p1", "orders", 40);
+
+            store.configureSinkWriters(CHAIN, "p1", Map.of("orders", List.of("fast", "slow")));
+            store.advanceSinkWriterAcked(
+                    CHAIN, "p1", "fast", "orders", new ChainPosition(new SourceOrder(1, 41), "t41"));
+
+            assertThat(store.ringDoneThrough(CHAIN, "p1"))
+                    .as("the initial cursor belongs to both writers until the slower writer advances")
+                    .containsEntry("orders", 40L);
+            assertThat(onlyConsumer(store).sinkAcked()).isNull();
+        });
+    }
+
+    @Test
     void legacyAggregateProgressCanSeedItsOnlySinkWriter() {
         withStore(store -> {
             store.create(CHAIN, null);
