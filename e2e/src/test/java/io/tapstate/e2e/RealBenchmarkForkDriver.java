@@ -26,7 +26,16 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
 
     record MeasuredPhase(String id, long acknowledgedOutputs, long firstIssuedAtNanos,
                          long sourceCompletedAtNanos, long completedAckAtNanos,
-                         long expectedSourceChanges, int observedDeliveries, long reportedRecordsOut) {
+                         long expectedSourceChanges, int observedDeliveries, long reportedRecordsOut,
+                         BenchmarkForkEnvironment.ClockAnchor clockAnchor,
+                         List<BenchmarkForkEnvironment.BatchResult> sourceBatches,
+                         BenchmarkResourceSampler.Summary resources) {
+        MeasuredPhase {
+            Objects.requireNonNull(clockAnchor, "measured clock anchor");
+            sourceBatches = List.copyOf(sourceBatches);
+            Objects.requireNonNull(resources, "phase resource measurements");
+        }
+
         double recordsOutPerSecond() {
             long duration = completedAckAtNanos - firstIssuedAtNanos;
             if (duration <= 0 || acknowledgedOutputs <= 0) {
@@ -217,6 +226,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             completedAckAt = captures.awaitMeasuredAcks(workload, phase, fork, positionCoverage);
             resources = resourceSampler.finish();
             commands = commandSampler.finish();
+        } catch (BenchmarkResourceSampler.SamplingFailure failure) {
+            throw failure.inPhase(phase.id());
         }
         List<BenchmarkMongoDeliveryObserver.Delivery> deliveries = targets.checkpoint(phase);
         if (deliveries.size() != phase.expectedLogicalOutputChanges()) {
@@ -231,7 +242,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 .mapToLong(Long::longValue).sum();
         return new PhaseWindow(new MeasuredPhase(phase.id(), phase.expectedLogicalOutputChanges(),
                 firstIssued, issued.sourceCompletedAtNanos(), completedAckAt, expectedSourceChanges,
-                deliveries.size(), reportedRecordsOut),
+                deliveries.size(), reportedRecordsOut, issued.clockAnchor(), issued.batches(), resources),
                 deliveries.stream().map(BenchmarkMongoDeliveryObserver.Delivery::durationNanos).toList(),
                 resources, commands);
     }

@@ -13,6 +13,7 @@ import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.Statement;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -34,12 +35,45 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
                          long issuedAtNanos, List<String> sql) throws Exception;
     }
 
-    record BatchResult(int index, long issuedAtNanos, long completedAtNanos) {}
+    record BatchResult(int index, long issuedAtNanos, long completedAtNanos) {
+        long durationNanos() {
+            return completedAtNanos - issuedAtNanos;
+        }
+    }
+
+    /** The bracket bounds this clock read's uncertainty, not later clock adjustments or UTC accuracy. */
+    record ClockAnchor(Instant utc, long beforeNanos, long afterNanos) {
+        ClockAnchor {
+            Objects.requireNonNull(utc, "UTC anchor");
+            if (afterNanos - beforeNanos < 0) {
+                throw new IllegalArgumentException("clock anchor bracket moved backward");
+            }
+        }
+
+        static ClockAnchor capture() {
+            long before = System.nanoTime();
+            Instant utc = Instant.now();
+            return new ClockAnchor(utc, before, System.nanoTime());
+        }
+
+        long uncertaintyNanos() {
+            return afterNanos - beforeNanos;
+        }
+
+        Instant earliestUtc(long monotonicNanos) {
+            return utc.plusNanos(monotonicNanos - afterNanos);
+        }
+
+        Instant latestUtc(long monotonicNanos) {
+            return utc.plusNanos(monotonicNanos - beforeNanos);
+        }
+    }
 
     record PhaseIssue(BenchmarkWorkloadDefinitions.Phase phase, long startedAtNanos,
-                      long sourceCompletedAtNanos, List<BatchResult> batches) {
+                      long sourceCompletedAtNanos, List<BatchResult> batches, ClockAnchor clockAnchor) {
         PhaseIssue {
             batches = List.copyOf(batches);
+            Objects.requireNonNull(clockAnchor, "phase clock anchor");
         }
     }
 
@@ -246,6 +280,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
                 || !workload.phases().get(nextPhase).equals(phase)) {
             throw new IllegalArgumentException("benchmark phases must run in declared order");
         }
+        ClockAnchor clockAnchor = ClockAnchor.capture();
         long started = System.nanoTime();
         long nextBatchStart = started;
         List<BatchResult> batches = new ArrayList<>();
@@ -266,7 +301,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
             batchIndex++;
         }
         pendingPhase = phase;
-        return new PhaseIssue(phase, started, System.nanoTime(), batches);
+        return new PhaseIssue(phase, started, System.nanoTime(), batches, clockAnchor);
     }
 
     /** Verifies final target content after the external ACK window has ended. */

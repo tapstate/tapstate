@@ -333,20 +333,8 @@ class PipelineBenchmarkLiveRunIT {
                 "mongoCommands", object("byCommand", new TreeMap<>(commands.byCommand()),
                         "byFamily", namedCounts(commands.byFamily()),
                         "elapsedMillis", commands.elapsedMillis()),
-                "measuredPhaseWindows", evidence.phases().stream().map(phase -> object(
-                        "id", phase.id(), "acknowledgedOutputs", phase.acknowledgedOutputs(),
-                        "firstIssuedAtNanos", phase.firstIssuedAtNanos(),
-                        "sourceCompletedAtNanos", phase.sourceCompletedAtNanos(),
-                        "sourceIssueDurationNanos",
-                        phase.sourceCompletedAtNanos() - phase.firstIssuedAtNanos(),
-                        "expectedSourceChanges", phase.expectedSourceChanges(),
-                        "completedAckAtNanos", phase.completedAckAtNanos(),
-                        "durationNanos", phase.completedAckAtNanos() - phase.firstIssuedAtNanos(),
-                        "throughputRecordsPerSecond", phase.recordsOutPerSecond(),
-                        "observedDeliveries", phase.observedDeliveries(),
-                        "reportedRecordsOut", phase.reportedRecordsOut(),
-                        "idempotentWriteOverhead",
-                        phase.reportedRecordsOut() - phase.acknowledgedOutputs())).toList(),
+                "measuredPhaseWindows", evidence.phases().stream()
+                        .map(PipelineBenchmarkLiveRunIT::phaseEvidence).toList(),
                 "declaredSourceCoverage", evidence.declaredSourceCoverage(),
                 "observedTargetCoverage", evidence.observedTargetCoverage(),
                 "logicalCoverage", correctness.logicalCoverage(),
@@ -358,6 +346,86 @@ class PipelineBenchmarkLiveRunIT {
                 "checksum", evidence.checksum(),
                 "correctnessChecksum", correctness.checksum(),
                 "errorTotal", evidence.errorTotal());
+    }
+
+    /** Diagnostic fields are additive; the performance window and its arithmetic remain unchanged. */
+    static Map<String, Object> phaseEvidence(RealBenchmarkForkDriver.MeasuredPhase phase) {
+        BenchmarkForkEnvironment.ClockAnchor anchor = phase.clockAnchor();
+        return object(
+                "id", phase.id(), "acknowledgedOutputs", phase.acknowledgedOutputs(),
+                "firstIssuedAtNanos", phase.firstIssuedAtNanos(),
+                "sourceCompletedAtNanos", phase.sourceCompletedAtNanos(),
+                "sourceIssueDurationNanos", phase.sourceCompletedAtNanos() - phase.firstIssuedAtNanos(),
+                "expectedSourceChanges", phase.expectedSourceChanges(),
+                "completedAckAtNanos", phase.completedAckAtNanos(),
+                "durationNanos", phase.completedAckAtNanos() - phase.firstIssuedAtNanos(),
+                "throughputRecordsPerSecond", phase.recordsOutPerSecond(),
+                "observedDeliveries", phase.observedDeliveries(),
+                "reportedRecordsOut", phase.reportedRecordsOut(),
+                "idempotentWriteOverhead", phase.reportedRecordsOut() - phase.acknowledgedOutputs(),
+                "firstIssuedAtUtcEarliest", anchor.earliestUtc(phase.firstIssuedAtNanos()).toString(),
+                "firstIssuedAtUtcLatest", anchor.latestUtc(phase.firstIssuedAtNanos()).toString(),
+                "sourceCompletedAtUtcEarliest", anchor.earliestUtc(phase.sourceCompletedAtNanos()).toString(),
+                "sourceCompletedAtUtcLatest", anchor.latestUtc(phase.sourceCompletedAtNanos()).toString(),
+                "completedAckAtUtcEarliest", anchor.earliestUtc(phase.completedAckAtNanos()).toString(),
+                "completedAckAtUtcLatest", anchor.latestUtc(phase.completedAckAtNanos()).toString(),
+                "clockAnchor", object("utc", anchor.utc().toString(),
+                        "monotonicBeforeNanos", anchor.beforeNanos(),
+                        "monotonicAfterNanos", anchor.afterNanos(),
+                        "uncertaintyNanos", anchor.uncertaintyNanos(),
+                        "uncertaintyScope", "CLOCK_READ_BRACKET_ONLY"),
+                "sourceBatches", phase.sourceBatches().stream().map(batch -> object(
+                        "index", batch.index(), "issuedAtNanos", batch.issuedAtNanos(),
+                        "completedAtNanos", batch.completedAtNanos(),
+                        "issueToCompleteNanos", batch.durationNanos(),
+                        "issuedAtUtcEarliest", anchor.earliestUtc(batch.issuedAtNanos()).toString(),
+                        "issuedAtUtcLatest", anchor.latestUtc(batch.issuedAtNanos()).toString(),
+                        "completedAtUtcEarliest", anchor.earliestUtc(batch.completedAtNanos()).toString(),
+                        "completedAtUtcLatest", anchor.latestUtc(batch.completedAtNanos()).toString())).toList(),
+                "resources", resourceEvidence(phase.resources(), anchor));
+    }
+
+    static Map<String, Object> resourceEvidence(BenchmarkResourceSampler.Summary resources,
+                                               BenchmarkForkEnvironment.ClockAnchor anchor) {
+        return object("cpuNanos", resources.cpuNanos(),
+                "gcCollectionMillis", resources.gcCollectionMillis(),
+                "peakHeapBytes", resources.peakHeapBytes(), "peakRssBytes", resources.peakRssBytes(),
+                "sampleCount", resources.sampleCount(),
+                "sampling", resources.sampling().map(diagnostics -> samplingEvidence(diagnostics, anchor))
+                        .orElseGet(() -> object("state", "NOT_RECORDED")));
+    }
+
+    private static Map<String, Object> samplingEvidence(BenchmarkResourceSampler.SamplingDiagnostics diagnostics,
+                                                       BenchmarkForkEnvironment.ClockAnchor anchor) {
+        return object("state", diagnostics.state(), "attemptCount", diagnostics.attemptCount(),
+                "failureCount", diagnostics.failureCount(),
+                "totalDurationNanos", diagnostics.totalDurationNanos(),
+                "maxDurationNanos", diagnostics.maxDurationNanos(),
+                "durationScope", "EXTERNAL_READ_ONLY", "retention", "FIRST_AND_LAST",
+                "retainedAttemptLimit", BenchmarkResourceSampler.MAX_RETAINED_ATTEMPTS,
+                "omittedAttempts", diagnostics.omittedAttempts(),
+                "attempts", diagnostics.retainedAttempts().stream().map(attempt -> object(
+                        "index", attempt.index(), "startedAtNanos", attempt.startedAtNanos(),
+                        "completedAtNanos", attempt.completedAtNanos(),
+                        "durationNanos", attempt.durationNanos(), "outcome", attempt.outcome().name(),
+                        "failureType", attempt.failureType(),
+                        "startedAtUtcEarliest", anchor.earliestUtc(attempt.startedAtNanos()).toString(),
+                        "startedAtUtcLatest", anchor.latestUtc(attempt.startedAtNanos()).toString(),
+                        "completedAtUtcEarliest", anchor.earliestUtc(attempt.completedAtNanos()).toString(),
+                        "completedAtUtcLatest", anchor.latestUtc(attempt.completedAtNanos()).toString(),
+                        "reading", readingEvidence(attempt.reading()))).toList());
+    }
+
+    private static Map<String, Object> readingEvidence(BenchmarkProcessProbe.Snapshot reading) {
+        if (reading == null) {
+            return object("state", "UNAVAILABLE");
+        }
+        return object("state", reading.complete() ? "COMPLETE" : "INCOMPLETE",
+                "cpuNanos", reading.cpuNanos().isPresent() ? reading.cpuNanos().getAsLong() : null,
+                "heapUsedBytes", reading.heapUsedBytes().isPresent() ? reading.heapUsedBytes().getAsLong() : null,
+                "rssBytes", reading.rssBytes().isPresent() ? reading.rssBytes().getAsLong() : null,
+                "gcCollectionMillis", reading.gcCollectionMillis().isPresent()
+                        ? reading.gcCollectionMillis().getAsLong() : null);
     }
 
     private static Map<String, Object> evaluation(PipelineBenchmarkComparison.Evaluation evaluation) {

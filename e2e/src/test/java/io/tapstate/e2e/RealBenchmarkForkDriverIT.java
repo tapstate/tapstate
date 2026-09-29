@@ -15,6 +15,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 class RealBenchmarkForkDriverIT {
 
     private static final String BOOT_JAR_PROPERTY = "tapstate.e2e.benchmark-smoke.jar";
+    private static final String ARM_PROPERTY = "tapstate.e2e.benchmark-smoke.arm";
+    private static final String FORK_PROPERTY = "tapstate.e2e.benchmark-smoke.fork";
 
     @BeforeAll
     static void requireServices() {
@@ -43,9 +45,13 @@ class RealBenchmarkForkDriverIT {
 
     private static void run(String workloadId) throws Exception {
         RealBenchmarkForkDriver driver = new RealBenchmarkForkDriver();
+        PipelineBenchmarkComparison.Arm arm = PipelineBenchmarkComparison.Arm.valueOf(
+                System.getProperty(ARM_PROPERTY, "A"));
+        int forkNumber = Integer.parseInt(System.getProperty(FORK_PROPERTY, "1"));
+        assertThat(forkNumber).as("the diagnostic fork number").isBetween(1, 5);
         PipelineBenchmarkHarness.ForkResult result = driver.run(
-                BenchmarkWorkloadDefinitions.byId(workloadId), PipelineBenchmarkComparison.Arm.A,
-                1, Path.of(System.getProperty(BOOT_JAR_PROPERTY)));
+                BenchmarkWorkloadDefinitions.byId(workloadId), arm,
+                forkNumber, Path.of(System.getProperty(BOOT_JAR_PROPERTY)));
 
         BenchmarkAckOracle.verify(List.of(result.correctness()));
         int expectedMeasured = workloadId.equals("stateful") ? 36_000 : 12_000;
@@ -73,7 +79,7 @@ class RealBenchmarkForkDriverIT {
                     phase.sourceCompletedAtNanos() - phase.firstIssuedAtNanos()).sum();
             assertThat(sourceIssueNanos).as("source issue time must be measured independently of target ACK")
                     .isPositive();
-            System.out.printf("benchmark-real-fork id=%s jar=%s throughput=%s"
+            System.out.printf("benchmark-real-fork acceptanceEvaluated=false id=%s jar=%s throughput=%s"
                             + " sourceIssueRate=%s acked=%s reportedOut=%s"
                             + " samples=%s mongoCommands=%s observedKeys=%s checksum=%s%n",
                     evidence.forkId(), evidence.applicationJar(), result.measurement().recordsOutPerSecond(),
@@ -84,6 +90,21 @@ class RealBenchmarkForkDriverIT {
                             RealBenchmarkForkDriver.MeasuredPhase::reportedRecordsOut).sum(),
                     evidence.resources().sampleCount(), evidence.mongoCommands().totalCommands(),
                     evidence.observedTargetCoverage().size(), evidence.checksum());
+            evidence.phases().forEach(phase -> {
+                BenchmarkForkEnvironment.ClockAnchor anchor = phase.clockAnchor();
+                BenchmarkResourceSampler.SamplingDiagnostics sampling = phase.resources().sampling()
+                        .orElseThrow(() -> new AssertionError("a diagnostic phase needs sampling attempts"));
+                assertThat(phase.sourceBatches()).as("the retained source issue batches").isNotEmpty();
+                System.out.printf("benchmark-real-phase acceptanceEvaluated=false fork=%s phase=%s"
+                                + " anchorUtc=%s anchorBeforeNanos=%d anchorAfterNanos=%d"
+                                + " firstIssueUtcEarliest=%s firstIssueUtcLatest=%s"
+                                + " firstIssuedAtNanos=%d sourceCompletedAtNanos=%d completedAckAtNanos=%d"
+                                + " sourceBatches=%s sampling=%s%n",
+                        evidence.forkId(), phase.id(), anchor.utc(), anchor.beforeNanos(), anchor.afterNanos(),
+                        anchor.earliestUtc(phase.firstIssuedAtNanos()), anchor.latestUtc(phase.firstIssuedAtNanos()),
+                        phase.firstIssuedAtNanos(), phase.sourceCompletedAtNanos(), phase.completedAckAtNanos(),
+                        phase.sourceBatches(), sampling);
+            });
         });
     }
 }
