@@ -244,8 +244,78 @@ class PipelineDraftCompilerTest {
                 "orders_view", io.tapstate.core.model.FromRef.literal("active-orders"), null, null));
         assertThat(compiled.serve()).isInstanceOf(ServeBlock.Inline.class);
         ServeBlock.Inline serve = (ServeBlock.Inline) compiled.serve();
+        assertThat(serve.id()).isNotEqualTo(serve.sync().getFirst().id());
+        assertThat(serve.sync().getFirst().id()).isEqualTo("warehouse-orders");
         assertThat(serve.sync()).extracting(sync -> sync.source()).containsExactly("warehouse");
         assertThat(serve.sync().getFirst().writeMode().yaml()).isEqualTo("append");
+        assertThat(serve.sync().getFirst().rename())
+                .isEqualTo(new RenameSpec(Map.of("orders", "orders_archive"), null, null, null));
+    }
+
+    @Test
+    void compilesDirectDagSourceToTargetWithDistinctIdsAndTargetTableRename() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("draft:source:1", "source", "mysql", "ai_fulfillment_orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("draft:target:1", "target", "mongo", "p1_view_1", Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("source-to-target", "draft:source:1", "draft:target:1")),
+                new PipelineDraft.Viewport(0, 0, 1));
+        PipelineResource compiled = compiler.compile(dagDraft(graph));
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiled.serve();
+
+        assertThat(serve.id()).isEqualTo("draft:target:1__serve");
+        assertThat(serve.sync().getFirst().id()).isEqualTo("draft:target:1");
+        assertThat(TableRename.apply("ai_fulfillment_orders", serve.sync().getFirst().rename()))
+                .isEqualTo("p1_view_1");
+        String canonical = new CanonicalWriter().write(compiled);
+        assertThat(new CanonicalWriter().write(new DslParser().parse(canonical))).isEqualTo(canonical);
+    }
+
+    @Test
+    void usesGraphViewNodeIdWhenViewMetadataOmitsViewId() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source-orders", "source", "crm", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("orders-view", "view", null, null, Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("source-to-view", "source-orders", "orders-view")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        assertThat(((ViewBlock.Inline) compiler.compile(dagDraft(graph)).view()).id()).isEqualTo("orders-view");
+    }
+
+    @Test
+    void avoidsGeneratedServeIdCollisionsWithOtherGraphNodes() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "mysql", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("target__serve", "filter", null, null,
+                        Map.of("expr", "active == true"), Map.of()),
+                new PipelineDraft.Node("target", "target", "mongo", "orders", Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("source-to-filter", "source", "target__serve"),
+                        new PipelineDraft.Edge("filter-to-target", "target__serve", "target")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiler.compile(dagDraft(graph)).serve();
+        assertThat(serve.id()).isEqualTo("target__serve_");
+        assertThat(serve.sync().getFirst().rename()).isNull();
+    }
+
+    @Test
+    void refusesAmbiguousDagTargetTableForMultipleSourceTables() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("orders", "source", "mysql", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("customers", "source", "mysql", "customers", Map.of(), Map.of()),
+                new PipelineDraft.Node("target", "target", "mongo", "report", Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("orders-to-target", "orders", "target"),
+                        new PipelineDraft.Edge("customers-to-target", "customers", "target")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        assertThatThrownBy(() -> compiler.compile(dagDraft(graph)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("target table requires exactly one upstream source table: target");
+    }
+
+    private static PipelineDraft dagDraft(PipelineDraft.Graph graph) {
+        return new PipelineDraft("p1", 1, 1, PipelineDraft.Mode.DAG, "p1", "", graph, null,
+                null, null, null, java.time.Instant.parse("2026-09-21T00:00:00Z"),
+                java.time.Instant.parse("2026-09-21T00:00:00Z"), "test");
     }
 
     private static PipelineDraft wizardDraft() {

@@ -295,10 +295,14 @@ public final class PipelineDraftCompiler {
                     throw new IllegalArgumentException("view node requires exactly one input: " + node.id());
                 }
                 String use = optionalText(node.config(), "use");
+                String viewId = optionalText(node.metadata(), "viewId");
+                if (viewId == null) {
+                    viewId = node.id();
+                }
                 view = use == null
-                        ? new ViewBlock.Inline(optionalText(node.metadata(), "viewId", node.id()), FromRef.literal(refs.getFirst()),
+                        ? new ViewBlock.Inline(viewId, FromRef.literal(refs.getFirst()),
                                 optionalText(node.config(), "primaryKey", "primary_key"), null)
-                        : new ViewBlock.Use(optionalText(node.metadata(), "viewId", node.id()), use, FromRef.literal(refs.getFirst()));
+                        : new ViewBlock.Use(viewId, use, FromRef.literal(refs.getFirst()));
             } else if ("target".equals(node.type())) {
                 if (serve != null) {
                     throw new IllegalArgumentException("graph has more than one target node");
@@ -308,8 +312,22 @@ public final class PipelineDraftCompiler {
                     throw new IllegalArgumentException("target node requires an input: " + node.id());
                 }
                 String targetSource = requiredNodeText(node.sourceId(), "target source", node.id());
-                serve = new ServeBlock.Inline(node.id(), FromClause.list(refs.stream().map(FromRef::literal).toArray(FromRef[]::new)),
-                        List.of(new SyncElement(node.id(), targetSource, writeMode(node.config(), node.id()), null, null, null)), null, null);
+                RenameSpec rename = graphTargetRename(node, nodes, inputs);
+                Set<String> occupiedIds = new HashSet<>(nodes.keySet());
+                for (PipelineDraft.Node candidate : graph.nodes()) {
+                    if ("view".equals(candidate.type())) {
+                        String viewId = optionalText(candidate.metadata(), "viewId");
+                        if (viewId != null) {
+                            occupiedIds.add(viewId);
+                        }
+                    }
+                }
+                String serveId = node.id() + "__serve";
+                while (occupiedIds.contains(serveId)) {
+                    serveId += "_";
+                }
+                serve = new ServeBlock.Inline(serveId, FromClause.list(refs.stream().map(FromRef::literal).toArray(FromRef[]::new)),
+                        List.of(new SyncElement(node.id(), targetSource, writeMode(node.config(), node.id()), rename, null, null)), null, null);
             } else {
                 graphOutputs(node.id(), nodes, inputs, outputs, visiting, steps);
             }
@@ -317,6 +335,36 @@ public final class PipelineDraftCompiler {
         return new PipelineResource(draft.pipelineId(), metadata(draft),
                 sourceIds.stream().map(id -> (SourceRef) SourceRef.bare(id)).toList(),
                 steps, view, serve, null, Map.of());
+    }
+
+    private static RenameSpec graphTargetRename(PipelineDraft.Node target, Map<String, PipelineDraft.Node> nodes,
+            Map<String, List<String>> inputs) {
+        if (target.table() == null || target.table().isBlank()) {
+            return null;
+        }
+        Set<String> inputTables = new LinkedHashSet<>();
+        collectSourceTables(target.id(), nodes, inputs, new HashSet<>(), inputTables);
+        if (inputTables.size() != 1) {
+            throw new IllegalArgumentException("target table requires exactly one upstream source table: " + target.id());
+        }
+        String inputTable = inputTables.iterator().next();
+        return inputTable.equals(target.table()) ? null
+                : new RenameSpec(Map.of(inputTable, target.table()), null, null, null);
+    }
+
+    private static void collectSourceTables(String nodeId, Map<String, PipelineDraft.Node> nodes,
+            Map<String, List<String>> inputs, Set<String> visited, Set<String> tables) {
+        if (!visited.add(nodeId)) {
+            return;
+        }
+        PipelineDraft.Node node = nodes.get(nodeId);
+        if ("source".equals(node.type())) {
+            tables.add(node.table());
+            return;
+        }
+        for (String input : inputs.getOrDefault(nodeId, List.of())) {
+            collectSourceTables(input, nodes, inputs, visited, tables);
+        }
     }
 
     private static List<String> graphOutputs(String nodeId, Map<String, PipelineDraft.Node> nodes,
