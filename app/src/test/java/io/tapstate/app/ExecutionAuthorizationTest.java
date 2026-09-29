@@ -217,6 +217,82 @@ class ExecutionAuthorizationTest {
         assertThat(current.failureClaimGeneration()).isZero();
     }
 
+    /**
+     * A run taken down for something else - a member it ran on going away - closes its writers while a
+     * write is still under way, and a connector let go under a write ends it in its coded failure. That
+     * failure is the closing's doing, not the target refusing anything. Filed as the sink's own, it would
+     * outrank the departure that actually ended the run, and the run would stay failed instead of being
+     * rebuilt, with nothing in any log to say why.
+     */
+    @Test
+    void aWriteItsOwnClosingBreaksDoesNotMarkTheRun() {
+        ExecutionFence fence = submittedRun();
+        CompletableFuture<WriteResult> write = new CompletableFuture<>();
+        SinkWriter sink = new SinkWriter() {
+            @Override
+            public CompletionStage<WriteResult> write(List<Envelope> records) {
+                return write;
+            }
+
+            @Override
+            public void close() {
+                // What a connector let go under a write does with it.
+                write.completeExceptionally(new TapstateException(ConnectorError.WRITE_FAILED,
+                        Map.of("connector", "mongodb", "detail", "state should be: open"), null));
+            }
+        };
+        SinkWriter guarded = FencedSinkWriterFactory.guarded(sink, fence, guard(claims));
+        CompletionStage<WriteResult> underWay = guarded.write(List.of());
+
+        guarded.close();
+
+        assertThatThrownBy(() -> underWay.toCompletableFuture().join())
+                .as("the write still fails where it is reported: nothing it carried landed")
+                .isInstanceOf(CompletionException.class);
+        WorkloadClaim current = claims.read(new WorkloadClaimKey(
+                "cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders")).orElseThrow().claim();
+        assertThat(current.failureClaimGeneration())
+                .as("what ended the run is for its driver to judge; a write the run's own closing broke is "
+                        + "not the sink failing")
+                .isZero();
+    }
+
+    /**
+     * The same closing, seen from the member driving the run: one of the three members the run was planned
+     * over leaves, the run is taken down with a write still under way on a member that stayed, and that
+     * write fails as its connector is let go. The departure is what ended the run, so the run is rebuilt.
+     */
+    @Test
+    void aRunAMemberLeftIsRebuiltThoughItsClosingBrokeAWriteUnderWay() {
+        membership.canCommit(Set.of("node-a", "node-b", "node-c"));
+        PipelineActuationOwnership nodeA = ownership(NODE_A);
+        assertThat(nodeA.permit("orders").granted()).isTrue();
+        ExecutionFence fence = nodeA.beginExecution("orders").fence();
+        CompletableFuture<WriteResult> write = new CompletableFuture<>();
+        SinkWriter sink = new SinkWriter() {
+            @Override
+            public CompletionStage<WriteResult> write(List<Envelope> records) {
+                return write;
+            }
+
+            @Override
+            public void close() {
+                write.completeExceptionally(new TapstateException(ConnectorError.WRITE_FAILED,
+                        Map.of("connector", "mongodb", "detail", "state should be: open"), null));
+            }
+        };
+        SinkWriter guarded = FencedSinkWriterFactory.guarded(sink, fence, guard(claims));
+        guarded.write(List.of());
+
+        membership.canCommit(Set.of("node-a", "node-b"));
+        guarded.close();
+
+        assertThat(new ClusterRebuildAdmission(nodeA, TTL, Duration.ofSeconds(30), nanos::get).admits("orders"))
+                .as("node-c went away under the run; the write its closing broke on node-a says nothing "
+                        + "about the pipeline, so the run is rebuilt rather than left failed")
+                .isTrue();
+    }
+
     @Test
     void aSupersededRunStopsWritingAndAcknowledgingOnceItsOwnWindowIsOver() {
         ExecutionFence fence = submittedRun();

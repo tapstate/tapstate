@@ -76,29 +76,46 @@ final class FencedSinkWriterFactory implements SupplierEx<SinkWriter> {
         }
     }
 
-    private record FencedSinkWriter(
-            SinkWriter delegate, ExecutionFence fence, ExecutionAuthorization authorization)
-            implements SinkWriter {
+    private static final class FencedSinkWriter implements SinkWriter {
+
+        private final SinkWriter delegate;
+        private final ExecutionFence fence;
+        private final ExecutionAuthorization authorization;
+        /**
+         * Set as closing starts, before the delegate is let go. A write still under way then is ended by the
+         * closing - a connector let go under a write fails it - and the run is closing because something
+         * else ended it, which is for whoever drives the run to judge. Filed as the sink's own failure, that
+         * write would outrank the reason the run actually ended: a member leaving would read as the
+         * pipeline's own death, and the pipeline would stay failed instead of being rebuilt.
+         */
+        private volatile boolean closing;
+
+        private FencedSinkWriter(SinkWriter delegate, ExecutionFence fence, ExecutionAuthorization authorization) {
+            this.delegate = delegate;
+            this.fence = fence;
+            this.authorization = authorization;
+        }
 
         @Override
         public CompletionStage<WriteResult> write(List<Envelope> records) {
             authorization.require(fence);
             try {
-                return delegate.write(records).whenComplete((ignored, failure) -> {
-                    if (PipelineFailures.isSinkWriteFailure(fence.pipelineId(), failure)) {
-                        authorization.recordSinkWriteFailure(fence);
-                    }
-                });
+                return delegate.write(records).whenComplete((ignored, failure) -> fileIfTheSinks(failure));
             } catch (RuntimeException failure) {
-                if (PipelineFailures.isSinkWriteFailure(fence.pipelineId(), failure)) {
-                    authorization.recordSinkWriteFailure(fence);
-                }
+                fileIfTheSinks(failure);
                 throw failure;
+            }
+        }
+
+        private void fileIfTheSinks(Throwable failure) {
+            if (!closing && PipelineFailures.isSinkWriteFailure(fence.pipelineId(), failure)) {
+                authorization.recordSinkWriteFailure(fence);
             }
         }
 
         @Override
         public void close() {
+            closing = true;
             delegate.close();
         }
     }
