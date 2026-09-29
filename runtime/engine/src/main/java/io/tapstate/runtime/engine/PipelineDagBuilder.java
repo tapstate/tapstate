@@ -23,7 +23,9 @@ import io.tapstate.runtime.engine.nest.NestStateLedger;
 import io.tapstate.runtime.engine.nest.NestTable;
 import io.tapstate.runtime.engine.nest.NestTopology;
 import io.tapstate.spi.sink.SinkWriter;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -387,7 +389,7 @@ public final class PipelineDagBuilder {
             // to reach the state store, and the vertex is a terminal sink like any other.
             List<Vertex> upstream = upstreamOf(view.from(), byKey, bindings);
             String viewName = VIEW_VERTEX_PREFIX + view.id();
-            sinkPlans.add(new SinkPlan(viewName, bindings.viewSinks().apply(view), upstream,
+            sinkPlans.add(new SinkPlan(viewName, writerIdFor(viewName), bindings.viewSinks().apply(view), upstream,
                     chainsOf(upstream, byKey, chains)));
             readsAs.put(view.id(), upstream);
         }
@@ -402,16 +404,15 @@ public final class PipelineDagBuilder {
             for (int i = 0; i < sync.size(); i++) {
                 SyncElement element = sync.get(i);
                 String name = SERVE_VERTEX_PREFIX + (element.id() != null ? element.id() : i);
-                sinkPlans.add(new SinkPlan(name, bindings.sinkWriters().apply(element), upstream,
+                sinkPlans.add(new SinkPlan(name, writerIdFor(name), bindings.sinkWriters().apply(element), upstream,
                         chainsOf(upstream, byKey, chains)));
             }
         }
 
         Map<String, List<String>> writerIdsByStream = new LinkedHashMap<>();
-        for (int writer = 0; writer < sinkPlans.size(); writer++) {
-            String writerId = "sink-" + writer;
-            for (String stream : sinkPlans.get(writer).streams()) {
-                writerIdsByStream.computeIfAbsent(stream, ignored -> new ArrayList<>()).add(writerId);
+        for (SinkPlan plan : sinkPlans) {
+            for (String stream : plan.streams()) {
+                writerIdsByStream.computeIfAbsent(stream, ignored -> new ArrayList<>()).add(plan.writerId());
             }
         }
         writerIdsByStream.replaceAll((stream, writers) -> List.copyOf(writers));
@@ -419,12 +420,10 @@ public final class PipelineDagBuilder {
         if (sinkAck != null) {
             sinkAck.prepareWriterPlan(writerPlan);
         }
-        for (int writer = 0; writer < sinkPlans.size(); writer++) {
-            SinkPlan plan = sinkPlans.get(writer);
-            String writerId = "sink-" + writer;
+        for (SinkPlan plan : sinkPlans) {
             SinkAckFactory writerAck = sinkAck == null
                     ? null
-                    : sinkAck.forWriter(writerId, plan.streams(), writerPlan);
+                    : sinkAck.forWriter(plan.writerId(), plan.streams(), writerPlan);
             Vertex vertex = dag.newVertex(plan.vertexName(),
                     sinkVertex(plan.vertexName(), plan.writerFactory(), writerAck, axes, assembled));
             connect(dag, plan.upstream(), vertex, outboundOrdinal, inboundOrdinal);
@@ -436,9 +435,20 @@ public final class PipelineDagBuilder {
     /** One terminal writer and the source streams the graph proves can reach it. */
     private record SinkPlan(
             String vertexName,
+            String writerId,
             SupplierEx<? extends SinkWriter> writerFactory,
             List<Vertex> upstream,
             List<String> streams) {
+    }
+
+    /**
+     * A durable writer key from the terminal's stable identity. URL-safe Base64 preserves every byte
+     * while keeping author-chosen ids, including a leading {@code $}, inside one Mongo field name.
+     */
+    private static String writerIdFor(String sinkIdentity) {
+        String encoded = Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(sinkIdentity.getBytes(StandardCharsets.UTF_8));
+        return "sink-" + encoded;
     }
 
     /** The source streams carried by {@code upstream}, or none when frontier binding is absent. */

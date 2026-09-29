@@ -28,6 +28,7 @@ import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.SyncElement;
+import io.tapstate.core.model.ViewBlock;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 import io.tapstate.spi.transform.TransformPort;
@@ -50,6 +51,10 @@ import org.junit.jupiter.api.Test;
 class PipelineDagBuilderAckTest {
 
     private static final String ACK_KEY = "test.sink.ack";
+    // Golden persisted keys: changing this encoding requires an explicit retained-state migration.
+    private static final String FIRST_WRITER_ID = "sink-c2VydmUuJGZpcnN0";
+    private static final String SECOND_WRITER_ID = "sink-c2VydmUuc2Vjb25k";
+    private static final String VIEW_WRITER_ID = "sink-dmlldy5vcmRlcnM";
 
     private static int suffix(String token) {
         return Integer.parseInt(token.replaceAll("\\D+", ""));
@@ -109,7 +114,7 @@ class PipelineDagBuilderAckTest {
                 "p", null, List.of(SourceRef.bare("orders_src")), null, null,
                 new ServeBlock.Inline(null, FromRef.literal("orders_src"),
                         List.of(
-                                new SyncElement("first", "first_dest", null, null, null),
+                                new SyncElement("$first", "first_dest", null, null, null),
                                 new SyncElement("second", "second_dest", null, null, null)),
                         null, null),
                 null, null);
@@ -121,13 +126,75 @@ class PipelineDagBuilderAckTest {
                 new FrontierBinding(Map.of("orders_src", "orders")));
 
         assertThat(sinkAck.preparedPlan.get("orders"))
-                .containsExactlyInAnyOrder("sink-0", "sink-1");
+                .containsExactly(FIRST_WRITER_ID, SECOND_WRITER_ID);
         assertThat(sinkAck.scopes).hasSize(2);
         assertThat(sinkAck.scopes).allSatisfy(scope -> {
             assertThat(scope.streams()).containsExactly("orders");
             assertThat(scope.writerIdsByStream().get("orders"))
-                    .containsExactlyInAnyOrder("sink-0", "sink-1");
+                    .containsExactly(FIRST_WRITER_ID, SECOND_WRITER_ID);
         });
+    }
+
+    @Test
+    void retainedWriterProgressFollowsNamedSinksAcrossReassemblyOrder() {
+        SyncElement first = new SyncElement("$first", "first_dest", null, null, null);
+        SyncElement second = new SyncElement("second", "second_dest", null, null, null);
+        PlanningAckFactory initial = buildPlan(List.of(first, second));
+        Map<String, Long> retainedProgress = Map.of(
+                initial.scopes.get(0).writerId(), 100L,
+                initial.scopes.get(1).writerId(), 50L);
+
+        PlanningAckFactory reordered = buildPlan(List.of(second, first));
+
+        assertThat(reordered.scopes)
+                .extracting(scope -> retainedProgress.get(scope.writerId()))
+                .containsExactly(50L, 100L);
+        assertThat(reordered.preparedPlan.get("orders"))
+                .containsExactly(SECOND_WRITER_ID, FIRST_WRITER_ID);
+    }
+
+    @Test
+    void addingAViewDoesNotMoveANamedServeSinkToAnotherPersistedSlot() {
+        SyncElement sink = new SyncElement("$first", "first_dest", null, null, null);
+        PlanningAckFactory initial = buildPlan(List.of(sink));
+        Map<String, Long> retainedProgress = Map.of(initial.scopes.get(0).writerId(), 100L);
+
+        PlanningAckFactory withView = buildPlanWithView(sink);
+
+        assertThat(withView.scopes)
+                .extracting(scope -> retainedProgress.get(scope.writerId()))
+                .containsExactly(null, 100L);
+        assertThat(withView.preparedPlan.get("orders"))
+                .containsExactly(VIEW_WRITER_ID, FIRST_WRITER_ID);
+    }
+
+    private static PlanningAckFactory buildPlan(List<SyncElement> sync) {
+        PlanningAckFactory sinkAck = new PlanningAckFactory();
+        PipelineResource pipeline = new PipelineResource(
+                "p", null, List.of(SourceRef.bare("orders_src")), null, null,
+                new ServeBlock.Inline(null, FromRef.literal("orders_src"), sync, null, null),
+                null, null);
+        PipelineDagBuilder.build(
+                pipeline,
+                bindings(),
+                sinkAck,
+                new FrontierBinding(Map.of("orders_src", "orders")));
+        return sinkAck;
+    }
+
+    private static PlanningAckFactory buildPlanWithView(SyncElement sync) {
+        PlanningAckFactory sinkAck = new PlanningAckFactory();
+        PipelineResource pipeline = new PipelineResource(
+                "p", null, List.of(SourceRef.bare("orders_src")), null,
+                new ViewBlock.Inline("orders", FromRef.literal("orders_src"), "id", null),
+                new ServeBlock.Inline(null, FromRef.literal("orders"), List.of(sync), null, null),
+                null, null);
+        PipelineDagBuilder.build(
+                pipeline,
+                bindings(),
+                sinkAck,
+                new FrontierBinding(Map.of("orders_src", "orders")));
+        return sinkAck;
     }
 
     /** Structural stubs for the leaves; the serve sink is the only vertex this test drives. */
@@ -137,7 +204,9 @@ class PipelineDagBuilderAckTest {
                 step -> (SupplierEx<TransformPort>) () -> ev -> List.of(ev),
                 syncElement -> (SupplierEx<SinkWriter>) RecordingWriter::new,
                 Function.<FromRef>identity().andThen(ref ->
-                        Map.of(FromRef.literal("orders_src"), List.of("orders_src")).getOrDefault(ref, List.of())));
+                        Map.of(FromRef.literal("orders_src"), List.of("orders_src")).getOrDefault(ref, List.of())),
+                sourceId -> List.of(sourceId),
+                view -> (SupplierEx<SinkWriter>) RecordingWriter::new);
     }
 
     /**
