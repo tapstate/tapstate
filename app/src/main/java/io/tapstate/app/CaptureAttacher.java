@@ -14,6 +14,15 @@ interface CaptureAttacher extends CaptureStarter {
 
     CaptureRun start(CaptureRunSpec spec, CaptureHandoff handoff, boolean startTail);
 
+    /**
+     * Has the chain reader {@code run} carries take on every table pipelines have since asked it for;
+     * answers whether its subscription changed. The default reads nothing, for an attacher whose runs have
+     * no chain reader to widen.
+     */
+    default boolean widen(CaptureRun run) {
+        return false;
+    }
+
     @Override
     default CaptureRun start(CaptureRunSpec spec, CaptureHandoff handoff) {
         return start(spec, handoff, true);

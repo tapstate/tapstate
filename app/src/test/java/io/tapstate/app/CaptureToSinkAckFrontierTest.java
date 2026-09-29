@@ -574,6 +574,9 @@ class CaptureToSinkAckFrontierTest {
 
         @Override
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+            // Where the stream begins, said before anything else, as a connector's stream says it.
+            listener.onStart(java.util.Optional.of(start instanceof CaptureStart.Resume resume
+                    ? resume.position() : new SourcePosition("start")));
             running = true;
             daemon = new Thread(() -> {
                 while (running) {

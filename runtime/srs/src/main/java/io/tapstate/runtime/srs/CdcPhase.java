@@ -3,6 +3,7 @@ package io.tapstate.runtime.srs;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.capture.CaptureConfig;
+import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.core.event.ChainPosition;
@@ -159,6 +160,56 @@ public final class CdcPhase {
     }
 
     /**
+     * Starts the chain's reader: one connector subscription over every table it subscribes to, each change
+     * routed to its table's ring, and the chain's durable positions moved only by {@code prefix} -- which
+     * releases a run of changes once everyone it was owed to has landed it, and never on the strength of one
+     * table's confirmation alone. The subscription it returns closes the account with the stream.
+     *
+     * <p>Where the stream began is handed to the account before anything else, and a run that carried no
+     * change but named a position is recorded like any other: behind every run before it, it is what moves
+     * a quiet chain.
+     */
+    static Subscription run(
+            CapturePort port,
+            CaptureConfig config,
+            CaptureStart start,
+            Map<String, TableRoute> routes,
+            CaptureHealth health,
+            PhysicalSourcePrefix prefix) {
+        Objects.requireNonNull(port, "port");
+        Objects.requireNonNull(config, "config");
+        Objects.requireNonNull(start, "start");
+        Objects.requireNonNull(routes, "routes");
+        Objects.requireNonNull(health, "health");
+        Objects.requireNonNull(prefix, "prefix");
+        Map<String, TableRoute> routeSnapshot = Map.copyOf(routes);
+        Subscription stream;
+        try {
+            stream = port.cdc(config, start, health.recording(new CaptureListener() {
+                @Override
+                public void onStart(Optional<SourcePosition> position) {
+                    prefix.start(position);
+                }
+
+                @Override
+                public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                    writeReleased(events, position, routeSnapshot::get, prefix);
+                }
+            }));
+        } catch (RuntimeException | Error failure) {
+            prefix.close();
+            throw failure;
+        }
+        return () -> {
+            try {
+                stream.close();
+            } finally {
+                prefix.close();
+            }
+        };
+    }
+
+    /**
      * One table's wiring: its ring, the slowest consumer's cursor in it, the chain's consumer offsets, and
      * a cut of the durable log behind it.
      *
@@ -222,22 +273,7 @@ public final class CdcPhase {
             return;
         }
         int last = events.size() - 1;
-        Map<String, List<SrsItem>> byTable = new LinkedHashMap<>();
-        for (int i = 0; i < events.size(); i++) {
-            Envelope event = events.get(i);
-            TableRoute route = routes.apply(event.src());
-            if (route == null) {
-                throw new TapstateException(
-                        CaptureError.EVENT_TABLE_NOT_SELECTED, Map.of("table", event.src()), null);
-            }
-            // The position the source named for the run rides with the change that closes it and no other.
-            // Carried on the earlier ones it would say of each that the source had already read past the
-            // last, and a run interrupted between them would resume past changes never delivered.
-            SourcePosition pos = i == last ? position.orElse(null) : null;
-            byTable.computeIfAbsent(event.src(), table -> new ArrayList<>()).add(new SrsItem(
-                    pos, event.op(), event.ts(), event.before(), event.after(), route.chain().schemaVer(),
-                    route.chain().captureFence()));
-        }
+        Map<String, List<SrsItem>> byTable = byTable(events, position, routes);
         String closingTable = events.get(last).src();
         long closingSeq = -1;
         Collection<ConsumerOffset> closingOffsets = List.of();
@@ -278,6 +314,65 @@ public final class CdcPhase {
             // one, rather than one per change.
             closing.trimThrough().accept(safe.order().seq());
         });
+    }
+
+    /**
+     * Writes one run of changes into the rings and hands it to the chain reader's account, which alone decides
+     * when the position the source named for it may be written down.
+     *
+     * <p>The account is asked for room before anything is written, so a reader whose account is full holds
+     * its source back instead of running ahead of what it can ever release. A run that carried no change but
+     * named a position is recorded too, with nothing owed: a source that reports where a transaction ends only
+     * after it has handed the transaction's changes over names that position on exactly such a run. One that
+     * named nothing and carried nothing tells nobody anything, and is let go.
+     */
+    private static void writeReleased(
+            List<Envelope> events,
+            Optional<SourcePosition> position,
+            Function<String, TableRoute> routes,
+            PhysicalSourcePrefix prefix) {
+        String token = position.map(SourcePosition::token).orElse(null);
+        if (events.isEmpty() && token == null) {
+            return;
+        }
+        // Routed before the account is asked for room: a change naming a table this reader does not carry
+        // fails the run whole, before any of it is written or recorded.
+        Map<String, List<SrsItem>> byTable = events.isEmpty() ? Map.of() : byTable(events, position, routes);
+        prefix.awaitRoom();
+        Map<String, Long> lastSeqByTable = new LinkedHashMap<>();
+        for (Map.Entry<String, List<SrsItem>> entry : byTable.entrySet()) {
+            lastSeqByTable.put(entry.getKey(),
+                    admit(routes.apply(entry.getKey()), entry.getKey(), entry.getValue()).lastSeq());
+        }
+        prefix.admitted(lastSeqByTable, token);
+    }
+
+    /**
+     * Projects one run of changes to ring items split by table, each table's share in the order the source
+     * read it. Every change is routed before any of them is written: a change naming a table this chain does
+     * not carry fails the whole run, and failing it after half of it is in the ring would leave the source
+     * read offset unable to describe what happened.
+     */
+    private static Map<String, List<SrsItem>> byTable(
+            List<Envelope> events, Optional<SourcePosition> position, Function<String, TableRoute> routes) {
+        int last = events.size() - 1;
+        Map<String, List<SrsItem>> byTable = new LinkedHashMap<>();
+        for (int i = 0; i < events.size(); i++) {
+            Envelope event = events.get(i);
+            TableRoute route = routes.apply(event.src());
+            if (route == null) {
+                throw new TapstateException(
+                        CaptureError.EVENT_TABLE_NOT_SELECTED, Map.of("table", event.src()), null);
+            }
+            // The position the source named for the run rides with the change that closes it and no other.
+            // Carried on the earlier ones it would say of each that the source had already read past the
+            // last, and a run interrupted between them would resume past changes never delivered.
+            SourcePosition pos = i == last ? position.orElse(null) : null;
+            byTable.computeIfAbsent(event.src(), table -> new ArrayList<>()).add(new SrsItem(
+                    pos, event.op(), event.ts(), event.before(), event.after(), route.chain().schemaVer(),
+                    route.chain().captureFence()));
+        }
+        return byTable;
     }
 
     /**

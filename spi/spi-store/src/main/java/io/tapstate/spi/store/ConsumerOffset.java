@@ -24,10 +24,12 @@ import java.util.Map;
  * generation and sequence, and {@code sinkAcked} moves only once every change up to a point of the source log
  * has landed for every table this pipeline selects. A table's sequence never ranks another table's change.
  *
- * <p>{@code selectedTables} is this pipeline's current table selection on the chain, across every source of
- * the pipeline that reads it, and {@code selectedTablesEpoch} the ring generation it was made in. Both are
- * absent on a record written before selections were recorded; such a consumer is treated as selecting every
- * table, which is the reading that can only hold the chain back, never let it skip.
+ * <p>{@code selectedTables} is the tables this pipeline currently reads through the chain's shared ring,
+ * across every source of the pipeline that reads it, and {@code selectedTablesEpoch} the ring generation the
+ * selection was made in. A pipeline reading the chain only through a direct tail of its own selects nothing
+ * from the ring, which is an empty selection: the chain's reader owes it nothing. Both are absent on a record
+ * written before selections were recorded; such a consumer is treated as selecting every table, which is the
+ * reading that can only hold the chain back, never let it skip.
  *
  * <p>The acked position is a pair, and both halves are needed for different reasons. The token is what
  * a read resumes from and the only half a connector understands. The order is the engine's own record of
@@ -147,9 +149,9 @@ public record ConsumerOffset(
     }
 
     /**
-     * Whether this pipeline reads {@code table} on the chain. A consumer whose selection was never recorded
-     * answers yes for every table: it may read any of them, and treating it as reading none would let the
-     * chain move past a change it still owes.
+     * Whether this pipeline reads {@code table} through the chain's shared ring. A consumer whose selection
+     * was never recorded answers yes for every table: it may read any of them, and treating it as reading
+     * none would let the chain move past a change it still owes.
      */
     public boolean selects(String table) {
         return selectedTables == null || selectedTables.contains(table);

@@ -15,6 +15,7 @@ import io.tapstate.runtime.srs.CaptureId;
 import io.tapstate.runtime.srs.CaptureRunSpec;
 import io.tapstate.runtime.srs.ConsumptionPlan;
 import io.tapstate.runtime.srs.MiningChainId;
+import io.tapstate.runtime.srs.ReaderNotServingYet;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SnapshotPhase;
 import io.tapstate.runtime.srs.SrsCoordinator;
@@ -97,6 +98,12 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
 
     /** The captures starts here were given back over, for as long as they are still not ready. */
     private final Map<CaptureId, RingWait> ringWaits = new LinkedHashMap<>();
+
+    /** The captures starts here were given back over because their reader does not read a table yet. */
+    private final Map<CaptureId, RingWait> servedWaits = new LinkedHashMap<>();
+
+    /** Has every chain reader this member runs take on the tables pipelines elsewhere asked it for. */
+    private ScheduledExecutorService widenings;
 
     /** Looks for captures pipelines here read and nobody tails; started with the first capture joined. */
     private ScheduledExecutorService takeovers;
@@ -207,6 +214,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 } else {
                     OwnedCapture existing = ownedCaptures.get(captureId);
                     if (existing != null) {
+                        serveFromTheReaderHere(existing, spec);
                         run = captureAttacher.start(spec.withCaptureFence(existing.permit.fence()), handoff, false);
                         existing.pipelines.add(pipelineId);
                     } else {
@@ -232,7 +240,12 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                             // Another member tails this source. The pipeline reads it no differently for
                             // that: its own load where its record says one is owed, then the changes the
                             // other member's tail writes into the shared ring.
-                            run = captureAttacher.start(spec, handoff, false);
+                            try {
+                                run = captureAttacher.start(spec, handoff, false);
+                            } catch (ReaderNotServingYet notYet) {
+                                throw notServedYet(pipelineId, captureId, notYet);
+                            }
+                            servedWaits.remove(captureId);
                             joinedCaptures.computeIfAbsent(captureId, ignored -> new JoinedCapture(spec, handoff))
                                     .pipelines.add(pipelineId);
                             lookForCapturesNobodyTails();
@@ -362,21 +375,28 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     /**
-     * Gives every source that tails a chain the whole of what this pipeline reads from that chain.
+     * Gives every source that tails a chain the whole of what this pipeline reads from that chain through its
+     * shared ring.
      *
      * <p>Two sources of one pipeline can read one database -- one source resource for orders and another for
      * customers, feeding the same join -- and then they share its mining chain and the pipeline's one record on
      * it. That record's selection decides which tables' acknowledgements the chain waits for before it moves,
      * so it has to name both: each source recording only its own share would overwrite the other's, and the
-     * chain would stop waiting for the table it dropped.
+     * chain would stop waiting for the table it dropped. A source read through a direct tail reads nothing
+     * through the ring, so it adds nothing to the selection -- and records the same one, rather than an empty
+     * one that would overwrite what the pipeline's buffered sources read.
      */
     private static List<SourcePlan> withChainSelections(List<SourcePlan> plans) {
         Map<MiningChainId, Set<String>> selections = new LinkedHashMap<>();
         for (SourcePlan plan : plans) {
             CaptureRunSpec spec = plan.spec();
-            if (ConsumptionPlan.of(spec.readMode(), spec.srsEnabled()).tail()) {
-                selections.computeIfAbsent(MiningChainId.resolve(spec.config(), spec.srsKey()),
-                        chain -> new TreeSet<>()).addAll(spec.config().streams());
+            ConsumptionPlan consumption = ConsumptionPlan.of(spec.readMode(), spec.srsEnabled());
+            if (consumption.tail()) {
+                Set<String> selected = selections.computeIfAbsent(
+                        MiningChainId.resolve(spec.config(), spec.srsKey()), chain -> new TreeSet<>());
+                if (consumption.sharedRing()) {
+                    selected.addAll(spec.config().streams());
+                }
             }
         }
         List<SourcePlan> selected = new ArrayList<>(plans.size());
@@ -458,6 +478,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     private void own(CaptureId captureId, CaptureRun run, CaptureOwnership.Permit permit, Set<String> pipelines) {
         OwnedCapture owned = new OwnedCapture(run, permit, pipelines);
         ownedCaptures.put(captureId, owned);
+        lookForRequestsToWidenFor();
         owned.lease = permit.claim() == null
                 ? CaptureClaimLease.unfenced()
                 : new CaptureClaimLease(
@@ -546,6 +567,97 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             takeovers.shutdownNow();
             takeovers = null;
         }
+        if (widenings != null) {
+            widenings.shutdownNow();
+            widenings = null;
+        }
+    }
+
+    /**
+     * Has this member's own reader of a chain take on the tables {@code spec} reads, before the pipeline is
+     * attached to it. The request is recorded first, exactly as a pipeline on any other member records it,
+     * and the reader here takes it on at once rather than the next time it looks: a pipeline started beside
+     * the reader it reads waits for nothing.
+     *
+     * <p>A reader that cannot be widened has stopped its stream already, and every pipeline reading it would
+     * go on healthy over a ring nobody writes; so its failure is recorded on the run they all read.
+     */
+    private void serveFromTheReaderHere(OwnedCapture owned, CaptureRunSpec spec) {
+        if (!spec.srsEnabled() || spec.readMode() == ReadMode.SNAPSHOT_ONLY) {
+            return;
+        }
+        String chain = MiningChainId.resolve(spec.config(), spec.srsKey()).value();
+        long epoch = storePort.meta().read(chain).map(SrsMeta::epoch).orElse(0L);
+        if (epoch < 1) {
+            return;
+        }
+        storePort.meta().requestPhysicalTables(chain, epoch, spec.config().streams());
+        try {
+            captureAttacher.widen(owned.run);
+        } catch (RuntimeException | Error failure) {
+            owned.run.health().fail(failure);
+            throw failure;
+        }
+    }
+
+    /**
+     * The start given back while the reader another member runs does not read a table this pipeline needs,
+     * or -- once that has gone on for longer than a lease, the longest the reader's own look for requests can
+     * take -- refused with a code instead of retried over nothing for ever.
+     */
+    private RuntimeException notServedYet(String pipelineId, CaptureId captureId, ReaderNotServingYet notYet) {
+        Duration bound = ownership.ttl();
+        long now = System.nanoTime();
+        RingWait wait = servedWaits.get(captureId);
+        if (wait == null || now - wait.lastLooked() > bound.toNanos()) {
+            LOG.info("The reader of capture {} does not read {} yet; pipeline {} starts once it does",
+                    captureId.value(), notYet.tables(), pipelineId);
+            wait = new RingWait(now, now);
+        }
+        if (now - wait.since() >= bound.toNanos()) {
+            servedWaits.remove(captureId);
+            return new TapstateException(
+                    CaptureError.SHARED_SELECTION_RESTART_REQUIRED, Map.of("chain", notYet.chainId()), notYet);
+        }
+        servedWaits.put(captureId, new RingWait(wait.since(), now));
+        return new RingNotOpenYet("the reader of capture " + captureId.value() + " does not read "
+                + notYet.tables() + " yet");
+    }
+
+    /**
+     * Has every chain reader this member runs take on what pipelines on other members asked it for. Those
+     * pipelines are given back until it has, so this runs on the member's own schedule rather than on any
+     * start of its own; one reader that cannot be widened does not keep the others from being looked at.
+     */
+    synchronized void widenTheReadersHere() {
+        for (Map.Entry<CaptureId, OwnedCapture> owned : ownedCaptures.entrySet()) {
+            try {
+                captureAttacher.widen(owned.getValue().run);
+            } catch (RuntimeException failure) {
+                owned.getValue().run.health().fail(failure);
+                LOG.warn("Could not have the reader of capture {} take on the tables asked of it",
+                        owned.getKey().value(), failure);
+            }
+        }
+    }
+
+    private void lookForRequestsToWidenFor() {
+        if (widenings != null || claimRenewInterval.isZero()) {
+            return;
+        }
+        widenings = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "tapstate-capture-widen");
+            thread.setDaemon(true);
+            return thread;
+        });
+        long every = claimRenewInterval.toMillis();
+        widenings.scheduleWithFixedDelay(() -> {
+            try {
+                widenTheReadersHere();
+            } catch (RuntimeException failure) {
+                LOG.warn("Looking for tables to take on failed; asking again later", failure);
+            }
+        }, every, every, TimeUnit.MILLISECONDS);
     }
 
     /**

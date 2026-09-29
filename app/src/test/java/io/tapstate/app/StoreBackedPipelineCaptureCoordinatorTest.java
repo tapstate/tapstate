@@ -484,7 +484,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
 
             @Override
             public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
-                assertThat(config.streams()).containsExactlyElementsOf(tableNames);
+                assertThat(config.streams()).containsExactlyInAnyOrderElementsOf(tableNames);
                 starts.add(start);
                 liveTails.incrementAndGet();
                 return liveTails::decrementAndGet;

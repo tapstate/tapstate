@@ -15,6 +15,7 @@ import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
+import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -91,7 +92,7 @@ class MongoSrsMetaStoreIT {
     private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
 
     @Test
-    void tableAcksPersistIndependentlyAndAnOlderGenerationCannotConfirmTheNewOne() {
+    void tableAcksPersistIndependentlyAndOnlyTheirOwnRingGenerationPositionsARun() {
         withStore(store -> {
             store.create(CHAIN, null);
             long first = store.openEpoch(CHAIN);
@@ -120,17 +121,225 @@ class MongoSrsMetaStoreIT {
             store.selectConsumerTables(CHAIN, "pipe", List.of("orders"), second);
             store.advanceTableSinkAcked(CHAIN, "pipe", "orders",
                     new ChainPosition(new SourceOrder(first, 99), "old-run"));
-            store.advanceTableSinkAcked(CHAIN, "pipe", "customers",
-                    new ChainPosition(new SourceOrder(second, 7), "dropped"));
-            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow().sinkAckedByTable())
-                    .as("a reader of an older generation, or of a table no longer selected, confirms nothing")
-                    .isEmpty();
+            assertThat(store.ringDoneThrough(CHAIN, "pipe"))
+                    .as("a sequence of a replaced ring generation does not say where this run carries on")
+                    .containsEntry("orders", 4L);
 
             store.advanceTableSinkAcked(CHAIN, "pipe", "orders",
                     new ChainPosition(new SourceOrder(second, 5), "replayed"));
             assertThat(store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow().sinkAckedByTable())
-                    .containsExactly(Map.entry("orders", new ChainPosition(new SourceOrder(second, 5), "replayed")));
+                    .as("a confirmation of the current generation outranks any of an earlier one")
+                    .containsEntry("orders", new ChainPosition(new SourceOrder(second, 5), "replayed"));
             assertThat(store.ringDoneThrough(CHAIN, "pipe")).containsEntry("orders", 5L);
+        });
+    }
+
+    /**
+     * A reader that took the chain over writes under a generation of its own, while a pipeline already on the
+     * chain keeps the selection it made under the old one and carries on reading. Its confirmations are the
+     * only thing that lets the new reader release anything, so they are kept -- and the ring it is positioned
+     * in is still its old selection's, so they do not move that.
+     */
+    @Test
+    void aTakeoverStillHearsWhatThePipelinesAlreadyOnTheChainConfirm() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long joined = store.openEpoch(CHAIN);
+            store.selectConsumerTables(CHAIN, "pipe", List.of("orders"), joined);
+            store.advanceConsumerReadSeq(CHAIN, "pipe", "orders", -1L);
+            long takenOver = store.openEpoch(CHAIN);
+
+            store.advanceTableSinkAcked(CHAIN, "pipe", "orders",
+                    new ChainPosition(new SourceOrder(takenOver, 12), "t12"));
+
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow().sinkAckedByTable())
+                    .containsExactly(Map.entry("orders", new ChainPosition(new SourceOrder(takenOver, 12), "t12")));
+            assertThat(store.ringDoneThrough(CHAIN, "pipe")).doesNotContainKey("orders");
+        });
+    }
+
+    /** A pipeline reading the chain only through a direct tail records no ring position from its own count. */
+    @Test
+    void aDirectTailsConfirmationIsKeptWithoutPositioningAnyRing() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            store.selectConsumerTables(CHAIN, "direct", List.of(), epoch);
+
+            store.advanceTableSinkAcked(CHAIN, "direct", "orders",
+                    new ChainPosition(new SourceOrder(epoch, 40), "t40"));
+
+            ConsumerOffset persisted = store.read(CHAIN).orElseThrow().consumerOffset("direct").orElseThrow();
+            assertThat(persisted.selectedTables()).as("it reads nothing through the ring").isEmpty();
+            assertThat(persisted.sinkAckedByTable())
+                    .containsExactly(Map.entry("orders", new ChainPosition(new SourceOrder(epoch, 40), "t40")));
+            assertThat(store.ringDoneThrough(CHAIN, "direct")).isEmpty();
+        });
+    }
+
+    @Test
+    void aGenerationPublishesOneSubscriptionAndALaterGenerationReplacesIt() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long first = store.openEpoch(CHAIN);
+            assertThat(store.physicalSelection(CHAIN)).isEmpty();
+
+            assertThat(store.publishPhysicalSelection(CHAIN,
+                    new SrsMetaStore.PhysicalSelection(first, List.of("orders", "customers")))).isTrue();
+            assertThat(store.publishPhysicalSelection(CHAIN,
+                    new SrsMetaStore.PhysicalSelection(first, List.of("customers", "orders"))))
+                    .as("the same tables published again are the same subscription").isTrue();
+            assertThat(store.publishPhysicalSelection(CHAIN,
+                    new SrsMetaStore.PhysicalSelection(first, List.of("orders"))))
+                    .as("a second, different subscription in one generation belongs to nobody").isFalse();
+            assertThat(store.physicalSelection(CHAIN)).contains(
+                    new SrsMetaStore.PhysicalSelection(first, 1L, List.of("customers", "orders")));
+
+            assertThat(store.publishPhysicalSelection(CHAIN,
+                    new SrsMetaStore.PhysicalSelection(first + 1, List.of("orders"))))
+                    .as("a generation the chain has not opened publishes nothing").isFalse();
+            long second = store.openEpoch(CHAIN);
+            assertThat(store.publishPhysicalSelection(CHAIN,
+                    new SrsMetaStore.PhysicalSelection(second, List.of("orders")))).isTrue();
+            assertThat(store.physicalSelection(CHAIN))
+                    .contains(new SrsMetaStore.PhysicalSelection(second, 1L, List.of("orders")));
+        });
+    }
+
+    /**
+     * A table asked for before the reader publishes is served by that very publication -- one that leaves it
+     * out is refused -- and one asked for afterwards by the wider subscription that replaces it.
+     */
+    @Test
+    void aSubscriptionServesEveryTableAskedForAndAWiderOneReplacesIt() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            assertThat(store.requestPhysicalTables(CHAIN, epoch + 1, List.of("orders")))
+                    .as("a generation the chain has not opened asks nothing").isFalse();
+            assertThat(store.requestPhysicalTables(CHAIN, epoch, List.of("customers"))).isTrue();
+
+            assertThat(store.publishPhysicalSelection(CHAIN,
+                    new SrsMetaStore.PhysicalSelection(epoch, List.of("orders"))))
+                    .as("a subscription leaving out a table asked for is refused").isFalse();
+            SrsMetaStore.PhysicalSelection first =
+                    new SrsMetaStore.PhysicalSelection(epoch, List.of("customers", "orders"));
+            assertThat(store.publishPhysicalSelection(CHAIN, first)).isTrue();
+            store.clearPhysicalRequests(CHAIN, first.tables());
+            assertThat(store.requestedPhysicalTables(CHAIN)).isEmpty();
+
+            assertThat(store.requestPhysicalTables(CHAIN, epoch, List.of("items"))).isTrue();
+            assertThat(store.replacePhysicalSelection(CHAIN, first,
+                    new SrsMetaStore.PhysicalSelection(epoch, 2L, List.of("customers", "orders"))))
+                    .as("a replacement still leaving a request out is refused").isFalse();
+            SrsMetaStore.PhysicalSelection wider =
+                    new SrsMetaStore.PhysicalSelection(epoch, 2L, List.of("customers", "items", "orders"));
+            assertThat(store.replacePhysicalSelection(CHAIN, first, wider)).isTrue();
+            assertThat(store.physicalSelection(CHAIN)).contains(wider);
+            assertThat(store.replacePhysicalSelection(CHAIN, first,
+                    new SrsMetaStore.PhysicalSelection(epoch, 2L, List.of("customers", "items", "orders", "x"))))
+                    .as("a replacement of a subscription no longer published replaces nothing").isFalse();
+            assertThat(store.requestedPhysicalTables(CHAIN)).containsExactly("items");
+            store.clearPhysicalRequests(CHAIN, List.of("items"));
+            assertThat(store.requestedPhysicalTables(CHAIN)).isEmpty();
+        });
+    }
+
+    @Test
+    void anAnchorLaysDownWhereAStreamBeganWithoutProvingAnOffsetNobodyTrusted() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long first = store.openEpoch(CHAIN);
+            ChainPosition started = new ChainPosition(new SourceOrder(first, -1L), "start-1");
+
+            assertThat(store.physicalPrefixTrusted(CHAIN)).isFalse();
+            assertThat(store.establishPhysicalAnchor(CHAIN, started)).isTrue();
+            assertThat(store.read(CHAIN).orElseThrow().sourceRead()).isEqualTo(started);
+            assertThat(store.physicalPrefixTrusted(CHAIN)).isTrue();
+
+            assertThat(store.advancePhysicalSourceReadOffset(CHAIN, first,
+                    new ChainPosition(new SourceOrder(first, 3), "released-3"))).isTrue();
+            assertThat(store.establishPhysicalAnchor(CHAIN, new ChainPosition(new SourceOrder(first, -1L), "again")))
+                    .as("the same generation keeps what its reader already released").isTrue();
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("released-3");
+
+            long second = store.openEpoch(CHAIN);
+            ChainPosition resumed = new ChainPosition(new SourceOrder(second, -1L), "start-2");
+            assertThat(store.establishPhysicalAnchor(CHAIN, resumed)).isTrue();
+            assertThat(store.read(CHAIN).orElseThrow().sourceRead())
+                    .as("a new stream of a trusted chain begins where it began").isEqualTo(resumed);
+            assertThat(store.establishPhysicalAnchor(CHAIN,
+                    new ChainPosition(new SourceOrder(first, -1L), "stale")))
+                    .as("a stream of a replaced generation anchors nothing").isFalse();
+        });
+    }
+
+    @Test
+    void anOffsetFromBeforeTrustExistedIsNotAnchoredOverUntilItIsTrusted() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long first = store.openEpoch(CHAIN);
+            ChainPosition legacy = new ChainPosition(new SourceOrder(first, 7), "legacy");
+            store.advanceSourceReadOffset(CHAIN, legacy);
+            long second = store.openEpoch(CHAIN);
+
+            assertThat(store.establishPhysicalAnchor(CHAIN,
+                    new ChainPosition(new SourceOrder(second, -1L), "start"))).isFalse();
+            assertThat(store.read(CHAIN).orElseThrow().sourceRead()).isEqualTo(legacy);
+            assertThat(store.physicalPrefixTrusted(CHAIN)).isFalse();
+
+            assertThat(store.trustSourceReadOffset(CHAIN, first)).as("only in the chain's own generation").isFalse();
+            assertThat(store.physicalPrefixTrusted(CHAIN)).isFalse();
+            assertThat(store.trustSourceReadOffset(CHAIN, second)).isTrue();
+            assertThat(store.read(CHAIN).orElseThrow().sourceRead()).as("trusting moves nothing").isEqualTo(legacy);
+            assertThat(store.establishPhysicalAnchor(CHAIN,
+                    new ChainPosition(new SourceOrder(second, -1L), "start"))).isTrue();
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("start");
+        });
+    }
+
+    @Test
+    void aPositionPutThereByHandIsTrusted() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.openEpoch(CHAIN);
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(1, 9), "legacy"));
+
+            store.rewindSourceReadOffset(CHAIN, "verified");
+
+            assertThat(store.physicalPrefixTrusted(CHAIN)).isTrue();
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("verified");
+        });
+    }
+
+    @Test
+    void aReleaseLandsOnlyWhileItsReaderHoldsTheGeneration() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long first = store.openEpoch(CHAIN);
+            store.selectConsumerTables(CHAIN, "pipe", List.of("orders"), first);
+            ChainPosition released = new ChainPosition(new SourceOrder(first, 4), "t4");
+
+            assertThat(store.advancePhysicalSourceReadOffset(CHAIN, first, released)).isTrue();
+            assertThat(store.advancePhysicalSinkAcked(CHAIN, "pipe", first, released)).isTrue();
+            assertThat(store.advancePhysicalSourceReadOffset(CHAIN, first,
+                    new ChainPosition(new SourceOrder(first, 2), "t2"))).as("behind, but still current").isTrue();
+            assertThat(store.read(CHAIN).orElseThrow().sourceRead()).isEqualTo(released);
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow().sinkAcked())
+                    .isEqualTo(released);
+
+            long second = store.openEpoch(CHAIN);
+            ChainPosition late = new ChainPosition(new SourceOrder(first, 9), "t9");
+            assertThat(store.advancePhysicalSourceReadOffset(CHAIN, first, late)).isFalse();
+            assertThat(store.advancePhysicalSinkAcked(CHAIN, "pipe", first, late)).isFalse();
+            assertThat(store.read(CHAIN).orElseThrow().sourceRead()).isEqualTo(released);
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow().sinkAcked())
+                    .isEqualTo(released);
+
+            assertThat(store.advancePhysicalSinkAcked(CHAIN, "gone", second,
+                    new ChainPosition(new SourceOrder(second, 1), "t1"))).isTrue();
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("gone"))
+                    .as("a pipeline that left is not brought back by a release").isEmpty();
         });
     }
 

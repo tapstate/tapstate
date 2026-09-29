@@ -249,6 +249,9 @@ class CaptureToSinkDataFlowTest {
 
         @Override
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+            // Where the stream begins, said before anything else, as a connector's stream says it.
+            listener.onStart(java.util.Optional.of(start instanceof CaptureStart.Resume resume
+                    ? resume.position() : new SourcePosition("start")));
             for (Envelope change : changes) {
                 listener.onBatch(java.util.List.of(change), java.util.Optional.of(new SourcePosition("src-" + change.ts())));
             }

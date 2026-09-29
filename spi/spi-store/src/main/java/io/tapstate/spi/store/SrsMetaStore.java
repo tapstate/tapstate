@@ -25,8 +25,93 @@ import java.util.Optional;
  */
 public interface SrsMetaStore {
 
+    /**
+     * The tables the chain's one ring-backed reader subscribed to, in the ring generation it opened, and
+     * which revision of that subscription this is within the generation.
+     *
+     * <p>A chain is read from its source once, for every pipeline on it, so what that one read subscribes
+     * to is the union of what they select. A pipeline arriving with a table outside it cannot be served by
+     * the running subscription: the source is not reading that table at all.
+     */
+    record PhysicalSelection(long epoch, long revision, List<String> tables) {
+
+        public PhysicalSelection {
+            if (epoch < 1 || revision < 1) {
+                throw new IllegalArgumentException(
+                        "a physical selection belongs to an opened generation and revision, got "
+                                + epoch + "/" + revision);
+            }
+            if (tables == null || tables.isEmpty()
+                    || tables.stream().anyMatch(table -> table == null || table.isBlank())) {
+                throw new IllegalArgumentException("a physical selection names at least one table");
+            }
+            tables = tables.stream().distinct().sorted().toList();
+        }
+
+        /** The first subscription of a generation. */
+        public PhysicalSelection(long epoch, List<String> tables) {
+            this(epoch, 1L, tables);
+        }
+    }
+
     /** Returns the meta record for a mining chain, or empty if the chain has not been seeded. */
     Optional<SrsMeta> read(String miningChainId);
+
+    /**
+     * What the chain's ring-backed reader subscribed to, or empty when no reader has published one. A
+     * selection from an earlier generation is still answered: whether it is current is the caller's to
+     * judge against the generation it reads under. The default answers empty.
+     */
+    default Optional<PhysicalSelection> physicalSelection(String miningChainId) {
+        return Optional.empty();
+    }
+
+    /**
+     * Publishes the first subscription of a generation, while the chain is in that generation, nothing else
+     * has been published for it -- or the same tables already have -- and it includes every table
+     * {@linkplain #requestPhysicalTables requested}. Answers whether the chain now holds exactly this
+     * selection; false means a request landed since the caller read them, another reader got there first, or
+     * the chain moved on. A mutate on an unseeded chain is a caller ordering error.
+     */
+    default boolean publishPhysicalSelection(String miningChainId, PhysicalSelection selection) {
+        throw new UnsupportedOperationException("this store does not record physical selections");
+    }
+
+    /**
+     * Replaces the subscription published in a generation with a wider one of the same generation, once the
+     * stream it described has stopped: only while {@code current} is still exactly what is published and
+     * {@code wider} includes every table requested. Answers whether it did. A mutate on an unseeded chain is a
+     * caller ordering error.
+     */
+    default boolean replacePhysicalSelection(
+            String miningChainId, PhysicalSelection current, PhysicalSelection wider) {
+        throw new UnsupportedOperationException("this store does not record physical selections");
+    }
+
+    /** The tables pipelines arriving on the chain asked its reader to subscribe to; empty by default. */
+    default List<String> requestedPhysicalTables(String miningChainId) {
+        return List.of();
+    }
+
+    /**
+     * Records that a pipeline arriving on the chain needs its reader to subscribe to {@code tables}, while the
+     * chain is in ring generation {@code epoch}; answers whether it is.
+     *
+     * <p>A reader publishes a subscription only if it includes every table asked for, so a request recorded
+     * before the reader publishes is served by that very subscription, and one recorded after it is found the
+     * next time the reader looks. The pipeline goes on only once a published subscription includes its
+     * tables: a pipeline that loaded a table the reader was not subscribed to would miss every change made
+     * between its load and the moment the reader took the table on. A mutate on an unseeded chain is a
+     * caller ordering error.
+     */
+    default boolean requestPhysicalTables(String miningChainId, long epoch, List<String> tables) {
+        throw new UnsupportedOperationException("this store does not record physical selections");
+    }
+
+    /** Drops the requests for {@code tables}, which a published subscription now serves; others are kept. */
+    default void clearPhysicalRequests(String miningChainId, List<String> tables) {
+        throw new UnsupportedOperationException("this store does not record physical selections");
+    }
 
     /**
      * The chain's consumer cursors alone, empty when the chain has not been seeded — what the cdc write
@@ -89,8 +174,73 @@ public interface SrsMetaStore {
      * a fresh run comes back in regardless.
      *
      * <p>A mutate on an unseeded chain is a caller ordering error, as with every other mutator here.
+     *
+     * <p>The offset it leaves is {@linkplain #physicalPrefixTrusted trusted}: somebody chose it knowing
+     * where every pipeline on the chain stands, which is the one proof an offset written before per-table
+     * acknowledgements existed cannot otherwise get.
      */
     void rewindSourceReadOffset(String miningChainId, String token);
+
+    /**
+     * Advances the source read offset to a position the chain's reader has released -- every change up to
+     * it landed for every consumer that selects a table it touched -- while the chain is still in ring
+     * generation {@code epoch}, and only forward. Answers whether the chain is still in that generation.
+     *
+     * <p>Fenced by generation because only the reader holding the chain's current generation may say how
+     * far its source was read: one that lost it to a newer reader is still running out its last callbacks,
+     * and a release from it could carry the offset past what the newer one has not landed. It then changes
+     * nothing and answers false. A position that does not rank after the one recorded is ignored, as
+     * {@link #advanceSourceReadOffset} ignores one, and the answer is still true.
+     *
+     * <p>The position carries that generation in its order, and a token: it names where a read resumes. A
+     * mutate on an unseeded chain is a caller ordering error.
+     */
+    default boolean advancePhysicalSourceReadOffset(String miningChainId, long epoch, ChainPosition position) {
+        throw new UnsupportedOperationException("this store does not fence source read releases by generation");
+    }
+
+    /**
+     * Whether the chain's source read offset is one every table it carries can resume from.
+     *
+     * <p>An offset is trusted once it was laid down as where a stream began, released by the chain's reader
+     * across every table it reads, adopted from a chain that provably carried a single table, or put there
+     * by hand. One written before any of those existed is not: while a chain carried several tables, one
+     * table's acknowledgement could move it past another table's change that had not landed, and nothing
+     * recorded says whether that happened. False for a chain with no record, and what a store without the
+     * notion answers.
+     */
+    default boolean physicalPrefixTrusted(String miningChainId) {
+        return false;
+    }
+
+    /**
+     * Lays down where the chain's reader actually began -- the connector's own start position, ordered in
+     * {@code position}'s generation beneath the first change of it -- as the chain's source read offset, and
+     * marks the offset trusted. Answers whether the chain now holds a trusted offset in that generation.
+     *
+     * <p>Laid down when the chain holds no offset, or holds a trusted one from an earlier generation or with
+     * no order at all: the new stream began where it began, and until one of its changes lands that is the
+     * only point it can be resumed from. A trusted offset already in this generation is kept -- it is a
+     * release the same reader made, or a start it already laid down. An offset that is not trusted is left
+     * alone and the answer is false: laying a start over it would make it look proven. So is a chain that
+     * has moved to another generation. A mutate on an unseeded chain is a caller ordering error.
+     */
+    default boolean establishPhysicalAnchor(String miningChainId, ChainPosition position) {
+        throw new UnsupportedOperationException("this store does not record physical anchors");
+    }
+
+    /**
+     * Marks the chain's source read offset trusted without moving it, while the chain is in ring generation
+     * {@code epoch}; answers whether it is.
+     *
+     * <p>For a caller that has established that every consumer of the chain reads one and the same table. On
+     * such a chain an acknowledgement could only ever speak for that table, so the offset it bounded is
+     * exact, and a later start over several tables may build on it. A mutate on an unseeded chain is a
+     * caller ordering error.
+     */
+    default boolean trustSourceReadOffset(String miningChainId, long epoch) {
+        throw new UnsupportedOperationException("this store does not record physical anchors");
+    }
 
     /**
      * Inserts or replaces one consumer pipeline's cursor on the chain, keyed by its pipeline id. A
@@ -126,6 +276,21 @@ public interface SrsMetaStore {
     void advanceSinkAcked(String miningChainId, String pipelineId, ChainPosition position);
 
     /**
+     * Advances one consumer's sink-acked position to a point its reader has released for it, while the chain
+     * is still in ring generation {@code epoch}; answers whether it is.
+     *
+     * <p>The release is the reader's word that every change up to that point landed for this consumer on
+     * every table it selects, which is what the consumer's chain-level position has to mean once the chain
+     * carries several tables. Fenced by generation for the reason {@link #advancePhysicalSourceReadOffset}
+     * is. Only forward, and never for a consumer the chain no longer records: a pipeline that left is not
+     * brought back by a release it no longer needs. A mutate on an unseeded chain is a caller ordering error.
+     */
+    default boolean advancePhysicalSinkAcked(
+            String miningChainId, String pipelineId, long epoch, ChainPosition position) {
+        throw new UnsupportedOperationException("this store does not fence sink releases by generation");
+    }
+
+    /**
      * Advances the sink-acked position as {@link #advanceSinkAcked(String, String, ChainPosition)} does, and
      * records with it where in {@code table}'s own change ring that change sat: the ring sequence the order
      * carries. A run that replaces this pipeline's run carries on from just past it, rather than from the
@@ -146,9 +311,10 @@ public interface SrsMetaStore {
 
     /**
      * Replaces one pipeline's table selection on the chain with {@code tables}, made in ring generation
-     * {@code epoch}: the whole set of tables this pipeline reads from the chain, across every source of the
-     * pipeline that reads it, not one source's share of them. It creates the consumer entry when the pipeline
-     * has none yet.
+     * {@code epoch}: the whole set of tables this pipeline reads from the chain's shared ring, across every
+     * source of the pipeline that reads it, not one source's share of them. It creates the consumer entry
+     * when the pipeline has none yet. A pipeline that reads the chain only through a direct tail of its own
+     * selects nothing from the ring, and records an empty selection: the chain's reader owes it nothing.
      *
      * <p>Replaced whole rather than added to, because what a chain may release is decided by who still reads
      * which table: a table a pipeline stopped reading and was still recorded as reading would hold the chain
@@ -162,16 +328,23 @@ public interface SrsMetaStore {
     }
 
     /**
-     * Records what {@code table}'s sink confirmed, in that table's own ring generation and sequence, without
-     * moving the pipeline's chain-level acknowledgement, and raises the table's {@code ringDoneThrough} to the
-     * same sequence in the same write.
+     * Records what {@code table}'s sink confirmed, in the order it was read under, without moving the
+     * pipeline's chain-level acknowledgement. Only ever raised: a position that does not rank after the one
+     * recorded for the table is ignored.
      *
-     * <p>On a chain carrying several tables the chain-level acknowledgement is released by whoever owns the
-     * chain's tail, and only once every change up to a point of the source log has landed for every table
-     * that reads it. This is the input to that release. Only ever raised: a position that does not rank after
-     * the one recorded is ignored, and so is one from a generation other than the selection's or for a table
-     * the pipeline no longer selects -- both belong to a reader that has since been replaced. A mutate on an
-     * unseeded chain is a caller ordering error.
+     * <p>On a chain carrying several tables the chain-level acknowledgement is released by whoever reads the
+     * chain, and only once every change up to a point of the source log has landed for every table that
+     * reads it. This is the input to that release, and it is recorded whatever generation it came from: a
+     * reader that took the chain over writes under a generation of its own while the pipelines already on
+     * the chain carry on reading, and their confirmations are what lets it release anything. One from a
+     * replaced generation can never stand for a change of the current one, because the release compares
+     * generations first.
+     *
+     * <p>The table's {@code ringDoneThrough} is raised to the same sequence in the same write only when the
+     * sequence is one of the ring this pipeline is positioned in: the selection records the table, in the
+     * generation the position carries, or no selection has been recorded at all. A sequence from another
+     * generation, or from a direct tail that numbers its own changes, says nothing about where in that ring
+     * a run of this pipeline should carry on. A mutate on an unseeded chain is a caller ordering error.
      */
     default void advanceTableSinkAcked(
             String miningChainId, String pipelineId, String table, ChainPosition position) {

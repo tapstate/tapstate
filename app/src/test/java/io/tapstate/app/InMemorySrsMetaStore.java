@@ -7,10 +7,12 @@ import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * A faithful in-memory {@link SrsMetaStore} for the data-plane tests, synchronized so a Jet worker's
@@ -24,10 +26,139 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     private final Map<String, SrsMeta> records = new LinkedHashMap<>();
     /** Per chain, per pipeline: the ring sequence of the last change each table's sink confirmed. */
     private final Map<String, Map<String, Map<String, Long>>> ringDone = new LinkedHashMap<>();
+    /** The chains whose source read offset every table they carry can resume from. */
+    private final Set<String> trusted = new HashSet<>();
+    /** What each chain's reader subscribed to, as its record would carry it. */
+    private final Map<String, PhysicalSelection> selections = new LinkedHashMap<>();
+    /** Tables asked for by pipelines arriving on each chain, until a subscription serves them. */
+    private final Map<String, java.util.Set<String>> requests = new LinkedHashMap<>();
 
     @Override
     public synchronized Optional<SrsMeta> read(String miningChainId) {
         return Optional.ofNullable(records.get(miningChainId));
+    }
+
+    @Override
+    public synchronized boolean replacePhysicalSelection(
+            String miningChainId, PhysicalSelection current, PhysicalSelection wider) {
+        SrsMeta m = require(miningChainId);
+        if (m.epoch() != wider.epoch() || !current.equals(selections.get(miningChainId))
+                || !wider.tables().containsAll(requests.getOrDefault(miningChainId, java.util.Set.of()))) {
+            return false;
+        }
+        selections.put(miningChainId, wider);
+        return true;
+    }
+
+    @Override
+    public synchronized List<String> requestedPhysicalTables(String miningChainId) {
+        return requests.getOrDefault(miningChainId, java.util.Set.of()).stream().sorted().toList();
+    }
+
+    @Override
+    public synchronized boolean requestPhysicalTables(String miningChainId, long epoch, List<String> tables) {
+        if (require(miningChainId).epoch() != epoch) {
+            return false;
+        }
+        requests.computeIfAbsent(miningChainId, chain -> new java.util.TreeSet<>()).addAll(tables);
+        return true;
+    }
+
+    @Override
+    public synchronized void clearPhysicalRequests(String miningChainId, List<String> tables) {
+        require(miningChainId);
+        java.util.Set<String> asked = requests.get(miningChainId);
+        if (asked != null) {
+            tables.forEach(asked::remove);
+        }
+    }
+
+    @Override
+    public synchronized Optional<PhysicalSelection> physicalSelection(String miningChainId) {
+        return Optional.ofNullable(selections.get(miningChainId));
+    }
+
+    @Override
+    public synchronized boolean publishPhysicalSelection(String miningChainId, PhysicalSelection selection) {
+        SrsMeta m = require(miningChainId);
+        if (selection.revision() != 1L) {
+            throw new IllegalArgumentException("a generation's first subscription is its revision one");
+        }
+        PhysicalSelection current = selections.get(miningChainId);
+        if (!selection.tables().containsAll(requests.getOrDefault(miningChainId, java.util.Set.of()))) {
+            return false;
+        }
+        if (m.epoch() != selection.epoch() || current != null && current.epoch() >= selection.epoch()) {
+            return current != null && current.equals(selection);
+        }
+        selections.put(miningChainId, selection);
+        return true;
+    }
+
+    @Override
+    public synchronized boolean advancePhysicalSourceReadOffset(
+            String miningChainId, long epoch, ChainPosition position) {
+        SrsMeta m = require(miningChainId);
+        if (m.epoch() != epoch) {
+            return false;
+        }
+        if (ranksAfter(position, m.sourceRead())) {
+            records.put(miningChainId, new SrsMeta(m.miningChainId(), position, m.consumerOffsets(),
+                    m.schemaHistory(), m.retention(), m.epoch(), Instant.now()));
+        }
+        return true;
+    }
+
+    @Override
+    public synchronized boolean physicalPrefixTrusted(String miningChainId) {
+        return trusted.contains(miningChainId);
+    }
+
+    @Override
+    public synchronized boolean establishPhysicalAnchor(String miningChainId, ChainPosition position) {
+        SrsMeta m = require(miningChainId);
+        long epoch = position.order().epoch();
+        if (m.epoch() != epoch) {
+            return false;
+        }
+        ChainPosition stored = m.sourceRead();
+        boolean trustedNow = trusted.contains(miningChainId);
+        if (stored == null || stored.token() == null
+                || trustedNow && (stored.order() == null || stored.order().epoch() < epoch)) {
+            records.put(miningChainId, new SrsMeta(m.miningChainId(), position, m.consumerOffsets(),
+                    m.schemaHistory(), m.retention(), m.epoch(), Instant.now()));
+            trusted.add(miningChainId);
+            return true;
+        }
+        return trustedNow;
+    }
+
+    @Override
+    public synchronized boolean trustSourceReadOffset(String miningChainId, long epoch) {
+        if (require(miningChainId).epoch() != epoch) {
+            return false;
+        }
+        trusted.add(miningChainId);
+        return true;
+    }
+
+    @Override
+    public synchronized boolean advancePhysicalSinkAcked(
+            String miningChainId, String pipelineId, long epoch, ChainPosition position) {
+        SrsMeta m = require(miningChainId);
+        if (m.epoch() != epoch) {
+            return false;
+        }
+        Optional<ConsumerOffset> existing = m.consumerOffset(pipelineId);
+        if (existing.isPresent() && ranksAfter(position, existing.get().sinkAcked())) {
+            advanceSinkAcked(miningChainId, pipelineId, position);
+        }
+        return true;
+    }
+
+    /** Whether {@code candidate} would move a position that is absent, unordered or ranked before it. */
+    private static boolean ranksAfter(ChainPosition candidate, ChainPosition stored) {
+        return stored == null || stored.order() == null || stored.order().compareTo(candidate.order()) < 0;
     }
 
     @Override
@@ -44,6 +175,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), new ChainPosition(null, token), m.consumerOffsets(),
                 m.schemaHistory(), m.retention(), m.epoch(), Instant.now()));
+        trusted.add(miningChainId);
     }
 
     @Override
@@ -141,17 +273,9 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
                 next.add(c);
             }
         }
-        if (existing != null) {
-            if (existing.selectedTablesEpoch() != null && existing.selectedTablesEpoch() != position.order().epoch()) {
-                return;
-            }
-            if (!existing.selects(table)) {
-                return;
-            }
-            ChainPosition prior = existing.sinkAckedByTable().get(table);
-            if (prior != null && prior.order().compareTo(position.order()) >= 0) {
-                return;
-            }
+        ChainPosition prior = existing == null ? null : existing.sinkAckedByTable().get(table);
+        if (prior != null && prior.order().compareTo(position.order()) >= 0) {
+            return;
         }
         Map<String, ChainPosition> acks = new LinkedHashMap<>(existing == null ? Map.of() : existing.sinkAckedByTable());
         acks.put(table, position);
@@ -167,7 +291,10 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), m.sourceRead(), next,
                 m.schemaHistory(), m.retention(), m.epoch()));
-        if (position.order().seq() >= 0) {
+        // Only a sequence of the ring this pipeline is positioned in says where a run of it carries on.
+        boolean itsRing = existing == null || existing.selectedTables() == null
+                || existing.selects(table) && existing.selectedTablesEpoch() == position.order().epoch();
+        if (position.order().seq() >= 0 && itsRing) {
             ringDone.computeIfAbsent(miningChainId, chain -> new LinkedHashMap<>())
                     .computeIfAbsent(pipelineId, pipeline -> new LinkedHashMap<>())
                     .merge(table, position.order().seq(), Math::max);
@@ -306,6 +433,8 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         // Idempotent for the same reason the detach below is: an absent chain already satisfies it.
         records.remove(miningChainId);
         ringDone.remove(miningChainId);
+        trusted.remove(miningChainId);
+        selections.remove(miningChainId);
     }
 
     @Override

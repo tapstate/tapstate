@@ -6,7 +6,6 @@ import io.tapstate.core.event.SourceOrder;
 import io.tapstate.runtime.engine.ReplayFloor;
 import io.tapstate.runtime.engine.ReplayFloorFactory;
 import io.tapstate.runtime.srs.CaptureRunUnit;
-import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SrsMetaStore;
 import java.util.Map;
 import java.util.Objects;
@@ -23,10 +22,15 @@ import java.util.Optional;
  * where <em>this</em> job resumes, and it is this job's replay that decides whether a change it already
  * applied can arrive a second time.
  *
+ * <p>What it reads is the table's own confirmation, not the chain's. A deletion is weighed against the
+ * floor by the order it was read under, and that order is a place in its own table's ring; the chain-level
+ * position is a place in the order the source handed runs over, which ranks nothing in any one ring. Read
+ * against it, a deletion on a quiet table could look safely behind a floor its table never reached.
+ *
  * <p>Everything reads as "not known" rather than "nothing acked": a member with no store bound, a stream
- * the pipeline never sourced, a chain with no record for this pipeline, and an acked position with no order
- * all answer empty. Each of them leaves the caller keeping what it holds, which is the direction that
- * cannot corrupt anything.
+ * the pipeline never sourced, a chain with no record for this pipeline, and a table with no confirmation
+ * recorded all answer empty. Each of them leaves the caller keeping what it holds, which is the direction
+ * that cannot corrupt anything.
  */
 final class StoreBackedReplayFloorFactory implements ReplayFloorFactory {
 
@@ -48,16 +52,15 @@ final class StoreBackedReplayFloorFactory implements ReplayFloorFactory {
         }
         return chain -> {
             String miningChainId = chainIdByTable.get(chain);
-            return miningChainId == null ? Optional.empty() : ackedOrder(meta, miningChainId);
+            return miningChainId == null ? Optional.empty() : ackedOrder(meta, miningChainId, chain);
         };
     }
 
-    /** Where this pipeline's sink has confirmed writes up to on the chain, as an order to compare on. */
-    private Optional<SourceOrder> ackedOrder(SrsMetaStore meta, String miningChainId) {
-        return meta.read(miningChainId).stream()
-                .flatMap(record -> record.consumerOffsets().stream())
+    /** Where this pipeline's sink has confirmed {@code table}'s writes up to, as an order to compare on. */
+    private Optional<SourceOrder> ackedOrder(SrsMetaStore meta, String miningChainId, String table) {
+        return meta.consumerOffsets(miningChainId).stream()
                 .filter(offset -> offset.pipelineId().equals(pipelineId))
-                .map(ConsumerOffset::sinkAcked)
+                .map(offset -> offset.sinkAckedByTable().get(table))
                 .filter(Objects::nonNull)
                 .map(ChainPosition::order)
                 .filter(Objects::nonNull)
