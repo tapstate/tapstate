@@ -5,6 +5,7 @@ import org.bson.Document;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -27,6 +28,22 @@ class MongoPipelineDraftStoreTest {
         assertThat(restored).isEqualTo(draft);
         assertThat(MongoPipelineDraftStore.toDocument(draft)).containsEntry("mode", "dag");
         assertThat(MongoPipelineDraftStore.toDocument(draft)).containsKey("graph").doesNotContainKey("wizard");
+    }
+
+    @Test
+    void roundTripsDraftNodeConfigWithUnconfiguredNullValues() {
+        Map<String, Object> config = new LinkedHashMap<>();
+        config.put("connectorId", null);
+        PipelineDraft draft = new PipelineDraft("incomplete", 1, 1, PipelineDraft.Mode.DAG,
+                "Incomplete", "", new PipelineDraft.Graph(
+                        List.of(new PipelineDraft.Node("target", "target", null, null, config, Map.of())),
+                        List.of(), new PipelineDraft.Viewport(0, 0, 1)), null,
+                null, null, null, Instant.EPOCH, Instant.EPOCH, "author");
+
+        PipelineDraft restored = MongoPipelineDraftStore.fromDocument(MongoPipelineDraftStore.toDocument(draft));
+
+        assertThat(restored.graph().nodes().getFirst().config()).containsKey("connectorId");
+        assertThat(restored.graph().nodes().getFirst().config().get("connectorId")).isNull();
     }
 
     @Test

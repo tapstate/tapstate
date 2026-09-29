@@ -86,7 +86,7 @@ public final class PipelineDraftCompiler {
             steps.add(step);
             previous = step.id();
         }
-        ServeBlock serve = compileWizardOutput(wizard.output(), previous, root.sourceId() + "." + root.table());
+        ServeBlock serve = compileWizardOutput(wizard.output(), previous, root.table());
         return new PipelineResource(draft.pipelineId(), metadata(draft),
                 sourceIds.stream().map(id -> (SourceRef) SourceRef.bare(id)).toList(), steps, null, serve, null, Map.of());
     }
@@ -95,13 +95,13 @@ public final class PipelineDraftCompiler {
         if (output == null) {
             throw new IllegalArgumentException("wizard output is required for publication");
         }
-        if (!"atlas".equals(output.kind())) {
+        if (!"atlas".equals(output.kind()) && !"source".equals(output.kind())) {
             throw new IllegalArgumentException("unsupported wizard output: " + output.kind());
         }
         String destinationId = firstText(output.config(), "sourceId", "destinationId", "source");
         String destinationTable = firstText(output.config(), "table", "destinationTable");
         if (destinationId == null || destinationTable == null) {
-            throw new IllegalArgumentException("wizard atlas output requires sourceId and table");
+            throw new IllegalArgumentException("wizard output requires sourceId and table");
         }
         String syncId = firstText(output.config(), "syncId");
         if (syncId == null) {
@@ -109,7 +109,8 @@ public final class PipelineDraftCompiler {
         }
         RenameSpec rename = inputTable != null && !inputTable.equals(destinationTable)
                 ? new RenameSpec(Map.of(inputTable, destinationTable), null, null, null) : null;
-        return new ServeBlock.Inline("atlas", FromClause.list(FromRef.literal(from)),
+        String serveId = "atlas".equals(output.kind()) ? "atlas" : "target";
+        return new ServeBlock.Inline(serveId, FromClause.list(FromRef.literal(from)),
                 List.of(new SyncElement(syncId, destinationId,
                         outputWriteMode(output.config()), rename, null, null)), null, null);
     }

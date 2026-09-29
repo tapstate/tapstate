@@ -191,6 +191,13 @@ public final class PipelineDraftService {
         if (path instanceof String value && !value.isBlank()) {
             reason.append(" at ").append(value);
         }
+        if ("dsl.upsert-needs-key".equals(diagnostic.code())) {
+            Object source = diagnostic.params().get("source");
+            Object table = diagnostic.params().get("table");
+            if (source instanceof String sourceId && table instanceof String tableName) {
+                reason.append(" (source: ").append(sourceId).append(", table: ").append(tableName).append(')');
+            }
+        }
         Object ref = diagnostic.params().get("ref");
         if (ref instanceof String value && !value.isBlank()) {
             reason.append(" (ref: ").append(value).append(')');

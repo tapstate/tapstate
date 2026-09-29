@@ -68,6 +68,13 @@ class PipelineDraftServiceTest {
                 .isEqualTo("dsl.missing-reference at transforms[0].from (ref: missing-table)");
     }
 
+    @Test
+    void validationReasonNamesTheKeylessUpsertInput() {
+        assertThat(PipelineDraftService.validationReason(new ValidationDiagnostic(
+                "dsl.upsert-needs-key", Map.of("path", "serve.sync", "source", "mysql", "table", "BB_0727"))))
+                .isEqualTo("dsl.upsert-needs-key at serve.sync (source: mysql, table: BB_0727)");
+    }
+
     private static PipelineDraft draft(long revision, String updatedBy, String baseHash,
             Long publishedRevision, String publishedHash, Instant createdAt, Instant updatedAt) {
         return new PipelineDraft("orders", 1, revision, PipelineDraft.Mode.WIZARD,

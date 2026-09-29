@@ -9,6 +9,7 @@ import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.RenameSpec;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Step;
+import io.tapstate.core.model.TableRename;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.canonical.CanonicalHash;
@@ -55,7 +56,7 @@ class PipelineDraftCompilerTest {
                 "atlas", io.tapstate.core.model.FromRef.literal("only-active"),
                 List.of(new io.tapstate.core.model.SyncElement(
                         "atlas_customer_orders", "atlas", io.tapstate.core.model.WriteMode.UPSERT,
-                        new RenameSpec(Map.of("crm.orders", "customer_orders"), null, null, null), null)), null, null));
+                        new RenameSpec(Map.of("orders", "customer_orders"), null, null, null), null)), null, null));
     }
 
     @Test
@@ -129,7 +130,58 @@ class PipelineDraftCompilerTest {
         assertThat(((io.tapstate.core.model.FromClause.Flow) ((ServeBlock.Inline) compiled.serve()).from()).refs())
                 .containsExactly(io.tapstate.core.model.FromRef.literal("active-orders"));
         assertThat(((ServeBlock.Inline) compiled.serve()).sync().getFirst().rename())
-                .isEqualTo(new RenameSpec(Map.of("crm.orders", "orders_archive"), null, null, null));
+                .isEqualTo(new RenameSpec(Map.of("orders", "orders_archive"), null, null, null));
+    }
+
+    @Test
+    void compilesOnPremWizardOutputToTheExistingGenericServeSyncShape() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft draft = new PipelineDraft(
+                template.pipelineId(), template.schemaVersion(), template.revision(), template.mode(),
+                template.name(), template.description(), template.graph(),
+                new PipelineDraft.Wizard(wizard.root(), List.of(),
+                        List.of(new PipelineDraft.Transform("keep-active", "filter", Map.of("expr", "active == true"))),
+                        new PipelineDraft.Output("source", Map.of(
+                                "sourceId", "warehouse", "table", "orders_archive", "writeMode", "append"))),
+                template.baseArtifactHash(), template.publishedDraftRevision(), template.publishedArtifactHash(),
+                template.createdAt(), template.updatedAt(), template.updatedBy());
+
+        PipelineResource compiled = compiler.compile(draft);
+
+        assertThat(compiled.serve()).isInstanceOf(ServeBlock.Inline.class);
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiled.serve();
+        assertThat(serve.id()).isEqualTo("target");
+        assertThat(serve.sync().getFirst().source()).isEqualTo("warehouse");
+        assertThat(serve.sync().getFirst().writeMode().yaml()).isEqualTo("append");
+        assertThat(serve.sync().getFirst().rename())
+                .isEqualTo(new RenameSpec(Map.of("orders", "orders_archive"), null, null, null));
+        assertThat(compiled.transforms()).extracting(Step::id).containsExactly("keep-active");
+    }
+
+    @Test
+    void compilesTheK2WizardShapeWithTheTargetModelsUnqualifiedRenameKey() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft draft = new PipelineDraft("k2", template.schemaVersion(), template.revision(),
+                PipelineDraft.Mode.WIZARD, "k2", "", null,
+                new PipelineDraft.Wizard(
+                        new PipelineDraft.Root("root", "mysql", "AA_0716", List.of("ID"), List.of()),
+                        List.of(), List.of(),
+                        new PipelineDraft.Output("source", Map.of(
+                                "sourceId", "mongo", "table", "k2", "writeMode", "upsert"))),
+                null, null, null, template.createdAt(), template.updatedAt(), template.updatedBy());
+
+        PipelineResource compiled = compiler.compile(draft);
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiled.serve();
+
+        assertThat(((FromClause.Flow) serve.from()).refs())
+                .containsExactly(FromRef.literal("mysql.AA_0716"));
+        assertThat(serve.sync().getFirst().rename())
+                .isEqualTo(new RenameSpec(Map.of("AA_0716", "k2"), null, null, null));
+        assertThat(TableRename.apply("AA_0716", serve.sync().getFirst().rename())).isEqualTo("k2");
+        PipelineResource roundTripped = (PipelineResource) new DslParser().parse(new CanonicalWriter().write(compiled));
+        assertThat(((ServeBlock.Inline) roundTripped.serve()).sync().getFirst().rename())
+                .isEqualTo(serve.sync().getFirst().rename());
     }
 
     @Test

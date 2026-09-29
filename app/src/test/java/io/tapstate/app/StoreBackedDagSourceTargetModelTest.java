@@ -359,6 +359,50 @@ class StoreBackedDagSourceTargetModelTest {
     }
 
     @Test
+    void a_published_wizard_artifact_with_a_qualified_rename_still_binds_its_target_collection() {
+        InMemoryStorePort store = new InMemoryStorePort();
+        store.artifacts().save(new SourceResource("mysql", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("AA_0716")), null, null));
+        store.artifacts().save(new SourceResource("mongo", null, "mongodb", Map.of("uri", "u"),
+                null, null, null, null));
+        store.artifacts().save(new PipelineResource("k2", null, List.of(SourceRef.bare("mysql")), null,
+                null, new ServeBlock.Inline("target", FromRef.literal("mysql.AA_0716"),
+                        List.of(new SyncElement("mongo_k2", "mongo", null,
+                                new RenameSpec(Map.of("mysql.AA_0716", "k2"), null, null, null), null)),
+                        null, null), null, null));
+        store.schemas().save(discovered("mysql", "mysql", new SourceTable("AA_0716",
+                List.of(new SourceField("ID", "INT")), List.of("ID"), List.of())));
+        OpenRingGenerations.forSources(store, "mysql");
+        Map<String, TargetTable> bound = new LinkedHashMap<>();
+
+        new StoreBackedDagSource(store, capturingMapBinder(bound)).dagFor("k2");
+
+        assertThat(bound).containsOnlyKeys("AA_0716");
+        assertThat(bound.get("AA_0716").name()).isEqualTo("k2");
+    }
+
+    @Test
+    void a_legacy_qualified_rename_cannot_choose_between_two_sources_of_the_same_table() {
+        InMemoryStorePort store = new InMemoryStorePort();
+        for (String sourceId : List.of("mysql_a", "mysql_b")) {
+            store.artifacts().save(new SourceResource(sourceId, null, "mysql", Map.of("host", "h"),
+                    SourceMode.CDC, List.of(TableRef.literal("AA_0716")), null, null));
+        }
+        store.artifacts().save(new SourceResource("mongo", null, "mongodb", Map.of("uri", "u"),
+                null, null, null, null));
+        store.artifacts().save(new PipelineResource("ambiguous", null,
+                List.of(SourceRef.bare("mysql_a"), SourceRef.bare("mysql_b")), null, null,
+                new ServeBlock.Inline("target", FromRef.literal("mysql_a.AA_0716"),
+                        List.of(new SyncElement("mongo_k2", "mongo", null,
+                                new RenameSpec(Map.of("mysql_a.AA_0716", "k2"), null, null, null), null)),
+                        null, null), null, null));
+
+        assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("ambiguous"))
+                .isInstanceOf(io.tapstate.core.common.TapstateException.class)
+                .hasMessageContaining("actuation.source-table-ambiguous");
+    }
+
+    @Test
     void renames_with_the_table_of_the_source_the_serve_block_reads() {
         InMemoryStorePort store = seededMultiSourcePipeline(FromRef.literal("address_src"));
         store.schemas().save(discovered("address_src", "mysql", new SourceTable(

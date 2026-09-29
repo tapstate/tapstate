@@ -1259,7 +1259,7 @@ final class StoreBackedDagSource implements DagSource {
         return new DagBindings(
                 key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch),
                 step -> transformBinding(step, stepsById, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds),
-                element -> sinkWriter(pipeline, element, targets, serveStreams),
+                element -> sinkWriter(pipeline, element, targets, serveStreams, sourceIdByTable),
                 ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
                 sourceKeysById::get,
                 view -> viewSink(pipeline, view, viewTargets, viewStreams, sourceKeysById),
@@ -2268,11 +2268,11 @@ final class StoreBackedDagSource implements DagSource {
      */
     private SupplierEx<? extends SinkWriter> sinkWriter(
             PipelineResource pipeline, SyncElement element, Map<String, TargetTable> targets,
-            Set<String> serveStreams) {
+            Set<String> serveStreams, Map<String, String> sourceIdByTable) {
         SourceResource sink = StoredArtifacts.requireSource(artifacts(), element.source());
         return sinkWriterBinder.bind(
                 sink.connector(), sink.config(), writeMode(element.writeMode()), ddl(element.ddl()),
-                TargetModelResolver.renameAll(targets, serveStreams, element.rename()),
+                TargetModelResolver.renameAll(targets, serveStreams, element.rename(), sourceIdByTable),
                 new PipelineNode(pipeline.id(), syncNodeId(element)),
                 element.onFullLoad() == null ? OnFullLoad.APPEND : OnFullLoad.valueOf(element.onFullLoad().name()),
                 freshFullLoad(pipeline));

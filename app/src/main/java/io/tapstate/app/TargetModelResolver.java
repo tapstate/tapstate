@@ -340,12 +340,20 @@ final class TargetModelResolver {
 
     /** Applies one sync element's rename rules to every source table that can reach that sink. */
     static Map<String, TargetTable> renameAll(
-            Map<String, TargetTable> targets, Iterable<String> sourceTables, RenameSpec rename) {
+            Map<String, TargetTable> targets, Iterable<String> sourceTables, RenameSpec rename,
+            Map<String, String> sourceIdByTable) {
         Map<String, TargetTable> renamed = new LinkedHashMap<>();
         for (String sourceTable : sourceTables) {
             TargetTable target = Objects.requireNonNull(
                     targets.get(sourceTable), "no discovered target model for served stream '" + sourceTable + "'");
-            renamed.put(sourceTable, rename(target, rename));
+            // An assembled stream is keyed by its step id, while its model keeps the root table name.
+            // Older Wizard artifacts stored the qualified source reference as their rename-map key.
+            String sourceId = sourceIdByTable.get(target.name());
+            String qualified = sourceId == null ? null : sourceId + "." + target.name();
+            String legacyName = rename == null || rename.map() == null || qualified == null
+                    || rename.map().containsKey(target.name()) ? null : rename.map().get(qualified);
+            renamed.put(sourceTable, legacyName == null ? rename(target, rename)
+                    : new TargetTable(legacyName, target.fields(), target.indexes()));
         }
         return Collections.unmodifiableMap(renamed);
     }

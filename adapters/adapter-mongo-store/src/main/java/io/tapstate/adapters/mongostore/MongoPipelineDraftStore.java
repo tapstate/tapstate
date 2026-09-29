@@ -17,6 +17,7 @@ import org.bson.Document;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -322,6 +323,6 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
         }
         Map<String, Object> result = new LinkedHashMap<>();
         values.forEach((key, item) -> result.put(String.valueOf(key), item));
-        return Map.copyOf(result);
+        return Collections.unmodifiableMap(result);
     }
 }

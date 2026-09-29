@@ -93,6 +93,7 @@ public final class ApplyService {
      * only the other one would be a guard in name.
      */
     private final LivePipelines live;
+    private final DeploymentProfile deploymentProfile;
     private final DslParser parser = new DslParser();
     private final CanonicalWriter writer = new CanonicalWriter();
 
@@ -105,7 +106,15 @@ public final class ApplyService {
     public ApplyService(
             Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
             PlanAdvisories advisories, SchemaDerivation derivation, LivePipelines live) {
+        this(catalog, store, auditGate, schemas, advisories, derivation, live, DeploymentProfile.ON_PREM);
+    }
+
+    public ApplyService(
+            Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
+            PlanAdvisories advisories, SchemaDerivation derivation, LivePipelines live,
+            DeploymentProfile deploymentProfile) {
         this.live = live;
+        this.deploymentProfile = Objects.requireNonNull(deploymentProfile, "deploymentProfile");
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.store = Objects.requireNonNull(store, "store");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
@@ -191,7 +200,8 @@ public final class ApplyService {
         // that reaches stored referrers, which must not be refused for an edit they were pulled into,
         // and a write target is a connection document normally filed by an earlier batch, which has
         // to be resolvable or every sync whose target was not resubmitted would pass unjudged.
-        TargetConnectorRules.validate(submitted, candidate);
+        TargetConnectorRules.validate(
+                submitted, candidate, liveCatalog, deploymentProfile == DeploymentProfile.CLOUD);
         List<Resource> validated = List.copyOf(workspace.resources());
         Map<String, String> workspacePreconditions = new LinkedHashMap<>();
         for (Resource resource : validated) {
