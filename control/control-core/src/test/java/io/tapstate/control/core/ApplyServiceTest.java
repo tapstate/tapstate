@@ -83,6 +83,57 @@ class ApplyServiceTest {
             config: { uri: "mongodb://10.30.0.11:27017/ods", auth_source: admin }
             """;
 
+    @Test
+    void aRedactedGenericSourceReadCannotBeReapplied() {
+        String original = """
+                version: tapstate/v1
+                kind: source
+                id: atlas
+                connector: mongodb-atlas
+                config: { uri: "mongodb+srv://probe:sentinel-secret@cluster.example/test" }
+                """;
+        service.apply("author", List.of(draft(original)));
+        String storedBefore = stored("atlas");
+        StoredArtifact display = new ArtifactQueryService(store).get("atlas").orElseThrow();
+
+        assertThat(display.canonicalForm())
+                .contains("mongodb+srv://<redacted>@cluster.example/test")
+                .doesNotContain("probe", "sentinel-secret");
+        assertThat(display.contentHash()).isEqualTo(CanonicalHash.of(store.get("atlas").orElseThrow()));
+        assertThatThrownBy(() -> service.apply(
+                "author", List.of(draft(display.canonicalForm(), display.contentHash()))))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST);
+                    assertThat(error.args()).containsOnlyKeys("reason");
+                });
+        assertThat(stored("atlas")).isEqualTo(storedBefore);
+    }
+
+    @Test
+    void aRedactionOutsideSourceConfigCannotBeReapplied() {
+        String original = """
+                version: tapstate/v1
+                kind: source
+                id: documented-atlas
+                metadata:
+                  description: "mongodb://probe:sentinel-secret@cluster.example/test"
+                connector: mongodb-atlas
+                config: { uri: "mongodb+srv://cluster.example/test" }
+                """;
+        service.apply("author", List.of(draft(original)));
+        String storedBefore = stored("documented-atlas");
+        StoredArtifact display = new ArtifactQueryService(store).get("documented-atlas").orElseThrow();
+
+        assertThat(display.canonicalForm())
+                .contains("mongodb://<redacted>@cluster.example/test")
+                .doesNotContain("probe", "sentinel-secret");
+        assertThatThrownBy(() -> service.apply(
+                "author", List.of(draft(display.canonicalForm(), display.contentHash()))))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
+        assertThat(stored("documented-atlas")).isEqualTo(storedBefore);
+    }
+
     /**
      * The refusal is reached through apply, which is the path an edit to a stored Source usually takes.
      *
