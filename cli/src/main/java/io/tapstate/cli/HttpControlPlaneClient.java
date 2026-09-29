@@ -483,10 +483,15 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
 
     @Override
     public ApplyOutcome apply(URI baseUrl, String credential, List<LocalDraft> drafts) {
+        return apply(baseUrl, credential, drafts, null);
+    }
+
+    @Override
+    public ApplyOutcome apply(URI baseUrl, String credential, List<LocalDraft> drafts, String project) {
         try {
             HttpRequest request = authed(baseUrl, "/api/artifacts:apply", credential)
                     .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(applyBody(drafts), StandardCharsets.UTF_8))
+                    .POST(HttpRequest.BodyPublishers.ofString(applyBody(drafts, project), StandardCharsets.UTF_8))
                     .build();
             HttpResponse<String> response =
                     send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
@@ -764,6 +769,67 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             return new ConnectorListOutcome.Unreachable();
         } catch (IOException | RuntimeException e) {
             return new ConnectorListOutcome.Unreachable();
+        }
+    }
+
+    @Override
+    public ProjectListOutcome projectList(URI baseUrl, String credential) {
+        try {
+            HttpRequest request = authed(baseUrl, "/api/projects", credential).GET().build();
+            HttpResponse<String> response =
+                    send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200) {
+                return new ProjectListOutcome.Listed(projects(response.body()));
+            }
+            Rejection r = rejection(response.body(), "The server refused the read.");
+            return new ProjectListOutcome.Rejected(r.code(), r.message());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new ProjectListOutcome.Unreachable();
+        } catch (IOException | RuntimeException e) {
+            return new ProjectListOutcome.Unreachable();
+        }
+    }
+
+    /** Decodes {@code {"items":[{"id","title","removable","resources":[{"id","kind"}]}]}}. */
+    private static List<ProjectListOutcome.Project> projects(String body) {
+        List<ProjectListOutcome.Project> projects = new ArrayList<>();
+        if (JsonReader.parse(body) instanceof Map<?, ?> map && map.get("items") instanceof List<?> items) {
+            for (Object item : items) {
+                if (!(item instanceof Map<?, ?> row) || !(row.get("id") instanceof String id)) {
+                    continue;
+                }
+                List<ProjectListOutcome.Member> members = new ArrayList<>();
+                if (row.get("resources") instanceof List<?> resources) {
+                    for (Object resource : resources) {
+                        if (resource instanceof Map<?, ?> r && r.get("id") instanceof String rid) {
+                            members.add(new ProjectListOutcome.Member(rid, String.valueOf(r.get("kind"))));
+                        }
+                    }
+                }
+                String title = row.get("title") instanceof String t ? t : id;
+                projects.add(new ProjectListOutcome.Project(
+                        id, title, Boolean.TRUE.equals(row.get("removable")), members));
+            }
+        }
+        return projects;
+    }
+
+    @Override
+    public DeleteOutcome projectRemove(URI baseUrl, String credential, String id) {
+        try {
+            HttpRequest request = authed(baseUrl, "/api/projects/" + urlSegment(id), credential).DELETE().build();
+            HttpResponse<String> response =
+                    send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() / 100 == 2) {
+                return new DeleteOutcome.Removed(id);
+            }
+            return rejectedDelete(response.body());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new DeleteOutcome.Unreachable();
+        } catch (IOException | RuntimeException e) {
+            return new DeleteOutcome.Unreachable();
         }
     }
 
@@ -2008,9 +2074,9 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
      * draft carrying {@code expectedContentHash} only when one was given. A draft with no precondition
      * omits the key rather than sending null, so a request that asked for no check stays exactly the shape
      * it has always been — and the published schema refuses properties it does not declare, which a null
-     * would still be one of.
+     * would still be one of. {@code project} is sent only when there is one, for the same reason.
      */
-    private static String applyBody(List<LocalDraft> drafts) {
+    private static String applyBody(List<LocalDraft> drafts, String project) {
         List<Object> array = new ArrayList<>();
         for (LocalDraft draft : drafts) {
             Map<String, Object> d = new LinkedHashMap<>();
@@ -2023,6 +2089,9 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         }
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("drafts", array);
+        if (project != null) {
+            body.put("project", project);
+        }
         return JsonOut.write(body);
     }
 

@@ -47,7 +47,7 @@ import java.util.concurrent.Callable;
  */
 @Command(name = "demo", mixinStandardHelpOptions = true,
         description = {
-                "Write the demo workspace: two sources on different engines, and the pipeline that"
+                "Write the demo project: two sources on different engines, and the pipeline that"
                         + " assembles them into one object.",
                 "Writes files only - bring the stack up with the quickstart script."})
 final class DemoCmd implements Callable<Integer> {
@@ -56,6 +56,9 @@ final class DemoCmd implements Callable<Integer> {
     static final int EXIT_DIAGNOSTIC = 1;
 
     /** The resources this writes, as {@code <kind directory>/<file>}, in the order a reader meets them. */
+    /** The demo's project file, written only into a directory that has none. */
+    static final String PROJECT_RESOURCE = "project.tap.yml";
+
     static final List<String> RESOURCES =
             List.of("source/orders_db.tap.yml", "source/fulfillment_db.tap.yml",
                     "pipeline/order_pipeline.tap.yml");
@@ -84,7 +87,7 @@ final class DemoCmd implements Callable<Integer> {
     private static final List<String> STEPS = List.of(
             "1. Bring up the demo stack (databases, server and store, seeded):",
             "     curl -sSL https://install.tapstate.dev/demo | sh",
-            "2. Write the demo workspace - orders in MySQL, shipments in PostgreSQL:",
+            "2. Write the demo project - orders in MySQL, shipments in PostgreSQL:",
             "     tapstate demo -w work",
             "3. Go online, register the connectors this demo reads, and apply it:",
             "     tapstate -w work   then: connect http://127.0.0.1:8080 ; login admin",
@@ -123,7 +126,7 @@ final class DemoCmd implements Callable<Integer> {
             description = "Print the walkthrough these files belong to, and write nothing.")
     boolean printSteps;
 
-    @Option(names = "--force", description = "Overwrite the demo files if the workspace already holds them.")
+    @Option(names = "--force", description = "Overwrite the demo files if the project already holds them.")
     boolean force;
 
     @Option(names = {"-o", "--output"}, paramLabel = "FORMAT",
@@ -152,7 +155,7 @@ final class DemoCmd implements Callable<Integer> {
      * shared with the guided first run's {@code sample} recipe, which writes these same files.
      */
     private List<Path> write(Path root) {
-        return WorkspaceWrite.write(root, bundledFiles(), force, CliError.DEMO_WORKSPACE_EXISTS).stream()
+        return WorkspaceWrite.write(root, bundledFiles(root), force, CliError.DEMO_PROJECT_EXISTS).stream()
                 .map(WorkspaceWrite.Written::path)
                 .toList();
     }
@@ -160,6 +163,26 @@ final class DemoCmd implements Callable<Integer> {
     /** The three files as they are written: bundled bytes, verbatim, in the order a reader meets them. */
     static List<WorkspaceWrite.File> bundledFiles() {
         return RESOURCES.stream().map(resource -> WorkspaceWrite.File.owned(resource, bundled(resource))).toList();
+    }
+
+    /**
+     * The files written into {@code root}: the three, preceded by the demo's project file when the
+     * directory has none. A directory that is already a project keeps its own name - the demo joins it
+     * rather than renaming it.
+     */
+    static List<WorkspaceWrite.File> bundledFiles(Path root) {
+        return bundledFiles(root, null);
+    }
+
+    /** The same, with the project file naming {@code project} instead of the demo's own, when one is given. */
+    static List<WorkspaceWrite.File> bundledFiles(Path root, String project) {
+        List<WorkspaceWrite.File> files = new ArrayList<>();
+        if (!ProjectFile.presentIn(root)) {
+            files.add(WorkspaceWrite.File.owned(PROJECT_RESOURCE,
+                    project == null ? bundled(PROJECT_RESOURCE) : ProjectFile.content(project)));
+        }
+        files.addAll(bundledFiles());
+        return files;
     }
 
     /** One bundled resource. Absent means a broken build, not a user error, so it crashes bare. */
@@ -212,7 +235,7 @@ final class DemoCmd implements Callable<Integer> {
             case JSON -> out.println(JsonOut.write(envelope(root, written)));
             case YAML -> out.println(YamlOut.write(envelope(root, written)));
             default -> {
-                out.println("Wrote the demo workspace to " + root + ":");
+                out.println("Wrote the demo project to " + root + ":");
                 written.forEach(path -> out.println("  " + root.relativize(path)));
                 out.println();
                 if (dockerIsOnThePath.getAsBoolean()) {

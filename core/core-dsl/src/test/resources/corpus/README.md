@@ -1,7 +1,7 @@
 # DSL corpus — acceptance baseline for the core-dsl pipeline (plan poc1 B1)
 
 This corpus materializes every §14 grammar scenario (14.1–14.11, X19 included) as
-loadable `.tap.yml` workspaces. It is the acceptance baseline for B2–B5: parse, validate,
+loadable `.tap.yml` projects. It is the acceptance baseline for B2–B5: parse, validate,
 CEL checking, and canonical round-trip are all asserted against these files. Grammar
 branches the corpus does not exercise are not implemented defensively (plan risk R3,
 corpus-first).
@@ -16,9 +16,9 @@ Authoring rules:
 - `CorpusSmokeTest` guards this structural contract (well-formedness, layout, rule
   vocabulary). It does **not** check DSL semantics — that is the validate engine's job.
 
-## valid/ — one workspace directory per §14 scenario
+## valid/ — one project directory per §14 scenario
 
-Each directory is an independently loadable workspace batch: every referenced id resolves
+Each directory is an independently loadable project batch: every referenced id resolves
 inside the directory (offline closure = the batch). Ids may repeat across
 directories — uniqueness is per batch.
 
@@ -70,12 +70,13 @@ together):
 | `illegal-value` | enum or format constraint violation | §2/§8 |
 | `illegal-expression` | CEL expression field fails to compile or type-check | §12 |
 | `composition` | structural composition rule broken | X17 |
-| `duplicate-id` | id collision: workspace top-level uniqueness, pipeline-internal uniqueness, or step-id shadowing of a source id / table name | §2/F8, §5 |
+| `duplicate-id` | id collision: project top-level uniqueness, pipeline-internal uniqueness, or step-id shadowing of a source id / table name | §2/F8, §5 |
 | `unsupported-mode` | source mode outside the connector's declared capability matrix | §4 / C3 |
 | `config-type-mismatch` | connector config value whose type differs from the connector's declared field type | C3 |
 | `invalid-config-value` | connector config value outside the connector's declared enum choices | C3 |
 | `unwind-needs-an-element-key` | an unwind naming nothing that varies per element, so every row it expands carries the parent's key | unwind |
 | `unwind-needs-an-upsert-target` | an unwind whose rows reach a sync that appends, where a delete is written as another row | unwind |
+| `reserved-label` | a resource's hand-written `project` label names a project other than the one the directory's `project.tap.yml` declares | project |
 | `join-input-not-a-table` | a join's `from:` map names another step of the pipeline rather than a source table | §5 |
 | `join-input-is-a-pattern` | a join's `from:` map binds an alias to a `/…/` pattern rather than one table | §5 |
 
@@ -115,6 +116,7 @@ Cases (sNN ties the case to the valid/ scenario it mutates; gNN = general gramma
 | `g17-view-without-primary-key` | missing-field | inline view with no `primary_key:`, the field its sink indexes uniquely |
 | `g18-unwind-without-an-element-key` | unwind-needs-an-element-key | `type: unwind` with neither `element_key` nor `include_array_index` |
 | `g19-unwind-into-an-append-target` | unwind-needs-an-upsert-target | a keyed `type: unwind` served to a sync with `write_mode: append` |
+| `g20-reserved-project-label-names-another-project` | reserved-label | a source labelled `project: billing_team` in a directory whose project file names `orders_team` |
 
 Connector-dimension variants (capability matrix, config field checks) are validated against the
 bundled catalog by plan task C3. The catalog's mode signal is trusted only where it is reliable —

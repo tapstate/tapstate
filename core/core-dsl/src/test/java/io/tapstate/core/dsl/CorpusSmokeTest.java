@@ -65,9 +65,12 @@ class CorpusSmokeTest {
             // key of the row it came from
             "unwind-needs-an-element-key",
             // an unwind whose rows reach a sync that appends, where a delete is another row
-            "unwind-needs-an-upsert-target");
+            "unwind-needs-an-upsert-target",
+            // a resource's hand-written project label names a project other than the one its file names
+            "reserved-label");
 
-    private static final Set<String> KINDS = Set.of("source", "pipeline", "transform", "view", "serve");
+    // A project file names the directory it sits in; it is not a resource, but it is a corpus document.
+    private static final Set<String> KINDS = Set.of("source", "pipeline", "transform", "view", "serve", "project");
 
     private static Yaml yaml;
 

@@ -47,17 +47,18 @@ class UpCmdTest {
               tapstate logs orders_sync  see what it is doing
               tapstate apply / tapstate start  the same thing, one step at a time
               edit any file above, then tapstate up again  it converges
+            Hint: no project.tap.yml here, so these resources are in the Default project. Add one naming a project to give them a project of their own.
             An AI assistant can take it from here: https://tapstate.dev/docs/first-run
             """;
 
-    private record Run(int code, String out, String err) {
+    record Run(int code, String out, String err) {
         String all() {
             return out + err;
         }
     }
 
     /** Writes the mirrored-table workspace and binds it to the default server, as a first run would. */
-    private static void scaffold(Path home, Path ws) {
+    static void scaffold(Path home, Path ws) {
         NewRecipeTest.Run r = NewRecipeTest.run(home, new ScriptedPrompter(),
                 "new", "mirrored-table", "--yes", "--connector", "mysql",
                 "--set", "host=db", "--set", "username=u", "--set", "password=s",
@@ -77,7 +78,7 @@ class UpCmdTest {
     }
 
     /** Saves a session for the bound context, so the run resumes it exactly as any online verb does. */
-    private static void signIn(Path home) {
+    static void signIn(Path home) {
         ContextDefinition local = ContextConfigStore.underHome(home).load().contexts().get("local");
         AuthSessionRecord record = new AuthSessionRecord(AuthSessionRecord.CURRENT_VERSION,
                 local.authRef(), local.id(), ISSUER, "alice", List.of("read", "write"),
@@ -85,7 +86,7 @@ class UpCmdTest {
         AuthFileStore.underHome(home).save(record, false);
     }
 
-    private static Run up(Path home, FakeUpControlPlane client, UnaryOperator<String> env, String... args) {
+    static Run up(Path home, FakeUpControlPlane client, UnaryOperator<String> env, String... args) {
         LaunchOptions launch = LaunchOptions.parse(args).withEnv(env);
         ContextResolver resolver = new ContextResolver(ContextConfigStore.underHome(home), env);
         AuthService auth = new AuthService(client, AuthFileStore.underHome(home), Clock.fixed(NOW, ZoneOffset.UTC));
@@ -98,7 +99,7 @@ class UpCmdTest {
         return new Run(code, out.toString(), err.toString());
     }
 
-    private static Run up(Path home, FakeUpControlPlane client, String... args) {
+    static Run up(Path home, FakeUpControlPlane client, String... args) {
         return up(home, client, name -> null, args);
     }
 
@@ -124,13 +125,32 @@ class UpCmdTest {
                 "lifecycle start orders_sync",
                 "status orders_sync");
         assertThat(r.out()).isEqualTo(
-                "Workspace: " + ws + "\n"
+                "Project: Default project (" + ws + ")\n"
                         + """
                           pipeline orders_sync: running
                           source orders_src: applied
                         State: running
                         """
                         + NEXT);
+    }
+
+    @Test
+    void everyApplyNamesTheProjectAndTheProjectFileIsNeverSent(@TempDir Path home, @TempDir Path ws)
+            throws java.io.IOException {
+        scaffold(home, ws);
+        java.nio.file.Files.writeString(ws.resolve("project.tap.yml"),
+                "version: tapstate/v1\nkind: project\nid: orders_team\n");
+        signIn(home);
+        FakeUpControlPlane client = new FakeUpControlPlane();
+
+        Run r = up(home, client, "up", "-w", ws.toString());
+
+        assertThat(r.code()).as(r.all()).isZero();
+        // Both applies are made as the project the file names, so the server labels what they carry.
+        assertThat(client.projects).containsExactly("orders_team", "orders_team");
+        assertThat(client.applied).allSatisfy(batch -> assertThat(batch)
+                .extracting(LocalDraft::source).noneMatch(source -> source.endsWith("project.tap.yml")));
+        assertThat(r.out()).startsWith("Project: orders_team (" + ws + ")\n").doesNotContain("Hint:");
     }
 
     @Test
@@ -152,7 +172,7 @@ class UpCmdTest {
                 .doesNotContain("lifecycle start orders_sync")
                 .doesNotContain("discoverSchema orders_src");
         assertThat(r.out()).isEqualTo(
-                "Workspace: " + ws + "\n"
+                "Project: Default project (" + ws + ")\n"
                         + """
                           pipeline orders_sync: running (apply: unchanged; start: already running)
                           source orders_src: applied (apply: unchanged; discover: already discovered)
@@ -339,7 +359,7 @@ class UpCmdTest {
 
         assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         assertThat(r.err()).contains(
-                "up: apply workspace failed on orders_sync: actuation.source-schema-not-discovered — "
+                "up: apply project failed on orders_sync: actuation.source-schema-not-discovered — "
                         + "Source `orders_src` needs a discovered schema before its tables can be selected.");
         assertThat(client.calls).contains("apply[pipeline,source]").doesNotContain("lifecycle start orders_sync");
     }
@@ -360,7 +380,7 @@ class UpCmdTest {
         // with a dangling-reference diagnostic naming the source it was just handed.
         assertThat(client.applied).hasSize(2);
         assertThat(client.applied.get(1).stream().map(LocalDraft::source))
-                .as("the workspace apply batch")
+                .as("the project apply batch")
                 .contains("source/orders_src.tap.yml", "pipeline/orders_sync.tap.yml");
     }
 
@@ -422,7 +442,7 @@ class UpCmdTest {
         Run r = up(home, client, "up", "-w", ws.toString());
 
         assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
-        assertThat(r.err()).contains("up: preflight failed on " + ws + ": cli.workspace-has-no-pipeline")
+        assertThat(r.err()).contains("up: preflight failed on " + ws + ": cli.project-has-no-pipeline")
                 .contains("tapstate new");
         // Nothing beyond the connect's own probe: the workspace is read before the server is asked anything.
         assertThat(client.calls).containsExactly("isHealthy");
@@ -443,7 +463,7 @@ class UpCmdTest {
             Run r = up(home, client, "up", "-w", ws.toString());
 
             assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
-            assertThat(r.err()).contains("up: preflight failed on " + ws + ": cli.workspace-unreadable")
+            assertThat(r.err()).contains("up: preflight failed on " + ws + ": cli.project-unreadable")
                     .contains(pipelines.toString());
             assertThat(client.calls).containsExactly("isHealthy");
             assertThat(r.out()).isEmpty();
@@ -565,7 +585,7 @@ class UpCmdTest {
                 .contains("\"next\": [")
                 .doesNotContain("Next:")
                 .doesNotContain("An AI assistant")
-                .doesNotContain("Workspace:");
+                .doesNotContain("Project:");
     }
 
     @Test
@@ -600,7 +620,7 @@ class UpCmdTest {
                 .contains("Usage: tapstate up")
                 .contains(Cli.VERB_HELP.get("up").summary())
                 .contains("preflight").contains("apply sources").contains("discover")
-                .contains("apply workspace").contains("start")
+                .contains("apply project").contains("start")
                 .contains("--server").contains("--yes");
     }
 
@@ -674,6 +694,15 @@ class UpCmdTest {
             bundledConnectors.forEach(id -> connectors.add(
                     new CatalogConnector(id, id, "database", List.of("cdc"), true, "bundled")));
             return new ConnectorListOutcome.Listed(connectors);
+        }
+
+        /** The project each apply named, in call order; a null entry is an apply that named none. */
+        final List<String> projects = new ArrayList<>();
+
+        @Override
+        public ApplyOutcome apply(URI baseUrl, String credential, List<LocalDraft> drafts, String project) {
+            projects.add(project);
+            return apply(baseUrl, credential, drafts);
         }
 
         @Override

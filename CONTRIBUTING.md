@@ -335,13 +335,13 @@ canonical_url: https://tapstate.dev/docs/<the-published-page>
 ```
 
 The published page is canonical. What stays here shrinks to a short pointer to it,
-plus anything executable — sample data, workspace files, scripts — which belongs
+plus anything executable — sample data, project files, scripts — which belongs
 with the code and moves nowhere.
 
 A page carries one shape or the other, never fields from both: a page that names a
 target *and* a canonical URL has not said which side of the handoff it is on.
 
-**What is not a page is out of scope.** Sample data, workspace files, scripts,
+**What is not a page is out of scope.** Sample data, project files, scripts,
 diagrams and fixtures under `docs/` need no header. They are read by running them.
 
 **A page nobody touches needs nothing.** The rule applies to pages a pull request

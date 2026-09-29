@@ -117,7 +117,7 @@ serve:
       write_mode: upsert
 ```
 
-The workspace also needs the `shop` read Source and the `document_store` target Source. Validate and
+The project also needs the `shop` read Source and the `document_store` target Source. Validate and
 discover the read Source before applying so model-based collision checks can run. The runtime check remains
 authoritative even after discovery.
 

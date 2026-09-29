@@ -29,7 +29,7 @@ docs/tutorials/
 └── <tutorial-slug>/
     ├── README.md                 <- the walkthrough itself
     ├── <data>.sql                <- sample data, if it has any
-    └── <other assets>            <- workspace files, diagrams, scripts
+    └── <other assets>            <- project files, diagrams, scripts
 ```
 
 The directory name is the slug a reader sees in the URL, so name it for the thing being taught

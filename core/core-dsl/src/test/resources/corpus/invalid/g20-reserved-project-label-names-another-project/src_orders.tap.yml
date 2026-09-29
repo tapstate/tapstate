@@ -1,0 +1,9 @@
+version: tapstate/v1
+kind: source
+id: src_orders
+metadata:
+  labels: { project: billing_team }
+connector: mysql
+config: { host: db, database: orders, username: u, password: p }
+mode: cdc
+tables: [ orders ]

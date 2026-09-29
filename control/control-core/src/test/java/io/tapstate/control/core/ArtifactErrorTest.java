@@ -13,7 +13,8 @@ class ArtifactErrorTest {
         assertThat(Domain.isRegistered("artifact")).isTrue();
         for (ArtifactError e : ArtifactError.values()) {
             assertThat(e.code()).startsWith("artifact.");
-            assertThat(e.severity()).isEqualTo(Severity.ERROR);
+            // The one exception is not a refusal: it reports an adoption that has already happened.
+            assertThat(e.severity()).isEqualTo(e == ArtifactError.PROJECT_CLAIMED ? Severity.WARNING : Severity.ERROR);
         }
     }
 
@@ -31,7 +32,13 @@ class ArtifactErrorTest {
                 // the id is a pipeline that is running or is about to run
                 "artifact.pipeline-not-stopped",
                 // the artifact was removed and some of its dependent bookkeeping was not
-                "artifact.reclaim-incomplete");
+                "artifact.reclaim-incomplete",
+                // another project on this server already owns the id
+                "artifact.project-id-taken",
+                // a resource stored with no project was adopted by the project that applied it
+                "artifact.project-claimed",
+                // the Default project can be emptied, never removed
+                "artifact.default-project-not-removable");
     }
 
     @Test
@@ -51,5 +58,10 @@ class ArtifactErrorTest {
         // is cleared by hand, a pipeline that came back up must be stopped before anything is cleared
         assertThat(ArtifactError.RECLAIM_INCOMPLETE.placeholders())
                 .containsExactlyInAnyOrder("id", "reason", "residue");
+        // owner = the project holding the id, project = the one refused: both, since the remedy names both
+        assertThat(ArtifactError.PROJECT_ID_TAKEN.placeholders())
+                .containsExactlyInAnyOrder("id", "kind", "owner", "project");
+        assertThat(ArtifactError.PROJECT_CLAIMED.placeholders())
+                .containsExactlyInAnyOrder("id", "kind", "project");
     }
 }

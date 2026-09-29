@@ -57,7 +57,7 @@ class McpStdioProcessTest {
             Map<?, ?> listed = readResponse(output, Duration.ofSeconds(10));
             assertThat(listed.get("id")).isEqualTo(2L);
             List<?> tools = (List<?>) ((Map<?, ?>) listed.get("result")).get("tools");
-            assertThat(tools).hasSize(19);
+            assertThat(tools).hasSize(20);
             assertThat(tools.stream()
                     .map(tool -> String.valueOf(((Map<?, ?>) tool).get("name")))
                     .toList())

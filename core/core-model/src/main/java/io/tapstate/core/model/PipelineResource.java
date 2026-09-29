@@ -14,7 +14,7 @@ import java.util.Objects;
  */
 @Doc("Composing runnable unit that references pre-created sources by id and wires transforms, view and serve into a task.")
 public record PipelineResource(
-        @Doc(value = "Unique resource id across the workspace; must not contain a dot.", required = true)
+        @Doc(value = "Unique resource id across the project; must not contain a dot.", required = true)
         String id,
         @Doc("Optional labels and free-text description.")
         Metadata metadata,

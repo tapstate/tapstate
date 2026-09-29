@@ -7,6 +7,7 @@ import io.tapstate.core.dsl.CapabilityRules;
 import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.dsl.DiscoveredTable;
+import io.tapstate.core.dsl.ProjectLabel;
 import io.tapstate.core.dsl.RowExpressionTypeRules;
 import io.tapstate.core.dsl.TargetConnectorRules;
 import io.tapstate.core.dsl.ReferenceGraph;
@@ -130,10 +131,30 @@ public final class ApplyService {
      * is not going anywhere.
      */
     public ApplyPlan plan(List<ArtifactDraft> drafts) {
+        return plan(drafts, null);
+    }
+
+    /**
+     * As {@link #plan(List)}, for a batch applied from {@code project}: every resource the batch declares
+     * is labelled as that project's, and a resource whose id another project on this server already owns
+     * refuses the whole batch with {@code artifact.project-id-taken}, naming the owner. A stored resource
+     * that carries no project is adopted by the first project to apply it, and the plan says so in a
+     * warning. Resources the batch only refers to - a write target filed by an earlier batch, say - are
+     * not in the batch and are left exactly as they are. A null {@code project} is the batch of a client
+     * that names none, judged as before.
+     */
+    public ApplyPlan plan(List<ArtifactDraft> drafts, String project) {
         Objects.requireNonNull(drafts, "drafts");
         List<Resource> resources = new ArrayList<>();
         for (ArtifactDraft draft : drafts) {
             resources.add(parse(draft));
+        }
+        List<ValidationDiagnostic> claimed = new ArrayList<>();
+        if (project != null) {
+            ProjectLabel.requireNotReserved(project, "project");
+            for (int index = 0; index < resources.size(); index++) {
+                resources.set(index, owned(drafts.get(index), resources.get(index), project, claimed));
+            }
         }
         // Preconditions are judged once every draft has parsed, so a malformed document is reported as
         // malformed rather than as a version conflict, and before the batch is validated, so an author
@@ -149,7 +170,56 @@ public final class ApplyService {
                 preconditions.put(parsed.id(), draft.expectedContentHash());
             }
         }
-        return planResources(resources, preconditions, ValidationScope.OFFLINE);
+        ApplyPlan planned = planResources(resources, preconditions,
+                project == null ? ValidationScope.OFFLINE : ValidationScope.PROJECT);
+        if (claimed.isEmpty()) {
+            return planned;
+        }
+        List<ValidationDiagnostic> warnings = new ArrayList<>(claimed);
+        warnings.addAll(planned.warnings());
+        return new ApplyPlan(planned.artifacts(), warnings, planned.preconditions(),
+                planned.workspacePreconditions());
+    }
+
+    /**
+     * One draft's resource as {@code project} applies it: labelled with the project, after refusing a
+     * hand-written label that names another one and an id another project already owns. An adoption of
+     * an unowned stored resource is recorded in {@code claimed}.
+     */
+    private Resource owned(ArtifactDraft draft, Resource resource, String project,
+            List<ValidationDiagnostic> claimed) {
+        try {
+            ProjectLabel.requireConsistent(resource, project);
+        } catch (DslException e) {
+            throw draft.source() != null ? e.withSource(draft.source()) : e;
+        }
+        Resource stored = store.get(resource.id()).orElse(null);
+        if (stored != null) {
+            String owner = ProjectLabel.of(stored);
+            if (owner != null && !owner.equals(project)) {
+                throw new TapstateException(ArtifactError.PROJECT_ID_TAKEN, Map.of(
+                        "id", resource.id(), "kind", stored.kind(), "owner", owner, "project", project), null);
+            }
+            if (owner == null) {
+                claimed.add(new ValidationDiagnostic(ArtifactError.PROJECT_CLAIMED.code(),
+                        Map.of("id", resource.id(), "kind", stored.kind(), "project", project)));
+            }
+        }
+        return ProjectLabel.stamped(resource, project);
+    }
+
+    /**
+     * The submitted resource, keeping the project its stored version belongs to when it names none
+     * itself. A client that knows nothing of projects - an older CLI, an edit made in a form - sends a
+     * resource without the label, and storing that as written would quietly take the resource out of its
+     * project on an edit that was never about ownership.
+     */
+    private Resource keepingOwner(Resource submitted) {
+        if (ProjectLabel.of(submitted) != null) {
+            return submitted;
+        }
+        String owner = store.get(submitted.id()).map(ProjectLabel::of).orElse(null);
+        return owner == null ? submitted : ProjectLabel.stamped(submitted, owner);
     }
 
     /**
@@ -162,6 +232,7 @@ public final class ApplyService {
         Objects.requireNonNull(submitted, "submitted");
         Objects.requireNonNull(preconditions, "preconditions");
         Objects.requireNonNull(validationScope, "validationScope");
+        submitted = submitted.stream().map(this::keepingOwner).toList();
         Set<String> submittedIds = submitted.stream().map(Resource::id).collect(java.util.stream.Collectors.toSet());
         List<Resource> storedResources = ReadableArtifactInventory.list(store);
         List<Resource> candidate = new ArrayList<>();
@@ -286,6 +357,9 @@ public final class ApplyService {
         if (scope == ValidationScope.OFFLINE) {
             return List.copyOf(submitted);
         }
+        if (scope == ValidationScope.PROJECT) {
+            return withStoredDependencies(candidate, submitted);
+        }
         Set<String> submittedSourceIds = new LinkedHashSet<>();
         Set<String> selectedIds = new LinkedHashSet<>();
         for (Resource resource : submitted) {
@@ -377,9 +451,14 @@ public final class ApplyService {
 
     /** Validates and plans a batch while performing no store or audit write. */
     public ArtifactValidationResult validate(List<ArtifactDraft> drafts) {
+        return validate(drafts, null);
+    }
+
+    /** As {@link #validate(List)}, judging the batch as {@code project} would apply it. */
+    public ArtifactValidationResult validate(List<ArtifactDraft> drafts, String project) {
         final ApplyPlan planned;
         try {
-            planned = plan(drafts);
+            planned = plan(drafts, project);
         } catch (TapstateException diagnostic) {
             return new ArtifactValidationResult(
                     false,
@@ -409,8 +488,16 @@ public final class ApplyService {
      * untouched.
      */
     public ApplyResult apply(String principal, List<ArtifactDraft> drafts) {
+        return apply(principal, drafts, null);
+    }
+
+    /**
+     * As {@link #apply(String, List)}, for a batch applied from {@code project}; see
+     * {@link #plan(List, String)} for what that adds.
+     */
+    public ApplyResult apply(String principal, List<ArtifactDraft> drafts, String project) {
         Objects.requireNonNull(principal, "principal");
-        ApplyPlan plan = plan(drafts);
+        ApplyPlan plan = plan(drafts, project);
         List<ArtifactOutcome> outcomes = new ArrayList<>();
         List<Resource> toWrite = new ArrayList<>();
         List<AuditContext> audited = new ArrayList<>();
@@ -497,8 +584,33 @@ public final class ApplyService {
                 .orElse(null);
     }
 
+    /**
+     * The submitted batch plus the stored resources it refers to without carrying them. A project refers
+     * to what it does not own - the connection a cluster was created with, which every project on it
+     * writes through - and a batch that had to carry such a resource to close its references would label
+     * it as its own and lock every other project out of it. Only what the batch reaches is added: a
+     * stored resource that refers to the batch is not, so another project's pipeline can never refuse
+     * this one's apply.
+     */
+    private static List<Resource> withStoredDependencies(List<Resource> candidate, List<Resource> submitted) {
+        Set<String> selectedIds = new LinkedHashSet<>();
+        submitted.forEach(resource -> selectedIds.add(resource.id()));
+        ReferenceGraph graph = ReferenceGraph.of(candidate);
+        ArrayDeque<String> pending = new ArrayDeque<>(selectedIds);
+        while (!pending.isEmpty()) {
+            for (ReferenceGraph.Edge dependency : graph.references(pending.removeFirst())) {
+                if (selectedIds.add(dependency.id())) {
+                    pending.addLast(dependency.id());
+                }
+            }
+        }
+        return candidate.stream().filter(resource -> selectedIds.contains(resource.id())).toList();
+    }
+
     private enum ValidationScope {
         OFFLINE,
+        /** A batch applied from a project: the batch, closed over the stored resources it refers to. */
+        PROJECT,
         ONLINE_SOURCE
     }
 

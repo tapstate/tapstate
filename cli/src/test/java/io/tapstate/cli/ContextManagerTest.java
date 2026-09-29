@@ -76,11 +76,11 @@ class ContextManagerTest {
 
         ContextManager.DeletionImpact impact = manager.previewDelete("dev");
         assertThat(impact.authRef()).isEqualTo(dev.authRef());
-        assertThat(impact.workspaceBindings()).containsExactly(workspace.toRealPath());
+        assertThat(impact.projectBindings()).containsExactly(workspace.toRealPath());
         manager.delete("dev");
         ContextConfig remaining = ContextConfigStore.underHome(home).load();
         assertThat(remaining.contexts()).containsOnlyKeys("alpha");
-        assertThat(remaining.workspaceBindings()).isEmpty();
+        assertThat(remaining.projectBindings()).isEmpty();
         assertThat(remaining.lastContext()).isNull();
     }
 

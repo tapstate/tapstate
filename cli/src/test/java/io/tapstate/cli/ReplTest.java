@@ -192,6 +192,10 @@ class ReplTest {
         /** Per-artifact register outcomes keyed by artifact byte length (for batch/directory tests); falls back to {@link #registerOutcome}. */
         final Map<Integer, ConnectorRegisterOutcome> registerOutcomeByLength = new HashMap<>();
         ConnectorListOutcome connectorListOutcome = new ConnectorListOutcome.Unreachable();
+        /** The canned project answers, and every call as {@code list|remove <id>}. */
+        ProjectListOutcome projectListOutcome = new ProjectListOutcome.Unreachable();
+        DeleteOutcome projectRemoveOutcome = new DeleteOutcome.Unreachable();
+        final List<String> projectCalls = new ArrayList<>();
         /** The canned derived-schema answer, and every call as {@code read|accept credential@base/id}. */
         DerivedSchemaOutcome derivedSchemaOutcome = new DerivedSchemaOutcome.Unreachable();
         final List<String> derivedSchemaCalls = new ArrayList<>();
@@ -415,6 +419,15 @@ class ReplTest {
         }
 
         @Override
+        public ApplyOutcome apply(URI baseUrl, String credential, List<LocalDraft> drafts, String project) {
+            appliedProjects.add(String.valueOf(project));
+            return apply(baseUrl, credential, drafts);
+        }
+
+        /** The project each apply named, "null" for none. */
+        final List<String> appliedProjects = new ArrayList<>();
+
+        @Override
         public ApplyOutcome apply(URI baseUrl, String credential, List<LocalDraft> drafts) {
             applyCalls.add(credential + "@" + baseUrl + " x" + drafts.size());
             appliedDrafts.add(List.copyOf(drafts));
@@ -473,6 +486,18 @@ class ReplTest {
                 return new ConnectorRegisterOutcome.Unreachable();
             }
             return registerOutcomeByLength.getOrDefault(artifact.length, registerOutcome);
+        }
+
+        @Override
+        public ProjectListOutcome projectList(URI baseUrl, String credential) {
+            projectCalls.add("list");
+            return healthy.contains(baseUrl) ? projectListOutcome : new ProjectListOutcome.Unreachable();
+        }
+
+        @Override
+        public DeleteOutcome projectRemove(URI baseUrl, String credential, String id) {
+            projectCalls.add("remove " + id);
+            return healthy.contains(baseUrl) ? projectRemoveOutcome : new DeleteOutcome.Unreachable();
         }
 
         @Override
@@ -739,7 +764,7 @@ class ReplTest {
 
     @Test
     void tokenizeKeepsDoubleQuotedSpacesAsOneWord() {
-        assertThat(Repl.tokenize("validate \"my workspace\"")).containsExactly("validate", "my workspace");
+        assertThat(Repl.tokenize("validate \"my project\"")).containsExactly("validate", "my project");
     }
 
     @Test
@@ -749,7 +774,7 @@ class ReplTest {
 
     @Test
     void dispatchHandlesAQuotedPathWithSpacesLikeTheOneShotForm(@TempDir Path base) throws Exception {
-        Path spaced = Files.createDirectory(base.resolve("my workspace"));
+        Path spaced = Files.createDirectory(base.resolve("my project"));
         copyWorkspace("/ws-valid", spaced);
         Harness h = harness();
         boolean cont = h.repl().dispatch("validate \"" + spaced + "\"");
@@ -1648,7 +1673,7 @@ class ReplTest {
         h.repl().dispatch("show collections views");
 
         assertThat(h.sink().toString().substring(mark))
-                .contains("what each source's database holds, not what the workspace declares");
+                .contains("what each source's database holds, not what the project declares");
         assertThat(client.dataBrowserCalls).containsExactly("collections views");
     }
 
@@ -2457,6 +2482,85 @@ class ReplTest {
         assertThat(out).contains("mysql").contains("acme")
                 .contains("bundled").contains("registered").contains("snapshot");
         assertThat(client.connectorListCalls).containsExactly("jwt-tok@http://node1:7900");
+    }
+
+    @Test
+    void applyInsideAProjectNamesItAndNeverSendsTheProjectFile(@TempDir Path project) throws Exception {
+        Files.writeString(project.resolve("project.tap.yml"), "version: tapstate/v1\nkind: project\nid: bank_c360\n");
+        Path sources = Files.createDirectories(project.resolve("source"));
+        Files.writeString(sources.resolve("src.tap.yml"),
+                "version: tapstate/v1\nkind: source\nid: src\nconnector: mysql\nconfig: { host: db }\n");
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.applyOutcome = new ApplyOutcome.Applied(List.of(new ApplyOutcome.Item("src", "source", "CREATED")));
+        Harness h = onlineSession(project, client);
+
+        assertThat(h.repl().dispatch("apply")).isTrue();
+        // Applied from a subdirectory, the project file above it still decides the project.
+        assertThat(h.repl().dispatch("apply source")).isTrue();
+
+        assertThat(client.appliedProjects).containsExactly("bank_c360", "bank_c360");
+        assertThat(client.appliedDrafts.get(0)).extracting(LocalDraft::source).containsExactly("source/src.tap.yml");
+    }
+
+    @Test
+    void applyOutsideAnyProjectNamesNone(@TempDir Path dir) throws Exception {
+        Files.writeString(dir.resolve("src.tap.yml"),
+                "version: tapstate/v1\nkind: source\nid: src\nconnector: mysql\nconfig: { host: db }\n");
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.applyOutcome = new ApplyOutcome.Applied(List.of(new ApplyOutcome.Item("src", "source", "CREATED")));
+        Harness h = onlineSession(dir, client);
+
+        assertThat(h.repl().dispatch("apply")).isTrue();
+
+        assertThat(client.appliedProjects).as("the Default project is named by naming none").containsExactly("null");
+    }
+
+    @Test
+    void projectsListsTheDefaultProjectFirstWithWhatEachHolds() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.projectListOutcome = new ProjectListOutcome.Listed(List.of(
+                new ProjectListOutcome.Project("default", "Default project", false, List.of()),
+                new ProjectListOutcome.Project("bank_c360", "bank_c360", true,
+                        List.of(new ProjectListOutcome.Member("customer_360", "pipeline")))));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("projects")).isTrue();
+
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("Default project (default): empty")
+                .contains("bank_c360: 1 resources")
+                .contains("  pipeline customer_360");
+        assertThat(out.indexOf("Default project")).isLessThan(out.indexOf("bank_c360"));
+        assertThat(client.projectCalls).containsExactly("list");
+
+        mark = h.sink().toString().length();
+        assertThat(h.repl().dispatch("projects -o json")).isTrue();
+        assertThat(h.sink().toString().substring(mark)).contains("\"removable\": false").contains("\"customer_360\"");
+    }
+
+    @Test
+    void projectsRemoveNamesTheProjectAndRendersTheDefaultProjectsRefusal() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.projectRemoveOutcome = new DeleteOutcome.Removed("c360_sample");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("projects remove c360_sample");
+        assertThat(h.sink().toString()).contains("removed project c360_sample");
+
+        client.projectRemoveOutcome = new DeleteOutcome.Rejected("artifact.default-project-not-removable",
+                "The Default project cannot be removed.", Map.of("project", "default"));
+        h.repl().dispatch("projects remove default");
+        assertThat(h.sink().toString()).contains("artifact.default-project-not-removable");
+
+        int mark = h.sink().toString().length();
+        h.repl().dispatch("projects remove");
+        assertThat(h.sink().toString().substring(mark)).contains("usage: projects remove <id>");
+        assertThat(client.projectCalls).containsExactly("remove c360_sample", "remove default");
+
+        client.projectListOutcome = new ProjectListOutcome.Rejected("control.forbidden", "You lack the grade.");
+        h.repl().dispatch("projects");
+        assertThat(h.sink().toString()).contains("control.forbidden");
     }
 
     @Test
@@ -6340,7 +6444,7 @@ class ReplTest {
         assertThat(repl.lastExitCode()).isZero();
         assertThat(saved.contexts()).containsOnlyKeys("dev");
         assertThat(saved.contexts().get("dev").seeds()).containsExactly(URI.create("http://127.0.0.1:7900"));
-        assertThat(saved.workspaceBindings()).containsEntry(workspace.toRealPath().toString(), "dev");
+        assertThat(saved.projectBindings()).containsEntry(workspace.toRealPath().toString(), "dev");
         assertThat(output.toString()).contains("created context dev").contains("bound dev");
     }
 
@@ -6356,7 +6460,7 @@ class ReplTest {
         ScriptedPrompter prompter = new ScriptedPrompter(
                 "Choose a context", "prod",
                 "Edit a context", "prod", "https://prod2.example.com", "n",
-                "Unbind this workspace",
+                "Unbind this project",
                 "Delete a context", "prod", "yes", "yes");
         CommandLine commandLine = Cli.newCommandLine();
         StringWriter output = new StringWriter();
@@ -6374,7 +6478,7 @@ class ReplTest {
         assertThat(repl.lastExitCode()).isZero();
         assertThat(saved.lastContext()).isNull();
         assertThat(saved.contexts()).containsOnlyKeys("dev");
-        assertThat(saved.workspaceBindings()).isEmpty();
+        assertThat(saved.projectBindings()).isEmpty();
         assertThat(output.toString()).contains("chose context prod")
                 .contains("updated context prod")
                 .contains("unbound dev")

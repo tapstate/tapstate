@@ -29,10 +29,13 @@ actuation.view-storage-tier-unsupported
 actuation.view-store-is-a-capture-source
 actuation.view-store-not-configured
 actuation.view-store-unreachable
+artifact.default-project-not-removable
 artifact.in-use
 artifact.not-found
 artifact.pipeline-not-stopped
 artifact.precondition-required
+artifact.project-claimed
+artifact.project-id-taken
 artifact.reclaim-incomplete
 artifact.version-conflict
 boot.cluster-id-invalid
@@ -87,7 +90,7 @@ cli.context-not-found
 cli.context-required
 cli.context-source-conflict
 cli.context-usage
-cli.demo-workspace-exists
+cli.demo-project-exists
 cli.docker-unavailable
 cli.if-match-needs-one-resource
 cli.issuer-discovery-failed
@@ -98,6 +101,9 @@ cli.mcp-unavailable
 cli.not-authenticated
 cli.not-connected
 cli.password-required
+cli.project-has-no-pipeline
+cli.project-not-writable
+cli.project-unreadable
 cli.remote-plaintext
 cli.repl-builtin-only
 cli.request-timed-out
@@ -108,9 +114,6 @@ cli.unknown-connector
 cli.verb-not-implemented
 cli.version-mismatch
 cli.watch-needs-a-terminal
-cli.workspace-has-no-pipeline
-cli.workspace-not-writable
-cli.workspace-unreadable
 cluster.membership-unreadable
 connector.ambiguous-connector-class
 connector.ambiguous-registration
@@ -178,6 +181,7 @@ dsl.missing-field
 dsl.missing-reference
 dsl.mode-mismatch
 dsl.mode-required-for-read
+dsl.reserved-label
 dsl.row-expression-needs-discovery
 dsl.row-expression-type-unknown
 dsl.row-expression-type-unsupported

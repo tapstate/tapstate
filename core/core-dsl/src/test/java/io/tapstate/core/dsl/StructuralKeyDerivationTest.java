@@ -1,5 +1,6 @@
 package io.tapstate.core.dsl;
 
+import io.tapstate.core.model.ProjectManifest;
 import io.tapstate.core.model.Doc;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.Metadata;
@@ -113,6 +114,7 @@ class StructuralKeyDerivationTest {
         assertWhitelist(DslParser.PIPELINE_KEYS, PipelineResource.class, DOCUMENT);
         assertWhitelist(DslParser.TRANSFORM_DEF_KEYS, TransformResource.class,
                 union(DOCUMENT, Set.of("type", "options")));
+        assertWhitelist(DslParser.PROJECT_KEYS, ProjectManifest.class, DOCUMENT);
     }
 
     @Test
@@ -178,6 +180,7 @@ class StructuralKeyDerivationTest {
     void whatTheParserDemandsMatchesWhatTheModelRequires() {
         assertRequired(DslParser.REQUIRED_SOURCE_KEYS, SourceResource.class);
         assertRequired(DslParser.REQUIRED_PIPELINE_KEYS, PipelineResource.class);
+        assertRequired(DslParser.REQUIRED_PROJECT_KEYS, ProjectManifest.class);
         assertRequired(DslParser.REQUIRED_TABLE_SPEC_KEYS, TableRef.Spec.class);
         assertRequired(DslParser.REQUIRED_SYNC_KEYS, SyncElement.class);
         assertRequired(DslParser.REQUIRED_PUSH_KEYS, PushElement.class);
@@ -214,7 +217,7 @@ class StructuralKeyDerivationTest {
             ViewBlock.Inline.class,
             TransformResource.class, TransformBody.Js.class, TransformBody.MapProjection.class,
             TransformBody.Filter.class, TransformBody.Unwind.class, TransformBody.Nest.class,
-            TransformBody.Join.class);
+            TransformBody.Join.class, ProjectManifest.class);
 
     /**
      * Records with a required component that the parser answers for rather than demanding of the
@@ -251,7 +254,7 @@ class StructuralKeyDerivationTest {
             Step.Use.class, ViewBlock.Inline.class, ViewBlock.Use.class, ServeBlock.Inline.class,
             ServeBlock.Use.class, TransformBody.Js.class, TransformBody.MapProjection.class,
             TransformBody.Filter.class, TransformBody.Unwind.class, TransformBody.Union.class,
-            TransformBody.Nest.class, TransformBody.Join.class);
+            TransformBody.Nest.class, TransformBody.Join.class, ProjectManifest.class);
 
     @Test
     @DisplayName("every record with a required component is demanded of the document or named as answered")
@@ -291,11 +294,11 @@ class StructuralKeyDerivationTest {
     private static final Set<String> DERIVED = Set.of(
             "SOURCE_KEYS", "PIPELINE_KEYS", "TRANSFORM_DEF_KEYS", "METADATA_KEYS", "SRS_KEYS",
             "TABLE_SPEC_KEYS", "SYNC_KEYS", "PUSH_KEYS", "STEP_BASE_KEYS", "STEP_USE_KEYS",
-            "SOURCE_REF_KEYS", "NEST_STATE_KEYS");
+            "SOURCE_REF_KEYS", "NEST_STATE_KEYS", "PROJECT_KEYS");
 
     /** The required-key sets, re-derived above from their record's {@code @Doc(required = true)}. */
     private static final Set<String> REQUIRED_DERIVED = Set.of(
-            "REQUIRED_SOURCE_KEYS", "REQUIRED_PIPELINE_KEYS", "REQUIRED_DEFINITION_KEYS",
+            "REQUIRED_SOURCE_KEYS", "REQUIRED_PIPELINE_KEYS", "REQUIRED_PROJECT_KEYS", "REQUIRED_DEFINITION_KEYS",
             "REQUIRED_TABLE_SPEC_KEYS", "REQUIRED_SYNC_KEYS", "REQUIRED_PUSH_KEYS",
             "REQUIRED_QUERY_KEYS", "REQUIRED_HOT_KEYS", "REQUIRED_WARM_KEYS",
             "REQUIRED_VIEW_DEF_KEYS", "REQUIRED_VIEW_INLINE_KEYS",

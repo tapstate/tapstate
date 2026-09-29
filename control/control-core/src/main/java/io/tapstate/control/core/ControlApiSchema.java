@@ -50,6 +50,7 @@ public final class ControlApiSchema {
         Map<String, SchemaRef> refs = new LinkedHashMap<>();
         bind(refs, "system.version", "SystemVersion");
         bind(refs, "connector.list", "ConnectorList");
+        bind(refs, "project.list", "ProjectList");
         bind(refs, "connector.get", "ConnectorGet");
         bind(refs, "source.list", "SourceList");
         bind(refs, "source.get", "SourceGet");
@@ -117,6 +118,7 @@ public final class ControlApiSchema {
                 Map.of("version", string("Product release this server was built from")),
                 true));
         pair(defs, "ConnectorList", empty, opaque);
+        pair(defs, "ProjectList", empty, opaque);
         pair(defs, "ConnectorGet", object(List.of("id"), Map.of("id", id), false), opaque);
         pair(defs, "SourceList", listRequest, sourceListResult);
         pair(defs, "SourceGet", object(List.of("id"), Map.of("id", id), false), opaque);
@@ -177,8 +179,14 @@ public final class ControlApiSchema {
                         string("Content hash of the stored version this draft edits, as returned by a read "
                                 + "of it; omit to apply unconditionally")),
                 false);
+        // The project is optional for the same reason: a batch that names none applies as it always did.
         Map<String, Object> artifactRequest = object(
-                List.of("drafts"), Map.of("drafts", array(draft)), false);
+                List.of("drafts"),
+                Map.of(
+                        "drafts", array(draft),
+                        "project", string("Id of the project the batch is applied from; labels every "
+                                + "resource in it as that project's, and refuses an id another project owns")),
+                false);
         pair(defs, "ArtifactValidate", artifactRequest, opaque);
         pair(defs, "ArtifactApply", artifactRequest, opaque);
 
@@ -398,9 +406,9 @@ public final class ControlApiSchema {
         properties.put("kind", Map.of(
                 "type", "string",
                 "enum", List.of("view"),
-                "description", "What this collection is, for the collections this workspace declares. "
+                "description", "What this collection is, for the collections this project declares. "
                         + "Absent for a collection no declaration covers — the listing shows "
-                        + "everything the database holds, and a database holds more than a workspace "
+                        + "everything the database holds, and a database holds more than a project "
                         + "authored, so an absent kind means this one was not made here rather than "
                         + "that it is of some unknown class. Other kinds join this list as they "
                         + "arrive."));
@@ -414,7 +422,7 @@ public final class ControlApiSchema {
                         + "collection's first page and look at a row."));
         properties.put("description", string(
                 "What whoever declared this collection wrote about it. Absent for a collection no view "
-                        + "declares, which is most of them — a database holds far more than a workspace "
+                        + "declares, which is most of them — a database holds far more than a project "
                         + "authored."));
         return object(List.of("name"), properties, false);
     }

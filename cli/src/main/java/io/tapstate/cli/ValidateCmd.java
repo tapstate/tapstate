@@ -36,7 +36,7 @@ import java.util.concurrent.Callable;
  * diagnostic.
  */
 @Command(name = "validate", mixinStandardHelpOptions = true,
-        description = "Validate a workspace path (directory of *.tap.yml, or a single artifact).")
+        description = "Validate a project path (directory of *.tap.yml, or a single artifact).")
 final class ValidateCmd implements Callable<Integer> {
 
     /** Exit code when the workspace is structurally / semantically invalid. */
@@ -51,7 +51,7 @@ final class ValidateCmd implements Callable<Integer> {
     WorkspaceOption workspace;
 
     @Parameters(index = "0", arity = "0..1",
-            description = "Workspace directory or artifact file (default: the workspace root).")
+            description = "Project directory or artifact file (default: the project root).")
     String path;
 
     @Option(names = {"-o", "--output"}, paramLabel = "FORMAT",
@@ -104,7 +104,7 @@ final class ValidateCmd implements Callable<Integer> {
             // clean diagnostic rather than letting a raw stack trace reach the user boundary. A
             // coded io-domain exception at the loader boundary is the proper long-term home.
             Throwable cause = e.getCause();
-            err.println("cannot read workspace " + display + ": "
+            err.println("cannot read project " + display + ": "
                     + (cause != null ? cause.getMessage() : e.getMessage()));
             err.flush();
             return EXIT_USAGE;

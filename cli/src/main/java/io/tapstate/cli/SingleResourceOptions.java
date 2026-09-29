@@ -48,7 +48,7 @@ abstract class SingleResourceOptions {
     List<String> syncTo = new ArrayList<>();
 
     @Option(names = "--out", paramLabel = "DIR",
-            description = "Write the artifact flat into this exact directory, bypassing the workspace layout.")
+            description = "Write the artifact flat into this exact directory, bypassing the project layout.")
     String out;
 
     @Option(names = "--force",

@@ -60,16 +60,16 @@ class ContextConsoleTest {
         assertThat(manager.suggestions().get(0).definition().tls().verify()).isFalse();
 
         Output bind = new Output();
-        assertThat(run(manager, workspace, bind, "Bind context to this workspace", "dev")).isZero();
+        assertThat(run(manager, workspace, bind, "Bind context to this project", "dev")).isZero();
         assertThat(manager.contextBoundExactlyTo(workspace)).contains("dev");
 
         Output unbind = new Output();
-        assertThat(run(manager, workspace, unbind, "Unbind this workspace")).isZero();
+        assertThat(run(manager, workspace, unbind, "Unbind this project")).isZero();
         assertThat(unbind.outText()).contains("unbound dev from " + workspace.toRealPath());
         assertThat(manager.contextBoundExactlyTo(workspace)).isEmpty();
 
         Output noBinding = new Output();
-        assertThat(run(manager, workspace, noBinding, "Unbind this workspace")).isZero();
+        assertThat(run(manager, workspace, noBinding, "Unbind this project")).isZero();
         assertThat(noBinding.outText()).contains("no context is bound to " + workspace.toRealPath());
     }
 

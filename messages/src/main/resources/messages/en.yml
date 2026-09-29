@@ -171,18 +171,18 @@ cli.alias-name-taken:
 cli.artifact-exists:
   message: "An artifact already exists at {path}."
   solution: "Choose a different id or --out, or pass --force to overwrite."
-cli.demo-workspace-exists:
-  message: "The workspace already holds a demo resource at {path}."
-  solution: "Use a different workspace with -w, or pass --force to overwrite the demo files there."
-cli.workspace-not-writable:
+cli.demo-project-exists:
+  message: "The project already holds a demo resource at {path}."
+  solution: "Use a different project with -w, or pass --force to overwrite the demo files there."
+cli.project-not-writable:
   message: "Could not write {path}: {reason}"
   solution: "Check that the directory exists, is writable, and that no plain file is sitting where a directory is needed. Demo files this run wrote were removed and any it overwrote were put back, though empty directories it created can remain."
-cli.workspace-unreadable:
-  message: "Could not read the workspace at {path}: {reason}"
-  solution: "Check that the workspace directory and every directory and *.tap.yml file under it can be read, then run `tapstate up` again."
-cli.workspace-has-no-pipeline:
-  message: "The workspace at {path} holds no pipeline (a *.tap.yml with kind: pipeline), so there is nothing to bring up."
-  solution: "Run `tapstate new` to write one, or point -w at a workspace that holds a pipeline."
+cli.project-unreadable:
+  message: "Could not read the project at {path}: {reason}"
+  solution: "Check that the project directory and every directory and *.tap.yml file under it can be read, then run `tapstate up` again."
+cli.project-has-no-pipeline:
+  message: "The project at {path} holds no pipeline (a *.tap.yml with kind: pipeline), so there is nothing to bring up."
+  solution: "Run `tapstate new` to write one, or point -w at a project that holds a pipeline."
 cli.unknown-connector:
   message: "No connector '{connector}' in the catalog."
   solution: "Pick a connector id from the catalog; run `tapstate new` interactively to choose one."
@@ -196,16 +196,16 @@ cli.kind-dir-mismatch:
   message: "Artifact {path} declares kind '{kind}' but sits in a '{dir}' directory."
   solution: "Move it under a '{kind}' directory, or change its declared kind to match."
 cli.resource-not-found:
-  message: "No resource with id '{id}' in the workspace."
+  message: "No resource with id '{id}' in the project."
   solution: "Run `tapstate ls` to see the available resources."
 cli.connect-failed:
   message: "Could not reach any Tapstate server among the seeds: {seeds}."
   solution: "Check the addresses are correct and that a Tapstate server is running there, then try connect again."
 cli.docker-unavailable:
   message: "The local development stack cannot be run in Docker: {reason}."
-  solution: "Install Docker with the Compose v2 plugin and make sure it is running, then run `tapstate up` again - or point the workspace at a server you already run with --server."
+  solution: "Install Docker with the Compose v2 plugin and make sure it is running, then run `tapstate up` again - or point the project at a server you already run with --server."
 cli.server-not-named:
-  message: "This workspace is not bound to a server, and there is nothing to ask."
+  message: "This project is not bound to a server, and there is nothing to ask."
   solution: "Pass --server <url> to name the server to use, or --start-local to start the local development stack on {server}."
 cli.password-required:
   message: "Signing in to {server} needs a password, and there is nothing to ask."
@@ -299,7 +299,7 @@ cli.context-source-conflict:
   solution: "Keep `--connect` for a temporary target, or keep `--context` for a saved context."
 cli.context-required:
   message: "The `{verb}` command needs a server context, but no target was selected."
-  solution: "Use `--context`, set `TAPSTATE_CONTEXT`, bind this exact workspace, or use `--connect` for a temporary target."
+  solution: "Use `--context`, set `TAPSTATE_CONTEXT`, bind this exact project, or use `--connect` for a temporary target."
 dsl.unknown-field:
   message: "Unknown field '{field}' at {path}."
   solution: "Remove it, or run `tapstate explain` to see the fields allowed here."
@@ -307,7 +307,7 @@ dsl.forbidden-field:
   message: "Field '{field}' is not allowed at {path}."
   solution: "It is valid elsewhere but not in this position; run `tapstate explain` to confirm."
 dsl.missing-reference:
-  message: "Reference '{ref}' at {path} points to nothing in this workspace."
+  message: "Reference '{ref}' at {path} points to nothing in this project."
   solution: "Define the referenced resource, or fix the name to match an existing one."
 dsl.ambiguous-reference:
   message: "Reference '{ref}' at {path} is ambiguous across more than one source."
@@ -347,7 +347,10 @@ dsl.composition:
   solution: "Review how the resources are wired together."
 dsl.duplicate-id:
   message: "Duplicate id '{id}' at {path}."
-  solution: "Ids must be unique within the workspace; rename one of them."
+  solution: "Ids must be unique within the project; rename one of them."
+dsl.reserved-label:
+  message: "Resource `{id}` sets the reserved label `{key}` to `{value}` at {path}, but it belongs to project `{expected}`."
+  solution: "Remove the `{key}` label from the file: bringing the project up writes it for you."
 dsl.missing-field:
   message: "Required field '{field}' is missing at {path}."
   solution: "Add '{field}' to that block. It has no default, and nothing else in the document implies it."
@@ -678,6 +681,15 @@ artifact.precondition-required:
 artifact.version-conflict:
   message: "Artifact `{id}` changed after it was read."
   solution: "Read the current artifact, decide again against that version, then retry."
+artifact.project-id-taken:
+  message: "The {kind} `{id}` already belongs to project `{owner}` on this server, so project `{project}` cannot apply it."
+  solution: "Rename `{id}` in project `{project}`, or remove it from project `{owner}` first."
+artifact.default-project-not-removable:
+  message: "The Default project (`{project}`) cannot be removed: every server keeps it, and it holds every resource that belongs to no other project."
+  solution: "Delete the resources you no longer want one by one, or move them into a project of their own by declaring them in its files."
+artifact.project-claimed:
+  message: "The {kind} `{id}` was already on this server with no project; it now belongs to project `{project}`."
+  solution: "Nothing to do if `{id}` is this project's. If another project uses it too, give that project its own id for it."
 source.already-exists:
   message: "A Source with id '{id}' already exists."
   solution: "Choose a different id, or replace the existing Source with its current ETag."

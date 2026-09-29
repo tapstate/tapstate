@@ -30,7 +30,7 @@ class NewSummaryTest {
             State: not running yet
             Next:
               edit any file above  they are ordinary YAML; the guided commands never hide them
-              tapstate validate  check the workspace without a server
+              tapstate validate  check the project without a server
               tapstate ls / tapstate desc <id>  see what is here and what each file declares
               tapstate up  bring it to running; it asks which server the first time
             An AI assistant can take it from here: https://tapstate.dev/docs/first-run
@@ -52,7 +52,7 @@ class NewSummaryTest {
         assertThat(r.code()).as(r.all()).isZero();
         assertThat(r.err()).isEmpty();
         assertThat(r.out()).isEqualTo(
-                "Workspace: " + ws + "\n"
+                "Project: " + ws + "\n"
                         + """
                           source/orders_src.tap.yml  source orders_src: mysql, cdc
                           pipeline/orders_sync.tap.yml  pipeline orders_sync: 1 source, view — assumed primary_key: id; edit if the table is keyed otherwise
@@ -71,7 +71,7 @@ class NewSummaryTest {
         assertThat(r.code()).as(r.all()).isZero();
         assertThat(r.err()).isEmpty();
         assertThat(r.out()).isEqualTo(
-                "Workspace: " + ws + "\n"
+                "Project: " + ws + "\n"
                         + """
                           source/example_source.tap.yml  source example_source: mysql, cdc
                           pipeline/example_pipeline.tap.yml  pipeline example_pipeline: 1 source, view
@@ -88,7 +88,7 @@ class NewSummaryTest {
         assertThat(r.code()).as(r.all()).isZero();
         assertThat(r.err()).isEmpty();
         assertThat(r.out()).isEqualTo(
-                "Workspace: " + ws + "\n"
+                "Project: " + ws + "\n" + "  project.tap.yml  project order_demo\n"
                         + """
                           source/orders_db.tap.yml  source orders_db: mysql, cdc
                           source/fulfillment_db.tap.yml  source fulfillment_db: postgres, cdc
@@ -120,7 +120,7 @@ class NewSummaryTest {
                 .doesNotContain("Next:")
                 .doesNotContain("State:")
                 .doesNotContain("An AI assistant")
-                .doesNotContain("Workspace:");
+                .doesNotContain("Project:");
         // the assumption belongs to the pipeline alone: the sources and the two dotfiles assumed nothing
         assertThat(countOf(r.out(), "\"assumed\"")).isEqualTo(1);
         assertThat(r.out().indexOf("\"assumed\"")).isGreaterThan(r.out().indexOf("\"kind\": \"pipeline\""));

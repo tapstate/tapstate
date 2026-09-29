@@ -2,6 +2,8 @@ package io.tapstate.cli;
 
 import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.model.ProjectManifest;
+import io.tapstate.core.dsl.WorkspaceLoader;
 import io.tapstate.core.dsl.Interpolator;
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.model.PipelineResource;
@@ -172,7 +174,7 @@ final class Repl {
     private static final List<String> ONLINE_VERBS = List.of(
             "apply", "get", "delete", "ls", "start", "stop", "pause", "resume", "restart", "status", "metrics",
             "snapshot", "logs", "position", "test", "test-result", "discover-schema", "schema", "register",
-            "connectors", "cluster", "token", "derived-schema", "explain");
+            "connectors", "projects", "cluster", "token", "derived-schema", "explain");
 
     private final CommandLine commandLine;
 
@@ -823,6 +825,9 @@ final class Repl {
         if (words.get(0).equals("token")) {
             return tokenOnline(words);
         }
+        if (words.get(0).equals("projects")) {
+            return projectsOnline(words);
+        }
         // `delete` and `apply` each carry a precondition of their own (`--if-match <hash>`), so they parse
         // their own words rather than falling into the positional-only guard below, which would refuse it.
         if (words.get(0).equals("delete")) {
@@ -1378,7 +1383,7 @@ final class Repl {
         // connection supplier declares none at all.
         out.println();
         out.println(listed + (listed == 1 ? " collection" : " collections")
-                + " — what each source's database holds, not what the workspace declares");
+                + " — what each source's database holds, not what the project declares");
         out.flush();
         return failed > 0 ? Cli.EXIT_DIAGNOSTIC : Cli.EXIT_OK;
     }
@@ -1854,6 +1859,12 @@ final class Repl {
             // a literal ${...} and take it for a real value
             return renderLocalRefusal(e);
         }
+        String project;
+        try {
+            project = declaredProject(target);
+        } catch (DslException e) {
+            return renderLocalRefusal(e);
+        }
         if (drafts.isEmpty()) {
             err.println("apply: no *.tap.yml artifacts found in " + target);
             err.flush();
@@ -1878,7 +1889,7 @@ final class Repl {
             LocalDraft only = drafts.get(0);
             drafts = List.of(new LocalDraft(only.source(), only.content(), ifMatch));
         }
-        ApplyOutcome outcome = applyDrafts(drafts);
+        ApplyOutcome outcome = applyDrafts(drafts, project);
         PrintWriter out = commandLine.getOut();
         return switch (outcome) {
             case ApplyOutcome.Applied applied -> {
@@ -3050,6 +3061,79 @@ final class Repl {
             case ConnectorListOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
             case ConnectorListOutcome.Unreachable ignored -> reportRequestFailed();
         };
+    }
+
+    /**
+     * {@code projects [-o text|json|yaml]} lists the server's projects, the Default project first and
+     * listed even when empty; {@code projects remove <id>} removes one project with everything it holds.
+     * The Default project is refused by the server: it can be emptied, never removed.
+     */
+    private int projectsOnline(List<String> words) {
+        PrintWriter err = commandLine.getErr();
+        if (words.size() >= 2 && words.get(1).equals("remove")) {
+            if (words.size() != 3 || words.get(2).startsWith("-")) {
+                err.println("projects: remove needs exactly one project id (usage: projects remove <id>)");
+                err.flush();
+                return Cli.EXIT_USAGE;
+            }
+            String id = words.get(2);
+            DeleteOutcome outcome = withFailover(
+                    () -> controlPlane.projectRemove(session.landingNode(), session.credential(), id),
+                    o -> o instanceof DeleteOutcome.Unreachable);
+            return switch (outcome) {
+                case DeleteOutcome.Removed removed -> {
+                    commandLine.getOut().println("removed project " + removed.id());
+                    commandLine.getOut().flush();
+                    yield Cli.EXIT_OK;
+                }
+                case DeleteOutcome.Rejected rejected ->
+                        renderRejection(rejected.code(), rejected.message(), rejected.params());
+                case DeleteOutcome.Unreachable ignored -> reportRequestFailed();
+            };
+        }
+        OutputFormat format = parseFormatOnly("projects", words);
+        if (format == null) {
+            return Cli.EXIT_USAGE;
+        }
+        ProjectListOutcome outcome = withFailover(
+                () -> controlPlane.projectList(session.landingNode(), session.credential()),
+                o -> o instanceof ProjectListOutcome.Unreachable);
+        return switch (outcome) {
+            case ProjectListOutcome.Listed listed -> {
+                renderProjects(listed.projects(), format);
+                yield Cli.EXIT_OK;
+            }
+            case ProjectListOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case ProjectListOutcome.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+
+    /** One line per project - its name, then what it holds by kind and id - or the machine tree. */
+    private void renderProjects(List<ProjectListOutcome.Project> projects, OutputFormat format) {
+        PrintWriter out = commandLine.getOut();
+        List<Object> rows = new ArrayList<>();
+        for (ProjectListOutcome.Project project : projects) {
+            if (format == OutputFormat.TEXT) {
+                out.println(project.title() + (project.title().equals(project.id()) ? "" : " (" + project.id() + ")")
+                        + ": " + (project.resources().isEmpty() ? "empty" : project.resources().size() + " resources"));
+                for (ProjectListOutcome.Member member : project.resources()) {
+                    out.println("  " + member.kind() + " " + member.id());
+                }
+            }
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("id", project.id());
+            row.put("title", project.title());
+            row.put("removable", project.removable());
+            row.put("resources", project.resources().stream()
+                    .map(m -> Map.of("id", m.id(), "kind", m.kind())).toList());
+            rows.add(row);
+        }
+        if (format == OutputFormat.JSON) {
+            out.println(JsonOut.write(Map.of("projects", rows)));
+        } else if (format == OutputFormat.YAML) {
+            out.println(YamlOut.write(Map.of("projects", rows)));
+        }
+        out.flush();
     }
 
     /**
@@ -4249,7 +4333,10 @@ final class Repl {
                         .sorted()
                         .toList();
                 for (Path f : yamls) {
-                    drafts.add(draft(target.relativize(f).toString(), f, lookup));
+                    LocalDraft read = draft(target.relativize(f).toString(), f, lookup);
+                    if (read != null) {
+                        drafts.add(read);
+                    }
                 }
             } catch (UncheckedIOException e) {
                 // Files.walk surfaces a mid-traversal access error (an unreadable or concurrently-removed
@@ -4259,14 +4346,37 @@ final class Repl {
                 throw e.getCause() != null ? e.getCause() : new IOException(e.getMessage(), e);
             }
         } else if (Files.isRegularFile(target)) {
-            drafts.add(draft(target.getFileName().toString(), target, lookup));
+            LocalDraft read = draft(target.getFileName().toString(), target, lookup);
+            if (read != null) {
+                drafts.add(read);
+            }
         }
         return drafts;
+    }
+
+    /**
+     * The project an {@code apply} of {@code target} is made from: the one whose project file sits at or
+     * above it, or null when there is none. A directory without a project file keeps applying exactly
+     * as it always did, unlabelled; it is {@code up} that brings a directory up as a project either way.
+     */
+    private static String declaredProject(Path target) {
+        Path start = Files.isDirectory(target) ? target : target.toAbsolutePath().getParent();
+        for (Path dir = start == null ? null : start.toAbsolutePath().normalize(); dir != null;
+                dir = dir.getParent()) {
+            if (Files.isRegularFile(dir.resolve(ProjectManifest.FILE_NAME))) {
+                return WorkspaceLoader.projectId(dir);
+            }
+        }
+        return null;
     }
 
     /** Reads one artifact and resolves its references, naming the file on whatever it refuses. */
     private LocalDraft draft(String source, Path file, UnaryOperator<String> lookup) throws IOException {
         String text = Files.readString(file);
+        // A project file names the project; it is not a resource and is never sent.
+        if (ProjectManifest.KIND.equals(DslParser.declaredKind(text))) {
+            return null;
+        }
         try {
             return new LocalDraft(source, Interpolator.interpolate(text, lookup));
         } catch (DslException e) {
@@ -4389,7 +4499,7 @@ final class Repl {
             // server to reach, and the run has five stages by contract - this is not a sixth.
             return reportBindFailure(options.format(), workspace, refused.code(), refused.args());
         } catch (java.io.IOException unreadable) {
-            return reportBindFailure(options.format(), workspace, CliError.WORKSPACE_UNREADABLE,
+            return reportBindFailure(options.format(), workspace, CliError.PROJECT_UNREADABLE,
                     Map.of("path", workspace.toString(), "reason", String.valueOf(unreadable.getMessage())));
         }
     }
@@ -4492,6 +4602,10 @@ final class Repl {
         /** Whether this run made the connection, in which case the connect's probe was the reachability check. */
         private final boolean connectedHere;
         private List<UpDraft> drafts = List.of();
+        /** The project this run brings up: its project file's id, or null for the Default project. */
+        private String project;
+        /** Whether the project is named by a project file, or only by its directory. */
+        private boolean declared;
         /** Each applied resource's change, as the server reported it. */
         private final Map<String, String> changes = new LinkedHashMap<>();
         /** What the stages had to say about each resource they left alone. */
@@ -4647,7 +4761,7 @@ final class Repl {
                 read = collectDrafts(workspace, DotEnv.layered(workspace, env));
             } catch (IOException e) {
                 String reason = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
-                return failure(UpCmd.STAGE_PREFLIGHT, workspace.toString(), CliError.WORKSPACE_UNREADABLE,
+                return failure(UpCmd.STAGE_PREFLIGHT, workspace.toString(), CliError.PROJECT_UNREADABLE,
                         Map.of("path", workspace.toString(), "reason", reason));
             } catch (DslException e) {
                 return failure(UpCmd.STAGE_PREFLIGHT, e.source(), e.code(), e.args());
@@ -4662,8 +4776,15 @@ final class Repl {
                 }
             }
             drafts = parsed;
+            try {
+                Optional<ProjectManifest> manifest = WorkspaceLoader.manifest(workspace);
+                declared = manifest.isPresent();
+                project = manifest.map(ProjectManifest::id).orElse(null);
+            } catch (DslException e) {
+                return failure(UpCmd.STAGE_PREFLIGHT, e.source(), e.code(), e.args());
+            }
             if (pipelines().isEmpty()) {
-                return failure(UpCmd.STAGE_PREFLIGHT, workspace.toString(), CliError.WORKSPACE_HAS_NO_PIPELINE,
+                return failure(UpCmd.STAGE_PREFLIGHT, workspace.toString(), CliError.PROJECT_HAS_NO_PIPELINE,
                         Map.of("path", workspace.toString()));
             }
             return Cli.EXIT_OK;
@@ -4707,7 +4828,7 @@ final class Repl {
                 return Cli.EXIT_OK;
             }
             List<String> ids = subjects.stream().map(UpDraft::id).toList();
-            switch (applyDrafts(batch.stream().map(UpDraft::draft).toList())) {
+            switch (applyDrafts(batch.stream().map(UpDraft::draft).toList(), project)) {
                 case ApplyOutcome.Applied applied -> {
                     for (ApplyOutcome.Item item : applied.items()) {
                         // A resource an earlier stage already applied keeps that stage's verdict: it is
@@ -4829,9 +4950,11 @@ final class Repl {
                     .toList();
             PrintWriter out = commandLine.getOut();
             switch (format) {
-                case TEXT -> FirstRunSummary.upText(out, workspace, pipelines, sources, nothingToDo);
-                case JSON -> out.println(JsonOut.write(FirstRunSummary.upEnvelope(workspace, pipelines, sources, nothingToDo)));
-                case YAML -> out.println(YamlOut.write(FirstRunSummary.upEnvelope(workspace, pipelines, sources, nothingToDo)));
+                case TEXT -> FirstRunSummary.upText(out, workspace, project, declared, pipelines, sources, nothingToDo);
+                case JSON -> out.println(JsonOut.write(
+                        FirstRunSummary.upEnvelope(workspace, project, pipelines, sources, nothingToDo)));
+                case YAML -> out.println(YamlOut.write(
+                        FirstRunSummary.upEnvelope(workspace, project, pipelines, sources, nothingToDo)));
             }
             out.flush();
         }
@@ -4923,9 +5046,9 @@ final class Repl {
     // composite verb chains them. There is one way to apply, discover, start or read a pipeline from
     // here, whichever verb asked.
 
-    /** Applies one batch of drafts. */
-    private ApplyOutcome applyDrafts(List<LocalDraft> drafts) {
-        return withFailover(() -> controlPlane.apply(session.landingNode(), session.credential(), drafts),
+    /** Applies one batch of drafts from {@code project}, or from no project when it is null. */
+    private ApplyOutcome applyDrafts(List<LocalDraft> drafts, String project) {
+        return withFailover(() -> controlPlane.apply(session.landingNode(), session.credential(), drafts, project),
                 o -> o instanceof ApplyOutcome.Unreachable);
     }
 

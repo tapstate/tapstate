@@ -70,7 +70,7 @@ tapstate(admin@127.0.0.1:8080)> shop.orders.find()
 ```
 
 `show collections` lists what the source really holds, not what you declared - a collection somebody
-created by hand shows up here too. That is intended: this face reads the database, not the workspace.
+created by hand shows up here too. That is intended: this face reads the database, not the project.
 
 The line under a `find` is the part to read:
 
@@ -233,7 +233,7 @@ Then ask the agent to list the collections of your source and read one of them. 
 `data_browser_collections` and then `data_browser_find`, and the rows it comes back with should be
 the ones you saw in section 3.
 
-The listing carries what your workspace said about each collection and nothing where it said nothing:
+The listing carries what your project said about each collection and nothing where it said nothing:
 a collection a view declares comes back with its `kind` and `description`; one that nobody declared
 comes back without those keys at all, rather than with empty ones. Absent and empty are different
 answers, and the agent is entitled to tell them apart.

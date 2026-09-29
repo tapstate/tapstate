@@ -35,18 +35,19 @@ import java.util.function.Supplier;
                 "       tapstate [LAUNCH] COMMAND [ARGS...]  run one command and exit"},
         description = {
                 "",
-                "With no command, opens a session: a prompt that holds a workspace and, once you",
+                "With no command, opens a session: a prompt that holds a project and, once you",
                 "connect, a server connection. The session commands are listed below. It exits",
                 "with the status of the first command in it that was refused, so a script that",
                 "pipes commands in reads one status for the whole run.",
                 "",
                 "With a command, runs it once and exits -- the form for scripts. A command takes",
-                "its own options, so the workspace is `tapstate validate -w DIR`, not",
+                "its own options, so the project is `tapstate validate -w DIR`, not",
                 "`tapstate -w DIR validate`.",
                 "",
                 "LAUNCH options come before the command and shape how the CLI starts:",
-                "  -w, --workdir DIR   workspace to start in (default: tap-work, or",
-                "                        $TAPSTATE_WORKDIR)",
+                "  -w, --workdir DIR   project to start in (default: $TAPSTATE_WORKDIR, else",
+                "                        the nearest directory holding a project.tap.yml,",
+                "                        else tap-work)",
                 "  -c, --connect URL   reach a server before doing anything else; takes the",
                 "                        same seed list as `connect`",
                 "      --context NAME  select a saved context for online commands",
@@ -58,9 +59,9 @@ import java.util.function.Supplier;
                 ""},
         footerHeading = "%nExamples:%n",
         footer = {
-                "  tapstate                      open a session in the default workspace",
+                "  tapstate                      open a session in the default project",
                 "  tapstate -w ./work            open a session in ./work",
-                "  tapstate validate ./work      validate a workspace and exit",
+                "  tapstate validate ./work      validate a project and exit",
                 "  tapstate help apply           describe one command",
                 "  TAPSTATE_PASSWORD=secret tapstate -c localhost:8080 -u admin",
                 "                                open a session already signed in",
@@ -69,8 +70,8 @@ import java.util.function.Supplier;
         exitCodeListHeading = "%nExit codes:%n",
         exitCodeList = {
                 "0:success",
-                "1:a coded diagnostic was reported (an invalid workspace, or a refused operation)",
-                "2:usage error (bad arguments, or a path that is not a usable workspace)",
+                "1:a coded diagnostic was reported (an invalid project, or a refused operation)",
+                "2:usage error (bad arguments, or a path that is not a usable project)",
                 "3:the verb is unavailable here (it needs a connection, or is not implemented yet)"
         })
 public final class Cli implements Runnable {
@@ -144,6 +145,10 @@ public final class Cli implements Runnable {
             Map.entry("connection.schema", "schema"),
             Map.entry("connector.register", "register"),
             Map.entry("connector.list", "connectors"),
+            // Both on one verb, as the token operations are: listing projects and removing one are one
+            // subject, and the removal reads as an action on the list.
+            Map.entry("project.list", "projects"),
+            Map.entry("project.remove", "projects"),
             Map.entry("cluster.members", "cluster"),
             Map.entry("token.create", "token"),
             Map.entry("token.list", "token"),
@@ -233,13 +238,15 @@ public final class Cli implements Runnable {
      */
     static final Map<String, VerbHelp> VERB_HELP = Map.ofEntries(
             Map.entry("apply", new VerbHelp("[<path>] [--if-match <hash>]",
-                    "Upload the workspace, or one artifact, creating or updating each resource.")),
+                    "Upload the project, or one artifact, creating or updating each resource.")),
             Map.entry("get", new VerbHelp("<id>",
                     "Fetch one stored artifact back as canonical YAML.")),
             Map.entry("delete", new VerbHelp("<id> [--if-match <hash>] [-o text|json|yaml]",
                     "Remove one stored artifact for good; --if-match pins the version removed.")),
             Map.entry("connectors", new VerbHelp("[-o text|json|yaml]",
                     "List the connectors registered on the server.")),
+            Map.entry("projects", new VerbHelp("[remove <id>] [-o text|json|yaml]",
+                    "List the server's projects, Default project first; remove deletes one.")),
             Map.entry("cluster", new VerbHelp("[-o text|json|yaml]",
                     "List the cluster's members, what each one is, and where to reach it.")),
             Map.entry("register", new VerbHelp("<path|connector-id> [-o text|json|yaml]",
@@ -295,7 +302,7 @@ public final class Cli implements Runnable {
             // the bound workspace is the operand.
             Map.entry("up", new VerbHelp(
                     "[--server <url>] [-u <name>] [--start-local] [--yes] [-o text|json|yaml] [-w <dir>]",
-                    "Bring the bound workspace to running: apply, discover, apply, start.")),
+                    "Bring the bound project to running: apply, discover, apply, start.")),
             // The reserved verbs. Each says what it is reserved for: "not implemented yet" answers the
             // question only once the reader knows what was going to be there.
             Map.entry("export", new VerbHelp("<id>",
@@ -329,7 +336,7 @@ public final class Cli implements Runnable {
             Map.entry("connect", new VerbHelp("<host:port>[,<host:port>...]",
                     "Reach a server; seeds tried in order.")),
             Map.entry("disconnect", new VerbHelp("",
-                    "Drop the connection, keep the workspace.")),
+                    "Drop the connection, keep the project.")),
             Map.entry("login", new VerbHelp("<username>",
                     "Sign in; prompts for the password.")),
             Map.entry("logout", new VerbHelp("",
@@ -337,9 +344,9 @@ public final class Cli implements Runnable {
             Map.entry(":ctx", new VerbHelp("",
                     "Manage saved contexts.")),
             Map.entry("cd", new VerbHelp("<dir>",
-                    "Change the session workspace.")),
+                    "Change the session project.")),
             Map.entry("pwd", new VerbHelp("",
-                    "Print the session workspace.")),
+                    "Print the session project.")),
             Map.entry("help", new VerbHelp("[<verb>]",
                     "List these, or describe one verb.")),
             Map.entry("exit", new VerbHelp("",

@@ -27,14 +27,38 @@ public enum ArtifactError implements TapstateErrorCode {
      * a code with a refusal would make a partly-executed removal indistinguishable from one that never
      * started, on every face.
      */
-    RECLAIM_INCOMPLETE("artifact.reclaim-incomplete", Set.of("id", "reason", "residue"));
+    RECLAIM_INCOMPLETE("artifact.reclaim-incomplete", Set.of("id", "reason", "residue")),
+    /**
+     * A project applied a resource whose id another project on this server already owns. {@code owner}
+     * is the project holding it, {@code project} the one that was refused. Resource ids are unique per
+     * server, so the only ways forward are a different id or removing the resource from its owner.
+     */
+    PROJECT_ID_TAKEN("artifact.project-id-taken", Set.of("id", "kind", "owner", "project")),
+    /**
+     * Not a refusal: a resource that was stored with no project now belongs to the project that just
+     * applied it. Said out loud because it is the one moment ownership changes without anybody having
+     * written a project name, and an adoption nobody was told about is indistinguishable from a
+     * resource that was always this project's.
+     */
+    PROJECT_CLAIMED("artifact.project-claimed", Set.of("id", "kind", "project"), Severity.WARNING),
+    /**
+     * A removal of the Default project. Every server has it and every unlabelled resource belongs to it,
+     * so it can be emptied - its resources deleted one by one - but never removed as a whole.
+     */
+    DEFAULT_PROJECT_NOT_REMOVABLE("artifact.default-project-not-removable", Set.of("project"));
 
     private final String code;
     private final Set<String> placeholders;
+    private final Severity severity;
 
     ArtifactError(String code, Set<String> placeholders) {
+        this(code, placeholders, Severity.ERROR);
+    }
+
+    ArtifactError(String code, Set<String> placeholders, Severity severity) {
         this.code = code;
         this.placeholders = placeholders;
+        this.severity = severity;
     }
 
     @Override
@@ -44,7 +68,7 @@ public enum ArtifactError implements TapstateErrorCode {
 
     @Override
     public Severity severity() {
-        return Severity.ERROR;
+        return severity;
     }
 
     @Override

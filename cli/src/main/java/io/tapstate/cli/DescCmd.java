@@ -45,7 +45,7 @@ import java.util.concurrent.Callable;
  * match its directory is flagged misplaced instead of being rendered with the wrong shape.
  */
 @Command(name = "desc", mixinStandardHelpOptions = true,
-        description = "Describe one workspace resource: summary, validation status and references.")
+        description = "Describe one project resource: summary, validation status and references.")
 final class DescCmd implements Callable<Integer> {
 
     /** Exit code when the id resolves to no resource (a coded {@code cli.resource-not-found}). */

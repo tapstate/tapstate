@@ -11,7 +11,7 @@ import java.util.Objects;
  */
 @Doc("A reusable view: declares where and how to materialize data, without any inbound wiring.")
 public record ViewResource(
-        @Doc(value = "Unique resource id across the workspace; must not contain a dot.", required = true)
+        @Doc(value = "Unique resource id across the project; must not contain a dot.", required = true)
         String id,
         @Doc("Optional labels and free-text description.")
         Metadata metadata,

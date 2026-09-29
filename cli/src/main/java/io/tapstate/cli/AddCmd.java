@@ -14,7 +14,7 @@ import java.io.PrintWriter;
  * compatibility alias and the new verb cannot drift in questions, validation, or output.
  */
 @Command(name = "add", mixinStandardHelpOptions = true,
-        description = "Add one source, pipeline, transform, view or serve artifact to a workspace.")
+        description = "Add one source, pipeline, transform, view or serve artifact to a project.")
 final class AddCmd extends SingleResourceOptions implements java.util.concurrent.Callable<Integer> {
 
     @Spec

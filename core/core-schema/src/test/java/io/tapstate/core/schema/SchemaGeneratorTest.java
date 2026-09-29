@@ -28,7 +28,8 @@ class SchemaGeneratorTest {
         Json.Arr oneOf = (Json.Arr) resource.get("oneOf");
         assertThat(oneOf.items()).containsExactly(
                 Json.ref("SourceResource"), Json.ref("PipelineResource"),
-                Json.ref("TransformResource"), Json.ref("ViewResource"), Json.ref("ServeResource"));
+                Json.ref("TransformResource"), Json.ref("ViewResource"), Json.ref("ServeResource"),
+                Json.ref("ProjectManifest"));
     }
 
     @Test

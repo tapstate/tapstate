@@ -51,7 +51,7 @@ final class ContextResolver {
         if (canonical == null) {
             return Optional.empty();
         }
-        String bound = current.workspaceBindings().get(canonical.toString());
+        String bound = current.projectBindings().get(canonical.toString());
         return present(bound)
                 ? Optional.of(named(current, bound, ResolvedContext.Source.WORKSPACE_BINDING))
                 : Optional.empty();

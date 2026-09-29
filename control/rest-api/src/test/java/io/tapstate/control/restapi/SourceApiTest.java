@@ -586,6 +586,12 @@ class SourceApiTest {
         @Bean ArtifactQueryService artifactQueryService(ArtifactStore store) {
             return new ArtifactQueryService(store);
         }
+        @Bean
+        io.tapstate.control.core.ProjectService projectService(ArtifactStore store,
+                ArtifactMutationService artifactMutationService) {
+            return new io.tapstate.control.core.ProjectService(store, artifactMutationService);
+        }
+
         @Bean ArtifactMutationService artifactMutationService(ArtifactStore store, AuditGate auditGate) {
             return new ArtifactMutationService(
                     store, NoReclaimStores.desired(), NoReclaimStores.state(),

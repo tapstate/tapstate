@@ -40,10 +40,10 @@ public final class ControlOperations {
     // artifact domain
     public static final Operation ARTIFACT_APPLY = mcp(
             "artifact.apply", Scope.WRITE, true,
-            "Apply a complete tapstate/v1 workspace after validation and return per-resource change results.");
+            "Apply a complete tapstate/v1 project after validation and return per-resource change results.");
     public static final Operation ARTIFACT_VALIDATE = mcp(
             "artifact.validate", Scope.READ, false,
-            "Validate a complete tapstate/v1 workspace without writing artifacts or audit records.");
+            "Validate a complete tapstate/v1 project without writing artifacts or audit records.");
     // The read every precondition-bearing write depends on. It is exposed alongside artifact.delete
     // rather than on the CLI alone because the removal demands a content hash a remote caller cannot
     // compute for itself; without this read on the same face, that verb is callable and unusable.
@@ -63,6 +63,19 @@ public final class ControlOperations {
                     + "must be the hash of the version just read, and the removal is refused if the stored "
                     + "version has moved on, if another resource still references the id, or if the id is a "
                     + "pipeline that is not stopped.");
+
+    // project domain: projects are read off the label apply writes; there is no project document.
+    public static final Operation PROJECT_LIST = mcp(
+            "project.list", Scope.READ, false,
+            "List the projects on this server with the resources each holds. The Default project is always "
+                    + "listed first, even when empty: it holds every resource that carries no project label, "
+                    + "and any project may refer to what it holds.");
+    // Destroys every resource of one project, so it stays off the model-facing face like the other bulk
+    // removals; a remote caller removes resources one at a time through artifact.delete.
+    public static final Operation PROJECT_REMOVE = new Operation(
+            "project.remove", Scope.WRITE, true, null,
+            "Remove a project by deleting every resource labelled with it, all or nothing. The Default "
+                    + "project cannot be removed, only emptied.", CLI_ONLY);
 
     // Source mutations and single-resource reads remain off MCP; source.list and source.draft are the
     // read-only Source operations exposed to model-facing clients.
@@ -149,8 +162,8 @@ public final class ControlOperations {
             "data-browser.collections", Scope.READ, false,
             "List the collections a declared Source's own database holds, each with what is known "
                     + "about it: the kind of collection, the fields discovery found, and whatever the "
-                    + "workspace said about it. These are the collections the database actually holds, "
-                    + "not the ones the workspace declared. A field list or a description that nobody "
+                    + "project said about it. These are the collections the database actually holds, "
+                    + "not the ones the project declared. A field list or a description that nobody "
                     + "answered is left out rather than sent empty.");
     public static final Operation DATA_BROWSER_FIND = mcp(
             "data-browser.find", Scope.READ, false,
@@ -194,7 +207,7 @@ public final class ControlOperations {
             "Replace one Pipeline definition while its content hash precondition still matches.", CLI_ONLY);
     public static final Operation PIPELINE_START = mcp(
             "pipeline.start", Scope.WRITE, true,
-            "Set a Pipeline's desired state to running after its workspace has been applied.");
+            "Set a Pipeline's desired state to running after its project has been applied.");
     // The description is rendered from the same declarations a stop works through, both outcomes of
             // them. Written out by hand it would describe whatever was true when somebody last edited it,
             // and a description that has fallen behind reads exactly like one that is complete.
@@ -285,6 +298,8 @@ public final class ControlOperations {
             ARTIFACT_GET,
             ARTIFACT_LIST,
             ARTIFACT_DELETE,
+            PROJECT_LIST,
+            PROJECT_REMOVE,
             SOURCE_CREATE,
             SOURCE_DRAFT,
             SOURCE_LIST,

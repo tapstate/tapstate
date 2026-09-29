@@ -153,7 +153,7 @@ final class WorkspaceWrite {
 
     private static TapstateException notWritable(Path path, IOException failure) {
         return new TapstateException(
-                CliError.WORKSPACE_NOT_WRITABLE,
+                CliError.PROJECT_NOT_WRITABLE,
                 Map.of("path", path.toString(), "reason", reason(failure)), null);
     }
 

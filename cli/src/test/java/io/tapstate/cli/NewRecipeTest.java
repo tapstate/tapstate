@@ -107,7 +107,7 @@ class NewRecipeTest {
                     .isEqualTo(DemoCmd.bundled(resource))
                     .isEqualTo(Files.readString(demoDir.resolve(resource)));
         }
-        assertThat(r.out()).startsWith("Workspace: " + ws + "\n"
+        assertThat(r.out()).startsWith("Project: " + ws + "\n" + "  project.tap.yml  project order_demo\n"
                 + "  source/orders_db.tap.yml  source orders_db: mysql, cdc\n"
                 + "  source/fulfillment_db.tap.yml  source fulfillment_db: postgres, cdc\n"
                 + "  pipeline/order_pipeline.tap.yml  pipeline order_pipeline: 2 sources, view\n");
@@ -197,7 +197,7 @@ class NewRecipeTest {
         assertThat(Files.readString(ws.resolve("source/orders_src.tap.yml")))
                 .contains("password: ${ORDERS_SRC_PASSWORD}")
                 .doesNotContain(": s\n");
-        assertThat(r.out()).startsWith("Workspace: " + ws + "\n"
+        assertThat(r.out()).startsWith("Project: " + ws + "\n"
                 + "  source/orders_src.tap.yml  source orders_src: mysql, cdc\n"
                 + "  pipeline/orders_sync.tap.yml  pipeline orders_sync: 1 source, view — assumed primary_key: id;");
         assertThat(r.out()).contains("\n  .env  ").contains("\n  .gitignore  ");
@@ -330,7 +330,7 @@ class NewRecipeTest {
                 .contains("\"kind\": \"pipeline\"")
                 .contains("\"kind\": \"env\"")
                 .contains("\"kind\": \"gitignore\"")
-                .doesNotContain("Workspace:");
+                .doesNotContain("Project:");
         assertThat(r.out().indexOf("\"kind\": \"source\""))
                 .isLessThan(r.out().indexOf("\"kind\": \"pipeline\""));
         assertThat(r.out().indexOf("\"kind\": \"pipeline\""))

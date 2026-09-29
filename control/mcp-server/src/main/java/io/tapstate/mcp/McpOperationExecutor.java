@@ -49,6 +49,7 @@ final class McpOperationExecutor {
             return switch (operation.id()) {
                 case "system.version" -> get("/version");
                 case "connector.list" -> get("/api/connectors");
+                case "project.list" -> get("/api/projects");
                 case "connector.get" -> get("/api/connectors/" + segment(required(args, "id")));
                 case "source.list" -> sourceList(args);
                 case "source.draft" -> sourceDraft(args);

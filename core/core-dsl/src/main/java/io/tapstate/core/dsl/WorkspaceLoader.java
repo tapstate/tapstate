@@ -1,6 +1,7 @@
 package io.tapstate.core.dsl;
 
 import io.tapstate.core.catalog.TapstateCatalog;
+import io.tapstate.core.model.ProjectManifest;
 import io.tapstate.core.model.Resource;
 
 import java.io.IOException;
@@ -9,6 +10,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.stream.Stream;
 
 /**
@@ -41,16 +43,49 @@ public final class WorkspaceLoader {
      */
     public static Workspace load(Path dir, TapstateCatalog catalog) {
         DslParser parser = new DslParser();
+        String project = projectId(dir);
         List<Resource> resources = new ArrayList<>();
         for (Path file : artifacts(dir)) {
             String name = file.getFileName().toString();
+            String text = read(file);
+            // A project file names the project; it is not one of its resources.
+            if (ProjectManifest.KIND.equals(DslParser.declaredKind(text))) {
+                continue;
+            }
             try {
-                resources.add(parser.parse(read(file)));
+                Resource resource = parser.parse(text);
+                ProjectLabel.requireConsistent(resource, project);
+                resources.add(resource);
             } catch (DslException e) {
                 throw e.withSource(name);   // a parse error is located at exactly this file
             }
         }
         return Workspace.of(resources, catalog);
+    }
+
+    /**
+     * The project file at the root of {@code dir}, parsed, or empty when the directory has none. A file
+     * that is present but malformed is refused with its own diagnostic rather than read as absent: the
+     * name it was meant to give the project would otherwise be silently replaced by the directory's.
+     */
+    public static Optional<ProjectManifest> manifest(Path dir) {
+        Path file = dir.resolve(ProjectManifest.FILE_NAME);
+        if (!Files.isRegularFile(file)) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(new DslParser().parseProject(read(file)));
+        } catch (DslException e) {
+            throw e.withSource(ProjectManifest.FILE_NAME);
+        }
+    }
+
+    /**
+     * The id of the project rooted at {@code dir}, as its project file declares it, or null when it has
+     * none: a directory without a project file is in the Default project, which no file names.
+     */
+    public static String projectId(Path dir) {
+        return manifest(dir).map(ProjectManifest::id).orElse(null);
     }
 
     private static List<Path> artifacts(Path dir) {

@@ -1,0 +1,3 @@
+rule: reserved-label
+path: metadata.labels.project
+note: "the project file names the project orders_team, and the source's hand-written project label names another one"

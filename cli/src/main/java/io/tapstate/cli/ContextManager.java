@@ -52,7 +52,7 @@ final class ContextManager {
             Map<String, ContextDefinition> contexts = new LinkedHashMap<>(current.contexts());
             contexts.put(name, definition);
             return new ContextConfigStore.Mutation<>(new ContextConfig(
-                    current.version(), current.lastContext(), contexts, current.workspaceBindings()), definition);
+                    current.version(), current.lastContext(), contexts, current.projectBindings()), definition);
         });
     }
 
@@ -63,7 +63,7 @@ final class ContextManager {
             Map<String, ContextDefinition> contexts = new LinkedHashMap<>(current.contexts());
             contexts.put(name, replacement);
             return new ContextConfigStore.Mutation<>(new ContextConfig(
-                    current.version(), current.lastContext(), contexts, current.workspaceBindings()), replacement);
+                    current.version(), current.lastContext(), contexts, current.projectBindings()), replacement);
         });
     }
 
@@ -82,7 +82,7 @@ final class ContextManager {
         store.update(current -> {
             required(current, name);
             return new ContextConfigStore.Mutation<>(
-                    new ContextConfig(current.version(), name, current.contexts(), current.workspaceBindings()), null);
+                    new ContextConfig(current.version(), name, current.contexts(), current.projectBindings()), null);
         });
     }
 
@@ -90,7 +90,7 @@ final class ContextManager {
         Path canonical = canonical(workspaceRoot);
         store.update(current -> {
             required(current, name);
-            Map<String, String> bindings = new LinkedHashMap<>(current.workspaceBindings());
+            Map<String, String> bindings = new LinkedHashMap<>(current.projectBindings());
             bindings.put(canonical.toString(), name);
             return new ContextConfigStore.Mutation<>(
                     new ContextConfig(current.version(), current.lastContext(), current.contexts(), bindings), null);
@@ -100,7 +100,7 @@ final class ContextManager {
     synchronized Optional<String> unbind(Path workspaceRoot) {
         Path canonical = canonical(workspaceRoot);
         return store.update(current -> {
-            Map<String, String> bindings = new LinkedHashMap<>(current.workspaceBindings());
+            Map<String, String> bindings = new LinkedHashMap<>(current.projectBindings());
             String removed = bindings.remove(canonical.toString());
             ContextConfig updated = removed == null ? current
                     : new ContextConfig(current.version(), current.lastContext(), current.contexts(), bindings);
@@ -110,7 +110,7 @@ final class ContextManager {
 
     synchronized Optional<String> contextBoundExactlyTo(Path workspaceRoot) {
         ContextConfig current = store.load();
-        return Optional.ofNullable(current.workspaceBindings().get(canonical(workspaceRoot).toString()));
+        return Optional.ofNullable(current.projectBindings().get(canonical(workspaceRoot).toString()));
     }
 
     /**
@@ -120,7 +120,7 @@ final class ContextManager {
      */
     synchronized Optional<URI> serverBoundTo(Path workspaceRoot) {
         ContextConfig current = store.load();
-        String name = current.workspaceBindings().get(canonical(workspaceRoot).toString());
+        String name = current.projectBindings().get(canonical(workspaceRoot).toString());
         ContextDefinition definition = name == null ? null : current.contexts().get(name);
         return definition == null ? Optional.empty() : Optional.of(definition.seeds().get(0));
     }
@@ -128,7 +128,7 @@ final class ContextManager {
     synchronized DeletionImpact previewDelete(String name) {
         ContextConfig current = store.load();
         ContextDefinition definition = required(current, name);
-        List<Path> bindings = current.workspaceBindings().entrySet().stream()
+        List<Path> bindings = current.projectBindings().entrySet().stream()
                 .filter(entry -> entry.getValue().equals(name))
                 .map(Map.Entry::getKey)
                 .map(Path::of)
@@ -142,7 +142,7 @@ final class ContextManager {
             required(current, name);
             Map<String, ContextDefinition> contexts = new LinkedHashMap<>(current.contexts());
             contexts.remove(name);
-            Map<String, String> bindings = new LinkedHashMap<>(current.workspaceBindings());
+            Map<String, String> bindings = new LinkedHashMap<>(current.projectBindings());
             bindings.entrySet().removeIf(entry -> entry.getValue().equals(name));
             String last = name.equals(current.lastContext()) ? null : current.lastContext();
             return new ContextConfigStore.Mutation<>(
@@ -193,9 +193,9 @@ final class ContextManager {
     record ContextChoice(String name, ContextDefinition definition, boolean suggested) {
     }
 
-    record DeletionImpact(String name, UUID authRef, List<Path> workspaceBindings) {
+    record DeletionImpact(String name, UUID authRef, List<Path> projectBindings) {
         DeletionImpact {
-            workspaceBindings = List.copyOf(new ArrayList<>(workspaceBindings));
+            projectBindings = List.copyOf(new ArrayList<>(projectBindings));
         }
     }
 }

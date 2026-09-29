@@ -428,6 +428,49 @@ public final class ArtifactMutationService {
         }
     }
 
+    /**
+     * Removes {@code ids} together, each through {@link #delete} under the version stored now. Every
+     * refusal is judged for the whole set before anything is removed: a resource referenced only from
+     * inside the set is not in use, one referenced from outside it is, and every pipeline in the set has
+     * to be stopped. The removal then runs referrers first, so no resource is ever left referring to one
+     * already gone.
+     */
+    public void deleteAll(String principal, List<String> ids) {
+        Objects.requireNonNull(principal, "principal");
+        java.util.Set<String> together = new java.util.LinkedHashSet<>(ids);
+        List<Resource> stored = store.list();
+        ReferenceGraph graph = ReferenceGraph.of(stored);
+        List<Resource> targets = new java.util.ArrayList<>();
+        for (String id : together) {
+            Resource target = store.get(id).orElseThrow(() -> error(ArtifactError.NOT_FOUND, Map.of("id", id)));
+            List<String> outside = graph.referencedBy(id).stream()
+                    .map(ReferenceGraph.Edge::id)
+                    .filter(referrer -> !together.contains(referrer))
+                    .sorted()
+                    .toList();
+            if (!outside.isEmpty()) {
+                throw error(ArtifactError.IN_USE, Map.of("id", id, "referrers", outside));
+            }
+            if (target instanceof PipelineResource) {
+                refuseWhenNotStopped(id);
+            }
+            targets.add(target);
+        }
+        targets.sort(java.util.Comparator.comparingInt(ArtifactMutationService::removalOrder));
+        for (Resource target : targets) {
+            delete(principal, target.id(), io.tapstate.core.model.canonical.CanonicalHash.of(target));
+        }
+    }
+
+    /** Pipelines refer to everything else and definitions refer to sources, so they go in that order. */
+    private static int removalOrder(Resource resource) {
+        return switch (resource.kind()) {
+            case "pipeline" -> 0;
+            case "serve", "view", "transform" -> 1;
+            default -> 2;
+        };
+    }
+
     private void refuseWhenReferenced(String id, List<Resource> stored) {
         List<String> referrers = ReferenceGraph.of(stored).referencedBy(id).stream()
                 .map(ReferenceGraph.Edge::id)

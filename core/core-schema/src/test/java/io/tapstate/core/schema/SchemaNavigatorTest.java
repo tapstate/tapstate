@@ -11,11 +11,11 @@ class SchemaNavigatorTest {
     private final SchemaNavigator nav = SchemaNavigator.bundled();
 
     @Test
-    void rootListsTheFiveResourceKinds() {
+    void rootListsTheFiveResourceKindsAndTheProjectFile() {
         SchemaNode root = nav.navigate("").orElseThrow();
         assertThat(root.path()).isEmpty();
         assertThat(root.description()).contains("top-level");
-        assertThat(root.children()).containsExactly("source", "pipeline", "transform", "view", "serve");
+        assertThat(root.children()).containsExactly("source", "pipeline", "transform", "view", "serve", "project");
     }
 
     @Test
@@ -105,7 +105,7 @@ class SchemaNavigatorTest {
     @Test
     void completesTopLevelKinds() {
         assertThat(nav.complete("")).containsExactly(
-                "pipeline", "serve", "source", "transform", "view");
+                "pipeline", "project", "serve", "source", "transform", "view");
         assertThat(nav.complete("sou")).containsExactly("source");
     }
 

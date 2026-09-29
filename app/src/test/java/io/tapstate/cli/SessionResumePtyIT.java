@@ -168,7 +168,7 @@ class SessionResumePtyIT {
         ContextConfig config = ContextConfigStore.underHome(home).load();
         ContextDefinition context = config.contexts().get("dev");
         assertThat(context).isNotNull();
-        assertThat(config.workspaceBindings()).containsExactlyEntriesOf(
+        assertThat(config.projectBindings()).containsExactlyEntriesOf(
                 Map.of(workspace.toRealPath().toString(), "dev"));
 
         ProcessResult login = runInPty(home, workspace, true, PASSWORD + "\n",
