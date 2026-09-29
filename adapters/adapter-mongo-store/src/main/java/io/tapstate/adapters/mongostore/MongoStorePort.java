@@ -195,8 +195,8 @@ public final class MongoStorePort implements StorePort {
         OperatorStateStore defaultState = operatorStateStores.inDatabase(operatorStateStores.defaultDatabase());
         this.keyedState = defaultState.state();
         this.nestDeadLetters = defaultState.deadLetters();
-        this.drafts = new MongoPipelineDraftStore(connection.client(), database.getCollection(PIPELINE_DRAFTS),
-                database.getCollection(ARTIFACTS));
+        this.drafts = new MongoPipelineDraftStore(connection.client(),
+                SystemCollections.PIPELINE_DRAFTS.on(database), SystemCollections.ARTIFACTS.on(database));
     }
 
     static String requireOperatorStateDatabase(String name, String controlDatabase) {

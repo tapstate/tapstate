@@ -611,7 +611,7 @@ final class ControlPlane {
 
     /** Creates and reads back an authoring draft through the public HTTP contract. */
     Map<String, Object> createPipelineDraft(String id, Map<String, Object> draft) {
-        HttpResponse<String> created = send(post("/api/pipelines/" + urlSegment(id) + "/draft",
+        HttpResponse<String> created = send(authed("/api/pipelines/" + urlSegment(id) + "/draft",
                 JsonWriter.write(draft)));
         expect(created, 201, "create pipeline draft " + id);
         HttpResponse<String> read = send(authedGet("/api/pipelines/" + urlSegment(id) + "/draft"));

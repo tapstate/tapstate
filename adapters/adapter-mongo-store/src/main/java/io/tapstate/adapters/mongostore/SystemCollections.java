@@ -110,6 +110,12 @@ public enum SystemCollections {
     PIPELINE_LAYOUTS(MongoStorePort.PIPELINE_LAYOUTS, Database.STORE, MongoPipelineLayoutStore.class,
             Strategy.MIGRATED, 0),
 
+    /** The authoring document kept independently from the artifact it compiles into. */
+    PIPELINE_DRAFTS(MongoStorePort.PIPELINE_DRAFTS, Database.STORE, MongoPipelineDraftStore.class,
+            Strategy.MIGRATED, 0,
+            new IndexSpec(List.of("revision"), false),
+            new IndexSpec(List.of("updatedAt"), false)),
+
     /**
      * The durable change log, one document per change, keyed by the ring it was written to and the
      * sequence that ring gave it. It needs no index of its own - that compound key is the index. Another
