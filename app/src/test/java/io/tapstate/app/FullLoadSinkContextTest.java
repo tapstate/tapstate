@@ -27,6 +27,29 @@ class FullLoadSinkContextTest {
     }
 
     @Test
+    void probeAFirstStartBuiltAfterItsCaptureRecordedTheSeamIsStillAFreshLoad() {
+        InMemoryStorePort store = store(ReadMode.SNAPSHOT_AND_CDC, io.tapstate.core.model.OnFullLoad.CLEAR);
+        SourceResource source = StoredArtifacts.requireSource(store.artifacts(), "src");
+        String chain = SourceCaptureResolution.of(source, SourceDiscovery.model(store, source)).chainId().value();
+        store.meta().setCdcStart(chain, "pipe", "seam-0", 1L);
+        assertThat(bind(store).factory.fullLoad()).isTrue();
+    }
+
+    @Test
+    void aFirstStartUsesFreshnessCapturedBeforeCaptureRegistersItsCursorAndSeam() {
+        InMemoryStorePort store = store(ReadMode.SNAPSHOT_AND_CDC, io.tapstate.core.model.OnFullLoad.CLEAR);
+        CapturingBinder binder = new CapturingBinder();
+        DagSource.StartPreparation prepared = new StoreBackedDagSource(store, binder)
+                .prepareStart("pipe", "tapstate");
+        SourceResource source = StoredArtifacts.requireSource(store.artifacts(), "src");
+        String chain = SourceCaptureResolution.of(source, SourceDiscovery.model(store, source)).chainId().value();
+        store.meta().startRingAfter(chain, "pipe", "orders", 0L);
+        store.meta().setCdcStart(chain, "pipe", "seam-0", 1L);
+        prepared.build(null);
+        assertThat(binder.factory.fullLoad()).isTrue();
+    }
+
+    @Test
     void cdcOnlyOverridesClear() {
         CapturingBinder binder = bind(store(ReadMode.CDC_ONLY, io.tapstate.core.model.OnFullLoad.CLEAR));
         assertThat(binder.factory.onFullLoad()).isEqualTo(OnFullLoad.CLEAR);
