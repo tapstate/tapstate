@@ -95,6 +95,9 @@ class MongoPipelineDraftStoreIT {
             assertThat(store.replace("orders", 1, draft("orders", 2, PipelineDraft.Mode.WIZARD)))
                     .isEqualTo(PipelineDraftMutation.MODE_CONFLICT);
             assertThat(store.replace("orders", 1, draft("orders", 2, PipelineDraft.Mode.DAG)))
+                    .isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+            assertThat(store.replace("orders", 1, draft("orders", 2, PipelineDraft.Mode.DAG,
+                    null, null, null)))
                     .isEqualTo(PipelineDraftMutation.REPLACED);
             assertThat(store.get("orders").orElseThrow().revision()).isEqualTo(2);
 
