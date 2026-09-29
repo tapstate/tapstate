@@ -39,6 +39,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -252,13 +253,13 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
         // refuses the start instead of letting the pipeline report RUNNING before its tail fails.
         CompletableFuture<Void> preflight = OracleLogMinerIdentifiers.appliesTo(config)
                 ? new CompletableFuture<>() : null;
+        AtomicBoolean closed = new AtomicBoolean();
         Thread thread = new Thread(
-                () -> streamLoop(connector, config, resumeAt, startAt, listener, stream, preflight),
+                () -> streamLoop(connector, config, resumeAt, startAt, listener, stream, preflight, closed),
                 "tapstate-cdc-" + connector.connectorId());
         thread.setDaemon(true);
         thread.start();
         awaitPreflight(preflight, connector, thread);
-        AtomicBoolean closed = new AtomicBoolean();
         return () -> {
             if (!closed.compareAndSet(false, true)) {
                 return;
@@ -535,7 +536,8 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
     }
 
     private void streamLoop(PdkConnector connector, CaptureConfig config, Object resumeAt, Long startAt,
-            CaptureListener listener, StreamReadFunction stream, CompletableFuture<Void> preflight) {
+            CaptureListener listener, StreamReadFunction stream, CompletableFuture<Void> preflight,
+            AtomicBoolean closed) {
         try {
             connector.underLoader(() -> {
                 // streamRead is handed only stream names, so the connector reads each changed table's
@@ -582,6 +584,12 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
                 return null;
             });
         } catch (Throwable t) {
+            if (t instanceof CancellationException && closed.get()) {
+                // Closing a subscription interrupts this worker before it stops the connector. A listener
+                // waiting on downstream capacity reports that interruption as cancellation; it is the
+                // requested stop, not a connector failure to publish through the listener's error channel.
+                return;
+            }
             // The cdc stream runs on this daemon thread; its failure cannot be returned to the caller, so it
             // is delivered through the listener's error channel for the runtime to observe and drive the
             // pipeline into an error state. It is logged as well, so a dead stream is visible in the logs.

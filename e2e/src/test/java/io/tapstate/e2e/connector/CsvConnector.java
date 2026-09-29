@@ -216,6 +216,9 @@ public class CsvConnector implements TapConnector {
                 .supportTimestampToStreamOffset((context, startTime) -> highWaterMarks(context))
                 .supportWriteRecord((context, events, table, consumer) ->
                         consumer.accept(write(context, events, table)))
+                .supportClearTable((context, event) -> clear(context, event.getTableId()))
+                .supportCountByPartitionFilterFunction((context, table, filter) ->
+                        rows(file(context, table.getId())).size())
                 // The three the read face drives. Registering them is what lets a specification exercise
                 // the browse chain without a real database at the far end; a connector missing any one of
                 // them is refused by name before the read starts.
@@ -407,6 +410,12 @@ public class CsvConnector implements TapConnector {
     }
 
     // ---- writes ----------------------------------------------------------------------------------
+
+    /** Clears an existing table while retaining its declared columns for the next write. */
+    private static void clear(TapConnectorContext context, String table) {
+        Path file = file(context, table);
+        write(file, header(file), List.of());
+    }
 
     /**
      * Applies a batch to the target file, creating it when this is the first write. Rows are keyed on
