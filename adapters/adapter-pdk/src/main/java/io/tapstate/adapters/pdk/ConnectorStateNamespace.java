@@ -2,9 +2,12 @@ package io.tapstate.adapters.pdk;
 
 import io.tapstate.core.model.PipelineNode;
 
+import java.util.Objects;
+
 /**
- * Where a connector's notes are filed: one namespace per pipeline node for what it keeps at that node,
- * and one namespace for the whole deployment for what the contract calls global.
+ * Where a connector's notes are filed: one namespace per pipeline node for what it keeps at that node, one
+ * per mining chain for what a change stream several pipelines share keeps, and one namespace for the whole
+ * deployment for what the contract calls global.
  *
  * <p>Both sides of a pipeline name it here rather than each spelling it themselves. The read side and
  * the write side reach this from different call paths and a node's notes are found only under the name
@@ -20,6 +23,8 @@ import io.tapstate.core.model.PipelineNode;
 public final class ConnectorStateNamespace {
 
     private static final String PREFIX = "pdk.state.";
+
+    private static final String SHARED_PREFIX = "pdk.chain.";
 
     /**
      * The one namespace every connector in the deployment shares, whatever pipeline or node it was
@@ -40,5 +45,17 @@ public final class ConnectorStateNamespace {
     /** The namespace {@code node}'s connector keeps its own notes in, or null for a drive naming no node. */
     public static String of(PipelineNode node) {
         return node == null ? null : PREFIX + node.pipelineId() + "." + node.nodeId();
+    }
+
+    /**
+     * The namespace the change stream of mining chain {@code chainId} keeps its notes in, whichever pipeline
+     * opens it.
+     *
+     * <p><b>Deliberately not under {@link #PREFIX}</b>, for the reason {@link #GLOBAL} is not: these notes are
+     * the chain's rather than any one pipeline's, so clearing a pipeline must not take them while others still
+     * read the chain through them. They go when the chain itself is cleared, and only then.
+     */
+    public static String ofShared(String chainId) {
+        return SHARED_PREFIX + Objects.requireNonNull(chainId, "chainId");
     }
 }

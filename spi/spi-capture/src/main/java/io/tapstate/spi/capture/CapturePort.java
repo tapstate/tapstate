@@ -1,5 +1,9 @@
 package io.tapstate.spi.capture;
 
+import io.tapstate.core.common.TapstateException;
+
+import java.util.Optional;
+
 /**
  * The read side of a connector: bounded snapshot reads, an unbounded CDC stream, a connection test
  * and schema discovery. A pure interface over the standard event envelope; it depends on the core
@@ -43,4 +47,20 @@ public interface CapturePort {
 
     /** Discovers the streams and fields the source exposes. */
     DiscoveredSchema discoverSchema(CaptureConfig config);
+
+    /**
+     * Lets go of what the connector set up on the source to read changes for {@code config}'s notes -- a
+     * replication slot, say -- and then of the notes themselves. Called once nothing reads through those
+     * notes any more and their state is being cleared: a resource left behind there is one nobody confirms
+     * again, and a source keeps its whole change log for it.
+     *
+     * <p>A source that refuses, or cannot be reached, keeps what it had; that is answered rather than thrown,
+     * as a coded refusal naming what is left there for somebody to remove by hand, because it must not stop
+     * the state being cleared. The notes are let go of either way. What is thrown is the clearing itself
+     * failing -- the notes could not be dropped. A port or connector with nothing to let go of answers empty,
+     * which is the default.
+     */
+    default Optional<TapstateException> release(CaptureConfig config) {
+        return Optional.empty();
+    }
 }

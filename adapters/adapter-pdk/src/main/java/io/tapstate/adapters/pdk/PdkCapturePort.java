@@ -13,6 +13,7 @@ import io.tapstate.spi.capture.DiscoveredSchema;
 import io.tapstate.spi.capture.FieldSchema;
 import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.SnapshotSession;
+import io.tapstate.spi.capture.SharedNotes;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.capture.TableSchema;
@@ -26,6 +27,7 @@ import io.tapdata.entity.utils.cache.Entry;
 import io.tapdata.entity.utils.cache.Iterator;
 import io.tapdata.entity.utils.cache.KVReadOnlyMap;
 import io.tapdata.pdk.apis.consumer.StreamReadConsumer;
+import io.tapdata.pdk.apis.functions.connector.common.ReleaseExternalFunction;
 import io.tapdata.pdk.apis.functions.connector.source.BatchReadFunction;
 import io.tapdata.pdk.apis.functions.connector.source.StreamReadFunction;
 import io.tapdata.pdk.apis.functions.connector.source.TimestampToStreamOffsetFunction;
@@ -389,14 +391,109 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
         }
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>The connector is opened over the notes a read over {@code config} opens, so its release function
+     * finds what it recorded there -- a replication slot's name, say -- and lets go of that on the source. A
+     * connector that registered no release function set nothing up there that it knows to let go of.
+     *
+     * <p>What the notes name on the source is read before anything is let go of, so that a release the source
+     * refuses can still say what is left there to remove by hand. Which notes name such a thing is the
+     * connector's own knowledge; {@link #NOTES_NAMING_SOURCE_RESOURCES} lists what is known of it, and a
+     * connector it does not list is still released and still answered for, only without the names.
+     *
+     * <p>The notes are dropped whether or not the source let go: the state they belong to is being cleared,
+     * and notes kept past that would hand the next run over this config a resource it has already given up.
+     */
+    @Override
+    public Optional<TapstateException> release(CaptureConfig config) {
+        List<String> namespaces = notesOf(config);
+        if (stateStore == null || namespaces.isEmpty()) {
+            // Nothing was kept anywhere a later drive could read it, so nothing was set up through it either.
+            return Optional.empty();
+        }
+        List<String> left = namedOnTheSource(config, namespaces);
+        Optional<TapstateException> refused = Optional.empty();
+        try {
+            PdkConnector connector = open(config);
+            try {
+                ReleaseExternalFunction release = connector.functions().getReleaseExternalFunction();
+                if (release != null) {
+                    connector.underLoader(() -> {
+                        release.release(connector.context());
+                        return null;
+                    });
+                }
+            } finally {
+                connector.stopQuietly();
+                connector.close();
+            }
+        } catch (VirtualMachineError fatal) {
+            throw fatal;
+        } catch (Throwable failure) {
+            if (failure instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            refused = Optional.of(new TapstateException(ConnectorError.RELEASE_FAILED,
+                    Map.of("connector", config.connectorId(), "detail", detail(failure),
+                            "resources", left.isEmpty() ? "nothing its notes name" : String.join(", ", left)),
+                    failure));
+        }
+        namespaces.forEach(stateStore::dropNamespace);
+        return refused;
+    }
+
+    /**
+     * Per connector, the notes naming something it set up on its source that its release function lets go of.
+     * Read only to say what is left there when a release fails.
+     */
+    static final Map<String, List<String>> NOTES_NAMING_SOURCE_RESOURCES =
+            Map.of("postgres", List.of("tapdata_pg_slot"));
+
+    /** Every namespace a drive over {@code config} keeps notes in or carries them from; empty for none. */
+    private static List<String> notesOf(CaptureConfig config) {
+        List<String> namespaces = new ArrayList<>();
+        if (config.sharedNotes() != null) {
+            namespaces.add(ConnectorStateNamespace.ofShared(config.sharedNotes().sharedBy()));
+            config.sharedNotes().carriedFrom().forEach(node -> namespaces.add(ConnectorStateNamespace.of(node)));
+        } else if (config.node() != null) {
+            namespaces.add(ConnectorStateNamespace.of(config.node()));
+        }
+        return namespaces;
+    }
+
+    /** What the notes in {@code namespaces} name on the source, read as a drive over them would read them. */
+    private List<String> namedOnTheSource(CaptureConfig config, List<String> namespaces) {
+        List<String> keys = NOTES_NAMING_SOURCE_RESOURCES.getOrDefault(config.connectorId(), List.of());
+        if (keys.isEmpty()) {
+            return List.of();
+        }
+        DurableStateMap notes = new DurableStateMap(stateStore, namespaces.get(0),
+                namespaces.subList(1, namespaces.size()));
+        List<String> named = new ArrayList<>();
+        for (String key : keys) {
+            try {
+                Object value = notes.get(key);
+                if (value != null) {
+                    named.add(String.valueOf(value));
+                }
+            } catch (RuntimeException unreadable) {
+                // Only the refusal loses this name; the release itself goes ahead either way.
+            }
+        }
+        return List.copyOf(named);
+    }
+
     // ---- drive helpers ---------------------------------------------------------------------------
 
     /**
      * Opens the connector for a drive that keeps notes: the node on the config says where they belong,
-     * so the full load and the change tail of one run file under one name and read each other's.
+     * so the full load and the change tail of one run file under one name and read each other's -- or the
+     * config's shared notes do, when the stream is a chain's that several pipelines read.
      */
     private PdkConnector open(CaptureConfig config) {
-        return open(config, config.node());
+        return open(config, config.node(), config.sharedNotes());
     }
 
     /**
@@ -407,12 +504,12 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
      * happened to put on the config.
      */
     private PdkConnector openUnscoped(CaptureConfig config) {
-        return open(config, null);
+        return open(config, null, null);
     }
 
-    private PdkConnector open(CaptureConfig config, PipelineNode node) {
+    private PdkConnector open(CaptureConfig config, PipelineNode node, SharedNotes notes) {
         return PdkConnector.open(config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(),
-                node, stateStore);
+                node, stateStore, notes);
     }
 
     /**

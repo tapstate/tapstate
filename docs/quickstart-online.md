@@ -774,8 +774,10 @@ In the REPL:
 tapstate(admin@127.0.0.1:8080)> stop order_pipeline
 This clears what the pipeline accumulated:
   - what its operators had assembled, and the changes they could not assemble
+  - what its connectors had kept for a later drive
   - the position it had read and confirmed up to
   - what the shared mining chain had read, once this is the last pipeline reading it
+  - any replication slot its source connector created on the source database, once no other pipeline reads through it
 The run after this one has no position to carry on from.
 Your target database is not touched either way.
 Clear order_pipeline? Type yes to go ahead [no]: yes

@@ -3,6 +3,7 @@ package io.tapstate.app;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.adapters.pdk.PdkCapturePort;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
@@ -23,6 +24,7 @@ import io.tapstate.spi.store.StorePort;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import java.time.Duration;
+import java.util.Optional;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -200,6 +202,11 @@ class DataPlaneActuationConfiguration {
             @Override
             public boolean widen(CaptureRun run) {
                 return captureRunUnit.widen(run);
+            }
+
+            @Override
+            public Optional<TapstateException> release(CaptureRunSpec spec) {
+                return captureRunUnit.release(spec);
             }
         };
         if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {

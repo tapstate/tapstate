@@ -414,6 +414,45 @@ final class Synthetic {
     }
 
     /**
+     * A source that keeps the name of a resource it creates on its source the way a replication-slot source
+     * does: under {@code tapdata_pg_slot} in its notes, created on a read that finds none there and read back
+     * on every read after. Each read hands over one row whose {@code slot} names the one it read through, so a
+     * case can tell which a drive used.
+     *
+     * <p>Its release function records the slot its notes name under {@code released} on {@code channel}, then
+     * throws -- the way a source that cannot be reached does -- when the channel holds {@code unreachable}.
+     */
+    static Path slotKeepingSource(Path dir, String channel) {
+        String register = ""
+                + "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
+                + "  Object slot = context.getStateMap().get(\"tapdata_pg_slot\");"
+                + "  if (slot == null) {"
+                + "    slot = \"slot-\" + java.util.UUID.randomUUID();"
+                + "    context.getStateMap().put(\"tapdata_pg_slot\", slot);"
+                + "  }"
+                + "  Map<String,Object> r = new LinkedHashMap<>();"
+                + "  r.put(\"id\", 1); r.put(\"slot\", String.valueOf(slot));"
+                + "  List<TapEvent> evs = new ArrayList<>();"
+                + "  evs.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(100L).after(r));"
+                + "  consumer.accept(evs, null);"
+                + "});"
+                + "functions.supportReleaseExternalFunction(context -> {"
+                + "  @SuppressWarnings(\"unchecked\") List<Object> released = (List<Object>) channel().get(\"released\");"
+                + "  released.add(String.valueOf(context.getStateMap().get(\"tapdata_pg_slot\")));"
+                + "  if (channel().containsKey(\"unreachable\")) {"
+                + "    throw new IllegalStateException(\"connection refused\");"
+                + "  }"
+                + "});";
+        String members = ""
+                + "@SuppressWarnings(\"unchecked\")"
+                + "private static Map<String,Object> channel() {"
+                + "  return (Map<String,Object>) System.getProperties().get(\"" + channel + "\");"
+                + "}";
+        return SyntheticJar.compileToJar(dir, "synthetic.SlotKeepingSource",
+                source("SlotKeepingSource", "", register, members));
+    }
+
+    /**
      * A source whose batchRead emits one row per column of the table it is handed, so a read through a
      * bare, fieldless table yields nothing. The scaffold's discovery reports one-column {@code t1}, so a
      * drive that passes the discovered table reads one row and a drive that passes a bare name reads zero.

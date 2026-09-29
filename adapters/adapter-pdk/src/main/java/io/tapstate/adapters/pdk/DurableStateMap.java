@@ -2,7 +2,9 @@ package io.tapstate.adapters.pdk;
 
 import io.tapdata.entity.utils.cache.KVMap;
 import io.tapstate.spi.store.KeyedStateStore;
+import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * The scratch map a connector reaches through its driving context, held under a namespace of its own so
@@ -26,15 +28,27 @@ import java.util.Objects;
  * {@code putIfAbsent}) returns a detached snapshot with mutable lists, maps and byte arrays. Editing
  * that snapshot changes no stored state until {@code put} is called with it. Reads always consult the
  * store so another connector's writes are visible; no per-open object cache hides them.
+ *
+ * <p>A map can carry notes over from namespaces that kept them before, key by key: a key its own namespace
+ * does not hold is looked for in each of those in turn, and the first value found is written into its own
+ * namespace and read from there from then on. Nothing is copied wholesale -- the store cannot list a
+ * namespace, and a note nobody asks for is one nobody needs. A key removed here is removed from those too,
+ * so that it cannot come back from where it was carried from.
  */
 final class DurableStateMap implements KVMap<Object> {
 
     private final KeyedStateStore store;
     private final String namespace;
+    private final List<String> carriedFrom;
 
     DurableStateMap(KeyedStateStore store, String namespace) {
+        this(store, namespace, List.of());
+    }
+
+    DurableStateMap(KeyedStateStore store, String namespace, List<String> carriedFrom) {
         this.store = Objects.requireNonNull(store, "store");
         this.namespace = Objects.requireNonNull(namespace, "namespace");
+        this.carriedFrom = List.copyOf(Objects.requireNonNull(carriedFrom, "carriedFrom"));
     }
 
     @Override
@@ -46,7 +60,7 @@ final class DurableStateMap implements KVMap<Object> {
     @Override
     public void put(String key, Object value) {
         if (value == null) {
-            store.delete(namespace, key);
+            forget(key);
             return;
         }
         store.save(namespace, key, ConnectorStateCodec.encode(value));
@@ -58,6 +72,10 @@ final class DurableStateMap implements KVMap<Object> {
             // Nothing to claim the key with; report what is there without touching it.
             return get(key);
         }
+        Object carried = get(key);
+        if (carried != null) {
+            return carried;
+        }
         return store.saveIfAbsent(namespace, key, ConnectorStateCodec.encode(value))
                 .map(ConnectorStateCodec::decode)
                 .orElse(null);
@@ -65,25 +83,47 @@ final class DurableStateMap implements KVMap<Object> {
 
     @Override
     public Object get(String key) {
-        return store.load(namespace, key).map(ConnectorStateCodec::decode).orElse(null);
+        Optional<byte[]> own = store.load(namespace, key);
+        if (own.isPresent()) {
+            return ConnectorStateCodec.decode(own.get());
+        }
+        for (String earlier : carriedFrom) {
+            Optional<byte[]> kept = store.load(earlier, key);
+            if (kept.isPresent()) {
+                // Written here before it is read from here, so whoever opens these notes next finds it
+                // without looking back; a concurrent carrier that got there first wins, and so does its value.
+                return store.saveIfAbsent(namespace, key, kept.get())
+                        .map(ConnectorStateCodec::decode)
+                        .orElseGet(() -> ConnectorStateCodec.decode(kept.get()));
+            }
+        }
+        return null;
     }
 
     @Override
     public Object remove(String key) {
         Object previous = get(key);
-        store.delete(namespace, key);
+        forget(key);
         return previous;
+    }
+
+    /** Deletes {@code key} here and wherever it could be carried from, so no later read brings it back. */
+    private void forget(String key) {
+        store.delete(namespace, key);
+        carriedFrom.forEach(earlier -> store.delete(earlier, key));
     }
 
     @Override
     public void clear() {
         // Naming the namespace is the only bulk operation the store has, and it is the one that fits:
-        // there is no way to list the keys, and nothing here needs one.
+        // there is no way to list the keys, and nothing here needs one. What was carried from goes with
+        // it, or a key cleared here would come back from there on the next read.
         store.dropNamespace(namespace);
+        carriedFrom.forEach(store::dropNamespace);
     }
 
     @Override
     public void reset() {
-        store.dropNamespace(namespace);
+        clear();
     }
 }

@@ -13,6 +13,7 @@ import io.tapdata.entity.schema.TapTable;
 import io.tapdata.entity.utils.DataMap;
 import io.tapdata.pdk.apis.TapConnector;
 import io.tapstate.core.model.PipelineNode;
+import io.tapstate.spi.capture.SharedNotes;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapdata.pdk.apis.context.TapConnectorContext;
 import io.tapdata.pdk.apis.entity.ConnectorCapabilities;
@@ -20,6 +21,7 @@ import io.tapdata.pdk.apis.functions.ConnectorFunctions;
 import io.tapdata.pdk.apis.spec.TapNodeSpecification;
 
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -106,11 +108,25 @@ final class PdkConnector implements AutoCloseable {
      */
     static PdkConnector open(String connectorId, ConnectorRef ref, Map<String, Object> settings,
                              PipelineNode node, KeyedStateStore stateStore) {
+        return open(connectorId, ref, settings, node, stateStore, null);
+    }
+
+    /**
+     * As above, with the notes kept as {@code notes} say when it is present rather than as {@code node}'s
+     * own: under the mining chain the change stream belongs to, so whichever pipeline opens the stream finds
+     * what the last one left, and carried over key by key from the nodes {@code notes} names as having kept
+     * them before. {@code node} still says whose run this is, for the connector's own log lines.
+     */
+    static PdkConnector open(String connectorId, ConnectorRef ref, Map<String, Object> settings,
+                             PipelineNode node, KeyedStateStore stateStore, SharedNotes notes) {
         ensureDeploymentIdentity();
         // The contract's shared static log channel prints to standard output until somebody listens, and
         // the first connector opened is the earliest point at which anybody has.
         ConnectorLog.installSharedChannel();
-        String stateNamespace = ConnectorStateNamespace.of(node);
+        String stateNamespace = notes == null
+                ? ConnectorStateNamespace.of(node) : ConnectorStateNamespace.ofShared(notes.sharedBy());
+        List<String> carriedFrom = notes == null
+                ? List.of() : notes.carriedFrom().stream().map(ConnectorStateNamespace::of).toList();
         String pipelineId = node == null ? null : node.pipelineId();
         gateApiLevel(connectorId, ref);
 
@@ -163,7 +179,7 @@ final class PdkConnector implements AutoCloseable {
             // and refuse to run when they differ, and that expectation is nowhere in the signatures.
             context.setStateMap(stateNamespace == null || stateStore == null
                     ? new InMemoryStateMap()
-                    : new DurableStateMap(stateStore, stateNamespace));
+                    : new DurableStateMap(stateStore, stateNamespace, carriedFrom));
             // The map the contract calls global is one the whole deployment shares, so it is the store
             // that makes it so: every member reads and writes the same namespace, and a write is visible
             // to the next reader wherever it runs. It is read through rather than loaded once on the way
@@ -255,7 +271,8 @@ final class PdkConnector implements AutoCloseable {
      * Where whatever this connector keeps for itself belongs, or null when the drive names no node.
      * Derived from the pipeline node that opened it, so the full load and the change tail of one run
      * answer with the same name while two pipelines reading the same database answer with different
-     * ones. What is filed under it is the state maps handed to the context above.
+     * ones -- unless it was opened over a chain's shared notes, when every pipeline on that chain answers
+     * with the chain's. What is filed under it is the state maps handed to the context above.
      */
     String stateNamespace() {
         return stateNamespace;

@@ -210,7 +210,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 CaptureRun run;
                 if (!managedOwnership) {
                     run = captureStarter.start(spec, handoff);
-                    runs.add(PipelineRun.unmanaged(run));
+                    runs.add(PipelineRun.unmanaged(run, spec));
                 } else {
                     OwnedCapture existing = ownedCaptures.get(captureId);
                     if (existing != null) {
@@ -252,7 +252,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                         }
                     }
                     runs.add(PipelineRun.managed(
-                            captureId, run, spec.srsEnabled() && spec.readMode() != ReadMode.SNAPSHOT_ONLY));
+                            captureId, run, spec.srsEnabled() && spec.readMode() != ReadMode.SNAPSHOT_ONLY, spec));
                 }
                 if (run.loadOverWhenHandedBack()) {
                     // Handed back with its load already over -- read on this thread, or none owed. What the
@@ -428,14 +428,16 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         permits.clear();
     }
 
-    private record PipelineRun(CaptureId captureId, CaptureRun run, boolean managed, boolean sharedTail) {
+    /** One source's run, with the spec it was started from: what a clearing lets go of on its source. */
+    private record PipelineRun(
+            CaptureId captureId, CaptureRun run, boolean managed, boolean sharedTail, CaptureRunSpec spec) {
 
-        static PipelineRun unmanaged(CaptureRun run) {
-            return new PipelineRun(null, run, false, false);
+        static PipelineRun unmanaged(CaptureRun run, CaptureRunSpec spec) {
+            return new PipelineRun(null, run, false, false, spec);
         }
 
-        static PipelineRun managed(CaptureId captureId, CaptureRun run, boolean sharedTail) {
-            return new PipelineRun(captureId, run, true, sharedTail);
+        static PipelineRun managed(CaptureId captureId, CaptureRun run, boolean sharedTail, CaptureRunSpec spec) {
+            return new PipelineRun(captureId, run, true, sharedTail, spec);
         }
     }
 
@@ -1057,6 +1059,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         RuntimeException firstFailure = null;
         boolean capturesStopped = true;
         Set<MiningChainId> chains = new LinkedHashSet<>();
+        SourceReaders readers = new SourceReaders(pipelineId);
         for (PipelineRun pipelineRun : runs) {
             CaptureRun run = pipelineRun.run;
             try {
@@ -1072,6 +1075,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             // Collected whether or not the close succeeded: a daemon that refused to stop does not make the
             // consumer membership this pipeline holds any less this pipeline's to give back.
             run.chainId().ifPresent(chains::add);
+            run.chainId().ifPresent(chainId -> readers.ran(chainId, pipelineRun.spec));
         }
         // A live drain cannot detach an empty queue: capture may already hold that queue and append into it
         // after the drain returns. Lifecycle teardown has no such race once every capture close returned, so
@@ -1117,16 +1121,22 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 // Nobody is left on it, so the whole record goes: the read offset, the seam the tail
                 // resumes from, the schema history, and which tables finished their initial load. This
                 // is what makes the next run of this pipeline read its source from the beginning, which
-                // is what asking for the state to be cleared meant.
-                firstFailure = runCleanup(() -> storePort.meta().dropChain(chainId.value()), firstFailure);
+                // is what asking for the state to be cleared meant. What the chain's reader set up on the
+                // source goes after it, and only once it has: see releaseOnTheSource.
+                firstFailure = runCleanup(() -> {
+                    storePort.meta().dropChain(chainId.value());
+                    releaseOnTheSource(pipelineId, readers.of(chainId), true);
+                }, firstFailure);
             } else {
                 // Others are still reading it, so only this pipeline's own cursor is its to give back.
                 // Run whether or not the release above succeeded, and safe to run twice: the detach
                 // states the end condition "this consumer holds nothing here", which an absent chain and
                 // an absent cursor already satisfy. Skipping it after one failure is what leaves a cursor
                 // nobody will ever advance holding back every pipeline still on the chain.
-                firstFailure = runCleanup(
-                        () -> storePort.meta().detachConsumer(chainId.value(), pipelineId), firstFailure);
+                firstFailure = runCleanup(() -> {
+                    storePort.meta().detachConsumer(chainId.value(), pipelineId);
+                    releaseOnTheSource(pipelineId, readers.of(chainId), false);
+                }, firstFailure);
             }
         }
         if (purgeState) {
@@ -1142,7 +1152,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             // pipeline. The loop keeps deciding from the release itself for the chains it holds, where
             // that reading is the one that cannot go stale under a consumer attaching in between.
             for (String chainId : storePort.meta().miningChainIdsWithConsumer(pipelineId)) {
-                firstFailure = purgeWhatTheRecordStillHolds(chainId, pipelineId, firstFailure);
+                firstFailure = purgeWhatTheRecordStillHolds(chainId, pipelineId, readers, firstFailure);
             }
             firstFailure = runCleanup(
                     () -> storePort.keyedState().dropNamespace(SnapshotLoadCounts.namespaceOf(pipelineId)),
@@ -1228,7 +1238,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      * quietly -- so the two are read together and only their agreement licenses the drop.
      */
     private RuntimeException purgeWhatTheRecordStillHolds(
-            String chainId, String pipelineId, RuntimeException firstFailure) {
+            String chainId, String pipelineId, SourceReaders readers, RuntimeException firstFailure) {
         boolean lastOneOff = storePort.meta().consumerOffsets(chainId).stream()
                         .allMatch(offset -> offset.pipelineId().equals(pipelineId))
                 && !srsCoordinator.isProvisioned(new MiningChainId(chainId));
@@ -1239,8 +1249,98 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                     } else {
                         storePort.meta().detachConsumer(chainId, pipelineId);
                     }
+                    releaseOnTheSource(pipelineId, readers.of(new MiningChainId(chainId)), lastOneOff);
                 },
                 firstFailure);
+    }
+
+    /**
+     * Lets go of what this pipeline's sources set up on their source to read one chain -- a replication slot --
+     * once the chain's record has been cleared of it: what the chain's shared reader kept when the chain itself
+     * went, and what each source read directly kept whenever its pipeline's state is cleared, its slot being
+     * its own.
+     *
+     * <p>After the record, never before. A clearing that stops between the two leaves a chain nobody reads and
+     * a slot nothing needs, and the next run on that chain picks the slot back up and is sent changes it
+     * already has; the other way round it leaves a chain whose recorded position points into a stream that
+     * is gone, and the next run is quietly sent nothing of what happened in between.
+     *
+     * <p>What the source refuses is said and left there: the state is cleared either way, and a clearing that
+     * failed over an unreachable source would leave a pipeline that can neither keep its state nor let go of
+     * it. What cannot be let go of on this side -- the notes -- fails the step like any other.
+     */
+    private void releaseOnTheSource(String pipelineId, List<CaptureRunSpec> read, boolean chainCleared) {
+        boolean sharedReaderReleased = false;
+        for (CaptureRunSpec spec : read) {
+            ConsumptionPlan plan = ConsumptionPlan.of(spec.readMode(), spec.srsEnabled());
+            if (!plan.tail() || (plan.sharedRing() && (!chainCleared || sharedReaderReleased))) {
+                continue;
+            }
+            sharedReaderReleased |= plan.sharedRing();
+            starter().release(spec).ifPresent(refused -> LOG.warn(
+                    "Cleared pipeline {}, but its source {} kept what it had set up to read changes; remove it "
+                            + "on the source by hand", pipelineId, spec.sourceId(), refused));
+        }
+    }
+
+    /** Whichever seam starts runs here: the attacher where tails are shared, the starter where they are not. */
+    private CaptureStarter starter() {
+        return managedOwnership ? captureAttacher : captureStarter;
+    }
+
+    /**
+     * Which of a pipeline's sources read which chain, for a clearing to let go of what they set up there: the
+     * specs its runs here were started from, and for a chain it holds no run of here, the specs its stored
+     * definition gives now -- a clearing is as often asked of a pipeline whose runs are gone, after a start
+     * that threw part way or a process that was replaced.
+     *
+     * <p>The definition is read once, and only if a chain turns out to need it. One that cannot be read now
+     * releases nothing on the chains it would have answered for, and says so: the clearing goes on, and what
+     * was set up on the source stays until somebody removes it there.
+     */
+    private final class SourceReaders {
+
+        private final String pipelineId;
+        private final Map<MiningChainId, List<CaptureRunSpec>> ran = new LinkedHashMap<>();
+        private Map<MiningChainId, List<CaptureRunSpec>> defined;
+
+        SourceReaders(String pipelineId) {
+            this.pipelineId = pipelineId;
+        }
+
+        void ran(MiningChainId chainId, CaptureRunSpec spec) {
+            ran.computeIfAbsent(chainId, ignored -> new ArrayList<>()).add(spec);
+        }
+
+        List<CaptureRunSpec> of(MiningChainId chainId) {
+            List<CaptureRunSpec> held = ran.get(chainId);
+            if (held != null) {
+                return held;
+            }
+            if (defined == null) {
+                defined = definedReaders();
+            }
+            return defined.getOrDefault(chainId, List.of());
+        }
+
+        private Map<MiningChainId, List<CaptureRunSpec>> definedReaders() {
+            Map<MiningChainId, List<CaptureRunSpec>> byChain = new LinkedHashMap<>();
+            try {
+                ArtifactStore captured = artifacts();
+                PipelineResource pipeline = StoredArtifacts.requirePipeline(captured, pipelineId);
+                for (SourceRef ref : pipeline.sources()) {
+                    SourceResource source = StoredArtifacts.requireSource(captured, ref.id());
+                    SourceCaptureResolution resolution = SourceCaptureResolution.unselected(source);
+                    CaptureRunSpec spec = deriveSpec(pipelineId, pipeline.settings(), source, resolution,
+                            srsSwitchOf(pipelineId, ref), 1L);
+                    byChain.computeIfAbsent(resolution.chainId(), ignored -> new ArrayList<>()).add(spec);
+                }
+            } catch (RuntimeException unreadable) {
+                LOG.warn("Clearing pipeline {} could not read which sources it is defined to read, so nothing it "
+                        + "set up on them to read changes is let go of there", pipelineId, unreadable);
+            }
+            return byChain;
+        }
     }
 
     /** Runs one release step, keeping the first failure and hanging any later one off it as suppressed. */

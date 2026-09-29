@@ -31,6 +31,7 @@ io.tapstate.spi.capture.CaptureListener :: method :: onError(java.lang.Throwable
 io.tapstate.spi.capture.CaptureListener :: method :: onStart(java.util.Optional<io.tapstate.spi.capture.SourcePosition>) -> void
 io.tapstate.spi.capture.CapturePort :: method :: cdc(io.tapstate.spi.capture.CaptureConfig, io.tapstate.spi.capture.CaptureStart, io.tapstate.spi.capture.CaptureListener) -> io.tapstate.spi.capture.Subscription
 io.tapstate.spi.capture.CapturePort :: method :: discoverSchema(io.tapstate.spi.capture.CaptureConfig) -> io.tapstate.spi.capture.DiscoveredSchema
+io.tapstate.spi.capture.CapturePort :: method :: release(io.tapstate.spi.capture.CaptureConfig) -> java.util.Optional<io.tapstate.core.common.TapstateException>
 io.tapstate.spi.capture.CapturePort :: method :: snapshot(io.tapstate.spi.capture.CaptureConfig) -> io.tapstate.spi.capture.CaptureBatch
 io.tapstate.spi.capture.CapturePort :: method :: testConnection(io.tapstate.spi.capture.CaptureConfig) -> io.tapstate.spi.capture.ConnectionReport
 io.tapstate.spi.capture.CaptureStart :: method :: at(java.time.Instant) -> io.tapstate.spi.capture.CaptureStart

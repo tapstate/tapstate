@@ -29,11 +29,19 @@ import java.util.Objects;
  * once - so folding a per-pipeline id into it would give every pipeline its own stream and mine the
  * same log as many times as there are readers.
  *
+ * <p>{@code sharedNotes}, when present, says the connector's notes are not {@code node}'s own but those
+ * of the change stream every pipeline on one chain shares -- see {@link SharedNotes}. The node still names
+ * whose run the read is, for everything but where its notes are filed. Absent, the notes are the node's.
+ *
  * <p>{@code settings} and {@code streams} are held as unmodifiable defensive copies; a null map or
  * list is normalized to empty.
  */
 public record CaptureConfig(
-        String connectorId, Map<String, Object> settings, List<String> streams, PipelineNode node) {
+        String connectorId,
+        Map<String, Object> settings,
+        List<String> streams,
+        PipelineNode node,
+        SharedNotes sharedNotes) {
 
     public CaptureConfig {
         Objects.requireNonNull(connectorId, "connectorId");
@@ -41,13 +49,28 @@ public record CaptureConfig(
         streams = streams == null ? List.of() : List.copyOf(streams);
     }
 
+    /** A config whose connector keeps its notes as {@code node}'s own. */
+    public CaptureConfig(String connectorId, Map<String, Object> settings, List<String> streams, PipelineNode node) {
+        this(connectorId, settings, streams, node, null);
+    }
+
     /** A config for a read that names no node — the read-only drives, which have none. */
     public CaptureConfig(String connectorId, Map<String, Object> settings, List<String> streams) {
-        this(connectorId, settings, streams, null);
+        this(connectorId, settings, streams, null, null);
     }
 
     /** The same config, read on behalf of {@code node}. */
     public CaptureConfig at(PipelineNode node) {
-        return new CaptureConfig(connectorId, settings, streams, node);
+        return new CaptureConfig(connectorId, settings, streams, node, sharedNotes);
+    }
+
+    /** The same config, its connector keeping {@code notes} rather than the node's own. */
+    public CaptureConfig sharing(SharedNotes notes) {
+        return new CaptureConfig(connectorId, settings, streams, node, notes);
+    }
+
+    /** The same config over {@code tables} instead of its own streams. */
+    public CaptureConfig over(List<String> tables) {
+        return new CaptureConfig(connectorId, settings, tables, node, sharedNotes);
     }
 }

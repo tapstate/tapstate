@@ -6,10 +6,12 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.CaptureStart;
+import io.tapstate.spi.capture.SharedNotes;
 import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ConsumerOffset;
@@ -17,6 +19,7 @@ import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -328,8 +331,11 @@ public final class CaptureRunUnit {
             return null;
         }
         if (chainId != null) {
-            return SnapshotPhase.open(
-                    port, spec.config(), chainId.value(), spec.pipelineId(), tables, epoch, meta);
+            // Over the notes the tail reads through: the seam a load samples is a position on the stream the
+            // tail goes on to read, and sampling one can be what sets that stream up on the source.
+            CaptureConfig config = plan.sharedRing()
+                    ? spec.config().sharing(sharedNotes(spec, chainId.value())) : spec.config();
+            return SnapshotPhase.open(port, config, chainId.value(), spec.pipelineId(), tables, epoch, meta);
         }
         long snapshotEpoch = spec.snapshotEpoch() > 0
                 ? spec.snapshotEpoch()
@@ -482,6 +488,7 @@ public final class CaptureRunUnit {
         private final String chainId;
         private final long epoch;
         private final CaptureHealth health;
+        private final SharedNotes notes;
         private SrsMetaStore.PhysicalSelection published;
         /** The stream running now; read without the lock, so an acknowledgement never waits on a widening. */
         private volatile Subscription stream;
@@ -492,6 +499,7 @@ public final class CaptureRunUnit {
             this.chainId = chainId;
             this.epoch = epoch;
             this.health = health;
+            this.notes = sharedNotes(spec, chainId);
         }
 
         /** Opens the generation's first subscription, beginning where {@code ownSeam} or the record says. */
@@ -565,8 +573,7 @@ public final class CaptureRunUnit {
                 CdcChain chain = new CdcChain(gate, meta, chainId, epoch, spec.schemaVer(), spec.captureFence());
                 routes.put(table, new CdcPhase.TableRoute(chain, consumers, seq -> { }));
             }
-            CaptureConfig physical = new CaptureConfig(spec.config().connectorId(), spec.config().settings(),
-                    selection.tables(), spec.config().node());
+            CaptureConfig physical = spec.config().over(selection.tables()).sharing(notes);
             stream = CdcPhase.run(port, physical, start, routes, health, prefix);
             meta.clearPhysicalRequests(chainId, selection.tables());
         }
@@ -590,6 +597,52 @@ public final class CaptureRunUnit {
                 stream.close();
             }
         }
+    }
+
+    /**
+     * The notes the chain's one change stream keeps, whichever pipeline opens it: the chain's own, carried over
+     * key by key from the notes this pipeline's node kept before there were any, then from the node of the
+     * same source in every other pipeline recorded reading the chain through its ring.
+     *
+     * <p>A pipeline recorded reading the chain directly is left out, as is one with nothing recorded yet: a
+     * direct reader's notes are its own, in use, and carrying from them would hand the chain's stream the
+     * replication slot another reader is streaming from.
+     */
+    private SharedNotes sharedNotes(CaptureRunSpec spec, String chainId) {
+        PipelineNode own = spec.config().node();
+        List<PipelineNode> carriedFrom = new ArrayList<>(List.of(own));
+        for (ConsumerOffset consumer : meta.consumerOffsets(chainId)) {
+            if (!consumer.pipelineId().equals(spec.pipelineId())
+                    && consumer.selectedTables() != null && !consumer.selectedTables().isEmpty()) {
+                carriedFrom.add(new PipelineNode(consumer.pipelineId(), own.nodeId()));
+            }
+        }
+        return new SharedNotes(chainId, carriedFrom);
+    }
+
+    /**
+     * Lets go of what {@code spec}'s source connector set up on the source to read changes, and of the notes
+     * it kept to find that again: the chain's, for a source read through the chain's shared ring, and the
+     * node's own for one read directly. A read with no tail set nothing up. Answers what the source refused
+     * to let go of, for the caller to report.
+     *
+     * <p>For the caller to call when that state is being cleared: a chain's once the last pipeline reading it
+     * clears its own, and a direct reader's whenever its pipeline does. Released while anyone still reads
+     * through them, a stream would go on over a slot that is gone.
+     */
+    public Optional<TapstateException> release(CaptureRunSpec spec) {
+        Objects.requireNonNull(spec, "spec");
+        ConsumptionPlan plan = ConsumptionPlan.of(spec.readMode(), spec.srsEnabled());
+        if (!plan.tail()) {
+            return Optional.empty();
+        }
+        if (!plan.sharedRing()) {
+            return port.release(spec.config());
+        }
+        // Nobody else is on the chain by now, so only this pipeline's own earlier notes can hold what the
+        // chain's notes never took over.
+        String chainId = MiningChainId.resolve(spec.config(), spec.srsKey()).value();
+        return port.release(spec.config().sharing(new SharedNotes(chainId, List.of(spec.config().node()))));
     }
 
     /**

@@ -12,6 +12,7 @@ import com.hazelcast.ringbuffer.Ringbuffer;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
@@ -20,6 +21,7 @@ import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
+import io.tapstate.spi.capture.SharedNotes;
 import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ConsumerOffset;
@@ -981,6 +983,57 @@ class CaptureRunUnitTest {
      * instead -- monotonic within the generation, exactly like the ring's, and taken afresh with each new
      * generation the chain opens.
      */
+    /**
+     * A direct tail over two tables writes a position down only once its pipeline has landed every change
+     * before it on both: a confirmation on one table does not stand for a change of the other. The later
+     * table lands as it is handed over here, and the earlier one not at all, so the only way the position can
+     * move before the earlier one lands is by taking one table's word for the other's.
+     */
+    @Test
+    void aDirectTailOverTwoTablesMovesOnlyPastWhatBothHaveLanded() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRunSpec spec = new CaptureRunSpec(configOver("orders", "customers"), ReadMode.CDC_ONLY,
+                "chain-direct-two", false, "src-1", "pipe-1", StartFrom.latest(), null, 0L);
+        String chainId = MiningChainId.resolve(spec.config(), spec.srsKey()).value();
+        Envelope order = Envelope.insert(10, "orders", Map.of("id", 10), Map.of());
+        Envelope customer = Envelope.insert(11, "customers", Map.of("id", 11), Map.of());
+        List<Envelope> forwarded = new CopyOnWriteArrayList<>();
+
+        runUnit(new FakeSource(List.of(), List.of(order, customer)), meta).start(spec, event -> {
+            forwarded.add(event);
+            if (event.src().equals("customers")) {
+                meta.advanceTableSinkAcked(chainId, "pipe-1", event.src(), event.position());
+            }
+        });
+
+        assertThat(meta.read(chainId).orElseThrow().sourceReadOffset())
+                .as("customers landed, orders before it did not").isEqualTo("start");
+        Envelope landedLast = forwarded.getFirst();
+        meta.advanceTableSinkAcked(chainId, "pipe-1", landedLast.src(), landedLast.position());
+        awaitSourceRead(meta, chainId, "src-11");
+    }
+
+    /**
+     * A run carrying no change still says where the source now is, and a direct tail writes that down once
+     * everything before it has landed -- a source whose captured tables fell quiet is released as the rest of
+     * its log moves on. Behind a change not landed yet, it waits its turn.
+     */
+    @Test
+    void aDirectTailMovesOnToWhereAQuietSourceIsOnceEverythingBeforeItLanded() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chainId = MiningChainId.resolve(config(), "chain-direct-quiet").value();
+        List<Envelope> forwarded = new CopyOnWriteArrayList<>();
+
+        runUnit(new FakeSource(List.of(), List.of(change(10))).withHeartbeatAt("hb-12"), meta)
+                .start(spec(ReadMode.CDC_ONLY, false, "chain-direct-quiet"), forwarded::add);
+
+        assertThat(meta.read(chainId).orElseThrow().sourceReadOffset())
+                .as("the change before the quiet run has not landed").isEqualTo("start");
+        Envelope change = forwarded.getFirst();
+        meta.advanceTableSinkAcked(chainId, "pipe-1", change.src(), change.position());
+        awaitSourceRead(meta, chainId, "hb-12");
+    }
+
     @Test
     void aDirectTailStampsEachChangeWithAnOrderSoASinkCanRankIt() {
         InMemoryMeta meta = new InMemoryMeta();
@@ -1396,6 +1449,105 @@ class CaptureRunUnitTest {
         owner.close();
     }
 
+    /**
+     * A reader that starts again reads its chain from where it was released to, so a pipeline already on the
+     * chain is owed what the new reader mines again before that pipeline's own run comes back -- written into
+     * the ring above the place the pipeline had. Coming back, the pipeline keeps that place rather than
+     * arriving afresh at the ring's end, which would step over every change mined again in between.
+     */
+    @Test
+    void aPipelineComingBackToAReaderThatStartedAgainReadsWhatItMinedAgain() {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chainId = MiningChainId.ofKey("k-mined-again").value();
+        meta.create(chainId, null);
+        long before = meta.openEpoch(chainId);
+        meta.establishPhysicalAnchor(chainId, new ChainPosition(new SourceOrder(before, -1L), "released-to"));
+        meta.selectConsumerTables(chainId, "pipe-back", List.of("customers"), before);
+        meta.startRingAfter(chainId, "pipe-back", "customers", -1L);
+        Envelope minedAgain = Envelope.insert(10L, "customers", Map.of("id", 10), Map.of());
+
+        CaptureRun reader = runUnit(new FakeSource(List.of(), List.of(minedAgain)), meta)
+                .start(specOver("pipe-owner", "k-mined-again", "orders"), e -> { });
+        assertThat(meta.read(chainId).orElseThrow().epoch()).as("a reader of a generation of its own")
+                .isGreaterThan(before);
+        assertThat(hz.getRingbuffer(SrsRingbuffer.ringName(chainId, "customers")).tailSequence())
+                .as("the change mined again is in the ring before the pipeline comes back").isZero();
+
+        CaptureRun back = runUnit(new FakeSource(List.of(), List.of()), meta)
+                .start(specOver("pipe-back", "k-mined-again", "customers"), e -> { }, false);
+
+        assertThat(meta.ringDoneThrough(chainId, "pipe-back"))
+                .as("its place is still below the change mined again, so its run reads it")
+                .containsEntry("customers", -1L);
+        back.close();
+        reader.close();
+    }
+
+    /**
+     * The chain's one change stream keeps the chain's notes whichever pipeline opens it -- the load that
+     * samples its seam as well as the tail -- carried over first from the opening pipeline's own node and
+     * then from that of every other pipeline recorded reading the chain through its ring. A pipeline recorded
+     * reading it directly is left out: its notes name the slot its own reader streams from.
+     */
+    @Test
+    void aSharedReaderAndTheLoadBeforeItKeepTheChainsNotes() {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chainId = MiningChainId.ofKey("chain-notes").value();
+        meta.create(chainId, null);
+        meta.selectConsumerTables(chainId, "reads-the-ring", List.of("orders"), 1L);
+        meta.selectConsumerTables(chainId, "reads-directly", List.of(), 1L);
+        FakeSource source = new FakeSource(List.of(row(1)), List.of());
+
+        runUnit(source, meta).start(specFor("pipe-1", ReadMode.SNAPSHOT_AND_CDC, "chain-notes"), e -> { })
+                .close();
+
+        assertThat(source.opened).as("the load, then the tail").hasSizeGreaterThanOrEqualTo(2)
+                .allSatisfy(config -> {
+                    assertThat(config.sharedNotes()).isNotNull();
+                    assertThat(config.sharedNotes().sharedBy()).isEqualTo(chainId);
+                    assertThat(config.sharedNotes().carriedFrom()).containsExactly(
+                            new PipelineNode("pipe-1", "src-1"), new PipelineNode("reads-the-ring", "src-1"));
+                    assertThat(config.node()).as("still read on this pipeline's behalf")
+                            .isEqualTo(new PipelineNode("pipe-1", "src-1"));
+                });
+    }
+
+    /** A pipeline reading its source directly keeps its node's own notes: its slot is nobody else's. */
+    @Test
+    void aDirectReaderKeepsItsNodesOwnNotes() {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource source = new FakeSource(List.of(), List.of());
+
+        runUnit(source, meta).start(spec(ReadMode.CDC_ONLY, false, "chain-direct-notes"), e -> { }).close();
+
+        assertThat(source.opened).singleElement().satisfies(config -> {
+            assertThat(config.sharedNotes()).isNull();
+            assertThat(config.node()).isEqualTo(new PipelineNode("pipe-1", "src-1"));
+        });
+    }
+
+    /**
+     * Letting go of a source reaches the notes its reads kept: the chain's for a pipeline reading through the
+     * ring -- carried from its own earlier notes alone, as nobody else is left on the chain -- and the node's
+     * own for one reading directly. A read with no tail set nothing up, and is let go of without a word to
+     * the source.
+     */
+    @Test
+    void aSourceIsLetGoOfThroughTheNotesItsReadsKept() {
+        FakeSource source = new FakeSource(List.of(), List.of());
+        CaptureRunUnit unit = runUnit(source, new InMemoryMeta());
+
+        unit.release(spec(ReadMode.CDC_ONLY, true, "chain-released"));
+        unit.release(spec(ReadMode.CDC_ONLY, false, "chain-released"));
+        unit.release(spec(ReadMode.SNAPSHOT_ONLY, true, "chain-released"));
+
+        assertThat(source.released).hasSize(2);
+        assertThat(source.released.get(0).sharedNotes()).isEqualTo(new SharedNotes(
+                MiningChainId.ofKey("chain-released").value(), List.of(new PipelineNode("pipe-1", "src-1"))));
+        assertThat(source.released.get(1).sharedNotes()).isNull();
+        assertThat(source.released.get(1).node()).isEqualTo(new PipelineNode("pipe-1", "src-1"));
+    }
+
     private static CaptureConfig configOver(String... tables) {
         return new CaptureConfig("mysql", Map.of("host", "h"), List.of(tables));
     }
@@ -1578,6 +1730,8 @@ class CaptureRunUnitTest {
         /** The position this source samples before its bounded read -- where a tail of it must join. */
         private final String seam;
         private Throwable cdcError;
+        /** Where a run carrying no change says the source is, handed over after the changes; null for none. */
+        private String heartbeat;
         boolean cdcStarted;
         int cdcStarts;
         /** Where the run asked this source to begin -- the whole of what a resume is observable as. */
@@ -1585,6 +1739,10 @@ class CaptureRunUnitTest {
         boolean cdcClosed;
         /** The tables each stream opened over this source subscribed to, in the order they were opened. */
         final List<List<String>> cdcStreams = new CopyOnWriteArrayList<>();
+        /** The config every read over this source was opened with -- loads and streams -- in order. */
+        final List<CaptureConfig> opened = new CopyOnWriteArrayList<>();
+        /** The config every release of this source was asked with, in order. */
+        final List<CaptureConfig> released = new CopyOnWriteArrayList<>();
 
         FakeSource(List<Envelope> snapshotRows, List<Envelope> changes) {
             this(snapshotRows, changes, "seam-0");
@@ -1603,8 +1761,21 @@ class CaptureRunUnitTest {
             return this;
         }
 
+        /** Has this source's stream end its changes with a run that carries none, naming {@code token}. */
+        FakeSource withHeartbeatAt(String token) {
+            this.heartbeat = token;
+            return this;
+        }
+
+        @Override
+        public Optional<TapstateException> release(CaptureConfig config) {
+            released.add(config);
+            return Optional.empty();
+        }
+
         @Override
         public CaptureBatch snapshot(CaptureConfig config) {
+            opened.add(config);
             // A bounded read yields the rows of the streams it selected and no others; an empty selection
             // is every stream the source exposes. The snapshot phase reads one table at a time, so a double
             // that ignored the selection would answer each of those reads with the whole source.
@@ -1619,6 +1790,7 @@ class CaptureRunUnitTest {
             cdcStarts++;
             cdcStart = start;
             cdcStreams.add(List.copyOf(config.streams()));
+            opened.add(config);
             if (cdcError != null) {
                 listener.onError(cdcError);
                 return () -> cdcClosed = true;
@@ -1629,6 +1801,9 @@ class CaptureRunUnitTest {
                     ? resume.position() : new SourcePosition("start")));
             for (Envelope e : changes) {
                 listener.onBatch(java.util.List.of(e), Optional.of(new SourcePosition("src-" + e.ts())));
+            }
+            if (heartbeat != null) {
+                listener.onBatch(List.of(), Optional.of(new SourcePosition(heartbeat)));
             }
             return () -> cdcClosed = true;
         }

@@ -260,7 +260,16 @@ public enum ConnectorError implements TapstateErrorCode {
      * because what a missed release costs is the source keeping some log a while longer, and failing the
      * stream over that would make an outage of a delay.
      */
-    ACKNOWLEDGE_FAILED("connector.acknowledge-failed", Set.of("connector", "detail"));
+    ACKNOWLEDGE_FAILED("connector.acknowledge-failed", Set.of("connector", "detail")),
+
+    /**
+     * A connector could not let go of what it set up on its source to read changes -- a replication slot,
+     * say -- while the state it belongs to was being cleared. {@code connector} is the connector id;
+     * {@code detail} is why; {@code resources} is what its notes named on the source, for somebody to remove
+     * there by hand. Reported, never fatal: the clearing completes, because a source that cannot be reached
+     * must not leave a pipeline that can neither keep its state nor let go of it.
+     */
+    RELEASE_FAILED("connector.release-failed", Set.of("connector", "detail", "resources"));
 
     private final String code;
     private final Set<String> placeholders;
