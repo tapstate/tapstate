@@ -8,22 +8,31 @@ import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.SrsDurableFrontier;
 import io.tapstate.spi.store.SrsMetaStore;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * The production sink-ack factory carried onto the DAG: it advances one consumer pipeline's durable
  * sink-acked source position as the sink confirms writes, so the source-read durable frontier has a real
  * input. It holds only serializable coordinates — a {@code table -> mining chain id} map for every source
- * the pipeline reads, plus the consumer pipeline id — and resolves the durable store on the member that
- * runs the sink, mirroring how the source's read-cursor publisher binds its store member-side. The store
- * itself is not serializable and never crosses the wire.
+ * the pipeline reads, the consumer pipeline id, and the stable writer plan compiled from the DAG — and
+ * resolves the durable store on the member that runs the sink, mirroring how the source's read-cursor
+ * publisher binds its store member-side. The store itself is not serializable and never crosses the wire.
  *
  * <p>The sink knows a chain only by the {@code src} stream name its events carry — a table at L1 — so this
- * maps that stream to the mining chain that keys its durable record and advances
- * {@code (miningChainId, pipelineId, srcpos)}. A member with no store bound resolves to a no-op ack, so a
- * sink still runs before the assembly layer makes the member SRS-capable. A stream the map does not carry
- * is a builder-side wiring defect (the sink saw a chain the pipeline never sourced) and crashes bare.
+ * maps that stream to the mining chain that keys its durable record and advances that writer's position.
+ * The store exposes the minimum over every writer expected on the stream as the pipeline position, so a
+ * fast target cannot move a replacement run past changes another target has not written. A member with no
+ * store bound resolves to a no-op ack, so a sink still runs before the assembly layer makes the member
+ * SRS-capable. A stream the map does not carry is a builder-side wiring defect (the sink saw a chain the
+ * pipeline never sourced) and crashes bare.
  *
  * <p>A snapshot row is ordered but carries no token, and what is persisted for it is the pipeline's cdc
  * start position: the read has confirmed rows of a snapshot but no change at all, so a resume belongs
@@ -45,10 +54,48 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
 
     private final Map<String, String> chainIdByTable;
     private final String pipelineId;
+    private final String writerId;
+    private final Set<String> writerStreams;
+    private final Map<String, List<String>> writerIdsByStream;
+    private final AtomicInteger resolvedWriterSequence;
+    private final Map<String, List<String>> resolvedWriterIdsByStream;
 
     StoreBackedSinkAckFactory(Map<String, String> chainIdByTable, String pipelineId) {
+        this(chainIdByTable, pipelineId, null, Set.of(), Map.of(),
+                new AtomicInteger(), new ConcurrentHashMap<>());
+    }
+
+    private StoreBackedSinkAckFactory(
+            Map<String, String> chainIdByTable,
+            String pipelineId,
+            String writerId,
+            Set<String> writerStreams,
+            Map<String, List<String>> writerIdsByStream,
+            AtomicInteger resolvedWriterSequence,
+            Map<String, List<String>> resolvedWriterIdsByStream) {
         this.chainIdByTable = Map.copyOf(chainIdByTable);
         this.pipelineId = pipelineId;
+        this.writerId = writerId;
+        this.writerStreams = Set.copyOf(writerStreams);
+        this.writerIdsByStream = copyPlan(writerIdsByStream);
+        this.resolvedWriterSequence = resolvedWriterSequence;
+        this.resolvedWriterIdsByStream = resolvedWriterIdsByStream;
+    }
+
+    @Override
+    public SinkAckFactory forWriter(
+            String writerId, List<String> streams, Map<String, List<String>> writerIdsByStream) {
+        if (writerId == null || writerId.isBlank()) {
+            throw new IllegalArgumentException("sink writer id must be non-blank");
+        }
+        return new StoreBackedSinkAckFactory(
+                chainIdByTable,
+                pipelineId,
+                writerId,
+                new LinkedHashSet<>(streams),
+                writerIdsByStream,
+                resolvedWriterSequence,
+                resolvedWriterIdsByStream);
     }
 
     @Override
@@ -57,6 +104,10 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
         if (!(bound instanceof SrsMetaStore meta)) {
             return (chain, position) -> { };
         }
+        WriterBinding writer = writerId == null
+                ? bindResolvedWriter()
+                : new WriterBinding(writerId, writerStreams, writerIdsByStream);
+        AtomicBoolean configured = new AtomicBoolean();
         Map<String, ChainPosition> recorded = new ConcurrentHashMap<>();
         return (chain, position) -> {
             String miningChainId = chainIdByTable.get(chain);
@@ -64,19 +115,92 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                 throw new IllegalStateException(
                         "sink acked a chain the pipeline never sourced: '" + chain + "'");
             }
+            if (!writer.streams().contains(chain)) {
+                throw new IllegalStateException("sink writer '" + writer.id()
+                        + "' acked a chain it does not receive: '" + chain + "'");
+            }
+            ensureConfigured(meta, writer, configured);
             String token = position.token() != null ? position.token()
                     : isSnapshotOf(position) ? cdcStart(meta, miningChainId, pipelineId) : null;
             ChainPosition acked = new ChainPosition(position.order(), token);
             if (isSnapshotOf(position)) {
-                meta.advanceSinkAcked(miningChainId, pipelineId, acked);
-                meta.markSnapshotComplete(miningChainId, pipelineId, chain);
+                meta.advanceSinkWriterAcked(miningChainId, pipelineId, writer.id(), chain, acked);
+                meta.markSinkWriterSnapshotComplete(miningChainId, pipelineId, writer.id(), chain);
             } else {
                 // A change is also recorded against its own table's ring, at the sequence it sat at there,
                 // so a run replacing this one carries on from it instead of from the head of the ring.
-                meta.advanceSinkAcked(miningChainId, pipelineId, chain, acked);
+                meta.advanceSinkWriterAcked(miningChainId, pipelineId, writer.id(), chain, acked);
                 recordHowFarTheSourceHasBeenRead(meta, miningChainId, acked, recorded);
             }
         };
+    }
+
+    /**
+     * Gives direct users of the factory one identity per resolve. Production binds stable identities in
+     * the DAG; this path keeps the factory seam truthful for tests and older callers that resolve it
+     * directly.
+     */
+    private WriterBinding bindResolvedWriter() {
+        synchronized (resolvedWriterIdsByStream) {
+            String resolvedId = "resolved-" + resolvedWriterSequence.getAndIncrement();
+            for (String stream : chainIdByTable.keySet()) {
+                resolvedWriterIdsByStream.compute(stream, (ignored, writers) -> {
+                    List<String> next = new ArrayList<>(writers == null ? List.of() : writers);
+                    next.add(resolvedId);
+                    return List.copyOf(next);
+                });
+            }
+            return new WriterBinding(resolvedId, chainIdByTable.keySet(), null);
+        }
+    }
+
+    /** Registers a resolved writer's complete plan once, immediately before its first acknowledgement. */
+    private void ensureConfigured(SrsMetaStore meta, WriterBinding writer, AtomicBoolean configured) {
+        if (configured.get()) {
+            return;
+        }
+        synchronized (configured) {
+            if (configured.get()) {
+                return;
+            }
+            Map<String, List<String>> plan = writer.plan();
+            if (plan == null) {
+                synchronized (resolvedWriterIdsByStream) {
+                    plan = copyPlan(resolvedWriterIdsByStream);
+                }
+            }
+            configure(meta, plan);
+            configured.set(true);
+        }
+    }
+
+    /** Registers the complete table-to-writer plan once per mining chain. */
+    private void configure(SrsMetaStore meta, Map<String, List<String>> plan) {
+        Map<String, Map<String, List<String>>> byMiningChain = new LinkedHashMap<>();
+        for (Map.Entry<String, List<String>> entry : plan.entrySet()) {
+            String miningChainId = chainIdByTable.get(entry.getKey());
+            if (miningChainId == null) {
+                throw new IllegalStateException(
+                        "sink writer plan names a chain the pipeline never sourced: '" + entry.getKey() + "'");
+            }
+            byMiningChain.computeIfAbsent(miningChainId, ignored -> new LinkedHashMap<>())
+                    .put(entry.getKey(), entry.getValue());
+        }
+        byMiningChain.forEach((miningChainId, writersByTable) ->
+                meta.configureSinkWriters(miningChainId, pipelineId, writersByTable));
+    }
+
+    private static Map<String, List<String>> copyPlan(Map<String, List<String>> plan) {
+        Map<String, List<String>> copy = new LinkedHashMap<>();
+        plan.forEach((stream, writers) -> copy.put(stream, List.copyOf(writers)));
+        return Map.copyOf(copy);
+    }
+
+    private record WriterBinding(String id, Set<String> streams, Map<String, List<String>> plan) {
+        private WriterBinding {
+            streams = Set.copyOf(streams);
+            plan = plan == null ? null : copyPlan(plan);
+        }
     }
 
     /**

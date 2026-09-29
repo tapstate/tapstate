@@ -381,14 +381,14 @@ public final class PipelineDagBuilder {
         // this the parser's own default - serve.from = the view's id - resolves to no vertex at all.
         Map<String, List<Vertex>> readsAs = new HashMap<>();
 
+        List<SinkPlan> sinkPlans = new ArrayList<>();
         if (pipeline.view() instanceof ViewBlock.Inline view) {
             // A declared view IS its own instruction to materialize: the pipeline needs no serve block
             // to reach the state store, and the vertex is a terminal sink like any other.
             List<Vertex> upstream = upstreamOf(view.from(), byKey, bindings);
             String viewName = VIEW_VERTEX_PREFIX + view.id();
-            Vertex vertex = dag.newVertex(viewName,
-                    sinkVertex(viewName, bindings.viewSinks().apply(view), sinkAck, axes, assembled));
-            connect(dag, upstream, vertex, outboundOrdinal, inboundOrdinal);
+            sinkPlans.add(new SinkPlan(viewName, bindings.viewSinks().apply(view), upstream,
+                    chainsOf(upstream, chains)));
             readsAs.put(view.id(), upstream);
         }
 
@@ -402,13 +402,47 @@ public final class PipelineDagBuilder {
             for (int i = 0; i < sync.size(); i++) {
                 SyncElement element = sync.get(i);
                 String name = SERVE_VERTEX_PREFIX + (element.id() != null ? element.id() : i);
-                Vertex vertex = dag.newVertex(name,
-                        sinkVertex(name, bindings.sinkWriters().apply(element), sinkAck, axes, assembled));
-                connect(dag, upstream, vertex, outboundOrdinal, inboundOrdinal);
+                sinkPlans.add(new SinkPlan(name, bindings.sinkWriters().apply(element), upstream,
+                        chainsOf(upstream, chains)));
             }
         }
 
+        Map<String, List<String>> writerIdsByStream = new LinkedHashMap<>();
+        for (int writer = 0; writer < sinkPlans.size(); writer++) {
+            String writerId = "sink-" + writer;
+            for (String stream : sinkPlans.get(writer).streams()) {
+                writerIdsByStream.computeIfAbsent(stream, ignored -> new ArrayList<>()).add(writerId);
+            }
+        }
+        writerIdsByStream.replaceAll((stream, writers) -> List.copyOf(writers));
+        Map<String, List<String>> writerPlan = Map.copyOf(writerIdsByStream);
+        for (int writer = 0; writer < sinkPlans.size(); writer++) {
+            SinkPlan plan = sinkPlans.get(writer);
+            String writerId = "sink-" + writer;
+            SinkAckFactory writerAck = sinkAck == null
+                    ? null
+                    : sinkAck.forWriter(writerId, plan.streams(), writerPlan);
+            Vertex vertex = dag.newVertex(plan.vertexName(),
+                    sinkVertex(plan.vertexName(), plan.writerFactory(), writerAck, axes, assembled));
+            connect(dag, plan.upstream(), vertex, outboundOrdinal, inboundOrdinal);
+        }
+
         return dag;
+    }
+
+    /** One terminal writer and the source streams the graph proves can reach it. */
+    private record SinkPlan(
+            String vertexName,
+            SupplierEx<? extends SinkWriter> writerFactory,
+            List<Vertex> upstream,
+            List<String> streams) {
+    }
+
+    /** The source streams carried by {@code upstream}, or none when frontier binding is absent. */
+    private static List<String> chainsOf(List<Vertex> upstream, PipelineChains chains) {
+        return chains == null
+                ? List.of()
+                : chains.union(upstream.stream().map(Vertex::getName).toList());
     }
 
     /**

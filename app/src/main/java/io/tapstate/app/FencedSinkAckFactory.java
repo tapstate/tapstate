@@ -4,6 +4,8 @@ import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.engine.SinkAckFactory;
 
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -38,6 +40,12 @@ final class FencedSinkAckFactory implements SinkAckFactory {
     @Override
     public SinkAck resolve(HazelcastInstance member) {
         return guarded(delegate.resolve(member), fence, ExecutionAuthorization.of(member));
+    }
+
+    @Override
+    public SinkAckFactory forWriter(
+            String writerId, List<String> streams, Map<String, List<String>> writerIdsByStream) {
+        return new FencedSinkAckFactory(delegate.forWriter(writerId, streams, writerIdsByStream), fence);
     }
 
     /** {@code ack}, asking {@code authorization} for {@code fence}'s run before each advance. */

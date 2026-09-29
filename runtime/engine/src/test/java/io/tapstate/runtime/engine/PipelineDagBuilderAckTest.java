@@ -102,6 +102,32 @@ class PipelineDagBuilderAckTest {
         assertThat(ack.calls).containsExactly("orders=p1");
     }
 
+    @Test
+    void declaresEverySinkWriterForTheStreamsItReceivesBeforeTheDagRuns() {
+        PlanningAckFactory sinkAck = new PlanningAckFactory();
+        PipelineResource pipeline = new PipelineResource(
+                "p", null, List.of(SourceRef.bare("orders_src")), null, null,
+                new ServeBlock.Inline(null, FromRef.literal("orders_src"),
+                        List.of(
+                                new SyncElement("first", "first_dest", null, null, null),
+                                new SyncElement("second", "second_dest", null, null, null)),
+                        null, null),
+                null, null);
+
+        PipelineDagBuilder.build(
+                pipeline,
+                bindings(),
+                sinkAck,
+                new FrontierBinding(Map.of("orders_src", "orders")));
+
+        assertThat(sinkAck.scopes).hasSize(2);
+        assertThat(sinkAck.scopes).allSatisfy(scope -> {
+            assertThat(scope.streams()).containsExactly("orders");
+            assertThat(scope.writerIdsByStream().get("orders"))
+                    .containsExactlyInAnyOrder("sink-0", "sink-1");
+        });
+    }
+
     /** Structural stubs for the leaves; the serve sink is the only vertex this test drives. */
     private static DagBindings bindings() {
         return new DagBindings(
@@ -162,6 +188,27 @@ class PipelineDagBuilderAckTest {
         public void advance(String chain, ChainPosition position) {
             calls.add(chain + "=" + position.token());
         }
+    }
+
+    private static final class PlanningAckFactory implements SinkAckFactory {
+        private final List<WriterScope> scopes = new ArrayList<>();
+
+        @Override
+        public SinkAck resolve(HazelcastInstance member) {
+            return (chain, position) -> { };
+        }
+
+        @Override
+        public SinkAckFactory forWriter(
+                String writerId, List<String> streams, Map<String, List<String>> writerIdsByStream) {
+            scopes.add(new WriterScope(writerId, List.copyOf(streams), Map.copyOf(writerIdsByStream)));
+            return this;
+        }
+    }
+
+    private record WriterScope(
+            String writerId, List<String> streams, Map<String, List<String>> writerIdsByStream)
+            implements java.io.Serializable {
     }
 
     private static final class RecordingWriter implements SinkWriter {

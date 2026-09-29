@@ -348,6 +348,33 @@ class MongoSrsMetaStoreIT {
     }
 
     @Test
+    void writerAwareProgressExposesOnlyTheSlowestSinkAgainstTheRealStore() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.configureSinkWriters(CHAIN, "p1", Map.of("orders", List.of("sink-0", "sink-1")));
+
+            store.advanceSinkWriterAcked(
+                    CHAIN, "p1", "sink-0", "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
+
+            assertThat(store.ringDoneThrough(CHAIN, "p1")).isEmpty();
+            assertThat(onlyConsumer(store).sinkAcked()).isNull();
+
+            store.advanceSinkWriterAcked(
+                    CHAIN, "p1", "sink-1", "orders", new ChainPosition(new SourceOrder(1, 50), "t50"));
+
+            assertThat(store.ringDoneThrough(CHAIN, "p1")).containsEntry("orders", 50L);
+            assertThat(onlyConsumer(store).sinkAckedSrcpos()).isEqualTo("t50");
+
+            store.markSinkWriterSnapshotComplete(CHAIN, "p1", "sink-0", "orders");
+            assertThat(store.read(CHAIN).orElseThrow().snapshotCompletedTables("p1")).isEmpty();
+
+            store.markSinkWriterSnapshotComplete(CHAIN, "p1", "sink-1", "orders");
+            assertThat(store.read(CHAIN).orElseThrow().snapshotCompletedTables("p1"))
+                    .containsExactly("orders");
+        });
+    }
+
+    @Test
     void anArrivalIsMarkedOnceAndNeverMovesAPlaceThePipelineAlreadyHas() {
         withStore(store -> {
             store.create(CHAIN, null);
