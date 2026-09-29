@@ -19,8 +19,8 @@ import org.springframework.beans.factory.support.DefaultListableBeanFactory;
 import org.springframework.http.HttpHeaders;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
-import tools.jackson.databind.json.JsonMapper;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -28,7 +28,6 @@ import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -86,28 +85,24 @@ class CloudAuthApiTest {
     void onPremCannotUseHandoffOrBackChannelAndCloudWithoutSdkFailsClosed() throws Exception {
         MockMvc op = mvc(AuthenticationMode.ON_PREM, false, false);
         op.perform(get(CloudAuthController.EXCHANGE_PATH).param("code", "code")).andExpect(status().isForbidden());
-        op.perform(post(CloudAuthController.INVALIDATE_PATH).content("{\"jti\":\"jti-a\"}"))
-                .andExpect(status().isForbidden());
+        op.perform(callback("controlled")).andExpect(status().isForbidden());
         assertThat(store.records).isEmpty();
         DefaultListableBeanFactory other = new DefaultListableBeanFactory();
         other.registerSingleton("mode", AuthenticationMode.CLOUD);
         MockMvc missing = controllerMvc(other);
         missing.perform(get(CloudAuthController.EXCHANGE_PATH).param("code", "code"))
                 .andExpect(status().isServiceUnavailable());
-        missing.perform(post(CloudAuthController.INVALIDATE_PATH).content("{\"jti\":\"jti-a\"}"))
-                .andExpect(status().isServiceUnavailable());
+        missing.perform(callback("controlled")).andExpect(status().isServiceUnavailable());
     }
 
     @Test
     void jtiAndUserCredentialsAloneCannotAuthorizeTheRevocationCallback() throws Exception {
         MockMvc mvc = mvc(AuthenticationMode.CLOUD, true, true);
         String cookie = authentication.exchangeCode("code").token();
-        mvc.perform(post(CloudAuthController.INVALIDATE_PATH).content("{\"jti\":\"jti-a\"}"))
-                .andExpect(status().isUnauthorized());
-        mvc.perform(post(CloudAuthController.INVALIDATE_PATH)
+        mvc.perform(callback("invalid-proof")).andExpect(status().isUnauthorized());
+        mvc.perform(callback("invalid-proof")
                         .header(HttpHeaders.AUTHORIZATION, "Bearer raw-user-jwt")
-                        .cookie(new Cookie(CloudSessionCookies.NAME, cookie))
-                        .content("{\"jti\":\"jti-a\"}"))
+                        .cookie(new Cookie(CloudSessionCookies.NAME, cookie)))
                 .andExpect(status().isUnauthorized());
         assertThat(authentication.authenticate(cookie)).isPresent();
         assertThat(store.revoked).isEmpty();
@@ -120,8 +115,7 @@ class CloudAuthApiTest {
         clock.now = NOW.plusSeconds(20 * 60);
         assertThat(authentication.authenticate(cookie)).isPresent();
         for (int request = 0; request < 2; request++) {
-            mvc.perform(post(CloudAuthController.INVALIDATE_PATH).header("X-Test-Callback-Proof", "controlled")
-                    .content("{\"jti\":\"jti-a\"}")).andExpect(status().isNoContent());
+            mvc.perform(callback("controlled")).andExpect(status().isNoContent());
         }
         assertThat(authentication.authenticate(cookie)).isEmpty();
         assertThat(validations.get()).isEqualTo(1);
@@ -130,8 +124,7 @@ class CloudAuthApiTest {
     @Test
     void anEarlyAuthenticatedCallbackPreventsALateHandoffFromResurrectingTheSession() throws Exception {
         MockMvc mvc = mvc(AuthenticationMode.CLOUD, true, true);
-        mvc.perform(post(CloudAuthController.INVALIDATE_PATH).header("X-Test-Callback-Proof", "controlled")
-                .content("{\"jti\":\"jti-a\"}")).andExpect(status().isNoContent());
+        mvc.perform(callback("controlled")).andExpect(status().isNoContent());
         mvc.perform(get(CloudAuthController.EXCHANGE_PATH).param("code", "code")).andExpect(status().isUnauthorized());
         assertThat(store.records).isEmpty();
     }
@@ -139,23 +132,27 @@ class CloudAuthApiTest {
     @Test
     void missingCallbackVerifierCannotBeReplacedByTheOutboundToken() throws Exception {
         MockMvc mvc = mvc(AuthenticationMode.CLOUD, true, false);
-        mvc.perform(post(CloudAuthController.INVALIDATE_PATH)
-                        .header(HttpHeaders.AUTHORIZATION, "Bearer outbound-cloud-token")
-                        .content("{\"jti\":\"jti-a\"}"))
+        mvc.perform(callback("outbound-cloud-token")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer outbound-cloud-token"))
                 .andExpect(status().isServiceUnavailable());
         assertThat(store.revoked).isEmpty();
     }
 
     @Test
-    void authenticatedMalformedCallbacksNeverExposeTheirBodyOrWriteARevocation() throws Exception {
+    void malformedCallbackParametersNeverEchoTheirValuesOrWriteARevocation() throws Exception {
         MockMvc mvc = mvc(AuthenticationMode.CLOUD, true, true);
         var invalid = mvc.perform(post(CloudAuthController.INVALIDATE_PATH)
-                        .header("X-Test-Callback-Proof", "controlled").content("body-secret-sentinel invalid json"))
+                        .param("jti", "query-secret-sentinel")
+                        .param("ts", "")
+                        .param("nonce", "controlled-nonce")
+                        .param("sign", "controlled"))
                 .andExpect(status().isBadRequest()).andReturn().getResponse();
-        assertThat(invalid.getContentAsString()).doesNotContain("body-secret-sentinel");
+        assertThat(invalid.getContentAsString()).doesNotContain("query-secret-sentinel");
         assertThat(store.revoked).isEmpty();
-        mvc.perform(post(CloudAuthController.INVALIDATE_PATH).header("X-Test-Callback-Proof", "controlled")
-                .content("{\"jti\":\"\"}")).andExpect(status().isBadRequest());
+        mvc.perform(post(CloudAuthController.INVALIDATE_PATH)
+                        .param("jti", "").param("ts", "1780000000000")
+                        .param("nonce", "controlled-nonce").param("sign", "controlled"))
+                .andExpect(status().isBadRequest());
     }
 
     @Test
@@ -198,19 +195,29 @@ class CloudAuthApiTest {
     private MockMvc mvc(AuthenticationMode mode, boolean withSdkPorts, boolean withCallback) {
         beans.registerSingleton("mode", mode);
         if (withSdkPorts) beans.registerSingleton("cloudAuthentication", authentication);
-        if (withCallback) beans.registerSingleton("callbacks", (CloudSessionCallbackVerifier) (issuer, org, cluster, method, path, headers, body) ->
+        if (withCallback) beans.registerSingleton("callbacks", (CloudSessionCallbackVerifier)
+                (issuer, org, cluster, method, timestamp, nonce, data, signature) ->
                 issuer.equals(IDENTITY.issuer()) && org.equals(IDENTITY.organizationId()) && cluster.equals(IDENTITY.clusterId())
-                        && method.equals("POST") && path.equals(CloudAuthController.INVALIDATE_PATH)
-                        && headers.getOrDefault("x-test-callback-proof", List.of()).equals(List.of("controlled")));
+                        && method.equals("POST") && timestamp.equals("1780000000000")
+                        && nonce.equals("controlled-nonce") && data.equals("jti-a")
+                        && signature.equals("controlled"));
         return controllerMvc(beans);
     }
 
     private static MockMvc controllerMvc(DefaultListableBeanFactory beans) {
         CloudAuthController controller = new CloudAuthController(beans.getBeanProvider(AuthenticationMode.class),
-                beans.getBeanProvider(CloudAuthenticationService.class), beans.getBeanProvider(CloudSessionCallbackVerifier.class),
-                JsonMapper.builder().build());
+                beans.getBeanProvider(CloudAuthenticationService.class),
+                beans.getBeanProvider(CloudSessionCallbackVerifier.class));
         return MockMvcBuilders.standaloneSetup(controller)
                 .setControllerAdvice(new ApiExceptionHandler(MessageCatalog.bundled())).build();
+    }
+
+    private static MockHttpServletRequestBuilder callback(String signature) {
+        return post(CloudAuthController.INVALIDATE_PATH)
+                .param("jti", "jti-a")
+                .param("ts", "1780000000000")
+                .param("nonce", "controlled-nonce")
+                .param("sign", signature);
     }
 
     private static String cookieValue(String header) { return header.substring(header.indexOf('=') + 1, header.indexOf(';')); }

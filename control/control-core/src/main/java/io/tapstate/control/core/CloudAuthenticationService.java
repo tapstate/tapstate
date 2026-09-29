@@ -4,7 +4,6 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CloudSessionIdentity;
 
 import java.util.Map;
-import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -53,11 +52,11 @@ public final class CloudAuthenticationService {
     }
 
     /** Keeps the persistence identity type behind the control ring's presentation boundary. */
-    public boolean authorizeCallback(CloudSessionCallbackVerifier verifier, String method, String path,
-            Map<String, List<String>> headers, byte[] body) {
+    public boolean authorizeCallback(CloudSessionCallbackVerifier verifier, String method,
+            String timestamp, String nonce, String data, String signature) {
         CloudSessionIdentity identity = sessions.identity();
         return verifier.verify(identity.issuer(), identity.organizationId(), identity.clusterId(),
-                method, path, headers, body);
+                method, timestamp, nonce, data, signature);
     }
 
     public static TapstateException unavailable() {

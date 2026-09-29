@@ -13,15 +13,8 @@ import org.springframework.stereotype.Controller;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestParam;
-import tools.jackson.databind.ObjectMapper;
-import tools.jackson.core.JacksonException;
 
-import java.io.IOException;
 import java.net.URI;
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 
 /** Managed login and the separately authenticated back-channel invalidation surface. */
@@ -30,20 +23,21 @@ class CloudAuthController {
 
     static final String EXCHANGE_PATH = "/auth/exchange";
     static final String INVALIDATE_PATH = "/auth/invalidate-session";
-    private static final int MAX_CALLBACK_BYTES = 4096;
+    private static final int MAX_JTI_LENGTH = 512;
+    private static final int MAX_TIMESTAMP_LENGTH = 32;
+    private static final int MAX_NONCE_LENGTH = 256;
+    private static final int MAX_SIGNATURE_LENGTH = 2048;
 
     private final AuthenticationMode mode;
     private final ObjectProvider<CloudAuthenticationService> authentication;
     private final ObjectProvider<CloudSessionCallbackVerifier> callbacks;
-    private final ObjectMapper json;
 
     CloudAuthController(ObjectProvider<AuthenticationMode> modes,
             ObjectProvider<CloudAuthenticationService> authentication,
-            ObjectProvider<CloudSessionCallbackVerifier> callbacks, ObjectMapper json) {
+            ObjectProvider<CloudSessionCallbackVerifier> callbacks) {
         mode = modes.getIfAvailable(() -> AuthenticationMode.ON_PREM);
         this.authentication = authentication;
         this.callbacks = callbacks;
-        this.json = json;
     }
 
     @GetMapping(EXCHANGE_PATH)
@@ -57,42 +51,29 @@ class CloudAuthController {
     }
 
     @PostMapping(INVALIDATE_PATH)
-    ResponseEntity<Void> invalidate(HttpServletRequest request) {
+    ResponseEntity<Void> invalidate(HttpServletRequest request,
+            @RequestParam(name = "jti", required = false) String jti,
+            @RequestParam(name = "ts", required = false) String timestamp,
+            @RequestParam(name = "nonce", required = false) String nonce,
+            @RequestParam(name = "sign", required = false) String signature) {
         CloudAuthenticationService service = requireCloud();
         CloudSessionCallbackVerifier verifier = callbacks.getIfAvailable();
         if (verifier == null) {
             throw CloudAuthenticationService.unavailable();
         }
-        byte[] body;
-        try {
-            body = request.getInputStream().readNBytes(MAX_CALLBACK_BYTES + 1);
-        } catch (IOException unreadable) {
+        if (!bounded(jti, MAX_JTI_LENGTH)
+                || !bounded(timestamp, MAX_TIMESTAMP_LENGTH)
+                || !bounded(nonce, MAX_NONCE_LENGTH)
+                || !bounded(signature, MAX_SIGNATURE_LENGTH)) {
             throw malformed();
         }
-        if (body.length > MAX_CALLBACK_BYTES) {
-            throw malformed();
-        }
-        Map<String, List<String>> headers = new LinkedHashMap<>();
-        request.getHeaderNames().asIterator().forEachRemaining(name -> {
-            List<String> values = new ArrayList<>();
-            request.getHeaders(name).asIterator().forEachRemaining(values::add);
-            headers.put(name.toLowerCase(Locale.ROOT), List.copyOf(values));
-        });
-        if (!service.authorizeCallback(verifier, request.getMethod(), INVALIDATE_PATH,
-                Map.copyOf(headers), body.clone())) {
+        // The provider signs exactly POST|ts|nonce|jti and sends an empty body. The SDK adapter owns
+        // signature/JWKS details; this controller only preserves the signed fields without inventing
+        // a second callback format or accepting a user credential as proof.
+        if (!service.authorizeCallback(verifier, request.getMethod(), timestamp, nonce, jti, signature)) {
             throw new TapstateException(ControlError.UNAUTHENTICATED, Map.of(), null);
         }
-        Invalidation parsed;
-        try {
-            parsed = json.readValue(body, Invalidation.class);
-        } catch (JacksonException malformed) {
-            // JSON parser messages can quote raw callback content. Do not attach them to diagnostics.
-            throw malformed();
-        }
-        if (parsed == null || parsed.jti() == null || parsed.jti().isBlank()) {
-            throw malformed();
-        }
-        service.invalidateJwt(parsed.jti());
+        service.invalidateJwt(jti);
         return ResponseEntity.noContent().header(HttpHeaders.CACHE_CONTROL, "no-store").build();
     }
 
@@ -109,8 +90,10 @@ class CloudAuthController {
 
     private static TapstateException malformed() {
         return new TapstateException(ControlError.MALFORMED_REQUEST,
-                Map.of("reason", "a valid jti callback body is required"), null);
+                Map.of("reason", "valid jti, ts, nonce, and sign callback parameters are required"), null);
     }
 
-    private record Invalidation(String jti) { }
+    private static boolean bounded(String value, int maximumLength) {
+        return value != null && !value.isBlank() && value.length() <= maximumLength;
+    }
 }

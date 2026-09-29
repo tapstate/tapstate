@@ -108,11 +108,14 @@ class ManagedCloudSessionAssemblyIT {
                 assertThat(login.toJson()).doesNotContain("controlled-raw-jwt", cookie, "controlled-machine-token");
                 assertThat(SystemCollections.USERS.on(raw.getDatabase(database)).countDocuments()).isZero();
             }
-            int denied = client.post().uri("/auth/invalidate-session").contentType(MediaType.APPLICATION_JSON)
-                    .body(Map.of("jti", JTI)).exchange((request, response) -> response.getStatusCode().value());
+            int denied = client.post().uri(builder -> builder.path("/auth/invalidate-session")
+                            .queryParam("jti", JTI).queryParam("ts", "1780000000000")
+                            .queryParam("nonce", "controlled-nonce").queryParam("sign", "invalid").build())
+                    .exchange((request, response) -> response.getStatusCode().value());
             assertThat(denied).isEqualTo(401);
-            int invalidated = client.post().uri("/auth/invalidate-session").header("X-Test-Callback-Proof", "controlled")
-                    .contentType(MediaType.APPLICATION_JSON).body(Map.of("jti", JTI))
+            int invalidated = client.post().uri(builder -> builder.path("/auth/invalidate-session")
+                            .queryParam("jti", JTI).queryParam("ts", "1780000000000")
+                            .queryParam("nonce", "controlled-nonce").queryParam("sign", "controlled").build())
                     .exchange((request, response) -> response.getStatusCode().value());
             assertThat(invalidated).isEqualTo(204);
             int afterRevocation = client.get().uri("/api/artifacts/controlled_source").header(HttpHeaders.COOKIE, cookie)
@@ -142,8 +145,10 @@ class ManagedCloudSessionAssemblyIT {
 
         @Bean
         CloudSessionCallbackVerifier controlledCallbackVerifier() {
-            return (issuer, org, cluster, method, path, headers, body) ->
-                    headers.getOrDefault("x-test-callback-proof", List.of()).equals(List.of("controlled"));
+            return (issuer, org, cluster, method, timestamp, nonce, data, signature) ->
+                    method.equals("POST") && timestamp.equals("1780000000000")
+                            && nonce.equals("controlled-nonce") && data.equals(JTI)
+                            && signature.equals("controlled");
         }
     }
 }
