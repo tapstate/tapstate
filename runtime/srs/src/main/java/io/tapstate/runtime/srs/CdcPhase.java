@@ -19,6 +19,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -270,6 +271,9 @@ public final class CdcPhase {
                     break;
                 }
                 LockSupport.parkNanos(BACKPRESSURE_PARK_NANOS);
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new CancellationException("the cdc write was interrupted while it waited for headroom");
+                }
             }
         }
         return new Admitted(lastSeq, offsets);
