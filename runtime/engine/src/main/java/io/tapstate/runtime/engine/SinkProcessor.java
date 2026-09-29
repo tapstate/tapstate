@@ -77,6 +77,20 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         return Stage.SINK;
     }
 
+    /**
+     * Not cooperative where there is an ack to report to. A write that settles hands the positions it earned
+     * to the ack there and then, and the ack a pipeline is built with writes them to the durable store and
+     * waits for the store to answer - for as long as the store takes, which is as long as it goes on holding
+     * a document for a writer that stopped halfway through writing it. A cooperative processor shares its
+     * thread with every other cooperative vertex on the member, of every run, so a report waiting there stops
+     * all of them with it, and nothing fails or says why. A sink with no ack only hands rows to its writer,
+     * which writes them off this thread, so it keeps its place in the cooperative pool.
+     */
+    @Override
+    public boolean isCooperative() {
+        return sinkAck == null;
+    }
+
     // One write in flight by default: a batch is applied to completion before the next is issued, so a
     // key's events can never be applied out of their arrival order. Raising this pipelines writes and
     // is only safe for an order-independent or append-only target.
