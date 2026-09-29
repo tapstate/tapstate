@@ -57,4 +57,28 @@ public interface CaptureListener {
      */
     default void onError(Throwable error) {
     }
+
+    /**
+     * Called when a position the stream's subscription was {@linkplain Subscription#acknowledge told is
+     * durable} has been handed to the source, and the source took it without complaint.
+     *
+     * <p>That is all it says. A source gives no sign that it acted on a position, and some pass one over in
+     * silence, so this is not evidence that anything was released -- only the source's own readings are.
+     * What it does show is the other half: that positions are still reaching the source at all, which is
+     * the reading that goes quiet when they stop. Not fatal either way; the default ignores the call.
+     */
+    default void onAcknowledged(SourcePosition position) {
+    }
+
+    /**
+     * Called when an acknowledged position could not be handed to the source: it could not be read back
+     * into the source's own form, or the source threw when it was given it.
+     *
+     * <p>Not fatal, and not {@link #onError}: the stream carries on, and the port tries again at its next
+     * interval. A position not handed over costs the source some log it could already have let go of, for
+     * a while longer; ending the stream over that would turn a delay in the source's housekeeping into an
+     * outage. The default ignores the call.
+     */
+    default void onAcknowledgeFailed(Throwable failure) {
+    }
 }

@@ -24,8 +24,11 @@
 
 io.tapstate.spi.capture.CaptureBatch :: method :: close() -> void
 io.tapstate.spi.capture.CaptureBatch :: method :: seam() -> java.util.Optional<io.tapstate.spi.capture.SourcePosition>
+io.tapstate.spi.capture.CaptureListener :: method :: onAcknowledgeFailed(java.lang.Throwable) -> void
+io.tapstate.spi.capture.CaptureListener :: method :: onAcknowledged(io.tapstate.spi.capture.SourcePosition) -> void
 io.tapstate.spi.capture.CaptureListener :: method :: onBatch(java.util.List<io.tapstate.core.event.Envelope>, java.util.Optional<io.tapstate.spi.capture.SourcePosition>) -> void
 io.tapstate.spi.capture.CaptureListener :: method :: onError(java.lang.Throwable) -> void
+io.tapstate.spi.capture.CaptureListener :: method :: onStart(java.util.Optional<io.tapstate.spi.capture.SourcePosition>) -> void
 io.tapstate.spi.capture.CapturePort :: method :: cdc(io.tapstate.spi.capture.CaptureConfig, io.tapstate.spi.capture.CaptureStart, io.tapstate.spi.capture.CaptureListener) -> io.tapstate.spi.capture.Subscription
 io.tapstate.spi.capture.CapturePort :: method :: discoverSchema(io.tapstate.spi.capture.CaptureConfig) -> io.tapstate.spi.capture.DiscoveredSchema
 io.tapstate.spi.capture.CapturePort :: method :: snapshot(io.tapstate.spi.capture.CaptureConfig) -> io.tapstate.spi.capture.CaptureBatch
