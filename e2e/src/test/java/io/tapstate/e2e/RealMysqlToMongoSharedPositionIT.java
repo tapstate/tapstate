@@ -2,6 +2,7 @@ package io.tapstate.e2e;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.mongodb.ConnectionString;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import io.tapstate.core.lifecycle.LifecycleVerb;
@@ -20,11 +21,17 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
 /**
- * Two pipeline nodes share a source position without sharing their connector identities. The second
- * starts from a tail position written by the first; after a process replacement both must resume.
- * Deletes made while the server is down distinguish resumed CDC from another snapshot.
+ * Two pipelines reading one source share its chain: one reader, one position, and one connector identity,
+ * kept in the chain's own notes rather than in either pipeline's. The second pipeline starts from a tail
+ * position the first one's run wrote; after a process replacement both must resume. Deletes made while the
+ * server is down distinguish resumed CDC from another snapshot.
  *
- * <p>The declarative vocabulary cannot compare the connector-owned identity bytes across nodes and
+ * <p>The identity is the connector's own name for its reader of the source. Kept per pipeline, it would be
+ * a different reader's for whichever pipeline opened the stream next; kept on the chain, it is the one
+ * reader's whoever opens it, so it has to stay the same when another pipeline joins and across the
+ * process being replaced, and no pipeline's own notes may hold one.
+ *
+ * <p>The declarative vocabulary cannot compare the connector-owned identity bytes across pipelines and
  * process replacements or require a tail position to replace the snapshot seam before another start.
  * The real MySQL connector, its position object and its separate class loader are essential here.
  */
@@ -37,7 +44,7 @@ class RealMysqlToMongoSharedPositionIT {
 
     @ParameterizedTest
     @EnumSource(Tiers.class)
-    void anotherReaderAndARestartKeepThePositionButNotTheOtherReadersIdentity(Tiers tier) throws Exception {
+    void anotherPipelineAndARestartKeepThePositionAndTheChainsOneReaderIdentity(Tiers tier) throws Exception {
         String suffix = tier.name().toLowerCase(Locale.ROOT);
         String first = "reader_first_" + suffix;
         String second = "reader_second_" + suffix;
@@ -49,8 +56,8 @@ class RealMysqlToMongoSharedPositionIT {
         String store = SharedMongo.replicaSetUrl("reader_position_store_" + suffix);
         String targetUri = SharedMongo.replicaSetUrl("reader_position_target_" + suffix);
         EndpointAddress target = EndpointAddress.uri(targetUri);
-        byte[] firstIdentity;
-        byte[] secondIdentity;
+        byte[] identity;
+        String chain;
 
         try (MongoEndpoints mongo = new MongoEndpoints()) {
             try (ServerHandle server = tier.launch(store)) {
@@ -65,17 +72,22 @@ class RealMysqlToMongoSharedPositionIT {
                 // It is absent until CDC has delivered and acknowledged a real change.
                 Await.until("the first reader's tail position", () -> !control.resumePoint(first).isEmpty(),
                         () -> control.logs(first));
-                firstIdentity = identity(store, first, "first_source");
+                chain = chainOf(store, first);
+                identity = chainIdentity(store, chain);
+                assertThat(nodeIdentity(store, first, "first_source"))
+                        .as("the reader's identity is the chain's, not the pipeline that opened it")
+                        .isEmpty();
 
                 // This is a new node with no state, taking a position issued by the first node. A new
                 // snapshot would hide that path by replacing the shared position with its own seam.
                 apply(control, mysql, targetUri, second, "second_source", "later_orders", "cdc_only");
                 sql(mysql, "INSERT INTO later_orders VALUES (2, 'second-tail')");
                 awaitIds(control, second, mongo, target, "later_orders", List.of(2L));
-                secondIdentity = identity(store, second, "second_source");
-                assertThat(secondIdentity).as("each live reader keeps a separate logical identity")
-                        .isNotEqualTo(firstIdentity);
-                assertThat(identity(store, first, "first_source")).isEqualTo(firstIdentity);
+                assertThat(chainOf(store, second)).as("both pipelines read one chain").isEqualTo(chain);
+                assertThat(chainIdentity(store, chain))
+                        .as("the chain's one reader kept its identity when it took the second table on")
+                        .isEqualTo(identity);
+                assertThat(nodeIdentity(store, second, "second_source")).isEmpty();
                 assertThat(control.state(first)).contains(PipelineState.RUNNING);
             }
 
@@ -90,8 +102,8 @@ class RealMysqlToMongoSharedPositionIT {
                 // paths. RUNNING alone could have been an observation left by the previous process.
                 awaitIds(control, first, mongo, target, "orders", List.of(99L));
                 awaitIds(control, second, mongo, target, "later_orders", List.of(3L, 99L));
-                assertThat(identity(store, first, "first_source")).isEqualTo(firstIdentity);
-                assertThat(identity(store, second, "second_source")).isEqualTo(secondIdentity);
+                assertThat(chainIdentity(store, chain)).as("and across the process being replaced")
+                        .isEqualTo(identity);
                 assertThat(control.errorCount(first)).contains(0L);
                 assertThat(control.errorCount(second)).contains(0L);
             }
@@ -148,13 +160,33 @@ class RealMysqlToMongoSharedPositionIT {
                 .map(row -> ((Number) row.get("id")).longValue()).sorted().toList();
     }
 
-    private static byte[] identity(String store, String pipeline, String source) {
+    /** The chain {@code pipeline} reads, as its cursor on the store names it. */
+    private static String chainOf(String store, String pipeline) {
         try (MongoClient client = MongoClients.create(store)) {
-            Document id = new Document("ns", "pdk.state." + pipeline + "." + source).append("k", "SERVER_NAME");
+            Document cursor = client.getDatabase(new ConnectionString(store).getDatabase())
+                    .getCollection("srs_consumer_offsets").find(new Document("_id.pipeline", pipeline)).first();
+            assertThat(cursor).as("%s has a cursor on a chain", pipeline).isNotNull();
+            return cursor.get("_id", Document.class).getString("chain");
+        }
+    }
+
+    /** The reader identity the chain's notes hold; it has to be there. */
+    private static byte[] chainIdentity(String store, String chain) {
+        return identityIn(store, "pdk.chain." + chain)
+                .orElseThrow(() -> new AssertionError("the chain " + chain + " keeps no reader identity"));
+    }
+
+    /** A reader identity kept in one pipeline node's own notes, if any is. */
+    private static java.util.Optional<byte[]> nodeIdentity(String store, String pipeline, String source) {
+        return identityIn(store, "pdk.state." + pipeline + "." + source);
+    }
+
+    private static java.util.Optional<byte[]> identityIn(String store, String namespace) {
+        try (MongoClient client = MongoClients.create(store)) {
+            Document id = new Document("ns", namespace).append("k", "SERVER_NAME");
             Document record = client.getDatabase("tapstate_nest").getCollection("operator_state")
                     .find(new Document("_id", id)).first();
-            assertThat(record).as("the reader identity is durable for %s/%s", pipeline, source).isNotNull();
-            return record.get("state", Binary.class).getData();
+            return java.util.Optional.ofNullable(record).map(found -> found.get("state", Binary.class).getData());
         }
     }
 
