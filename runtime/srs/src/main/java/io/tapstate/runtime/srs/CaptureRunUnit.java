@@ -256,6 +256,7 @@ public final class CaptureRunUnit {
         if (plan.sharedRing()) {
             coordinator.attachConsumer(state.chainId, spec.pipelineId());
             state.consumerAttached = true;
+            selectConsumerTables(spec, state);
             // A selected table protects its ring before arrival is sampled. If a writer gets there first,
             // the later sample moves arrival past what it wrote; once this registration lands, the writer
             // is constrained until that sample and its cursor are published together. Raising the floor
@@ -266,7 +267,18 @@ public final class CaptureRunUnit {
                     Objects.requireNonNull(state.chainId, "a tail resolves its chain before it runs"),
                     spec.pipelineId());
             state.consumerAttached = true;
+            selectConsumerTables(spec, state);
         }
+    }
+
+    /**
+     * Records which tables this pipeline reads from the chain, in the generation it attached under, before
+     * anything of this run can be acknowledged. The chain's durable prefix is released per table and per
+     * consumer, so an acknowledgement that arrived before its reader's selection would be judged against the
+     * selection of a reader that is gone.
+     */
+    private void selectConsumerTables(CaptureRunSpec spec, OpenState state) {
+        meta.selectConsumerTables(state.chainId.value(), spec.pipelineId(), spec.chainSelection(), state.epoch);
     }
 
     private Optional<StreamSource<SrsItem>> ringSource(

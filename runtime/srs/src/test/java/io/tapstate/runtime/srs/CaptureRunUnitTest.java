@@ -1730,10 +1730,7 @@ class CaptureRunUnitTest {
             Map<String, Long> perTable = new LinkedHashMap<>(existing == null ? Map.of() : existing.perTableSeq());
             perTable.merge(table, lastReadSeq, Math::max);
             ChainPosition ack = existing == null ? null : existing.sinkAcked();
-            next.add(new ConsumerOffset(
-                    pipelineId,
-                    perTable,
-                    ack,
+            next.add(rebuilt(existing, pipelineId, perTable, ack,
                     existing == null ? List.of() : existing.snapshotCompletedTables(),
                     existing == null ? null : existing.cdcStartPosition(),
                     existing == null ? 0L : existing.snapshotEpoch()));
@@ -1755,10 +1752,7 @@ class CaptureRunUnitTest {
                 }
             }
             Map<String, Long> perTable = existing == null ? Map.of() : existing.perTableSeq();
-            next.add(new ConsumerOffset(
-                    pipelineId,
-                    perTable,
-                    position,
+            next.add(rebuilt(existing, pipelineId, perTable, position,
                     existing == null ? List.of() : existing.snapshotCompletedTables(),
                     existing == null ? null : existing.cdcStartPosition(),
                     existing == null ? 0L : existing.snapshotEpoch()));
@@ -1780,8 +1774,7 @@ class CaptureRunUnitTest {
                     next.add(consumer);
                 }
             }
-            next.add(new ConsumerOffset(
-                    pipelineId,
+            next.add(rebuilt(existing, pipelineId,
                     existing == null ? Map.of() : existing.perTableSeq(),
                     existing == null ? null : existing.sinkAcked(),
                     existing == null ? List.of() : existing.snapshotCompletedTables(),
@@ -1831,12 +1824,103 @@ class CaptureRunUnitTest {
             if (!completed.contains(table)) {
                 completed.add(table);
             }
-            consumers.add(new ConsumerOffset(pipelineId, mine == null ? Map.of() : mine.perTableSeq(),
+            consumers.add(rebuilt(mine, pipelineId, mine == null ? Map.of() : mine.perTableSeq(),
                     mine == null ? null : mine.sinkAcked(), completed,
                     mine == null ? null : mine.cdcStartPosition(),
                     mine == null ? 0L : mine.snapshotEpoch()));
             records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), consumers,
                     m.schemaHistory(), m.retention(), m.epoch()));
+        }
+
+        /** A consumer rebuilt with the facets a mutator names, its selection and table acks carried across. */
+        private static ConsumerOffset rebuilt(ConsumerOffset existing, String pipelineId, Map<String, Long> perTable,
+                ChainPosition ack, List<String> completed, String cdcStart, long snapshotEpoch) {
+            return new ConsumerOffset(pipelineId, perTable, ack, completed, cdcStart, snapshotEpoch,
+                    existing == null ? null : existing.selectedTables(),
+                    existing == null ? null : existing.selectedTablesEpoch(),
+                    existing == null ? Map.of() : existing.sinkAckedByTable());
+        }
+
+        @Override
+        public synchronized void selectConsumerTables(
+                String miningChainId, String pipelineId, List<String> tables, long epoch) {
+            SrsMeta m = require(miningChainId);
+            List<String> selected = tables.stream().distinct().sorted().toList();
+            List<ConsumerOffset> next = new ArrayList<>();
+            ConsumerOffset existing = null;
+            for (ConsumerOffset c : m.consumerOffsets()) {
+                if (c.pipelineId().equals(pipelineId)) {
+                    existing = c;
+                } else {
+                    next.add(c);
+                }
+            }
+            Map<String, ChainPosition> retained = new LinkedHashMap<>();
+            if (existing != null && existing.selectedTablesEpoch() != null
+                    && existing.selectedTablesEpoch() == epoch) {
+                existing.sinkAckedByTable().forEach((table, position) -> {
+                    if (selected.contains(table)) {
+                        retained.put(table, position);
+                    }
+                });
+            }
+            next.add(new ConsumerOffset(pipelineId,
+                    existing == null ? Map.of() : existing.perTableSeq(),
+                    existing == null ? null : existing.sinkAcked(),
+                    existing == null ? List.of() : existing.snapshotCompletedTables(),
+                    existing == null ? null : existing.cdcStartPosition(),
+                    existing == null ? 0L : existing.snapshotEpoch(),
+                    selected, epoch, retained));
+            records.put(miningChainId, new SrsMeta(
+                    m.miningChainId(), m.sourceRead(), next,
+                    m.schemaHistory(), m.retention(), m.epoch()));
+        }
+
+        @Override
+        public synchronized void advanceTableSinkAcked(
+                String miningChainId, String pipelineId, String table, ChainPosition position) {
+            SrsMeta m = require(miningChainId);
+            List<ConsumerOffset> next = new ArrayList<>();
+            ConsumerOffset existing = null;
+            for (ConsumerOffset c : m.consumerOffsets()) {
+                if (c.pipelineId().equals(pipelineId)) {
+                    existing = c;
+                } else {
+                    next.add(c);
+                }
+            }
+            if (existing != null) {
+                if (existing.selectedTablesEpoch() != null
+                        && existing.selectedTablesEpoch() != position.order().epoch()) {
+                    return;
+                }
+                if (!existing.selects(table)) {
+                    return;
+                }
+                ChainPosition prior = existing.sinkAckedByTable().get(table);
+                if (prior != null && prior.order().compareTo(position.order()) >= 0) {
+                    return;
+                }
+            }
+            Map<String, ChainPosition> acks =
+                    new LinkedHashMap<>(existing == null ? Map.of() : existing.sinkAckedByTable());
+            acks.put(table, position);
+            next.add(new ConsumerOffset(pipelineId,
+                    existing == null ? Map.of() : existing.perTableSeq(),
+                    existing == null ? null : existing.sinkAcked(),
+                    existing == null ? List.of() : existing.snapshotCompletedTables(),
+                    existing == null ? null : existing.cdcStartPosition(),
+                    existing == null ? 0L : existing.snapshotEpoch(),
+                    existing == null ? null : existing.selectedTables(),
+                    existing == null ? null : existing.selectedTablesEpoch(),
+                    acks));
+            records.put(miningChainId, new SrsMeta(
+                    m.miningChainId(), m.sourceRead(), next,
+                    m.schemaHistory(), m.retention(), m.epoch()));
+            if (position.order().seq() >= 0) {
+                ringDone.computeIfAbsent(miningChainId + "/" + pipelineId, key -> new LinkedHashMap<>())
+                        .merge(table, position.order().seq(), Math::max);
+            }
         }
 
         private SrsMeta require(String miningChainId) {

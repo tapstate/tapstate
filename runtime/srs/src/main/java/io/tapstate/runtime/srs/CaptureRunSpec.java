@@ -5,6 +5,7 @@ import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.spi.store.WorkloadClaimFence;
 
+import java.util.List;
 import java.util.Objects;
 
 /**
@@ -23,6 +24,8 @@ import java.util.Objects;
  *       generation assigned to a bounded read that has no change chain of its own.</li>
  *   <li>{@code captureFence} — the cluster claim generation a durable append must still match, or null on
  *       the unchanged single-member path.</li>
+ *   <li>{@code selectedChainTables} — every table this pipeline reads from the chain, across all of its
+ *       sources that read it, or null for a caller that knows only this source's streams.</li>
  * </ul>
  *
  * <p>No connector position is carried here. Both a run's seam and its per-change positions are the
@@ -43,7 +46,25 @@ public record CaptureRunSpec(
         String retention,
         long schemaVer,
         long snapshotEpoch,
-        WorkloadClaimFence captureFence) {
+        WorkloadClaimFence captureFence,
+        List<String> selectedChainTables) {
+
+    /** A run whose pipeline reads nothing else from the chain than what this source's streams name. */
+    public CaptureRunSpec(
+            CaptureConfig config,
+            ReadMode readMode,
+            String srsKey,
+            boolean srsEnabled,
+            String sourceId,
+            String pipelineId,
+            StartFrom startFrom,
+            String retention,
+            long schemaVer,
+            long snapshotEpoch,
+            WorkloadClaimFence captureFence) {
+        this(config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
+                startFrom, retention, schemaVer, snapshotEpoch, captureFence, null);
+    }
 
     /**
      * The ordinary construction used by callers that do not allocate a chainless snapshot generation.
@@ -87,7 +108,24 @@ public record CaptureRunSpec(
     public CaptureRunSpec withCaptureFence(WorkloadClaimFence fence) {
         return new CaptureRunSpec(
                 config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
-                startFrom, retention, schemaVer, snapshotEpoch, fence);
+                startFrom, retention, schemaVer, snapshotEpoch, fence, selectedChainTables);
+    }
+
+    /** The same run, with {@code tables} as everything its pipeline reads from the chain. */
+    public CaptureRunSpec withChainSelection(List<String> tables) {
+        return new CaptureRunSpec(
+                config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
+                startFrom, retention, schemaVer, snapshotEpoch, captureFence, List.copyOf(tables));
+    }
+
+    /**
+     * Every table this run's pipeline reads from the chain: the chain-wide selection when the caller gave one,
+     * this source's own streams otherwise. What a chain may release is decided by who reads which table, so
+     * recording one source's share as the pipeline's whole selection would let the chain move past a change
+     * of a table the pipeline's other source still owes.
+     */
+    public List<String> chainSelection() {
+        return selectedChainTables != null ? selectedChainTables : config.streams();
     }
 
     public CaptureRunSpec {
@@ -100,6 +138,7 @@ public record CaptureRunSpec(
             throw new IllegalArgumentException(
                     "a chainless snapshot generation must not be negative, got " + snapshotEpoch);
         }
+        selectedChainTables = selectedChainTables == null ? null : List.copyOf(selectedChainTables);
         // The connector doing this read files notes it has to find again on a later drive, and which node
         // they belong to is the pair named right here. Scoped from those two rather than accepted on the
         // config, so there is one derivation of the pair instead of two held together by nobody: a caller

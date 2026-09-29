@@ -13,6 +13,7 @@ import io.tapstate.runtime.srs.CaptureRun;
 import io.tapstate.runtime.srs.CaptureError;
 import io.tapstate.runtime.srs.CaptureId;
 import io.tapstate.runtime.srs.CaptureRunSpec;
+import io.tapstate.runtime.srs.ConsumptionPlan;
 import io.tapstate.runtime.srs.MiningChainId;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SnapshotPhase;
@@ -42,6 +43,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -356,7 +358,36 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             releaseUnopened(permits, failure);
             throw failure;
         }
-        return plans;
+        return withChainSelections(plans);
+    }
+
+    /**
+     * Gives every source that tails a chain the whole of what this pipeline reads from that chain.
+     *
+     * <p>Two sources of one pipeline can read one database -- one source resource for orders and another for
+     * customers, feeding the same join -- and then they share its mining chain and the pipeline's one record on
+     * it. That record's selection decides which tables' acknowledgements the chain waits for before it moves,
+     * so it has to name both: each source recording only its own share would overwrite the other's, and the
+     * chain would stop waiting for the table it dropped.
+     */
+    private static List<SourcePlan> withChainSelections(List<SourcePlan> plans) {
+        Map<MiningChainId, Set<String>> selections = new LinkedHashMap<>();
+        for (SourcePlan plan : plans) {
+            CaptureRunSpec spec = plan.spec();
+            if (ConsumptionPlan.of(spec.readMode(), spec.srsEnabled()).tail()) {
+                selections.computeIfAbsent(MiningChainId.resolve(spec.config(), spec.srsKey()),
+                        chain -> new TreeSet<>()).addAll(spec.config().streams());
+            }
+        }
+        List<SourcePlan> selected = new ArrayList<>(plans.size());
+        for (SourcePlan plan : plans) {
+            CaptureRunSpec spec = plan.spec();
+            Set<String> tables = ConsumptionPlan.of(spec.readMode(), spec.srsEnabled()).tail()
+                    ? selections.get(MiningChainId.resolve(spec.config(), spec.srsKey())) : null;
+            selected.add(tables == null ? plan : new SourcePlan(plan.sourceId(), plan.discovered(),
+                    plan.resolution(), spec.withChainSelection(List.copyOf(tables)), plan.captureId()));
+        }
+        return selected;
     }
 
     /**

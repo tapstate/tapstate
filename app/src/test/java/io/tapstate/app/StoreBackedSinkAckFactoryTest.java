@@ -172,6 +172,25 @@ class StoreBackedSinkAckFactoryTest {
     }
 
     @Test
+    void aSharedChainKeepsEachTablesAcknowledgementApartFromTheChainsOwn() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-shop", null);
+        SinkAck ack = new StoreBackedSinkAckFactory(
+                Map.of("orders", "mc-shop", "customers", "mc-shop"), "pipe-1")
+                .resolve(memberWith(store));
+
+        ack.advance("customers", at(0, "t2"));
+        ack.advance("orders", at(5, "t5"));
+
+        ConsumerOffset consumer = store.read("mc-shop").orElseThrow().consumerOffset("pipe-1").orElseThrow();
+        // What each table landed is the input the chain's prefix is released from; the chain's own
+        // acknowledgement waits for that release rather than taking whichever table spoke last.
+        assertThat(consumer.sinkAckedByTable()).containsExactlyInAnyOrderEntriesOf(Map.of(
+                "customers", at(0, "t2"), "orders", at(5, "t5")));
+        assertThat(consumer.sinkAcked()).isNull();
+    }
+
+    @Test
     void aSnapshotRowSaysNothingAboutHowFarARingWasReached() {
         InMemorySrsMetaStore store = new InMemorySrsMetaStore();
         store.create("mc-orders", null);

@@ -7,7 +7,10 @@ import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.SrsDurableFrontier;
+import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SrsMetaStore;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -68,15 +71,67 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                     : isSnapshotOf(position) ? cdcStart(meta, miningChainId, pipelineId) : null;
             ChainPosition acked = new ChainPosition(position.order(), token);
             if (isSnapshotOf(position)) {
-                meta.advanceSinkAcked(miningChainId, pipelineId, acked);
+                if (singleTableChain(miningChainId, chain, meta.consumerOffsets(miningChainId))) {
+                    meta.advanceSinkAcked(miningChainId, pipelineId, acked);
+                }
                 meta.markSnapshotComplete(miningChainId, pipelineId, chain);
             } else {
-                // A change is also recorded against its own table's ring, at the sequence it sat at there,
-                // so a run replacing this one carries on from it instead of from the head of the ring.
-                meta.advanceSinkAcked(miningChainId, pipelineId, chain, acked);
-                recordHowFarTheSourceHasBeenRead(meta, miningChainId, acked, recorded);
+                // Recorded against the change's own table, at the sequence it sat at in that table's ring,
+                // so a run replacing this one carries on from it instead of from the head of the ring --
+                // and so that whoever releases the chain's prefix can see which tables have landed what.
+                meta.advanceTableSinkAcked(miningChainId, pipelineId, chain, acked);
+                List<ConsumerOffset> consumers = meta.consumerOffsets(miningChainId);
+                if (singleTableChain(miningChainId, chain, consumers)) {
+                    meta.advanceSinkAcked(miningChainId, pipelineId, acked);
+                    recordHowFarTheSourceHasBeenRead(
+                            meta, miningChainId, acked, landed(consumers, acked), recorded);
+                }
             }
         };
+    }
+
+    /**
+     * Whether {@code table} is the only table anything reads from {@code miningChainId} -- the one shape in
+     * which a table's acknowledgement also says how far the chain's source log has landed.
+     *
+     * <p>On a chain carrying several tables it does not: one source log feeds them all, and a quiet table's
+     * change can land while an earlier change of another table is still in flight. Moving the chain there would
+     * let a restart resume past that change, and the source never sends it again. So on such a chain this
+     * records the table's acknowledgement alone and leaves the chain to whoever owns its tail, which releases
+     * it only once every change up to a point of the log has landed for every table that reads it. A consumer
+     * whose selection was never recorded is read as reading this table alone: it has not attached since
+     * selections were recorded, and the tail it runs under still reads only the tables of its own capture.
+     */
+    private boolean singleTableChain(String miningChainId, String table, List<ConsumerOffset> consumers) {
+        long mapped = chainIdByTable.values().stream().filter(miningChainId::equals).count();
+        return mapped == 1 && consumers.stream().allMatch(consumer ->
+                consumer.selectedTables() == null || consumer.selectedTables().equals(List.of(table)));
+    }
+
+    /**
+     * {@code consumers}, read before this acknowledgement was written, as they stand once it has landed:
+     * this pipeline's entry carries {@code acked}, and a pipeline that had no entry yet has one now.
+     *
+     * <p>Without that the read would pin the answer one delivery behind -- this pipeline's own earlier
+     * position, or nothing at all on its first acknowledgement, which resolves to no advance. What this
+     * pipeline holds can be higher than {@code acked} when another member acknowledged further first, and
+     * treating it as {@code acked} then changes nothing: {@code acked} is the candidate the lowest starts from.
+     */
+    private List<ConsumerOffset> landed(List<ConsumerOffset> consumers, ChainPosition acked) {
+        List<ConsumerOffset> landed = new ArrayList<>(consumers.size() + 1);
+        boolean own = false;
+        for (ConsumerOffset consumer : consumers) {
+            if (consumer.pipelineId().equals(pipelineId)) {
+                landed.add(consumer.withSinkAcked(acked));
+                own = true;
+            } else {
+                landed.add(consumer);
+            }
+        }
+        if (!own) {
+            landed.add(new ConsumerOffset(pipelineId, Map.of(), acked));
+        }
+        return landed;
     }
 
     /**
@@ -104,18 +159,20 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
      *
      * <p>The consumers are asked for on their own rather than read off the whole record, because the record
      * also carries a schema history that grows for the life of the chain and this path would then pay for
-     * it on every acknowledged batch. Unchanged from last time means the slowest consumer has landed
-     * nothing since, so the write would say what the record already holds — the same round trip for nothing
-     * that the forwarding side skips. Two members acking at once can still both write; the store's own
-     * guarantee that this value only ever moves forward is what makes that harmless, and it is the same
+     * it on every acknowledged batch -- and they are asked for once per acknowledgement, the same read that
+     * decided whether the chain carries one table. Unchanged from last time means the slowest consumer has
+     * landed nothing since, so the write would say what the record already holds — the same round trip for
+     * nothing that the forwarding side skips. Two members acking at once can still both write; the store's
+     * own guarantee that this value only ever moves forward is what makes that harmless, and it is the same
      * guarantee that lets a reader and a sink write it at all.
      */
     private static void recordHowFarTheSourceHasBeenRead(
             SrsMetaStore meta,
             String miningChainId,
             ChainPosition acked,
+            List<ConsumerOffset> consumers,
             Map<String, ChainPosition> recorded) {
-        SrsDurableFrontier.safeAdvance(acked, meta.consumerOffsets(miningChainId)).ifPresent(safe -> {
+        SrsDurableFrontier.safeAdvance(acked, consumers).ifPresent(safe -> {
             if (!safe.equals(recorded.get(miningChainId))) {
                 meta.advanceSourceReadOffset(miningChainId, safe);
                 recorded.put(miningChainId, safe);

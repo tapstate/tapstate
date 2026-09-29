@@ -91,6 +91,70 @@ class MongoSrsMetaStoreIT {
     private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
 
     @Test
+    void tableAcksPersistIndependentlyAndAnOlderGenerationCannotConfirmTheNewOne() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long first = store.openEpoch(CHAIN);
+            store.selectConsumerTables(CHAIN, "pipe", List.of("orders", "customers"), first);
+
+            store.advanceTableSinkAcked(CHAIN, "pipe", "customers",
+                    new ChainPosition(new SourceOrder(first, 0), "t2"));
+            store.advanceTableSinkAcked(CHAIN, "pipe", "orders",
+                    new ChainPosition(new SourceOrder(first, 4), "t1"));
+            store.advanceTableSinkAcked(CHAIN, "pipe", "customers",
+                    new ChainPosition(new SourceOrder(first, 0), "stale"));
+
+            ConsumerOffset persisted = store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow();
+            assertThat(persisted.sinkAcked())
+                    .as("a table's acknowledgement says nothing about how far the chain's source log landed")
+                    .isNull();
+            assertThat(persisted.sinkAckedByTable()).containsExactlyInAnyOrderEntriesOf(Map.of(
+                    "orders", new ChainPosition(new SourceOrder(first, 4), "t1"),
+                    "customers", new ChainPosition(new SourceOrder(first, 0), "t2")));
+            assertThat(persisted.selectedTables()).containsExactly("customers", "orders");
+            assertThat(persisted.selectedTablesEpoch()).isEqualTo(first);
+            assertThat(store.ringDoneThrough(CHAIN, "pipe"))
+                    .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 4L, "customers", 0L));
+
+            long second = store.openEpoch(CHAIN);
+            store.selectConsumerTables(CHAIN, "pipe", List.of("orders"), second);
+            store.advanceTableSinkAcked(CHAIN, "pipe", "orders",
+                    new ChainPosition(new SourceOrder(first, 99), "old-run"));
+            store.advanceTableSinkAcked(CHAIN, "pipe", "customers",
+                    new ChainPosition(new SourceOrder(second, 7), "dropped"));
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow().sinkAckedByTable())
+                    .as("a reader of an older generation, or of a table no longer selected, confirms nothing")
+                    .isEmpty();
+
+            store.advanceTableSinkAcked(CHAIN, "pipe", "orders",
+                    new ChainPosition(new SourceOrder(second, 5), "replayed"));
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow().sinkAckedByTable())
+                    .containsExactly(Map.entry("orders", new ChainPosition(new SourceOrder(second, 5), "replayed")));
+            assertThat(store.ringDoneThrough(CHAIN, "pipe")).containsEntry("orders", 5L);
+        });
+    }
+
+    @Test
+    void aSelectionInTheSameGenerationKeepsTheAcknowledgementsOfTheTablesItKeeps() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            store.selectConsumerTables(CHAIN, "pipe", List.of("orders", "customers"), epoch);
+            store.advanceTableSinkAcked(CHAIN, "pipe", "orders", new ChainPosition(new SourceOrder(epoch, 3), "t3"));
+            store.advanceTableSinkAcked(CHAIN, "pipe", "customers",
+                    new ChainPosition(new SourceOrder(epoch, 2), "t2"));
+
+            store.selectConsumerTables(CHAIN, "pipe", List.of("orders"), epoch);
+
+            ConsumerOffset persisted = store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow();
+            assertThat(persisted.selectedTables()).containsExactly("orders");
+            assertThat(persisted.sinkAckedByTable())
+                    .as("the table it keeps keeps what it confirmed; the one it dropped is no longer waited on")
+                    .containsExactly(Map.entry("orders", new ChainPosition(new SourceOrder(epoch, 3), "t3")));
+        });
+    }
+
+    @Test
     void createSeedsAnEmptyRecordAndReadReturnsIt() {
         withStore(store -> {
             store.create(CHAIN, "7d");

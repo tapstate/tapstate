@@ -145,6 +145,40 @@ public interface SrsMetaStore {
     }
 
     /**
+     * Replaces one pipeline's table selection on the chain with {@code tables}, made in ring generation
+     * {@code epoch}: the whole set of tables this pipeline reads from the chain, across every source of the
+     * pipeline that reads it, not one source's share of them. It creates the consumer entry when the pipeline
+     * has none yet.
+     *
+     * <p>Replaced whole rather than added to, because what a chain may release is decided by who still reads
+     * which table: a table a pipeline stopped reading and was still recorded as reading would hold the chain
+     * back for an acknowledgement that is never coming. A table acknowledgement survives only for a table that
+     * stays selected in the same generation; any other one belongs to a reader that is gone, and its sequence
+     * says nothing about the ring this generation writes. The read cursor and the ring completion are left as
+     * they are. A mutate on an unseeded chain is a caller ordering error.
+     */
+    default void selectConsumerTables(String miningChainId, String pipelineId, List<String> tables, long epoch) {
+        throw new UnsupportedOperationException("this store does not record consumer table selections");
+    }
+
+    /**
+     * Records what {@code table}'s sink confirmed, in that table's own ring generation and sequence, without
+     * moving the pipeline's chain-level acknowledgement, and raises the table's {@code ringDoneThrough} to the
+     * same sequence in the same write.
+     *
+     * <p>On a chain carrying several tables the chain-level acknowledgement is released by whoever owns the
+     * chain's tail, and only once every change up to a point of the source log has landed for every table
+     * that reads it. This is the input to that release. Only ever raised: a position that does not rank after
+     * the one recorded is ignored, and so is one from a generation other than the selection's or for a table
+     * the pipeline no longer selects -- both belong to a reader that has since been replaced. A mutate on an
+     * unseeded chain is a caller ordering error.
+     */
+    default void advanceTableSinkAcked(
+            String miningChainId, String pipelineId, String table, ChainPosition position) {
+        throw new UnsupportedOperationException("this store does not record table acknowledgements");
+    }
+
+    /**
      * Per table, the ring sequence up to which this pipeline has nothing left to receive from that table's
      * change ring: the last change its sink confirmed there, or where the ring stood when the pipeline
      * arrived on it, whichever {@link #advanceSinkAcked(String, String, String, ChainPosition)} and
