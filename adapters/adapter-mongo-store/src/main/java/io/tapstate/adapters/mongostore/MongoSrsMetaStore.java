@@ -3,6 +3,7 @@ package io.tapstate.adapters.mongostore;
 import com.mongodb.ErrorCategory;
 import com.mongodb.MongoException;
 import com.mongodb.MongoWriteException;
+import com.mongodb.ReadConcern;
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
@@ -264,6 +265,16 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                 sourceReadAdvanceFilter(miningChainId, position.order()).append("epoch", epoch),
                 new Document("$set", sourceReadFields(position, Instant.now(clock)))).getMatchedCount());
         return matched == 1 || epochOf(miningChainId) == epoch;
+    }
+
+    @Override
+    public Optional<ChainPosition> durableSourceRead(String miningChainId) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Document root = StoreIo.call(() -> collection.withReadConcern(ReadConcern.MAJORITY)
+                .find(new Document("_id", miningChainId))
+                .projection(Projections.include("sourceReadOffset", "sourceReadEpoch", "sourceReadSeq"))
+                .first());
+        return root == null ? Optional.empty() : Optional.ofNullable(sourceReadFrom(root));
     }
 
     @Override

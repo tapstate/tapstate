@@ -164,8 +164,11 @@ public final class CaptureHealth {
         lastAcknowledgedAt.set(Instant.now());
     }
 
-    /** Records a position that did not reach the source, and the code it failed with when it carries one. */
-    private void acknowledgeFailed(Throwable acknowledgeFailure) {
+    /**
+     * Records a position that did not reach the source, and the code it failed with when it carries one --
+     * whether the source refused it, or the position could not even be read to be handed over.
+     */
+    void acknowledgeFailed(Throwable acknowledgeFailure) {
         acknowledgeFailures.incrementAndGet();
         lastAcknowledgeFailureCode.set(
                 acknowledgeFailure instanceof TapstateException coded ? coded.code().code() : null);

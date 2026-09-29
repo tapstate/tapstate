@@ -17,6 +17,7 @@ import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.testsupport.RequiresDocker;
+import org.bson.BsonDocument;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.MongoDBContainer;
@@ -30,6 +31,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -1042,6 +1044,46 @@ class MongoSrsMetaStoreIT {
             assertThat(store.read(CHAIN).orElseThrow().consumerOffsets()).isEmpty();
             assertThat(store.read("never_seeded")).isEmpty();
         });
+    }
+
+    /**
+     * The position a source may be told to release up to is read with a majority read concern: a write only
+     * the old primary had, rolled back in a failover, must never reach a source that would then have let go
+     * of what the rolled-back record asks for again.
+     */
+    @Test
+    void theDurablePositionIsReadWithAMajorityReadConcern() {
+        List<BsonDocument> finds = new CopyOnWriteArrayList<>();
+        CommandListener recordFinds = new CommandListener() {
+            @Override
+            public void commandStarted(CommandStartedEvent event) {
+                if ("find".equals(event.getCommandName())) {
+                    finds.add(event.getCommand().clone());
+                }
+            }
+        };
+        MongoClientSettings settings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl()))
+                .addCommandListener(recordFinds)
+                .build();
+        try (MongoClient client = MongoClients.create(settings)) {
+            MongoCollection<Document> roots = client.getDatabase("tapstate").getCollection("srs_meta");
+            MongoCollection<Document> consumers = client.getDatabase("tapstate").getCollection("srs_consumer_offsets");
+            roots.drop();
+            consumers.drop();
+            MongoSrsMetaStore store = new MongoSrsMetaStore(client, roots, consumers);
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            ChainPosition released = new ChainPosition(new SourceOrder(epoch, 3), "t3");
+            store.advanceSourceReadOffset(CHAIN, released);
+            finds.clear();
+
+            assertThat(store.durableSourceRead(CHAIN)).contains(released);
+
+            assertThat(finds).hasSize(1);
+            assertThat(finds.getFirst().getDocument("readConcern").getString("level").getValue())
+                    .isEqualTo("majority");
+        }
     }
 
     @Test

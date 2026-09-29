@@ -436,7 +436,7 @@ public final class CaptureRunUnit {
             CaptureRunSpec spec, String chainId, long epoch, String ownSeam, CaptureHealth health) {
         SharedTail tail = new SharedTail(spec, chainId, epoch, health);
         tail.open(ownSeam);
-        return tail;
+        return SourceAcknowledgements.follow(meta, chainId, tail, health);
     }
 
     /**
@@ -448,6 +448,7 @@ public final class CaptureRunUnit {
     public boolean widen(CaptureRun run) {
         Objects.requireNonNull(run, "run");
         return run.cdcSubscription()
+                .map(tail -> tail instanceof SourceAcknowledgements.Followed followed ? followed.tail() : tail)
                 .filter(SharedTail.class::isInstance)
                 .map(tail -> ((SharedTail) tail).widen())
                 .orElse(false);
@@ -482,7 +483,8 @@ public final class CaptureRunUnit {
         private final long epoch;
         private final CaptureHealth health;
         private SrsMetaStore.PhysicalSelection published;
-        private Subscription stream;
+        /** The stream running now; read without the lock, so an acknowledgement never waits on a widening. */
+        private volatile Subscription stream;
         private boolean closed;
 
         SharedTail(CaptureRunSpec spec, String chainId, long epoch, CaptureHealth health) {
@@ -569,6 +571,18 @@ public final class CaptureRunUnit {
             meta.clearPhysicalRequests(chainId, selection.tables());
         }
 
+        /**
+         * Hands {@code durable} to the stream running now. A stream replaced by a wider one is told nothing
+         * more; the one that replaced it is told the positions from then on, which only move forward.
+         */
+        @Override
+        public void acknowledge(SourcePosition durable) {
+            Subscription current = stream;
+            if (current != null) {
+                current.acknowledge(durable);
+            }
+        }
+
         @Override
         public synchronized void close() {
             closed = true;
@@ -629,13 +643,7 @@ public final class CaptureRunUnit {
             prefix.close();
             throw failure;
         }
-        return () -> {
-            try {
-                stream.close();
-            } finally {
-                prefix.close();
-            }
-        };
+        return SourceAcknowledgements.follow(meta, chainId, CdcPhase.closingWith(stream, prefix), health);
     }
 
     /**

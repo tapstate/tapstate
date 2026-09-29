@@ -200,11 +200,24 @@ public final class CdcPhase {
             prefix.close();
             throw failure;
         }
-        return () -> {
-            try {
-                stream.close();
-            } finally {
-                prefix.close();
+        return closingWith(stream, prefix);
+    }
+
+    /** {@code stream}, closing {@code prefix} with it and handing every acknowledgement straight through. */
+    static Subscription closingWith(Subscription stream, PhysicalSourcePrefix prefix) {
+        return new Subscription() {
+            @Override
+            public void acknowledge(SourcePosition durable) {
+                stream.acknowledge(durable);
+            }
+
+            @Override
+            public void close() {
+                try {
+                    stream.close();
+                } finally {
+                    prefix.close();
+                }
             }
         };
     }

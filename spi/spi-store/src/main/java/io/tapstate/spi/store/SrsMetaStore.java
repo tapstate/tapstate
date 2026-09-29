@@ -200,6 +200,19 @@ public interface SrsMetaStore {
     }
 
     /**
+     * The chain's source read offset as it stands durably, or empty for a chain with no offset or no record.
+     *
+     * <p>Read so that only a write a majority of the store's members has taken is seen. This is the value a
+     * source may be told to release its change log up to, and a write the store could still roll back in a
+     * failover must never be told to one: the source would have let go of changes that the rolled-back record
+     * then asks it for again. The default reads the record as {@link #read} does, which is durable for a store
+     * with no replicas to fail over to.
+     */
+    default Optional<ChainPosition> durableSourceRead(String miningChainId) {
+        return read(miningChainId).map(SrsMeta::sourceRead);
+    }
+
+    /**
      * Whether the chain's source read offset is one every table it carries can resume from.
      *
      * <p>An offset is trusted once it was laid down as where a stream began, released by the chain's reader
