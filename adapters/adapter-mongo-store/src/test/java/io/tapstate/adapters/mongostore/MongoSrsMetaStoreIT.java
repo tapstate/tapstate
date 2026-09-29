@@ -31,12 +31,14 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static io.tapstate.adapters.mongostore.StoredBytes.DOCUMENT_CEILING;
@@ -88,6 +90,9 @@ class MongoSrsMetaStoreIT {
 
     /** What the size case leaves between the record it seeds and the ceiling. */
     private static final int UNDER_THE_CEILING = 4_096;
+
+    /** The commands that change something at the endpoint, as a command listener names them. */
+    private static final Set<String> WRITE_COMMANDS = Set.of("insert", "update", "delete", "findAndModify");
 
     @Container
     private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
@@ -1191,6 +1196,105 @@ class MongoSrsMetaStoreIT {
         } finally {
             resumeCursorCleanup.countDown();
             dropCommitted.countDown();
+            executor.shutdownNow();
+            assertThat(executor.awaitTermination(30, TimeUnit.SECONDS)).isTrue();
+        }
+    }
+
+    /**
+     * A writer that stops for good halfway through one of its chain's writes holds up no other writer of that
+     * chain - which is what a member killed while its sinks were reporting leaves behind.
+     *
+     * <p>Whatever such a writer had open, the endpoint keeps open until a lifetime of its own runs out, a minute
+     * by default, and a write that has to wait for it waits that long. Here the writer on the member that goes
+     * stops right after its first write reaches the endpoint, and every write the writers left on the chain make
+     * afterwards - to the same pipeline's record, to another pipeline's, and to the chain's own - has to land
+     * well inside that minute.
+     */
+    @Test
+    void aWriterThatStopsHalfwayThroughAWriteHoldsUpNoOtherWriterOfItsChain() throws Exception {
+        CountDownLatch stopped = new CountDownLatch(1);
+        CountDownLatch released = new CountDownLatch(1);
+        AtomicBoolean armed = new AtomicBoolean();
+        CommandListener stopsAfterItsFirstWrite = new CommandListener() {
+            @Override
+            public void commandSucceeded(CommandSucceededEvent event) {
+                if (!WRITE_COMMANDS.contains(event.getCommandName()) || !armed.compareAndSet(true, false)) {
+                    return;
+                }
+                stopped.countDown();
+                try {
+                    // Let go only once the case is over, so its clients can close. Until then this writer is gone
+                    // as far as the endpoint and every other writer can tell.
+                    released.await(120, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        };
+        MongoClientSettings stoppingSettings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl()))
+                .addCommandListener(stopsAfterItsFirstWrite)
+                .build();
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try (MongoClient stoppingClient = MongoClients.create(stoppingSettings);
+                MongoClient survivingClient = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            MongoCollection<Document> roots = survivingClient.getDatabase("tapstate").getCollection("srs_meta");
+            MongoCollection<Document> consumers =
+                    survivingClient.getDatabase("tapstate").getCollection("srs_consumer_offsets");
+            roots.drop();
+            consumers.drop();
+            MongoSrsMetaStore stopping = new MongoSrsMetaStore(stoppingClient,
+                    stoppingClient.getDatabase("tapstate").getCollection("srs_meta"),
+                    stoppingClient.getDatabase("tapstate").getCollection("srs_consumer_offsets"));
+            MongoSrsMetaStore surviving = new MongoSrsMetaStore(survivingClient, roots, consumers);
+            surviving.create(CHAIN, null);
+            // Two pipelines on the chain, each with a record already: one whose writers are on both members, and
+            // one whose only writer is on the member that stays.
+            surviving.beginWriterRun(CHAIN, "orders-pipe", "run-1",
+                    Map.of("orders", List.of("sink#0", "sink#1")));
+            surviving.beginWriterRun(CHAIN, "audit-pipe", "run-1", Map.of("orders", List.of("sink#0")));
+
+            armed.set(true);
+            Future<?> stoppingWrite = executor.submit(() -> stopping.advanceWriter(CHAIN, "orders-pipe", "run-1",
+                    "sink#1", "orders", new WriterProgress(new SourceOrder(1L, 40L), null)));
+            assertThat(stopped.await(10, TimeUnit.SECONDS))
+                    .as("the writer on the member that goes has stopped halfway through its write")
+                    .isTrue();
+
+            ChainPosition landed = new ChainPosition(new SourceOrder(1L, 41L), "binlog:41");
+            WriterProgress progress = new WriterProgress(new SourceOrder(1L, 41L), landed);
+            Future<?> survivingWrites = executor.submit(() -> {
+                surviving.advanceWriter(CHAIN, "orders-pipe", "run-1", "sink#0", "orders", progress);
+                surviving.advanceSinkAcked(CHAIN, "orders-pipe", "orders", landed);
+                surviving.advanceRingDone(CHAIN, "orders-pipe", "orders", 42L);
+                surviving.advanceConsumerReadSeq(CHAIN, "audit-pipe", "orders", 41L);
+                surviving.markSnapshotComplete(CHAIN, "audit-pipe", "orders");
+                surviving.advanceSourceReadOffset(CHAIN, landed);
+            });
+            try {
+                survivingWrites.get(15, TimeUnit.SECONDS);
+            } catch (TimeoutException waiting) {
+                throw new AssertionError("the writers left on the chain were still waiting 15 s after another writer "
+                        + "stopped halfway through a write - on what that writer left open, which the endpoint "
+                        + "goes on holding for a minute by default", waiting);
+            }
+
+            SrsMeta record = surviving.read(CHAIN).orElseThrow();
+            assertThat(surviving.writerRun(CHAIN, "orders-pipe").orElseThrow().progress().get("orders"))
+                    .as("and what they wrote landed")
+                    .containsEntry("sink#0", progress);
+            assertThat(record.consumerOffset("orders-pipe").orElseThrow().sinkAcked()).isEqualTo(landed);
+            assertThat(surviving.ringDoneThrough(CHAIN, "orders-pipe")).containsEntry("orders", 42L);
+            ConsumerOffset audit = record.consumerOffset("audit-pipe").orElseThrow();
+            assertThat(audit.perTableSeq()).containsEntry("orders", 41L);
+            assertThat(audit.snapshotCompletedTables()).containsExactly("orders");
+            assertThat(record.sourceRead()).isEqualTo(landed);
+            assertThat(stoppingWrite.isDone())
+                    .as("while the writer that stopped is still stopped: nothing here waited for it to go on")
+                    .isFalse();
+        } finally {
+            released.countDown();
             executor.shutdownNow();
             assertThat(executor.awaitTermination(30, TimeUnit.SECONDS)).isTrue();
         }

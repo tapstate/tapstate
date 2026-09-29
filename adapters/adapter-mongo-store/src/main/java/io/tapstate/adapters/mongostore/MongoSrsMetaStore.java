@@ -55,6 +55,13 @@ import org.bson.Document;
  * remains an append-only array on the chain document, advanced by an update that keeps the newest entries
  * inside a fixed byte budget. Nullable positions are stored only when present, never as explicit nulls.
  *
+ * <p>A write to a consumer document that is already there is one write of its own, and holds nothing once
+ * it has returned. Only a write that finds no document takes a transaction, which writes the chain document
+ * too, because creating a cursor has to be set against a drop of the chain it would belong to. What a
+ * transaction has written stays held until it ends, and one whose writer stopped halfway through it - a
+ * member killed mid-write - ends only when the endpoint gives up on it, a minute later by default. Taken on
+ * every consumer write, that put every writer of a chain behind any member that died while it was writing.
+ *
  * <p>Driver IO failures are translated into coded io diagnostics, so no driver type escapes the module
  * (rule R3). A re-seed of an existing chain (which would discard its accumulated truth) and a mutate of
  * an unseeded chain are caller ordering errors — surfaced bare (an {@code IllegalStateException}), not
@@ -64,8 +71,8 @@ import org.bson.Document;
 public final class MongoSrsMetaStore implements SrsMetaStore {
 
     /**
-     * A root-local fence advanced with every split-cursor write. It has no model meaning: its write is
-     * what makes the root-existence check conflict with a concurrent lifecycle delete.
+     * A root-local fence advanced by every split-cursor write that may create the cursor. It has no model
+     * meaning: its write is what makes the root-existence check conflict with a concurrent lifecycle delete.
      */
     private static final String CONSUMER_WRITE_REVISION = "consumerWriteRevision";
 
@@ -306,11 +313,15 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      *
      * <p>Every writer of a sink reports on its own, working the table's position out from what it read back, so
      * a report worked out before a later one can land after it, carrying the older answer; written, it would
-     * move the position back, and a run replacing this one would start from there. So it is compared with the
-     * table's last one in the same transaction as the write - and every write to a chain's consumers takes the
-     * chain's revision first, so two of them never both pass the comparison over the same value. Only the
-     * table's own: each table's ring numbers its changes on its own, so one table's position says nothing about
-     * how far another's has got.
+     * move the position back, and a run replacing this one would start from there. So the write carries the
+     * comparison in its own filter, and lands only where the table's last position is earlier than this one or
+     * there is none: the comparison and the write are one act, which no report landing in between can split.
+     * Where that finds nothing, the ring place alone is raised, where the last position is this one or later.
+     * Only the table's own: each table's ring numbers its changes on its own, so one table's position says
+     * nothing about how far another's has got.
+     *
+     * <p>Where neither finds anything there is no document to compare with - or its table's position went with
+     * a rewrite in between - and the fenced path decides again, in a transaction that may create the document.
      */
     @Override
     public void advanceSinkAcked(
@@ -319,8 +330,23 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(table, "table");
         Objects.requireNonNull(position, "position");
+        Objects.requireNonNull(position.order(), "position order");
         migrateLegacyConsumers(miningChainId, true);
         Document key = consumerKey(miningChainId, pipelineId);
+        SourceOrder order = position.order();
+        if (updateExistingConsumer(miningChainId, tableAckedBefore(key, table, order),
+                sinkAckedUpdate(pipelineId, table, position))) {
+            return;
+        }
+        Document atOrAfter = tableAckedAtOrAfter(key, table, order);
+        boolean settled = order.seq() >= 0
+                ? updateExistingConsumer(miningChainId, atOrAfter,
+                        new Document("$max", new Document(PER_TABLE_RING_DONE + "." + table, order.seq())))
+                : StoreIo.call(miningChainId, () -> consumers.find(atOrAfter)
+                        .projection(Projections.include("_id")).first()) != null;
+        if (settled) {
+            return;
+        }
         writeConsumer(miningChainId, session -> {
             Document held = consumers.find(session, key)
                     .projection(Projections.include(SINK_ACKED_BY_TABLE + "." + table)).first();
@@ -375,13 +401,15 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         }
         Document filter = new Document(consumerKey(miningChainId, pipelineId))
                 .append(WRITER_RUN + ".id", runId);
-        Document[] after = new Document[1];
-        writeConsumer(miningChainId, session -> after[0] = consumers.findOneAndUpdate(session, filter,
+        // One write of its own, like every write to a document that is already there: a run's accounting is
+        // only ever advanced here, never created, so a document that is not there, or carries another run, is
+        // left as it is and answers nothing.
+        Document after = StoreIo.call(miningChainId, () -> consumers.findOneAndUpdate(filter,
                 new Document("$set", new Document(path, entry)),
                 new FindOneAndUpdateOptions()
                         .returnDocument(ReturnDocument.AFTER)
                         .projection(Projections.include(WRITER_RUN, "snapshotEpoch", "cdcStartPosition"))));
-        return after[0] == null ? Optional.empty() : writerRunOf(after[0]);
+        return after == null ? Optional.empty() : writerRunOf(after);
     }
 
     @Override
@@ -558,6 +586,32 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             update.append("$max", new Document(PER_TABLE_RING_DONE + "." + table, position.order().seq()));
         }
         return update;
+    }
+
+    /**
+     * The consumer at {@code key}, where the last acked position written for {@code table} is earlier than
+     * {@code order}, or where there is none it can be compared with - read as {@link #tableAckedFrom} reads
+     * one: a generation and a ring sequence, both numbers. Ranked by generation first, as an order is.
+     */
+    static Document tableAckedBefore(Document key, String table, SourceOrder order) {
+        String epoch = SINK_ACKED_BY_TABLE + "." + table + ".epoch";
+        String seq = SINK_ACKED_BY_TABLE + "." + table + ".ringSeq";
+        return new Document(key).append("$or", List.of(
+                new Document(epoch, new Document("$not", new Document("$type", "number"))),
+                new Document(seq, new Document("$not", new Document("$type", "number"))),
+                new Document(epoch, new Document("$lt", order.epoch())),
+                new Document(epoch, order.epoch()).append(seq, new Document("$lt", order.seq()))));
+    }
+
+    /** The rest of the consumer at {@code key}: a last acked position for {@code table} at or after {@code order}. */
+    static Document tableAckedAtOrAfter(Document key, String table, SourceOrder order) {
+        String epoch = SINK_ACKED_BY_TABLE + "." + table + ".epoch";
+        String seq = SINK_ACKED_BY_TABLE + "." + table + ".ringSeq";
+        return new Document(key)
+                .append(seq, new Document("$type", "number"))
+                .append("$or", List.of(
+                        new Document(epoch, new Document("$gt", order.epoch())),
+                        new Document(epoch, order.epoch()).append(seq, new Document("$gte", order.seq()))));
     }
 
     /** The order of the last acked position written for {@code table}, or null while none has been. */
@@ -806,24 +860,41 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     /**
-     * Writes one split consumer document after moving any embedded predecessors out of the chain record.
-     * The identity fields are insert-only so a partial update can create the cursor without replacing a
-     * different facet written concurrently by the same pipeline.
+     * Writes one split consumer document after moving any embedded predecessors out of the chain record: where
+     * it stands, in one write of its own, when it is already there, and otherwise on the fenced path, which may
+     * create it. The identity fields are insert-only so a partial update can create the cursor without replacing
+     * a different facet written concurrently by the same pipeline.
      */
     private void updateConsumer(String miningChainId, String pipelineId, Document update) {
         Objects.requireNonNull(miningChainId, "miningChainId");
         Objects.requireNonNull(pipelineId, "pipelineId");
         migrateLegacyConsumers(miningChainId, true);
+        Document key = consumerKey(miningChainId, pipelineId);
+        if (updateExistingConsumer(miningChainId, key, update)) {
+            return;
+        }
         update.append("$setOnInsert", consumerIdentity(miningChainId, pipelineId));
         writeConsumer(miningChainId, session -> consumers.updateOne(session,
-                consumerKey(miningChainId, pipelineId), update, new UpdateOptions().upsert(true)));
+                key, update, new UpdateOptions().upsert(true)));
     }
 
     /**
-     * Checks the root and writes one split cursor as a single lifecycle operation. The revision increment
-     * deliberately writes the root rather than merely reading it: a concurrent {@link #dropChain(String)}
-     * then conflicts on that document, so MongoDB serializes the two transactions. If the drop wins, a
-     * retry finds no root and refuses the mutation; if this write wins, the later drop removes its cursor.
+     * Applies {@code update} to the consumer document {@code filter} finds, in one write that holds nothing once
+     * it has returned, and answers whether it found one. It never creates one, and that is why it needs no fence
+     * against a drop of the chain: a drop before it leaves it nothing to find, a drop after it takes what it
+     * wrote, and a drop under way when it arrives is waited for and leaves it nothing either - so nothing it does
+     * can bring back a cursor a drop took away.
+     */
+    private boolean updateExistingConsumer(String miningChainId, Document filter, Document update) {
+        return StoreIo.call(miningChainId, () -> consumers.updateOne(filter, update)).getMatchedCount() > 0;
+    }
+
+    /**
+     * Checks the root and writes one split cursor - one the write may create - as a single lifecycle operation.
+     * The revision increment deliberately writes the root rather than merely reading it: a concurrent
+     * {@link #dropChain(String)} then conflicts on that document, so MongoDB serializes the two transactions.
+     * If the drop wins, a retry finds no root and refuses the mutation; if this write wins, the later drop
+     * removes its cursor.
      */
     private void writeConsumer(String miningChainId, ConsumerWrite write) {
         StoreIo.run(miningChainId, () -> {
