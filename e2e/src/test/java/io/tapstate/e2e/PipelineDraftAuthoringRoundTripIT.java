@@ -50,7 +50,7 @@ class PipelineDraftAuthoringRoundTripIT {
                     .containsEntry("mode", "dag")
                     .containsEntry("name", "Orders editor draft")
                     .containsEntry("description", "Persisted independently of compiled DSL")
-                    .containsEntry("revision", 1);
+                    .containsEntry("revision", 1L);
             assertThat(saved.get("graph")).isEqualTo(graph);
         }
     }

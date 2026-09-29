@@ -82,6 +82,8 @@ class CliFaceProjectionGatesTest {
             "source.create", "source.delete", "source.draft", "source.get", "source.list", "source.schema",
             "source.update",
             "pipeline.get", "pipeline.list", "pipeline.layout.get", "pipeline.layout.update", "pipeline.create", "pipeline.update",
+            "pipeline-draft.list", "pipeline-draft.get", "pipeline-draft.create", "pipeline-draft.replace",
+            "pipeline-draft.delete", "pipeline-draft.preview", "pipeline-draft.publish",
             "user.create", "user.passwd", "user.list");
 
     @Test

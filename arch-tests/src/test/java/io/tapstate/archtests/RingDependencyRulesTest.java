@@ -6,6 +6,8 @@ import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.domain.JavaModifier;
 import com.tngtech.archunit.core.importer.ClassFileImporter;
 import com.tngtech.archunit.core.importer.ImportOption;
+import io.tapstate.spi.store.PipelineDraft;
+import io.tapstate.spi.store.PipelineDraftMutation;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -373,24 +375,26 @@ class RingDependencyRulesTest {
     @Test
     @DisplayName("R5: rest-api depends on control-core + core + the shared message catalog (not the ports)")
     void r5_restApiLayering() {
+        DescribedPredicate<JavaClass> allowedRestApiDependencies =
+                resideInAPackage("java..")
+                        .or(resideInAPackage("io.tapstate.control.restapi.."))
+                        .or(resideInAPackage("io.tapstate.control.core.."))
+                        .or(resideInAPackage("io.tapstate.core.."))
+                        .or(resideInAPackage("io.tapstate.messages.."))
+                        .or(resideInAPackage("org.springframework.."))
+                        .or(resideInAPackage("com.fasterxml.jackson.annotation.."))
+                        .or(resideInAPackage("tools.jackson.databind.."))
+                        .or(resideInAPackage("jakarta.servlet.."))
+                        // These two framework-free SPI value types are the serialized authoring
+                        // document and mutation result, not ports. The HTTP adapter uses them only
+                        // to map the wire shape to/from the application service; it never calls a
+                        // storage interface.
+                        .or(equivalentTo(PipelineDraft.class))
+                        .or(DescribedPredicate.describe("PipelineDraft wire-model members",
+                                type -> type.getName().startsWith(PipelineDraft.class.getName() + "$")))
+                        .or(equivalentTo(PipelineDraftMutation.class));
         classes().that().resideInAPackage("io.tapstate.control.restapi..")
-                .should().onlyDependOnClassesThat().resideInAnyPackage(
-                        "java..",
-                        "io.tapstate.control.restapi..",
-                        "io.tapstate.control.core..",
-                        "io.tapstate.core..",
-                        // the shared error-code message catalog + renderer (presentation layer): rest-api
-                        // renders coded errors the same way the CLI does (its R6 grant), a leaf not a ring
-                        "io.tapstate.messages..",
-                        // Spring is permitted in the control ring (rest-api is the HTTP layer)
-                        "org.springframework..",
-                        // Jackson annotations and databind are the JSON substrate used only by the HTTP
-                        // projection to enforce request shape and response omission rules.
-                        "com.fasterxml.jackson.annotation..",
-                        "tools.jackson.databind..",
-                        // the Servlet API is the substrate the Web MVC servlet stack runs on; the HTTP
-                        // layer's interceptor and controllers read the request through it
-                        "jakarta.servlet..")
+                .should().onlyDependOnClassesThat(allowedRestApiDependencies)
                 .allowEmptyShould(true)
                 .because("the HTTP presentation adapter sits on control-core, the kernel, the shared "
                         + "message catalog and the servlet substrate; it does not reach the ports directly")
