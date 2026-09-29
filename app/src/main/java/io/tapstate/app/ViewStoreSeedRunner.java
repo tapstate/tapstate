@@ -45,11 +45,18 @@ final class ViewStoreSeedRunner implements SmartInitializingSingleton {
     private final ArtifactStore artifacts;
     private final String serverStoreUri;
     private final String tlsCaFile;
+    private final String viewsDatabase;
 
     ViewStoreSeedRunner(ArtifactStore artifacts, String serverStoreUri, String tlsCaFile) {
+        this(artifacts, serverStoreUri, tlsCaFile, ViewTargetResolver.STATE_STORE_SOURCE_ID);
+    }
+
+    ViewStoreSeedRunner(
+            ArtifactStore artifacts, String serverStoreUri, String tlsCaFile, String viewsDatabase) {
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.serverStoreUri = Objects.requireNonNull(serverStoreUri, "serverStoreUri");
         this.tlsCaFile = tlsCaFile;
+        this.viewsDatabase = Objects.requireNonNull(viewsDatabase, "viewsDatabase");
     }
 
     @Override
@@ -70,7 +77,7 @@ final class ViewStoreSeedRunner implements SmartInitializingSingleton {
         }
         SourceResource store = new SourceResource(
                 id, null, CONNECTOR,
-                Map.of("isUri", true, "uri", viewsUri(serverStoreUri)),
+                Map.of("isUri", true, "uri", viewsUri(serverStoreUri, viewsDatabase)),
                 // No mode and no tables: this is a connection supplier, not something to read from. The
                 // distinction is load-bearing -- a resource under this id that declares capture settings
                 // is refused as an authored source rather than written into.
@@ -105,7 +112,11 @@ final class ViewStoreSeedRunner implements SmartInitializingSingleton {
      * exactly as a rewritten path does.
      */
     static String viewsUri(String serverStoreUri) {
-        String database = ViewTargetResolver.STATE_STORE_SOURCE_ID;
+        return viewsUri(serverStoreUri, ViewTargetResolver.STATE_STORE_SOURCE_ID);
+    }
+
+    static String viewsUri(String serverStoreUri, String database) {
+        Objects.requireNonNull(database, "database");
         int scheme = serverStoreUri.indexOf("://");
         int authorityStart = scheme < 0 ? 0 : scheme + 3;
         int query = serverStoreUri.indexOf('?', authorityStart);

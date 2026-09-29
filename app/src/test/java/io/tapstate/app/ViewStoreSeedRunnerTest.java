@@ -49,7 +49,7 @@ class ViewStoreSeedRunnerTest {
         SourceResource source = (SourceResource)
                 store.artifacts().get(ViewTargetResolver.STATE_STORE_SOURCE_ID).orElseThrow();
         assertThat(source.config().get("uri"))
-                .isEqualTo("mongodb+srv://user:sentinel-password@atlas.example/views?authSource=metadata");
+                .isEqualTo("mongodb+srv://user:sentinel-password@atlas.example/metadata_views?authSource=metadata");
     }
 
     @Test

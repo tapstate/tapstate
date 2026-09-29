@@ -91,7 +91,7 @@ class StateDatabaseModeBoundaryIT {
         apply.apply("fixture-verified-user", List.of(new ArtifactDraft(null, accepted)));
         String resolved = routeStoredDefinition();
         assertThat(resolved).isEqualTo(mode == CloudRuntimeSettings.Mode.CLOUD
-                ? deploymentDatabase : customDatabase);
+                ? metadata + "_operator" : customDatabase);
         HazelcastInstance member = context.getBean(HazelcastInstance.class);
         member.getMap(NAMESPACE).put("same-key", "durable-value");
         try (var raw = MongoClients.create(MONGO.getReplicaSetUrl())) {
@@ -99,9 +99,11 @@ class StateDatabaseModeBoundaryIT {
                     .getCollection(SystemCollections.OPERATOR_STATE.collectionName())
                     .find(new Document("_id.ns", NAMESPACE)).first();
             assertThat(written).as("the runtime map acknowledged a real, selected-database write").isNotNull();
-            String unused = mode == CloudRuntimeSettings.Mode.CLOUD ? customDatabase : deploymentDatabase;
-            assertThat(raw.getDatabase(unused).getCollection(SystemCollections.OPERATOR_STATE.collectionName())
-                    .countDocuments(new Document("_id.ns", NAMESPACE))).isZero();
+            for (String unused : mode == CloudRuntimeSettings.Mode.CLOUD
+                    ? List.of(customDatabase, deploymentDatabase) : List.of(deploymentDatabase)) {
+                assertThat(raw.getDatabase(unused).getCollection(SystemCollections.OPERATOR_STATE.collectionName())
+                        .countDocuments(new Document("_id.ns", NAMESPACE))).isZero();
+            }
             assertThat(raw.getDatabase(metadata).getCollection(SystemCollections.OPERATOR_STATE.collectionName())
                     .countDocuments()).isZero();
         }

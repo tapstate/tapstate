@@ -89,7 +89,7 @@ actuation.from-regex-empty:
   solution: "Use a regex matching a selected source table or an earlier transform step."
 boot.cloud-atlas-uri-invalid:
   message: "The managed Cloud metadata URI is not a valid MongoDB connection string."
-  solution: "Set tapstate.cloud.atlas-uri to a mongodb:// or mongodb+srv:// connection string."
+  solution: "Set tapstate.cloud.atlas-uri to a mongodb:// or mongodb+srv:// connection string with an explicit database name short enough for the deployment-owned operator and views databases."
 boot.cloud-base-url-invalid:
   message: "The managed Cloud base URL is not a valid absolute HTTP(S) URL."
   solution: "Set tapstate.cloud.base-url to the Global Control Plane origin without credentials, a query, or a fragment."

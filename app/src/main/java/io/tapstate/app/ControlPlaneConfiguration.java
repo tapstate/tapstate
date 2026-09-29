@@ -534,7 +534,8 @@ class ControlPlaneConfiguration {
         // It changes nothing observable while the mongodb catalog marks `uri` non-secret; what it
         // removes is a seam where a later change to that marking would silently not apply here.
         return new ViewStoreSeedRunner(
-                artifactStore, cloud.metadataUri(mongoProperties.getUri()), mongoProperties.getTlsCaFile());
+                artifactStore, cloud.metadataUri(mongoProperties.getUri()), mongoProperties.getTlsCaFile(),
+                cloud.viewsDatabase(ViewTargetResolver.STATE_STORE_SOURCE_ID));
     }
 
     @Bean

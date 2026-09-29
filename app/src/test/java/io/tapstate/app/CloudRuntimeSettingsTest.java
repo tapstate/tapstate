@@ -15,6 +15,8 @@ class CloudRuntimeSettingsTest {
         assertThat(settings.mode()).isEqualTo(CloudRuntimeSettings.Mode.ON_PREM);
         assertThat(settings.metadataUri("mongodb://localhost:27017/tapstate"))
                 .isEqualTo("mongodb://localhost:27017/tapstate");
+        assertThat(settings.operatorStateDatabase("custom_operator")).isEqualTo("custom_operator");
+        assertThat(settings.viewsDatabase("custom_views")).isEqualTo("custom_views");
     }
 
     @Test
@@ -29,6 +31,8 @@ class CloudRuntimeSettingsTest {
         assertThat(settings.clusterId()).isEqualTo("configured-cluster");
         assertThat(settings.metadataUri("mongodb://localhost:27017/tapstate"))
                 .isEqualTo("mongodb+srv://cluster.example/tapstate");
+        assertThat(settings.operatorStateDatabase("onprem_operator")).isEqualTo("tapstate_operator");
+        assertThat(settings.viewsDatabase("views")).isEqualTo("tapstate_views");
         assertThat(settings.toString()).doesNotContain("secret-token", "cluster.example");
     }
 
@@ -78,6 +82,19 @@ class CloudRuntimeSettingsTest {
         assertThatThrownBy(() -> CloudRuntimeSettings.resolve(properties))
                 .isInstanceOfSatisfying(TapstateException.class,
                         error -> assertThat(error.code()).isEqualTo(BootError.CLOUD_ATLAS_URI_INVALID));
+    }
+
+    @Test
+    void cloudMetadataRequiresAnExplicitDatabaseForItsDerivedStores() {
+        CloudProperties properties = complete();
+        properties.setAtlasUri("mongodb+srv://cluster.example");
+
+        assertThatThrownBy(() -> CloudRuntimeSettings.resolve(properties))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(BootError.CLOUD_ATLAS_URI_INVALID);
+                    assertThat(error.args()).isEmpty();
+                    assertThat(error.getCause()).isNull();
+                });
     }
 
     private static CloudProperties complete() {
