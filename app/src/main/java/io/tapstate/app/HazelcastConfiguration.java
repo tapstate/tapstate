@@ -36,6 +36,7 @@ import io.tapstate.spi.store.NestDeadLetterStore;
 import io.tapstate.spi.store.OperatorStateStores;
 import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
+import io.tapstate.spi.store.StorePort;
 import io.tapstate.spi.store.ClusterIdentityStore;
 import io.tapstate.spi.store.ClusterMembershipStore;
 import io.tapstate.spi.store.WorkloadClaimStore;
@@ -50,7 +51,6 @@ import org.slf4j.LoggerFactory;
 
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -101,7 +101,7 @@ class HazelcastConfiguration {
             @Nullable OperatorStateStores operatorStateStores, @Nullable SrsLogStore srsLogStore,
             ObjectProvider<ClusterIdentityStore> clusterIdentities,
             ObjectProvider<WorkloadClaimStore> workloadClaims,
-            ClusterMembershipGate membershipGate) {
+            ClusterMembershipGate membershipGate, BootId bootId, ObjectProvider<StorePort> storePorts) {
         ClusterMemberPreflight.Identity identity =
                 ClusterMemberPreflight.validate(properties, clusterProperties, controlProperties);
         warnAboutClusterProfile(clusterProperties);
@@ -109,7 +109,7 @@ class HazelcastConfiguration {
         long sessionAskedAt = System.nanoTime();
         if (identity != null) {
             identity = ClusterMemberPreflight.reserve(identity, clusterProperties,
-                    clusterIdentities.getIfAvailable(), claimStore, UUID.randomUUID().toString());
+                    clusterIdentities.getIfAvailable(), claimStore, bootId.value());
         }
         Config config = memberConfig(properties, nestStateStore, nestSettings, srsLogStore);
         if (identity != null) {
@@ -140,6 +140,12 @@ class HazelcastConfiguration {
             member.getUserContext().put(
                     io.tapstate.runtime.engine.nest.NestMemoryBudget.SPLIT_BRAIN_PROTECTION_CONTEXT_KEY,
                     ClusterMembershipGate.PROTECTION_NAME);
+            // What a member leaves open at the store when it goes is ended by the members left, as soon as they
+            // see it go, rather than by the store once it gives up on it. See DepartedMemberTransactions.
+            StorePort store = storePorts.getIfAvailable();
+            if (store != null) {
+                endWhatDepartedMembersLeaveOpen(member, store);
+            }
         }
         // A member its own out-of-memory handling shuts down leaves this process up and serving HTTP over an
         // engine that no longer exists. Have that written down on the member: the engine reads it to fail the
@@ -224,6 +230,14 @@ class HazelcastConfiguration {
         return member;
     }
 
+    /**
+     * Has what the members {@code member} sees leave the cluster left open at {@code store} ended as soon as it sees
+     * them go.
+     */
+    static void endWhatDepartedMembersLeaveOpen(HazelcastInstance member, StorePort store) {
+        member.getCluster().addMembershipListener(new DepartedMemberTransactions(store));
+    }
+
     /** Renews and releases the claim that was acquired before this member was created. */
     @Bean(destroyMethod = "close")
     NodeSessionLease nodeSessionLease(
@@ -271,7 +285,7 @@ class HazelcastConfiguration {
         return hazelcastMember(properties, new ClusterProperties(), new ControlEndpointProperties(),
                 srsMetaStore, connectorProvisioner, snapshotBuffer, nestStateStore, nestSettings,
                 nestDeadLetterStore, null, srsLogStore, emptyProvider(), emptyProvider(),
-                new ClusterMembershipGate(new ClusterProperties()));
+                new ClusterMembershipGate(new ClusterProperties()), BootId.fresh(), emptyProvider());
     }
 
     private static <T> ObjectProvider<T> emptyProvider() {
