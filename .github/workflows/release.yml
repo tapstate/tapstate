@@ -381,7 +381,7 @@ jobs:
           pnpm lint
           pnpm --filter web i18n:check
           pnpm --filter web test
-          pnpm build
+          pnpm --filter web build --mode onprem
       - name: stage the pinned Web bundle for the Boot JAR
         run: |
           web_revision="$(git -C tapstate-web rev-parse HEAD)"
@@ -421,7 +421,8 @@ jobs:
           [[ "$files_sha256" =~ ^[0-9a-f]{64}$ ]]
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
           echo "files-sha256=$files_sha256" >> "$GITHUB_OUTPUT"
-      # The Cloud target consumes this exact Boot JAR. It does not rebuild Web or the server.
+      # The ordinary image consumes this on-prem Web-bearing Boot JAR. Cloud builds a separate
+      # Boot JAR because Vite deployment profiles are compile-time inputs.
       - uses: actions/upload-artifact@v4
         with:
           name: server-boot-jar
@@ -451,10 +452,103 @@ jobs:
           path: ${{ runner.temp }}/server-image.tar
           if-no-files-found: error
 
+  cloud-server-jar:
+    # Cloud and on-prem share the same server revision but not the same Web bundle. The Cloud Web
+    # profile consumes the Cluster cookie session and compiles its Console return URL into static
+    # assets, so reusing the ordinary Boot JAR would silently ship on-prem login behavior.
+    needs: version
+    runs-on: ubuntu-latest
+    outputs:
+      web_revision: ${{ steps.web-provenance.outputs.revision }}
+      web_files_sha256: ${{ steps.web-provenance.outputs.files-sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          persist-credentials: false
+      - name: write the release version into every file that pins one
+        run: .github/scripts/set-version.sh "${{ needs.version.outputs.version }}"
+      - uses: actions/checkout@v4
+        with:
+          repository: tapstate/tapstate-web
+          ref: ws/release-${{ needs.version.outputs.version }}
+          token: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+          path: tapstate-web
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: enable the pinned package manager
+        run: corepack enable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: tapstate-web/pnpm-lock.yaml
+      - name: build the pinned Cloud Web production bundle
+        working-directory: tapstate-web
+        env:
+          VITE_CLOUD_CONSOLE_URL: ${{ vars.VITE_CLOUD_CONSOLE_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const value = process.env.VITE_CLOUD_CONSOLE_URL?.trim()
+          const url = new URL(value)
+          if (url.protocol !== 'https:' || url.username || url.password || url.hash) process.exit(1)
+          NODE
+          pnpm install --frozen-lockfile
+          pnpm --filter web build --mode cloud
+      - name: stage the pinned Cloud Web bundle for the Boot JAR
+        shell: bash
+        run: |
+          web_revision="$(git -C tapstate-web rev-parse HEAD)"
+          bash scripts/prepare-web-assets.sh \
+            --web-root tapstate-web \
+            --web-revision "$web_revision" \
+            --tapstate-revision "${{ needs.version.outputs.sha }}" \
+            --release-version "${{ needs.version.outputs.version }}" \
+            --output app/target/generated-resources/tapstate-web
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      # Temporary until this exact SDK coordinate is published to Tapdata Nexus.
+      - uses: actions/checkout@v4
+        with:
+          repository: tapstate/tapstate-cloud
+          ref: ${{ env.CLOUD_SDK_REVISION }}
+          token: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+          path: tapstate-cloud-sdk
+          persist-credentials: false
+      - name: install the pinned Cloud SDK into the runner Maven repository
+        run: >-
+          mvn -B -f tapstate-cloud-sdk/pom.xml -pl client/java -am
+          -DskipSdkGeneration=true -DskipTests install
+      - name: build the Cloud Web-bearing Boot JAR
+        run: mvn -B -pl app -am -DskipTests package
+      - name: read the staged Cloud Web provenance
+        id: web-provenance
+        shell: bash
+        run: |
+          properties=app/target/classes/META-INF/tapstate-web.properties
+          revision="$(sed -n 's/^revision=//p' "$properties")"
+          files_sha256="$(sed -n 's/^files.sha256=//p' "$properties")"
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$files_sha256" =~ ^[0-9a-f]{64}$ ]]
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+          echo "files-sha256=$files_sha256" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cloud-server-boot-jar
+          path: app/target/app-*-boot.jar
+          if-no-files-found: error
+
   cloud-image:
     # The image is built and verified before approval, without touching ECR. Its seven connector
     # bytes and companion license texts must match the versioned lock in this release commit.
-    needs: [version, server-image]
+    needs: [version, cloud-server-jar]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -467,7 +561,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: server-boot-jar
+          name: cloud-server-boot-jar
           path: app/target
       - name: stage the exact published connector and license bytes
         env:
@@ -497,8 +591,8 @@ jobs:
             --build-context "cloud_connectors=$RUNNER_TEMP/cloud-stage" \
             --build-arg "TAPSTATE_RELEASE_VERSION=${{ needs.version.outputs.version }}" \
             --build-arg "TAPSTATE_REVISION=${{ needs.version.outputs.sha }}" \
-            --build-arg "TAPSTATE_WEB_REVISION=${{ needs.server-image.outputs.web_revision }}" \
-            --build-arg "TAPSTATE_WEB_FILES_SHA256=${{ needs.server-image.outputs.web_files_sha256 }}" \
+            --build-arg "TAPSTATE_WEB_REVISION=${{ needs.cloud-server-jar.outputs.web_revision }}" \
+            --build-arg "TAPSTATE_WEB_FILES_SHA256=${{ needs.cloud-server-jar.outputs.web_files_sha256 }}" \
             --output "type=oci,dest=$RUNNER_TEMP/cloud-image.tar" .
       - name: verify both platforms, Web provenance, and locked inputs
         id: verify
@@ -521,7 +615,7 @@ jobs:
             --output "$RUNNER_TEMP/cloud-web-provenance-check.json" \
             --version '${{ needs.version.outputs.version }}' \
             --tapstate-revision '${{ needs.version.outputs.sha }}' \
-            --web-revision '${{ needs.server-image.outputs.web_revision }}'
+            --web-revision '${{ needs.cloud-server-jar.outputs.web_revision }}'
           digest="$(jq -er '.manifests | if length == 1 then .[0].digest else error("root count") end' \
             "$RUNNER_TEMP/cloud-layout/index.json")"
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]

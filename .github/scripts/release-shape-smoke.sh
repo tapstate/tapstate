@@ -92,11 +92,14 @@ has   "and explicitly not pushed"               server-image 'push: false'
 has   "and the archive is what gets pushed"     publish      'oci-layout://'
 hasnt "the image is not rebuilt after approval" publish      'build-push-action'
 
-# The Cloud archive reuses the pinned server Boot JAR and rejects any connector, license, Web,
-# or cross-platform byte drift before approval. It must not turn into a second Web build.
-has   "the server exposes one Boot JAR to Cloud"       server-image 'name: server-boot-jar'
-has   "Cloud waits for that Boot JAR"                 cloud-image 'needs:.*server-image'
-has   "Cloud downloads that exact Boot JAR"          cloud-image 'name: server-boot-jar'
+# The two deployment profiles compile different Web authentication behavior. Both use the same
+# staging and Boot JAR path, but Cloud must never inherit the ordinary image's on-prem bundle.
+has   "the ordinary image builds the on-prem Web profile" server-image 'pnpm --filter web build --mode onprem'
+has   "Cloud builds its own Web-bearing Boot JAR"         cloud-server-jar 'name: cloud-server-boot-jar'
+has   "Cloud compiles the Cloud Web profile"              cloud-server-jar 'pnpm --filter web build --mode cloud'
+has   "Cloud compiles an explicit Console return URL"     cloud-server-jar 'VITE_CLOUD_CONSOLE_URL:'
+has   "Cloud waits for its profile-specific Boot JAR"     cloud-image 'needs:.*cloud-server-jar'
+has   "Cloud downloads that exact Boot JAR"               cloud-image 'name: cloud-server-boot-jar'
 has   "Cloud uses the checked-in connector lock"    cloud-image 'deploy/cloud/connectors.lock.json'
 has   "Cloud stages published connector bytes"      cloud-image 'stage-connectors[.]py'
 has   "Cloud builds its own OCI archive"             cloud-image 'type=oci'
@@ -292,7 +295,7 @@ has "the performance lane is judged by the same reader as every other check" \
 # from a correct one on every dispatch from `main`: same tree, same artifacts, same green run. It
 # diverges only on the case the input exists for, and there it builds the wrong line's code under the
 # right line's version number and publishes it -- with nothing red anywhere.
-for j in cli-native server-image connectors join-perf gates draft publish; do
+for j in cli-native server-image cloud-server-jar cloud-image connectors join-perf gates draft publish; do
   has "$j builds the commit the version job resolved" "$j" 'ref: \$\{\{ needs\.version\.outputs\.sha \}\}'
 done
 # And the release that comes out says so, which is the half a reader can check afterwards.

@@ -149,10 +149,20 @@ fi
 WORKFLOW="$ROOT/.github/workflows/cloud-ecr.yml"
 if grep -qE '^  workflow_dispatch:' "$WORKFLOW" \
         && grep -qE '^      tapstate_revision:' "$WORKFLOW" \
-        && grep -qE '^      web_revision:' "$WORKFLOW"; then
-    ok "the independent workflow requires exact Tapstate and Web revisions"
+        && grep -qE '^      web_revision:' "$WORKFLOW" \
+        && grep -qE '^      cloud_console_url:' "$WORKFLOW"; then
+    ok "the independent workflow requires exact revisions and a Cloud Console URL"
 else
-    bad "the independent workflow requires exact Tapstate and Web revisions" "immutable inputs are missing"
+    bad "the independent workflow requires exact revisions and a Cloud Console URL" \
+        "immutable inputs or the Cloud return URL are missing"
+fi
+# shellcheck disable=SC2016  # This asserts the workflow expression literally.
+if grep -qF 'VITE_CLOUD_CONSOLE_URL: ${{ inputs.cloud_console_url }}' "$WORKFLOW" \
+        && grep -qF 'pnpm --filter web build --mode cloud' "$WORKFLOW"; then
+    ok "the independent workflow builds the Cloud Web profile with its return URL"
+else
+    bad "the independent workflow builds the Cloud Web profile with its return URL" \
+        "the Cloud Vite mode or Cloud Console URL is missing"
 fi
 # shellcheck disable=SC2016  # This asserts the workflow expression literally.
 if grep -qF 'environment: ${{ inputs.target_environment }}' "$WORKFLOW" \

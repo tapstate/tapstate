@@ -11,6 +11,11 @@ on:
         description: Full tapstate-web commit SHA to embed
         required: true
         type: string
+      cloud_console_url:
+        description: HTTPS Cloud Console URL compiled into the Cloud Web bundle
+        required: true
+        default: https://dev.cloud.tapstate.com/
+        type: string
       target_environment:
         description: GitHub Environment holding the ECR destination and authentication
         required: true
@@ -34,11 +39,18 @@ jobs:
       tag: ${{ steps.identity.outputs.tag }}
     steps:
       - name: validate immutable inputs
+        env:
+          CLOUD_CONSOLE_URL: ${{ inputs.cloud_console_url }}
         shell: bash
         run: |
           set -euo pipefail
           [[ '${{ inputs.tapstate_revision }}' =~ ^[0-9a-f]{40}$ ]]
           [[ '${{ inputs.web_revision }}' =~ ^[0-9a-f]{40}$ ]]
+          node <<'NODE'
+          const value = process.env.CLOUD_CONSOLE_URL?.trim()
+          const url = new URL(value)
+          if (url.protocol !== 'https:' || url.username || url.password || url.hash) process.exit(1)
+          NODE
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tapstate_revision }}
@@ -59,8 +71,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: build the pinned Web production bundle
+      - name: build the pinned Cloud Web production bundle
         working-directory: tapstate-web
+        env:
+          VITE_CLOUD_CONSOLE_URL: ${{ inputs.cloud_console_url }}
         shell: bash
         run: |
           set -euo pipefail
@@ -70,7 +84,7 @@ jobs:
           pnpm lint
           pnpm --filter web i18n:check
           pnpm --filter web test
-          pnpm build
+          pnpm --filter web build --mode cloud
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
