@@ -19,6 +19,7 @@ import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SrsMetaStore;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -148,6 +149,26 @@ class StoreBackedSinkAckFactoryTest {
         // apart and neither ring is positioned by the other's.
         assertThat(store.ringDoneThrough("mc-shop", "pipe-1"))
                 .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 7L, "items", 3L));
+    }
+
+    @Test
+    void aQuietTableAckCannotAdvanceTheSharedSourcePastAnotherTablesPendingChange() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-shop", null);
+        store.advanceSourceReadOffset("mc-shop", at(-1, "t0"));
+        store.upsertConsumerOffset("mc-shop", new ConsumerOffset("pipe-1", Map.of(), null, List.of(), null, 0L));
+        SinkAck ack = new StoreBackedSinkAckFactory(
+                Map.of("orders", "mc-shop", "customers", "mc-shop"), "pipe-1")
+                .resolve(memberWith(store));
+
+        // One source log feeds both tables. The orders change at t1 is read but has not landed; the later
+        // customers change at t2 lands first. Its acknowledgement says nothing about t1, so a restart has to
+        // be able to read t1 from the source again -- and it can only do that from a position before it.
+        ack.advance("customers", at(0, "t2"));
+
+        assertThat(store.read("mc-shop").orElseThrow().sourceReadOffset())
+                .as("a physical source read offset cannot cross an unacknowledged table")
+                .isEqualTo("t0");
     }
 
     @Test
