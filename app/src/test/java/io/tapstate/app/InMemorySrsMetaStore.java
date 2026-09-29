@@ -239,9 +239,12 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     @Override
     public synchronized void startRingAfter(String miningChainId, String pipelineId, String table, long seq) {
         require(miningChainId);
-        ringDone.computeIfAbsent(miningChainId, chain -> new LinkedHashMap<>())
+        Long done = ringDone.computeIfAbsent(miningChainId, chain -> new LinkedHashMap<>())
                 .computeIfAbsent(pipelineId, pipeline -> new LinkedHashMap<>())
                 .putIfAbsent(table, seq);
+        if (done == null) {
+            advanceConsumerReadSeq(miningChainId, pipelineId, table, seq);
+        }
     }
 
     @Override

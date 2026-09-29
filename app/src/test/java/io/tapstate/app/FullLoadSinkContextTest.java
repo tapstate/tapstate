@@ -27,6 +27,38 @@ class FullLoadSinkContextTest {
     }
 
     @Test
+    void aPreExistingSnapshotSeamMakesAnSrsDisabledRecoveryANonFreshLoad() {
+        InMemoryStorePort store = store(
+                ReadMode.SNAPSHOT_AND_CDC, io.tapstate.core.model.OnFullLoad.CLEAR, false);
+        SourceResource source = StoredArtifacts.requireSource(store.artifacts(), "src");
+        String chain = SourceCaptureResolution.of(source, SourceDiscovery.model(store, source)).chainId().value();
+        store.meta().setCdcStart(chain, "pipe", "seam-0", 1L);
+
+        var consumer = store.meta().read(chain).orElseThrow().consumerOffsets().getFirst();
+        assertThat(consumer.perTableSeq()).isEmpty();
+        assertThat(consumer.sinkAcked()).isNull();
+        assertThat(consumer.snapshotCompletedTables()).isEmpty();
+
+        CapturingBinder binder = new CapturingBinder();
+        new StoreBackedDagSource(store, binder).prepareStart("pipe", "tapstate").build(null);
+        assertThat(binder.factory.fullLoad()).isFalse();
+    }
+
+    @Test
+    void aFirstStartUsesFreshnessCapturedBeforeCaptureRegistersItsCursorAndSeam() {
+        InMemoryStorePort store = store(ReadMode.SNAPSHOT_AND_CDC, io.tapstate.core.model.OnFullLoad.CLEAR);
+        CapturingBinder binder = new CapturingBinder();
+        DagSource.StartPreparation prepared = new StoreBackedDagSource(store, binder)
+                .prepareStart("pipe", "tapstate");
+        SourceResource source = StoredArtifacts.requireSource(store.artifacts(), "src");
+        String chain = SourceCaptureResolution.of(source, SourceDiscovery.model(store, source)).chainId().value();
+        store.meta().startRingAfter(chain, "pipe", "orders", 0L);
+        store.meta().setCdcStart(chain, "pipe", "seam-0", 1L);
+        prepared.build(null);
+        assertThat(binder.factory.fullLoad()).isTrue();
+    }
+
+    @Test
     void cdcOnlyOverridesClear() {
         CapturingBinder binder = bind(store(ReadMode.CDC_ONLY, io.tapstate.core.model.OnFullLoad.CLEAR));
         assertThat(binder.factory.onFullLoad()).isEqualTo(OnFullLoad.CLEAR);
@@ -58,6 +90,11 @@ class FullLoadSinkContextTest {
     }
 
     private static InMemoryStorePort store(ReadMode mode, io.tapstate.core.model.OnFullLoad policy) {
+        return store(mode, policy, true);
+    }
+
+    private static InMemoryStorePort store(
+            ReadMode mode, io.tapstate.core.model.OnFullLoad policy, boolean srsEnabled) {
         InMemoryStorePort store = new InMemoryStorePort();
         store.artifacts().save(new SourceResource("src", null, "mysql", Map.of("host", "h"), SourceMode.CDC,
                 List.of(TableRef.literal("orders")), null, null));
@@ -65,7 +102,8 @@ class FullLoadSinkContextTest {
         store.schemas().save(new DiscoveredSourceModel("src", "mysql", 0L, new SourceModel(List.of(
                 new SourceTable("orders", List.of(new SourceField("id", "bigint", TapstateType.INT64, null)),
                         List.of("id"), List.of())))));
-        store.artifacts().save(new PipelineResource("pipe", null, List.of(SourceRef.spec("src", true)), null, null,
+        store.artifacts().save(new PipelineResource(
+                "pipe", null, List.of(SourceRef.spec("src", srsEnabled)), null, null,
                 new ServeBlock.Inline(null, FromRef.literal("src"), List.of(
                         new SyncElement("sink", "dest", null, null, null, policy)), null, null),
                 new Settings(null, null, null, null, mode, null), null));

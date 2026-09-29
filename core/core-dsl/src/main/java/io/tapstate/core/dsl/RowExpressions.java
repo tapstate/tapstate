@@ -80,6 +80,10 @@ public final class RowExpressions {
     /** The name the typed row carries in the compiler's type namespace. */
     private static final String ROW_TYPE = "tapstate.Row";
 
+    /** The envelope's two row images, the only roots through which an expression reaches a column. */
+    private static final String BEFORE = "before";
+    private static final String AFTER = "after";
+
     /** The envelope's row maps before any source model is known: every column is dyn. */
     private static final CelType UNTYPED_ROW = MapType.create(SimpleType.STRING, SimpleType.DYN);
 
@@ -103,16 +107,16 @@ public final class RowExpressions {
     /** A compiler over the envelope root with an untyped row, and no result-type constraint. */
     private static CelCompilerBuilder envelope() {
         return base()
-                .addVar("before", UNTYPED_ROW)
-                .addVar("after", UNTYPED_ROW);
+                .addVar(BEFORE, UNTYPED_ROW)
+                .addVar(AFTER, UNTYPED_ROW);
     }
 
     /** The same envelope with the row carrying per-column types. */
     private static CelCompilerBuilder envelope(StructType row) {
         return base()
                 .setTypeProvider(providerOf(row))
-                .addVar("before", StructTypeReference.create(ROW_TYPE))
-                .addVar("after", StructTypeReference.create(ROW_TYPE));
+                .addVar(BEFORE, StructTypeReference.create(ROW_TYPE))
+                .addVar(AFTER, StructTypeReference.create(ROW_TYPE));
     }
 
     /** Checks a predicate; returns the diagnostic, or {@code null} when it compiles to {@code bool}. */
@@ -146,12 +150,39 @@ public final class RowExpressions {
                     CelExpr operand = select.operand();
                     if (operand.getKind() == CelExpr.ExprKind.Kind.IDENT) {
                         String root = operand.ident().name();
-                        if (root.equals("after") || root.equals("before")) {
+                        if (root.equals(AFTER) || root.equals(BEFORE)) {
                             columns.add(select.field());
                         }
                     }
                 });
         return columns;
+    }
+
+    /**
+     * The row column {@code expr} does nothing but read - {@code amount} for {@code after.amount} or
+     * {@code before.amount} - or {@code null} when it does anything more.
+     *
+     * <p>Such a value is that column's own value under another name, so whatever was declared about the
+     * column still describes it: for a decimal, the precision, scale and range a target needs before it
+     * can build the column at all. Anything beyond the read - arithmetic, a function, a presence test -
+     * produces a value nothing was declared about. An expression that does not compile answers
+     * {@code null} as well, since it cannot be shown to read anything.
+     */
+    public static String movedColumn(String expr) {
+        CelValidationResult result = VALUE.compile(expr);
+        if (result.hasError()) {
+            return null;
+        }
+        CelExpr root = checked(result).getExpr();
+        if (root.getKind() != CelExpr.ExprKind.Kind.SELECT || root.select().testOnly()) {
+            return null;
+        }
+        CelExpr operand = root.select().operand();
+        if (operand.getKind() != CelExpr.ExprKind.Kind.IDENT) {
+            return null;
+        }
+        String image = operand.ident().name();
+        return image.equals(AFTER) || image.equals(BEFORE) ? root.select().field() : null;
     }
 
     /**
@@ -311,7 +342,7 @@ public final class RowExpressions {
                 .map(call -> call.args().get(0))
                 .filter(operand -> operand.getKind() == CelExpr.ExprKind.Kind.IDENT)
                 .map(operand -> operand.ident().name())
-                .filter(root -> root.equals("after") || root.equals("before"))
+                .filter(root -> root.equals(AFTER) || root.equals(BEFORE))
                 .findFirst()
                 .map(root -> "a row field is read by name: write " + root + ".<column> rather than "
                         + root + "[...], which names no column and so cannot be checked against the "

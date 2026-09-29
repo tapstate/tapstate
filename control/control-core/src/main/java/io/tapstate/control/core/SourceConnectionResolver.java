@@ -31,9 +31,10 @@ public final class SourceConnectionResolver {
     }
 
     /**
-     * Preserves request values and restores only secret fields omitted from a redacted saved-Source view.
-     * A stored Source is eligible only when its connector agrees with the request; otherwise the request
-     * remains an ad hoc connection. A null settings map is treated as an empty request.
+     * Preserves request values and restores secret fields omitted from a redacted saved-Source view. Mongo
+     * URI userinfo is restored only when the displayed location still matches the stored URI. A stored
+     * Source is eligible only when its connector agrees with the request; otherwise the request remains an
+     * ad hoc connection. A null settings map is treated as an empty request.
      */
     public ConnectionConfig resolve(
             String connectionId, String connectorId, Map<String, Object> settings) {
@@ -51,20 +52,21 @@ public final class SourceConnectionResolver {
                             resolved.put(secret, source.config().get(secret));
                         }
                     }
+                    Object saved = source.config().get("uri");
+                    Object supplied = resolved.get("uri");
                     if ("mongodb-atlas".equals(source.connector())) {
-                        Object saved = source.config().get("uri");
-                        Object supplied = resolved.get("uri");
                         if (!resolved.containsKey("uri") && saved instanceof String) {
                             resolved.put("uri", saved);
-                        } else if (supplied instanceof String uri
-                                && MongoUriUserInfo.isRedactedDisplay(uri)) {
-                            if (!(saved instanceof String savedUri)
-                                    || !uri.equals(MongoUriUserInfo.redact(savedUri))) {
-                                throw new TapstateException(ControlError.MALFORMED_REQUEST,
-                                        Map.of("reason", "a redacted URI cannot test a different connection"), null);
-                            }
-                            resolved.put("uri", savedUri);
                         }
+                    }
+                    if (supplied instanceof String displayed
+                            && MongoUriUserInfo.isRedactedDisplay(displayed)) {
+                        if (!(saved instanceof String savedUri)
+                                || !displayed.equals(MongoUriUserInfo.redact(savedUri))) {
+                            throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                                    Map.of("reason", "a redacted URI cannot address a different connection"), null);
+                        }
+                        resolved.put("uri", savedUri);
                     }
                     return new ConnectionConfig(source.id(), connectorId, resolved);
                 })

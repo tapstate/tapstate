@@ -852,7 +852,9 @@ class CaptureRunUnitTest {
         assertThat(run.cdcSubscription()).isPresent();
 
         String chainId = run.chainId().get().value();
-        assertThat(meta.read(chainId).orElseThrow().consumerOffset("pipe-1")).isEmpty();
+        ConsumerOffset offset = meta.read(chainId).orElseThrow().consumerOffset("pipe-1").orElseThrow();
+        assertThat(offset.perTableSeq()).containsEntry("orders", -1L);
+        assertThat(offset.cdcStartPosition()).isNull();
         Ringbuffer<SrsItem> ring = hz.getRingbuffer(SrsRingbuffer.ringName(chainId, "orders"));
         assertThat(ring.tailSequence()).isEqualTo(1L);
     }
@@ -1096,6 +1098,125 @@ class CaptureRunUnitTest {
     }
 
     @Test
+    void tableRegistrationCompletesBeforeArrivalCanBePublished() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chainId = MiningChainId.resolve(config(), "chain-arrival-registration").value();
+        new CaptureRunUnit(new FakeSource(List.of(row(1)), List.of()), new SrsCoordinator(meta), meta, hz)
+                .start(specFor("pipe-owner", ReadMode.SNAPSHOT_AND_CDC, "chain-arrival-registration"),
+                        event -> { }, true);
+        // The established reader is keeping up, so only the attaching reader can constrain this write.
+        meta.advanceConsumerReadSeq(chainId, "pipe-owner", "orders", 100L);
+
+        CountDownLatch registrationReached = new CountDownLatch(1);
+        CountDownLatch allowRegistration = new CountDownLatch(1);
+        meta.pauseRegistration("pipe-joining", registrationReached, allowRegistration);
+        AtomicReference<Throwable> joiningFailure = new AtomicReference<>();
+        Thread joining = new Thread(() -> {
+            try {
+                new CaptureRunUnit(
+                        new FakeSource(List.of(row(2)), List.of()), new SrsCoordinator(meta), meta, hz)
+                        .start(specFor("pipe-joining", ReadMode.SNAPSHOT_AND_CDC,
+                                "chain-arrival-registration"), event -> { }, false);
+            } catch (Throwable failure) {
+                joiningFailure.set(failure);
+            }
+        }, "joining-consumer");
+        joining.setDaemon(true);
+
+        String ringName = SrsRingbuffer.ringName(chainId, "orders");
+        SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer(ringName));
+        AtomicReference<Throwable> beforeArrivalFailure = new AtomicReference<>();
+        AtomicReference<Throwable> afterArrivalFailure = new AtomicReference<>();
+        Thread afterArrival = null;
+        try {
+            joining.start();
+            assertThat(registrationReached.await(2, TimeUnit.SECONDS))
+                    .as("table registration is paused before it becomes visible")
+                    .isTrue();
+            assertThat(meta.ringDoneThrough(chainId, "pipe-joining"))
+                    .as("arrival cannot be published before table registration")
+                    .isEmpty();
+
+            List<Envelope> beforeArrivalChanges = new ArrayList<>();
+            for (int id = 0; id < 9; id++) {
+                beforeArrivalChanges.add(change(id));
+            }
+            CdcChain chain = new CdcChain(
+                    new SrsWriteGate(ring), meta, chainId,
+                    meta.read(chainId).orElseThrow().epoch(), 0L);
+            Thread beforeArrival = new Thread(() -> {
+                try {
+                    CdcPhase.run(new FakeSource(List.of(), beforeArrivalChanges), config(), chain,
+                            () -> meta.consumerOffsets(chainId), new CaptureHealth());
+                } catch (Throwable failure) {
+                    beforeArrivalFailure.set(failure);
+                }
+            }, "writer-before-arrival");
+            beforeArrival.start();
+            beforeArrival.join(2000);
+            assertThat(beforeArrival.isAlive()).isFalse();
+            assertThat(beforeArrivalFailure.get()).isNull();
+            assertThat(ring.tailSequence()).isEqualTo(8L);
+            assertThat(ring.headSequence()).isEqualTo(1L);
+
+            allowRegistration.countDown();
+            joining.join(2000);
+            assertThat(joining.isAlive()).isFalse();
+            assertThat(joiningFailure.get()).isNull();
+            assertThat(meta.ringDoneThrough(chainId, "pipe-joining"))
+                    .as("changes written before registration landed precede the eventual arrival")
+                    .containsExactly(Map.entry("orders", 8L));
+            assertThat(meta.read(chainId).orElseThrow()
+                    .consumerOffset("pipe-joining").orElseThrow().perTableSeq())
+                    .as("arrival lifts the conservative cursor to the same sequence")
+                    .containsEntry("orders", 8L);
+
+            List<Envelope> afterArrivalChanges = new ArrayList<>();
+            for (int id = 9; id < 18; id++) {
+                afterArrivalChanges.add(change(id));
+            }
+            afterArrival = new Thread(() -> {
+                try {
+                    CdcPhase.run(new FakeSource(List.of(), afterArrivalChanges), config(), chain,
+                            () -> meta.consumerOffsets(chainId), new CaptureHealth());
+                } catch (Throwable failure) {
+                    afterArrivalFailure.set(failure);
+                }
+            }, "writer-after-arrival");
+            afterArrival.setDaemon(true);
+            afterArrival.start();
+
+            long deadline = System.nanoTime() + Duration.ofSeconds(2).toNanos();
+            while (ring.tailSequence() < 16L && System.nanoTime() < deadline) {
+                Thread.sleep(5);
+            }
+            assertThat(ring.tailSequence()).isEqualTo(16L);
+            assertThat(afterArrival.isAlive())
+                    .as("the capacity-plus-one change waits instead of overwriting the first owed change")
+                    .isTrue();
+
+            List<Integer> received = new ArrayList<>();
+            SrsRingReader reader = SrsRingReader.resumingAfter(ring, 8L,
+                    seq -> meta.advanceConsumerReadSeq(chainId, "pipe-joining", "orders", seq));
+            assertThat(reader.fill((item, seq) -> received.add((Integer) item.after().get("id")), 1))
+                    .isOne();
+            afterArrival.join(2000);
+            assertThat(afterArrival.isAlive()).isFalse();
+            assertThat(afterArrivalFailure.get()).isNull();
+            assertThat(reader.fill((item, seq) -> received.add((Integer) item.after().get("id")), 8))
+                    .isEqualTo(8);
+            assertThat(received).containsExactly(9, 10, 11, 12, 13, 14, 15, 16, 17);
+        } finally {
+            allowRegistration.countDown();
+            meta.advanceConsumerReadSeq(chainId, "pipe-joining", "orders", Long.MAX_VALUE);
+            joining.interrupt();
+            if (afterArrival != null) {
+                afterArrival.interrupt();
+            }
+        }
+    }
+
+    @Test
     void aPipelineComingBackKeepsThePlaceItHadInTheRingRatherThanTheOneTheRingHasReached() {
         InMemoryMeta meta = new InMemoryMeta();
         String chain = MiningChainId.resolve(config(), "chain-return").value();
@@ -1104,6 +1225,7 @@ class CaptureRunUnitTest {
         SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer(SrsRingbuffer.ringName(chain, "orders")));
         long hadReached = ring.append(buffered(1));
         meta.startRingAfter(chain, "pipe-b", "orders", hadReached);
+        meta.advanceConsumerReadSeq(chain, "pipe-b", "orders", hadReached);
         ring.append(buffered(2));
         ring.append(buffered(3));
 
@@ -1113,6 +1235,9 @@ class CaptureRunUnitTest {
         assertThat(meta.ringDoneThrough(chain, "pipe-b"))
                 .as("the two changes written while it was away are still owed to it")
                 .containsExactly(Map.entry("orders", hadReached));
+        assertThat(meta.read(chain).orElseThrow().consumerOffset("pipe-b").orElseThrow().perTableSeq())
+                .as("attaching on another member leaves the returning reader's cursor advanced")
+                .containsEntry("orders", hadReached);
     }
 
     @Test
@@ -1127,6 +1252,7 @@ class CaptureRunUnitTest {
         new CaptureRunUnit(new FakeSource(List.of(), List.of()), new SrsCoordinator(meta), meta, hz)
                 .start(new CaptureRunSpec(config(), ReadMode.CDC_ONLY, "chain-cdc-start", true, "src-1",
                         "pipe-present", StartFrom.latest(), null, 0L), e -> { }, false);
+        meta.advanceConsumerReadSeq(chain, "pipe-earliest", "orders", held);
         new CaptureRunUnit(new FakeSource(List.of(), List.of()), new SrsCoordinator(meta), meta, hz)
                 .start(new CaptureRunSpec(config(), ReadMode.CDC_ONLY, "chain-cdc-start", true, "src-1",
                         "pipe-earliest", StartFrom.earliest(), null, 0L), e -> { }, false);
@@ -1137,6 +1263,10 @@ class CaptureRunUnitTest {
         assertThat(meta.ringDoneThrough(chain, "pipe-earliest"))
                 .as("a read from the earliest change is owed everything the ring holds, so nothing is marked")
                 .isEmpty();
+        assertThat(meta.read(chain).orElseThrow().consumerOffset("pipe-present").orElseThrow().perTableSeq())
+                .containsEntry("orders", held);
+        assertThat(meta.read(chain).orElseThrow().consumerOffset("pipe-earliest").orElseThrow().perTableSeq())
+                .containsEntry("orders", held);
     }
 
     private static SrsItem buffered(int id) {
@@ -1166,6 +1296,8 @@ class CaptureRunUnitTest {
         String chainId = run.chainId().orElseThrow().value();
         assertThat(hz.getRingbuffer(SrsRingbuffer.ringName(chainId, "orders")).tailSequence()).isEqualTo(0L);
         assertThat(hz.getRingbuffer(SrsRingbuffer.ringName(chainId, "customers")).tailSequence()).isEqualTo(0L);
+        assertThat(meta.read(chainId).orElseThrow().consumerOffset("pipe-1").orElseThrow().perTableSeq())
+                .containsExactlyInAnyOrderEntriesOf(Map.of("orders", -1L, "customers", -1L));
     }
 
     @Test
@@ -1273,7 +1405,7 @@ class CaptureRunUnitTest {
         InMemoryMeta many = new InMemoryMeta();
         runUnit(new FakeSource(List.of(), List.of(
                         change(10), change(11), change(12), change(13), change(14),
-                        change(15), change(16), change(17), change(18), change(19))),
+                        change(15), change(16), change(17))),
                 many)
                 .start(spec(ReadMode.CDC_ONLY, true, "chain-reads-many"), e -> { });
 
@@ -1281,9 +1413,9 @@ class CaptureRunUnitTest {
         // costs when both come from the same record.
         assertThat(many.cursorReads - few.cursorReads)
                 .as("cursor reads scale one-for-one with runs of changes")
-                .isEqualTo(8);
+                .isEqualTo(6);
         // And the whole record is fetched only by the start path, the same number of times either way:
-        // eight more runs of changes fetch it not once more.
+        // six more runs of changes fetch it not once more.
         assertThat(many.wholeRecordReads)
                 .as("whole-record fetches do not scale with the number of change runs")
                 .isEqualTo(few.wholeRecordReads);
@@ -1311,14 +1443,14 @@ class CaptureRunUnitTest {
     }
 
     @Test
-    void theHeadroomBoundTreatsAConsumerThatHasNotReadTheTableAsHavingReadNothing() {
+    void theHeadroomBoundIgnoresAConsumerWithoutThatTable() {
         InMemoryMeta meta = new InMemoryMeta();
         meta.create("chain-other", null);
-        // The consumer has a cursor on another table but none on orders: for orders it has read nothing (-1),
-        // holding the orders ring at the head until it starts reading orders.
+        // A cursor for customers alone does not say this consumer subscribes to orders.
         meta.advanceConsumerReadSeq("chain-other", "p1", "customers", 9L);
 
-        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-other"), "orders")).isEqualTo(-1L);
+        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-other"), "orders"))
+                .isEqualTo(Long.MAX_VALUE);
     }
 
     /** A mock connector: a fixed snapshot batch and a fixed change stream driven into the listener when cdc starts. */
@@ -1466,15 +1598,28 @@ class CaptureRunUnitTest {
     private static final class InMemoryMeta implements SrsMetaStore {
         /** Per chain and pipeline, how far each table's ring is done with -- kept once, never raised here. */
         final Map<String, Map<String, Long>> ringDone = new LinkedHashMap<>();
+        private volatile String pausedPipeline;
+        private volatile CountDownLatch registrationReached;
+        private volatile CountDownLatch allowRegistration;
 
-        @Override
-        public void startRingAfter(String miningChainId, String pipelineId, String table, long seq) {
-            ringDone.computeIfAbsent(miningChainId + "/" + pipelineId, key -> new LinkedHashMap<>())
-                    .putIfAbsent(table, seq);
+        void pauseRegistration(String pipelineId, CountDownLatch reached, CountDownLatch allow) {
+            pausedPipeline = pipelineId;
+            registrationReached = reached;
+            allowRegistration = allow;
         }
 
         @Override
-        public Map<String, Long> ringDoneThrough(String miningChainId, String pipelineId) {
+        public synchronized void startRingAfter(String miningChainId, String pipelineId, String table, long seq) {
+            Long done = ringDone.computeIfAbsent(miningChainId + "/" + pipelineId,
+                            key -> new LinkedHashMap<>())
+                    .putIfAbsent(table, seq);
+            if (done == null) {
+                advanceConsumerReadSeqNow(miningChainId, pipelineId, table, seq);
+            }
+        }
+
+        @Override
+        public synchronized Map<String, Long> ringDoneThrough(String miningChainId, String pipelineId) {
             return Map.copyOf(ringDone.getOrDefault(miningChainId + "/" + pipelineId, Map.of()));
         }
 
@@ -1509,13 +1654,13 @@ class CaptureRunUnitTest {
         private final Map<String, SrsMeta> records = new LinkedHashMap<>();
 
         @Override
-        public Optional<SrsMeta> read(String miningChainId) {
+        public synchronized Optional<SrsMeta> read(String miningChainId) {
             wholeRecordReads++;
             return Optional.ofNullable(records.get(miningChainId));
         }
 
         @Override
-        public List<ConsumerOffset> consumerOffsets(String miningChainId) {
+        public synchronized List<ConsumerOffset> consumerOffsets(String miningChainId) {
             cursorReads++;
             Optional<SrsMeta> record = read(miningChainId);
             // This double answers the narrow read out of the same map, so the line above counted a whole
@@ -1561,6 +1706,17 @@ class CaptureRunUnitTest {
 
         @Override
         public void advanceConsumerReadSeq(String miningChainId, String pipelineId, String table, long lastReadSeq) {
+            if (lastReadSeq == -1L && pipelineId.equals(pausedPipeline)) {
+                registrationReached.countDown();
+                awaitRoom(allowRegistration);
+            }
+            synchronized (this) {
+                advanceConsumerReadSeqNow(miningChainId, pipelineId, table, lastReadSeq);
+            }
+        }
+
+        private void advanceConsumerReadSeqNow(
+                String miningChainId, String pipelineId, String table, long lastReadSeq) {
             SrsMeta m = require(miningChainId);
             List<ConsumerOffset> next = new ArrayList<>();
             ConsumerOffset existing = null;
@@ -1572,7 +1728,7 @@ class CaptureRunUnitTest {
                 }
             }
             Map<String, Long> perTable = new LinkedHashMap<>(existing == null ? Map.of() : existing.perTableSeq());
-            perTable.put(table, lastReadSeq);
+            perTable.merge(table, lastReadSeq, Math::max);
             ChainPosition ack = existing == null ? null : existing.sinkAcked();
             next.add(new ConsumerOffset(
                     pipelineId,

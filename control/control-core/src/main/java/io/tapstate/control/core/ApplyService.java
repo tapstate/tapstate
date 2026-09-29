@@ -229,7 +229,7 @@ public final class ApplyService {
         Objects.requireNonNull(validationScope, "validationScope");
         for (Resource resource : submitted) {
             if (resource instanceof SourceResource source
-                    && SourceReadProjection.containsDisplayMarker(source.config())) {
+                    && SourceReadProjection.containsDisplayMarker(source)) {
                 throw new TapstateException(ControlError.MALFORMED_REQUEST,
                         Map.of("reason", "redacted Source settings cannot be applied; provide complete credentials"),
                         null);

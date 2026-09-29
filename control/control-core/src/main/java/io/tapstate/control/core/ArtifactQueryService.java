@@ -16,11 +16,12 @@ import java.util.Optional;
 /**
  * The resource-type-agnostic read side of the double-layer model: the store is the truth layer, and a
  * read returns an artifact from that layer — never from a local draft (server-as-truth). Public Source
- * reads omit connector config, while their stored resource, content hash, and typed internal reads are
- * unchanged. {@link ApplyService} is the write side; this is its read peer.
+ * reads omit connector config and redact Mongo URI userinfo in remaining display fields, while their
+ * stored resource, content hash, and typed internal reads remain unchanged. {@link ApplyService} is the
+ * write side; this is its read peer.
  *
- * <p>Non-Source reads remain byte-stable canonical output. A Source read is a config-omitting projection
- * produced by the same writer; the server is still the truth for its omitted configuration.
+ * <p>Non-Source reads remain byte-stable canonical output. A Source read is a display projection produced
+ * by the same writer; the server remains the truth for its omitted connection configuration.
  */
 public final class ArtifactQueryService {
 
@@ -33,7 +34,7 @@ public final class ArtifactQueryService {
         this.store = Objects.requireNonNull(store, "store");
     }
 
-    /** Returns the stored artifact for the id as its canonical form, or empty when none is stored. */
+    /** Returns the stored artifact for the id as its public canonical form, or empty when none is stored. */
     public Optional<StoredArtifact> get(String id) {
         Objects.requireNonNull(id, "id");
         return store.get(id).map(this::view);
@@ -69,8 +70,7 @@ public final class ArtifactQueryService {
 
     /**
      * Lists stored artifacts of the given {@code kind} as their canonical form; a null or blank kind is
-     * "no filter" and returns every artifact, the same as {@link #list()}. Read-by-kind lives here in
-     * the read service so a face stays a pure projection of the verb rather than filtering results itself.
+     * "no filter" and returns every artifact, the same as {@link #list()}.
      */
     public List<ArtifactListEntry> list(String kind) {
         if (kind == null || kind.isBlank()) {
@@ -80,9 +80,7 @@ public final class ArtifactQueryService {
     }
 
     private StoredArtifact view(Resource resource) {
-        // The hash comes back beside the canonical form rather than being derivable from it: it is taken
-        // over the resource's structure, so a caller holding only these bytes cannot recompute it and
-        // must hand this field straight back as a precondition.
+        // The authoritative hash travels beside the display projection and is not derived from it.
         String canonical = resource instanceof SourceResource source
                 ? sourceProjection.canonicalForRead(source) : writer.write(resource);
         return new StoredArtifact(resource.id(), resource.kind(), canonical, CanonicalHash.of(resource));

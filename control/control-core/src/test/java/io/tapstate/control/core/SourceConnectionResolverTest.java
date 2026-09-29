@@ -62,7 +62,7 @@ class SourceConnectionResolverTest {
     }
 
     @Test
-    void restoresOnlyTheMatchingAtlasUriDisplayForConnectionTests() {
+    void restoresOnlyTheMatchingAtlasUriDisplayForConnectionOperations() {
         String original = "mongodb+srv://alice:pa%40ss@cluster.example/test";
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource(
@@ -73,6 +73,8 @@ class SourceConnectionResolverTest {
         ConnectionConfig kept = resolver.resolve("atlas", "mongodb-atlas",
                 Map.of("isUri", true, "uri", "mongodb+srv://<redacted>@cluster.example/test"));
         assertThat(kept.settings()).containsEntry("uri", original);
+        assertThat(resolver.resolve("atlas", "mongodb-atlas", Map.of("isUri", true)).settings())
+                .containsEntry("uri", original);
 
         assertThatThrownBy(() -> resolver.resolve("atlas", "mongodb-atlas",
                 Map.of("isUri", true, "uri", "mongodb+srv://<redacted>@other.example/test")))
