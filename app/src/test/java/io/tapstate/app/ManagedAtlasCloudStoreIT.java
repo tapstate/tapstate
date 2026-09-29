@@ -42,37 +42,35 @@ class ManagedAtlasCloudStoreIT {
         String metadataUri = inDatabase(baseUri, metadataDatabase);
         Path plugins = work.resolve("plugins");
 
-        try {
-            try (ConfigurableApplicationContext first = start(metadataUri, plugins)) {
-                StorePort store = first.getBean(StorePort.class);
-                assertThat(first.getBean(OperatorStateStores.class).defaultDatabase())
-                        .isEqualTo(operatorDatabase);
-                store.keyedState().save(NAMESPACE, "key", "durable-state".getBytes(StandardCharsets.UTF_8));
-                SourceResource views = (SourceResource) store.artifacts().get("views").orElseThrow();
-                String viewsUri = String.valueOf(views.config().get("uri"));
-                assertThat(databaseName(viewsUri)).isEqualTo(viewsDatabase);
-                try (MongoClient viewClient = MongoClients.create(viewsUri)) {
-                    viewClient.getDatabase(viewsDatabase).getCollection("witness")
+        try (MongoClient witness = MongoClients.create(metadataUri)) {
+            try {
+                try (ConfigurableApplicationContext first = start(metadataUri, plugins)) {
+                    StorePort store = first.getBean(StorePort.class);
+                    assertThat(first.getBean(OperatorStateStores.class).defaultDatabase())
+                            .isEqualTo(operatorDatabase);
+                    store.keyedState().save(NAMESPACE, "key", "durable-state".getBytes(StandardCharsets.UTF_8));
+                    SourceResource views = (SourceResource) store.artifacts().get("views").orElseThrow();
+                    String viewsUri = String.valueOf(views.config().get("uri"));
+                    assertThat(databaseName(viewsUri)).isEqualTo(viewsDatabase);
+                    witness.getDatabase(viewsDatabase).getCollection("witness")
                             .insertOne(new Document("_id", "view-row").append("value", 1));
+                    assertEncryptedAndSeparated(witness, metadataDatabase, operatorDatabase, viewsDatabase);
                 }
-                assertEncryptedAndSeparated(metadataUri, metadataDatabase, operatorDatabase, viewsDatabase);
-            }
 
-            try (ConfigurableApplicationContext restarted = start(metadataUri, plugins)) {
-                StorePort store = restarted.getBean(StorePort.class);
-                assertThat(store.keyedState().load(NAMESPACE, "key"))
-                        .hasValueSatisfying(bytes -> assertThat(bytes)
-                                .isEqualTo("durable-state".getBytes(StandardCharsets.UTF_8)));
-                SourceResource views = (SourceResource) store.artifacts().get("views").orElseThrow();
-                String viewsUri = String.valueOf(views.config().get("uri"));
-                assertThat(databaseName(viewsUri)).isEqualTo(viewsDatabase);
-                try (MongoClient viewClient = MongoClients.create(viewsUri)) {
-                    assertThat(viewClient.getDatabase(viewsDatabase).getCollection("witness")
+                try (ConfigurableApplicationContext restarted = start(metadataUri, plugins)) {
+                    StorePort store = restarted.getBean(StorePort.class);
+                    assertThat(store.keyedState().load(NAMESPACE, "key"))
+                            .hasValueSatisfying(bytes -> assertThat(bytes)
+                                    .isEqualTo("durable-state".getBytes(StandardCharsets.UTF_8)));
+                    SourceResource views = (SourceResource) store.artifacts().get("views").orElseThrow();
+                    String viewsUri = String.valueOf(views.config().get("uri"));
+                    assertThat(databaseName(viewsUri)).isEqualTo(viewsDatabase);
+                    assertThat(witness.getDatabase(viewsDatabase).getCollection("witness")
                             .countDocuments(new Document("_id", "view-row"))).isEqualTo(1);
                 }
+            } finally {
+                dropDatabases(witness, metadataDatabase, operatorDatabase, viewsDatabase);
             }
-        } finally {
-            dropDatabases(metadataUri, metadataDatabase, operatorDatabase, viewsDatabase);
         }
     }
 
@@ -95,33 +93,29 @@ class ManagedAtlasCloudStoreIT {
     }
 
     private static void assertEncryptedAndSeparated(
-            String metadataUri, String metadataDatabase, String operatorDatabase, String viewsDatabase) {
-        try (MongoClient raw = MongoClients.create(metadataUri)) {
-            Document storedViews = raw.getDatabase(metadataDatabase)
-                    .getCollection(SystemCollections.ARTIFACTS.collectionName())
-                    .find(new Document("_id", "views")).first();
-            assertThat(storedViews).isNotNull();
-            assertThat(storedViews.get("body", Document.class).get("config"))
-                    .isInstanceOf(String.class).asString().startsWith("tscfg:1:");
-            assertThat(raw.getDatabase(operatorDatabase)
-                    .getCollection(SystemCollections.OPERATOR_STATE.collectionName())
-                    .countDocuments(new Document("_id.ns", NAMESPACE))).isEqualTo(1);
-            assertThat(raw.getDatabase(metadataDatabase)
-                    .getCollection(SystemCollections.OPERATOR_STATE.collectionName()).countDocuments()).isZero();
-            assertThat(raw.getDatabase(viewsDatabase)
-                    .getCollection(SystemCollections.ARTIFACTS.collectionName()).countDocuments()).isZero();
-        }
+            MongoClient raw, String metadataDatabase, String operatorDatabase, String viewsDatabase) {
+        Document storedViews = raw.getDatabase(metadataDatabase)
+                .getCollection(SystemCollections.ARTIFACTS.collectionName())
+                .find(new Document("_id", "views")).first();
+        assertThat(storedViews).isNotNull();
+        assertThat(storedViews.get("body", Document.class).get("config"))
+                .isInstanceOf(String.class).asString().startsWith("tscfg:1:");
+        assertThat(raw.getDatabase(operatorDatabase)
+                .getCollection(SystemCollections.OPERATOR_STATE.collectionName())
+                .countDocuments(new Document("_id.ns", NAMESPACE))).isEqualTo(1);
+        assertThat(raw.getDatabase(metadataDatabase)
+                .getCollection(SystemCollections.OPERATOR_STATE.collectionName()).countDocuments()).isZero();
+        assertThat(raw.getDatabase(viewsDatabase)
+                .getCollection(SystemCollections.ARTIFACTS.collectionName()).countDocuments()).isZero();
     }
 
     private static void dropDatabases(
-            String metadataUri, String metadataDatabase, String operatorDatabase, String viewsDatabase) {
-        try (MongoClient cleanup = MongoClients.create(metadataUri)) {
-            cleanup.getDatabase(metadataDatabase).drop();
-            cleanup.getDatabase(operatorDatabase).drop();
-            cleanup.getDatabase(viewsDatabase).drop();
-            assertThat(cleanup.listDatabaseNames().into(new ArrayList<>()))
-                    .doesNotContain(metadataDatabase, operatorDatabase, viewsDatabase);
-        }
+            MongoClient cleanup, String metadataDatabase, String operatorDatabase, String viewsDatabase) {
+        cleanup.getDatabase(metadataDatabase).drop();
+        cleanup.getDatabase(operatorDatabase).drop();
+        cleanup.getDatabase(viewsDatabase).drop();
+        assertThat(cleanup.listDatabaseNames().into(new ArrayList<>()))
+                .doesNotContain(metadataDatabase, operatorDatabase, viewsDatabase);
     }
 
     private static String databaseName(String uri) {

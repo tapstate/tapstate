@@ -20,9 +20,9 @@ class CloudStatusLifecycleWiringTest {
             .withUserConfiguration(CloudRuntimeConfiguration.class);
 
     @Test
-    void onPremAndCloudBothKeepStatusReportingOffByDefault() {
+    void onPremStaysOffAndCloudRequiresARealReporterByDefault() {
         runner.run(context -> assertThat(context.getBean(CloudStatusLifecycle.class).enabled()).isFalse());
-        cloud().run(context -> assertThat(context.getBean(CloudStatusLifecycle.class).enabled()).isFalse());
+        cloud().run(context -> assertFailure(context.getStartupFailure(), BootError.CLOUD_STATUS_SDK_REQUIRED));
     }
 
     @Test
@@ -47,19 +47,19 @@ class CloudStatusLifecycleWiringTest {
     }
 
     @Test
-    void aCloudReporterIsOnlyEnabledExplicitlyAndDoesNotSendBeforeApplicationReady() {
+    void aCloudReporterIsEnabledByModeAndDoesNotSendBeforeApplicationReady() {
         AtomicInteger sent = new AtomicInteger();
         CloudStatusReporter controlled = new CloudStatusReporter("validated-fixture-cluster",
                 () -> new CloudRuntimeStatus("fixture-version", 0, 0, null),
                 (cluster, nonce, status) -> sent.incrementAndGet(), () -> "fixture-nonce");
         cloud().withBean(CloudStatusReporter.class, () -> controlled)
-                .withPropertyValues("SDK_STATUS_SENDER_ENABLED=true")
                 .run(context -> {
                     assertThat(context).hasNotFailed();
                     assertThat(context.getBean(CloudStatusLifecycle.class).enabled()).isTrue();
                     assertThat(sent.get()).isZero();
                 });
         cloud().withBean(CloudStatusReporter.class, () -> controlled)
+                .withPropertyValues("SDK_STATUS_SENDER_ENABLED=false")
                 .run(context -> assertThat(context.getBean(CloudStatusLifecycle.class).enabled()).isFalse());
         assertThat(sent.get()).isZero();
     }

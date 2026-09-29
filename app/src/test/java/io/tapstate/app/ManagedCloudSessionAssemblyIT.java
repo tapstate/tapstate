@@ -22,6 +22,7 @@ import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
+import org.springframework.context.annotation.Primary;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
@@ -131,6 +132,7 @@ class ManagedCloudSessionAssemblyIT {
     @Import({StoreConfiguration.class, ControlPlaneConfiguration.class})
     static class Assembly {
         @Bean
+        @Primary
         CloudAuthenticationService controlledAuthentication(
                 CloudSessionStore sessions, TokenSecrets secrets, Clock clock, ClusterIdentityService clusters) {
             CloudSessionIdentity identity = new CloudSessionIdentity("https://cloud.example", "controlled-org",
@@ -144,6 +146,7 @@ class ManagedCloudSessionAssemblyIT {
         }
 
         @Bean
+        @Primary
         CloudSessionCallbackVerifier controlledCallbackVerifier() {
             return (issuer, org, cluster, method, timestamp, nonce, data, signature) ->
                     method.equals("POST") && timestamp.equals("1780000000000")

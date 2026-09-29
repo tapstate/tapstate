@@ -15,6 +15,7 @@ class CloudPropertiesBindingTest {
     private final ApplicationContextRunner runner = new ApplicationContextRunner()
             .withInitializer(context -> context.getEnvironment().getPropertySources()
                     .remove(StandardEnvironment.SYSTEM_ENVIRONMENT_PROPERTY_SOURCE_NAME))
+            .withPropertyValues("SDK_STATUS_SENDER_ENABLED=false")
             .withUserConfiguration(CloudRuntimeConfiguration.class);
 
     @Test

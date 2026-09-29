@@ -105,7 +105,7 @@ class CloudExternalConfigStartupIT {
                     .find(new Document("_id", managedView.get("_id"))).first()).isEqualTo(managedView);
             assertThat(raw.getDatabase(ignored).listCollectionNames().into(new ArrayList<>())).isEmpty();
         }
-        assertThat(cloudRequests.get()).as("no SDK adapter is installed yet").isZero();
+        awaitCloudRequests(2, restarted);
         assertSafeOutput(first, values.get("tapstate.cloud.atlas-uri"));
         assertSafeOutput(restarted, values.get("tapstate.cloud.atlas-uri"));
     }
@@ -213,13 +213,24 @@ class CloudExternalConfigStartupIT {
     }
 
     @Test
-    void anEnabledCloudStatusProcessRequiresTheActualSdkReporter() throws Exception {
+    void cloudModeUsesTheActualSdkReporterWithoutASeparateEnableFlag() throws Exception {
         String uri = MONGO.getReplicaSetUrl(uniqueDatabase("status_cloud"));
         Running running = start(Carrier.ENVIRONMENT, cloudValues(uri), uri,
-                "--SDK_STATUS_SENDER_ENABLED=true");
-        running.awaitFailure("boot.cloud-status-sdk-required");
-        assertThat(cloudRequests.get()).as("missing SDK is not replaced with successful fake heartbeats").isZero();
+                "--tapstate.connectors.seed-dir=" + CloudConnectorTestInputs.seedDirectory());
+        running.awaitHealth();
+        awaitCloudRequests(1, running);
         assertSafeOutput(running, uri);
+    }
+
+    private void awaitCloudRequests(int minimum, Running running) throws IOException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(90);
+        while (cloudRequests.get() < minimum && System.nanoTime() < deadline) {
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(20));
+        }
+        String output = running.output().replace(TOKEN, "<redacted>");
+        assertThat(cloudRequests.get())
+                .withFailMessage("the real SDK status sender did not reach Cloud:%n%s", output)
+                .isGreaterThanOrEqualTo(minimum);
     }
 
     private void assertUntouched(String database) {

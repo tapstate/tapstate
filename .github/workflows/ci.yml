@@ -38,6 +38,10 @@ permissions:
   contents: read
   pull-requests: write
 
+env:
+  # Temporary until this exact coordinate is published to the configured Nexus snapshot repository.
+  CLOUD_SDK_REVISION: d0e25b58096135f4da6b3e69df99876f49c8dc3b
+
 jobs:
   shard-plan:
     runs-on: ubuntu-latest
@@ -74,6 +78,17 @@ jobs:
       # install outputs live in its temporary repository and never enter that cache.
       - name: Seed an isolated dependency repository
         run: .github/scripts/ci-maven-cache.sh seed "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
+      - uses: actions/checkout@v4
+        with:
+          repository: tapstate/tapstate-cloud
+          ref: ${{ env.CLOUD_SDK_REVISION }}
+          token: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+          path: tapstate-cloud-sdk
+          persist-credentials: false
+      - name: Install the pinned Cloud SDK into the isolated repository
+        run: >-
+          mvn -B -f tapstate-cloud-sdk/pom.xml -pl client/java -am
+          -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipSdkGeneration=true -DskipTests install
       - name: Build the reactor without running tests
         run: mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install
       - name: Prepare pinned public inputs for Cloud startup witnesses
@@ -171,6 +186,17 @@ jobs:
 
       - name: Seed an isolated dependency repository
         run: .github/scripts/ci-maven-cache.sh seed "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
+      - uses: actions/checkout@v4
+        with:
+          repository: tapstate/tapstate-cloud
+          ref: ${{ env.CLOUD_SDK_REVISION }}
+          token: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+          path: tapstate-cloud-sdk
+          persist-credentials: false
+      - name: Install the pinned Cloud SDK into the isolated repository
+        run: >-
+          mvn -B -f tapstate-cloud-sdk/pom.xml -pl client/java -am
+          -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipSdkGeneration=true -DskipTests install
       - uses: actions/download-artifact@v4
         with:
           name: ci-shard-plan
@@ -368,6 +394,7 @@ jobs:
           shellcheck deploy/docker/dockerfile-smoke-test.sh
           shellcheck scripts/prepare-web-assets.sh
           shellcheck scripts/prepare-web-assets-smoke.sh
+          shellcheck deploy/cloud/ecr-publish.sh deploy/cloud/ecr-publish-smoke.sh
           python3 -m py_compile .github/scripts/web-provenance.py .github/scripts/web-provenance-smoke.py
           shellcheck -s sh deploy/install-site/assemble.sh
           shellcheck -s sh deploy/install-site/verify-published.sh
@@ -394,6 +421,8 @@ jobs:
         run: python3 .github/scripts/web-provenance-smoke.py
       - name: Cloud connector input and test-preparation cases
         run: python3 deploy/cloud/stage-connectors-test.py
+      - name: Cloud ECR publisher cases
+        run: bash deploy/cloud/ecr-publish-smoke.sh
       - name: install-site verifier smoke
         run: bash deploy/install-site/verify-smoke.sh
 
@@ -582,5 +611,16 @@ jobs:
           distribution: temurin
           java-version: "21"
           cache: maven
+      - uses: actions/checkout@v4
+        with:
+          repository: tapstate/tapstate-cloud
+          ref: ${{ env.CLOUD_SDK_REVISION }}
+          token: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+          path: tapstate-cloud-sdk
+          persist-credentials: false
+      - name: Install the pinned Cloud SDK into the runner repository
+        run: >-
+          mvn -B -f tapstate-cloud-sdk/pom.xml -pl client/java -am
+          -DskipSdkGeneration=true -DskipTests install
       - name: image smoke (builds the boot jar + image, then runs the black-box checks)
         run: bash deploy/docker/image-smoke.sh --build
