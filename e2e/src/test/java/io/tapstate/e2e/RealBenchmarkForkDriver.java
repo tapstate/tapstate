@@ -52,11 +52,13 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     BenchmarkMongoCommandSampler.Summary mongoCommands,
                     Map<String, Long> declaredSourceCoverage,
                     Map<String, Long> observedTargetCoverage,
-                    String checksum, long errorTotal) {
+                    String checksum, long errorTotal,
+                    Optional<BenchmarkJdiTelemetrySession.Evidence> telemetry) {
         Evidence {
             phases = List.copyOf(phases);
             declaredSourceCoverage = Map.copyOf(declaredSourceCoverage);
             observedTargetCoverage = Map.copyOf(observedTargetCoverage);
+            Objects.requireNonNull(telemetry, "telemetry availability");
         }
     }
 
@@ -65,6 +67,13 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                                BenchmarkMongoCommandSampler.Summary mongoCommands) {}
 
     private final List<Evidence> evidence = new ArrayList<>();
+    private final BenchmarkForkEnvironment.BootLauncher launcher;
+
+    RealBenchmarkForkDriver() { this(BenchmarkForkEnvironment.OwnedBoot::plain); }
+
+    RealBenchmarkForkDriver(BenchmarkForkEnvironment.BootLauncher launcher) {
+        this.launcher = Objects.requireNonNull(launcher);
+    }
 
     List<Evidence> evidence() {
         return List.copyOf(evidence);
@@ -79,7 +88,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             throw new IllegalArgumentException("a positive fork number and application JAR are required");
         }
         String forkId = workload.id() + "-" + arm + "-" + armFork;
-        try (BenchmarkForkEnvironment fork = BenchmarkForkEnvironment.open(workload, applicationJar, forkId)) {
+        try (BenchmarkForkEnvironment fork = BenchmarkForkEnvironment.open(workload, applicationJar, forkId, launcher)) {
             BenchmarkSourceLineage.Witness lineage = workload.database()
                     == BenchmarkWorkloadDefinitions.Database.MYSQL
                     ? BenchmarkSourceLineage.readMySql(fork.sourceSettings())
@@ -132,6 +141,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 awaitQuiescentRecordsOut(workload, fork.control());
                 try (TargetWatchSet targets = TargetWatchSet.open(
                         workload, workload.phases().get(phaseIndex), fork)) {
+                    fork.beginTelemetryCapture();
                     for (BenchmarkWorkloadDefinitions.Phase phase : workload.phases().subList(phaseIndex,
                             workload.phases().size())) {
                         if (phase.measured()) {
@@ -145,6 +155,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                             if (measured.isEmpty()) {
                                 throw new AssertionError("terminal arrived before any measured delivery");
                             }
+                            fork.cutoffTelemetryCapture();
                             targets.expectTerminal(workload, phase);
                             terminal = fork.runPhase(phase, true);
                             chains = captures.awaitTerminalAcks(workload, fork, positionCoverage);
@@ -190,7 +201,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                         arm, throughput, latencies, resources.peakHeapBytes(), resources.peakRssBytes());
                 Evidence run = new Evidence(forkId, workload, arm, applicationJar,
                         measured, resources, mongoCommands,
-                        declaredSourceCoverage, observedTargetCoverage, checksum, errorTotal);
+                        declaredSourceCoverage, observedTargetCoverage, checksum, errorTotal,
+                        fork.finishTelemetryCapture());
                 evidence.add(run);
                 return new PipelineBenchmarkHarness.ForkResult(performance, correctness);
             }

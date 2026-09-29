@@ -8,6 +8,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import java.nio.file.Path;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -74,6 +75,50 @@ class BenchmarkJdiTelemetryWitnessIT {
                 assertThat(session.server().isAlive()).as("failed detach leaves no orphaned owned Boot process").isFalse();
             } finally {
                 session.server().kill(); cleanup.shutdownNow();
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(Arm.class)
+    void passiveBootKeepsHealthAvailableWithoutInventingScopedCounts(Arm arm,
+            @TempDir Path directory) throws Exception {
+        String property = arm == Arm.REFERENCE ? "tapstate.e2e.jdi-cost.reference-jar"
+                : "tapstate.e2e.jdi-cost.observability-jar";
+        String database = "jdi_passive_" + arm.name().toLowerCase(Locale.ROOT);
+        String uri = SharedMongo.replicaSetUrl(database);
+        try (var artifact = BenchmarkJdiCostObserver.Artifact.open(Path.of(System.getProperty(property)), arm);
+                var session = BenchmarkJdiTelemetrySession.launch(artifact, uri, database, database + "_operator",
+                        BenchmarkJdiTelemetrySession.Mode.PASSIVE_JDWP)) {
+            ControlPlane readiness = new ControlPlane(session.server().baseUrl());
+            Await.until("passive immutable boot readiness", () -> { session.checkCapture(); return readiness.healthy(); },
+                    () -> "owned process alive=" + session.server().isAlive());
+            session.begin();
+            RunningPipeline pipeline = RunningPipeline.started(session.server(), directory);
+            Await.until("passive fixture rows reached the target",
+                    () -> pipeline.rowsAtTarget() == RunningPipeline.SEEDED_ROWS,
+                    () -> "visible rows=" + pipeline.rowsAtTarget());
+            pipeline.stopAndSettle(); session.cutoff();
+            var evidence = session.shutdownAndFinish();
+            assertThat(evidence.mode()).isEqualTo(BenchmarkJdiTelemetrySession.Mode.PASSIVE_JDWP);
+            assertThat(evidence.fullyDrained()).as("passive mode cannot prove scoped invocation drain").isFalse();
+            assertThat(evidence.unavailable()).contains(BenchmarkJdiCostObserver.Unavailable.SCOPED_COST_CAPTURE);
+            assertThat(evidence.costs()).isEmpty(); assertThat(evidence.commands()).isEmpty();
+            assertThat(evidence.callbacks()).isEmpty();
+            assertThat(evidence.handlingNanos()).as("passive measured group has no runtime breakpoint handler").isZero();
+            assertThat(evidence.windowBreakpointEvents()).isZero();
+            assertThatThrownBy(() -> evidence.entries(Unit.SYNC_COMMAND_SEND))
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("unavailable in passive mode");
+            Map<?, ?> scoped = (Map<?, ?>) PipelineBenchmarkLiveRunIT.telemetryEvidence(java.util.Optional.of(evidence))
+                    .get("scopedCosts");
+            assertThat(scoped.get("state")).isEqualTo("UNAVAILABLE");
+            if (arm == Arm.OBSERVABILITY) {
+                assertThat(evidence.drainBreakpointEvents()).isEqualTo(1);
+                assertThat(evidence.drainHandlingNanos()).isPositive();
+                assertThat(evidence.shutdown().health().quiescent()).isTrue();
+                assertThat(evidence.shutdown().health().closed()).isTrue();
+            } else {
+                assertThat(evidence.begin().health()).isNull(); assertThat(evidence.deltas()).isEmpty();
             }
         }
     }

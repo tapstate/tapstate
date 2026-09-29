@@ -89,6 +89,7 @@ final class BenchmarkJdiCostObserver {
     }
 
     enum Unavailable {
+        SCOPED_COST_CAPTURE,
         LATEST_OBSERVATION_BINARY_ENCODER,
         ASYNC_WRITE_COMPLETION,
         WIRE_DOCUMENT_COUNT,

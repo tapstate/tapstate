@@ -17,6 +17,7 @@ import static io.tapstate.e2e.BenchmarkJdiCostObserver.WireKey;
 
 /** A separate boot-process cost capture; debugger windows are never performance samples. */
 final class BenchmarkJdiTelemetrySession implements AutoCloseable {
+    enum Mode { PASSIVE_JDWP, ACTIVE_CAPTURE }
     enum Feature { LATEST_PAYLOAD, CHUNKS, ROLLUPS, EVENTS, DISPATCHER, JANITOR }
     enum Origin { WRITE, READ, CLEANUP, ROLLUP_BATCH, JANITOR_BATCH }
     enum Segment { WINDOW, CARRY_IN, DRAIN_TAIL }
@@ -42,10 +43,11 @@ final class BenchmarkJdiTelemetrySession implements AutoCloseable {
     }
     record Boundary(long atNanos, int activeScopes, int openCalls, Health health, Pending pending) { }
     /** Counts use the invocation's entry cohort; pending boundary maps account for carry-in and drain. */
-    record Evidence(BenchmarkJdiCostObserver.Arm arm, String artifactSha256, Set<Feature> available,
+    record Evidence(BenchmarkJdiCostObserver.Arm arm, String artifactSha256, Mode mode, Set<Feature> available,
             Map<CostKey, Count> costs, Map<WireCostKey, Count> commands,
             Map<CallbackKey, Count> callbacks, Boundary begin, Boundary cutoff, Boundary shutdown,
-            Map<Sink, Delta> deltas, long events, long handlingNanos, long excludedLoaders,
+            Map<Sink, Delta> deltas, long events, long handlingNanos, long windowBreakpointEvents,
+            long drainBreakpointEvents, long drainHandlingNanos, long excludedLoaders,
             boolean fullyDrained, Set<BenchmarkJdiCostObserver.Unavailable> unavailable) {
         Evidence {
             available = Set.copyOf(available); costs = Map.copyOf(costs);
@@ -53,6 +55,7 @@ final class BenchmarkJdiTelemetrySession implements AutoCloseable {
             deltas = Map.copyOf(deltas); unavailable = Set.copyOf(unavailable);
         }
         long entries(Unit unit) {
+            if (mode != Mode.ACTIVE_CAPTURE) { throw invalid("scoped cost counts are unavailable in passive mode"); }
             return costs.entrySet().stream().filter(entry -> entry.getKey().unit() == unit)
                     .mapToLong(entry -> entry.getValue().entries()).sum();
         }
@@ -86,6 +89,7 @@ final class BenchmarkJdiTelemetrySession implements AutoCloseable {
             "scanLatestAfter", "scanManifestsAfter", "reclaimChunks", "deleteIfUnchanged",
             "deleteManifestIfUnchanged", "deleteAll", "deleteIncarnation", "deleteLegacy");
     private final BenchmarkJdiCostObserver.Artifact artifact;
+    private final Mode mode;
     private final RealProcessServer server;
     private final VirtualMachine vm;
     private final Set<String> databases;
@@ -104,14 +108,15 @@ final class BenchmarkJdiTelemetrySession implements AutoCloseable {
     private final Thread pump;
     private volatile CompletableFuture<Boundary> boundaryCommand;
     private volatile boolean running = true;
-    private boolean measured, shuttingDown, disconnected;
+    private boolean measured, windowEnded, shuttingDown, disconnected;
     private long applicationLoader = -1, eventCount, handlingNanos, excludedLoaders;
+    private long windowBreakpointEvents, drainBreakpointEvents, drainHandlingNanos;
     private ObjectReference dispatcher;
     private Boundary begin, cutoff, shutdown;
 
     private BenchmarkJdiTelemetrySession(BenchmarkJdiCostObserver.Artifact artifact,
-            RealProcessServer server, VirtualMachine vm, String database) throws Exception {
-        this.artifact = artifact; this.server = server; this.vm = vm;
+            RealProcessServer server, VirtualMachine vm, String database, Mode mode) throws Exception {
+        this.artifact = artifact; this.server = server; this.vm = vm; this.mode = Objects.requireNonNull(mode);
         databases = Set.of(database, "admin", "local", "config");
         manifest();
         for (String type : specs.stream().map(Spec::type).distinct().toList()) {
@@ -132,6 +137,18 @@ final class BenchmarkJdiTelemetrySession implements AutoCloseable {
     static BenchmarkJdiTelemetrySession launch(BenchmarkJdiCostObserver.Artifact artifact,
             String storeUri, String database, Consumer<RealProcessServer> serverLaunched,
             Runnable listenerStopped) throws Exception {
+        return launch(artifact, storeUri, database, SharedMongo.OPERATOR_STATE_DATABASE,
+                Mode.ACTIVE_CAPTURE, serverLaunched, listenerStopped);
+    }
+
+    static BenchmarkJdiTelemetrySession launch(BenchmarkJdiCostObserver.Artifact artifact,
+            String storeUri, String database, String operatorStateDatabase, Mode mode) throws Exception {
+        return launch(artifact, storeUri, database, operatorStateDatabase, mode, server -> { }, () -> { });
+    }
+
+    private static BenchmarkJdiTelemetrySession launch(BenchmarkJdiCostObserver.Artifact artifact,
+            String storeUri, String database, String operatorStateDatabase, Mode mode,
+            Consumer<RealProcessServer> serverLaunched, Runnable listenerStopped) throws Exception {
         ListeningConnector connector = Bootstrap.virtualMachineManager().listeningConnectors().stream()
                 .filter(value -> value.name().equals("com.sun.jdi.SocketListen")).findFirst()
                 .orElseThrow(() -> invalid("loopback JDI connector unavailable"));
@@ -145,14 +162,14 @@ final class BenchmarkJdiTelemetrySession implements AutoCloseable {
         try {
             String address = BenchmarkJdiCostObserver.numericLoopbackDialAddress(
                     arguments.get("localAddress").value(), reported, arguments.get("port").value());
-            server = RealProcessServer.launchingWithJvmArguments(storeUri, artifact.bootJar,
+            server = RealProcessServer.launchingWithJvmArguments(storeUri, operatorStateDatabase, artifact.bootJar,
                     List.of("-agentlib:jdwp=transport=dt_socket,server=n,suspend=y,address=" + address), List.of());
             serverLaunched.accept(server);
             vm = connector.accept(arguments);
             if (!vm.canGetBytecodes()) { throw invalid("target method bytecodes unavailable"); }
             connector.stopListening(arguments); listening = false;
             listenerStopped.run();
-            return new BenchmarkJdiTelemetrySession(artifact, server, vm, database);
+            return new BenchmarkJdiTelemetrySession(artifact, server, vm, database, mode);
         } catch (Throwable problem) {
             launchFailure = problem;
             if (vm != null) { try { vm.dispose(); } catch (Exception ignored) { } }
@@ -188,7 +205,7 @@ final class BenchmarkJdiTelemetrySession implements AutoCloseable {
     void cutoff() throws Exception {
         if (begin == null || cutoff != null) { throw invalid("invalid cutoff boundary"); }
         cutoff = boundary();
-        synchronized (lock) { costs.cutoff(); commands.cutoff(); callbacks.cutoff(); }
+        synchronized (lock) { costs.cutoff(); commands.cutoff(); callbacks.cutoff(); windowEnded = true; }
         vm.resume();
     }
 
@@ -211,11 +228,14 @@ final class BenchmarkJdiTelemetrySession implements AutoCloseable {
             Map<Sink, Delta> deltas = deltas(begin.health(), shutdown == null ? null : shutdown.health());
             if (deltas.values().stream().anyMatch(value -> value.dropped() != 0 || value.failures() != 0
                     || value.timeouts() != 0)) { throw invalid("drain abandoned or failed admitted telemetry"); }
-            return new Evidence(artifact.arm, artifact.arm.sha256, available, costs.counts(), commands.counts(),
-                    callbacks.counts(), begin, cutoff, shutdown, deltas, eventCount, handlingNanos, excludedLoaders,
-                    true, EnumSet.of(BenchmarkJdiCostObserver.Unavailable.ASYNC_WRITE_COMPLETION,
-                            BenchmarkJdiCostObserver.Unavailable.WIRE_DOCUMENT_COUNT,
-                            BenchmarkJdiCostObserver.Unavailable.WIRE_BYTE_COUNT));
+            var unavailable = EnumSet.of(BenchmarkJdiCostObserver.Unavailable.ASYNC_WRITE_COMPLETION,
+                    BenchmarkJdiCostObserver.Unavailable.WIRE_DOCUMENT_COUNT,
+                    BenchmarkJdiCostObserver.Unavailable.WIRE_BYTE_COUNT);
+            if (mode == Mode.PASSIVE_JDWP) { unavailable.add(BenchmarkJdiCostObserver.Unavailable.SCOPED_COST_CAPTURE); }
+            return new Evidence(artifact.arm, artifact.arm.sha256, mode, available, costs.counts(), commands.counts(),
+                    callbacks.counts(), begin, cutoff, shutdown, deltas, eventCount, handlingNanos,
+                    windowBreakpointEvents, drainBreakpointEvents, drainHandlingNanos, excludedLoaders,
+                    mode == Mode.ACTIVE_CAPTURE, unavailable);
         }
     }
 
@@ -273,6 +293,9 @@ final class BenchmarkJdiTelemetrySession implements AutoCloseable {
         feature(Feature.EVENTS, MONGO + "MongoPipelineEventStore");
         feature(Feature.DISPATCHER, DISPATCHER);
         feature(Feature.JANITOR, APP + "ObservationJanitor");
+        if (mode == Mode.PASSIVE_JDWP) {
+            specs.removeIf(spec -> spec.kind() != Kind.CONSTRUCTOR && spec.kind() != Kind.CLOSE);
+        }
     }
 
     private void feature(Feature feature, String type) throws Exception {
@@ -365,7 +388,10 @@ final class BenchmarkJdiTelemetrySession implements AutoCloseable {
                         disconnected = true; running = false;
                     } else if (!(event instanceof VMStartEvent)) { throw invalid("unmapped boot capture event"); }
                 }
-                if (measured) { handlingNanos += System.nanoTime() - started; }
+                if (measured) {
+                    if (windowEnded) { drainHandlingNanos += System.nanoTime() - started; }
+                    else { handlingNanos += System.nanoTime() - started; }
+                }
             }
         } finally { if (!disconnected) { set.resume(); } }
     }
@@ -422,6 +448,9 @@ final class BenchmarkJdiTelemetrySession implements AutoCloseable {
 
     private void breakpoint(BreakpointEvent event) throws Exception {
         if (++eventCount > 100_000) { throw invalid("boot capture event budget exceeded"); }
+        if (measured) {
+            if (windowEnded) { drainBreakpointEvents++; } else { windowBreakpointEvents++; }
+        }
         Object mapping = event.request().getProperty("telemetry-site");
         if (!(mapping instanceof Site site)) { throw invalid("breakpoint had no closed capture mapping"); }
         Spec spec = site.spec();

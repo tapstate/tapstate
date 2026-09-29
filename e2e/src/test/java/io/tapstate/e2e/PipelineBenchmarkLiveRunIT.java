@@ -19,6 +19,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 
@@ -346,6 +347,71 @@ class PipelineBenchmarkLiveRunIT {
                 "checksum", evidence.checksum(),
                 "correctnessChecksum", correctness.checksum(),
                 "errorTotal", evidence.errorTotal());
+    }
+
+    static Map<String, Object> telemetryEvidence(Optional<BenchmarkJdiTelemetrySession.Evidence> recorded) {
+        if (recorded.isEmpty()) { return object("state", "NOT_RECORDED"); }
+        var capture = recorded.orElseThrow();
+        boolean active = capture.mode() == BenchmarkJdiTelemetrySession.Mode.ACTIVE_CAPTURE;
+        Map<String, Object> result = object("state", "RECORDED", "mode", capture.mode().name(),
+                "performanceAcceptanceEligible", false, "artifactSha256", capture.artifactSha256(),
+                "scope", "BEFORE_MEASURED_GROUP_TO_BEFORE_TERMINAL", "accounting", "INVOCATION_ENTRY_COHORTS",
+                "availableFeatures", capture.available().stream().map(Enum::name).sorted().toList(),
+                "unavailable", capture.unavailable().stream().map(Enum::name).sorted().toList(),
+                "allBreakpointEvents", capture.events(), "observerHandlingNanos", capture.handlingNanos(),
+                "observerHandlingScope", "MEASURED_GROUP_HANDLER_LOWER_BOUND",
+                "measuredGroupBreakpointEvents", capture.windowBreakpointEvents(),
+                "drainBreakpointEvents", capture.drainBreakpointEvents(),
+                "drainHandlerNanos", capture.drainHandlingNanos(),
+                "drainHandlerScope", "POST_CUTOFF_HANDLER_LOWER_BOUND", "scopedAccountingDrained", capture.fullyDrained(),
+                "begin", telemetryBoundary(capture.begin()), "cutoff", telemetryBoundary(capture.cutoff()),
+                "shutdown", capture.shutdown() == null ? object("state", "UNAVAILABLE") : telemetryBoundary(capture.shutdown()),
+                "sinkDeltas", capture.deltas().entrySet().stream().map(entry -> object(
+                        "sink", entry.getKey().name(), "coalesced", entry.getValue().coalesced(),
+                        "dropped", entry.getValue().dropped(), "successes", entry.getValue().successes(),
+                        "failures", entry.getValue().failures(), "timeouts", entry.getValue().timeouts())).toList());
+        result.put("scopedCosts", active ? object("state", "RECORDED", "costs", capture.costs().entrySet().stream()
+                .map(entry -> object("segment", entry.getKey().segment().name(), "origin", entry.getKey().origin().name(),
+                        "namespace", entry.getKey().namespace().name(), "unit", entry.getKey().unit().name(),
+                        "entries", entry.getValue().entries(), "normalReturns", entry.getValue().normalReturns())).toList(),
+                "commands", capture.commands().entrySet().stream().map(entry -> object(
+                        "segment", entry.getKey().segment().name(), "origin", entry.getKey().origin().name(),
+                        "namespace", entry.getKey().wire().namespace().name(), "operation", entry.getKey().wire().operation().name(),
+                        "entries", entry.getValue().entries(), "normalReturns", entry.getValue().normalReturns())).toList(),
+                "callbacks", capture.callbacks().entrySet().stream().map(entry -> object(
+                        "segment", entry.getKey().segment().name(), "origin", entry.getKey().origin().name(),
+                        "namespace", entry.getKey().namespace().name(), "entries", entry.getValue().entries(),
+                        "normalReturns", entry.getValue().normalReturns())).toList())
+                : object("state", "UNAVAILABLE", "reason", "PASSIVE_JDWP"));
+        return result;
+    }
+
+    private static Map<String, Object> telemetryBoundary(BenchmarkJdiTelemetrySession.Boundary boundary) {
+        Map<String, Object> pending = object(
+                "costs", boundary.pending().costs().entrySet().stream().map(entry -> object(
+                        "segment", entry.getKey().segment().name(), "origin", entry.getKey().origin().name(),
+                        "namespace", entry.getKey().namespace().name(), "unit", entry.getKey().unit().name(),
+                        "open", entry.getValue())).toList(),
+                "commands", boundary.pending().commands().entrySet().stream().map(entry -> object(
+                        "segment", entry.getKey().segment().name(), "origin", entry.getKey().origin().name(),
+                        "namespace", entry.getKey().wire().namespace().name(), "operation", entry.getKey().wire().operation().name(),
+                        "open", entry.getValue())).toList(),
+                "callbacks", boundary.pending().callbacks().entrySet().stream().map(entry -> object(
+                        "segment", entry.getKey().segment().name(), "origin", entry.getKey().origin().name(),
+                        "namespace", entry.getKey().namespace().name(), "open", entry.getValue())).toList());
+        var health = boundary.health();
+        return object("atNanos", boundary.atNanos(), "activeScopes", boundary.activeScopes(),
+                "openCalls", boundary.openCalls(), "pending", pending,
+                "health", health == null ? object("state", "UNAVAILABLE") : object(
+                        "state", "RECORDED", "dispatcherObjectIdentity", health.identity(),
+                        "startedAtObjectIdentity", health.epochIdentity(), "closed", health.closed(),
+                        "abort", health.abort(), "latestPending", health.latestPending(), "latestSlots", health.latestSlots(),
+                        "sinks", health.sinks().entrySet().stream().map(entry -> object(
+                                "sink", entry.getKey().name(), "statsObjectIdentity", entry.getValue().identity(),
+                                "coalesced", entry.getValue().coalesced(), "dropped", entry.getValue().dropped(),
+                                "successes", entry.getValue().successes(), "failures", entry.getValue().failures(),
+                                "timeouts", entry.getValue().timeouts(), "queued", entry.getValue().queued(),
+                                "inFlight", entry.getValue().inFlight())).toList()));
     }
 
     /** Diagnostic fields are additive; the performance window and its arithmetic remain unchanged. */

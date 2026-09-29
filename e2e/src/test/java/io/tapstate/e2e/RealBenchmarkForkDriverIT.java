@@ -1,5 +1,7 @@
 package io.tapstate.e2e;
 
+import com.mongodb.ConnectionString;
+import io.tapstate.core.common.JsonWriter;
 import io.tapstate.testsupport.DockerGate;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
@@ -17,6 +19,8 @@ class RealBenchmarkForkDriverIT {
     private static final String BOOT_JAR_PROPERTY = "tapstate.e2e.benchmark-smoke.jar";
     private static final String ARM_PROPERTY = "tapstate.e2e.benchmark-smoke.arm";
     private static final String FORK_PROPERTY = "tapstate.e2e.benchmark-smoke.fork";
+    private static final String MODE_PROPERTY = "tapstate.e2e.benchmark-smoke.capture-mode";
+    private enum Mode { PLAIN, PASSIVE_JDWP, ACTIVE_CAPTURE }
 
     @BeforeAll
     static void requireServices() {
@@ -44,67 +48,84 @@ class RealBenchmarkForkDriverIT {
     }
 
     private static void run(String workloadId) throws Exception {
-        RealBenchmarkForkDriver driver = new RealBenchmarkForkDriver();
         PipelineBenchmarkComparison.Arm arm = PipelineBenchmarkComparison.Arm.valueOf(
                 System.getProperty(ARM_PROPERTY, "A"));
-        int forkNumber = Integer.parseInt(System.getProperty(FORK_PROPERTY, "1"));
-        assertThat(forkNumber).as("the diagnostic fork number").isBetween(1, 5);
-        PipelineBenchmarkHarness.ForkResult result = driver.run(
-                BenchmarkWorkloadDefinitions.byId(workloadId), arm,
-                forkNumber, Path.of(System.getProperty(BOOT_JAR_PROPERTY)));
+        Mode mode = Mode.valueOf(System.getProperty(MODE_PROPERTY, "PLAIN"));
+        Path applicationJar = Path.of(System.getProperty(BOOT_JAR_PROPERTY));
+        BenchmarkJdiCostObserver.Artifact artifact = mode == Mode.PLAIN ? null : BenchmarkJdiCostObserver.Artifact.open(
+                applicationJar, arm == PipelineBenchmarkComparison.Arm.A ? BenchmarkJdiCostObserver.Arm.REFERENCE
+                        : BenchmarkJdiCostObserver.Arm.OBSERVABILITY);
+        try (artifact) {
+            RealBenchmarkForkDriver driver = mode == Mode.PLAIN ? new RealBenchmarkForkDriver()
+                    : new RealBenchmarkForkDriver((storeUri, operatorDatabase, jar) -> {
+                        if (!jar.equals(applicationJar)) { throw new AssertionError("calibration artifact changed"); }
+                        var session = BenchmarkJdiTelemetrySession.launch(artifact, storeUri,
+                                new ConnectionString(storeUri).getDatabase(), operatorDatabase,
+                                BenchmarkJdiTelemetrySession.Mode.valueOf(mode.name()));
+                        return new BenchmarkForkEnvironment.OwnedBoot(session.server(), session);
+                    });
+            int forkNumber = Integer.parseInt(System.getProperty(FORK_PROPERTY, "1"));
+            assertThat(forkNumber).as("the diagnostic fork number").isBetween(1, 5);
+            PipelineBenchmarkHarness.ForkResult result = driver.run(
+                    BenchmarkWorkloadDefinitions.byId(workloadId), arm,
+                    forkNumber, applicationJar);
 
-        BenchmarkAckOracle.verify(List.of(result.correctness()));
-        int expectedMeasured = workloadId.equals("stateful") ? 36_000 : 12_000;
-        int expectedPhysical = switch (workloadId) {
-            case "copy" -> 12_001;
-            case "stateless" -> 12_002;
-            case "stateful" -> 36_002;
-            default -> throw new AssertionError("unrecognized benchmark workload " + workloadId);
-        };
-        assertThat(result.measurement().deliveryNanos()).hasSize(expectedMeasured);
-        assertThat(result.measurement().recordsOutPerSecond()).isPositive();
-        assertThat(result.correctness().errorTotal()).isZero();
-        assertThat(driver.evidence()).singleElement().satisfies(evidence -> {
-            assertThat(evidence.phases()).hasSize(workloadId.equals("stateful") ? 2 : 1);
-            assertThat(evidence.resources().sampleCount()).isGreaterThan(1);
-            assertThat(evidence.mongoCommands().totalCommands()).isPositive();
-            assertThat(evidence.observedTargetCoverage()).hasSize(expectedPhysical);
-            assertThat(evidence.observedTargetCoverage().values()).containsOnly(1L);
-            evidence.phases().forEach(phase -> assertThat(phase.reportedRecordsOut())
-                    .as("replayed sink work remains visible as a cost beside logical delivery")
-                    .isGreaterThanOrEqualTo(phase.acknowledgedOutputs()));
-            long sourceChanges = evidence.phases().stream()
-                    .mapToLong(RealBenchmarkForkDriver.MeasuredPhase::expectedSourceChanges).sum();
-            long sourceIssueNanos = evidence.phases().stream().mapToLong(phase ->
-                    phase.sourceCompletedAtNanos() - phase.firstIssuedAtNanos()).sum();
-            assertThat(sourceIssueNanos).as("source issue time must be measured independently of target ACK")
-                    .isPositive();
-            System.out.printf("benchmark-real-fork acceptanceEvaluated=false id=%s jar=%s throughput=%s"
-                            + " sourceIssueRate=%s acked=%s reportedOut=%s"
-                            + " samples=%s mongoCommands=%s observedKeys=%s checksum=%s%n",
-                    evidence.forkId(), evidence.applicationJar(), result.measurement().recordsOutPerSecond(),
-                    sourceChanges * 1_000_000_000.0 / sourceIssueNanos,
-                    evidence.phases().stream().mapToLong(
-                            RealBenchmarkForkDriver.MeasuredPhase::acknowledgedOutputs).sum(),
-                    evidence.phases().stream().mapToLong(
-                            RealBenchmarkForkDriver.MeasuredPhase::reportedRecordsOut).sum(),
-                    evidence.resources().sampleCount(), evidence.mongoCommands().totalCommands(),
-                    evidence.observedTargetCoverage().size(), evidence.checksum());
-            evidence.phases().forEach(phase -> {
-                BenchmarkForkEnvironment.ClockAnchor anchor = phase.clockAnchor();
-                BenchmarkResourceSampler.SamplingDiagnostics sampling = phase.resources().sampling()
-                        .orElseThrow(() -> new AssertionError("a diagnostic phase needs sampling attempts"));
-                assertThat(phase.sourceBatches()).as("the retained source issue batches").isNotEmpty();
-                System.out.printf("benchmark-real-phase acceptanceEvaluated=false fork=%s phase=%s"
-                                + " anchorUtc=%s anchorBeforeNanos=%d anchorAfterNanos=%d"
-                                + " firstIssueUtcEarliest=%s firstIssueUtcLatest=%s"
-                                + " firstIssuedAtNanos=%d sourceCompletedAtNanos=%d completedAckAtNanos=%d"
-                                + " sourceBatches=%s sampling=%s%n",
-                        evidence.forkId(), phase.id(), anchor.utc(), anchor.beforeNanos(), anchor.afterNanos(),
-                        anchor.earliestUtc(phase.firstIssuedAtNanos()), anchor.latestUtc(phase.firstIssuedAtNanos()),
-                        phase.firstIssuedAtNanos(), phase.sourceCompletedAtNanos(), phase.completedAckAtNanos(),
-                        phase.sourceBatches(), sampling);
+            BenchmarkAckOracle.verify(List.of(result.correctness()));
+            int expectedMeasured = workloadId.equals("stateful") ? 36_000 : 12_000;
+            int expectedPhysical = switch (workloadId) {
+                case "copy" -> 12_001;
+                case "stateless" -> 12_002;
+                case "stateful" -> 36_002;
+                default -> throw new AssertionError("unrecognized benchmark workload " + workloadId);
+            };
+            assertThat(result.measurement().deliveryNanos()).hasSize(expectedMeasured);
+            assertThat(result.measurement().recordsOutPerSecond()).isPositive();
+            assertThat(result.correctness().errorTotal()).isZero();
+            assertThat(driver.evidence()).singleElement().satisfies(evidence -> {
+                assertThat(evidence.phases()).hasSize(workloadId.equals("stateful") ? 2 : 1);
+                assertThat(evidence.resources().sampleCount()).isGreaterThan(1);
+                assertThat(evidence.mongoCommands().totalCommands()).isPositive();
+                assertThat(evidence.observedTargetCoverage()).hasSize(expectedPhysical);
+                assertThat(evidence.observedTargetCoverage().values()).containsOnly(1L);
+                evidence.phases().forEach(phase -> assertThat(phase.reportedRecordsOut())
+                        .as("replayed sink work remains visible as a cost beside logical delivery")
+                        .isGreaterThanOrEqualTo(phase.acknowledgedOutputs()));
+                long sourceChanges = evidence.phases().stream()
+                        .mapToLong(RealBenchmarkForkDriver.MeasuredPhase::expectedSourceChanges).sum();
+                long sourceIssueNanos = evidence.phases().stream().mapToLong(phase ->
+                        phase.sourceCompletedAtNanos() - phase.firstIssuedAtNanos()).sum();
+                assertThat(sourceIssueNanos).as("source issue time must be measured independently of target ACK")
+                        .isPositive();
+                System.out.printf("benchmark-real-fork acceptanceEvaluated=false id=%s jar=%s throughput=%s"
+                                + " sourceIssueRate=%s acked=%s reportedOut=%s"
+                                + " samples=%s mongoCommands=%s observedKeys=%s checksum=%s%n",
+                        evidence.forkId(), evidence.applicationJar(), result.measurement().recordsOutPerSecond(),
+                        sourceChanges * 1_000_000_000.0 / sourceIssueNanos,
+                        evidence.phases().stream().mapToLong(
+                                RealBenchmarkForkDriver.MeasuredPhase::acknowledgedOutputs).sum(),
+                        evidence.phases().stream().mapToLong(
+                                RealBenchmarkForkDriver.MeasuredPhase::reportedRecordsOut).sum(),
+                        evidence.resources().sampleCount(), evidence.mongoCommands().totalCommands(),
+                        evidence.observedTargetCoverage().size(), evidence.checksum());
+                assertThat(evidence.telemetry().isPresent()).isEqualTo(mode != Mode.PLAIN);
+                System.out.println("benchmark-real-telemetry mode=" + mode + " evidence="
+                        + JsonWriter.write(PipelineBenchmarkLiveRunIT.telemetryEvidence(evidence.telemetry())));
+                evidence.phases().forEach(phase -> {
+                    BenchmarkForkEnvironment.ClockAnchor anchor = phase.clockAnchor();
+                    BenchmarkResourceSampler.SamplingDiagnostics sampling = phase.resources().sampling()
+                            .orElseThrow(() -> new AssertionError("a diagnostic phase needs sampling attempts"));
+                    assertThat(phase.sourceBatches()).as("the retained source issue batches").isNotEmpty();
+                    System.out.printf("benchmark-real-phase acceptanceEvaluated=false fork=%s phase=%s"
+                                    + " anchorUtc=%s anchorBeforeNanos=%d anchorAfterNanos=%d"
+                                    + " firstIssueUtcEarliest=%s firstIssueUtcLatest=%s"
+                                    + " firstIssuedAtNanos=%d sourceCompletedAtNanos=%d completedAckAtNanos=%d"
+                                    + " sourceBatches=%s sampling=%s%n",
+                            evidence.forkId(), phase.id(), anchor.utc(), anchor.beforeNanos(), anchor.afterNanos(),
+                            anchor.earliestUtc(phase.firstIssuedAtNanos()), anchor.latestUtc(phase.firstIssuedAtNanos()),
+                            phase.firstIssuedAtNanos(), phase.sourceCompletedAtNanos(), phase.completedAckAtNanos(),
+                            phase.sourceBatches(), sampling);
+                });
             });
-        });
+        }
     }
 }

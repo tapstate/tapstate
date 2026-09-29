@@ -173,8 +173,14 @@ final class RealProcessServer implements ServerHandle {
     /** Launches an explicit artifact with JVM options before the application arguments. */
     static RealProcessServer launchingWithJvmArguments(String storeUri, Path jar,
             List<String> jvmArguments, List<String> applicationArguments) {
+        return launchingWithJvmArguments(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, jar,
+                jvmArguments, applicationArguments);
+    }
+
+    static RealProcessServer launchingWithJvmArguments(String storeUri, String operatorStateDatabase, Path jar,
+            List<String> jvmArguments, List<String> applicationArguments) {
         List<String> applicationOptions = List.copyOf(applicationArguments);
-        return launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, jar, LOOPBACK,
+        return launching(storeUri, operatorStateDatabase, jar, LOOPBACK,
                 port -> applicationOptions, List.copyOf(jvmArguments));
     }
 

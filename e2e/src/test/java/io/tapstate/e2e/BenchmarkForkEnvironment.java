@@ -19,6 +19,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -28,6 +29,32 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
     private static final Duration PIPELINE_WAIT = Duration.ofMinutes(3);
     private static final Duration TARGET_WAIT = Duration.ofMinutes(5);
     private static final Duration TARGET_POLL = Duration.ofSeconds(2);
+
+    @FunctionalInterface
+    interface BootLauncher {
+        OwnedBoot launch(String storeUri, String operatorStateDatabase, Path applicationJar) throws Exception;
+    }
+
+    record OwnedBoot(RealProcessServer server, BenchmarkJdiTelemetrySession telemetry) implements AutoCloseable {
+        OwnedBoot {
+            Objects.requireNonNull(server, "owned server");
+            if (telemetry != null && telemetry.server() != server) {
+                throw new IllegalArgumentException("telemetry must own this exact server");
+            }
+        }
+        static OwnedBoot plain(String storeUri, String operatorStateDatabase, Path applicationJar) {
+            return new OwnedBoot(RealProcessServer.start(storeUri, operatorStateDatabase, applicationJar), null);
+        }
+        void check() { if (telemetry != null) { telemetry.checkCapture(); } }
+        void begin() throws Exception { if (telemetry != null) { telemetry.begin(); } }
+        void cutoff() throws Exception { if (telemetry != null) { telemetry.cutoff(); } }
+        Optional<BenchmarkJdiTelemetrySession.Evidence> finish() throws Exception {
+            return telemetry == null ? Optional.empty() : Optional.of(telemetry.shutdownAndFinish());
+        }
+        @Override public void close() {
+            if (telemetry != null) { telemetry.close(); } else { server.close(); }
+        }
+    }
 
     @FunctionalInterface
     interface BatchHook {
@@ -101,6 +128,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
     private final String managedViewsUri;
     private final String operatorStateUri;
     private final RealProcessServer server;
+    private final OwnedBoot boot;
     private final ControlPlane control;
     private final Connection source;
     private final MongoClient mongo;
@@ -111,7 +139,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
 
     private BenchmarkForkEnvironment(BenchmarkWorkloadDefinitions.Workload workload, String forkId,
             Map<String, Object> sourceSettings, String storeUri, String externalTargetUri,
-            String managedViewsUri, String operatorStateUri, RealProcessServer server,
+            String managedViewsUri, String operatorStateUri, OwnedBoot boot,
             ControlPlane control, Connection source, MongoClient mongo) {
         this.workload = workload;
         this.forkId = forkId;
@@ -120,7 +148,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
         this.externalTargetUri = externalTargetUri;
         this.managedViewsUri = managedViewsUri;
         this.operatorStateUri = operatorStateUri;
-        this.server = server;
+        this.boot = Objects.requireNonNull(boot); this.server = boot.server();
         this.control = control;
         this.source = source;
         this.mongo = mongo;
@@ -129,6 +157,11 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
     /** Opens and starts one fork, with all source rows present before the first pipeline starts. */
     static BenchmarkForkEnvironment open(BenchmarkWorkloadDefinitions.Workload workload,
             Path applicationJar, String forkId) throws Exception {
+        return open(workload, applicationJar, forkId, OwnedBoot::plain);
+    }
+
+    static BenchmarkForkEnvironment open(BenchmarkWorkloadDefinitions.Workload workload,
+            Path applicationJar, String forkId, BootLauncher launcher) throws Exception {
         Objects.requireNonNull(workload, "workload");
         Objects.requireNonNull(applicationJar, "applicationJar");
         if (!Files.isRegularFile(applicationJar) || forkId == null || forkId.isBlank()) {
@@ -147,14 +180,19 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
 
         Connection source = workload.database() == BenchmarkWorkloadDefinitions.Database.MYSQL
                 ? SharedMySql.connect(sourceSettings) : SharedPostgres.connect(sourceSettings);
-        RealProcessServer server = null;
+        OwnedBoot boot = null;
         MongoClient mongo = null;
         try {
             execute(source, workload.setupSql());
             // The view database is product-wide on this replica set. Forks run serially, and the
             // preceding application process is closed before these shared collections are dropped.
             workload.resetTargets(externalTargetUri, managedViewsUri, operatorStateUri);
-            server = RealProcessServer.start(storeUri, operatorDatabase, applicationJar);
+            boot = Objects.requireNonNull(launcher.launch(storeUri, operatorDatabase, applicationJar));
+            RealProcessServer server = boot.server();
+            OwnedBoot ownedBoot = boot;
+            ControlPlane readiness = new ControlPlane(server.baseUrl());
+            Await.until("benchmark owned boot readiness", () -> { ownedBoot.check(); return readiness.healthy(); },
+                    () -> "owned process alive=" + server.isAlive());
             ControlPlane control = new ControlPlane(server.baseUrl());
             control.bootstrapAndLogin("benchmark", "benchmark-password");
             String sourceConnector = workload.database() == BenchmarkWorkloadDefinitions.Database.MYSQL
@@ -187,10 +225,10 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
             }
             mongo = MongoClients.create(storeUri);
             return new BenchmarkForkEnvironment(workload, forkId, sourceSettings, storeUri,
-                    externalTargetUri, managedViewsUri, operatorStateUri, server, control, source, mongo);
+                    externalTargetUri, managedViewsUri, operatorStateUri, boot, control, source, mongo);
         } catch (Exception | Error failure) {
-            if (server != null) {
-                server.close();
+            if (boot != null) {
+                boot.close();
             }
             if (mongo != null) {
                 mongo.close();
@@ -241,6 +279,10 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
     RealProcessServer server() {
         return server;
     }
+
+    void beginTelemetryCapture() throws Exception { boot.begin(); }
+    void cutoffTelemetryCapture() throws Exception { boot.cutoff(); }
+    Optional<BenchmarkJdiTelemetrySession.Evidence> finishTelemetryCapture() throws Exception { return boot.finish(); }
 
     /** Issues a source-side preflight statement without advancing the frozen phase sequence. */
     void executeSource(String sql) throws Exception {
@@ -484,7 +526,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
         }
         closed = true;
         try {
-            server.close();
+            boot.close();
         } finally {
             try {
                 source.close();
