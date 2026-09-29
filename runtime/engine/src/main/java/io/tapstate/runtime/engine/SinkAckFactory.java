@@ -2,6 +2,8 @@ package io.tapstate.runtime.engine;
 
 import com.hazelcast.core.HazelcastInstance;
 import java.io.Serializable;
+import java.util.List;
+import java.util.Map;
 
 /**
  * Resolves, on the member it runs on, the {@link SinkAck} a sink advances its durable watermark through. It
@@ -24,4 +26,23 @@ public interface SinkAckFactory extends Serializable {
      * watermark through, bound to the store the member holds.
      */
     SinkAck resolve(HazelcastInstance member);
+
+    /**
+     * Gives the factory the complete writer plan while the DAG is being assembled, before it can be
+     * submitted. A durable implementation uses this hook to reject retained aggregate progress that
+     * cannot truthfully be assigned to several writers. The default has no preparation to perform.
+     */
+    default void prepareWriterPlan(Map<String, List<String>> writerIdsByStream) {
+    }
+
+    /**
+     * Binds this factory to one stable sink writer and the complete writer plan for every source stream.
+     * A store-backed implementation uses the plan to keep each writer's progress apart and expose only
+     * the minimum as the pipeline's durable position. Factories that do not persist progress need no
+     * additional binding and retain their existing behaviour.
+     */
+    default SinkAckFactory forWriter(
+            String writerId, List<String> streams, Map<String, List<String>> writerIdsByStream) {
+        return this;
+    }
 }

@@ -1274,7 +1274,7 @@ final class StoreBackedDagSource implements DagSource {
         if (readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY) {
             return SinkAckFactory.NONE;
         }
-        return new StoreBackedSinkAckFactory(chainIdByTable(pipeline), pipelineId);
+        return new StoreBackedSinkAckFactory(chainIdByTable(pipeline), pipelineId, storePort.meta());
     }
 
     /**

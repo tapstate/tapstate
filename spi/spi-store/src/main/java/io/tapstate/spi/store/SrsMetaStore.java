@@ -145,6 +145,32 @@ public interface SrsMetaStore {
     }
 
     /**
+     * Records the complete set of sink writers expected to receive each table on this mining chain.
+     * Writer-aware stores use this before acknowledgements begin so one writer cannot advance a
+     * pipeline-level position on behalf of another. A writer-aware store must refuse to expand retained
+     * aggregate progress into a plan naming multiple writers: an older record cannot prove which writer
+     * reached that position, so the pipeline has to clear its retained state and either run a full resync
+     * or explicitly accept a new incremental baseline. The default keeps older stores compatible with the
+     * single-writer contract.
+     */
+    default void configureSinkWriters(
+            String miningChainId, String pipelineId, Map<String, List<String>> writerIdsByTable) {
+    }
+
+    /**
+     * Records one writer's acknowledgement and derives the pipeline-level positions from the minimum of
+     * every writer configured for the table. The default preserves the former single-writer behaviour.
+     */
+    default void advanceSinkWriterAcked(
+            String miningChainId,
+            String pipelineId,
+            String writerId,
+            String table,
+            ChainPosition position) {
+        advanceSinkAcked(miningChainId, pipelineId, table, position);
+    }
+
+    /**
      * Per table, the ring sequence up to which this pipeline has nothing left to receive from that table's
      * change ring: the last change its sink confirmed there, or where the ring stood when the pipeline
      * arrived on it, whichever {@link #advanceSinkAcked(String, String, String, ChainPosition)} and
@@ -239,6 +265,15 @@ public interface SrsMetaStore {
      * mutate on an unseeded chain is a caller ordering error.
      */
     void markSnapshotComplete(String miningChainId, String pipelineId, String table);
+
+    /**
+     * Marks one writer's copy of a table snapshot complete. Writer-aware stores expose the table as
+     * complete only after every configured writer has marked it; the default is the single-writer case.
+     */
+    default void markSinkWriterSnapshotComplete(
+            String miningChainId, String pipelineId, String writerId, String table) {
+        markSnapshotComplete(miningChainId, pipelineId, table);
+    }
 
     /**
      * Lists the id of every mining chain that carries a cursor for {@code pipelineId} — exactly the
