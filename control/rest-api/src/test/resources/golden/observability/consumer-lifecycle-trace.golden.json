@@ -1,0 +1,23 @@
+{
+  "contractVersion": "v1",
+  "pipelineId": "orders",
+  "trace": [
+    {"action":"initial latest","requestVersion":1,"resourceVersion":0,"responseStatus":200,"disposition":"ACCEPTED","cachedViews":["latest"],"cursorViews":[],"latestCount":42},
+    {"action":"initial history","requestVersion":2,"resourceVersion":0,"responseStatus":200,"disposition":"ACCEPTED","cachedViews":["history","latest"],"cursorViews":["history"],"latestCount":42},
+    {"action":"initial events","requestVersion":3,"resourceVersion":0,"responseStatus":200,"disposition":"ACCEPTED","cachedViews":["events","history","latest"],"cursorViews":["events","history"],"latestCount":42},
+    {"action":"initial logs","requestVersion":4,"resourceVersion":0,"responseStatus":200,"disposition":"ACCEPTED","cachedViews":["events","history","latest","logs"],"cursorViews":["events","history"],"latestCount":42},
+    {"action":"accepted start","requestVersion":null,"resourceVersion":1,"responseStatus":null,"disposition":"INVALIDATED","cachedViews":[],"cursorViews":[],"latestCount":null},
+    {"action":"await current publication","requestVersion":6,"resourceVersion":1,"responseStatus":404,"disposition":"PENDING","cachedViews":[],"cursorViews":[],"latestCount":null},
+    {"action":"late pre-start response","requestVersion":5,"resourceVersion":1,"responseStatus":200,"disposition":"IGNORED","cachedViews":[],"cursorViews":[],"latestCount":null},
+    {"action":"new execution publication","requestVersion":7,"resourceVersion":1,"responseStatus":200,"disposition":"ACCEPTED","cachedViews":["latest"],"cursorViews":[],"latestCount":1},
+    {"action":"changed history window","requestVersion":9,"resourceVersion":1,"responseStatus":200,"disposition":"ACCEPTED","cachedViews":["history","latest"],"cursorViews":["history"],"latestCount":1},
+    {"action":"late old history window","requestVersion":8,"resourceVersion":1,"responseStatus":200,"disposition":"IGNORED","cachedViews":["history","latest"],"cursorViews":["history"],"latestCount":1},
+    {"action":"deleted pipeline","requestVersion":null,"resourceVersion":2,"responseStatus":null,"disposition":"INVALIDATED","cachedViews":[],"cursorViews":[],"latestCount":null},
+    {"action":"deleted read","requestVersion":10,"resourceVersion":2,"responseStatus":404,"disposition":"NOT_FOUND","cachedViews":[],"cursorViews":[],"latestCount":null},
+    {"action":"same id recreated","requestVersion":null,"resourceVersion":3,"responseStatus":null,"disposition":"INVALIDATED","cachedViews":[],"cursorViews":[],"latestCount":null},
+    {"action":"recreated without publication","requestVersion":11,"resourceVersion":3,"responseStatus":404,"disposition":"PENDING","cachedViews":[],"cursorViews":[],"latestCount":null},
+    {"action":"late previous resource","requestVersion":7,"resourceVersion":3,"responseStatus":200,"disposition":"IGNORED","cachedViews":[],"cursorViews":[],"latestCount":null},
+    {"action":"recreated publication","requestVersion":12,"resourceVersion":3,"responseStatus":200,"disposition":"ACCEPTED","cachedViews":["latest"],"cursorViews":[],"latestCount":7},
+    {"action":"late previous resource history","requestVersion":8,"resourceVersion":3,"responseStatus":200,"disposition":"IGNORED","cachedViews":["latest"],"cursorViews":[],"latestCount":7}
+  ]
+}
