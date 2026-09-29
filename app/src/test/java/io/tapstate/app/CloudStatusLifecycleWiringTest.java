@@ -5,6 +5,7 @@ import io.tapstate.control.core.CloudStatusReporter;
 import io.tapstate.core.common.TapstateException;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.core.env.StandardEnvironment;
 
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -14,6 +15,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 class CloudStatusLifecycleWiringTest {
 
     private final ApplicationContextRunner runner = new ApplicationContextRunner()
+            .withInitializer(context -> context.getEnvironment().getPropertySources()
+                    .remove(StandardEnvironment.SYSTEM_ENVIRONMENT_PROPERTY_SOURCE_NAME))
             .withUserConfiguration(CloudRuntimeConfiguration.class);
 
     @Test
@@ -65,7 +68,8 @@ class CloudStatusLifecycleWiringTest {
         return runner.withPropertyValues(
                 "tapstate.cloud.base-url=https://cloud.example",
                 "tapstate.cloud.token=fixture-token",
-                "tapstate.cloud.atlas-uri=mongodb://atlas.example/metadata");
+                "tapstate.cloud.atlas-uri=mongodb://atlas.example/metadata",
+                "tapstate.cloud.cluster-id=lifecycle-cluster");
     }
 
     private static void assertFailure(Throwable failure, BootError code) {

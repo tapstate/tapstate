@@ -21,7 +21,7 @@ enum BootError implements TapstateErrorCode {
     /** The embedded Hazelcast member could not be started (e.g. its loopback port is in use). */
     HAZELCAST_UNAVAILABLE("boot.hazelcast-unavailable", Set.of()),
 
-    /** A managed Cloud runtime must receive its three external settings as one complete unit. */
+    /** A managed Cloud runtime must receive its four external settings as one complete unit. */
     CLOUD_CONFIG_INCOMPLETE("boot.cloud-config-incomplete", Set.of()),
 
     /** The configured Global Control Plane address is not an absolute HTTP(S) base URL. */

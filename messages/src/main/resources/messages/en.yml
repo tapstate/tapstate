@@ -95,7 +95,7 @@ boot.cloud-base-url-invalid:
   solution: "Set tapstate.cloud.base-url to the Global Control Plane origin without credentials, a query, or a fragment."
 boot.cloud-config-incomplete:
   message: "The managed Cloud startup configuration is incomplete."
-  solution: "Set tapstate.cloud.base-url, tapstate.cloud.token, and tapstate.cloud.atlas-uri together, or remove all three for on-prem mode."
+  solution: "Set tapstate.cloud.base-url, tapstate.cloud.token, tapstate.cloud.atlas-uri, and tapstate.cloud.cluster-id together, or remove all four, including any CLUSTER_ID alias, for on-prem mode."
 boot.cloud-connectors-invalid:
   message: "Cloud connector `{connector}` failed its required startup check: {reason}."
   solution: "Restore the matching release, lock, and licenses; repair the stored artifact or plugin cache if mismatched, then confirm every connector can register and load."

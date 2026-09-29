@@ -143,6 +143,20 @@ class CloudExternalConfigStartupIT {
         assertSafeOutput(running, null);
     }
 
+    @ParameterizedTest
+    @EnumSource(Carrier.class)
+    void missingClusterIdFailsBeforeOpeningEitherMetadataStore(Carrier carrier) throws Exception {
+        String ignored = uniqueDatabase("missing_cluster_id_ignored");
+        String selected = uniqueDatabase("missing_cluster_id_selected");
+        Map<String, String> values = cloudValues(MONGO.getReplicaSetUrl(selected));
+        values.remove("tapstate.cloud.cluster-id");
+        Running running = start(carrier, values, MONGO.getReplicaSetUrl(ignored));
+        running.awaitFailure("boot.cloud-config-incomplete");
+        assertUntouched(ignored);
+        assertUntouched(selected);
+        assertSafeOutput(running, values.get("tapstate.cloud.atlas-uri"));
+    }
+
     @Test
     void invalidCloudBaseUrlFailsWithoutEchoingEmbeddedCredentials() throws Exception {
         String ignored = uniqueDatabase("invalid_ignored");
@@ -233,6 +247,7 @@ class CloudExternalConfigStartupIT {
         values.put("tapstate.cloud.base-url", "http://127.0.0.1:" + cloud.getAddress().getPort());
         values.put("tapstate.cloud.token", TOKEN);
         values.put("tapstate.cloud.atlas-uri", uri);
+        values.put("tapstate.cloud.cluster-id", "external-config-cluster");
         return values;
     }
 
@@ -266,7 +281,7 @@ class CloudExternalConfigStartupIT {
                 .redirectErrorStream(true).redirectOutput(log.toFile());
         // Do not inherit a developer's Cloud configuration, Java injection options, or external Spring file.
         builder.environment().keySet().removeIf(key -> key.startsWith("TAPSTATE_") || key.startsWith("SPRING_")
-                || key.equals("SDK_STATUS_SENDER_ENABLED")
+                || key.equals("SDK_STATUS_SENDER_ENABLED") || key.equals("CLUSTER_ID")
                 || key.equals("JAVA_TOOL_OPTIONS") || key.equals("JDK_JAVA_OPTIONS") || key.equals("_JAVA_OPTIONS"));
         if (carrier == Carrier.ENVIRONMENT) {
             values.forEach((key, value) -> builder.environment().put(

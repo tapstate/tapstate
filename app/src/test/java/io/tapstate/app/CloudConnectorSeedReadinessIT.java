@@ -142,9 +142,10 @@ class CloudConnectorSeedReadinessIT {
     }
 
     private static SpringApplicationBuilder builder(AtomicInteger ready) {
-        return new SpringApplicationBuilder(Bootstrap.class).listeners(event -> {
-            if (event instanceof ApplicationReadyEvent) { ready.incrementAndGet(); }
-        });
+        return new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated())
+                .listeners(event -> {
+                    if (event instanceof ApplicationReadyEvent) { ready.incrementAndGet(); }
+                });
     }
 
     private String[] arguments(String uri, boolean cloud, Path seeds) {
@@ -157,7 +158,8 @@ class CloudConnectorSeedReadinessIT {
                 "--tapstate.connectors.plugins-dir=" + work.resolve("plugins")));
         if (cloud) {
             args.addAll(List.of("--tapstate.cloud.base-url=https://cloud.example.invalid",
-                    "--tapstate.cloud.token=cloud-seed-fixture-token", "--tapstate.cloud.atlas-uri=" + uri));
+                    "--tapstate.cloud.token=cloud-seed-fixture-token", "--tapstate.cloud.atlas-uri=" + uri,
+                    "--tapstate.cloud.cluster-id=cloud-seed-cluster"));
         }
         return args.toArray(String[]::new);
     }

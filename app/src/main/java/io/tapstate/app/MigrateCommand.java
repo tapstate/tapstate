@@ -12,6 +12,7 @@ import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.env.ConfigurableEnvironment;
 
 import java.io.PrintStream;
 import java.util.Arrays;
@@ -57,12 +58,20 @@ final class MigrateCommand {
      * refused to start.
      */
     static int run(String[] args, PrintStream out, PrintStream err) {
+        return run(args, out, err, null);
+    }
+
+    static int run(String[] args, PrintStream out, PrintStream err, ConfigurableEnvironment environment) {
         SpringApplication application = new SpringApplication(SettingsOnly.class);
+        if (environment != null) {
+            application.setEnvironment(environment);
+        }
         application.setWebApplicationType(WebApplicationType.NONE);
         application.setBannerMode(Banner.Mode.OFF);
         try (ConfigurableApplicationContext context = application.run(args)) {
             MongoProperties properties = context.getBean(MongoProperties.class);
-            CloudRuntimeSettings cloud = CloudRuntimeSettings.resolve(context.getBean(CloudProperties.class));
+            CloudRuntimeSettings cloud = CloudRuntimeSettings.resolve(
+                    context.getBean(CloudProperties.class), context.getEnvironment().getProperty("CLUSTER_ID"));
             report(args, properties, cloud, out);
             return 0;
         } catch (TapstateException e) {

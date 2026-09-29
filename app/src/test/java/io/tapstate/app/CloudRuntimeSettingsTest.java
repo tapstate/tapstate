@@ -18,7 +18,7 @@ class CloudRuntimeSettingsTest {
     }
 
     @Test
-    void theCompleteTriadSelectsCloudAndItsAtlasMetadataUri() {
+    void theCompleteSetSelectsCloudAndItsConfiguredIdentityAndAtlasMetadataUri() {
         CloudProperties properties = complete();
         properties.setBaseUrl("https://cloud.tapstate.io/");
 
@@ -26,13 +26,14 @@ class CloudRuntimeSettingsTest {
 
         assertThat(settings.mode()).isEqualTo(CloudRuntimeSettings.Mode.CLOUD);
         assertThat(settings.baseUrl()).hasToString("https://cloud.tapstate.io");
+        assertThat(settings.clusterId()).isEqualTo("configured-cluster");
         assertThat(settings.metadataUri("mongodb://localhost:27017/tapstate"))
                 .isEqualTo("mongodb+srv://cluster.example/tapstate");
         assertThat(settings.toString()).doesNotContain("secret-token", "cluster.example");
     }
 
     @Test
-    void aPartialTriadFailsBeforeOpeningEitherStoreOrCloud() {
+    void aPartialSetFailsBeforeOpeningEitherStoreOrCloud() {
         CloudProperties properties = new CloudProperties();
         properties.setBaseUrl("https://cloud.tapstate.io");
         properties.setToken("secret-token");
@@ -84,6 +85,7 @@ class CloudRuntimeSettingsTest {
         properties.setBaseUrl("https://cloud.tapstate.io");
         properties.setToken("secret-token");
         properties.setAtlasUri("mongodb+srv://cluster.example/tapstate");
+        properties.setClusterId("configured-cluster");
         return properties;
     }
 }

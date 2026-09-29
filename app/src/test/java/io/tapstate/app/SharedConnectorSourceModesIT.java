@@ -90,7 +90,8 @@ class SharedConnectorSourceModesIT {
                 "--tapstate.connectors.seed-dir=" + CloudConnectorTestInputs.seedDirectory()));
         if (cloud) {
             arguments.addAll(List.of("--tapstate.cloud.base-url=https://cloud.example",
-                    "--tapstate.cloud.token=controlled-outbound-token", "--tapstate.cloud.atlas-uri=" + uri));
+                    "--tapstate.cloud.token=controlled-outbound-token", "--tapstate.cloud.atlas-uri=" + uri,
+                    "--tapstate.cloud.cluster-id=shared-source-cluster"));
         } else {
             arguments.add("--tapstate.store.mongo.uri=" + uri);
         }

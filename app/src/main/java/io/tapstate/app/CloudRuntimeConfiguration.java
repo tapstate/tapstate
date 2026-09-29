@@ -16,8 +16,9 @@ import java.util.Map;
 class CloudRuntimeConfiguration {
 
     @Bean
-    CloudRuntimeSettings cloudRuntimeSettings(CloudProperties properties, MongoProperties mongo) {
-        CloudRuntimeSettings settings = CloudRuntimeSettings.resolve(properties);
+    CloudRuntimeSettings cloudRuntimeSettings(
+            CloudProperties properties, MongoProperties mongo, Environment environment) {
+        CloudRuntimeSettings settings = CloudRuntimeSettings.resolve(properties, environment.getProperty("CLUSTER_ID"));
         if (settings.cloud() && !mongo.isEnabled()) {
             // The optional store switch serves on-prem substrate runs. A managed runtime must not
             // use it to bypass its mandatory metadata connection and persistence startup gates.
@@ -48,6 +49,9 @@ class CloudRuntimeConfiguration {
 
     // TODO Bind CloudCodeExchanger, CloudJwtValidator and CloudSessionCallbackVerifier to the published SDK
     // with stable user-id and authenticated invalidation contracts. The SDK owns its verification mechanism.
+    // Use settings.clusterId() explicitly when configuring the SDK; do not let its environment default
+    // override the ID resolved from Spring's file, environment, or JVM property sources.
+    // The startup token belongs only to status reporting, never to login code exchange or callbacks.
     // Construct CloudAuthenticationService with the validated deployment identity and local session store;
     // subsequent requests must use its 30-minute sliding local session without Cloud calls or JWT refresh.
     // The SDK adapter must also bind a CloudStatusReporter using its validated deployment identity

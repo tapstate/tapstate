@@ -138,9 +138,11 @@ class StateDatabaseModeBoundaryIT {
         if (mode == CloudRuntimeSettings.Mode.CLOUD) {
             args.addAll(List.of("--tapstate.cloud.base-url=https://cloud.example.invalid",
                     "--tapstate.cloud.token=mode-fixture-token",
-                    "--tapstate.cloud.atlas-uri=" + MONGO.getReplicaSetUrl(database)));
+                    "--tapstate.cloud.atlas-uri=" + MONGO.getReplicaSetUrl(database),
+                    "--tapstate.cloud.cluster-id=state-mode-cluster"));
         }
-        context = new SpringApplicationBuilder(Bootstrap.class).run(args.toArray(String[]::new));
+        context = new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated())
+                .run(args.toArray(String[]::new));
     }
 
     private static String definition(String database) {

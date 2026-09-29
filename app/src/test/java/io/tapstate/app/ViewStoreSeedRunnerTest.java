@@ -40,6 +40,7 @@ class ViewStoreSeedRunnerTest {
         properties.setBaseUrl("https://cloud.example");
         properties.setToken("sentinel-token");
         properties.setAtlasUri("mongodb+srv://user:sentinel-password@atlas.example/metadata");
+        properties.setClusterId("managed-view-cluster");
 
         new ControlPlaneConfiguration()
                 .viewStoreSeedRunner(store.artifacts(), mongo, CloudRuntimeSettings.resolve(properties))

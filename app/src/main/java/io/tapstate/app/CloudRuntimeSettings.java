@@ -8,7 +8,7 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * Validated Cloud startup settings. No single value enables Cloud behavior: all three values must be
+ * Validated Cloud startup settings. No single value enables Cloud behavior: all four values must be
  * present, while their complete absence preserves the existing on-prem behavior. This keeps an
  * on-prem deployment that deliberately points its ordinary Mongo setting at Atlas from being
  * mistaken for a managed Cloud Cluster.
@@ -27,25 +27,35 @@ final class CloudRuntimeSettings {
     private final URI baseUrl;
     private final String token;
     private final String atlasUri;
+    private final String clusterId;
 
-    private CloudRuntimeSettings(Mode mode, URI baseUrl, String token, String atlasUri) {
+    private CloudRuntimeSettings(Mode mode, URI baseUrl, String token, String atlasUri, String clusterId) {
         this.mode = Objects.requireNonNull(mode, "mode");
         this.baseUrl = baseUrl;
         this.token = token;
         this.atlasUri = atlasUri;
+        this.clusterId = clusterId;
     }
 
     static CloudRuntimeSettings resolve(CloudProperties properties) {
+        return resolve(properties, null);
+    }
+
+    /** The SDK's unprefixed Cluster ID is a fallback only when the canonical setting is absent. */
+    static CloudRuntimeSettings resolve(CloudProperties properties, String sdkClusterId) {
         Objects.requireNonNull(properties, "properties");
+        String clusterId = properties.getClusterId() != null ? properties.getClusterId() : sdkClusterId;
         boolean any = properties.getBaseUrl() != null
                 || properties.getToken() != null
-                || properties.getAtlasUri() != null;
+                || properties.getAtlasUri() != null
+                || clusterId != null;
         if (!any) {
-            return new CloudRuntimeSettings(Mode.ON_PREM, null, null, null);
+            return new CloudRuntimeSettings(Mode.ON_PREM, null, null, null, null);
         }
         if (!hasText(properties.getBaseUrl())
                 || !hasText(properties.getToken())
-                || !hasText(properties.getAtlasUri())) {
+                || !hasText(properties.getAtlasUri())
+                || !hasText(clusterId)) {
             throw new TapstateException(BootError.CLOUD_CONFIG_INCOMPLETE, Map.of(), null);
         }
         URI baseUrl = parseBaseUrl(properties.getBaseUrl());
@@ -53,7 +63,7 @@ final class CloudRuntimeSettings {
         if (!(atlasUri.startsWith("mongodb://") || atlasUri.startsWith("mongodb+srv://"))) {
             throw new TapstateException(BootError.CLOUD_ATLAS_URI_INVALID, Map.of(), null);
         }
-        return new CloudRuntimeSettings(Mode.CLOUD, baseUrl, properties.getToken(), atlasUri);
+        return new CloudRuntimeSettings(Mode.CLOUD, baseUrl, properties.getToken(), atlasUri, clusterId.trim());
     }
 
     private static URI parseBaseUrl(String raw) {
@@ -102,6 +112,10 @@ final class CloudRuntimeSettings {
 
     String atlasUri() {
         return atlasUri;
+    }
+
+    String clusterId() {
+        return clusterId;
     }
 
     String metadataUri(String onPremUri) {

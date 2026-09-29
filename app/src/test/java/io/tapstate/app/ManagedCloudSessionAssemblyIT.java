@@ -64,6 +64,7 @@ class ManagedCloudSessionAssemblyIT {
                 "--tapstate.test.managed-auth=true",
                 "--tapstate.cloud.base-url=https://cloud.example", "--tapstate.cloud.token=controlled-machine-token",
                 "--tapstate.cloud.atlas-uri=" + uri,
+                "--tapstate.cloud.cluster-id=managed-assembly-cluster",
                 "--tapstate.store.mongo.operator-state-database=managed_auth_ops_" + Long.toUnsignedString(System.nanoTime(), 16),
                 "--tapstate.connectors.plugins-dir=" + work.resolve("plugins"),
                 "--tapstate.connectors.seed-dir=" + CloudConnectorTestInputs.seedDirectory())) {
