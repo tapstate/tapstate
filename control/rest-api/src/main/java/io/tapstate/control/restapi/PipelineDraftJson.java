@@ -22,11 +22,11 @@ final class PipelineDraftJson {
         int schemaVersion = number(body.getOrDefault("schemaVersion", PipelineDraft.CURRENT_SCHEMA_VERSION),
                 "schemaVersion").intValue();
         long revision = defaultRevision;
-        String mode = text(body.get("mode"), "mode").toUpperCase();
+        String mode = text(body.get("mode"), "mode").toUpperCase(java.util.Locale.ROOT);
         Map<String, Object> graph = object(body.get("graph"));
         Map<String, Object> wizard = object(body.get("wizard"));
         PipelineDraft.Graph graphModel = graph == null ? null
-                : json.convertValue(normalize(graph, "graph"), PipelineDraft.Graph.class);
+                : json.convertValue(graph, PipelineDraft.Graph.class);
         PipelineDraft.Wizard wizardModel = wizard == null ? null
                 : json.convertValue(normalizeWizardForModel(wizard), PipelineDraft.Wizard.class);
         return new PipelineDraft(
@@ -51,11 +51,12 @@ final class PipelineDraftJson {
         result.put("pipelineId", draft.pipelineId());
         result.put("schemaVersion", draft.schemaVersion());
         result.put("revision", draft.revision());
-        result.put("mode", draft.mode().name().toLowerCase());
+        result.put("mode", draft.mode().name().toLowerCase(java.util.Locale.ROOT));
         result.put("name", draft.name());
         result.put("description", draft.description());
-        result.put("graph", draft.graph() == null ? null : normalize(json.convertValue(draft.graph(), Map.class), "graph"));
-        result.put("wizard", draft.wizard() == null ? null : normalize(json.convertValue(draft.wizard(), Map.class), "wizard"));
+        result.put("graph", draft.graph() == null ? null : json.convertValue(draft.graph(), Map.class));
+        result.put("wizard", draft.wizard() == null ? null
+                : normalizeWizardForWire(json.convertValue(draft.wizard(), Map.class)));
         result.put("baseArtifactHash", draft.baseArtifactHash());
         result.put("publishedDraftRevision", draft.publishedDraftRevision());
         result.put("publishedArtifactHash", draft.publishedArtifactHash());
@@ -94,23 +95,33 @@ final class PipelineDraftJson {
         return normalized;
     }
 
-    private static Object normalize(Object value, String field) {
-        if (value instanceof Map<?, ?> map) {
-            Map<String, Object> result = new LinkedHashMap<>();
-            for (Map.Entry<?, ?> entry : map.entrySet()) {
-                String key = String.valueOf(entry.getKey());
-                Object child = normalize(entry.getValue(), key);
-                if (("mode".equals(key) || "shape".equals(key)) && child instanceof String string) {
-                    child = string.toLowerCase();
-                }
-                result.put(key, child);
+    /** The Wizard wire contract lowercases only the relation shape enum, never arbitrary user config. */
+    private static Map<String, Object> normalizeWizardForWire(Map<String, Object> wizard) {
+        Map<String, Object> normalized = new LinkedHashMap<>(wizard);
+        Object relatedValue = normalized.get("related");
+        if (!(relatedValue instanceof List<?> related)) {
+            return normalized;
+        }
+
+        normalized.put("related", related.stream().map(item -> {
+            if (!(item instanceof Map<?, ?> relationEntry)) {
+                return item;
             }
-            return result;
-        }
-        if (value instanceof List<?> list) {
-            return list.stream().map(item -> normalize(item, field)).toList();
-        }
-        return value;
+            Map<String, Object> nextEntry = new LinkedHashMap<>();
+            relationEntry.forEach((key, value) -> nextEntry.put(String.valueOf(key), value));
+            Object relationValue = nextEntry.get("relation");
+            if (relationValue instanceof Map<?, ?> relation) {
+                Map<String, Object> nextRelation = new LinkedHashMap<>();
+                relation.forEach((key, value) -> nextRelation.put(String.valueOf(key), value));
+                Object shape = nextRelation.get("shape");
+                if (shape instanceof String value) {
+                    nextRelation.put("shape", value.toLowerCase(java.util.Locale.ROOT));
+                }
+                nextEntry.put("relation", nextRelation);
+            }
+            return nextEntry;
+        }).toList());
+        return normalized;
     }
 
     private static String text(Object value, String field) {

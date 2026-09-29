@@ -433,6 +433,31 @@ public final class ApplyService {
                 .artifacts().getFirst().resource();
     }
 
+    /** Validates a Pipeline draft for publication, including the same live-buffering guard as artifact writes. */
+    public ApplyPlan planDraftPublication(Resource resource) {
+        Objects.requireNonNull(resource, "resource");
+        ApplyPlan plan = planResources(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE);
+        Resource prepared = plan.artifacts().getFirst().resource();
+        if (live != null && prepared instanceof PipelineResource replacement) {
+            ReadableArtifactInventory.Snapshot inventory = ReadableArtifactInventory.scan(store);
+            live.refuseBufferingChangeWhileLive(storedPipeline(inventory.resources(), replacement.id()), replacement);
+        }
+        return plan;
+    }
+
+    /** Re-derives the published pipeline's schema after the artifact transaction has committed. */
+    public List<ValidationDiagnostic> refreshPublishedPipeline(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        try {
+            derivation.derive(pipelineId);
+            return List.of();
+        } catch (TapstateException failure) {
+            return List.of(new ValidationDiagnostic(ControlError.SCHEMA_DERIVATION_INCOMPLETE.code(),
+                    Map.of("pipeline", pipelineId, "causeCode", failure.code().code(),
+                            "causeParams", failure.args())));
+        }
+    }
+
     /**
      * Validates the batch (via {@link #plan}), then writes the changed set — created and updated
      * artifacts — into the store as one atomic batch, returning one outcome per artifact in submission

@@ -172,7 +172,13 @@ public record PipelineDraft(
     /** Candidate Artifact and conditions used by an atomic publish operation. */
     public record Publication(String pipelineId, long expectedDraftRevision,
             String expectedArtifactHash, Resource artifact, String publishedArtifactHash,
-            Instant publishedAt, String updatedBy) {
+            Instant publishedAt, String updatedBy, Map<String, String> workspacePreconditions) {
+        public Publication(String pipelineId, long expectedDraftRevision, String expectedArtifactHash,
+                Resource artifact, String publishedArtifactHash, Instant publishedAt, String updatedBy) {
+            this(pipelineId, expectedDraftRevision, expectedArtifactHash, artifact, publishedArtifactHash,
+                    publishedAt, updatedBy, Map.of());
+        }
+
         public Publication {
             requireText(pipelineId, "pipeline id");
             if (expectedDraftRevision < 1) {
@@ -185,6 +191,7 @@ public record PipelineDraft(
             requireText(publishedArtifactHash, "published artifact hash");
             Objects.requireNonNull(publishedAt, "publishedAt");
             requireText(updatedBy, "updatedBy");
+            workspacePreconditions = workspacePreconditions == null ? Map.of() : Map.copyOf(workspacePreconditions);
         }
     }
 

@@ -70,6 +70,11 @@ class PipelineDraftStoreContractTest {
         assertThat(store.delete("orders", 2)).isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
         assertThat(store.delete("orders", 1)).isEqualTo(PipelineDraftMutation.DELETED);
         assertThat(store.get("orders")).isEmpty();
+        assertThat(store.create(draft(PipelineDraft.Mode.DAG, 1, graph(), null)))
+                .isEqualTo(PipelineDraftMutation.CREATED);
+        assertThat(store.get("orders").orElseThrow().revision()).isEqualTo(2);
+        assertThat(store.replace("orders", 1, draft(PipelineDraft.Mode.DAG, 2, graphWithNode("stale"), null)))
+                .isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
     }
 
     private static PipelineDraft draft(PipelineDraft.Mode mode, long revision, PipelineDraft.Graph graph,
@@ -100,6 +105,7 @@ class PipelineDraftStoreContractTest {
     private static final class InMemoryDraftStore implements PipelineDraftStore {
         private final Map<String, PipelineDraft> drafts = new LinkedHashMap<>();
         private final Map<String, Resource> artifacts = new LinkedHashMap<>();
+        private final Map<String, Long> lastRevision = new LinkedHashMap<>();
 
         @Override
         public synchronized Optional<PipelineDraft> get(String pipelineId) {
@@ -113,8 +119,13 @@ class PipelineDraftStoreContractTest {
 
         @Override
         public synchronized PipelineDraftMutation create(PipelineDraft draft) {
-            return drafts.putIfAbsent(draft.pipelineId(), draft) == null
-                    ? PipelineDraftMutation.CREATED : PipelineDraftMutation.ALREADY_EXISTS;
+            if (drafts.containsKey(draft.pipelineId())) {
+                return PipelineDraftMutation.ALREADY_EXISTS;
+            }
+            long revision = Math.max(draft.revision(), lastRevision.getOrDefault(draft.pipelineId(), 0L) + 1);
+            drafts.put(draft.pipelineId(), withRevision(draft, revision));
+            lastRevision.put(draft.pipelineId(), revision);
+            return PipelineDraftMutation.CREATED;
         }
 
         @Override
@@ -130,7 +141,13 @@ class PipelineDraftStoreContractTest {
             if (current.revision() != expectedRevision) {
                 return PipelineDraftMutation.REVISION_CONFLICT;
             }
+            if (!java.util.Objects.equals(current.baseArtifactHash(), replacement.baseArtifactHash())
+                    || !java.util.Objects.equals(current.publishedDraftRevision(), replacement.publishedDraftRevision())
+                    || !java.util.Objects.equals(current.publishedArtifactHash(), replacement.publishedArtifactHash())) {
+                return PipelineDraftMutation.REVISION_CONFLICT;
+            }
             drafts.put(pipelineId, replacement);
+            lastRevision.put(pipelineId, replacement.revision());
             return PipelineDraftMutation.REPLACED;
         }
 
@@ -165,6 +182,13 @@ class PipelineDraftStoreContractTest {
                     publication.publishedArtifactHash(), publication.expectedDraftRevision(),
                     publication.publishedArtifactHash(), current.createdAt(), publication.publishedAt(), publication.updatedBy()));
             return PipelineDraftMutation.PUBLISHED;
+        }
+
+        private static PipelineDraft withRevision(PipelineDraft draft, long revision) {
+            return new PipelineDraft(draft.pipelineId(), draft.schemaVersion(), revision, draft.mode(), draft.name(),
+                    draft.description(), draft.graph(), draft.wizard(), draft.baseArtifactHash(),
+                    draft.publishedDraftRevision(), draft.publishedArtifactHash(), draft.createdAt(),
+                    draft.updatedAt(), draft.updatedBy());
         }
     }
 }

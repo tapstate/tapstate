@@ -105,7 +105,7 @@ class PipelineDraftController {
                 id, expected, artifactHash, AuthenticatedCaller.subject());
         refuse(result.mutation(), id);
         return Map.of("pipelineId", id, "revision", expected, "artifactHash", result.artifactHash(),
-                "published", true);
+                "published", true, "warnings", result.warnings());
     }
 
     private ResponseEntity<Map<String, Object>> response(PipelineDraft draft) {

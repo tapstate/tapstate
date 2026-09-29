@@ -206,7 +206,12 @@ public final class PipelineDraftCompiler {
                 requiredText(pair.parentField(), "related parent field");
             }
             Map<String, String> on = new LinkedHashMap<>();
-            relation.on().forEach(pair -> on.put(pair.childField(), pair.parentField()));
+            relation.on().forEach(pair -> {
+                if (on.putIfAbsent(pair.childField(), pair.parentField()) != null) {
+                    throw new IllegalArgumentException(
+                            "related association contains duplicate child field: " + pair.childField());
+                }
+            });
             List<String> key = relation.key().isEmpty() ? null : relation.key();
             List<String> arrayKey = relation.shape() == PipelineDraft.Shape.ARRAY ? relation.arrayKey() : null;
             EmbedAs shape = switch (relation.shape()) {

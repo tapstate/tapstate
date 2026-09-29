@@ -108,6 +108,20 @@ class PipelineDraftCompilerTest {
     }
 
     @Test
+    void rejectsDuplicateChildFieldsInOneAssociation() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft.Related duplicate = new PipelineDraft.Related("duplicate", "orders", "crm", "items",
+                new PipelineDraft.Relation(List.of(
+                        new PipelineDraft.FieldPair("order_id", "id"),
+                        new PipelineDraft.FieldPair("order_id", "tenant_id")),
+                        PipelineDraft.Shape.ARRAY, "items", List.of(), List.of("id")), List.of());
+        PipelineDraft draft = withWizard(template, wizard.root(), List.of(duplicate), List.of(), wizard.output());
+
+        assertCompileFails(draft, "related association contains duplicate child field: order_id");
+    }
+
+    @Test
     void compilesSourceTransformsWithoutInventingAnEmptyNest() {
         PipelineDraft template = wizardDraft();
         PipelineDraft.Wizard wizard = template.wizard();

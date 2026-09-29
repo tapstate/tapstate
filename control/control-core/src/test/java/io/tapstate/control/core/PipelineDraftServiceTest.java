@@ -102,6 +102,21 @@ class PipelineDraftServiceTest {
     }
 
     @Test
+    void recreatedDraftDoesNotReuseRevisionAndRejectsRequestsFromItsPreviousIncarnation() {
+        PipelineDraft initial = draft(1, "alice", null, null, null, NOW, NOW);
+        assertThat(service.create(initial)).isEqualTo(PipelineDraftMutation.CREATED);
+        assertThat(service.discard("alice", "orders", 1)).isEqualTo(PipelineDraftMutation.DELETED);
+
+        assertThat(service.create(initial)).isEqualTo(PipelineDraftMutation.CREATED);
+        PipelineDraft recreated = service.find("orders").orElseThrow();
+        assertThat(recreated.revision()).isEqualTo(2);
+        assertThat(service.save("alice", "orders", 1, initial)).isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+        assertThat(service.publish("orders", 1, null, "alice").mutation())
+                .isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+        assertThat(service.find("orders")).contains(recreated);
+    }
+
+    @Test
     void previewCompilesOnlyTheRequestedRevision() {
         PipelineDraft complete = draft(4, "alice", null, null, null, NOW, NOW);
         store.seed(complete);
@@ -188,10 +203,12 @@ class PipelineDraftServiceTest {
 
     private static final class MemoryDraftStore implements PipelineDraftStore {
         private final Map<String, PipelineDraft> drafts = new LinkedHashMap<>();
+        private final Map<String, Long> lastRevision = new LinkedHashMap<>();
         private PipelineDraft.Publication lastPublication;
 
         void seed(PipelineDraft draft) {
             drafts.put(draft.pipelineId(), draft);
+            lastRevision.merge(draft.pipelineId(), draft.revision(), Math::max);
         }
 
         @Override
@@ -206,8 +223,12 @@ class PipelineDraftServiceTest {
 
         @Override
         public PipelineDraftMutation create(PipelineDraft draft) {
-            return drafts.putIfAbsent(draft.pipelineId(), draft) == null
-                    ? PipelineDraftMutation.CREATED : PipelineDraftMutation.ALREADY_EXISTS;
+            if (drafts.containsKey(draft.pipelineId())) return PipelineDraftMutation.ALREADY_EXISTS;
+            long revision = Math.max(draft.revision(), lastRevision.getOrDefault(draft.pipelineId(), 0L) + 1);
+            PipelineDraft created = withRevision(draft, revision);
+            drafts.put(draft.pipelineId(), created);
+            lastRevision.put(draft.pipelineId(), revision);
+            return PipelineDraftMutation.CREATED;
         }
 
         @Override
@@ -217,7 +238,13 @@ class PipelineDraftServiceTest {
             if (current == null) return PipelineDraftMutation.NOT_FOUND;
             if (current.revision() != expectedRevision) return PipelineDraftMutation.REVISION_CONFLICT;
             if (current.mode() != replacement.mode()) return PipelineDraftMutation.MODE_CONFLICT;
+            if (!Objects.equals(current.baseArtifactHash(), replacement.baseArtifactHash())
+                    || !Objects.equals(current.publishedDraftRevision(), replacement.publishedDraftRevision())
+                    || !Objects.equals(current.publishedArtifactHash(), replacement.publishedArtifactHash())) {
+                return PipelineDraftMutation.REVISION_CONFLICT;
+            }
             drafts.put(pipelineId, replacement);
+            lastRevision.put(pipelineId, replacement.revision());
             return PipelineDraftMutation.REPLACED;
         }
 
@@ -240,6 +267,13 @@ class PipelineDraftServiceTest {
             }
             lastPublication = publication;
             return PipelineDraftMutation.PUBLISHED;
+        }
+
+        private static PipelineDraft withRevision(PipelineDraft draft, long revision) {
+            return new PipelineDraft(draft.pipelineId(), draft.schemaVersion(), revision, draft.mode(), draft.name(),
+                    draft.description(), draft.graph(), draft.wizard(), draft.baseArtifactHash(),
+                    draft.publishedDraftRevision(), draft.publishedArtifactHash(), draft.createdAt(),
+                    draft.updatedAt(), draft.updatedBy());
         }
     }
 }

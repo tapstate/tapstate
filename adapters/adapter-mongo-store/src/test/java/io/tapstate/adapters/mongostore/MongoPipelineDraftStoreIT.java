@@ -56,6 +56,9 @@ class MongoPipelineDraftStoreIT {
             assertThat(storedArtifact.getString("contentHash")).isEqualTo(artifactHash);
             assertThat(store.get("orders").orElseThrow().publishedDraftRevision()).isEqualTo(1L);
 
+            assertThat(store.replace("orders", 1, draft("orders", 2, PipelineDraft.Mode.DAG)))
+                    .isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+
             assertThat(store.replace("orders", 1, draft("orders", 2, PipelineDraft.Mode.DAG,
                     artifactHash, 1L, artifactHash)))
                     .isEqualTo(PipelineDraftMutation.REPLACED);
@@ -99,6 +102,16 @@ class MongoPipelineDraftStoreIT {
             assertThat(store.delete("orders", 2)).isEqualTo(PipelineDraftMutation.DELETED);
             assertThat(store.delete("orders", 2)).isEqualTo(PipelineDraftMutation.NOT_FOUND);
             assertThat(store.list()).extracting(PipelineDraft::pipelineId).containsExactly("customers");
+
+            assertThat(store.create(draft("orders", 1, PipelineDraft.Mode.DAG)))
+                    .isEqualTo(PipelineDraftMutation.CREATED);
+            assertThat(store.get("orders").orElseThrow().revision()).isEqualTo(3);
+            assertThat(store.replace("orders", 2, draft("orders", 3, PipelineDraft.Mode.DAG)))
+                    .isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+            Resource ordersArtifact = artifact("orders");
+            assertThat(store.publish(new PipelineDraft.Publication("orders", 2, null, ordersArtifact,
+                    CanonicalHash.of(ordersArtifact), Instant.parse("2026-09-21T03:00:00Z"), "stale-publisher")))
+                    .isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
         }
     }
 
@@ -123,6 +136,30 @@ class MongoPipelineDraftStoreIT {
                     CanonicalHash.of(ordersArtifact), Instant.parse("2026-09-21T01:00:00Z"), "publisher");
             assertThat(store.publish(stale)).isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
             assertThat(artifacts.countDocuments()).isZero();
+        }
+    }
+
+    @Test
+    void publishRejectsDependenciesThatChangedAfterValidation() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            var database = client.getDatabase("tapstate_pipeline_draft_it");
+            var drafts = database.getCollection("pipeline_drafts");
+            var artifacts = database.getCollection("artifacts");
+            drafts.drop();
+            artifacts.drop();
+            MongoPipelineDraftStore store = new MongoPipelineDraftStore(client, drafts, artifacts);
+            assertThat(store.create(draft("orders", 1, PipelineDraft.Mode.DAG)))
+                    .isEqualTo(PipelineDraftMutation.CREATED);
+            artifacts.insertOne(new Document("_id", "crm").append("contentHash", "new-source-hash"));
+
+            Resource ordersArtifact = artifact("orders");
+            PipelineDraft.Publication staleDependency = new PipelineDraft.Publication("orders", 1, null,
+                    ordersArtifact, CanonicalHash.of(ordersArtifact), Instant.parse("2026-09-21T04:00:00Z"),
+                    "publisher", Map.of("crm", "hash-used-during-validation"));
+
+            assertThat(store.publish(staleDependency)).isEqualTo(PipelineDraftMutation.ARTIFACT_CONFLICT);
+            assertThat(artifacts.find(new Document("_id", "orders")).first()).isNull();
+            assertThat(store.get("orders").orElseThrow().publishedDraftRevision()).isNull();
         }
     }
 

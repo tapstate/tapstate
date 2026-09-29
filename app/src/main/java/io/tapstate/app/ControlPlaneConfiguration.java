@@ -591,8 +591,9 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    PipelineDraftService pipelineDraftService(StorePort storePort, AuditGate auditGate, ApplyService applyService) {
-        return new PipelineDraftService(storePort.drafts(), auditGate, applyService);
+    PipelineDraftService pipelineDraftService(
+            StorePort storePort, ArtifactQueryService artifacts, AuditGate auditGate, ApplyService applyService) {
+        return new PipelineDraftService(storePort.drafts(), artifacts, auditGate, applyService);
     }
 
     @Bean

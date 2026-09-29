@@ -23,37 +23,51 @@ public final class PipelineDraftService {
     private final Clock clock;
     private final AuditGate auditGate;
     private final ApplyService validation;
+    private final ArtifactQueryService artifacts;
 
     public PipelineDraftService(PipelineDraftStore store) {
-        this(store, new PipelineDraftCompiler(), new CanonicalWriter(), Clock.systemUTC(), null, null);
+        this(store, new PipelineDraftCompiler(), new CanonicalWriter(), Clock.systemUTC(), null, null, null);
     }
 
     PipelineDraftService(PipelineDraftStore store, PipelineDraftCompiler compiler,
             CanonicalWriter writer, Clock clock) {
-        this(store, compiler, writer, clock, null, null);
+        this(store, compiler, writer, clock, null, null, null);
     }
 
     public PipelineDraftService(PipelineDraftStore store, AuditGate auditGate) {
-        this(store, new PipelineDraftCompiler(), new CanonicalWriter(), Clock.systemUTC(), auditGate, null);
+        this(store, new PipelineDraftCompiler(), new CanonicalWriter(), Clock.systemUTC(), auditGate, null, null);
     }
 
     public PipelineDraftService(PipelineDraftStore store, AuditGate auditGate, ApplyService validation) {
-        this(store, new PipelineDraftCompiler(), new CanonicalWriter(), Clock.systemUTC(), auditGate, validation);
+        this(store, new PipelineDraftCompiler(), new CanonicalWriter(), Clock.systemUTC(), auditGate, validation, null);
+    }
+
+    public PipelineDraftService(PipelineDraftStore store, ArtifactQueryService artifacts,
+            AuditGate auditGate, ApplyService validation) {
+        this(store, new PipelineDraftCompiler(), new CanonicalWriter(), Clock.systemUTC(), auditGate,
+                validation, artifacts);
     }
 
     PipelineDraftService(PipelineDraftStore store, PipelineDraftCompiler compiler,
             CanonicalWriter writer, Clock clock, AuditGate auditGate) {
-        this(store, compiler, writer, clock, auditGate, null);
+        this(store, compiler, writer, clock, auditGate, null, null);
     }
 
     PipelineDraftService(PipelineDraftStore store, PipelineDraftCompiler compiler,
             CanonicalWriter writer, Clock clock, AuditGate auditGate, ApplyService validation) {
+        this(store, compiler, writer, clock, auditGate, validation, null);
+    }
+
+    private PipelineDraftService(PipelineDraftStore store, PipelineDraftCompiler compiler,
+            CanonicalWriter writer, Clock clock, AuditGate auditGate, ApplyService validation,
+            ArtifactQueryService artifacts) {
         this.store = Objects.requireNonNull(store, "store");
         this.compiler = Objects.requireNonNull(compiler, "compiler");
         this.writer = Objects.requireNonNull(writer, "writer");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.auditGate = auditGate;
         this.validation = validation;
+        this.artifacts = artifacts;
     }
 
     public Optional<PipelineDraft> find(String pipelineId) {
@@ -67,8 +81,10 @@ public final class PipelineDraftService {
     public PipelineDraftMutation create(PipelineDraft draft) {
         Objects.requireNonNull(draft, "draft");
         Instant now = Instant.now(clock);
+        String baseArtifactHash = artifacts == null ? null
+                : artifacts.getResource(draft.pipelineId()).map(StoredResource::contentHash).orElse(null);
         return store.create(new PipelineDraft(draft.pipelineId(), draft.schemaVersion(), 1, draft.mode(),
-                draft.name(), draft.description(), draft.graph(), draft.wizard(), null, null, null,
+                draft.name(), draft.description(), draft.graph(), draft.wizard(), baseArtifactHash, null, null,
                 now, now, draft.updatedBy()));
     }
 
@@ -147,14 +163,19 @@ public final class PipelineDraftService {
         if (expectedArtifactHash != null && !Objects.equals(expectedArtifactHash, draft.baseArtifactHash())) {
             return new PublishResult(PipelineDraftMutation.ARTIFACT_CONFLICT, null, null);
         }
-        PipelineResource artifact = validateAndPrepare(pipelineId, compile(pipelineId, draft));
+        PipelineResource candidate = compile(pipelineId, draft);
+        ApplyPlan plan = validation == null ? null : validation.planDraftPublication(candidate);
+        PipelineResource artifact = plan == null ? candidate
+                : (PipelineResource) plan.artifacts().getFirst().resource();
         String artifactHash = CanonicalHash.of(artifact);
         PipelineDraft.Publication publication = new PipelineDraft.Publication(
                 pipelineId, expectedDraftRevision, draft.baseArtifactHash(), artifact, artifactHash,
-                Instant.now(clock), updatedBy);
+                Instant.now(clock), updatedBy, plan == null ? java.util.Map.of() : plan.workspacePreconditions());
         PipelineDraftMutation outcome = store.publish(publication);
+        List<ValidationDiagnostic> warnings = outcome == PipelineDraftMutation.PUBLISHED && validation != null
+                ? validation.refreshPublishedPipeline(pipelineId) : List.of();
         return new PublishResult(outcome, outcome == PipelineDraftMutation.PUBLISHED ? artifact : null,
-                outcome == PipelineDraftMutation.PUBLISHED ? artifactHash : null);
+                outcome == PipelineDraftMutation.PUBLISHED ? artifactHash : null, warnings);
     }
 
     private PipelineResource compile(String pipelineId, PipelineDraft draft) {
@@ -227,7 +248,16 @@ public final class PipelineDraftService {
         return auditGate.dispatch(operation, new AuditContext(principal, pipelineId), action);
     }
 
-    public record PublishResult(PipelineDraftMutation mutation, PipelineResource artifact, String artifactHash) {
+    public record PublishResult(PipelineDraftMutation mutation, PipelineResource artifact, String artifactHash,
+            List<ValidationDiagnostic> warnings) {
+        public PublishResult {
+            warnings = warnings == null ? List.of() : List.copyOf(warnings);
+        }
+
+        public PublishResult(PipelineDraftMutation mutation, PipelineResource artifact, String artifactHash) {
+            this(mutation, artifact, artifactHash, List.of());
+        }
+
         public boolean published() {
             return mutation == PipelineDraftMutation.PUBLISHED;
         }

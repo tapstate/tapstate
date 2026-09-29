@@ -45,7 +45,7 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
     @Override
     public Optional<PipelineDraft> get(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        Document document = StoreIo.call(() -> drafts.find(new Document("_id", pipelineId)).first());
+        Document document = StoreIo.call(() -> drafts.find(activeDraft(pipelineId)).first());
         return document == null ? Optional.empty() : Optional.of(fromDocument(PipelineDraftMigrations.migrate(document)));
     }
 
@@ -53,7 +53,8 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
     public List<PipelineDraft> list() {
         return StoreIo.call(() -> {
             List<PipelineDraft> result = new ArrayList<>();
-            try (MongoCursor<Document> cursor = drafts.find().sort(Indexes.ascending("_id")).iterator()) {
+            try (MongoCursor<Document> cursor = drafts.find(new Document("deleted", new Document("$ne", true)))
+                    .sort(Indexes.ascending("_id")).iterator()) {
                 while (cursor.hasNext()) {
                     result.add(fromDocument(PipelineDraftMigrations.migrate(cursor.next())));
                 }
@@ -66,14 +67,29 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
     public PipelineDraftMutation create(PipelineDraft draft) {
         Objects.requireNonNull(draft, "draft");
         return StoreIo.call(() -> {
-            try {
-                drafts.insertOne(toDocument(draft));
-                return PipelineDraftMutation.CREATED;
-            } catch (MongoException error) {
-                if (ErrorCategory.fromErrorCode(error.getCode()) == ErrorCategory.DUPLICATE_KEY) {
+            while (true) {
+                Document current = drafts.find(new Document("_id", draft.pipelineId())).first();
+                if (current == null) {
+                    try {
+                        drafts.insertOne(toDocument(draft));
+                        return PipelineDraftMutation.CREATED;
+                    } catch (MongoException error) {
+                        if (ErrorCategory.fromErrorCode(error.getCode()) != ErrorCategory.DUPLICATE_KEY) {
+                            throw error;
+                        }
+                        continue;
+                    }
+                }
+                if (!Boolean.TRUE.equals(current.getBoolean("deleted"))) {
                     return PipelineDraftMutation.ALREADY_EXISTS;
                 }
-                throw error;
+                long previousRevision = ((Number) current.get(REVISION)).longValue();
+                PipelineDraft revived = withRevision(draft, previousRevision + 1);
+                Document filter = new Document("_id", draft.pipelineId())
+                        .append(REVISION, previousRevision).append("deleted", true);
+                if (drafts.replaceOne(filter, toDocument(revived)).getMatchedCount() == 1) {
+                    return PipelineDraftMutation.CREATED;
+                }
             }
         });
     }
@@ -89,15 +105,20 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
             throw new IllegalArgumentException("replacement revision must increment by one");
         }
         return StoreIo.call(() -> {
-            Document current = drafts.find(new Document("_id", pipelineId)).first();
-            if (current != null && !replacement.mode().name().toLowerCase().equals(current.getString("mode"))) {
+            Document current = drafts.find(activeDraft(pipelineId)).first();
+            if (current != null && !replacement.mode().name().toLowerCase(java.util.Locale.ROOT)
+                    .equals(current.getString("mode"))) {
                 return PipelineDraftMutation.MODE_CONFLICT;
             }
-            if (drafts.replaceOne(new Document("_id", pipelineId).append(REVISION, expectedRevision),
+            Document filter = activeDraft(pipelineId).append(REVISION, expectedRevision)
+                    .append("baseArtifactHash", replacement.baseArtifactHash())
+                    .append("publishedDraftRevision", replacement.publishedDraftRevision())
+                    .append("publishedArtifactHash", replacement.publishedArtifactHash());
+            if (drafts.replaceOne(filter,
                     toDocument(replacement)).getMatchedCount() == 1) {
                 return PipelineDraftMutation.REPLACED;
             }
-            return drafts.find(new Document("_id", pipelineId)).first() == null
+            return drafts.find(activeDraft(pipelineId)).first() == null
                     ? PipelineDraftMutation.NOT_FOUND : PipelineDraftMutation.REVISION_CONFLICT;
         });
     }
@@ -109,11 +130,17 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
             throw new IllegalArgumentException("expected revision must be positive");
         }
         return StoreIo.call(() -> {
-            if (drafts.deleteOne(new Document("_id", pipelineId).append(REVISION, expectedRevision))
-                    .getDeletedCount() == 1) {
+            Document filter = activeDraft(pipelineId).append(REVISION, expectedRevision);
+            Document update = new Document("$set", new Document("deleted", true).append("deletedAt", new Date()))
+                    .append("$unset", new Document("schemaVersion", "").append("mode", "")
+                            .append("name", "").append("description", "").append("graph", "")
+                            .append("wizard", "").append("baseArtifactHash", "")
+                            .append("publishedDraftRevision", "").append("publishedArtifactHash", "")
+                            .append("createdAt", "").append("updatedAt", "").append("updatedBy", ""));
+            if (drafts.updateOne(filter, update).getMatchedCount() == 1) {
                 return PipelineDraftMutation.DELETED;
             }
-            return drafts.find(new Document("_id", pipelineId)).first() == null
+            return drafts.find(activeDraft(pipelineId)).first() == null
                     ? PipelineDraftMutation.NOT_FOUND : PipelineDraftMutation.REVISION_CONFLICT;
         });
     }
@@ -128,11 +155,11 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
         try (ClientSession session = client.startSession()) {
             session.startTransaction();
             try {
-                Document currentDraft = drafts.find(session, new Document("_id", publication.pipelineId())
+                Document currentDraft = drafts.find(session, activeDraft(publication.pipelineId())
                         .append(REVISION, publication.expectedDraftRevision())).first();
                 if (currentDraft == null) {
                     session.abortTransaction();
-                    return drafts.find(new Document("_id", publication.pipelineId())).first() == null
+                    return drafts.find(activeDraft(publication.pipelineId())).first() == null
                             ? PipelineDraftMutation.NOT_FOUND : PipelineDraftMutation.REVISION_CONFLICT;
                 }
 
@@ -140,6 +167,11 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
                         new Document("_id", publication.pipelineId())).projection(new Document("contentHash", 1)).first();
                 String currentHash = currentArtifact == null ? null : currentArtifact.getString("contentHash");
                 if (!Objects.equals(currentHash, publication.expectedArtifactHash())) {
+                    session.abortTransaction();
+                    return PipelineDraftMutation.ARTIFACT_CONFLICT;
+                }
+
+                if (hasStaleWorkspacePrecondition(session, publication.workspacePreconditions())) {
                     session.abortTransaction();
                     return PipelineDraftMutation.ARTIFACT_CONFLICT;
                 }
@@ -152,8 +184,12 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
                         .append("publishedArtifactHash", publication.publishedArtifactHash())
                         .append("updatedAt", Date.from(publication.publishedAt()))
                         .append("updatedBy", publication.updatedBy());
-                drafts.replaceOne(session, new Document("_id", publication.pipelineId())
-                        .append(REVISION, publication.expectedDraftRevision()), updatedDraft);
+                if (drafts.replaceOne(session, activeDraft(publication.pipelineId())
+                        .append(REVISION, publication.expectedDraftRevision()), updatedDraft).getMatchedCount() != 1) {
+                    session.abortTransaction();
+                    return drafts.find(activeDraft(publication.pipelineId())).first() == null
+                            ? PipelineDraftMutation.NOT_FOUND : PipelineDraftMutation.REVISION_CONFLICT;
+                }
                 session.commitTransaction();
                 return PipelineDraftMutation.PUBLISHED;
             } catch (RuntimeException error) {
@@ -167,11 +203,22 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
         }
     }
 
+    private boolean hasStaleWorkspacePrecondition(ClientSession session, Map<String, String> preconditions) {
+        for (Map.Entry<String, String> expected : preconditions.entrySet()) {
+            Document dependency = artifacts.find(session, new Document("_id", expected.getKey()))
+                    .projection(new Document("contentHash", 1)).first();
+            if (dependency == null || !Objects.equals(dependency.getString("contentHash"), expected.getValue())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     static Document toDocument(PipelineDraft draft) {
         Document document = new Document("_id", draft.pipelineId())
                 .append("schemaVersion", draft.schemaVersion())
                 .append(REVISION, draft.revision())
-                .append("mode", draft.mode().name().toLowerCase())
+                .append("mode", draft.mode().name().toLowerCase(java.util.Locale.ROOT))
                 .append("name", draft.name())
                 .append("description", draft.description())
                 .append("baseArtifactHash", draft.baseArtifactHash())
@@ -186,6 +233,17 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
             document.append("wizard", wizardDocument(draft.wizard()));
         }
         return document;
+    }
+
+    private static Document activeDraft(String pipelineId) {
+        return new Document("_id", pipelineId).append("deleted", new Document("$ne", true));
+    }
+
+    private static PipelineDraft withRevision(PipelineDraft draft, long revision) {
+        return new PipelineDraft(draft.pipelineId(), draft.schemaVersion(), revision, draft.mode(), draft.name(),
+                draft.description(), draft.graph(), draft.wizard(), draft.baseArtifactHash(),
+                draft.publishedDraftRevision(), draft.publishedArtifactHash(), draft.createdAt(),
+                draft.updatedAt(), draft.updatedBy());
     }
 
     static PipelineDraft fromDocument(Document document) {

@@ -247,6 +247,8 @@ class PipelineApiTest {
         client().post().uri("/api/pipelines/pl1/draft")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
                 .contentType(MediaType.APPLICATION_JSON).body(overlayDraft).retrieve().toBodilessEntity();
+        PipelineDraft overlay = context.getBean(FakePipelineDraftStore.class).get("pl1").orElseThrow();
+        assertThat(overlay.baseArtifactHash()).isEqualTo(CanonicalHash.of(parse(PIPELINE_V1)));
 
         ResponseEntity<Map> catalog = client().get().uri("/api/pipelines")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
@@ -338,7 +340,9 @@ class PipelineApiTest {
                      "table":"items","relation":{"on":[{"childField":"order_id",
                        "parentField":"_id"}],"shape":"array","path":"items","key":["_id"],
                        "arrayKey":["_id"]},"preTransforms":[]}],
-                   "transforms":[],"output":{"kind":"atlas","config":{"sourceId":"target",
+                   "transforms":[{"id":"preserve-config","type":"map",
+                     "fields":{"mode":"Append","shape":"SubDocument"}}],
+                   "output":{"kind":"atlas","config":{"sourceId":"target",
                      "table":"orders_output"}}}}
                 """;
 
@@ -348,6 +352,11 @@ class PipelineApiTest {
 
         assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
         assertThat(shapeOf(created.getBody())).isEqualTo("array");
+        Map<?, ?> wizard = (Map<?, ?>) created.getBody().get("wizard");
+        Map<?, ?> transform = (Map<?, ?>) ((List<?>) wizard.get("transforms")).getFirst();
+        Map<?, ?> fields = (Map<?, ?>) transform.get("fields");
+        assertThat(fields.get("mode")).isEqualTo("Append");
+        assertThat(fields.get("shape")).isEqualTo("SubDocument");
 
         ResponseEntity<Map> replaced = client().put().uri("/api/pipelines/wizard-shape-p1/draft")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
@@ -357,6 +366,27 @@ class PipelineApiTest {
         assertThat(replaced.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(replaced.getBody()).containsEntry("revision", 2);
         assertThat(shapeOf(replaced.getBody())).isEqualTo("array");
+    }
+
+    @Test
+    void dagDraftDoesNotNormalizeArbitraryConnectorConfigValues() {
+        String token = machineToken(Scope.WRITE);
+        String draft = """
+                {"pipelineId":"case-sensitive-config","mode":"dag","name":"Case test",
+                 "graph":{"nodes":[{"id":"source","type":"source","sourceId":"mysql",
+                   "table":"items","config":{"mode":"Append","shape":"SubDocument"},
+                   "metadata":{}}],"edges":[],"viewport":{"x":0,"y":0,"zoom":1}}}
+                """;
+
+        ResponseEntity<Map> created = client().post().uri("/api/pipelines/case-sensitive-config/draft")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(draft).retrieve().toEntity(Map.class);
+
+        Map<?, ?> graph = (Map<?, ?>) created.getBody().get("graph");
+        Map<?, ?> node = (Map<?, ?>) ((List<?>) graph.get("nodes")).getFirst();
+        Map<?, ?> config = (Map<?, ?>) node.get("config");
+        assertThat(config.get("mode")).isEqualTo("Append");
+        assertThat(config.get("shape")).isEqualTo("SubDocument");
     }
 
     private static String shapeOf(Map<?, ?> draft) {
@@ -947,8 +977,9 @@ class PipelineApiTest {
         }
 
         @Bean
-        PipelineDraftService pipelineDraftService(FakePipelineDraftStore store, AuditGate auditGate) {
-            return new PipelineDraftService(store, auditGate);
+        PipelineDraftService pipelineDraftService(
+                FakePipelineDraftStore store, ArtifactQueryService artifacts, AuditGate auditGate) {
+            return new PipelineDraftService(store, artifacts, auditGate, null);
         }
 
         @Bean
@@ -1381,9 +1412,11 @@ class PipelineApiTest {
     /** An in-memory draft store that preserves the same revision and publication preconditions as Mongo. */
     static final class FakePipelineDraftStore implements PipelineDraftStore {
         private final Map<String, PipelineDraft> drafts = new LinkedHashMap<>();
+        private final Map<String, Long> lastRevision = new LinkedHashMap<>();
 
         synchronized void clear() {
             drafts.clear();
+            lastRevision.clear();
         }
 
         @Override
@@ -1398,8 +1431,13 @@ class PipelineApiTest {
 
         @Override
         public synchronized PipelineDraftMutation create(PipelineDraft draft) {
-            return drafts.putIfAbsent(draft.pipelineId(), draft) == null
-                    ? PipelineDraftMutation.CREATED : PipelineDraftMutation.ALREADY_EXISTS;
+            if (drafts.containsKey(draft.pipelineId())) {
+                return PipelineDraftMutation.ALREADY_EXISTS;
+            }
+            long revision = Math.max(draft.revision(), lastRevision.getOrDefault(draft.pipelineId(), 0L) + 1);
+            drafts.put(draft.pipelineId(), withRevision(draft, revision));
+            lastRevision.put(draft.pipelineId(), revision);
+            return PipelineDraftMutation.CREATED;
         }
 
         @Override
@@ -1415,7 +1453,13 @@ class PipelineApiTest {
             if (current.revision() != expectedRevision) {
                 return PipelineDraftMutation.REVISION_CONFLICT;
             }
+            if (!Objects.equals(current.baseArtifactHash(), replacement.baseArtifactHash())
+                    || !Objects.equals(current.publishedDraftRevision(), replacement.publishedDraftRevision())
+                    || !Objects.equals(current.publishedArtifactHash(), replacement.publishedArtifactHash())) {
+                return PipelineDraftMutation.REVISION_CONFLICT;
+            }
             drafts.put(pipelineId, replacement);
+            lastRevision.put(pipelineId, replacement.revision());
             return PipelineDraftMutation.REPLACED;
         }
 
@@ -1451,6 +1495,13 @@ class PipelineApiTest {
                     publication.publishedArtifactHash(), current.createdAt(), publication.publishedAt(),
                     publication.updatedBy()));
             return PipelineDraftMutation.PUBLISHED;
+        }
+
+        private static PipelineDraft withRevision(PipelineDraft draft, long revision) {
+            return new PipelineDraft(draft.pipelineId(), draft.schemaVersion(), revision, draft.mode(), draft.name(),
+                    draft.description(), draft.graph(), draft.wizard(), draft.baseArtifactHash(),
+                    draft.publishedDraftRevision(), draft.publishedArtifactHash(), draft.createdAt(),
+                    draft.updatedAt(), draft.updatedBy());
         }
     }
 
