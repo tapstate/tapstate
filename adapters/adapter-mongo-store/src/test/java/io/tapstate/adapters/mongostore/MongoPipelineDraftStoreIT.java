@@ -56,7 +56,8 @@ class MongoPipelineDraftStoreIT {
             assertThat(storedArtifact.getString("contentHash")).isEqualTo(artifactHash);
             assertThat(store.get("orders").orElseThrow().publishedDraftRevision()).isEqualTo(1L);
 
-            assertThat(store.replace("orders", 1, draft("orders", 2, PipelineDraft.Mode.DAG)))
+            assertThat(store.replace("orders", 1, draft("orders", 2, PipelineDraft.Mode.DAG,
+                    artifactHash, 1L, artifactHash)))
                     .isEqualTo(PipelineDraftMutation.REPLACED);
             assertThat(store.publish(new PipelineDraft.Publication("orders", 2, "stale-hash", artifact,
                     artifactHash, Instant.parse("2026-09-21T02:00:00Z"), "publisher")))
@@ -126,6 +127,11 @@ class MongoPipelineDraftStoreIT {
     }
 
     private static PipelineDraft draft(String id, long revision, PipelineDraft.Mode mode) {
+        return draft(id, revision, mode, revision == 1 ? null : "artifact-hash", null, null);
+    }
+
+    private static PipelineDraft draft(String id, long revision, PipelineDraft.Mode mode,
+            String baseArtifactHash, Long publishedDraftRevision, String publishedArtifactHash) {
         Instant now = Instant.parse("2026-09-21T00:00:00Z");
         boolean dag = mode == PipelineDraft.Mode.DAG;
         PipelineDraft.Graph graph = dag
@@ -133,7 +139,7 @@ class MongoPipelineDraftStoreIT {
         PipelineDraft.Wizard wizard = dag ? null : new PipelineDraft.Wizard(
                 new PipelineDraft.Root(id, "crm", "orders", List.of(), List.of()), List.of(), List.of(), null);
         return new PipelineDraft(id, 1, revision, mode, id, "", graph, wizard,
-                revision == 1 ? null : "artifact-hash", null, null, now, now, "author");
+                baseArtifactHash, publishedDraftRevision, publishedArtifactHash, now, now, "author");
     }
 
     private static Resource artifact(String id) {
