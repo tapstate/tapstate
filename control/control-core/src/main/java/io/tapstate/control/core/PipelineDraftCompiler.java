@@ -352,7 +352,7 @@ public final class PipelineDraftCompiler {
     private static RenameSpec graphTargetRename(PipelineDraft.Node target, Map<String, PipelineDraft.Node> nodes,
             Map<String, List<String>> inputs) {
         Map<String, String> tableMappings = graphTargetMappings(target);
-        if (tableMappings != null) {
+        if (!tableMappings.isEmpty()) {
             return new RenameSpec(tableMappings, null, null, null);
         }
         if (target.table() == null || target.table().isBlank()) {
@@ -366,6 +366,10 @@ public final class PipelineDraftCompiler {
             throw new IllegalArgumentException("target table requires exactly one upstream source table: " + target.id());
         }
         String inputTable = inputTables.iterator().next();
+        if (inputTable == null) {
+            throw new IllegalArgumentException("target table requires a non-null upstream source table: "
+                    + target.id());
+        }
         if (isRegexReference(inputTable)) {
             throw new IllegalArgumentException("target table cannot rename a regex-selected source table: " + target.id());
         }
@@ -376,7 +380,7 @@ public final class PipelineDraftCompiler {
     private static Map<String, String> graphTargetMappings(PipelineDraft.Node target) {
         Object configured = target.config().get("tableMappings");
         if (configured == null) {
-            return null;
+            return Map.of();
         }
         if (!(configured instanceof List<?> mappings)) {
             throw new IllegalArgumentException("target tableMappings must be a list: " + target.id());
@@ -402,7 +406,7 @@ public final class PipelineDraftCompiler {
                 throw new IllegalArgumentException("duplicate target table mapping: " + sourceTable);
             }
         }
-        return result.isEmpty() ? null : result;
+        return result;
     }
 
     private static String mapText(Map<?, ?> values, String key) {
