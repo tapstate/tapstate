@@ -375,6 +375,57 @@ class MongoSrsMetaStoreIT {
     }
 
     @Test
+    void legacyAggregateProgressCannotStandForTwoDivergentSinkWriters() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            // This is the complete shape released before writer-aware progress: the fast target reached
+            // 100, the slow target reached 50, and only the aggregate 100 could be recorded.
+            store.advanceSinkAcked(
+                    CHAIN, "p1", "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
+
+            assertThatThrownBy(() -> store.configureSinkWriters(
+                    CHAIN, "p1", Map.of("orders", List.of("fast", "slow"))))
+                    .isInstanceOf(TapstateException.class)
+                    .satisfies(thrown -> {
+                        TapstateException refusal = (TapstateException) thrown;
+                        assertThat(refusal.code()).isEqualTo(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS);
+                        assertThat(refusal.args()).containsEntry("pipeline", "p1");
+                    });
+
+            // Refusal is atomic: it leaves the aggregate intact but does not promote it into writer
+            // evidence. Clearing this consumer is the control-store half of the required full resync.
+            assertThat(store.ringDoneThrough(CHAIN, "p1")).containsEntry("orders", 100L);
+            assertThat(onlyConsumer(store).sinkAckedSrcpos()).isEqualTo("t100");
+            store.detachConsumer(CHAIN, "p1");
+
+            store.configureSinkWriters(CHAIN, "p1", Map.of("orders", List.of("fast", "slow")));
+            store.advanceSinkWriterAcked(
+                    CHAIN, "p1", "fast", "orders", new ChainPosition(new SourceOrder(2, 100), "t2-100"));
+            store.advanceSinkWriterAcked(
+                    CHAIN, "p1", "slow", "orders", new ChainPosition(new SourceOrder(2, 50), "t2-50"));
+
+            assertThat(store.ringDoneThrough(CHAIN, "p1")).containsEntry("orders", 50L);
+            assertThat(onlyConsumer(store).sinkAckedSrcpos()).isEqualTo("t2-50");
+        });
+    }
+
+    @Test
+    void legacyAggregateProgressCanSeedItsOnlySinkWriter() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.advanceSinkAcked(
+                    CHAIN, "p1", "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
+
+            store.configureSinkWriters(CHAIN, "p1", Map.of("orders", List.of("only")));
+            store.advanceSinkWriterAcked(
+                    CHAIN, "p1", "only", "orders", new ChainPosition(new SourceOrder(1, 101), "t101"));
+
+            assertThat(store.ringDoneThrough(CHAIN, "p1")).containsEntry("orders", 101L);
+            assertThat(onlyConsumer(store).sinkAckedSrcpos()).isEqualTo("t101");
+        });
+    }
+
+    @Test
     void anArrivalIsMarkedOnceAndNeverMovesAPlaceThePipelineAlreadyHas() {
         withStore(store -> {
             store.create(CHAIN, null);

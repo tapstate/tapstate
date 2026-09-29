@@ -416,6 +416,9 @@ public final class PipelineDagBuilder {
         }
         writerIdsByStream.replaceAll((stream, writers) -> List.copyOf(writers));
         Map<String, List<String>> writerPlan = Map.copyOf(writerIdsByStream);
+        if (sinkAck != null) {
+            sinkAck.prepareWriterPlan(writerPlan);
+        }
         for (int writer = 0; writer < sinkPlans.size(); writer++) {
             SinkPlan plan = sinkPlans.get(writer);
             String writerId = "sink-" + writer;

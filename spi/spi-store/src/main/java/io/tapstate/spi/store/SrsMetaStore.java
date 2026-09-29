@@ -147,7 +147,10 @@ public interface SrsMetaStore {
     /**
      * Records the complete set of sink writers expected to receive each table on this mining chain.
      * Writer-aware stores use this before acknowledgements begin so one writer cannot advance a
-     * pipeline-level position on behalf of another. The default keeps older stores compatible with the
+     * pipeline-level position on behalf of another. A writer-aware store must refuse to expand retained
+     * aggregate progress into a plan naming multiple writers: an older record cannot prove which writer
+     * reached that position, so the pipeline has to clear its retained state and either run a full resync
+     * or explicitly accept a new incremental baseline. The default keeps older stores compatible with the
      * single-writer contract.
      */
     default void configureSinkWriters(

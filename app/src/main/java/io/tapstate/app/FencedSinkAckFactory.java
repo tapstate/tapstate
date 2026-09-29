@@ -43,6 +43,11 @@ final class FencedSinkAckFactory implements SinkAckFactory {
     }
 
     @Override
+    public void prepareWriterPlan(Map<String, List<String>> writerIdsByStream) {
+        delegate.prepareWriterPlan(writerIdsByStream);
+    }
+
+    @Override
     public SinkAckFactory forWriter(
             String writerId, List<String> streams, Map<String, List<String>> writerIdsByStream) {
         return new FencedSinkAckFactory(delegate.forWriter(writerId, streams, writerIdsByStream), fence);

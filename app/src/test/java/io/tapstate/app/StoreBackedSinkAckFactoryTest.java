@@ -13,12 +13,15 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.hazelcast.core.HazelcastInstance;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SrsMetaStore;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -165,6 +168,23 @@ class StoreBackedSinkAckFactoryTest {
 
         assertThat(store.ringDoneThrough("mc-orders", "pipe-1").get("orders"))
                 .isEqualTo(50L);
+    }
+
+    @Test
+    void aLegacyAggregateIsRefusedBeforeTheDagCanRunWithTwoWriters() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        store.advanceSinkAcked("mc-orders", "pipe-1", "orders", at(100, "w100"));
+        Map<String, List<String>> plan = Map.of("orders", List.of("fast", "slow"));
+        StoreBackedSinkAckFactory factory = new StoreBackedSinkAckFactory(
+                Map.of("orders", "mc-orders"), "pipe-1", store);
+
+        assertThatThrownBy(() -> factory.prepareWriterPlan(plan))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(thrown -> assertThat(((TapstateException) thrown).code())
+                        .isEqualTo(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS));
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1"))
+                .containsEntry("orders", 100L);
     }
 
     @Test

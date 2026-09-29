@@ -120,6 +120,8 @@ class PipelineDagBuilderAckTest {
                 sinkAck,
                 new FrontierBinding(Map.of("orders_src", "orders")));
 
+        assertThat(sinkAck.preparedPlan.get("orders"))
+                .containsExactlyInAnyOrder("sink-0", "sink-1");
         assertThat(sinkAck.scopes).hasSize(2);
         assertThat(sinkAck.scopes).allSatisfy(scope -> {
             assertThat(scope.streams()).containsExactly("orders");
@@ -192,10 +194,16 @@ class PipelineDagBuilderAckTest {
 
     private static final class PlanningAckFactory implements SinkAckFactory {
         private final List<WriterScope> scopes = new ArrayList<>();
+        private Map<String, List<String>> preparedPlan = Map.of();
 
         @Override
         public SinkAck resolve(HazelcastInstance member) {
             return (chain, position) -> { };
+        }
+
+        @Override
+        public void prepareWriterPlan(Map<String, List<String>> writerIdsByStream) {
+            preparedPlan = Map.copyOf(writerIdsByStream);
         }
 
         @Override

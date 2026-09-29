@@ -445,14 +445,16 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         return update;
     }
 
-    /** Installs the complete writer plan and seeds newly named writers from the compatible public cursor. */
+    /**
+     * Installs the complete writer plan and seeds newly named writers from a compatible public cursor.
+     * A cursor from before writer-aware progress is compatible with one writer only: with several, the
+     * aggregate may name the fastest writer and there is no stored evidence for the rest.
+     */
     private static void configureSinkWriters(
             Document consumer, String pipelineId, Map<String, List<String>> writerIdsByTable) {
         Document expected = new Document();
-        Document progress = nestedDocument(consumer, SINK_WRITER_PROGRESS, pipelineId, true);
-        Document ringDone = nestedDocument(consumer, PER_TABLE_RING_DONE, pipelineId, false);
-        ChainPosition aggregateAck = sinkAckedFrom(consumer);
-        List<String> completed = snapshotCompletedFrom(consumer);
+        LinkedHashSet<String> allWriterIds = new LinkedHashSet<>();
+        Map<String, List<String>> normalizedPlan = new LinkedHashMap<>();
         for (Map.Entry<String, List<String>> entry : writerIdsByTable.entrySet()) {
             String table = storedKey(entry.getKey(), "table");
             if (entry.getValue().isEmpty()) {
@@ -463,6 +465,26 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                     .map(writerId -> storedKey(writerId, "sink writer id"))
                     .distinct()
                     .toList();
+            normalizedPlan.put(table, writerIds);
+            allWriterIds.addAll(writerIds);
+        }
+
+        Document priorPlan = nestedDocument(consumer, EXPECTED_SINK_WRITERS, pipelineId, false);
+        Document ringDone = nestedDocument(consumer, PER_TABLE_RING_DONE, pipelineId, false);
+        ChainPosition aggregateAck = sinkAckedFrom(consumer);
+        List<String> completed = snapshotCompletedFrom(consumer);
+        boolean hasAggregateProgress = aggregateAck != null
+                || (ringDone != null && !ringDone.isEmpty())
+                || !completed.isEmpty();
+        if (priorPlan == null && allWriterIds.size() > 1 && hasAggregateProgress) {
+            throw new TapstateException(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS,
+                    Map.of("pipeline", pipelineId), null);
+        }
+
+        Document progress = nestedDocument(consumer, SINK_WRITER_PROGRESS, pipelineId, true);
+        for (Map.Entry<String, List<String>> entry : normalizedPlan.entrySet()) {
+            String table = entry.getKey();
+            List<String> writerIds = entry.getValue();
             expected.append(table, writerIds);
             for (String writerId : writerIds) {
                 Document writer = writerProgress(progress, pipelineId, writerId, table, true);

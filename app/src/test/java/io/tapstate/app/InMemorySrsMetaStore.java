@@ -1,13 +1,16 @@
 package io.tapstate.app;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -263,13 +266,25 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
                     meta.schemaHistory(), meta.retention(), meta.epoch());
             records.put(miningChainId, meta);
         }
-        SinkWriters writers = sinkWriters.computeIfAbsent(miningChainId, ignored -> new LinkedHashMap<>())
-                .computeIfAbsent(pipelineId, ignored -> new SinkWriters());
         ConsumerOffset existing = meta.consumerOffset(pipelineId).orElse(null);
         Map<String, Long> completedRing = ringDoneThrough(miningChainId, pipelineId);
         Set<String> completedSnapshots = existing == null
                 ? Set.of()
                 : Set.copyOf(existing.snapshotCompletedTables());
+        LinkedHashSet<String> allWriterIds = new LinkedHashSet<>();
+        writerIdsByTable.values().forEach(allWriterIds::addAll);
+        SinkWriters priorPlan = writers(miningChainId, pipelineId);
+        boolean hasAggregateProgress = (existing != null && existing.sinkAcked() != null)
+                || !completedRing.isEmpty()
+                || !completedSnapshots.isEmpty();
+        if (priorPlan == null && allWriterIds.size() > 1 && hasAggregateProgress) {
+            throw new TapstateException(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS,
+                    Map.of("pipeline", pipelineId), null);
+        }
+        SinkWriters writers = priorPlan != null
+                ? priorPlan
+                : sinkWriters.computeIfAbsent(miningChainId, ignored -> new LinkedHashMap<>())
+                        .computeIfAbsent(pipelineId, ignored -> new SinkWriters());
         Map<String, List<String>> expected = new LinkedHashMap<>();
         writerIdsByTable.forEach((table, writerIds) -> {
             expected.put(table, List.copyOf(writerIds));

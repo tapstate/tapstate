@@ -24,7 +24,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  * input. It holds only serializable coordinates — a {@code table -> mining chain id} map for every source
  * the pipeline reads, the consumer pipeline id, and the stable writer plan compiled from the DAG — and
  * resolves the durable store on the member that runs the sink, mirroring how the source's read-cursor
- * publisher binds its store member-side. The store itself is not serializable and never crosses the wire.
+ * publisher binds its store member-side. An assembly-only store handle checks the complete writer plan
+ * before the DAG can be submitted; it is transient, so the store itself never crosses the wire.
  *
  * <p>The sink knows a chain only by the {@code src} stream name its events carry — a table at L1 — so this
  * maps that stream to the mining chain that keys its durable record and advances that writer's position.
@@ -59,10 +60,16 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
     private final Map<String, List<String>> writerIdsByStream;
     private final AtomicInteger resolvedWriterSequence;
     private final Map<String, List<String>> resolvedWriterIdsByStream;
+    private final transient SrsMetaStore assemblyStore;
 
     StoreBackedSinkAckFactory(Map<String, String> chainIdByTable, String pipelineId) {
+        this(chainIdByTable, pipelineId, null);
+    }
+
+    StoreBackedSinkAckFactory(
+            Map<String, String> chainIdByTable, String pipelineId, SrsMetaStore assemblyStore) {
         this(chainIdByTable, pipelineId, null, Set.of(), Map.of(),
-                new AtomicInteger(), new ConcurrentHashMap<>());
+                new AtomicInteger(), new ConcurrentHashMap<>(), assemblyStore);
     }
 
     private StoreBackedSinkAckFactory(
@@ -72,7 +79,8 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
             Set<String> writerStreams,
             Map<String, List<String>> writerIdsByStream,
             AtomicInteger resolvedWriterSequence,
-            Map<String, List<String>> resolvedWriterIdsByStream) {
+            Map<String, List<String>> resolvedWriterIdsByStream,
+            SrsMetaStore assemblyStore) {
         this.chainIdByTable = Map.copyOf(chainIdByTable);
         this.pipelineId = pipelineId;
         this.writerId = writerId;
@@ -80,6 +88,32 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
         this.writerIdsByStream = copyPlan(writerIdsByStream);
         this.resolvedWriterSequence = resolvedWriterSequence;
         this.resolvedWriterIdsByStream = resolvedWriterIdsByStream;
+        this.assemblyStore = assemblyStore;
+    }
+
+    /**
+     * Checks and records every already-seeded chain before the DAG can run. A chain not seeded yet is
+     * left to the member-side lazy registration; it has no retained cursor that could be ambiguous.
+     */
+    @Override
+    public void prepareWriterPlan(Map<String, List<String>> writerIdsByStream) {
+        if (assemblyStore == null) {
+            return;
+        }
+        LinkedHashSet<String> miningChainIds = new LinkedHashSet<>();
+        for (String stream : writerIdsByStream.keySet()) {
+            String miningChainId = chainIdByTable.get(stream);
+            if (miningChainId == null) {
+                throw new IllegalStateException(
+                        "sink writer plan names a chain the pipeline never sourced: '" + stream + "'");
+            }
+            miningChainIds.add(miningChainId);
+        }
+        for (String miningChainId : miningChainIds) {
+            if (assemblyStore.read(miningChainId).isPresent()) {
+                configure(assemblyStore, miningChainId, writerIdsByStream);
+            }
+        }
     }
 
     @Override
@@ -95,7 +129,8 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                 new LinkedHashSet<>(streams),
                 writerIdsByStream,
                 resolvedWriterSequence,
-                resolvedWriterIdsByStream);
+                resolvedWriterIdsByStream,
+                assemblyStore);
     }
 
     @Override
