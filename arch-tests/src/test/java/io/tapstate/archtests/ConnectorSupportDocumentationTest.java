@@ -1,7 +1,6 @@
 package io.tapstate.archtests;
 
 import io.tapstate.core.catalog.OfficialConnectors;
-import io.tapstate.core.dsl.TargetConnectorRules;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -86,7 +85,7 @@ class ConnectorSupportDocumentationTest {
         for (Path document : DOCUMENTS) {
             String text = Files.readString(document);
             for (String kind : OfficialConnectors.IDS_BY_DATABASE_KIND.keySet()) {
-                String direction = kind.equals(TargetConnectorRules.SUPPORTED_TARGET_KIND)
+                String direction = kind.equals("mongodb")
                         ? "Read and write" : "Read";
                 assertThat(text).as("certified direction for '%s' in %s", kind, document)
                         .contains("| " + DATABASE_NAMES.get(kind) + " | `" + kind + "` | " + direction + " |");
