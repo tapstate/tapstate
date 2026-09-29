@@ -2430,7 +2430,7 @@ final class StoreBackedDagSource implements DagSource {
                 freshFullLoad);
     }
 
-    /** A CDC-only read and any consumer state beyond capture's initial seam suppress target preparation. */
+    /** A CDC-only read and any durable consumer state suppress target preparation. */
     private boolean freshFullLoad(PipelineResource pipeline) {
         if (pipeline.settings() != null
                 && pipeline.settings().readMode() == io.tapstate.core.model.ReadMode.CDC_ONLY) {
@@ -2442,7 +2442,8 @@ final class StoreBackedDagSource implements DagSource {
                                 consumer -> consumer.pipelineId().equals(pipeline.id())
                                         && (!consumer.perTableSeq().isEmpty()
                                                 || consumer.sinkAcked() != null
-                                                || !consumer.snapshotCompletedTables().isEmpty())))
+                                                || !consumer.snapshotCompletedTables().isEmpty()
+                                                || consumer.cdcStartPosition() != null)))
                         .orElse(false));
     }
 
