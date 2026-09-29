@@ -37,7 +37,9 @@ class PipelineDraftAuthoringRoundTripIT {
                             "config", Map.of("connectorId", "orders-mysql"),
                             "metadata", Map.of("label", "Orders"))),
                     "edges", java.util.List.of(),
-                    "viewport", Map.of("x", 0, "y", 0, "zoom", 1));
+                    // JSON round-trips numeric values as doubles, so model the
+                    // persisted viewport values the same way in this contract test.
+                    "viewport", Map.of("x", 0.0, "y", 0.0, "zoom", 1.0));
             Map<String, Object> saved = control.createPipelineDraft(PIPELINE_ID, Map.of(
                     "pipelineId", PIPELINE_ID,
                     "mode", "dag",
