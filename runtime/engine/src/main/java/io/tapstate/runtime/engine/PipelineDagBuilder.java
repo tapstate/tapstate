@@ -388,7 +388,7 @@ public final class PipelineDagBuilder {
             List<Vertex> upstream = upstreamOf(view.from(), byKey, bindings);
             String viewName = VIEW_VERTEX_PREFIX + view.id();
             sinkPlans.add(new SinkPlan(viewName, bindings.viewSinks().apply(view), upstream,
-                    chainsOf(upstream, chains)));
+                    chainsOf(upstream, byKey, chains)));
             readsAs.put(view.id(), upstream);
         }
 
@@ -403,7 +403,7 @@ public final class PipelineDagBuilder {
                 SyncElement element = sync.get(i);
                 String name = SERVE_VERTEX_PREFIX + (element.id() != null ? element.id() : i);
                 sinkPlans.add(new SinkPlan(name, bindings.sinkWriters().apply(element), upstream,
-                        chainsOf(upstream, chains)));
+                        chainsOf(upstream, byKey, chains)));
             }
         }
 
@@ -439,10 +439,22 @@ public final class PipelineDagBuilder {
     }
 
     /** The source streams carried by {@code upstream}, or none when frontier binding is absent. */
-    private static List<String> chainsOf(List<Vertex> upstream, PipelineChains chains) {
-        return chains == null
-                ? List.of()
-                : chains.union(upstream.stream().map(Vertex::getName).toList());
+    private static List<String> chainsOf(
+            List<Vertex> upstream, Map<String, Vertex> byKey, PipelineChains chains) {
+        if (chains == null) {
+            return List.of();
+        }
+        List<String> keys = new ArrayList<>();
+        for (Vertex vertex : upstream) {
+            String key = byKey.entrySet().stream()
+                    .filter(entry -> entry.getValue() == vertex)
+                    .map(Map.Entry::getKey)
+                    .findFirst()
+                    .orElseThrow(() -> new IllegalStateException(
+                            "upstream vertex '" + vertex.getName() + "' has no pipeline key"));
+            keys.add(key);
+        }
+        return chains.union(keys);
     }
 
     /**

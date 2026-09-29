@@ -15,7 +15,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -107,7 +106,7 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
         WriterBinding writer = writerId == null
                 ? bindResolvedWriter()
                 : new WriterBinding(writerId, writerStreams, writerIdsByStream);
-        AtomicBoolean configured = new AtomicBoolean();
+        Set<String> configuredMiningChains = ConcurrentHashMap.newKeySet();
         Map<String, ChainPosition> recorded = new ConcurrentHashMap<>();
         return (chain, position) -> {
             String miningChainId = chainIdByTable.get(chain);
@@ -119,7 +118,7 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                 throw new IllegalStateException("sink writer '" + writer.id()
                         + "' acked a chain it does not receive: '" + chain + "'");
             }
-            ensureConfigured(meta, writer, configured);
+            ensureConfigured(meta, writer, miningChainId, configuredMiningChains);
             String token = position.token() != null ? position.token()
                     : isSnapshotOf(position) ? cdcStart(meta, miningChainId, pipelineId) : null;
             ChainPosition acked = new ChainPosition(position.order(), token);
@@ -154,13 +153,17 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
         }
     }
 
-    /** Registers a resolved writer's complete plan once, immediately before its first acknowledgement. */
-    private void ensureConfigured(SrsMetaStore meta, WriterBinding writer, AtomicBoolean configured) {
-        if (configured.get()) {
+    /** Registers a writer's complete plan for one mining chain before its first acknowledgement there. */
+    private void ensureConfigured(
+            SrsMetaStore meta,
+            WriterBinding writer,
+            String miningChainId,
+            Set<String> configuredMiningChains) {
+        if (configuredMiningChains.contains(miningChainId)) {
             return;
         }
-        synchronized (configured) {
-            if (configured.get()) {
+        synchronized (configuredMiningChains) {
+            if (configuredMiningChains.contains(miningChainId)) {
                 return;
             }
             Map<String, List<String>> plan = writer.plan();
@@ -169,25 +172,30 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                     plan = copyPlan(resolvedWriterIdsByStream);
                 }
             }
-            configure(meta, plan);
-            configured.set(true);
+            configure(meta, miningChainId, plan);
+            configuredMiningChains.add(miningChainId);
         }
     }
 
-    /** Registers the complete table-to-writer plan once per mining chain. */
-    private void configure(SrsMetaStore meta, Map<String, List<String>> plan) {
-        Map<String, Map<String, List<String>>> byMiningChain = new LinkedHashMap<>();
+    /** Registers the complete table-to-writer plan for {@code miningChainId} without touching another. */
+    private void configure(
+            SrsMetaStore meta, String miningChainId, Map<String, List<String>> plan) {
+        Map<String, List<String>> writersByTable = new LinkedHashMap<>();
         for (Map.Entry<String, List<String>> entry : plan.entrySet()) {
-            String miningChainId = chainIdByTable.get(entry.getKey());
-            if (miningChainId == null) {
+            String entryMiningChainId = chainIdByTable.get(entry.getKey());
+            if (entryMiningChainId == null) {
                 throw new IllegalStateException(
                         "sink writer plan names a chain the pipeline never sourced: '" + entry.getKey() + "'");
             }
-            byMiningChain.computeIfAbsent(miningChainId, ignored -> new LinkedHashMap<>())
-                    .put(entry.getKey(), entry.getValue());
+            if (entryMiningChainId.equals(miningChainId)) {
+                writersByTable.put(entry.getKey(), entry.getValue());
+            }
         }
-        byMiningChain.forEach((miningChainId, writersByTable) ->
-                meta.configureSinkWriters(miningChainId, pipelineId, writersByTable));
+        if (writersByTable.isEmpty()) {
+            throw new IllegalStateException(
+                    "sink writer plan names no stream on mining chain '" + miningChainId + "'");
+        }
+        meta.configureSinkWriters(miningChainId, pipelineId, writersByTable);
     }
 
     private static Map<String, List<String>> copyPlan(Map<String, List<String>> plan) {
