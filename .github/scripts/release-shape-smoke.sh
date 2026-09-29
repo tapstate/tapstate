@@ -76,7 +76,7 @@ hasnt "the publish path retires no branches of its own" satellites 'unbranch'
 # does not need the approval, is the failure this file exists for. Checked over every job there is,
 # so a new one is covered without this list being edited.
 for j in $jobs_list; do
-  case "$j" in publish|satellites) continue ;; esac
+  case "$j" in publish|satellites|cloud-ecr) continue ;; esac
   body="$(job "$j")"
   if grep -qE 'imagetools create|docker push|push: true|draft=false|--latest=|make_latest|satellites[.]sh release|docs-release[.]sh settle' <<<"$body"; then
     bad "no irreversible act in '$j'" \
@@ -106,6 +106,19 @@ has   "Cloud checks Web files and revision"         cloud-image 'web-provenance[
 has   "Cloud retains the checked archive"           cloud-image 'name: cloud-image'
 has   "a failed Cloud image blocks approval"         gates       'needs:.*cloud-image'
 hasnt "Cloud does not rebuild Web"                   cloud-image 'pnpm build|prepare-web-assets[.]sh|mvn .*package'
+
+# The release ECR publication happens only after the ordinary release and satellites are out. It
+# consumes the archive checked above, calls the same publisher as the independent validation
+# workflow, and never gains a second path that rebuilds the image or downloads connector bytes.
+has   "ECR waits until satellite publication is complete" cloud-ecr 'needs:.*satellites'
+has   "ECR consumes the checked Cloud archive"             cloud-ecr 'name: cloud-image'
+has   "ECR uses the production GitHub Environment"         cloud-ecr 'environment: cloud-ecr-release'
+has   "ECR selects one authentication mode"                cloud-ecr 'ecr-publish[.]sh auth-mode'
+has   "ECR uses the shared digest publisher"               cloud-ecr 'ecr-publish[.]sh publish'
+has   "ECR publishes the verified archive digest"          cloud-ecr 'needs[.]cloud-image[.]outputs[.]digest'
+hasnt "ECR never rebuilds the approved image"              cloud-ecr 'buildx build|build-push-action'
+hasnt "ECR never downloads connector bytes again"          cloud-ecr 'stage-connectors|release download'
+has   "cleanup waits for the final ECR publication"        cleanup   'needs:.*cloud-ecr'
 
 # C6. The publish step edits the existing release; it never re-sends a body. Re-running the action
 # that assembled the draft would overwrite whatever the approver wrote, and nothing would say so.
