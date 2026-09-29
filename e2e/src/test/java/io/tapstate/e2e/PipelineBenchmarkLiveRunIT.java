@@ -106,7 +106,7 @@ class PipelineBenchmarkLiveRunIT {
         return new RunConfig(baseline, candidate, output, gate, target, primary);
     }
 
-    private static Path harnessRoot() throws Exception {
+    static Path harnessRoot() throws Exception {
         Command result = git(Path.of("").toAbsolutePath(), "rev-parse", "--show-toplevel");
         if (result.exitCode() != 0 || result.output().isBlank()) {
             throw new AssertionError("cannot locate the benchmark harness repository: " + result.output());
@@ -114,7 +114,7 @@ class PipelineBenchmarkLiveRunIT {
         return Path.of(result.output().trim()).toAbsolutePath().normalize();
     }
 
-    private static void requireSafeOutput(Path output, Path root) throws Exception {
+    static void requireSafeOutput(Path output, Path root) throws Exception {
         if (!output.isAbsolute() || output.getFileName() == null) {
             throw new IllegalArgumentException("benchmark output must be an absolute file path");
         }
@@ -132,7 +132,7 @@ class PipelineBenchmarkLiveRunIT {
         throw new AssertionError("cannot check whether benchmark output is ignored: " + ignored.output());
     }
 
-    private static Map<String, Object> harnessRevision(Path root) throws Exception {
+    static Map<String, Object> harnessRevision(Path root) throws Exception {
         Command revision = git(root, "rev-parse", "HEAD");
         if (revision.exitCode() != 0 || !revision.output().trim().matches("[0-9a-f]{40,64}")) {
             throw new AssertionError("cannot identify the benchmark harness revision: " + revision.output());
@@ -222,7 +222,7 @@ class PipelineBenchmarkLiveRunIT {
         }
     }
 
-    private static String sha256(Path path) throws IOException {
+    static String sha256(Path path) throws IOException {
         MessageDigest digest;
         try {
             digest = MessageDigest.getInstance("SHA-256");
@@ -238,7 +238,7 @@ class PipelineBenchmarkLiveRunIT {
         return HexFormat.of().formatHex(digest.digest());
     }
 
-    private static Map<String, Object> environment() throws Exception {
+    static Map<String, Object> environment() throws Exception {
         java.lang.management.OperatingSystemMXBean operatingSystem = ManagementFactory.getOperatingSystemMXBean();
         Object totalMemory = operatingSystem instanceof com.sun.management.OperatingSystemMXBean extended
                 ? extended.getTotalMemorySize() : "UNAVAILABLE";

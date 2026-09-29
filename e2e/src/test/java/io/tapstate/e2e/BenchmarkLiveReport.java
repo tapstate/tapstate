@@ -34,6 +34,7 @@ final class BenchmarkLiveReport {
         }
         document.put("formatVersion", 1);
         document.put("status", "INITIALIZING");
+        document.put("acceptanceEvaluated", false);
         document.put("startedAt", Instant.now().toString());
         document.put("forks", forks);
         persist();
@@ -56,6 +57,7 @@ final class BenchmarkLiveReport {
 
     void finish(Map<String, Object> evaluation, boolean passed) {
         document.put("evaluation", evaluation);
+        document.put("acceptanceEvaluated", true);
         document.put("status", passed ? "PASSED" : "FAILED");
         document.put("finishedAt", Instant.now().toString());
         persist();

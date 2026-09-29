@@ -14,14 +14,13 @@ import io.tapstate.control.core.HistoryAggregator;
 import io.tapstate.control.core.PipelineMetricsHistory;
 import io.tapstate.spi.store.HistoryRollupStore;
 import io.tapstate.spi.store.RateHistoryStore;
-import io.tapstate.testsupport.DockerGate;
+import io.tapstate.testsupport.RequiresDocker;
 import org.bson.BsonArray;
 import org.bson.BsonDateTime;
 import org.bson.BsonDocument;
 import org.bson.BsonValue;
 import org.bson.Document;
 import org.bson.types.ObjectId;
-import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import java.net.URI;
@@ -46,6 +45,7 @@ import java.util.NavigableMap;
 import java.util.Optional;
 import java.util.TreeMap;
 import java.util.HexFormat;
+import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -59,6 +59,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * against a reference build without rollup support. Optional warm-up and hot-read counts apply
  * equally to both arms; the five-read default preserves the original small fixture.
  */
+@RequiresDocker
 class HistoryQueryBenchmarkIT {
 
     private static final String DATABASE = "history_query_benchmark";
@@ -106,30 +107,35 @@ class HistoryQueryBenchmarkIT {
                   ddl: apply
             """;
 
-    @BeforeAll
-    static void requireDocker() {
-        DockerGate.require();
-    }
-
     @Test
     void theSameFifteenDayFixtureMeasuresOneHourOneDayAndFifteenDays() throws Exception {
-        assertThat(HOT_READS).isBetween(5, 100);
-        assertThat(WARMUP_READS).isBetween(0, 50);
+        String configuredJar = System.getProperty(BOOT_JAR_PROPERTY);
+        String jarSetting = configuredJar == null || configuredJar.isBlank()
+                ? System.getProperty(REACTOR_JAR_PROPERTY) : configuredJar;
+        String configuredAnchor = System.getProperty(ANCHOR_PROPERTY);
+        runPair(new Settings(jarSetting == null || jarSetting.isBlank() ? null : Path.of(jarSetting),
+                configuredAnchor == null || configuredAnchor.isBlank() ? null : Instant.parse(configuredAnchor),
+                WARMUP_READS, HOT_READS, Boolean.getBoolean(RAW_ONLY_PROPERTY),
+                Boolean.getBoolean(CACHED_FIRST_PROPERTY)), ignored -> { });
+    }
+
+    static PairRun runPair(Settings settings, Consumer<Map<String, Object>> evidenceSink) throws Exception {
+        assertThat(settings.hotReads()).isBetween(5, 100);
+        assertThat(settings.warmupReads()).isBetween(0, 50);
+        Path jar = settings.jar();
+        String artifactSha = jar == null ? "reactor" : sha256(jar);
         String storeUri = SharedMongo.replicaSetUrl(DATABASE);
         try (MongoClient mongo = MongoClients.create(storeUri)) {
             MongoDatabase database = mongo.getDatabase(DATABASE);
             database.drop();
-            String configuredJar = System.getProperty(BOOT_JAR_PROPERTY);
-            String jarSetting = configuredJar == null || configuredJar.isBlank()
-                    ? System.getProperty(REACTOR_JAR_PROPERTY) : configuredJar;
-            Path jar = jarSetting == null || jarSetting.isBlank() ? null : Path.of(jarSetting);
             List<Window> frozen = List.of(
                     new Window("1h", Duration.ofHours(1), "raw", "PT1M"),
                     new Window("1d", Duration.ofDays(1), "PT30M", "PT30M"),
                     new Window("15d", RETENTION, "PT6H", "PT6H"));
             Instant to;
             Instant missingBucket;
-            boolean rawOnly = Boolean.getBoolean(RAW_ONLY_PROPERTY);
+            Fixture fixture;
+            boolean rawOnly = settings.rawOnly();
             try (RealProcessServer setupServer = startServer(storeUri, jar, true)) {
                 ControlPlane setupControl = new ControlPlane(setupServer.baseUrl());
                 setupControl.bootstrapAndLogin("history-benchmark", "history-benchmark-password");
@@ -138,11 +144,10 @@ class HistoryQueryBenchmarkIT {
 
                 // Keep the upper edge off the minute boundary and three minutes behind wall time. The
                 // latter leaves room for the live server's retention cutoff to move while tests run.
-                String configuredAnchor = System.getProperty(ANCHOR_PROPERTY);
-                to = configuredAnchor == null || configuredAnchor.isBlank()
+                to = settings.anchor() == null
                         ? Instant.now().truncatedTo(ChronoUnit.MINUTES)
                                 .minus(Duration.ofMinutes(3)).plusSeconds(17)
-                        : Instant.parse(configuredAnchor);
+                        : settings.anchor();
                 missingBucket = Instant.ofEpochSecond(
                         Math.floorDiv(to.minus(Duration.ofMinutes(30)).getEpochSecond(), 1_800) * 1_800);
                 Document artifact = database.getCollection(MongoStorePort.ARTIFACTS)
@@ -157,14 +162,20 @@ class HistoryQueryBenchmarkIT {
                         jar == null ? "reactor" : jar, jar == null ? "reactor" : sha256(jar),
                         System.getProperty("os.name"), System.getProperty("os.arch"),
                         System.getProperty("java.version"), to, missingBucket, entries.size(),
-                        incarnation == null ? "legacy" : "incarnation", WARMUP_READS, HOT_READS);
+                        incarnation == null ? "legacy" : "incarnation", settings.warmupReads(), settings.hotReads());
+                fixture = new Fixture(to, entries.firstKey(), entries.lastKey(), missingBucket,
+                        entries.size(), null);
+                assertFresh(fixture, Instant.now(), false);
                 if (rawOnly) {
                     readWindows(database, setupServer, setupControl.credential(), frozen, to,
-                            missingBucket, true, "raw-frozen");
-                    return;
+                            missingBucket, true, "raw-frozen", settings, fixture, evidenceSink);
+                    return null;
                 }
-                int buckets = seedRollups(database, entries, to, incarnation);
-                System.out.printf("history-query-rollup-seed buckets=%d resolutions=PT30M,PT6H%n", buckets);
+                RollupSeed seed = seedRollups(database, entries, to, incarnation);
+                fixture = new Fixture(to, entries.firstKey(), entries.lastKey(), missingBucket,
+                        entries.size(), seed.validUntil());
+                System.out.printf("history-query-rollup-seed buckets=%d resolutions=PT30M,PT6H validUntil=%s%n",
+                        seed.buckets(), seed.validUntil());
             }
 
             Instant alignedTo = floor(to, Duration.ofHours(6));
@@ -174,13 +185,13 @@ class HistoryQueryBenchmarkIT {
                     // the longest six-hour-aligned window strictly inside that cutoff.
                     new Window("15d-tier-aligned-14d18h", RETENTION.minus(Duration.ofHours(6)),
                             "PT6H", "PT6H"));
-            boolean cachedFirst = Boolean.getBoolean(CACHED_FIRST_PROPERTY);
+            boolean cachedFirst = settings.cachedFirst();
             System.out.printf("history-query-arm-order first=%s second=%s%n",
                     cachedFirst ? "cached" : "raw", cachedFirst ? "raw" : "cached");
             ArmRuns first = runArm(database, storeUri, jar, cachedFirst,
-                    frozen, aligned, to, alignedTo, missingBucket);
+                    frozen, aligned, to, alignedTo, missingBucket, settings, fixture, evidenceSink);
             ArmRuns second = runArm(database, storeUri, jar, !cachedFirst,
-                    frozen, aligned, to, alignedTo, missingBucket);
+                    frozen, aligned, to, alignedTo, missingBucket, settings, fixture, evidenceSink);
             ArmRuns raw = cachedFirst ? second : first;
             ArmRuns cached = cachedFirst ? first : second;
             compare(raw.frozen(), cached.frozen());
@@ -195,6 +206,12 @@ class HistoryQueryBenchmarkIT {
             for (WindowRun run : cached.missing()) {
                 reportPair("missing-rollup", matching(raw.aligned(), run.window()), run);
             }
+            assertFresh(fixture, Instant.now(), false);
+            if (jar != null) {
+                assertThat(sha256(jar)).as("the protected query artifact stayed unchanged").isEqualTo(artifactSha);
+            }
+            return new PairRun(artifactSha, fixture, settings.warmupReads(), settings.hotReads(),
+                    cachedFirst, raw, cached);
         }
     }
 
@@ -211,16 +228,18 @@ class HistoryQueryBenchmarkIT {
 
     private static ArmRuns runArm(MongoDatabase database, String storeUri, Path jar, boolean cached,
             List<Window> frozen, List<Window> aligned, Instant to, Instant alignedTo,
-            Instant missingBucket) throws Exception {
+            Instant missingBucket, Settings settings, Fixture fixture,
+            Consumer<Map<String, Object>> evidenceSink) throws Exception {
         try (RealProcessServer server = startServer(storeUri, jar, !cached)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
             control.login("history-benchmark", "history-benchmark-password");
             String credential = control.credential();
             List<WindowRun> frozenRuns = readWindows(database, server, credential,
-                    frozen, to, missingBucket, true, cached ? "cached-frozen" : "raw-frozen");
+                    frozen, to, missingBucket, true, cached ? "cached-frozen" : "raw-frozen",
+                    settings, fixture, evidenceSink);
             List<WindowRun> alignedRuns = readWindows(database, server, credential,
                     aligned, alignedTo, missingBucket, false,
-                    cached ? "cached-full-hit" : "raw-aligned");
+                    cached ? "cached-full-hit" : "raw-aligned", settings, fixture, evidenceSink);
             if (!cached) {
                 return new ArmRuns(frozenRuns, alignedRuns, List.of());
             }
@@ -229,7 +248,8 @@ class HistoryQueryBenchmarkIT {
             }
             deleteMiddleRollup(database, alignedTo, aligned);
             List<WindowRun> missingRuns = readWindows(database, server, credential,
-                    aligned, alignedTo, missingBucket, false, "cached-missing-rollup");
+                    aligned, alignedTo, missingBucket, false, "cached-missing-rollup",
+                    settings, fixture, evidenceSink);
             for (WindowRun run : missingRuns) {
                 assertOnlyMissingBucketReadsRaw(run, alignedTo);
             }
@@ -269,7 +289,7 @@ class HistoryQueryBenchmarkIT {
         return entries;
     }
 
-    private static int seedRollups(MongoDatabase database,
+    private static RollupSeed seedRollups(MongoDatabase database,
             NavigableMap<Instant, RateHistoryStore.Entry> entries, Instant to, String incarnation) {
         MongoHistoryRollupStore store = new MongoHistoryRollupStore(database,
                 database.getCollection(MongoStorePort.PIPELINE_HISTORY_ROLLUPS), RETENTION);
@@ -312,7 +332,7 @@ class HistoryQueryBenchmarkIT {
                 count++;
             }
         }
-        return count;
+        return new RollupSeed(count, computedAt.plus(HistoryRollupStore.MAX_CACHE_AGE));
     }
 
     private static HistoryRollupStore.Fragment fragment(HistoryAggregator.Emitted emitted) {
@@ -437,8 +457,9 @@ class HistoryQueryBenchmarkIT {
     }
 
     private static List<Reading> allReadings(WindowRun run) {
-        List<Reading> readings = new ArrayList<>(1 + run.hot().size());
+        List<Reading> readings = new ArrayList<>(1 + run.warmup().size() + run.hot().size());
         readings.add(run.cold());
+        readings.addAll(run.warmup());
         readings.addAll(run.hot());
         return readings;
     }
@@ -471,9 +492,17 @@ class HistoryQueryBenchmarkIT {
 
     private static List<WindowRun> readWindows(MongoDatabase database, RealProcessServer server,
             String credential, List<Window> windows, Instant to, Instant missingBucket,
-            boolean frozen, String mode) throws Exception {
+            boolean frozen, String mode, Settings settings, Fixture fixture,
+            Consumer<Map<String, Object>> evidenceSink) throws Exception {
         List<WindowRun> runs = new ArrayList<>();
         for (Window window : windows) {
+            boolean cached = mode.startsWith("cached-");
+            assertFresh(fixture, Instant.now(), cached);
+            if (!frozen) {
+                assertThat(to.minus(window.span()))
+                        .as("supplemental full-hit range must remain inside moving retention")
+                        .isAfter(Instant.now().minus(RETENTION));
+            }
             URI uri = query(server.baseUrl(), to.minus(window.span()), to, window.resolution());
             WindowRun run;
             var samplingAnchor = BenchmarkForkEnvironment.ClockAnchor.capture();
@@ -482,16 +511,20 @@ class HistoryQueryBenchmarkIT {
                 sampler.start();
                 Reading cold = profiledGet(database, uri, credential);
                 assertResponse(cold, window, missingBucket, frozen);
-                for (int i = 0; i < WARMUP_READS; i++) {
-                    assertResponse(profiledGet(database, uri, credential), window, missingBucket, frozen);
+                List<Reading> warmup = new ArrayList<>();
+                for (int i = 0; i < settings.warmupReads(); i++) {
+                    Reading reading = profiledGet(database, uri, credential);
+                    assertResponse(reading, window, missingBucket, frozen);
+                    warmup.add(reading);
                 }
                 List<Reading> hot = new ArrayList<>();
-                for (int i = 0; i < HOT_READS; i++) {
+                for (int i = 0; i < settings.hotReads(); i++) {
                     Reading reading = profiledGet(database, uri, credential);
                     assertResponse(reading, window, missingBucket, frozen);
                     hot.add(reading);
                 }
-                run = new WindowRun(window, cold, List.copyOf(hot), sampler.finish());
+                run = new WindowRun(window, cold, List.copyOf(warmup), List.copyOf(hot), sampler.finish(),
+                        samplingAnchor, Instant.now());
             } catch (BenchmarkResourceSampler.SamplingFailure failure) {
                 throw failure.inPhase(mode + "/" + window.name());
             }
@@ -500,8 +533,18 @@ class HistoryQueryBenchmarkIT {
                 reportFrozen(window, run.cold(), run.hot());
             }
             reportPath(mode, run);
-            System.out.println("history-query-evidence=" + JsonWriter.write(
-                    windowEvidence(mode, run, to, samplingAnchor)));
+            Map<String, Object> evidence = windowEvidence(mode, run, to, samplingAnchor);
+            evidence.put("fixture", fixtureEvidence(fixture));
+            System.out.println("history-query-evidence=" + JsonWriter.write(evidence));
+            evidenceSink.accept(evidence);
+            assertFresh(fixture, run.completedAt(), cached);
+            for (Reading reading : allReadings(run)) {
+                assertBounds(reading.response(), to.minus(window.span()), to, frozen);
+                assertThat(bound(reading.response(), "retentionCutoff"))
+                        .as("the server retention cutoff did not consume the frozen fixture")
+                        .isBefore(fixture.firstSample());
+                compareResponse(run.cold(), reading);
+            }
         }
         return List.copyOf(runs);
     }
@@ -572,7 +615,9 @@ class HistoryQueryBenchmarkIT {
         evidence.put("coldScope", "FIRST_QUERY_FOR_WINDOW");
         evidence.put("memoryScope", "WINDOW_COLD_WARMUP_HOT_AND_PROFILE_SETUP");
         evidence.put("cold", readingEvidence(run.cold()));
+        evidence.put("warmup", readingsEvidence(run.warmup()));
         evidence.put("hot", readingsEvidence(run.hot()));
+        evidence.put("completedAt", run.completedAt().toString());
         evidence.put("clock", Map.of("utc", samplingAnchor.utc().toString(),
                 "monotonicBeforeNanos", samplingAnchor.beforeNanos(),
                 "monotonicAfterNanos", samplingAnchor.afterNanos()));
@@ -601,7 +646,8 @@ class HistoryQueryBenchmarkIT {
 
     private static Map<String, Object> collectionEvidence(CollectionCost cost) {
         return Map.of("readOperations", cost.commands(), "keysExamined", cost.keysExamined(),
-                "docsExamined", cost.docsExamined(), "replyBytes", cost.replyBytes());
+                "docsExamined", cost.docsExamined(), "replyBytes", cost.replyBytes(),
+                "profileOperations", cost.operations().stream().map(Document::toJson).toList());
     }
 
     @SuppressWarnings("unchecked")
@@ -633,12 +679,59 @@ class HistoryQueryBenchmarkIT {
             Reading expected = raw.get(i).cold();
             Reading actual = cached.get(i).cold();
             assertThat(cached.get(i).window()).isEqualTo(raw.get(i).window());
-            for (String field : List.of("pipelineId", "effectiveResolution", "status", "consistency",
-                    "segments", "gaps", "unavailable", "nextCursor")) {
-                assertThat(actual.response().get(field)).as("raw/cache response field %s", field)
-                        .isEqualTo(expected.response().get(field));
-            }
+            compareResponse(expected, actual);
         }
+    }
+
+    private static void compareResponse(Reading expected, Reading actual) {
+        for (String field : List.of("pipelineId", "effectiveResolution", "status", "consistency",
+                "segments", "gaps", "unavailable", "nextCursor")) {
+            assertThat(actual.response().get(field)).as("raw/cache response field %s", field)
+                    .isEqualTo(expected.response().get(field));
+        }
+    }
+
+    static void assertBounds(Map<String, Object> response, Instant from, Instant to, boolean clipped) {
+        Instant cutoff = bound(response, "retentionCutoff");
+        Instant effectiveFrom = bound(response, "effectiveFrom");
+        Instant effectiveTo = bound(response, "effectiveTo");
+        assertThat(effectiveFrom).as("effective bounds are ordered").isBefore(effectiveTo);
+        assertThat(effectiveTo).as("the frozen upper query edge was preserved").isEqualTo(to);
+        Instant expectedFrom = clipped && from.isBefore(cutoff) ? cutoff : from;
+        assertThat(effectiveFrom).as("only the original requested retention clipping is allowed")
+                .isEqualTo(expectedFrom).isAfterOrEqualTo(cutoff);
+    }
+
+    private static Instant bound(Map<String, Object> response, String name) {
+        Object value = response.get(name);
+        assertThat(value).as("history response bound %s is present", name).isInstanceOf(String.class);
+        try {
+            return Instant.parse((String) value);
+        } catch (java.time.format.DateTimeParseException invalid) {
+            throw new AssertionError("history response bound " + name + " is malformed", invalid);
+        }
+    }
+
+    static void assertFresh(Fixture fixture, Instant now, boolean cached) {
+        assertThat(fixture.firstSample()).as("frozen samples must remain inside moving retention")
+                .isAfter(now.minus(RETENTION));
+        assertThat(fixture.anchor()).as("the original query upper edge is in the past").isBefore(now);
+        if (cached) {
+            assertThat(fixture.rollupValidUntil()).as("cached fixture has its original validity deadline")
+                    .isNotNull().isAfter(now);
+        }
+    }
+
+    static Map<String, Object> fixtureEvidence(Fixture fixture) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("anchor", fixture.anchor().toString());
+        result.put("firstSample", fixture.firstSample().toString());
+        result.put("lastSample", fixture.lastSample().toString());
+        result.put("missingBucket", fixture.missingBucket().toString());
+        result.put("seededSamples", fixture.seededSamples());
+        result.put("rollupValidUntil", fixture.rollupValidUntil() == null ? null
+                : fixture.rollupValidUntil().toString());
+        return result;
     }
 
     private static WindowRun matching(List<WindowRun> runs, Window window) {
@@ -712,12 +805,24 @@ class HistoryQueryBenchmarkIT {
                 .toList().get(values.size() / 2);
     }
 
-    private record Window(String name, Duration span, String resolution, String effectiveResolution) {}
+    record Settings(Path jar, Instant anchor, int warmupReads, int hotReads,
+            boolean rawOnly, boolean cachedFirst) {}
 
-    private record ArmRuns(List<WindowRun> frozen, List<WindowRun> aligned, List<WindowRun> missing) {}
+    record Fixture(Instant anchor, Instant firstSample, Instant lastSample, Instant missingBucket,
+            int seededSamples, Instant rollupValidUntil) {}
 
-    private record WindowRun(Window window, Reading cold, List<Reading> hot,
-            BenchmarkResourceSampler.Summary resources) {}
+    private record RollupSeed(int buckets, Instant validUntil) {}
+
+    record PairRun(String artifactSha256, Fixture fixture, int warmupReads, int hotReads,
+            boolean cachedFirst, ArmRuns raw, ArmRuns cached) {}
+
+    record Window(String name, Duration span, String resolution, String effectiveResolution) {}
+
+    record ArmRuns(List<WindowRun> frozen, List<WindowRun> aligned, List<WindowRun> missing) {}
+
+    record WindowRun(Window window, Reading cold, List<Reading> warmup, List<Reading> hot,
+            BenchmarkResourceSampler.Summary resources, BenchmarkForkEnvironment.ClockAnchor clock,
+            Instant completedAt) {}
 
     record CollectionCost(int commands, long keysExamined, long docsExamined,
             long replyBytes, List<Document> operations) {}

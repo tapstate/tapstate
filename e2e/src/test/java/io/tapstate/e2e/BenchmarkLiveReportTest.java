@@ -27,6 +27,7 @@ class BenchmarkLiveReportTest {
 
         Map<?, ?> afterFork = read(output);
         assertThat(afterFork.get("status")).isEqualTo("RUNNING");
+        assertThat(afterFork.get("acceptanceEvaluated")).isEqualTo(false);
         assertThat((List<?>) afterFork.get("forks")).hasSize(1);
         assertThat(((Map<?, ?>) ((List<?>) afterFork.get("forks")).getFirst()).get("id"))
                 .isEqualTo("copy-A-1");
@@ -34,6 +35,7 @@ class BenchmarkLiveReportTest {
         report.fail(new IllegalStateException("source stopped"));
         Map<?, ?> failed = read(output);
         assertThat(failed.get("status")).isEqualTo("FAILED");
+        assertThat(failed.get("acceptanceEvaluated")).isEqualTo(false);
         assertThat((List<?>) failed.get("forks")).hasSize(1);
         assertThat(((Map<?, ?>) failed.get("failure")).get("message")).isEqualTo("source stopped");
         try (var files = Files.list(directory)) {
@@ -50,6 +52,7 @@ class BenchmarkLiveReportTest {
 
         Map<?, ?> failed = read(output);
         assertThat(failed.get("status")).isEqualTo("FAILED");
+        assertThat(failed.get("acceptanceEvaluated")).isEqualTo(true);
         assertThat(((Map<?, ?>) failed.get("evaluation")).get("failures"))
                 .isEqualTo(List.of("throughput regressed"));
         assertThatThrownBy(() -> new BenchmarkLiveReport(output))
