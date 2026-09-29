@@ -10,7 +10,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.function.Supplier;
+import java.util.function.Function;
 
 /**
  * Supplies the Jet topology a pipeline runs, and the namespaces that topology keeps state in. The actuator
@@ -34,7 +34,8 @@ interface DagSource {
         validateStart(pipelineId);
         NestCapacity capacity = capacityOf(pipelineId);
         Set<OperatorStateLocation> locations = stateLocations(pipelineId, defaultDatabase);
-        return new StartPreparation(capacity, locations, Optional.empty(), () -> dagFor(pipelineId));
+        return new StartPreparation(
+                capacity, locations, Optional.empty(), fence -> dagFor(pipelineId, fence));
     }
 
     /**
@@ -47,6 +48,19 @@ interface DagSource {
 
     /** The topology to run for {@code pipelineId}. */
     DAG dagFor(String pipelineId);
+
+    /**
+     * The topology to run for {@code pipelineId}, with every external effect in it held to {@code fence}'s
+     * run — so a member still carrying a piece of an earlier run stops writing rather than writing beside
+     * the current one.
+     *
+     * <p>Defaulted to the unfenced topology for the stand-ins a lifecycle test drives, whose topologies
+     * reach nothing outside the process and therefore have nothing to fence. The store-backed builder
+     * overrides it; a member of a cluster only ever reaches this one.
+     */
+    default DAG dagFor(String pipelineId, ExecutionFence fence) {
+        return dagFor(pipelineId);
+    }
 
     /**
      * What {@code pipelineId}'s topology keeps state in — for each component that keeps any, what to call
@@ -115,7 +129,7 @@ interface DagSource {
             NestCapacity capacity,
             Set<OperatorStateLocation> stateLocations,
             Optional<ArtifactStore> artifactSnapshot,
-            Supplier<DAG> dagBuilder) {
+            Function<ExecutionFence, DAG> dagBuilder) {
 
         public StartPreparation {
             Objects.requireNonNull(capacity, "capacity");
@@ -124,8 +138,19 @@ interface DagSource {
             Objects.requireNonNull(dagBuilder, "dagBuilder");
         }
 
-        StartPlan build() {
-            return new StartPlan(dagBuilder.get(), capacity, stateLocations, artifactSnapshot);
+        /**
+         * Builds the topology, with every external effect in it held to {@code fence}'s run. Taking the
+         * fence here rather than at preparation is what keeps the two in step: the run is fenced before
+         * the first side effect of a start, and the topology is built after placement and teardown, so
+         * the generation the build is held to is the one this member has just been granted.
+         *
+         * <p>A null fence is the single-member path, where there is one run of anything and so nothing
+         * for a second one to be held against. Deliberately the only way to get an unfenced topology
+         * from a preparation: a no-argument build would let a clustered start drop its fence without
+         * anything in the call saying so.
+         */
+        StartPlan build(ExecutionFence fence) {
+            return new StartPlan(dagBuilder.apply(fence), capacity, stateLocations, artifactSnapshot);
         }
     }
 

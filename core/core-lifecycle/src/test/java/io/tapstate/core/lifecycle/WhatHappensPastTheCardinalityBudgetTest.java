@@ -84,6 +84,7 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.record.delivery.duration",
                         "tapstate.pipeline.process.duration",
                         "tapstate.pipeline.snapshot.rows",
+                        "tapstate.pipeline.snapshot.rows.current_run",
                         "tapstate.pipeline.snapshot.rows.total",
                         "tapstate.pipeline.errors",
                         "tapstate.pipeline.frontier.gap",
@@ -101,7 +102,8 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.reconcile.failures.streak");
         for (CardinalityBudget budget : List.of(CardinalityBudget.RECORDS, CardinalityBudget.BYTES,
                 CardinalityBudget.LAG, CardinalityBudget.RECORD_DELIVERY_DURATION,
-                CardinalityBudget.SNAPSHOT_ROWS, CardinalityBudget.SNAPSHOT_ROWS_TOTAL)) {
+                CardinalityBudget.SNAPSHOT_ROWS, CardinalityBudget.SNAPSHOT_ROWS_CURRENT_RUN,
+                CardinalityBudget.SNAPSHOT_ROWS_TOTAL)) {
             assertThat(budget.openDimension()).as(budget.name()).contains(TABLE_ID);
             assertThat(budget.distinctValues()).as(budget.name()).isEqualTo(1_000);
         }

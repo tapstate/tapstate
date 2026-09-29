@@ -844,7 +844,7 @@ class PipelineApiTest {
     @SpringBootConfiguration
     @EnableAutoConfiguration
     @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceProjectionServiceTestConfiguration.class,
-            PipelinePositionTestConfiguration.class,
+            PipelinePositionTestConfiguration.class, ClusterTopologyTestConfiguration.class,
             DerivedSchemaTestConfiguration.class, ObservabilityTestConfiguration.class})
     static class TestApp {
 

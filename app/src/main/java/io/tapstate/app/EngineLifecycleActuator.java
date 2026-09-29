@@ -48,21 +48,42 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     private final DagSource dagSource;
     private final PipelineCaptureCoordinator captureCoordinator;
     private final NestStateTeardown stateTeardown;
+    private final PipelineActuationOwnership actuation;
 
     EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
             NestStateTeardown stateTeardown) {
+        this(engine, dagSource, captureCoordinator, stateTeardown, PipelineActuationOwnership.single());
+    }
+
+    EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
+            NestStateTeardown stateTeardown, PipelineActuationOwnership actuation) {
         this.engine = Objects.requireNonNull(engine, "engine");
         this.dagSource = Objects.requireNonNull(dagSource, "dagSource");
         this.captureCoordinator = Objects.requireNonNull(captureCoordinator, "captureCoordinator");
         this.stateTeardown = Objects.requireNonNull(stateTeardown, "stateTeardown");
+        this.actuation = Objects.requireNonNull(actuation, "actuation");
     }
 
     @Override
     public void start(String pipelineId) {
         // A refusal here is deliberately before teardown, capture, and submission: an unmet source-model
         // prerequisite must leave no data-plane component running and no start-side state mutation behind.
+        // An engine whose member was shut down for want of memory is the first such refusal. Everything
+        // below would otherwise run up to the member and be thrown back uncoded, a capture left reading for
+        // a job that cannot exist.
+        engine.refuseIfLost(pipelineId);
         DagSource.StartPreparation prepared = dagSource.prepareStart(
                 pipelineId, stateTeardown.defaultDatabase());
+        // The run's own generation, taken before the first side effect for the same reason: a run this
+        // member cannot fence is one nothing could later stop from writing, so it must not be half built.
+        // Nothing is recorded as failed here -- the pipeline is fine, this member is not its driver any
+        // more (or cannot prove it is), and the member that is will put a run behind it.
+        PipelineActuationOwnership.Execution execution = actuation.beginExecution(pipelineId);
+        if (!execution.allowed()) {
+            LOG.warn("Not starting pipeline {} on this member: its run could not be fenced to a new "
+                    + "execution generation", pipelineId);
+            return;
+        }
         // Before anything reads it: a drop the last stop noted but did not finish is finished here, so this
         // run never starts onto a half-dropped state. A start with nothing noted drops nothing, which is
         // what leaves a run that died without a stop with its state - and so with a shape to be held to.
@@ -78,18 +99,24 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // snapshot, so an apply cannot move one without the others. Said after the drop above, which is the
         // one thing entitled to clear what earlier runs said.
         stateTeardown.willKeepStateAt(pipelineId, prepared.stateLocations());
-        prepared.artifactSnapshot().ifPresentOrElse(
-                snapshot -> captureCoordinator.startCapture(pipelineId, snapshot),
-                () -> captureCoordinator.startCapture(pipelineId));
+        try {
+            prepared.artifactSnapshot().ifPresentOrElse(
+                    snapshot -> captureCoordinator.startCapture(pipelineId, snapshot),
+                    () -> captureCoordinator.startCapture(pipelineId));
+        } catch (RingNotOpenYet notYet) {
+            // Nothing was opened, so nothing is submitted: the pipeline reads as started and carries no job,
+            // which is exactly what the next pass starts again. Not recorded as failed -- a capture it reads is
+            // being opened on another member, and how long that may take is bounded where it is decided.
+            return;
+        }
         // Capture opens the SRS generation that source vertices compile into the DAG. Build only now, but
         // from the same frozen artifacts used above; placement and teardown were already fixed, so any
         // shape record this writes remains named even if construction refuses the start.
-        DagSource.StartPlan plan = prepared.build();
+        DagSource.StartPlan plan = prepared.build(execution.fence());
         // The capacity travels with the submission because the maps are made by the job: what a state map
         // holds is fixed as it is created, so a number applied after the job started would be accepted and
         // change nothing.
-        engine.submit(pipelineId, plan.dag(),
-                capacity.mapDatabases(), capacity.settings());
+        engine.submit(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings());
     }
 
     @Override
@@ -137,9 +164,15 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         }
         boolean jobOver = engine.awaitTerminal(pipelineId, JOB_TEARDOWN_BUDGET);
         captureCoordinator.stopCapture(pipelineId, purgeState);
-        if (purgeState && jobOver) {
+        if (purgeState && jobOver && !engine.isLost()) {
             // Only once nothing is left to write into it. A processor still winding down writes state as it
             // closes, and a drop racing that leaves entries behind with the note already gone.
+            //
+            // Nor on an engine whose member was shut down for want of memory. Half of the drop is on that
+            // member, which refuses it with an uncoded error, and "no job" there only means the member no
+            // longer answers: its shutdown can still be waiting for the job to end. Left noted, the drop is
+            // finished by the next start, which on a lost engine comes after the restart that is the only
+            // way back.
             stateTeardown.finishPending(pipelineId);
         }
     }
@@ -150,6 +183,13 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // cdc capture feeding its ring dies while the job keeps running over a ring gone quiet (coordinator).
         // Either surfaces here so the converge side drives the pipeline into the observable FAILED state.
         return engine.failureOf(pipelineId).or(() -> captureCoordinator.captureFailure(pipelineId));
+    }
+
+    @Override
+    public Optional<Throwable> lost(String pipelineId) {
+        // The engine alone: a member shut down for want of memory took every job it held with it. The capture is
+        // not asked. It keeps running behind a paused pipeline, and whether it has died is failure()'s to say.
+        return engine.lost(pipelineId).map(Throwable.class::cast);
     }
 
     @Override

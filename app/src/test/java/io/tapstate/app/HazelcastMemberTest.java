@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
@@ -28,14 +29,21 @@ import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.boot.context.properties.bind.Bindable;
+import org.springframework.boot.context.properties.bind.Binder;
+import org.springframework.boot.context.properties.source.MapConfigurationPropertySource;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.net.ServerSocket;
+import java.time.Duration;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * The embedded Hazelcast member wired by the assembly root: exactly one full member per process,
@@ -90,6 +98,252 @@ class HazelcastMemberTest {
         assertThat(config.getProperty("hazelcast.logging.type")).isEqualTo("slf4j");
         assertThat(config.getProperty("hazelcast.shutdownhook.enabled")).isEqualTo("false");
         assertThat(config.getProperty("hazelcast.phone.home.enabled")).isEqualTo("false");
+        assertThat(config.getProperty("hazelcast.heartbeat.interval.seconds")).isEqualTo("5");
+        assertThat(config.getProperty("hazelcast.max.no.heartbeat.seconds")).isEqualTo("30");
+    }
+
+    @Test
+    void clusteredChangeRingsKeepOneSynchronousBackup() {
+        Config config = HazelcastConfiguration.memberConfig(new HazelcastProperties());
+        ClusterProperties cluster = new ClusterProperties();
+        cluster.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
+
+        HazelcastConfiguration.configureClusterProtection(config, new ClusterMembershipGate(cluster));
+
+        assertThat(config.getRingbufferConfig("srs.*").getBackupCount()).isEqualTo(1);
+        assertThat(config.getRingbufferConfig("srs.*").getAsyncBackupCount()).isZero();
+    }
+
+    @Test
+    void tcpIpModeEnablesOnlyTcpIpDiscoveryAndPinsTheConfiguredPort() {
+        HazelcastProperties properties = bind(Map.of(
+                "tapstate.hz.cluster-name", "cluster-red",
+                "tapstate.hz.discovery.mode", "tcp-ip",
+                "tapstate.hz.discovery.tcp-ip.seeds[0]", "127.0.0.1:5701",
+                "tapstate.hz.member-port", "5702"));
+
+        Config config = HazelcastConfiguration.memberConfig(properties);
+        JoinConfig join = config.getNetworkConfig().getJoin();
+
+        assertThat(join.getTcpIpConfig().isEnabled()).isTrue();
+        assertThat(join.getTcpIpConfig().getMembers()).containsExactly("127.0.0.1:5701");
+        assertThat(join.getAutoDetectionConfig().isEnabled()).isFalse();
+        assertThat(join.getMulticastConfig().isEnabled()).isFalse();
+        assertThat(join.getKubernetesConfig().isEnabled()).isFalse();
+        assertThat(config.getNetworkConfig().getPort()).isEqualTo(5702);
+        assertThat(config.getNetworkConfig().isPortAutoIncrement()).isFalse();
+    }
+
+    /**
+     * A member reports the address the deployment gives it, and still binds the one it was told to bind.
+     *
+     * <p>Members exchange the address each reports for itself and dial that from then on, so a member
+     * behind a port mapping is unreachable unless it can report the outside of the mapping. The two have
+     * to be read together: reporting the outside while binding the inside is the whole arrangement, and a
+     * change that quietly made the member bind what it reports would pass a case that only read one.
+     */
+    @Test
+    void aMemberReportsTheAddressItIsGivenAndStillBindsTheOneItWasTold() {
+        HazelcastProperties properties = bind(Map.of(
+                "tapstate.hz.cluster-name", "cluster-red",
+                "tapstate.hz.discovery.mode", "tcp-ip",
+                "tapstate.hz.discovery.tcp-ip.seeds[0]", "10.20.0.11:15701",
+                "tapstate.hz.bind-address", "10.0.0.5",
+                "tapstate.hz.member-port", "5701",
+                "tapstate.hz.advertised-member-address", "10.20.0.11:15701"));
+
+        Config config = HazelcastConfiguration.memberConfig(properties);
+
+        assertThat(config.getNetworkConfig().getPublicAddress())
+                .as("what the others are told to dial")
+                .isEqualTo("10.20.0.11:15701");
+        assertThat(config.getNetworkConfig().getInterfaces().getInterfaces())
+                .as("what it actually binds, which the report does not move")
+                .containsExactly("10.0.0.5");
+        assertThat(config.getNetworkConfig().getPort())
+                .as("and the port it actually binds, which a mapped port does not move either")
+                .isEqualTo(5701);
+    }
+
+    /**
+     * Left out, a member reports what it binds -- the byte-for-byte behaviour of every deployment that
+     * has nothing in front of it.
+     */
+    @Test
+    void aMemberGivenNoAddressToReportReportsNothingAndIsLeftAsItWas() {
+        HazelcastProperties properties = bind(Map.of(
+                "tapstate.hz.cluster-name", "cluster-red",
+                "tapstate.hz.discovery.mode", "tcp-ip",
+                "tapstate.hz.discovery.tcp-ip.seeds[0]", "127.0.0.1:5701"));
+
+        Config config = HazelcastConfiguration.memberConfig(properties);
+
+        assertThat(config.getNetworkConfig().getPublicAddress())
+                .as("nothing is reported, so the member reports what it binds")
+                .isNull();
+    }
+
+    /**
+     * With discovery off there is nobody to be reached by, so an address to report is refused rather than
+     * accepted and ignored.
+     *
+     * <p>A loopback-only member has no other members. An address here is either a misconfiguration or a
+     * preparation for something this mode does not do; accepted silently, both look like a working
+     * cluster right up until somebody asks why nothing joined.
+     */
+    @Test
+    void anAddressToReportIsRefusedWhileDiscoveryIsOff() {
+        HazelcastProperties properties = bind(Map.of(
+                "tapstate.hz.cluster-name", "cluster-red",
+                "tapstate.hz.advertised-member-address", "10.20.0.11:15701"));
+
+        assertThatThrownBy(() -> HazelcastConfiguration.memberConfig(properties))
+                .isInstanceOfSatisfying(TapstateException.class, refused -> {
+                    assertThat(refused.code()).isEqualTo(BootError.DISCOVERY_CONFIG_INVALID);
+                    assertThat(refused.args().get("detail").toString())
+                            .contains("advertised-member-address");
+                });
+    }
+
+    /**
+     * Named outbound ports are what an egress rule can be written against.
+     *
+     * <p>Without them an outgoing member connection takes an arbitrary ephemeral port, so the only
+     * firewall rule that admits member traffic is one that admits the whole ephemeral range. All three
+     * readings belong in one case: what it dials from, what it binds, and what it reports are three
+     * different things, and a change that moved any one of them onto another would pass a case that
+     * only read the first.
+     */
+    @Test
+    void aMemberDialsFromThePortsItIsGivenAndStillBindsAndReportsWhatItWasTold() {
+        HazelcastProperties properties = bind(Map.of(
+                "tapstate.hz.cluster-name", "cluster-red",
+                "tapstate.hz.discovery.mode", "tcp-ip",
+                "tapstate.hz.discovery.tcp-ip.seeds[0]", "10.20.0.11:15701",
+                "tapstate.hz.bind-address", "10.0.0.5",
+                "tapstate.hz.member-port", "5701",
+                "tapstate.hz.advertised-member-address", "10.20.0.11:15701",
+                "tapstate.hz.outbound-member-ports[0]", "21000-21099",
+                "tapstate.hz.outbound-member-ports[1]", "21500"));
+
+        Config config = HazelcastConfiguration.memberConfig(properties);
+
+        assertThat(config.getNetworkConfig().getOutboundPortDefinitions())
+                .as("the local ports a dial may leave from")
+                .containsExactlyInAnyOrder("21000-21099", "21500");
+        assertThat(config.getNetworkConfig().getInterfaces().getInterfaces())
+                .as("what it binds, which naming outbound ports does not move")
+                .containsExactly("10.0.0.5");
+        assertThat(config.getNetworkConfig().getPublicAddress())
+                .as("what it reports, which naming outbound ports does not move either")
+                .isEqualTo("10.20.0.11:15701");
+    }
+
+    /** Left out, a dial takes any ephemeral port -- the behaviour of every deployment without a rule. */
+    @Test
+    void aMemberGivenNoOutboundPortsDialsFromAnyPort() {
+        HazelcastProperties properties = bind(Map.of(
+                "tapstate.hz.cluster-name", "cluster-red",
+                "tapstate.hz.discovery.mode", "tcp-ip",
+                "tapstate.hz.discovery.tcp-ip.seeds[0]", "127.0.0.1:5701"));
+
+        Config config = HazelcastConfiguration.memberConfig(properties);
+
+        // Unrestricted has two spellings in the library -- never set is null, cleared is empty -- and
+        // both mean the same thing here, so neither is allowed to read as a restriction.
+        assertThat(config.getNetworkConfig().getOutboundPortDefinitions())
+                .as("nothing named, so nothing is restricted")
+                .isNullOrEmpty();
+    }
+
+    /**
+     * With discovery off the member dials nobody, so there is no outgoing connection for this to place.
+     * Accepted silently it would read as a working restriction that never applied to anything.
+     */
+    @Test
+    void outboundPortsAreRefusedWhileDiscoveryIsOff() {
+        HazelcastProperties properties = bind(Map.of(
+                "tapstate.hz.cluster-name", "cluster-red",
+                "tapstate.hz.outbound-member-ports[0]", "21000-21099"));
+
+        assertThatThrownBy(() -> HazelcastConfiguration.memberConfig(properties))
+                .isInstanceOfSatisfying(TapstateException.class, refused -> {
+                    assertThat(refused.code()).isEqualTo(BootError.DISCOVERY_CONFIG_INVALID);
+                    assertThat(refused.args().get("detail").toString())
+                            .contains("outbound-member-ports");
+                });
+    }
+
+    /**
+     * A definition that is not a port is refused here, naming the setting and the value.
+     *
+     * <p>Handed on as written it fails inside the library instead, where the message names neither --
+     * and the two halves are refused for different reasons, so both are read: a value of the wrong shape
+     * entirely, and one of the right shape that is not a port.
+     */
+    @Test
+    void anOutboundPortThatIsNotAPortOrARangeIsRefused() {
+        assertThatThrownBy(() -> HazelcastConfiguration.memberConfig(bind(Map.of(
+                "tapstate.hz.cluster-name", "cluster-red",
+                "tapstate.hz.discovery.mode", "tcp-ip",
+                "tapstate.hz.discovery.tcp-ip.seeds[0]", "127.0.0.1:5701",
+                "tapstate.hz.outbound-member-ports[0]", "*"))))
+                .as("not a port and not a range")
+                .isInstanceOfSatisfying(TapstateException.class, refused ->
+                        assertThat(refused.args().get("detail").toString()).contains("'*'"));
+
+        assertThatThrownBy(() -> HazelcastConfiguration.memberConfig(bind(Map.of(
+                "tapstate.hz.cluster-name", "cluster-red",
+                "tapstate.hz.discovery.mode", "tcp-ip",
+                "tapstate.hz.discovery.tcp-ip.seeds[0]", "127.0.0.1:5701",
+                "tapstate.hz.outbound-member-ports[0]", "0-5"))))
+                .as("the right shape, and still not a port a dial can leave from")
+                .isInstanceOfSatisfying(TapstateException.class, refused ->
+                        assertThat(refused.args().get("detail").toString()).contains("1-65535"));
+    }
+
+    @Test
+    void kubernetesModePrefersHeadlessServiceDnsAndLeavesEveryOtherJoinPathOff() {
+        HazelcastProperties properties = bind(Map.of(
+                "tapstate.hz.cluster-name", "cluster-red",
+                "tapstate.hz.discovery.mode", "kubernetes",
+                "tapstate.hz.discovery.kubernetes.service-dns", "tapstate.default.svc.cluster.local"));
+
+        Config config = HazelcastConfiguration.memberConfig(properties);
+        JoinConfig join = config.getNetworkConfig().getJoin();
+
+        assertThat(join.getKubernetesConfig().isEnabled()).isTrue();
+        assertThat(join.getKubernetesConfig().getProperty("service-dns"))
+                .isEqualTo("tapstate.default.svc.cluster.local");
+        assertThat(join.getAutoDetectionConfig().isEnabled()).isFalse();
+        assertThat(join.getMulticastConfig().isEnabled()).isFalse();
+        assertThat(join.getTcpIpConfig().isEnabled()).isFalse();
+        assertThat(config.getNetworkConfig().isPortAutoIncrement()).isFalse();
+    }
+
+    @Test
+    void tcpIpDiscoveryFormsOneTwoMemberCluster() throws Exception {
+        int[] ports = twoFreePorts();
+        HazelcastProperties firstProperties = clusteredProperties(ports[0], ports[0]);
+        HazelcastProperties secondProperties = clusteredProperties(ports[1], ports[0]);
+        HazelcastInstance first = HazelcastConfiguration.startMember(
+                () -> com.hazelcast.core.Hazelcast.newHazelcastInstance(
+                        HazelcastConfiguration.memberConfig(firstProperties)));
+        HazelcastInstance second = HazelcastConfiguration.startMember(
+                () -> com.hazelcast.core.Hazelcast.newHazelcastInstance(
+                        HazelcastConfiguration.memberConfig(secondProperties)));
+        try {
+            awaitMembers(first, 2, Duration.ofSeconds(10));
+            assertThat(first.getCluster().getMembers()).hasSize(2);
+            assertThat(second.getCluster().getMembers()).hasSize(2);
+            assertThat(first.getCluster().getMembers().stream().map(member -> member.getAddress().toString()))
+                    .containsExactlyInAnyOrderElementsOf(
+                            second.getCluster().getMembers().stream()
+                                    .map(member -> member.getAddress().toString()).toList());
+        } finally {
+            second.shutdown();
+            first.shutdown();
+        }
     }
 
     @Test
@@ -445,6 +699,35 @@ class HazelcastMemberTest {
 
         assertThat(config.getMapConfigs().keySet())
                 .noneMatch(name -> name.startsWith(JoinMaps.NAMESPACE_PREFIX));
+    }
+
+    private static HazelcastProperties bind(Map<String, String> values) {
+        return new Binder(new MapConfigurationPropertySource(values))
+                .bind("tapstate.hz", Bindable.of(HazelcastProperties.class))
+                .orElseGet(HazelcastProperties::new);
+    }
+
+    private static HazelcastProperties clusteredProperties(int memberPort, int seedPort) {
+        HazelcastProperties properties = new HazelcastProperties();
+        properties.setClusterName("two-member-test");
+        properties.setMemberPort(memberPort);
+        properties.getDiscovery().setMode(HazelcastProperties.DiscoveryMode.TCP_IP);
+        properties.getDiscovery().getTcpIp().setSeeds(List.of("127.0.0.1:" + seedPort));
+        return properties;
+    }
+
+    private static int[] twoFreePorts() throws Exception {
+        try (ServerSocket first = new ServerSocket(0); ServerSocket second = new ServerSocket(0)) {
+            return new int[] {first.getLocalPort(), second.getLocalPort()};
+        }
+    }
+
+    private static void awaitMembers(HazelcastInstance member, int expected, Duration budget)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + budget.toNanos();
+        while (member.getCluster().getMembers().size() != expected && System.nanoTime() < deadline) {
+            Thread.sleep(25);
+        }
     }
 
     /** A sentinel meta store: an identity to assert the user-context binding; its facets are never invoked here. */

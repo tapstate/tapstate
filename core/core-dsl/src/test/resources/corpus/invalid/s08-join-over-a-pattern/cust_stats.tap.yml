@@ -1,0 +1,20 @@
+# Invalid: the join binds alias o to the pattern /orders/. A join reads one table per alias - its SQL
+# names that table's columns and its rows are keyed on that table's primary key - and a pattern names
+# a set, even where it matches one table today. Write the table name, o: orders, and the batch is valid.
+version: tapstate/v1
+kind: pipeline
+id: cust_stats
+source: [ src_crm, src_erp ]
+transforms:
+  - id: cust_orders
+    type: join
+    from: { c: customers, o: /orders/ }
+    engine: builtin
+    sql: |
+      SELECT c.id AS customer_id, o.id AS order_id, o.amount AS amount
+      FROM c JOIN o ON o.customer_id = c.id
+view:
+  id: cust_stats
+  from: cust_orders
+  primary_key: order_id
+  storage: { warm: { collection: cust_stats } }

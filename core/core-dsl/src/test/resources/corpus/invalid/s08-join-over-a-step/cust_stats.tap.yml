@@ -1,0 +1,25 @@
+# Invalid: the join reads the js step 'renamed_orders' through alias o. A join resolves its SQL
+# against the discovered columns of each input and keys its rows on the driving table's primary
+# key; a step's output has neither. Point o at the orders table and the batch is valid.
+version: tapstate/v1
+kind: pipeline
+id: cust_stats
+source: [ src_crm, src_erp ]
+transforms:
+  - id: renamed_orders
+    from: [ orders ]
+    type: js
+    script: |
+      function process(record, ctx) { return record; }
+  - id: cust_orders
+    type: join
+    from: { c: customers, o: renamed_orders }
+    engine: builtin
+    sql: |
+      SELECT c.id AS customer_id, o.id AS order_id, o.amount AS amount
+      FROM c JOIN o ON o.customer_id = c.id
+view:
+  id: cust_stats
+  from: cust_orders
+  primary_key: order_id
+  storage: { warm: { collection: cust_stats } }

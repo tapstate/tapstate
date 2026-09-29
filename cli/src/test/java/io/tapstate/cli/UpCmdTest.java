@@ -748,5 +748,11 @@ class UpCmdTest {
         @Override public String watchStatus(URI u, String c, String id, StatusStream s, java.util.function.BooleanSupplier stop) { throw new AssertionError(); }
         @Override public String followLogs(URI u, String c, String id, LogStream s, java.util.function.BooleanSupplier stop) { throw new AssertionError(); }
         @Override public String tail(URI u, String c, String id, String collection, Object f, TailStream s, java.util.function.BooleanSupplier stop) { throw new AssertionError(); }
+        // Asked once, when the resumed session goes looking for the other members it could move to.
+        // These cases are about the preflight stages, and a cluster that does not answer leaves the
+        // session with the seed it already has -- which is what every one of them then uses.
+        @Override public ClusterMembersOutcome clusterMembers(URI u, String c) {
+            return new ClusterMembersOutcome.Unreachable();
+        }
     }
 }

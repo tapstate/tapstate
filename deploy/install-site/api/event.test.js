@@ -76,6 +76,38 @@ test('an unknown entry point is refused rather than recorded as-is', () => {
   assert.ok(error);
 });
 
+// --- the channel ------------------------------------------------------------------------------------
+// The denominator counts community installs. Our own test harnesses install constantly -- four
+// platforms, several installs each, every night -- so without a field that says which is which, the
+// figure everything is divided by is mostly us and nothing downstream can separate it afterwards.
+
+test('an install that says it is ours is recorded as ours', () => {
+  const { event, error } = buildEvent({ ...good, channel: 'internal' }, headers, NOW);
+  assert.equal(error, undefined);
+  assert.equal(event.channel, 'internal');
+});
+
+test('an install that says it is a community install is recorded as one', () => {
+  const { event } = buildEvent({ ...good, channel: 'community' }, headers, NOW);
+  assert.equal(event.channel, 'community');
+});
+
+// The case the whole field turns on. An installer older than the field cannot say which side it is
+// on, and 'community' would file it inside the denominator -- which is exactly where our own lanes
+// running a previous release would land. "Nobody said" has to stay its own answer.
+test('an install that says nothing is unknown, not community', () => {
+  assert.equal('channel' in good, false, 'the fixture must not carry one, or this proves nothing');
+  const { event } = buildEvent(good, headers, NOW);
+  assert.equal(event.channel, 'unknown');
+});
+
+test('a channel that is neither is refused rather than folded into one of them', () => {
+  for (const bad of ['internal ', 'INTERNAL', 'ci', '', 'communityy', 42, null]) {
+    const { error } = buildEvent({ ...good, channel: bad }, headers, NOW);
+    assert.ok(error, `expected refusal for channel=${JSON.stringify(bad)}`);
+  }
+});
+
 test('an unknown platform is refused', () => {
   assert.ok(buildEvent({ ...good, os: 'plan9' }, headers, NOW).error);
   assert.ok(buildEvent({ ...good, arch: 'sparc' }, headers, NOW).error);

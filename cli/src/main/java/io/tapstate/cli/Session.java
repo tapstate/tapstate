@@ -26,6 +26,9 @@ final class Session {
     private URI landingNode;
     private boolean connected;
 
+    /** Whether {@link #members} came from the cluster rather than from the seeds somebody typed. */
+    private boolean membersDiscovered;
+
     /** The bearer credential presented on authenticated requests (opaque; {@code null} while unauthenticated). */
     private String credential;
 
@@ -110,6 +113,7 @@ final class Session {
         this.landingNode = landingNode;
         this.connected = true;
         this.members = this.seeds;   // members = seeds until discovery refines them
+        this.membersDiscovered = false;
         // a fresh connect is a new transport target: never carry a credential the previous node issued
         this.credential = null;
         this.credentialKind = null;
@@ -144,6 +148,24 @@ final class Session {
         this.members = List.copyOf(members);
     }
 
+    /** Whether the candidate members are still just the seeds, or the cluster has said who it has. */
+    boolean membersDiscovered() {
+        return membersDiscovered;
+    }
+
+    /**
+     * Replaces the candidate members with what the cluster itself advertises.
+     *
+     * <p>Until this runs the candidates are the seeds somebody typed, so a session can only ever move
+     * back to a node it was already told about -- which in a cluster that has grown, or whose seed has
+     * been retired, is a session with one place to go. The caller decides what goes in here; what this
+     * records is that the set is no longer just the seeds.
+     */
+    void useAdvertisedMembers(List<URI> members) {
+        this.members = List.copyOf(members);
+        this.membersDiscovered = true;
+    }
+
     /** Moves the landing node to another member (failover), keeping the credential and member set. */
     void reland(URI landingNode) {
         this.landingNode = landingNode;
@@ -156,6 +178,9 @@ final class Session {
         this.principal = null;
         this.clusterName = null;
         this.members = this.seeds;
+        // What the cluster advertised was told to this credential. Dropping the credential drops it too,
+        // rather than leaving the next user of this session moving between members nobody re-confirmed.
+        this.membersDiscovered = false;
     }
 
     /** Clears the session back to offline, dropping any credential. */

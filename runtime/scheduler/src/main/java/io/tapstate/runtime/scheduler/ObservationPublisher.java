@@ -189,12 +189,13 @@ public final class ObservationPublisher {
      * projections, so the two faces cannot come to disagree.
      *
      * <p>How far the load got accumulates and about how far it has to go does not, which is why they are a
-     * counter and a gauge and not two of either. The total is what the last discovery of the source
-     * counted: an estimate, never maintained since, and free to be revised downwards by the next
-     * discovery. Declaring it a counter would promise a reader it only ever rises, and the first
-     * re-discovery of a table that shrank would break that promise silently.
+     * counter and a gauge and not two of either. The total begins as what the last discovery counted and
+     * becomes the confirmed row count when the target finishes the load. Declaring it a counter would
+     * promise it only ever rises, which a later discovery of a table that shrank could break.
      */
     private static final String SNAPSHOT_ROWS_METRIC = "tapstate.pipeline.snapshot.rows";
+    private static final String SNAPSHOT_ROWS_CURRENT_RUN_METRIC =
+            "tapstate.pipeline.snapshot.rows.current_run";
     private static final String SNAPSHOT_ROWS_TOTAL_METRIC = "tapstate.pipeline.snapshot.rows.total";
 
     /**
@@ -268,6 +269,7 @@ public final class ObservationPublisher {
             Map.entry(RECORDS_METRIC, keyed("records.", DIRECTION_ATTRIBUTE)),
             Map.entry(BYTES_METRIC, keyed("bytes.", DIRECTION_ATTRIBUTE)),
             Map.entry(LAG_METRIC, keyed("lag.", TABLE_ID_ATTRIBUTE)),
+            Map.entry(SNAPSHOT_ROWS_CURRENT_RUN_METRIC, keyed("snapshot.rows.read.", TABLE_ID_ATTRIBUTE)),
             // Reduced and not dropped, which is the opposite of what the load's two measurements get, and
             // for the reason that decides between them: a drop is only honest when another face carries
             // the metric, and the load has one - this observation's own snapshot dataset. Failures have
@@ -352,6 +354,7 @@ public final class ObservationPublisher {
     private final Function<String, OptionalLong> recordCounts;
     private final Function<String, Map<String, String>> positions;
     private final Function<String, SnapshotReading> snapshots;
+    private final Function<String, SnapshotReading> runSnapshots;
     private final Function<String, Map<String, Long>> frontierGaps;
     private final Function<String, Map<String, NestStateReading>> nestStateReadings;
     private final Function<String, Map<String, Long>> frontierStalls;
@@ -641,6 +644,27 @@ public final class ObservationPublisher {
             Function<String, DeliveryReading> deliveries,
             Function<String, StageReading> stages,
             Clock clock) {
+        this(state, observations, recordCounts, positions, snapshots, frontierGaps, nestStateReadings,
+                coldLayer, frontierStalls, frontierStall, nestDeadLetters, joinRecomputeDone,
+                joinRecomputeExpected, captures, deliveries, stages, id -> SnapshotReading.NONE, clock);
+    }
+
+    public ObservationPublisher(StateStore state, ObservationStore observations,
+            Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
+            Function<String, SnapshotReading> snapshots,
+            Function<String, Map<String, Long>> frontierGaps,
+            Function<String, Map<String, NestStateReading>> nestStateReadings,
+            NestColdLayerWatch coldLayer,
+            Function<String, Map<String, Long>> frontierStalls,
+            FrontierStallWatch frontierStall,
+            Function<String, Map<String, Long>> nestDeadLetters,
+            Function<String, Map<String, Long>> joinRecomputeDone,
+            Function<String, Map<String, Long>> joinRecomputeExpected,
+            Function<String, CaptureReading> captures,
+            Function<String, DeliveryReading> deliveries,
+            Function<String, StageReading> stages,
+            Function<String, SnapshotReading> runSnapshots,
+            Clock clock) {
         this.captures = Objects.requireNonNull(captures, "captures");
         this.deliveries = Objects.requireNonNull(deliveries, "deliveries");
         this.stages = Objects.requireNonNull(stages, "stages");
@@ -657,6 +681,7 @@ public final class ObservationPublisher {
         this.recordCounts = Objects.requireNonNull(recordCounts, "recordCounts");
         this.positions = Objects.requireNonNull(positions, "positions");
         this.snapshots = Objects.requireNonNull(snapshots, "snapshots");
+        this.runSnapshots = Objects.requireNonNull(runSnapshots, "runSnapshots");
         this.frontierGaps = Objects.requireNonNull(frontierGaps, "frontierGaps");
         this.nestStateReadings = Objects.requireNonNull(nestStateReadings, "nestStateReadings");
         this.coldLayer = Objects.requireNonNull(coldLayer, "coldLayer");
@@ -718,9 +743,10 @@ public final class ObservationPublisher {
             // metrics and as the observation's own snapshot dataset, and asking its source again for the
             // second use would let the two faces of one load describe different passes of it.
             SnapshotReading loaded = snapshots.apply(pipelineId);
+            SnapshotReading readThisRun = runSnapshots.apply(pipelineId);
             List<MetricFact> measured = facts(pipelineId, actual, at, readings, gaps, pinned,
                     nestDeadLetters.apply(pipelineId), joinRecomputeDone.apply(pipelineId),
-                    joinRecomputeExpected.apply(pipelineId), loaded);
+                    joinRecomputeExpected.apply(pipelineId), loaded, readThisRun);
             Observation published = new Observation(pipelineId, actual,
                     FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
                     loaded.byTable(), positions.apply(pipelineId), carried, at, measured);
@@ -821,6 +847,14 @@ public final class ObservationPublisher {
             Map<String, NestStateReading> nestReadings, Map<String, Long> gaps, Map<String, Long> pinned,
             Map<String, Long> discarded, Map<String, Long> rebuildDone, Map<String, Long> rebuildExpected,
             SnapshotReading loaded) {
+        return facts(pipelineId, actual, at, nestReadings, gaps, pinned, discarded, rebuildDone,
+                rebuildExpected, loaded, SnapshotReading.NONE);
+    }
+
+    List<MetricFact> facts(String pipelineId, PipelineState actual, Instant at,
+            Map<String, NestStateReading> nestReadings, Map<String, Long> gaps, Map<String, Long> pinned,
+            Map<String, Long> discarded, Map<String, Long> rebuildDone, Map<String, Long> rebuildExpected,
+            SnapshotReading loaded, SnapshotReading readThisRun) {
         List<MetricFact> facts = new ArrayList<>();
         failures(pipelineId, at).ifPresent(facts::add);
         recordCounts.apply(pipelineId)
@@ -883,7 +917,20 @@ public final class ObservationPublisher {
                 .forEach(facts::add);
         spent(pipelineId, at, stages.apply(pipelineId)).ifPresent(facts::add);
         load(pipelineId, at, loaded).forEach(facts::add);
+        runLoad(pipelineId, at, readThisRun).ifPresent(facts::add);
         return facts;
+    }
+
+    private static Optional<MetricFact> runLoad(String pipelineId, Instant at, SnapshotReading read) {
+        if (read == null || read.start().isEmpty()) {
+            return Optional.empty();
+        }
+        List<MetricPoint> points = new ArrayList<>();
+        read.byTable().forEach((table, progress) -> points.add(MetricPoint.accumulated(
+                Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, TABLE_ID_ATTRIBUTE, table),
+                read.countingSince(), at, progress.rowsDone())));
+        return points.isEmpty() ? Optional.empty()
+                : Optional.of(new MetricFact(SNAPSHOT_ROWS_CURRENT_RUN_METRIC, MetricType.COUNTER, "{row}", points));
     }
 
     /**

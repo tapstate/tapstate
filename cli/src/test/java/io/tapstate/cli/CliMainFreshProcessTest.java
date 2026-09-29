@@ -173,6 +173,7 @@ class CliMainFreshProcessTest {
                     new Request("/healthz", AuthorizationKind.ABSENT),
                     new Request("/version", AuthorizationKind.ABSENT),
                     new Request("/.well-known/tapstate", AuthorizationKind.ABSENT),
+                    new Request("/api/cluster/members", AuthorizationKind.EXPECTED_MACHINE),
                     new Request("/api/connectors", AuthorizationKind.EXPECTED_MACHINE));
             assertCacheUnchanged(before, authFile, authDirectory);
 
@@ -195,6 +196,7 @@ class CliMainFreshProcessTest {
                     new Request("/healthz", AuthorizationKind.ABSENT),
                     new Request("/version", AuthorizationKind.ABSENT),
                     new Request("/.well-known/tapstate", AuthorizationKind.ABSENT),
+                    new Request("/api/cluster/members", AuthorizationKind.EXPECTED_MACHINE),
                     new Request("/api/connectors", AuthorizationKind.EXPECTED_MACHINE));
             assertCacheUnchanged(poisoned, authFile, authDirectory);
             assertNoAuthTransientArtifacts(authDirectory);
@@ -257,11 +259,16 @@ class CliMainFreshProcessTest {
                     .isZero();
             assertNoSensitiveOutput(result);
             assertThat(JsonReader.parse(redacted(result.stdout()))).isEqualTo(Map.of("connectors", List.of()));
+            // The exact traffic of a fresh process, in order. The topology read is there once, right
+            // after the session is exchanged: that is where the session learns the other members it
+            // could move to, and once is the whole of it -- a cached session is re-activated before
+            // every API call, so a second appearance here would mean a round trip per command.
             assertThat(requests).containsExactly(
                     new Request("/healthz", AuthorizationKind.ABSENT),
                     new Request("/version", AuthorizationKind.ABSENT),
                     new Request("/.well-known/tapstate", AuthorizationKind.ABSENT),
                     new Request("/auth/session", AuthorizationKind.EXPECTED_HUMAN_SESSION),
+                    new Request("/api/cluster/members", AuthorizationKind.EXPECTED_HUMAN_ACCESS),
                     new Request("/api/connectors", AuthorizationKind.EXPECTED_HUMAN_ACCESS));
             assertCacheUnchanged(before, authFile, authDirectory);
             assertNoAuthTransientArtifacts(authDirectory);
@@ -570,6 +577,7 @@ class CliMainFreshProcessTest {
                 new Request("/healthz", AuthorizationKind.ABSENT),
                 new Request("/version", AuthorizationKind.ABSENT),
                 new Request("/.well-known/tapstate", AuthorizationKind.ABSENT),
+                new Request("/api/cluster/members", AuthorizationKind.EXPECTED_MACHINE),
                 new Request("/api/connectors", AuthorizationKind.EXPECTED_MACHINE));
     }
 

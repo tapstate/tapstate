@@ -116,6 +116,58 @@ class SrsCoordinatorTest {
         assertThat(coord.isProvisioned(CHAIN)).isTrue();
     }
 
+    // ---- joining a chain another member mines ------------------------------------
+
+    @Test
+    void aMemberJoiningAChainAnotherMemberMinesReadsUnderTheGenerationRunningAndOpensNone() {
+        FakeMeta meta = new FakeMeta();
+        long running = new SrsCoordinator(meta).provisionSource("src-a", CHAIN, List.of("orders"), "7d").epoch();
+        SrsCoordinator here = new SrsCoordinator(meta);
+
+        ProvisionOutcome joined = here.joinSource("src-a", CHAIN, List.of("orders"));
+
+        // The other member's tail writes every change under the generation it opened, and a load read here
+        // is ordered against those changes by the generation stamped on it.
+        assertThat(joined.epoch()).isEqualTo(running);
+        assertThat(joined.merged()).as("the chain was open before this member arrived").isTrue();
+        assertThat(meta.mutations).filteredOn(m -> m.startsWith("openEpoch:")).hasSize(1);
+        assertThat(meta.mutations).filteredOn(m -> m.startsWith("create:")).hasSize(1);
+        here.attachConsumer(CHAIN, "p-here");
+        assertThat(here.affectedConsumers(CHAIN)).containsExactly("p-here");
+    }
+
+    @Test
+    void aMemberStartingToMineAChainItJoinedTakesAGenerationOfItsOwnAndKeepsWhatItAttached() {
+        FakeMeta meta = new FakeMeta();
+        long running = new SrsCoordinator(meta).provisionSource("src-a", CHAIN, List.of("orders"), "7d").epoch();
+        SrsCoordinator here = new SrsCoordinator(meta);
+        here.joinSource("src-a", CHAIN, List.of("orders"));
+        here.attachConsumer(CHAIN, "p-joined");
+
+        // The member mining it is gone, and this one takes the tail over.
+        ProvisionOutcome mined = here.provisionSource("src-a", CHAIN, List.of("orders"), "7d");
+
+        assertThat(mined.epoch())
+                .as("a tail taking a ring over starts a generation of its own, as a restart does")
+                .isGreaterThan(running);
+        assertThat(mined.merged())
+                .as("and a start that fails from here leaves what the join attached where it was")
+                .isTrue();
+        assertThat(here.affectedConsumers(CHAIN)).containsExactly("p-joined");
+        assertThat(here.provisionSource("src-b", CHAIN, List.of("orders"), "7d").epoch())
+                .as("once mined here, a further source merges under that generation")
+                .isEqualTo(mined.epoch());
+    }
+
+    @Test
+    void joiningAChainWithNoGenerationOpenIsAnOrderingError() {
+        SrsCoordinator here = new SrsCoordinator(new FakeMeta());
+
+        assertThatThrownBy(() -> here.joinSource("src-a", CHAIN, List.of("orders")))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(CHAIN.value());
+    }
+
     // ---- consumer attach / detach boundary ---------------------------------------
 
     @Test
@@ -305,7 +357,13 @@ class SrsCoordinatorTest {
         @Override
         public long openEpoch(String miningChainId) {
             mutations.add("openEpoch:" + miningChainId);
-            return ++epoch;
+            ++epoch;
+            SrsMeta record = records.get(miningChainId);
+            if (record != null) {
+                records.put(miningChainId, new SrsMeta(record.miningChainId(), record.sourceRead(),
+                        record.consumerOffsets(), record.schemaHistory(), record.retention(), epoch));
+            }
+            return epoch;
         }
 
         @Override

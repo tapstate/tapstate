@@ -67,10 +67,13 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
             String token = position.token() != null ? position.token()
                     : isSnapshotOf(position) ? cdcStart(meta, miningChainId, pipelineId) : null;
             ChainPosition acked = new ChainPosition(position.order(), token);
-            meta.advanceSinkAcked(miningChainId, pipelineId, acked);
             if (isSnapshotOf(position)) {
+                meta.advanceSinkAcked(miningChainId, pipelineId, acked);
                 meta.markSnapshotComplete(miningChainId, pipelineId, chain);
             } else {
+                // A change is also recorded against its own table's ring, at the sequence it sat at there,
+                // so a run replacing this one carries on from it instead of from the head of the ring.
+                meta.advanceSinkAcked(miningChainId, pipelineId, chain, acked);
                 recordHowFarTheSourceHasBeenRead(meta, miningChainId, acked, recorded);
             }
         };

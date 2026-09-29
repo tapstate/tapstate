@@ -427,6 +427,11 @@ class SessionStateTest {
         }
 
         @Override
+        public ClusterMembersOutcome clusterMembers(URI baseUrl, String credential) {
+            return new ClusterMembersOutcome.Unreachable();
+        }
+
+        @Override
         public String tail(URI baseUrl, String credential, String sourceId, String collection, Object filter,
                            TailStream sink, java.util.function.BooleanSupplier stop) {
             return null;

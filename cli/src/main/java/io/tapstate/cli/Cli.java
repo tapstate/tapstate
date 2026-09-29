@@ -81,7 +81,7 @@ public final class Cli implements Runnable {
      * declaration, and the version is wanted on a path that must not depend on either. The build pins it
      * to the project version, so the string here cannot quietly drift from what was released.
      */
-    static final String VERSION = "tapstate 0.5.0";
+    static final String VERSION = "tapstate 0.6.0";
 
     /**
      * Just the number out of {@link #VERSION}, for the places that print it beside another version and
@@ -144,6 +144,7 @@ public final class Cli implements Runnable {
             Map.entry("connection.schema", "schema"),
             Map.entry("connector.register", "register"),
             Map.entry("connector.list", "connectors"),
+            Map.entry("cluster.members", "cluster"),
             Map.entry("token.create", "token"),
             Map.entry("token.list", "token"),
             Map.entry("token.revoke", "token"),
@@ -239,6 +240,8 @@ public final class Cli implements Runnable {
                     "Remove one stored artifact for good; --if-match pins the version removed.")),
             Map.entry("connectors", new VerbHelp("[-o text|json|yaml]",
                     "List the connectors registered on the server.")),
+            Map.entry("cluster", new VerbHelp("[-o text|json|yaml]",
+                    "List the cluster's members, what each one is, and where to reach it.")),
             Map.entry("register", new VerbHelp("<path|connector-id> [-o text|json|yaml]",
                     "Upload local connector artifacts, or fetch a published connector by id.")),
             Map.entry("test", new VerbHelp("<id> [-o text|json|yaml]",

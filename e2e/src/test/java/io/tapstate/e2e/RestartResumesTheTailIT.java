@@ -181,6 +181,13 @@ class RestartResumesTheTailIT {
             control.stop(pipelineId, false);
             control.lifecycle(pipelineId, LifecycleVerb.START);
 
+            // Both words are answered once they are recorded, so the run before this one can still be going
+            // when they return. A row written in that gap is that run's to carry: it carries it and
+            // confirms it, and the run replacing it then rightly carries on past it with nothing left to
+            // drive -- which reads as nought below, the reading kept for rows that went some other way.
+            // So the liveness row waits for the new run to be up.
+            awaitTheRunThatReplacedTheOneBefore(control, pipelineId, droveBefore);
+
             // Liveness before the count. A run that has not begun its snapshot has read nought too, so
             // without a row that actually crosses after the restart the assertion below is vacuous.
             insert(source, LIVENESS_ID, LIVENESS_ROW);
@@ -246,7 +253,7 @@ class RestartResumesTheTailIT {
     /**
      * The rows-read reading, taken only once the run it is a reading of is shown to be there at all and
      * to be a new one. Two situations answer "it read nought" while the claim above it is false, and both
-     * have been met in this file: a pipeline with no live run answers the snapshot face with nothing, and
+     * have been met in this file: a pipeline with no live run answers the run-local snapshot metric with nothing, and
      * the default this reading takes for a missing table turns that into the very value the claim
      * asserts; and a restart that did not restart leaves the run before it delivering the rows the case
      * waited for, so they arrive on time while saying nothing about a run that was never built.
@@ -265,7 +272,7 @@ class RestartResumesTheTailIT {
                         + "not there", pipelineId, read)
                 .contains(PipelineState.RUNNING);
         assertThat(control.snapshotRowsRead(pipelineId))
-                .as("the snapshot face of %s: with no live run it answers nothing at all, which the "
+                .as("the run-local snapshot metric of %s: with no live run it answers nothing at all, which the "
                         + "reading taken from it would report as a table that was never read", pipelineId)
                 .containsKey(TABLE);
         assertThat(settledRecordCount(control, pipelineId))
@@ -297,6 +304,28 @@ class RestartResumesTheTailIT {
             sleep();
         }
         return last;
+    }
+
+    /**
+     * Waits until the live run is a new one: its record count reads below what the run before it reached.
+     * That run's count only climbs, and a run replacing it begins again at nought, so no reading of the old
+     * run passes this, and neither does a pipeline with no run at all, which reads nothing.
+     */
+    private static void awaitTheRunThatReplacedTheOneBefore(
+            ControlPlane control, String pipelineId, long droveBefore) {
+        long deadline = System.nanoTime() + TIMEOUT.toNanos();
+        Optional<Long> last = Optional.empty();
+        while (System.nanoTime() - deadline < 0) {
+            last = control.recordCount(pipelineId);
+            if (last.filter(count -> count < droveBefore).isPresent()) {
+                return;
+            }
+            sleep();
+        }
+        assertThat(last)
+                .as("records the live run of %s has driven, waited on for a run replacing the one that drove %d",
+                        pipelineId, droveBefore)
+                .hasValueSatisfying(count -> assertThat(count).isLessThan(droveBefore));
     }
 
     /** What the run has driven to its sinks, once that count settles; -1 for as long as none is live. */

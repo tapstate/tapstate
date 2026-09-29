@@ -7,11 +7,13 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.entry;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.SourceMode;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.TableRef;
+import io.tapstate.core.model.ViewBlock;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
@@ -37,6 +39,24 @@ class StoreBackedSinkPositionsTest {
         SourceResource source = source("orders_src", "orders", "h-orders");
         artifacts.save(source);
         artifacts.save(pipeline(PIPELINE, "orders_src"));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        String chain = chainOf(source);
+        store.meta().create(chain, null);
+        store.meta().advanceSinkAcked(chain, PIPELINE, new ChainPosition(new SourceOrder(1, 6), "w6"));
+
+        assertThat(new StoreBackedSinkPositions(store).apply(PIPELINE))
+                .containsExactly(entry("orders", "w6"));
+    }
+
+    @Test
+    void omitsThePositionOfAnUnreferencedTableOnTheSameSource() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        SourceResource source = new SourceResource("orders_src", null, "fake", Map.of("host", "h-orders"),
+                SourceMode.CDC, List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null);
+        artifacts.save(source);
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.bare("orders_src")),
+                null, new ViewBlock.Inline("order_state", FromRef.literal("orders"), "id", null),
+                null, null, null));
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         String chain = chainOf(source);
         store.meta().create(chain, null);

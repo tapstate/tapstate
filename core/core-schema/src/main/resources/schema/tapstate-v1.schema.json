@@ -158,7 +158,7 @@
       "description": "One field projection rule: rename a source field, drop a field, set a literal value, or compute a value from a CEL expression."
     },
     "FromClause": {
-      "description": "The upstream wiring of a transform step: either a list of references for streaming steps, or a map of named upstreams for nest and join.",
+      "description": "The upstream wiring of a transform step: either a list of references for streaming steps, or a map of named upstreams for nest and join. A join's map names one source table per alias - never another step, and never a /…/ pattern.",
       "oneOf": [
         {
           "type": "array",
@@ -1086,7 +1086,7 @@
     },
     "TransformBody.Join": {
       "type": "object",
-      "description": "Materializes a flat wide table by joining streams with SQL.",
+      "description": "Materializes a flat wide table by joining source tables with SQL; every alias in from: names one source table.",
       "properties": {
         "type": {
           "description": "Transform type discriminator.",

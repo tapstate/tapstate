@@ -1,5 +1,6 @@
 package io.tapstate.runtime.scheduler;
 
+import io.tapstate.core.lifecycle.FlatMetricProjection;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.PipelineState;
@@ -41,6 +42,7 @@ class HowFarTheLoadGotReachesTheReadFaceTest {
 
     private static final String ROWS = "tapstate.pipeline.snapshot.rows";
     private static final String TOTAL = "tapstate.pipeline.snapshot.rows.total";
+    private static final String CURRENT_RUN = "tapstate.pipeline.snapshot.rows.current_run";
 
     private final InMemoryStateStore state = new InMemoryStateStore();
     private final ObservationStore observations = new UnusedObservations();
@@ -121,6 +123,24 @@ class HowFarTheLoadGotReachesTheReadFaceTest {
         assertThat(factNamed(measured, ROWS).points()).singleElement()
                 .satisfies(point -> assertThat(point.value()).isEqualTo(500L));
         assertThat(measured).extracting(MetricFact::name).doesNotContain(TOTAL);
+    }
+
+    @Test
+    void aReplacedRunCanReportTheCompletedLoadAndStillShowThatItReadNoRowsItself() {
+        SnapshotReading completed = new SnapshotReading(
+                Map.of("orders", new TableSnapshot(5L, 5L, 100)), LOAD_BEGAN);
+        SnapshotReading skipped = new SnapshotReading(
+                Map.of("orders", new TableSnapshot(0L, 5L, 0)), AT);
+
+        List<MetricFact> measured = publisher(completed).facts("orders", PipelineState.RUNNING, AT,
+                Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), completed, skipped);
+
+        assertThat(factNamed(measured, ROWS).points()).singleElement()
+                .satisfies(point -> assertThat(point.value()).isEqualTo(5L));
+        assertThat(factNamed(measured, CURRENT_RUN).points()).singleElement()
+                .satisfies(point -> assertThat(point.value()).isZero());
+        assertThat(FlatMetricProjection.of(measured, ObservationPublisher.FLAT_REDUCTIONS).metrics())
+                .containsEntry("snapshot.rows.read.orders", 0L);
     }
 
     /** One table's finished load, counted by a connector that can count it. */

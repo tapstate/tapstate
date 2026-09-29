@@ -93,168 +93,346 @@ public final class CaptureRunUnit {
      * <ol>
      *   <li>a tail — buffered or direct — provisions the mining chain first, seeding its meta: the
      *       precondition for recording the cdc-start position, and for resuming at one;</li>
+     *   <li>the pipeline attaches to the chain as a consumer, and a shared-ring run exposes the Jet source
+     *       over its ring;</li>
      *   <li>the snapshot phase drains to the pass-through sink: on a shared-ring run it records the cdc-start
-     *       position at the seam and marks each selected table's snapshot complete once drained, otherwise it
-     *       is a pure drain with no chain to position or mark;</li>
-     *   <li>a shared-ring tail then attaches the consumer, runs the cdc phase into the change ring, and
-     *       exposes the Jet source; an srs-disabled tail attaches the same consumer and streams straight to
-     *       the pass-through sink. Both begin where the durable record says, and where it says nothing
-     *       the direct one begins where {@code start_from} asked while the shared miner takes the
-     *       present — see {@link #sourceStart}.</li>
+     *       position at the seam, otherwise it is a pure drain with no chain to position;</li>
+     *   <li>a shared-ring tail then runs the cdc phase into the change ring; an srs-disabled tail streams
+     *       straight to the pass-through sink, behind the load. Both begin where the durable record says,
+     *       and where it says nothing the direct one begins where {@code start_from} asked while the shared
+     *       miner takes the present — see {@link #sourceStart}.</li>
      * </ol>
+     *
+     * <p>All of it happens on the calling thread, rows included. {@link #begin} is the same run with the rows
+     * and the tail left to a thread of its own.
      */
     public CaptureRun start(CaptureRunSpec spec, Consumer<Envelope> passthrough) {
-        Objects.requireNonNull(spec, "spec");
-        Objects.requireNonNull(passthrough, "passthrough");
-        ConsumptionPlan plan = ConsumptionPlan.of(spec.readMode(), spec.srsEnabled());
+        return start(spec, passthrough, true);
+    }
 
-        MiningChainId chainId = null;
-        boolean merged = false;
-        boolean chainCreated = false;
-        boolean consumerAttached = false;
-        long epoch = 0;
-        Optional<Subscription> subscription = Optional.empty();
+    /**
+     * Starts one pipeline attachment and starts the shared tail only when this member owns its capture claim.
+     *
+     * <p>An attachment that starts no tail is the same attachment wherever it is made: the pipeline's own
+     * load, as its own record says it is owed, and its membership of the chain whose ring it reads. What
+     * differs is only who writes that ring. On the member holding the capture it is this member's own tail;
+     * anywhere else it is another member's, so the chain is joined under the generation that tail writes
+     * under rather than opened -- see {@link SrsCoordinator#joinSource}.
+     */
+    public CaptureRun start(CaptureRunSpec spec, Consumer<Envelope> passthrough, boolean startTail) {
+        Objects.requireNonNull(passthrough, "passthrough");
+        return start(spec, CaptureHandoff.of(passthrough), startTail);
+    }
+
+    /** As {@link #start(CaptureRunSpec, Consumer)}, telling {@code handoff} as each table's load is in. */
+    public CaptureRun start(CaptureRunSpec spec, CaptureHandoff handoff) {
+        return start(spec, handoff, true);
+    }
+
+    /**
+     * As {@link #start(CaptureRunSpec, Consumer, boolean)}, telling {@code handoff} as each table's load is in.
+     * The load is read on the calling thread and the run is handed back once it is over, so {@code handoff}
+     * has to take every row without waiting for anything this caller does next.
+     */
+    public CaptureRun start(CaptureRunSpec spec, CaptureHandoff handoff, boolean startTail) {
+        return open(spec, handoff, startTail, false);
+    }
+
+    /** As {@link #begin(CaptureRunSpec, CaptureHandoff, boolean)}, starting the tail as well. */
+    public CaptureRun begin(CaptureRunSpec spec, CaptureHandoff handoff) {
+        return begin(spec, handoff, true);
+    }
+
+    /**
+     * Begins the source run for {@code spec} and hands it back as soon as its load has been opened, reading
+     * the load -- and then starting the tail -- on a thread of the run's own.
+     *
+     * <p>Everything a job assembled from this run reads is done before this returns, in the order
+     * {@link #start} does it: the chain and its generation, its membership of the chain, where this pipeline
+     * arrives on each ring, and the seam its load began at. Only the rows are left, and the rows are what
+     * a large load cannot afford to read before the job that takes them is running: they go into a hand-off
+     * that holds a few thousand of them, and it is the job that makes room. Read here, they would fill it
+     * and wait for a job nobody can submit until this returns.
+     *
+     * <p>A run that owes no load has nothing to read, and is started as {@link #start} starts it, tail
+     * included. A failure of what is left is reported through the run's {@link CaptureRun#failure()}.
+     */
+    public CaptureRun begin(CaptureRunSpec spec, CaptureHandoff handoff, boolean startTail) {
+        return open(spec, handoff, startTail, true);
+    }
+
+    private CaptureRun open(CaptureRunSpec spec, CaptureHandoff handoff, boolean startTail, boolean inBackground) {
+        Objects.requireNonNull(spec, "spec");
+        Objects.requireNonNull(handoff, "handoff");
+        ConsumptionPlan plan = ConsumptionPlan.of(spec.readMode(), spec.srsEnabled());
         List<String> tables = spec.config().streams();
         if (tables == null || tables.isEmpty()) {
             throw new IllegalArgumentException("capture config must select at least one stream");
         }
+        OpenState state = new OpenState();
         try {
-            // Any tail opens the chain, buffered or not. The flag chooses whether changes go through the
-            // shared ring; it does not choose whether this source has a durable record, because that record
-            // is what the next run reads to know where to start -- a question the flag has no bearing on.
-            if (plan.tail()) {
-                chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
-                ProvisionOutcome provisioned = coordinator
-                        .provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
-                merged = provisioned.merged();
-                epoch = provisioned.epoch();
-                chainCreated = !merged;
-            }
-
+            provisionChain(spec, plan, startTail, state);
             // Opened before the load, not with the tail: the load's rows are this run's too, and an
             // account opened after them would report a run that had read nothing until its first change.
             CaptureHealth health = new CaptureHealth();
-            long snapshotCount = 0;
+            attachConsumer(spec, plan, startTail, tables, state);
+            markPipelineArrival(spec, plan, tables, state.chainId);
+            Optional<StreamSource<SrsItem>> ringSource = ringSource(spec, plan, tables, state.chainId);
+            state.load = openLoad(spec, plan, tables, state.chainId, state.epoch);
             // The seam this run's own load began at, for the tail that follows it -- null when no load ran
             // here. Carried from the phase rather than read back off the chain, because the chain records
             // one seam for however many pipelines load from it: read back, a pipeline new to the chain
             // gets whichever load reached the record first and starts its tail where that one began.
-            String ownSeam = null;
-            Map<String, Long> snapshotCounts = new LinkedHashMap<>();
-            // Which tables a resuming run still owes is asked once, by the snapshot phase, of this
-            // pipeline's own record on the chain -- so it survives the process that answered it last, and a
-            // run that owes none reads nothing. Asking the coarser "is the whole load done" here as well
-            // put the same question to the same record twice, and two readings of one fact are two things
-            // that can disagree. It is the pipeline's question and not the chain's: a chain excludes the
-            // table subset from its identity, so a second pipeline on it would otherwise inherit the
-            // first's answer and skip a load it never did.
-            if (plan.snapshot()) {
-                Consumer<Envelope> snapshotPassthrough = event -> {
-                    // Two tallies of rows that overlap, kept apart because they answer different
-                    // questions: this one is what the load read, reported once it finishes and used to
-                    // say which tables it covered; the other is what the run has received at all, which
-                    // goes on climbing over the tail that follows.
-                    snapshotCounts.merge(event.src(), 1L, Long::sum);
-                    health.received(event);
-                    passthrough.accept(event);
-                };
-                // A chainless read has no ring generation, but its rows still enter the same stateful graph.
-                // Its caller therefore assigns a run generation of its own; the drain stamps it at the one
-                // shared boundary every chainless snapshot passes through.
-                if (chainId != null) {
-                    SnapshotPhase.Outcome loaded = SnapshotPhase.run(port, spec.config(), chainId.value(),
-                            spec.pipelineId(), tables, epoch, meta, snapshotPassthrough);
-                    snapshotCount = loaded.rows();
-                    ownSeam = loaded.tailSeam();
-                } else {
-                    long snapshotEpoch = spec.snapshotEpoch() > 0
-                            ? spec.snapshotEpoch() : chainlessSnapshotEpoch.incrementAndGet();
-                    snapshotCount = SnapshotPhase.drain(
-                            port, spec.config(), snapshotEpoch, snapshotPassthrough);
-                }
+            String ownSeam = tailSeam(state.load);
+            Supplier<Optional<Subscription>> tail =
+                    () -> openTail(spec, plan, state.chainId, state.epoch, ownSeam,
+                            startTail, health, handoff);
+
+            Optional<CaptureRun> backgroundRun = beginBackgroundLoad(
+                    spec, handoff, inBackground, tail, state, ringSource, health);
+            if (backgroundRun.isPresent()) {
+                return backgroundRun.get();
             }
 
-            Optional<StreamSource<SrsItem>> ringSource = Optional.empty();
-            if (plan.sharedRing()) {
-                String cid = chainId.value();
-                long ringEpoch = epoch;
-                coordinator.attachConsumer(chainId, spec.pipelineId());
-                consumerAttached = true;
-                // The cursors alone, not the whole record: this is read on every run of changes, and the
-                // record also carries a schema history that grows per DDL and is never read here.
-                Supplier<Collection<ConsumerOffset>> consumers = () -> meta.consumerOffsets(cid);
-                // What the acked position can be attributed to decides whether this chain's log can be
-                // cut at all. A chain records one acked position for the whole chain, and the sequence in
-                // it came from whichever table's ring held that change -- on a chain of one table there is
-                // only one ring it could be, so the frontier bounds that log exactly; on a chain of several
-                // there is no way to tell which, and cutting the wrong ring deletes changes that still have
-                // to be replayed. So a multi-table chain keeps everything, and will until an acked position
-                // is recorded per table. That is not a smaller version of this cut, it is a different
-                // record, and it belongs with the work that makes a table recoverable on its own.
-                SrsLogStore log = hz.getUserContext().get(SRS_LOG_USER_CONTEXT_KEY) instanceof SrsLogStore
-                        bound ? bound : null;
-                boolean cuttable = log != null && tables.size() == 1;
-                Map<String, CdcPhase.TableRoute> routes = new LinkedHashMap<>();
-                for (String table : tables) {
-                    String ringName = SrsRingbuffer.ringName(cid, table);
-                    SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer(ringName)));
-                    // One generation across the chain's tables: they are rebuilt together, so a sequence of
-                    // one ring is comparable with a sequence of another exactly when both were opened by the
-                    // same provisioning.
-                    CdcChain chain = new CdcChain(gate, meta, cid, ringEpoch, spec.schemaVer());
-                    LongConsumer trim = cuttable ? seq -> log.trim(ringName, seq) : seq -> { };
-                    routes.put(table, new CdcPhase.TableRoute(chain, consumers, trim));
-                }
-                CaptureStart minerStart = tailStart(
-                        meta, cid, spec.pipelineId(), ownSeam, CaptureStart.present());
-                refuseAnInstantThisBufferWillNeverReach(
-                        spec.startFrom(), minerStart, spec.retention());
-                subscription = Optional.of(CdcPhase.run(
-                        port, spec.config(), minerStart, routes, health));
-                String firstTable = tables.getFirst();
-                String firstRing = SrsRingbuffer.ringName(cid, firstTable);
-                ringSource = Optional.of(SrsRingSource.create(
-                        firstRing, spec.startFrom(), readCursorPublisher(cid, spec.pipelineId(), firstTable),
-                        spec.retention()));
-            } else if (plan.directTail()) {
-                // srs.enabled:false: the tail streams straight to the consumer with no shared ring. The ring
-                // is the whole of what the flag decides -- the chain is open and its record is kept either
-                // way -- so this tail begins where that record says, exactly as a buffered one does. Taking
-                // the present here instead is a silent loss: the tail comes up healthy and every change
-                // between where it had reached and now is gone.
-                //
-                // It attaches as a consumer for the same reason a buffered tail does: it is using the chain,
-                // and a teardown that could not see it would tear the chain out from under a live reader.
-                // Stated rather than relied on: a direct tail is `tail && !sharedRing`, so reaching here
-                // means the branch forty lines up already resolved the chain. That is a fact about a
-                // record's accessor, which is exactly the kind nothing downstream can see.
-                MiningChainId directChainId =
-                        Objects.requireNonNull(chainId, "a tail resolves its chain before it runs");
-                coordinator.attachConsumer(directChainId, spec.pipelineId());
-                consumerAttached = true;
-                String directChain = directChainId.value();
-                long directEpoch = epoch;
-                Supplier<Collection<ConsumerOffset>> directConsumers = () -> meta.consumerOffsets(directChain);
-                AtomicLong forwarded = new AtomicLong();
-                AtomicReference<ChainPosition> directLastWritten = new AtomicReference<>();
-                subscription = Optional.of(port.cdc(
-                        spec.config(), tailStart(
-                                meta, directChain, spec.pipelineId(), ownSeam, sourceStart(spec.startFrom())),
-                        health.recording((events, position) -> forwardDirect(
-                                events, position, directChain, directEpoch, forwarded,
-                                directConsumers, directLastWritten, passthrough))));
-            }
-
+            SnapshotRead snapshot = readSnapshot(state.load, handoff, health);
+            state.subscription = tail.get();
             return new CaptureRun(
-                    Optional.ofNullable(chainId), merged, snapshotCount, snapshotCounts, ringSource, subscription, health);
+                    Optional.ofNullable(state.chainId), state.merged, snapshot.count(), snapshot.counts(),
+                    ringSource, state.subscription, health);
         } catch (RuntimeException | Error failure) {
+            if (state.load != null) {
+                state.load.close();
+            }
             RuntimeException cleanupFailure = rollbackStartFailure(
-                    chainId, spec.pipelineId(), chainCreated, consumerAttached, subscription);
+                    state.chainId, spec.pipelineId(), state.chainCreated,
+                    state.consumerAttached, state.subscription);
             if (cleanupFailure != null) {
                 failure.addSuppressed(cleanupFailure);
             }
             throw failure;
         }
+    }
+
+    private void provisionChain(
+            CaptureRunSpec spec, ConsumptionPlan plan, boolean startTail, OpenState state) {
+        // Any tail opens the chain, buffered or not. The flag chooses whether changes go through the
+        // shared ring; it does not choose whether this source has a durable record, because that record
+        // is what the next run reads to know where to start -- a question the flag has no bearing on.
+        if (!plan.tail()) {
+            return;
+        }
+        state.chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+        // Only the member that runs the tail opens a generation; an attachment reads the one that tail
+        // writes under.
+        ProvisionOutcome provisioned = startTail
+                ? coordinator.provisionSource(
+                        spec.sourceId(), state.chainId, spec.config().streams(), spec.retention())
+                : coordinator.joinSource(spec.sourceId(), state.chainId, spec.config().streams());
+        state.merged = provisioned.merged();
+        state.epoch = provisioned.epoch();
+        state.chainCreated = !state.merged;
+    }
+
+    private void markPipelineArrival(
+            CaptureRunSpec spec, ConsumptionPlan plan, List<String> tables, MiningChainId chainId) {
+        // Where this pipeline starts in each ring, marked now: after it is on the chain, and before its
+        // own load reads a row or any tail this run opens mines a change -- so everything it is owed lands
+        // above the mark. A cdc-only read from the earliest change or from an instant is placed by that
+        // start instead, when its reader opens. A pipeline coming back keeps the place it had.
+        if (plan.sharedRing() && (plan.snapshot() || spec.startFrom() instanceof StartFrom.Latest)) {
+            markWhereThisPipelineArrives(chainId.value(), spec.pipelineId(), tables);
+        }
+    }
+
+    private void attachConsumer(
+            CaptureRunSpec spec,
+            ConsumptionPlan plan,
+            boolean startTail,
+            List<String> tables,
+            OpenState state) {
+        // On the chain before the load rather than after it. Membership is what keeps the chain open:
+        // the last consumer to give it back closes it, and a load read while the job runs gives any
+        // other pipeline on the chain the whole length of the load in which to stop.
+        if (plan.sharedRing()) {
+            coordinator.attachConsumer(state.chainId, spec.pipelineId());
+            state.consumerAttached = true;
+            // A selected table protects its ring before arrival is sampled. If a writer gets there first,
+            // the later sample moves arrival past what it wrote; once this registration lands, the writer
+            // is constrained until that sample and its cursor are published together. Raising the floor
+            // to -1 also leaves an already advanced cursor where a returning run left it.
+            registerConsumerTables(state.chainId.value(), spec.pipelineId(), tables);
+        } else if (plan.directTail() && startTail) {
+            coordinator.attachConsumer(
+                    Objects.requireNonNull(state.chainId, "a tail resolves its chain before it runs"),
+                    spec.pipelineId());
+            state.consumerAttached = true;
+        }
+    }
+
+    private Optional<StreamSource<SrsItem>> ringSource(
+            CaptureRunSpec spec, ConsumptionPlan plan, List<String> tables, MiningChainId chainId) {
+        if (!plan.sharedRing()) {
+            return Optional.empty();
+        }
+        String firstTable = tables.getFirst();
+        String firstRing = SrsRingbuffer.ringName(chainId.value(), firstTable);
+        return Optional.of(SrsRingSource.create(
+                firstRing, spec.startFrom(),
+                readCursorPublisher(chainId.value(), spec.pipelineId(), firstTable), spec.retention()));
+    }
+
+    private SnapshotPhase.Load openLoad(
+            CaptureRunSpec spec,
+            ConsumptionPlan plan,
+            List<String> tables,
+            MiningChainId chainId,
+            long epoch) {
+        // Which tables a resuming run still owes is asked once, by the snapshot phase, of this
+        // pipeline's own record on the chain. A chainless read instead gets a run generation of its own.
+        if (!plan.snapshot()) {
+            return null;
+        }
+        if (chainId != null) {
+            return SnapshotPhase.open(
+                    port, spec.config(), chainId.value(), spec.pipelineId(), tables, epoch, meta);
+        }
+        long snapshotEpoch = spec.snapshotEpoch() > 0
+                ? spec.snapshotEpoch()
+                : chainlessSnapshotEpoch.incrementAndGet();
+        return SnapshotPhase.openChainless(port, spec.config(), snapshotEpoch);
+    }
+
+    private Optional<CaptureRun> beginBackgroundLoad(
+            CaptureRunSpec spec,
+            CaptureHandoff handoff,
+            boolean inBackground,
+            Supplier<Optional<Subscription>> tail,
+            OpenState state,
+            Optional<StreamSource<SrsItem>> ringSource,
+            CaptureHealth health) {
+        if (state.load == null || !inBackground || !state.load.readsAnything()) {
+            return Optional.empty();
+        }
+        BackgroundLoad reading = new BackgroundLoad(
+                state.load, handoff, tail, health,
+                "tapstate-load-" + spec.pipelineId() + "-" + spec.sourceId());
+        // Started before the run that owns it is made: a reader that cannot start then leaves no
+        // run behind, only the read it opened, which the failure path closes with the chain.
+        reading.start();
+        return Optional.of(new CaptureRun(
+                Optional.ofNullable(state.chainId), state.merged, ringSource, health, reading));
+    }
+
+    private static SnapshotRead readSnapshot(
+            SnapshotPhase.Load load, CaptureHandoff handoff, CaptureHealth health) {
+        Map<String, Long> counts = new LinkedHashMap<>();
+        if (load == null) {
+            return new SnapshotRead(0, counts);
+        }
+        long count = load.read(event -> {
+            // Two tallies of rows that overlap, kept apart because they answer different questions:
+            // this one is what the load read; the health count goes on climbing over the following tail.
+            counts.merge(event.src(), 1L, Long::sum);
+            health.received(event);
+            handoff.accept(event);
+        }, handoff::loaded);
+        load.close();
+        return new SnapshotRead(count, counts);
+    }
+
+    private static String tailSeam(SnapshotPhase.Load load) {
+        return load == null ? null : load.tailSeam();
+    }
+
+    private record SnapshotRead(long count, Map<String, Long> counts) {
+    }
+
+    private static final class OpenState {
+        private MiningChainId chainId;
+        private boolean merged;
+        private boolean chainCreated;
+        private boolean consumerAttached;
+        private long epoch;
+        private Optional<Subscription> subscription = Optional.empty();
+        private SnapshotPhase.Load load;
+    }
+
+    private void registerConsumerTables(String chainId, String pipelineId, List<String> tables) {
+        for (String table : tables) {
+            meta.advanceConsumerReadSeq(chainId, pipelineId, table, -1L);
+        }
+    }
+
+    /**
+     * Opens the tail that follows a load, or nothing where this run starts no tail.
+     *
+     * <p>A shared-ring tail runs the cdc phase into the change ring; an srs-disabled one streams straight to
+     * the pipeline through {@code passthrough}, behind the load it follows. Both begin where the durable
+     * record says, and where it says nothing the direct one begins where {@code start_from} asked while the
+     * shared miner takes the present -- see {@link #sourceStart}.
+     */
+    private Optional<Subscription> openTail(
+            CaptureRunSpec spec,
+            ConsumptionPlan plan,
+            MiningChainId chainId,
+            long epoch,
+            String ownSeam,
+            boolean startTail,
+            CaptureHealth health,
+            Consumer<Envelope> passthrough) {
+        if (!startTail) {
+            return Optional.empty();
+        }
+        List<String> tables = spec.config().streams();
+        if (plan.sharedRing()) {
+            String cid = chainId.value();
+            // The cursors alone, not the whole record: this is read on every run of changes, and the
+            // record also carries a schema history that grows per DDL and is never read here.
+            Supplier<Collection<ConsumerOffset>> consumers = () -> meta.consumerOffsets(cid);
+            // What the acked position can be attributed to decides whether this chain's log can be
+            // cut at all. A chain records one acked position for the whole chain, and the sequence in
+            // it came from whichever table's ring held that change -- on a chain of one table there is
+            // only one ring it could be, so the frontier bounds that log exactly; on a chain of several
+            // there is no way to tell which, and cutting the wrong ring deletes changes that still have
+            // to be replayed. So a multi-table chain keeps everything, and will until an acked position
+            // is recorded per table. That is not a smaller version of this cut, it is a different
+            // record, and it belongs with the work that makes a table recoverable on its own.
+            SrsLogStore log = hz.getUserContext().get(SRS_LOG_USER_CONTEXT_KEY) instanceof SrsLogStore
+                    bound ? bound : null;
+            boolean cuttable = log != null && tables.size() == 1;
+            Map<String, CdcPhase.TableRoute> routes = new LinkedHashMap<>();
+            for (String table : tables) {
+                String ringName = SrsRingbuffer.ringName(cid, table);
+                SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer(ringName)));
+                // One generation across the chain's tables: they are rebuilt together, so a sequence of
+                // one ring is comparable with a sequence of another exactly when both were opened by the
+                // same provisioning.
+                CdcChain chain = new CdcChain(gate, meta, cid, epoch, spec.schemaVer(), spec.captureFence());
+                LongConsumer trim = cuttable ? seq -> log.trim(ringName, seq) : seq -> { };
+                routes.put(table, new CdcPhase.TableRoute(chain, consumers, trim));
+            }
+            CaptureStart minerStart = tailStart(meta, cid, spec.pipelineId(), ownSeam, CaptureStart.present());
+            refuseAnInstantThisBufferWillNeverReach(spec.startFrom(), minerStart, spec.retention());
+            return Optional.of(CdcPhase.run(port, spec.config(), minerStart, routes, health));
+        }
+        if (plan.directTail()) {
+            // srs.enabled:false: the tail streams straight to the consumer with no shared ring. The ring
+            // is the whole of what the flag decides -- the chain is open and its record is kept either
+            // way -- so this tail begins where that record says, exactly as a buffered one does. Taking
+            // the present here instead is a silent loss: the tail comes up healthy and every change
+            // between where it had reached and now is gone.
+            String directChain = chainId.value();
+            Supplier<Collection<ConsumerOffset>> directConsumers = () -> meta.consumerOffsets(directChain);
+            AtomicLong forwarded = new AtomicLong();
+            AtomicReference<ChainPosition> directLastWritten = new AtomicReference<>();
+            return Optional.of(port.cdc(
+                    spec.config(), tailStart(
+                            meta, directChain, spec.pipelineId(), ownSeam, sourceStart(spec.startFrom())),
+                    health.recording((events, position) -> forwardDirect(
+                            events, position, directChain, epoch, forwarded,
+                            directConsumers, directLastWritten, passthrough))));
+        }
+        return Optional.empty();
     }
 
     /**
@@ -462,6 +640,19 @@ public final class CaptureRunUnit {
             case StartFrom.Latest ignored -> CaptureStart.present();
             case StartFrom.At at -> CaptureStart.at(at.instant());
         };
+    }
+
+    /**
+     * Marks, for each of the pipeline's tables, where it starts in that table's ring: just past what the ring
+     * already holds. Read from the ring itself, which numbers on across rebuilds, so the mark names the same
+     * place for every member that reads it. A refusal while the cluster is still forming surfaces as an
+     * uncoded failure of this start, which the next pass tries again.
+     */
+    private void markWhereThisPipelineArrives(String chainId, String pipelineId, List<String> tables) {
+        for (String table : tables) {
+            SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer(SrsRingbuffer.ringName(chainId, table)));
+            meta.startRingAfter(chainId, pipelineId, table, ring.tailSequence());
+        }
     }
 
     /**

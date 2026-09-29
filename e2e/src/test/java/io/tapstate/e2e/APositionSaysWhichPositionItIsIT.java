@@ -11,9 +11,16 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -40,9 +47,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * on the wire while the screen kept printing the old word would leave every reader exactly where they
  * started while a test on the document went green.
  *
- * <p>The position it asserts is the one the run actually acked, read back out of the product first, so the
- * case cannot pass by printing a value it composed itself. Waiting for that ack is also what makes the
- * first half mean anything: before one exists there is no position on screen to be read as the wrong one.
+ * <p>The position it asserts is the one the run actually acked, read back out of the product on both sides
+ * of the session that prints it, so the case cannot pass by printing a value it composed itself. Waiting
+ * for that ack is also what makes the first half mean anything: before one exists there is no position on
+ * screen to be read as the wrong one.
  *
  * <p><b>A real connector, and not by preference.</b> The harness's own file connector hands the product a
  * null offset on every change it streams, so nothing it drives ever acks a position -- measured, not
@@ -79,7 +87,7 @@ class APositionSaysWhichPositionItIsIT {
     }
 
     @Test
-    void theRecordedPositionNamesItselfAndTheUnrecordedOnesAreNamedToo() {
+    void theRecordedPositionNamesItselfAndTheUnrecordedOnesAreNamedToo() throws Exception {
         String database = PIPELINE_ID + "_src";
         String sourceUri = SharedMongo.replicaSetUrl(database);
         String targetUri = SharedMongo.replicaSetUrl(PIPELINE_ID + "_tgt");
@@ -107,17 +115,18 @@ class APositionSaysWhichPositionItIsIT {
             Await.until("the pipeline to have acked a source position", TIMEOUT,
                     () -> control.durablePosition(PIPELINE_ID, COLLECTION).isPresent(),
                     () -> String.valueOf(control.durablePosition(PIPELINE_ID, COLLECTION)));
-            String acked = control.durablePosition(PIPELINE_ID, COLLECTION).orElseThrow();
-
-            CliOnce.Run run = CliOnce.runSession(PASSWORD, "metrics " + PIPELINE_ID + "\nexit\n",
-                    "-c", server.baseUrl().toString(), "-u", USER);
+            Observed first = metricsHeldStill(control, server);
+            String acked = first.acked();
+            CliOnce.Run run = first.run();
 
             assertThat(run.exitCode())
                     .as("the session must have run; stdout was:%n%s%nstderr was:%n%s", run.stdout(), run.stderr())
                     .isZero();
             assertThat(run.stdout())
-                    .as("the position on screen is the one the run acked, and it says which position that is")
-                    .contains("targetAckedPosition." + COLLECTION + "  " + acked);
+                    .as("the acked table is named without displaying its connector-private token")
+                    .doesNotContain(acked);
+            String firstFingerprint = printedFingerprint(run.stdout());
+            assertThat(firstFingerprint).isEqualTo(fingerprintOf(acked));
             assertThat(run.stdout())
                     .as("a position nobody records is printed by name, not left out to be guessed at")
                     .contains("sourceHeadPosition  not collected")
@@ -125,6 +134,77 @@ class APositionSaysWhichPositionItIsIT {
             assertThat(run.stdout())
                     .as("the name that said where but never which is gone, not kept beside the new one")
                     .doesNotContain("perTableOffset");
+
+            rename(source, database, 1, "v2");
+            Await.until("a second change the tail carried to the target", TIMEOUT,
+                    () -> mongo.documents(target, COLLECTION).stream()
+                            .anyMatch(document -> "v2".equals(document.getString("name"))),
+                    () -> mongo.documents(target, COLLECTION).toString());
+            Await.until("the target-acked source position to advance", TIMEOUT,
+                    () -> control.durablePosition(PIPELINE_ID, COLLECTION)
+                            .filter(position -> !position.equals(acked)).isPresent(),
+                    () -> String.valueOf(control.durablePosition(PIPELINE_ID, COLLECTION)));
+            Observed second = metricsHeldStill(control, server);
+            String nextAcked = second.acked();
+            CliOnce.Run next = second.run();
+            assertThat(next.exitCode())
+                    .as("the session must have run; stdout was:%n%s%nstderr was:%n%s", next.stdout(), next.stderr())
+                    .isZero();
+            assertThat(next.stdout()).doesNotContain(acked, nextAcked);
+            assertThat(printedFingerprint(next.stdout()))
+                    .isEqualTo(fingerprintOf(nextAcked))
+                    .isNotEqualTo(firstFingerprint);
+        }
+    }
+
+    /**
+     * A {@code metrics} session together with the acked position it had to print, read on both sides of it.
+     *
+     * <p>A session prints whichever position was acked when it asked, and an ack can land at any moment --
+     * the one for a change included, which lands after that change is already visible in the target. A
+     * single read beside the session can therefore name a position the session has already moved past. The
+     * same position read before and after leaves it nothing else to have printed, because a run does not
+     * move its acked position and then return it to the same one. A session that straddled a move says
+     * nothing either way, so it is run again rather than judged.
+     */
+    private static Observed metricsHeldStill(ControlPlane control, ServerHandle server) {
+        AtomicReference<Observed> held = new AtomicReference<>();
+        AtomicReference<String> lastMove = new AtomicReference<>("no session");
+        Await.until("the acked position to hold still across one metrics session", TIMEOUT, () -> {
+            String before = control.durablePosition(PIPELINE_ID, COLLECTION).orElseThrow();
+            CliOnce.Run run = CliOnce.runSession(PASSWORD, "metrics " + PIPELINE_ID + "\nexit\n",
+                    "-c", server.baseUrl().toString(), "-u", USER);
+            String after = control.durablePosition(PIPELINE_ID, COLLECTION).orElseThrow();
+            if (!before.equals(after)) {
+                lastMove.set("a session that ran while the position moved from %s to %s"
+                        .formatted(fingerprintOf(before), fingerprintOf(after)));
+                return false;
+            }
+            held.set(new Observed(before, run));
+            return true;
+        }, lastMove::get);
+        return held.get();
+    }
+
+    /** One {@code metrics} session and the acked position that held still while it ran. */
+    private record Observed(String acked, CliOnce.Run run) {
+    }
+
+    private static String printedFingerprint(String output) {
+        Matcher line = Pattern.compile("(?m)^targetAckedPosition\\." + COLLECTION
+                + "  opaque position fingerprint ([0-9a-f]{16}) \\(source coordinate unavailable\\)$")
+                .matcher(output);
+        assertThat(line.find()).as("the acked table has an opaque position fingerprint").isTrue();
+        return line.group(1);
+    }
+
+    private static String fingerprintOf(String position) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256")
+                    .digest(position.getBytes(StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(digest, 0, 8);
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("every Java platform provides SHA-256", e);
         }
     }
 

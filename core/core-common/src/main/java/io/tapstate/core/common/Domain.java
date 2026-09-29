@@ -50,6 +50,12 @@ public enum Domain {
     // control layer: the resource-type-agnostic verb layer (apply / audit / auth); diagnosable
     // failures such as an operation refused because its mandatory audit record could not be written
     CONTROL,
+    // the cluster read face: what a member can say about the cluster it is part of. Its codes are the
+    // ones this face decides for itself before any store is reached -- chiefly that the member asked
+    // cannot answer at all, because the engine member it reads from is not active. Distinct from BOOT,
+    // which reports that the engine member could not be started in the first place, and from STORE / IO,
+    // which report that the durable half of the same answer could not be reached (control)
+    CLUSTER,
     // runtime execution: driving the Jet job that runs a pipeline (submit / suspend / resume /
     // cancel), and the machinery the running job itself depends on — carrying a position through the
     // engine, propagating a frontier; diagnosable failures such as acting on a pipeline that has no

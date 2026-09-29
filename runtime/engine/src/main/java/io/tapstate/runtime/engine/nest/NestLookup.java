@@ -1,5 +1,7 @@
 package io.tapstate.runtime.engine.nest;
 
+import com.hazelcast.partition.PartitionAware;
+
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -153,21 +155,58 @@ public record NestLookup(
         return mixed ^ (mixed >>> 16);
     }
 
+    /** The entry one bucket of the identities pointing at {@code referenced} is filed under. */
+    public static At bucketKey(List<Object> referenced, int bucket) {
+        return new At(referenced, bucket);
+    }
+
     /**
-     * The entry one bucket of the identities pointing at {@code referenced} is filed under: that row's own
-     * key with the bucket number appended.
+     * Where one bucket of the identities pointing at a row is kept: that row's own key, and which bucket.
      *
-     * <p>Flat, and that is load-bearing rather than tidy. A key is filed in the layer behind the map under
-     * a name built by naming the kind of every value in it, and there is no kind for a key nested inside
-     * another - so a key holding one is refused outright, at the moment a bucket first has to be read back
-     * from the cold layer rather than when it is written. Appending keeps every value a scalar, and stays
-     * injective because the number of columns identifying a row is fixed for a namespace, which makes the
-     * last value the bucket in every key of it.
+     * <p><b>Placed by the row it belongs to rather than by its own bucket number.</b> Every bucket of a row
+     * is read by the processor that row was routed to, so buckets scattered by their own hash are fetched
+     * from across the cluster to answer a change that arrived locally - on every edit of the pointed-at
+     * row, and again on every row that starts or stops pointing at it. Saying which key places this hands
+     * all of them to the member already holding the row, and costs nothing: the placement is read off the
+     * key before it is serialized, so no caller has to know about it and no entry has to be told twice.
+     *
+     * <p><b>The identity is copied into one kind of list on the way in, and that is load-bearing.</b> What
+     * places an entry is the bytes its key serializes to, not its equality, so the same identity arriving
+     * once as a fixed list and once as a wrapped one would be two entries on two partitions - and both
+     * would look right from every angle except a count of what the row is pointed at by. The flat key this
+     * replaced got that for free by building its own list; holding a caller's, this has to do it.
+     *
+     * <p>Named in the layer behind the map exactly as that flat key was - the values, then the bucket, then
+     * the letters naming their kinds - so nothing already written under one has to be found again.
      */
-    public static List<Object> bucketKey(List<Object> referenced, int bucket) {
-        List<Object> key = new ArrayList<>(referenced.size() + 1);
-        key.addAll(referenced);
-        key.add(bucket);
-        return Collections.unmodifiableList(key);
+    public record At(List<Object> referenced, int bucket) implements PartitionAware<List<Object>>, Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        public At {
+            referenced = Collections.unmodifiableList(new ArrayList<>(referenced));
+        }
+
+        @Override
+        public List<Object> getPartitionKey() {
+            return referenced;
+        }
+
+        /**
+         * The flat key this replaced: the identity's values with the bucket number after them.
+         *
+         * <p>Kept because it is how the layer behind the map names this entry. A name is built by naming
+         * the kind of every value in a key and there is no kind for a key nested inside another, so a
+         * name taken off this record directly would be refused - and it would be refused the first time a
+         * bucket had to be read back from the cold layer rather than when it was written. Flattening also
+         * stays injective, because the number of columns identifying a row is fixed for a namespace,
+         * which makes the last value the bucket in every key of it.
+         */
+        List<Object> flattened() {
+            List<Object> flat = new ArrayList<>(referenced.size() + 1);
+            flat.addAll(referenced);
+            flat.add(bucket);
+            return Collections.unmodifiableList(flat);
+        }
     }
 }

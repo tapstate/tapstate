@@ -13,7 +13,7 @@ import com.hazelcast.config.MaxSizePolicy;
  * that decides what they are when they appear, and it does so by a pattern over the name every join
  * namespace shares.
  *
- * <p>Three maps per join, and each is load-bearing rather than a cache:
+ * <p>Four maps per join, and each is load-bearing rather than a cache:
  *
  * <ul>
  *   <li><b>the fact mirror</b> - the current image of each fact row, because a recompute has to re-emit
@@ -21,7 +21,9 @@ import com.hazelcast.config.MaxSizePolicy;
  *   <li><b>the dimension mirror</b> - the current image of each dimension row, because a fact row
  *       arriving has to be able to look its dimension up;
  *   <li><b>the reverse index</b> - which fact rows reference which dimension key, because a change to a
- *       dimension row has to find the rows it affects.
+ *       dimension row has to find the rows it affects;
+ *   <li><b>the writers</b> - the last batch each run of the join recorded as taken in whole, because a
+ *       fact row mirrored by a run that died has to be told apart from one whose index entries landed.
  * </ul>
  *
  * <p><b>A replica per entry, which the nest maps deliberately do not keep.</b> The difference is what
@@ -84,6 +86,11 @@ public final class JoinMaps {
     /** Where one join step keeps which fact rows reference which key of one dimension source. */
     public static String reverseIndex(String pipelineId, String stepId, String source) {
         return NAMESPACE_PREFIX + pipelineId + "." + stepId + ".index." + source;
+    }
+
+    /** Where one join step keeps the last batch each of its runs recorded as taken in whole. */
+    public static String writers(String pipelineId, String stepId) {
+        return NAMESPACE_PREFIX + pipelineId + "." + stepId + ".writers";
     }
 
     /**

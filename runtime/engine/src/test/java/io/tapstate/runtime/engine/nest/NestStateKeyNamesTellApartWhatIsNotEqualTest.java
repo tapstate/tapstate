@@ -68,6 +68,31 @@ class NestStateKeyNamesTellApartWhatIsNotEqualTest {
     }
 
     /**
+     * The name a bucket of the identities pointing at a row is filed under, written out rather than
+     * derived.
+     *
+     * <p>That key says which row places it, so that every bucket of one row is held where that row is.
+     * What it is <i>named</i> by is a separate question and did not move with it: the values it carries,
+     * flat, exactly as when the key was a plain list. Written here as the literal string because what this
+     * protects is entries that already exist - anything that changes the name leaves every bucket ever
+     * written unreachable, and nothing reports it. The rows themselves still render and every document
+     * still looks right; what is lost is the record of who points at them, which surfaces much later as an
+     * edit to a row that reaches no document at all.
+     *
+     * <p>Derived instead of written out, this would agree with whatever the naming happens to do, which is
+     * the one thing it must not do.
+     */
+    @Test
+    void aBucketOfReferrersKeepsTheNameItsEntriesWereWrittenUnder() {
+        assertThat(NestStateKeys.nameOf(NestLookup.bucketKey(List.of("C7"), 0)))
+                .isEqualTo("[\"C7\",0]~si");
+        assertThat(NestStateKeys.nameOf(NestLookup.bucketKey(List.of("C7", 42L), 7)))
+                .describedAs("a composite identity keeps its values in the order it carries them, with "
+                        + "the bucket last - which is what makes the name injective")
+                .isEqualTo("[\"C7\",42,7]~sli");
+    }
+
+    /**
      * A value the naming has no letter for is the engine's own defect - it chose the fields the vertex is
      * partitioned by - so it crashes rather than being given a name that another kind might also take.
      */

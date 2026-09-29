@@ -107,7 +107,7 @@ group() {   # <heading> <entries>
 grouped="$(group "What's new" "$news"; group "Fixes" "$fixes"; group "Other changes" "$other")"
 
 cat <<EOF
-Preview build — single-node, in-memory runtime, not for production.
+Preview build — not for production. Runs as a single member by default; cluster mode is an opt-in preview.
 
 <!-- Breaking changes: what somebody upgrading has to DO, not what we changed. Delete this
      section if this release breaks nothing. A rolling 0.x minor is allowed to break
@@ -129,6 +129,9 @@ concerns a change the connector never reads, which no delivery guarantee can cov
 * **Changes lost while the change stream positions itself.** The position is recorded before
   the snapshot runs and is not handed to the connector's stream read until afterwards, so a
   change written to the source inside that window can be missed.
+
+* **Cluster members talk over an unauthenticated port.** The member protocol has no
+  authentication or TLS; expose it only on a private network.
 
 * **Join does not produce fan-out.** Keep each dimension unique on its complete join key.
   Duplicate dimension keys replace the earlier match with the later-arriving row; there is no

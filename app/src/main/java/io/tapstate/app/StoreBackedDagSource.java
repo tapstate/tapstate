@@ -38,6 +38,7 @@ import io.tapstate.runtime.engine.nest.NestClock;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.engine.nest.NestTable;
 import io.tapstate.runtime.srs.CaptureRunUnit;
+import io.tapstate.runtime.srs.SourcePlacement;
 import io.tapstate.runtime.srs.SrsSourceProcessor;
 import io.tapstate.runtime.srs.StartFrom;
 import io.tapstate.spi.sink.DdlPolicy;
@@ -99,6 +100,7 @@ final class StoreBackedDagSource implements DagSource {
     private final JoinSchemaDrift joinSchemaDrift;
     private final SourceSchemaCopy sourceSchemaCopy;
     private final StepSchemaRecord stepSchemaRecord;
+    private final SourcePlacement sourcePlacement;
 
     StoreBackedDagSource(StorePort storePort) {
         this(storePort, assembledSinkWriterBinder());
@@ -114,10 +116,16 @@ final class StoreBackedDagSource implements DagSource {
         this(storePort, assembledSinkWriterBinder(), NestSettings.defaults(), storeReachability);
     }
 
-    /** The assembled source: nests held to {@code nestSettings}, the store probed before a view is built. */
+    /**
+     * The assembled source: nests held to {@code nestSettings}, the store probed before a view is built, and
+     * every source vertex run where {@code sourcePlacement} says. The member a start runs on starts the
+     * capture before it builds the topology, so that member is where the capture's hand-off fills and where
+     * the vertex that drains it has to be.
+     */
     StoreBackedDagSource(
-            StorePort storePort, NestSettings nestSettings, StoreReachability storeReachability) {
-        this(storePort, assembledSinkWriterBinder(), nestSettings, storeReachability);
+            StorePort storePort, NestSettings nestSettings, StoreReachability storeReachability,
+            SourcePlacement sourcePlacement) {
+        this(storePort, assembledSinkWriterBinder(), nestSettings, storeReachability, sourcePlacement);
     }
 
     /**
@@ -141,12 +149,13 @@ final class StoreBackedDagSource implements DagSource {
     public StartPreparation prepareStart(String pipelineId, String defaultDatabase) {
         ReadOnlyArtifactSnapshot snapshot = ReadOnlyArtifactSnapshot.capture(storePort.artifacts());
         StoreBackedDagSource captured = new StoreBackedDagSource(
-                storePort, sinkWriterBinder, nestSettings, storeReachability, snapshot);
+                storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement, snapshot);
         captured.validateStart(pipelineId);
         NestCapacity capacity = captured.capacityOf(pipelineId);
         Set<OperatorStateLocation> locations = captured.stateLocations(pipelineId, defaultDatabase);
         return new StartPreparation(
-                capacity, locations, Optional.of(snapshot), () -> captured.dagFor(pipelineId));
+                capacity, locations, Optional.of(snapshot),
+                fence -> captured.dagFor(pipelineId, fence));
     }
 
     @Override
@@ -189,13 +198,21 @@ final class StoreBackedDagSource implements DagSource {
     StoreBackedDagSource(
             StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
             StoreReachability storeReachability) {
-        this(storePort, sinkWriterBinder, nestSettings, storeReachability,
+        // Every construction that builds a topology for a cluster names where its sources run; the ones that
+        // reach here build for a single member, or inspect a topology rather than submit it.
+        this(storePort, sinkWriterBinder, nestSettings, storeReachability, SourcePlacement.anyMember());
+    }
+
+    StoreBackedDagSource(
+            StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
+            StoreReachability storeReachability, SourcePlacement sourcePlacement) {
+        this(storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement,
                 Objects.requireNonNull(storePort, "storePort").artifacts());
     }
 
     private StoreBackedDagSource(
             StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
-            StoreReachability storeReachability, ArtifactStore artifactStore) {
+            StoreReachability storeReachability, SourcePlacement sourcePlacement, ArtifactStore artifactStore) {
         this.storePort = Objects.requireNonNull(storePort, "storePort");
         this.artifactStore = Objects.requireNonNull(artifactStore, "artifactStore");
         this.sinkWriterBinder = Objects.requireNonNull(sinkWriterBinder, "sinkWriterBinder");
@@ -205,10 +222,21 @@ final class StoreBackedDagSource implements DagSource {
         this.joinSchemaDrift = new JoinSchemaDrift(this.storePort.derivedSchemas());
         this.sourceSchemaCopy = new SourceSchemaCopy(this.storePort.derivedSchemas());
         this.stepSchemaRecord = new StepSchemaRecord(this.storePort.derivedSchemas());
+        this.sourcePlacement = Objects.requireNonNull(sourcePlacement, "sourcePlacement");
     }
 
     @Override
     public DAG dagFor(String pipelineId) {
+        return dagFor(pipelineId, null);
+    }
+
+    /**
+     * The topology, with every external effect in it held to {@code fence}'s run. A single-node run passes
+     * none: there is one member and one run of anything, so there is nothing for a second one to be held
+     * against.
+     */
+    @Override
+    public DAG dagFor(String pipelineId, ExecutionFence fence) {
         // Expanded before anything reads the blocks, so every later step - target resolution included -
         // sees one shape rather than having to know a reference from a body.
         PipelineResource pipeline = PipelineInlining.inline(
@@ -284,11 +312,15 @@ final class StoreBackedDagSource implements DagSource {
         }
         requireFactKeyPublishedWhereAWriteMatchesOnIt(pipeline, compiledJoins, serveStreams);
         FrontierBinding frontier = frontierBinding(sourceVertices);
+        PipelineResource builtPipeline = new PipelineResource(
+                pipeline.id(), pipeline.metadata(),
+                pipeline.sources().stream().filter(ref -> sourceKeysById.containsKey(ref.id())).toList(),
+                pipeline.transforms(), pipeline.view(), pipeline.serve(), pipeline.settings(), pipeline.experimental());
         return PipelineDagBuilder.build(
-                pipeline,
+                builtPipeline,
                 bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets, viewTargets,
-                        serveStreams, viewStreams, stepIds, frontier, compiledJoins),
-                sinkAckFactory(pipeline, pipelineId), frontier);
+                        serveStreams, viewStreams, stepIds, frontier, compiledJoins, fence),
+                FencedSinkAckFactory.heldTo(sinkAckFactory(pipeline, pipelineId), fence), frontier);
     }
 
     /**
@@ -320,6 +352,7 @@ final class StoreBackedDagSource implements DagSource {
             holdings.add(PipelineStateInventory.OPERATOR_STATE.in(operatorNamespaces));
         }
         Set<String> driveNamespaces = new LinkedHashSet<>(connectorStateNamespaces(pipeline));
+        driveNamespaces.add(SnapshotLoadCounts.namespaceOf(pipelineId));
         if (readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY) {
             // This is capture-side state kept for the next drive, just as a connector's own notes are.
             // Clearing that state clears the generation too; keeping it lets a reread outrank operator
@@ -514,7 +547,12 @@ final class StoreBackedDagSource implements DagSource {
             if (skipUndiscovered && discovered == null) {
                 continue;
             }
-            SourceCaptureResolution resolution = SourceCaptureResolution.of(source, discovered);
+            Optional<SourceCaptureResolution> selected =
+                    SourceCaptureResolution.forPipeline(pipeline, source, discovered);
+            if (selected.isEmpty()) {
+                continue;
+            }
+            SourceCaptureResolution resolution = selected.orElseThrow();
             for (String table : resolution.tables()) {
                 String key = resolution.tables().size() == 1 ? sourceId : sourceId + "." + table;
                 vertices.put(key, new SourceVertex(pipeline.id(), sourceId, table, resolution));
@@ -628,9 +666,12 @@ final class StoreBackedDagSource implements DagSource {
                 published.put(stream, publishedAs(base, produced, atTheSource(pipelineId, stream,
                         sourceVertices)));
             } else if (produced != null) {
-                // Unknown lineage cannot preserve source attributes or secondary uniqueness.
+                // Unknown lineage cannot preserve source attributes or secondary uniqueness. A decimal
+                // type token also declares bounds, so it cannot survive a script that may replace it.
                 published.put(stream, TargetModelResolver.keyedOn(new TargetTable(base.name(), base.fields().stream()
-                        .map(field -> new TargetField(field.name(), field.type(), field.primaryKey(), field.inferredType()))
+                        .map(field -> new TargetField(field.name(),
+                                field.inferredType() == io.tapstate.core.common.TapstateType.DECIMAL
+                                        ? null : field.type(), field.primaryKey(), field.inferredType()))
                         .toList(), List.of()), base.fields().stream().filter(TargetField::primaryKey)
                         .map(TargetField::name).toList()));
             }
@@ -816,7 +857,7 @@ final class StoreBackedDagSource implements DagSource {
             if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Join join
                     && inputsOf(refsOf(inline.from()), vertices, keysByTable, keysBySource, steps,
                             Map.of(), vertex -> copiedColumns(pipelineId, vertex), incomplete) != null) {
-                compiled.put(step.id(), compileJoin(inline, join, sourceIdByTable(vertices)));
+                compiled.put(step.id(), compileJoin(inline, join, sourceIdByTable(vertices), steps));
             }
         }
         recordStepSchemas(pipelineId, deriveSteps(pipeline, vertices, keysByTable, keysBySource,
@@ -989,9 +1030,15 @@ final class StoreBackedDagSource implements DagSource {
         produced.origins().forEach((output, origin) -> parentNames.put(origin, output));
         for (String column : produced.columns().keySet()) {
             TargetField carried = declared.get(column);
-            boolean spellingStillHolds = carried != null && !retyped(column, produced, atTheSource);
+            var inferred = JoinSchemaDrift.typeOf(produced.columns().get(column));
+            // A decimal without a descriptor can reuse an older source spelling only while the value
+            // is unchanged. A computed value with the same name has no declared source range.
+            boolean spellingStillHolds = carried != null && !retyped(column, produced, atTheSource)
+                    && (inferred != io.tapstate.core.common.TapstateType.DECIMAL
+                    || produced.numericTypes().containsKey(column)
+                    || produced.unchangedFields().contains(column));
             fields.add(new TargetField(column, spellingStillHolds ? carried.type() : null, false,
-                    JoinSchemaDrift.typeOf(produced.columns().get(column)),
+                    inferred,
                     produced.numericTypes().get(column), produced.stringTypes().get(column)));
             TargetField identity = produced.expanded()
                     ? declared.get(produced.origins().get(column)) : carried;
@@ -1224,10 +1271,9 @@ final class StoreBackedDagSource implements DagSource {
         Map<String, String> chainIdByTable = new LinkedHashMap<>();
         for (String sourceId : pipeline.sourceIds()) {
             SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
-            SourceCaptureResolution resolution = SourceCaptureResolution.of(source, SourceDiscovery.model(storePort, source));
-            for (String table : resolution.tables()) {
-                chainIdByTable.put(table, resolution.chainId().value());
-            }
+            SourceCaptureResolution.forPipeline(pipeline, source, SourceDiscovery.model(storePort, source))
+                    .ifPresent(resolution -> resolution.tables().forEach(table ->
+                            chainIdByTable.put(table, resolution.chainId().value())));
         }
         return chainIdByTable;
     }
@@ -1248,7 +1294,8 @@ final class StoreBackedDagSource implements DagSource {
             Set<String> viewStreams,
             Set<String> stepIds,
             FrontierBinding frontier,
-            Map<String, CompiledJoin> compiledJoins) {
+            Map<String, CompiledJoin> compiledJoins,
+            ExecutionFence fence) {
         ChainAxes axes = frontier.axes();
         boolean snapshotOnly = readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY;
         long snapshotEpoch = snapshotOnly
@@ -1256,13 +1303,16 @@ final class StoreBackedDagSource implements DagSource {
                 : 0L;
         Map<String, Step.Inline> stepsById = inlineStepsById(pipeline);
         Map<String, String> sourceIdByTable = sourceIdByTable(sourceVertices);
+        StartFrom freshStart = freshRingStart(pipeline);
         return new DagBindings(
-                key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch),
+                key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch, freshStart),
                 step -> transformBinding(step, stepsById, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds),
-                element -> sinkWriter(pipeline, element, targets, serveStreams, sourceIdByTable),
+                element -> FencedSinkWriterFactory.heldTo(
+                        sinkWriter(pipeline, element, targets, serveStreams, sourceIdByTable), fence),
                 ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
                 sourceKeysById::get,
-                view -> viewSink(pipeline, view, viewTargets, viewStreams, sourceKeysById),
+                view -> FencedSinkWriterFactory.heldTo(
+                        viewSink(pipeline, view, viewTargets, viewStreams, sourceKeysById), fence),
                 nestBinding(pipeline, sourceIdByTable(sourceVertices)),
                 joinBinding(compiledJoins));
     }
@@ -1935,10 +1985,11 @@ final class StoreBackedDagSource implements DagSource {
             PipelineResource pipeline, Map<String, String> sourceIdByTable) {
         Map<String, CompiledJoin> byStep = new LinkedHashMap<>();
         if (pipeline.transforms() != null) {
+            Set<String> stepIds = stepIds(pipeline);
             for (Step step : pipeline.transforms()) {
                 if (step instanceof Step.Inline inline
                         && inline.body() instanceof TransformBody.Join join) {
-                    byStep.put(step.id(), compileJoin(inline, join, sourceIdByTable));
+                    byStep.put(step.id(), compileJoin(inline, join, sourceIdByTable, stepIds));
                 }
             }
         }
@@ -1966,12 +2017,20 @@ final class StoreBackedDagSource implements DagSource {
      * NULL for a column that turns out to hold one is the direction that produces a wrong promise.
      */
     private CompiledJoin compileJoin(Step.Inline step, TransformBody.Join join,
-            Map<String, String> sourceIdByTable) {
+            Map<String, String> sourceIdByTable, Set<String> stepIds) {
         Map<String, List<String>> keyByTable = new LinkedHashMap<>();
         Map<String, String> tableByName = new LinkedHashMap<>();
         List<io.tapstate.core.sql.SourceTable> tables = new ArrayList<>();
         if (step.from() instanceof FromClause.Aliases aliases) {
             aliases.aliases().forEach((alias, ref) -> {
+                // A step's output has no discovered columns and no key, so the SQL could resolve none of
+                // its columns and the refusal would arrive as a column-resolution error on every start.
+                // Validation refuses this shape; a pipeline stored before it did is refused here, coded,
+                // so the start fails with the reason rather than being retried for ever.
+                if (ref instanceof FromRef.Literal literal && stepIds.contains(literal.ref())) {
+                    throw new TapstateException(ActuationError.JOIN_INPUT_NOT_A_TABLE,
+                            Map.of("step", step.id(), "alias", alias, "ref", literal.ref()), null);
+                }
                 NestTable resolved = nestTable(ref, sourceIdByTable);
                 List<io.tapstate.core.sql.SourceColumn> columns =
                         columnsOf(resolved.name(), sourceIdByTable);
@@ -1988,8 +2047,17 @@ final class StoreBackedDagSource implements DagSource {
             });
         }
         List<io.tapstate.core.sql.SourceTable> derivedFrom = List.copyOf(tables);
-        io.tapstate.core.sql.JoinPlan plan =
-                io.tapstate.core.sql.SqlFrontEnd.derive(join.sql(), derivedFrom);
+        io.tapstate.core.sql.JoinPlan plan;
+        try {
+            plan = io.tapstate.core.sql.SqlFrontEnd.derive(join.sql(), derivedFrom);
+        } catch (io.tapstate.core.sql.SqlFrontEndException invalid) {
+            // Validation only parses the SQL: the columns it resolves against are the discovered ones,
+            // which only exist here. A statement that does not resolve against them fails the same way
+            // on every start, so it is refused with a code - which is what lets the pipeline end up
+            // failed with the reason instead of retried for ever.
+            throw new TapstateException(ActuationError.JOIN_SQL_INVALID,
+                    Map.of("step", step.id(), "detail", diagnosis(invalid)), invalid);
+        }
         // Every source the plan carries has to be one the step declared, because the alias is what the
         // wiring resolves an upstream through. The SQL may spell a source either way - the alias, or the
         // table it stands for, both of which were registered above so that the front end accepts what an
@@ -2021,6 +2089,51 @@ final class StoreBackedDagSource implements DagSource {
         }
         return new CompiledJoin(plan, key, Map.copyOf(dimensionRowKeyColumns),
                 Map.copyOf(tableByName), join, derivedFrom);
+    }
+
+    /**
+     * The front end's diagnosis as a person reads it: its first line, which names the fault and its
+     * position, without the class names the wrapping exceptions prefix it with. Calcite's validator
+     * reports through exceptions that each put the next one's class name in front of its message, so
+     * the text arrives as {@code org.apache.calcite.runtime.CalciteContextException: From line 1, ...}
+     * however far down the cause chain it is read.
+     */
+    private static String diagnosis(io.tapstate.core.sql.SqlFrontEndException invalid) {
+        String message = invalid.getMessage();
+        if (message == null) {
+            return "";
+        }
+        int end = message.indexOf('\n');
+        String line = (end < 0 ? message : message.substring(0, end)).trim();
+        while (true) {
+            int colon = line.indexOf(": ");
+            if (colon <= 0 || !isQualifiedThrowableName(line.substring(0, colon))) {
+                return line;
+            }
+            line = line.substring(colon + 2).trim();
+        }
+    }
+
+    /**
+     * Whether {@code name} reads as a fully qualified exception or error class, such as
+     * {@code org.apache.calcite.runtime.CalciteContextException}: dotted, every segment a Java
+     * identifier, the last one ending in {@code Exception} or {@code Error}.
+     */
+    private static boolean isQualifiedThrowableName(String name) {
+        if (name.indexOf('.') < 0 || !(name.endsWith("Exception") || name.endsWith("Error"))) {
+            return false;
+        }
+        for (String segment : name.split("\\.", -1)) {
+            if (segment.isEmpty() || !Character.isJavaIdentifierStart(segment.charAt(0))) {
+                return false;
+            }
+            for (int i = 1; i < segment.length(); i++) {
+                if (!Character.isJavaIdentifierPart(segment.charAt(i))) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     /** The columns of one table, in the shared type vocabulary the plan is derived against. */
@@ -2167,7 +2280,7 @@ final class StoreBackedDagSource implements DagSource {
      * writer fills.
      */
     private ProcessorMetaSupplier sourceVertex(
-            SourceVertex vertex, ChainAxes axes, boolean snapshotOnly, long snapshotEpoch) {
+            SourceVertex vertex, ChainAxes axes, boolean snapshotOnly, long snapshotEpoch, StartFrom freshStart) {
         if (vertex == null) {
             throw new IllegalStateException("source vertex binding is missing");
         }
@@ -2179,14 +2292,22 @@ final class StoreBackedDagSource implements DagSource {
         if (snapshotOnly) {
             return SrsSourceProcessor.snapshotOnlyMetaSupplier(
                     vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.table(), snapshotEpoch,
-                    order -> new Watermark(FrontierOrders.pack(chain, order), axis));
+                    order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement);
         }
+        // Where in the ring this run starts. Not the head as such: a ring outlives the runs that read it, so
+        // after one run dies the head can sit far below what this pipeline already landed, and starting there
+        // hands its target every change the ring still holds again. The record says how far the pipeline is
+        // done in this table's ring -- confirmed by its sink, or marked when it arrived -- and the run carries
+        // on just past that. With nothing recorded, the pipeline's own start decides.
+        Long doneThrough = storePort.meta()
+                .ringDoneThrough(vertex.resolution().chainId().value(), vertex.pipelineId())
+                .get(vertex.table());
         return SrsSourceProcessor.metaSupplier(
-                vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.table(), StartFrom.earliest(),
-                ringGeneration(vertex.resolution()),
+                vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.table(), freshStart,
+                doneThrough, ringGeneration(vertex.resolution()),
                 CaptureRunUnit.readCursorPublisher(
                         vertex.resolution().chainId().value(), vertex.pipelineId(), vertex.table()),
-                order -> new Watermark(FrontierOrders.pack(chain, order), axis));
+                order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement);
     }
 
     /**
@@ -2199,6 +2320,20 @@ final class StoreBackedDagSource implements DagSource {
      */
     private long ringGeneration(SourceCaptureResolution resolution) {
         return storePort.meta().read(resolution.chainId().value()).map(SrsMeta::epoch).orElse(0L);
+    }
+
+    /**
+     * Where a run with nothing recorded in a ring starts reading it: a cdc-only read where its own start says
+     * -- the present unless it names an earlier point, which is also what its capture is told -- and any read
+     * that loads first at the head, beneath which its own load is ordered.
+     */
+    private static StartFrom freshRingStart(PipelineResource pipeline) {
+        if (readModeOf(pipeline) != ReadMode.CDC_ONLY) {
+            return StartFrom.earliest();
+        }
+        String raw = pipeline.settings() != null && pipeline.settings().startFrom() != null
+                ? pipeline.settings().startFrom() : "latest";
+        return StartFrom.parse(raw);
     }
 
     private static ReadMode readModeOf(PipelineResource pipeline) {
@@ -2365,7 +2500,8 @@ final class StoreBackedDagSource implements DagSource {
             SourceVertex vertex = entry.getValue();
             if (pattern.matcher(vertex.table()).matches()
                     || pattern.matcher(entry.getKey()).matches()
-                    || pattern.matcher(vertex.sourceId()).matches()) {
+                    || pattern.matcher(vertex.sourceId()).matches()
+                    || pattern.matcher(vertex.sourceId() + "." + vertex.table()).matches()) {
                 matches.add(entry.getKey());
             }
         }

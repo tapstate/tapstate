@@ -41,11 +41,11 @@ class TheDefaultLimitsAreReachableBeforeAMemberDiesTest {
     private static final long MIB = 1024L * KIB;
 
     /**
-     * The member these are sized against. Nothing in the product states one, so this is an assumption
-     * rather than a fact - written down here because every number below is it divided by something, and an
-     * assumption that is not written down is one nobody can correct.
+     * The member these are sized against. It used to be written here, as an assumption this file made on
+     * its own; it is now a requirement the product states, so this reads it from where the product keeps
+     * it rather than keeping a second copy that could drift from the published one.
      */
-    private static final long REFERENCE_HEAP = 4L * 1024L * MIB;
+    private static final long REFERENCE_HEAP = NestSettings.REFERENCE_MEMBER_HEAP_BYTES;
 
     /**
      * What one entry may take on its own before it is refused. A sixteenth of the heap for a single

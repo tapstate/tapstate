@@ -21,10 +21,14 @@ import io.tapstate.core.model.TableRef;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.runtime.srs.CaptureHealth;
+import io.tapstate.runtime.srs.CaptureId;
 import io.tapstate.runtime.srs.CaptureRun;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
+import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.ClusterMembership;
+import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -112,6 +116,27 @@ class EngineLifecycleActuatorTest {
                 "stopCapture:" + PIPE + "[purge][jobTerminal]");
     }
 
+    /**
+     * A start the capture side gives back submits nothing and throws nothing. The pipeline is left carrying
+     * no job, which is what the next pass starts again -- rather than a job over a ring nobody opened, or a
+     * failure recorded for a capture another member is still opening.
+     */
+    @Test
+    void aStartTheCaptureGivesBackSubmitsNothing() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        coordinator.givesTheStartBack = true;
+        RecordingDagSource dagSource = new RecordingDagSource(events);
+        LifecycleActuator actuator =
+                new EngineLifecycleActuator(new Engine(member), dagSource, coordinator, teardown());
+
+        actuator.start(PIPE);
+
+        assertThat(events).containsExactly("startCapture:" + PIPE);
+        assertThat(member.getJet().getJob(PIPE)).as("no job was submitted").isNull();
+        assertThat(actuator.isCarryingAJob(PIPE)).isFalse();
+    }
+
     @Test
     void surfacesACaptureFailureThroughTheSeamWhenTheEngineJobReportsNone() {
         RuntimeException boom = new RuntimeException("cdc tail died");
@@ -158,6 +183,38 @@ class EngineLifecycleActuatorTest {
         actuator.start(PIPE);
         try {
             assertThat(coordinator.artifactSnapshot).isSameAs(snapshot);
+        } finally {
+            actuator.stop(PIPE, true);
+        }
+    }
+
+    @Test
+    void theTopologyAStartBuildsIsHeldToThatStartsOwnRun() {
+        // The run's generation is taken before the first side effect; the topology is built afterwards, once
+        // placement and any outstanding teardown are settled. Everything else a start does sits between the
+        // two, and nothing local ties them together -- so a build handed no generation is the quiet failure
+        // here: it reaches every external effect unfenced, and a run nothing fences is a run nothing can
+        // later stop from writing beside the run that replaced it.
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        RecordingDagSource dagSource = new RecordingDagSource(events);
+        PipelineActuationOwnership ownership = clusteredOwnership();
+        assertThat(ownership.permit(PIPE).granted())
+                .as("the member has to hold the pipeline before a start of it can be fenced at all")
+                .isTrue();
+        LifecycleActuator actuator = new EngineLifecycleActuator(
+                new Engine(member), dagSource, coordinator, teardown(), ownership);
+        coordinator.jobTerminalProbe = () -> awaitTerminal(member.getJet().getJob(PIPE));
+
+        actuator.start(PIPE);
+        try {
+            assertThat(dagSource.fences).as("the topology was built exactly once").hasSize(1);
+            ExecutionFence fence = dagSource.fences.get(0);
+            assertThat(fence).as("the build was given a run to be held to, not none").isNotNull();
+            assertThat(fence.pipelineId()).isEqualTo(PIPE);
+            assertThat(fence.executionGeneration())
+                    .as("and it is this start's own generation, the one begun a moment earlier")
+                    .isEqualTo(1);
         } finally {
             actuator.stop(PIPE, true);
         }
@@ -272,6 +329,19 @@ class EngineLifecycleActuatorTest {
      * The state teardown these cases run against: the stand-in topology keeps no state, so what this drops
      * is nothing. It is here because the actuator will not be built without one, which is the point.
      */
+    /** A member that holds its cluster's pipelines, so a start of one is granted a run to be fenced to. */
+    private PipelineActuationOwnership clusteredOwnership() {
+        ClusterProperties properties = new ClusterProperties();
+        properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
+        ClusterMembershipGate gate = new ClusterMembershipGate(properties);
+        gate.install(new ClusterMembership("cluster-a", 7, Set.of("node-a", "node-b", "node-c")));
+        gate.canCommit(Set.of("node-a", "node-b"));
+        ClusterWorkloadClaims claims = new ClusterWorkloadClaims(new InMemoryWorkloadClaimStore(), gate);
+        return new PipelineActuationOwnership(
+                "cluster-a", new WorkloadOwner("node-a", "boot-a"), gate, claims,
+                Duration.ofSeconds(30), Duration.ofSeconds(10), () -> 0L);
+    }
+
     private NestStateTeardown teardown() {
         return new NestStateTeardown(member, new InMemoryKeyedStateStore(), new InMemoryNestDeadLetterStore());
     }
@@ -322,6 +392,7 @@ class EngineLifecycleActuatorTest {
         private ArtifactStore artifactSnapshot;
         private Supplier<Boolean> jobAbsentProbe = () -> true;
         private boolean jobWasAbsentAtStart;
+        private boolean givesTheStartBack;
 
         RecordingCaptureCoordinator(List<String> events) {
             this.events = events;
@@ -331,6 +402,10 @@ class EngineLifecycleActuatorTest {
         public void startCapture(String pipelineId) {
             jobWasAbsentAtStart = jobAbsentProbe.get();
             events.add("startCapture:" + pipelineId);
+            if (givesTheStartBack) {
+                throw new RingNotOpenYet(CaptureId.of(
+                        new CaptureConfig("mysql", Map.of("host", "h"), List.of("orders")), null));
+            }
         }
 
         @Override
@@ -360,6 +435,7 @@ class EngineLifecycleActuatorTest {
     private static final class RecordingDagSource implements DagSource {
         private final List<String> events;
         private final IdleDagSource idle = new IdleDagSource();
+        private final List<ExecutionFence> fences = new CopyOnWriteArrayList<>();
         private Runnable validation = () -> {
         };
         private ArtifactStore artifactSnapshot;
@@ -382,7 +458,7 @@ class EngineLifecycleActuatorTest {
             return new StartPreparation(
                     capacityOf(pipelineId), stateLocations(pipelineId, defaultDatabase),
                     Optional.of(artifactSnapshot),
-                    () -> dagFor(pipelineId));
+                    fence -> dagFor(pipelineId, fence));
         }
 
         /** Keeps no state, so there is nothing for a budget to be applied to. */
@@ -395,6 +471,16 @@ class EngineLifecycleActuatorTest {
         public DAG dagFor(String pipelineId) {
             events.add("buildDag:" + pipelineId);
             return idle.dagFor(pipelineId);
+        }
+
+        /**
+         * Kept out of the shared event log on purpose: the log is asserted verbatim by the cases about verb
+         * ordering, and a run generation in it would make every one of those cases read as being about this.
+         */
+        @Override
+        public DAG dagFor(String pipelineId, ExecutionFence fence) {
+            fences.add(fence);
+            return dagFor(pipelineId);
         }
 
         @Override

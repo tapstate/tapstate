@@ -5,6 +5,10 @@ import com.hazelcast.nio.ObjectDataOutput;
 import com.hazelcast.nio.serialization.StreamSerializer;
 import io.tapstate.core.event.Op;
 import io.tapstate.spi.capture.SourcePosition;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
+import io.tapstate.spi.store.WorkloadOwner;
 
 import java.io.IOException;
 import java.util.LinkedHashMap;
@@ -38,6 +42,7 @@ public final class SrsItemSerializer implements StreamSerializer<SrsItem> {
         writeRow(out, item.before());
         writeRow(out, item.after());
         out.writeLong(item.schemaVer());
+        writeFence(out, item.captureFence());
     }
 
     @Override
@@ -49,7 +54,33 @@ public final class SrsItemSerializer implements StreamSerializer<SrsItem> {
         Map<String, Object> before = readRow(in);
         Map<String, Object> after = readRow(in);
         long schemaVer = in.readLong();
-        return new SrsItem(srcPos, op, ts, before, after, schemaVer);
+        return new SrsItem(srcPos, op, ts, before, after, schemaVer, readFence(in));
+    }
+
+    private static void writeFence(ObjectDataOutput out, WorkloadClaimFence fence) throws IOException {
+        out.writeBoolean(fence != null);
+        if (fence == null) {
+            return;
+        }
+        out.writeString(fence.key().clusterId());
+        out.writeString(fence.key().type().name());
+        out.writeString(fence.key().resourceId());
+        out.writeString(fence.owner().nodeId());
+        out.writeString(fence.owner().bootId());
+        out.writeLong(fence.claimGeneration());
+        out.writeLong(fence.executionGeneration());
+        out.writeLong(fence.topologyRevision());
+    }
+
+    private static WorkloadClaimFence readFence(ObjectDataInput in) throws IOException {
+        if (!in.readBoolean()) {
+            return null;
+        }
+        WorkloadClaimKey key = new WorkloadClaimKey(
+                in.readString(), WorkloadClaimType.valueOf(in.readString()), in.readString());
+        WorkloadOwner owner = new WorkloadOwner(in.readString(), in.readString());
+        return new WorkloadClaimFence(
+                key, owner, in.readLong(), in.readLong(), in.readLong());
     }
 
     private static void writeRow(ObjectDataOutput out, Map<String, Object> row) throws IOException {

@@ -165,7 +165,7 @@ public sealed interface TransformBody {
 
     /** {@code type: join} — flat wide-table materialization over joined streams (§5.2). */
     @YamlType("join")
-    @Doc("Materializes a flat wide table by joining streams with SQL.")
+    @Doc("Materializes a flat wide table by joining source tables with SQL; every alias in from: names one source table.")
     record Join(
             @Doc(value = "The engine that runs the join.", required = true)
             JoinEngine engine,

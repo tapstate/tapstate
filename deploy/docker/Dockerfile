@@ -66,13 +66,25 @@ RUN mkdir -p /var/lib/tapstate/plugins /var/lib/tapstate/logs /var/lib/tapstate/
 # Already resolved to exactly one file by the stage above, so this names it outright.
 COPY --from=boot-jar --chown=tapstate:tapstate /jars/tapstate.jar /opt/tapstate/tapstate.jar
 
+# Keep per-build metadata out of the earlier installation layers so source changes can reuse them.
+ARG TAPSTATE_RELEASE_VERSION=development
+ARG TAPSTATE_REVISION=unknown
+ARG TAPSTATE_WEB_REVISION=unknown
+ARG TAPSTATE_WEB_FILES_SHA256=unknown
+LABEL org.opencontainers.image.version="$TAPSTATE_RELEASE_VERSION" \
+      org.opencontainers.image.revision="$TAPSTATE_REVISION" \
+      io.tapstate.web.revision="$TAPSTATE_WEB_REVISION" \
+      io.tapstate.web.files.sha256="$TAPSTATE_WEB_FILES_SHA256"
+
 USER tapstate
 
 EXPOSE 8080
 
 # The endpoint is pure liveness: it answers 200 while this process serves HTTP and asserts nothing
 # about the store. That is sufficient here only because the server refuses to finish starting when
-# the store is unreachable, so "serving HTTP at all" already implies the store verified once.
+# the store is unreachable, so "serving HTTP at all" already implies the store verified once. It
+# answers 503 once the process has declared itself broken -- its engine shut down for want of memory,
+# with the process still up -- which is the one state only a restart recovers from.
 HEALTHCHECK --interval=5s --timeout=3s --start-period=60s --retries=24 \
   CMD curl -fsS http://127.0.0.1:8080/healthz || exit 1
 

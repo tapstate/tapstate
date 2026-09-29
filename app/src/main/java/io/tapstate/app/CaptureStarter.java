@@ -1,19 +1,19 @@
 package io.tapstate.app;
 
-import io.tapstate.core.event.Envelope;
+import io.tapstate.runtime.srs.CaptureHandoff;
 import io.tapstate.runtime.srs.CaptureRun;
 import io.tapstate.runtime.srs.CaptureRunSpec;
-import java.util.function.Consumer;
 
 /**
- * The seam by which the capture coordinator starts one source run and gets back a live handle. Its production
- * binding is the capture run unit's {@code start}; keeping it a seam lets the coordinator's handle-lifecycle
- * logic be driven without a running Jet member. The signature matches the run unit exactly, so the binding is
- * a plain method reference.
+ * The seam by which a test coordinator starts one source run and gets back a live handle. Production uses
+ * {@link CaptureAttacher} so another pipeline can read its own load without opening a second change tail.
  */
 @FunctionalInterface
 interface CaptureStarter {
 
-    /** Starts the source run for {@code spec}, draining any snapshot rows to {@code passthrough}. */
-    CaptureRun start(CaptureRunSpec spec, Consumer<Envelope> passthrough);
+    /**
+     * Starts the source run for {@code spec}, handing any snapshot rows to {@code handoff} and telling it as
+     * each table's load is in. The run may be handed back while its load is still being read.
+     */
+    CaptureRun start(CaptureRunSpec spec, CaptureHandoff handoff);
 }

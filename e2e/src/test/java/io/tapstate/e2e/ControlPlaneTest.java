@@ -1,5 +1,6 @@
 package io.tapstate.e2e;
 
+import io.tapstate.control.core.ClusterError;
 import io.tapstate.control.core.MonitorError;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.lifecycle.LifecycleError;
@@ -328,6 +329,74 @@ class ControlPlaneTest {
         assertThatThrownBy(() -> ControlPlane.interpretRefusal(302, "", "the batch"))
                 .isInstanceOf(AssertionError.class)
                 .hasMessageContaining("302");
+    }
+
+    // The cluster read has a refusal of the same kind, and it arrived for the same reason: a member
+    // says it cannot read the cluster while its engine member is not active, which is a window the
+    // product passes through rather than a failure. Waiting it out is what makes a poll a poll -- and
+    // one transient answer ending a wait, on a face that answers 503 for seconds at a time, is a wait
+    // that never witnessed anything. The other half is that nothing else gets the same patience.
+
+    @Test
+    void waitsOutTheOneMembershipRefusalThatMeansAskAgain() {
+        assertThat(ControlPlane.interpretClusterMembers(
+                        503, coded(ClusterError.MEMBERSHIP_UNREADABLE.code())))
+                .isEmpty();
+    }
+
+    /**
+     * Written on the code and not on the status, so that a 503 arriving from anywhere else stays loud.
+     * A proxy in front of the product answers 503 too, and it means the opposite of this one.
+     */
+    @Test
+    void keepsAnotherCodesUnavailableLoud() {
+        assertThatThrownBy(() -> ControlPlane.interpretClusterMembers(
+                        503, coded(LifecycleError.UNKNOWN_PIPELINE.code())))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("got 503");
+    }
+
+    /**
+     * The answer this whole distinction exists to keep out: a page with no code on it. A caller cannot
+     * tell one from the product having fallen over, so a wait that sat through it would sit through the
+     * failure as well.
+     */
+    @Test
+    void keepsAnUncodedPageLoud() {
+        for (String body : List.of("", "<html><body>Internal Server Error</body></html>", "boom")) {
+            assertThatThrownBy(() -> ControlPlane.interpretClusterMembers(500, body))
+                    .isInstanceOf(AssertionError.class)
+                    .hasMessageContaining("got 500");
+        }
+    }
+
+    @Test
+    void readsTheMembersOutOfAnAnswerInAStableOrder() {
+        assertThat(ControlPlane.interpretClusterMembers(200, topology("node-c", "node-a")))
+                .contains(List.of("node-a", "node-c"));
+    }
+
+    @Test
+    void tellsARefusalsCodeFromHavingBeenAnsweredAtAll() {
+        assertThat(ControlPlane.interpretClusterRefusal(200, topology("node-a"))).isEmpty();
+        assertThat(ControlPlane.interpretClusterRefusal(
+                        503, coded(ClusterError.MEMBERSHIP_UNREADABLE.code())))
+                .contains(ClusterError.MEMBERSHIP_UNREADABLE.code());
+    }
+
+    /** A refusal with nothing to say is the failure, not a reading of one. */
+    @Test
+    void refusesToReportAnUncodedRefusalAsACode() {
+        assertThatThrownBy(() -> ControlPlane.interpretClusterRefusal(500, "boom"))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("would not say why");
+    }
+
+    /** A topology answer naming {@code nodeIds}, in the order given. */
+    private static String topology(String... nodeIds) {
+        List<Map<String, String>> members =
+                java.util.Arrays.stream(nodeIds).map(id -> Map.of("nodeId", id)).toList();
+        return JsonWriter.write(Map.of("clusterId", "cluster-a", "members", members));
     }
 
     private static String status(String state) {

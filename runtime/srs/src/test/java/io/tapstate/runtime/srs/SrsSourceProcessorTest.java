@@ -135,6 +135,30 @@ class SrsSourceProcessorTest {
     }
 
     @Test
+    void aRunCarryingOnPastAConfirmedChangeStreamsOnlyWhatCameAfterIt() throws InterruptedException {
+        fill("srs.chain.resume", 4);
+
+        // The ring outlived the run that confirmed changes 0 and 1. The run replacing it carries on past them;
+        // one started at the head would stream all four and hand the target the first two again.
+        DAG dag = new DAG();
+        Vertex source = dag.newVertex("source", SrsSourceProcessor.metaSupplier(
+                PIPELINE, "srs.chain.resume", "orders", StartFrom.earliest(), 1L, 1L,
+                SrsReadCursorPublisherFactory.NONE, null, SourcePlacement.anyMember()));
+        Vertex project = dag.newVertex("project", Processors.mapP(SrsSourceProcessorTest::describe))
+                .localParallelism(1);
+        Vertex sink = dag.newVertex("sink", SinkProcessors.writeListP("out-resume")).localParallelism(1);
+        dag.edge(between(source, project)).edge(between(project, sink));
+        Job job = hz.getJet().newJob(dag);
+        IList<String> out = hz.getList("out-resume");
+        try {
+            awaitSize(out, 2);
+            assertThat(out).containsExactly("orders|w2|2|1:2", "orders|w3|3|1:3");
+        } finally {
+            job.cancel();
+        }
+    }
+
+    @Test
     void publishes_the_read_cursor_member_side_as_it_drains() throws InterruptedException {
         PUBLISHED.clear();
         fill("srs.chain.cursor", 5);
@@ -253,7 +277,7 @@ class SrsSourceProcessorTest {
 
         DAG dag = new DAG();
         Vertex source = dag.newVertex("source", SrsSourceProcessor.snapshotOnlyMetaSupplier(
-                PIPELINE, ringName, "orders", 7L, null));
+                PIPELINE, ringName, "orders", 7L, null, SourcePlacement.anyMember()));
         Vertex project = dag.newVertex("project", Processors.mapP(SrsSourceProcessorTest::describe))
                 .localParallelism(1);
         Vertex sink = dag.newVertex("sink", SinkProcessors.writeListP("out-snapshot-only"))
@@ -290,7 +314,7 @@ class SrsSourceProcessorTest {
 
         Job job = hz.getJet().newJob(new DAG().vertex(new Vertex("source",
                 SrsSourceProcessor.metaSupplier(PIPELINE, "srs.chain.nogen", "orders", StartFrom.earliest(), 0L,
-                        SrsReadCursorPublisherFactory.NONE))));
+                        SrsReadCursorPublisherFactory.NONE, SourcePlacement.anyMember()))));
 
         assertThatThrownBy(() -> job.join())
                 .hasMessageContaining("srs.chain.nogen")
@@ -385,7 +409,7 @@ class SrsSourceProcessorTest {
         // a no-op to the rest, so resolving over several members yields more than one distinct supplier.
         ProcessorMetaSupplier meta = SrsSourceProcessor.metaSupplier(
                 PIPELINE, "srs.chain.pins", "orders", StartFrom.earliest(), 1L,
-                SrsReadCursorPublisherFactory.NONE);
+                SrsReadCursorPublisherFactory.NONE, SourcePlacement.anyMember());
         List<Address> addresses = List.of(
                 Address.createUnresolvedAddress("10.0.0.1", 5701),
                 Address.createUnresolvedAddress("10.0.0.2", 5702),
@@ -394,6 +418,47 @@ class SrsSourceProcessorTest {
         Function<? super Address, ? extends ProcessorSupplier> assignment = meta.get(addresses);
 
         assertThat(addresses.stream().map(assignment).distinct().count()).isGreaterThan(1);
+    }
+
+    /**
+     * The one instance runs on the member its placement names, and on no other, for both shapes of source.
+     *
+     * <p>A source drains a hand-off the capture fills on the member that started it, so an instance anywhere
+     * else finds nothing to drain and reads nothing, with its job running and nothing thrown. Left to the
+     * engine the member is picked at random on every resolution, so each member is named in turn and the
+     * assignment resolved many times over: a random pick lands on the named member a third of the time,
+     * and on it every time essentially never.
+     */
+    @Test
+    void runs_the_one_instance_on_the_member_its_placement_names() {
+        List<Address> addresses = List.of(
+                Address.createUnresolvedAddress("10.0.0.1", 5701),
+                Address.createUnresolvedAddress("10.0.0.2", 5702),
+                Address.createUnresolvedAddress("10.0.0.3", 5703));
+        for (Address named : addresses) {
+            SourcePlacement placement = SourcePlacement.on(named);
+            List<ProcessorMetaSupplier> shapes = List.of(
+                    SrsSourceProcessor.metaSupplier(PIPELINE, "srs.chain.placed", "orders", StartFrom.earliest(),
+                            1L, SrsReadCursorPublisherFactory.NONE, placement),
+                    SrsSourceProcessor.snapshotOnlyMetaSupplier(
+                            PIPELINE, "srs.chain.placed", "orders", 1L, null, placement));
+            for (ProcessorMetaSupplier meta : shapes) {
+                for (int resolution = 0; resolution < 20; resolution++) {
+                    Function<? super Address, ? extends ProcessorSupplier> assignment = meta.get(addresses);
+                    for (Address member : addresses) {
+                        if (member.equals(named)) {
+                            assertThat(assignment.apply(member))
+                                    .describedAs("the named member %s runs the source", named)
+                                    .isNotInstanceOf(ProcessorMetaSupplier.ExpectNothingProcessorSupplier.class);
+                        } else {
+                            assertThat(assignment.apply(member))
+                                    .describedAs("%s is not the named member %s and runs nothing", member, named)
+                                    .isInstanceOf(ProcessorMetaSupplier.ExpectNothingProcessorSupplier.class);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -429,6 +494,144 @@ class SrsSourceProcessorTest {
             job.cancel();
             hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
             hz.getList("out-late").destroy();
+        }
+    }
+
+    // ---- a declared load, read while the job runs ---------------------------------------------------
+
+    /**
+     * A declared load arrives a part at a time while the source runs, so an empty buffer is not the end of
+     * it. The ring waits until the load has been handed over in full: here it holds changes from the start,
+     * and a source that read them the first time its buffer ran dry would put them ahead of the row that is
+     * still to come.
+     */
+    @Test
+    void aDeclaredLoadHoldsTheRingUntilItHasAllBeenHandedOver() throws InterruptedException {
+        String ring = "srs.chain.declared";
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        buffer.declareSnapshot(PIPELINE, ring);
+        buffer.append(PIPELINE, ring, snapshotRow(100));
+        buffer.append(PIPELINE, ring, snapshotRow(101));
+        fill(ring, 2);
+        hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+        IList<String> out = hz.getList("out-declared");
+        Job job = hz.getJet().newJob(projectedDag(ring, "orders", "out-declared", 1024, SrsReadCursorPublisherFactory.NONE));
+        try {
+            awaitSize(out, 2);
+            Thread.sleep(300);
+            assertThat(List.copyOf(out))
+                    .as("the ring's changes wait while the load is still arriving")
+                    .containsExactly("orders|null|100|null", "orders|null|101|null");
+
+            buffer.append(PIPELINE, ring, snapshotRow(102));
+            buffer.endSnapshot(PIPELINE, ring);
+            awaitSize(out, 5);
+
+            assertThat(List.copyOf(out)).containsExactly(
+                    "orders|null|100|null", "orders|null|101|null", "orders|null|102|null",
+                    "orders|w0|0|1:0", "orders|w1|1|1:1");
+        } finally {
+            job.cancel();
+            hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+            out.destroy();
+        }
+    }
+
+    /**
+     * The load's bound says every row of it has left, so it waits for the last row rather than for the
+     * buffer to run dry: promised on the rows that have left while more is arriving, it would record the
+     * table as written with its tail still to come.
+     */
+    @Test
+    void promisesADeclaredLoadOnlyOnceItHasAllBeenHandedOver() throws InterruptedException {
+        SEEN.clear();
+        String ring = "srs.chain.declaredbound";
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        buffer.declareSnapshot(PIPELINE, ring);
+        buffer.append(PIPELINE, ring, snapshotRow(100).withOrder(SourceOrder.snapshotRow(1L)));
+        buffer.append(PIPELINE, ring, snapshotRow(101).withOrder(SourceOrder.snapshotRow(1L)));
+        hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+        Job job = hz.getJet().newJob(recordingDag(ring, "orders", "out-declaredbound", 1024));
+        try {
+            awaitSize(hz.getList("out-declaredbound"), 2);
+            Thread.sleep(300);
+            assertThat(SEEN).as("no bound while the load is still arriving").doesNotContain("b:7:0");
+
+            buffer.endSnapshot(PIPELINE, ring);
+
+            awaitSeen("b:7:0");
+            assertThat(SEEN).containsSubsequence("i:100", "i:101", "b:7:0");
+        } finally {
+            job.cancel();
+            hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+            hz.getList("out-declaredbound").destroy();
+        }
+    }
+
+    /**
+     * A source that starts on a load another instance of it has already taken rows from -- a job restarted
+     * part way through the load -- cannot vouch for the rows that instance took and never sent on. It
+     * carries on with the rest and promises nothing about the load, so the table stays owed and is read
+     * again rather than recorded as written without them.
+     */
+    @Test
+    void aSourceStartingOnALoadAlreadyBegunPromisesNothingOfIt() throws InterruptedException {
+        SEEN.clear();
+        String ring = "srs.chain.begun";
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        buffer.declareSnapshot(PIPELINE, ring);
+        buffer.append(PIPELINE, ring, snapshotRow(100).withOrder(SourceOrder.snapshotRow(1L)));
+        assertThat(buffer.drain(PIPELINE, ring)).as("taken by an instance before this one").hasSize(1);
+        buffer.append(PIPELINE, ring, snapshotRow(101).withOrder(SourceOrder.snapshotRow(1L)));
+        buffer.endSnapshot(PIPELINE, ring);
+        hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+        Job job = hz.getJet().newJob(recordingDag(ring, "orders", "out-begun", 1024));
+        try {
+            awaitSize(hz.getList("out-begun"), 1);
+            Thread.sleep(500);
+
+            assertThat(SEEN).contains("i:101").doesNotContain("b:7:0");
+        } finally {
+            job.cancel();
+            hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+            hz.getList("out-begun").destroy();
+        }
+    }
+
+    /**
+     * The sink records a load as written only on reaching the load's own position, so that bound goes out
+     * before the bound of any change that follows it: promised first, the change's higher bound makes the
+     * load's no advance at all, and it is never sent. Here a change is handed over with the load's rows,
+     * which puts a change's position in hand while the load's bound is still owed.
+     */
+    @Test
+    void theLoadsBoundGoesOutAheadOfTheBoundOfAChangeHandedOverWithIt() throws InterruptedException {
+        SEEN.clear();
+        String ring = "srs.chain.loadfirst";
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        buffer.declareSnapshot(PIPELINE, ring);
+        buffer.append(PIPELINE, ring, snapshotRow(100).withOrder(SourceOrder.snapshotRow(1L)));
+        buffer.append(PIPELINE, ring, snapshotRow(101).withOrder(SourceOrder.snapshotRow(1L)));
+        buffer.append(PIPELINE, ring, Envelope.insert(5L, "orders", Map.of("id", 5), null)
+                .withPosition(new ChainPosition(new SourceOrder(1L, 5L), "t5")));
+        hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+        Job job = hz.getJet().newJob(recordingDag(ring, "orders", "out-loadfirst", 1024));
+        try {
+            awaitSize(hz.getList("out-loadfirst"), 3);
+            Thread.sleep(300);
+            assertThat(SEEN.stream().filter(entry -> entry.startsWith("b:")).toList())
+                    .as("nothing promised while the load's own bound is still owed")
+                    .isEmpty();
+
+            buffer.endSnapshot(PIPELINE, ring);
+
+            awaitSeen("b:7:6");
+            assertThat(SEEN.stream().filter(entry -> entry.startsWith("b:")).toList())
+                    .containsExactly("b:7:0", "b:7:6");
+        } finally {
+            job.cancel();
+            hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+            hz.getList("out-loadfirst").destroy();
         }
     }
 
@@ -471,7 +674,8 @@ class SrsSourceProcessorTest {
         Vertex source = dag.newVertex("source", SrsSourceProcessor.metaSupplier(
                 PIPELINE, ringName, src, StartFrom.earliest(), 1L, SrsReadCursorPublisherFactory.NONE,
                 order -> new Watermark(
-                        order.seq() == SourceOrder.SNAPSHOT_SEQ ? 0L : order.seq() + 1, (byte) 7)));
+                        order.seq() == SourceOrder.SNAPSHOT_SEQ ? 0L : order.seq() + 1, (byte) 7),
+                SourcePlacement.anyMember()));
         Vertex record = dag.newVertex("record", ProcessorMetaSupplier.forceTotalParallelismOne(
                 ProcessorSupplier.of(RecordingBounds::new)));
         Vertex sink = dag.newVertex("sink", SinkProcessors.writeListP(sinkName)).localParallelism(1);
@@ -535,7 +739,8 @@ class SrsSourceProcessorTest {
         DAG dag = new DAG();
         Vertex source = dag.newVertex("source",
                 SrsSourceProcessor.metaSupplier(
-                        PIPELINE, ringName, src, StartFrom.earliest(), epoch, publisherFactory));
+                        PIPELINE, ringName, src, StartFrom.earliest(), epoch, publisherFactory,
+                        SourcePlacement.anyMember()));
         Vertex project = dag.newVertex("project", Processors.mapP(SrsSourceProcessorTest::describe))
                 .localParallelism(1);
         Vertex sink = dag.newVertex("sink", SinkProcessors.writeListP(sinkName)).localParallelism(1);
