@@ -19,8 +19,10 @@ import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.util.UriComponentsBuilder;
 import tools.jackson.databind.ObjectMapper;
 
+import java.math.BigDecimal;
 import java.net.URI;
 import java.util.Map;
 import java.util.Objects;
@@ -59,7 +61,9 @@ class PipelineDraftController {
         PipelineDraftMutation outcome = service().create(actor, draft);
         refuse(outcome, id);
         PipelineDraft created = service().find(id).orElseThrow(() -> error(PipelineDraftError.NOT_FOUND, id));
-        return ResponseEntity.created(URI.create("/api/pipelines/" + id + "/draft"))
+        URI location = UriComponentsBuilder.fromPath("/api/pipelines/{id}/draft")
+                .buildAndExpand(id).encode().toUri();
+        return ResponseEntity.created(location)
                 .eTag(etag(created.revision())).body(PipelineDraftJson.write(json, created));
     }
 
@@ -138,18 +142,28 @@ class PipelineDraftController {
         if (ifMatch == null || !ifMatch.matches("\"[1-9][0-9]*\"")) {
             throw error(PipelineDraftError.PRECONDITION_REQUIRED, id);
         }
-        return Long.parseLong(ifMatch.substring(1, ifMatch.length() - 1));
+        try {
+            return Long.parseLong(ifMatch.substring(1, ifMatch.length() - 1));
+        } catch (NumberFormatException error) {
+            throw error(PipelineDraftError.PRECONDITION_REQUIRED, id);
+        }
     }
 
     private static long number(Object value, String field) {
-        if (!(value instanceof Number number)
-                || !Double.isFinite(number.doubleValue())
-                || number.doubleValue() != Math.rint(number.doubleValue())
-                || number.longValue() < 1) {
+        if (!(value instanceof Number number)) {
             throw new TapstateException(ControlError.MALFORMED_REQUEST,
                     Map.of("reason", field + " must be a positive integer"), null);
         }
-        return number.longValue();
+        try {
+            long result = new BigDecimal(number.toString()).longValueExact();
+            if (result < 1) {
+                throw new ArithmeticException("integer must be positive");
+            }
+            return result;
+        } catch (NumberFormatException | ArithmeticException error) {
+            throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                    Map.of("reason", field + " must be a positive integer in range"), error);
+        }
     }
 
     private static String etag(long revision) {

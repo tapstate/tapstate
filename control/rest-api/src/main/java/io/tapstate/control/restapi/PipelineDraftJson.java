@@ -3,6 +3,7 @@ package io.tapstate.control.restapi;
 import io.tapstate.spi.store.PipelineDraft;
 import tools.jackson.databind.ObjectMapper;
 
+import java.math.BigDecimal;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -19,8 +20,8 @@ final class PipelineDraftJson {
         if (pathId != null && !pathId.equals(id)) {
             throw new IllegalArgumentException("pipelineId does not match the path");
         }
-        int schemaVersion = number(body.getOrDefault("schemaVersion", PipelineDraft.CURRENT_SCHEMA_VERSION),
-                "schemaVersion").intValue();
+        int schemaVersion = schemaVersion(
+                body.getOrDefault("schemaVersion", PipelineDraft.CURRENT_SCHEMA_VERSION));
         long revision = defaultRevision;
         String mode = text(body.get("mode"), "mode").toUpperCase(java.util.Locale.ROOT);
         Map<String, Object> graph = object(body.get("graph"));
@@ -148,13 +149,15 @@ final class PipelineDraftJson {
         return string;
     }
 
-    private static Number number(Object value, String field) {
-        if (!(value instanceof Number number)
-                || !Double.isFinite(number.doubleValue())
-                || number.doubleValue() != Math.rint(number.doubleValue())) {
-            throw new IllegalArgumentException(field + " must be numeric");
+    private static int schemaVersion(Object value) {
+        if (!(value instanceof Number number)) {
+            throw new IllegalArgumentException("schemaVersion must be an integer");
         }
-        return number;
+        try {
+            return new BigDecimal(number.toString()).intValueExact();
+        } catch (NumberFormatException | ArithmeticException error) {
+            throw new IllegalArgumentException("schemaVersion must be an integer in range", error);
+        }
     }
 
     @SuppressWarnings("unchecked")

@@ -330,6 +330,74 @@ class PipelineApiTest {
     }
 
     @Test
+    void draftEndpointsRejectIntegerValuesThatOverflowTheirContracts() {
+        String token = machineToken(Scope.WRITE);
+        String draft = """
+                {"pipelineId":"overflow-revision","mode":"dag","name":"Orders",
+                 "graph":{"nodes":[],"edges":[],"viewport":{"x":0,"y":0,"zoom":1}}}
+                """;
+        client().post().uri("/api/pipelines/overflow-revision/draft")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(draft).retrieve().toBodilessEntity();
+
+        ApiError overflowRevision = client().post().uri("/api/pipelines/overflow-revision/draft:publish")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body("{\"revision\":18446744073709551617}")
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(overflowRevision.code()).isEqualTo("control.malformed-request");
+        assertThat(context.getBean(FakePipelineDraftStore.class).get("overflow-revision").orElseThrow().revision())
+                .isEqualTo(1L);
+        assertThat(context.getBean(FakeArtifactStore.class).get("overflow-revision")).isEmpty();
+
+        String schemaDraft = """
+                {"pipelineId":"overflow-schema","schemaVersion":4294967297,"mode":"dag","name":"Orders",
+                 "graph":{"nodes":[],"edges":[],"viewport":{"x":0,"y":0,"zoom":1}}}
+                """;
+        ApiError overflowSchema = client().post().uri("/api/pipelines/overflow-schema/draft")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(schemaDraft)
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(overflowSchema.code()).isEqualTo("control.malformed-request");
+        assertThat(context.getBean(FakePipelineDraftStore.class).get("overflow-schema")).isEmpty();
+
+        ApiError overflowEtag = client().put().uri("/api/pipelines/overflow-revision/draft")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .header(HttpHeaders.IF_MATCH, "\"9223372036854775808\"")
+                .contentType(MediaType.APPLICATION_JSON).body(draft)
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.PRECONDITION_REQUIRED);
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(overflowEtag.code()).isEqualTo("pipeline-draft.precondition-required");
+    }
+
+    @Test
+    void draftCreationEncodesPipelineIdInLocationHeader() {
+        String id = "pipeline with spaces";
+        String draft = """
+                {"pipelineId":"pipeline with spaces","mode":"dag","name":"Orders",
+                 "graph":{"nodes":[],"edges":[],"viewport":{"x":0,"y":0,"zoom":1}}}
+                """;
+
+        ResponseEntity<Map> created = client().post()
+                .uri(uriBuilder -> uriBuilder.path("/api/pipelines/{id}/draft").build(id))
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.WRITE))
+                .contentType(MediaType.APPLICATION_JSON).body(draft).retrieve().toEntity(Map.class);
+
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(created.getHeaders().getLocation()).isNotNull();
+        assertThat(created.getHeaders().getLocation().toASCIIString())
+                .endsWith("/api/pipelines/pipeline%20with%20spaces/draft");
+    }
+
+    @Test
     void wizardDraftRoundTripsLowerCaseRelationShapes() {
         String token = machineToken(Scope.WRITE);
         String draft = """
