@@ -237,6 +237,12 @@ public final class PipelineDraftCompiler {
         fields.forEach((name, value) -> {
             if (value instanceof String string && string.startsWith("$")) {
                 result.put(name, FieldRule.rename(string.substring(1)));
+            } else if (value instanceof String string && string.startsWith("=")) {
+                String expression = string.substring(1);
+                if (expression.isBlank()) {
+                    throw new IllegalArgumentException("computed map expression must be non-blank: " + name);
+                }
+                result.put(name, FieldRule.computed(expression));
             } else if (Boolean.FALSE.equals(value)) {
                 result.put(name, FieldRule.drop());
             } else {

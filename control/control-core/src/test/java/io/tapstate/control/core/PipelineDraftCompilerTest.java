@@ -3,6 +3,7 @@ package io.tapstate.control.core;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
+import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
@@ -131,6 +132,36 @@ class PipelineDraftCompilerTest {
                 .containsExactly(io.tapstate.core.model.FromRef.literal("active-orders"));
         assertThat(((ServeBlock.Inline) compiled.serve()).sync().getFirst().rename())
                 .isEqualTo(new RenameSpec(Map.of("orders", "orders_archive"), null, null, null));
+    }
+
+    @Test
+    void compilesComputedMapValuesAsDslExpressionsInsteadOfLiterals() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft draft = withWizard(template, template.wizard().root(), List.of(),
+                List.of(new PipelineDraft.Transform("project-fields", "map", Map.of(
+                        "display_name", "=1 + 1",
+                        "source_name", "$name",
+                        "removed", false,
+                        "region", "north"))),
+                template.wizard().output());
+
+        PipelineResource compiled = compiler.compile(draft);
+        Step.Inline map = (Step.Inline) compiled.transforms().getFirst();
+        Map<String, FieldRule> fields = ((TransformBody.MapProjection) map.body()).fields();
+        String canonical = new CanonicalWriter().write(compiled);
+
+        assertThat(fields)
+                .containsEntry("display_name", FieldRule.computed("1 + 1"))
+                .containsEntry("source_name", FieldRule.rename("name"))
+                .containsEntry("removed", FieldRule.drop())
+                .containsEntry("region", FieldRule.literal("north"));
+        assertThat(canonical).contains("display_name: \"=1 + 1\"");
+        assertThat(new CanonicalWriter().write(new DslParser().parse(canonical))).isEqualTo(canonical);
+        assertThatThrownBy(() -> compiler.compile(withWizard(template, template.wizard().root(), List.of(),
+                List.of(new PipelineDraft.Transform("empty-expression", "map", Map.of("display_name", "="))),
+                template.wizard().output())))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("computed map expression must be non-blank: display_name");
     }
 
     @Test
