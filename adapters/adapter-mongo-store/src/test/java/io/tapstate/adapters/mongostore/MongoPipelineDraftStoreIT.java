@@ -42,7 +42,7 @@ class MongoPipelineDraftStoreIT {
             artifacts.drop();
 
             MongoPipelineDraftStore store = new MongoPipelineDraftStore(client, drafts, artifacts);
-            PipelineDraft initial = draft(1, "Orders");
+            PipelineDraft initial = draft("orders", 1, PipelineDraft.Mode.DAG);
             assertThat(store.create(initial)).isEqualTo(PipelineDraftMutation.CREATED);
 
             Resource artifact = artifact("orders");
@@ -56,7 +56,7 @@ class MongoPipelineDraftStoreIT {
             assertThat(storedArtifact.getString("contentHash")).isEqualTo(artifactHash);
             assertThat(store.get("orders").orElseThrow().publishedDraftRevision()).isEqualTo(1L);
 
-            assertThat(store.replace("orders", 1, draft(2, "Orders changed")))
+            assertThat(store.replace("orders", 1, draft("orders", 2, PipelineDraft.Mode.DAG)))
                     .isEqualTo(PipelineDraftMutation.REPLACED);
             assertThat(store.publish(new PipelineDraft.Publication("orders", 2, "stale-hash", artifact,
                     artifactHash, Instant.parse("2026-09-21T02:00:00Z"), "publisher")))
@@ -66,11 +66,74 @@ class MongoPipelineDraftStoreIT {
         }
     }
 
-    private static PipelineDraft draft(long revision, String name) {
+    @Test
+    void createListReplaceAndDeleteUseRevisionAndModePreconditions() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            var database = client.getDatabase("tapstate_pipeline_draft_it");
+            var drafts = database.getCollection("pipeline_drafts");
+            var artifacts = database.getCollection("artifacts");
+            drafts.drop();
+            artifacts.drop();
+            MongoPipelineDraftStore store = new MongoPipelineDraftStore(client, drafts, artifacts);
+
+            PipelineDraft initial = draft("orders", 1, PipelineDraft.Mode.DAG);
+            assertThat(store.create(initial)).isEqualTo(PipelineDraftMutation.CREATED);
+            assertThat(store.create(initial)).isEqualTo(PipelineDraftMutation.ALREADY_EXISTS);
+            assertThat(store.create(draft("customers", 1, PipelineDraft.Mode.DAG)))
+                    .isEqualTo(PipelineDraftMutation.CREATED);
+            assertThat(store.get("missing")).isEmpty();
+            assertThat(store.list()).extracting(PipelineDraft::pipelineId).containsExactly("customers", "orders");
+
+            assertThat(store.replace("missing", 1, draft("missing", 2, PipelineDraft.Mode.DAG)))
+                    .isEqualTo(PipelineDraftMutation.NOT_FOUND);
+            assertThat(store.replace("orders", 2, draft("orders", 3, PipelineDraft.Mode.DAG)))
+                    .isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+            assertThat(store.replace("orders", 1, draft("orders", 2, PipelineDraft.Mode.WIZARD)))
+                    .isEqualTo(PipelineDraftMutation.MODE_CONFLICT);
+            assertThat(store.replace("orders", 1, draft("orders", 2, PipelineDraft.Mode.DAG)))
+                    .isEqualTo(PipelineDraftMutation.REPLACED);
+            assertThat(store.get("orders").orElseThrow().revision()).isEqualTo(2);
+
+            assertThat(store.delete("orders", 1)).isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+            assertThat(store.delete("orders", 2)).isEqualTo(PipelineDraftMutation.DELETED);
+            assertThat(store.delete("orders", 2)).isEqualTo(PipelineDraftMutation.NOT_FOUND);
+            assertThat(store.list()).extracting(PipelineDraft::pipelineId).containsExactly("customers");
+        }
+    }
+
+    @Test
+    void publishDistinguishesMissingAndStaleDraftRevisions() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            var database = client.getDatabase("tapstate_pipeline_draft_it");
+            var drafts = database.getCollection("pipeline_drafts");
+            var artifacts = database.getCollection("artifacts");
+            drafts.drop();
+            artifacts.drop();
+            MongoPipelineDraftStore store = new MongoPipelineDraftStore(client, drafts, artifacts);
+            Resource missingArtifact = artifact("missing");
+            PipelineDraft.Publication missing = new PipelineDraft.Publication("missing", 1, null, missingArtifact,
+                    CanonicalHash.of(missingArtifact), Instant.parse("2026-09-21T01:00:00Z"), "publisher");
+            assertThat(store.publish(missing)).isEqualTo(PipelineDraftMutation.NOT_FOUND);
+
+            assertThat(store.create(draft("orders", 1, PipelineDraft.Mode.DAG)))
+                    .isEqualTo(PipelineDraftMutation.CREATED);
+            Resource ordersArtifact = artifact("orders");
+            PipelineDraft.Publication stale = new PipelineDraft.Publication("orders", 2, null, ordersArtifact,
+                    CanonicalHash.of(ordersArtifact), Instant.parse("2026-09-21T01:00:00Z"), "publisher");
+            assertThat(store.publish(stale)).isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+            assertThat(artifacts.countDocuments()).isZero();
+        }
+    }
+
+    private static PipelineDraft draft(String id, long revision, PipelineDraft.Mode mode) {
         Instant now = Instant.parse("2026-09-21T00:00:00Z");
-        return new PipelineDraft("orders", 1, revision, PipelineDraft.Mode.DAG, name, "",
-                new PipelineDraft.Graph(List.of(), List.of(), new PipelineDraft.Viewport(0, 0, 1)), null,
-                revision == 1 ? null : "artifact-hash", 1L, "artifact-hash", now, now, "author");
+        boolean dag = mode == PipelineDraft.Mode.DAG;
+        PipelineDraft.Graph graph = dag
+                ? new PipelineDraft.Graph(List.of(), List.of(), new PipelineDraft.Viewport(0, 0, 1)) : null;
+        PipelineDraft.Wizard wizard = dag ? null : new PipelineDraft.Wizard(
+                new PipelineDraft.Root(id, "crm", "orders", List.of(), List.of()), List.of(), List.of(), null);
+        return new PipelineDraft(id, 1, revision, mode, id, "", graph, wizard,
+                revision == 1 ? null : "artifact-hash", null, null, now, now, "author");
     }
 
     private static Resource artifact(String id) {

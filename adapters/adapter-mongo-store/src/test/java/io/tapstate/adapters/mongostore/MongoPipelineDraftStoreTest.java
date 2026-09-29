@@ -47,6 +47,69 @@ class MongoPipelineDraftStoreTest {
     }
 
     @Test
+    void roundTripsWizardRelationsTransformsAndNullableOutput() {
+        PipelineDraft draft = new PipelineDraft("orders", 1, 4, PipelineDraft.Mode.WIZARD,
+                "Orders", "assembled", null,
+                new PipelineDraft.Wizard(
+                        new PipelineDraft.Root("orders", "mysql", "orders", List.of("id"),
+                                List.of(new PipelineDraft.Transform("normalize-root", "map",
+                                        Map.of("customer", "$customer_name", "discard", false, "active", true)))),
+                        List.of(new PipelineDraft.Related("items", "orders", "mysql", "order_items",
+                                new PipelineDraft.Relation(
+                                        List.of(new PipelineDraft.FieldPair("order_id", "id"),
+                                                new PipelineDraft.FieldPair("tenant_id", "tenant_id")),
+                                        PipelineDraft.Shape.ARRAY, "items", List.of("item_id"), List.of("item_id")),
+                                List.of(new PipelineDraft.Transform("keep-items", "filter",
+                                        Map.of("expr", "active == true"))))),
+                        List.of(new PipelineDraft.Transform("post-map", "map", Map.of("count", 1))), null),
+                null, null, null, Instant.EPOCH, Instant.EPOCH, "author");
+
+        PipelineDraft restored = MongoPipelineDraftStore.fromDocument(MongoPipelineDraftStore.toDocument(draft));
+
+        assertThat(restored).isEqualTo(draft);
+        assertThat(restored.wizard().output()).isNull();
+        assertThat(restored.wizard().related().getFirst().relation().on())
+                .containsExactly(new PipelineDraft.FieldPair("order_id", "id"),
+                        new PipelineDraft.FieldPair("tenant_id", "tenant_id"));
+        assertThat(restored.wizard().root().preTransforms().getFirst().fields())
+                .containsEntry("customer", "$customer_name").containsEntry("discard", false);
+    }
+
+    @Test
+    void readsDocumentMapsAndMissingLegacyFieldsWithoutLosingDefaults() {
+        Document legacy = new Document("_id", "legacy-wizard")
+                .append("mode", "wizard")
+                .append("revision", 2L)
+                .append("name", "Legacy")
+                .append("updatedBy", "migration")
+                .append("wizard", new Document("root", new Document("id", "root")
+                        .append("sourceId", "mysql").append("table", "orders")
+                        .append("key", "not-a-list")
+                        .append("preTransforms", List.of(Map.of("id", "rename", "type", "map",
+                                "fields", Map.of("customer", "$name")))))
+                        .append("related", List.of(Map.of(
+                                "id", "items", "parentId", "root", "sourceId", "mysql", "table", "order_items",
+                                "relation", new Document("on", List.of(Map.of("childField", "order_id", "parentField", "id")))
+                                        .append("shape", "array").append("path", "items")
+                                        .append("key", "not-a-list").append("arrayKey", List.of("item_id")),
+                                "preTransforms", "not-a-list")))
+                        .append("transforms", "not-a-list")
+                        .append("output", null));
+
+        PipelineDraft restored = MongoPipelineDraftStore.fromDocument(legacy);
+
+        assertThat(restored.schemaVersion()).isEqualTo(PipelineDraft.CURRENT_SCHEMA_VERSION);
+        assertThat(restored.createdAt()).isEqualTo(Instant.EPOCH);
+        assertThat(restored.updatedAt()).isEqualTo(Instant.EPOCH);
+        assertThat(restored.wizard().root().key()).isEmpty();
+        assertThat(restored.wizard().root().preTransforms()).hasSize(1);
+        assertThat(restored.wizard().related().getFirst().relation().key()).isEmpty();
+        assertThat(restored.wizard().related().getFirst().preTransforms()).isEmpty();
+        assertThat(restored.wizard().transforms()).isEmpty();
+        assertThat(restored.wizard().output()).isNull();
+    }
+
+    @Test
     void migratesTheOriginalUnversionedEmptyDraftToSchemaOne() {
         Document legacy = new Document("_id", "orders")
                 .append("revision", 1L)

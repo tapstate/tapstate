@@ -312,6 +312,172 @@ class PipelineDraftCompilerTest {
                 .hasMessage("target table requires exactly one upstream source table: target");
     }
 
+    @Test
+    void rejectsMalformedWizardRootsRelationsAndParentGraphs() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard base = template.wizard();
+        assertThatThrownBy(() -> compiler.compile(null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessage("draft");
+        assertCompileFails(withWizard(template, new PipelineDraft.Root("root", " ", "orders", List.of(), List.of()),
+                List.of(), List.of(), base.output()), "wizard field must be non-blank: wizard root source");
+        assertCompileFails(withWizard(template, new PipelineDraft.Root("root", "crm", " ", List.of(), List.of()),
+                List.of(), List.of(), base.output()), "wizard field must be non-blank: wizard root table");
+
+        PipelineDraft.Related missingParent = related("child", "absent", PipelineDraft.Shape.OBJECT,
+                "child", List.of("id"), List.of(new PipelineDraft.FieldPair("parent_id", "id")));
+        assertCompileFails(withWizard(template, base.root(), List.of(missingParent), List.of(), base.output()),
+                "related table parent does not exist: absent");
+
+        PipelineDraft.Related selfParent = related("child", "child", PipelineDraft.Shape.OBJECT,
+                "child", List.of("id"), List.of(new PipelineDraft.FieldPair("parent_id", "id")));
+        assertCompileFails(withWizard(template, base.root(), List.of(selfParent), List.of(), base.output()),
+                "wizard relation cannot point to itself: child");
+
+        PipelineDraft.Related first = related("first", "second", PipelineDraft.Shape.OBJECT,
+                "first", List.of("id"), List.of(new PipelineDraft.FieldPair("id", "id")));
+        PipelineDraft.Related second = related("second", "first", PipelineDraft.Shape.OBJECT,
+                "second", List.of("id"), List.of(new PipelineDraft.FieldPair("id", "id")));
+        assertCompileFails(withWizard(template, base.root(), List.of(first, second), List.of(), base.output()),
+                "wizard related table cycle at: first");
+
+        PipelineDraft.Related duplicate = related("orders", "root", PipelineDraft.Shape.OBJECT,
+                "orders", List.of("id"), List.of(new PipelineDraft.FieldPair("id", "id")));
+        assertCompileFails(withWizard(template, base.root(), List.of(duplicate), List.of(), base.output()),
+                "duplicate wizard id: orders");
+    }
+
+    @Test
+    void rejectsIncompleteRelationShapesAndAssociationFields() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Root root = template.wizard().root();
+        PipelineDraft.Related arrayWithoutKey = new PipelineDraft.Related("child", "orders", "crm", "child_table",
+                new PipelineDraft.Relation(List.of(new PipelineDraft.FieldPair("parent_id", "id")),
+                        PipelineDraft.Shape.ARRAY, "child", List.of(), List.of()), List.of());
+        assertCompileFails(withWizard(template, root, List.of(arrayWithoutKey), List.of(), template.wizard().output()),
+                "array relation requires an array key");
+
+        PipelineDraft.Related flatWithPath = related("child", "orders", PipelineDraft.Shape.FLAT,
+                "", List.of("id"), List.of(new PipelineDraft.FieldPair("parent_id", "id")));
+        assertCompileFails(withWizard(template, root, List.of(flatWithPath), List.of(), template.wizard().output()),
+                "flat relation must not have a target path");
+
+        PipelineDraft.Related missingPath = related("child", "orders", PipelineDraft.Shape.OBJECT,
+                null, List.of("id"), List.of(new PipelineDraft.FieldPair("parent_id", "id")));
+        assertCompileFails(withWizard(template, root, List.of(missingPath), List.of(), template.wizard().output()),
+                "object and array relations require a target path");
+
+        PipelineDraft.Related noConditions = related("child", "orders", PipelineDraft.Shape.OBJECT,
+                "child", List.of("id"), List.of());
+        assertCompileFails(withWizard(template, root, List.of(noConditions), List.of(), template.wizard().output()),
+                "relation requires at least one association condition");
+
+        PipelineDraft.Related blankField = related("child", "orders", PipelineDraft.Shape.OBJECT,
+                "child", List.of("id"), List.of(new PipelineDraft.FieldPair(" ", "id")));
+        assertCompileFails(withWizard(template, root, List.of(blankField), List.of(), template.wizard().output()),
+                "wizard field must be non-blank: related child field");
+    }
+
+    @Test
+    void compilesWizardOutputAliasesAndRejectsUnsupportedModes() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Output aliasedOutput = new PipelineDraft.Output("source", Map.of(
+                "source", "warehouse", "destinationTable", "archive", "write_mode", "append", "syncId", "sink"));
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiler.compile(withWizard(template,
+                template.wizard().root(), List.of(), List.of(), aliasedOutput)).serve();
+        assertThat(serve.sync().getFirst().id()).isEqualTo("sink");
+        assertThat(serve.sync().getFirst().source()).isEqualTo("warehouse");
+        assertThat(serve.sync().getFirst().writeMode().yaml()).isEqualTo("append");
+        assertThat(serve.sync().getFirst().rename()).isNotNull();
+
+        PipelineDraft.Output invalidMode = new PipelineDraft.Output("atlas",
+                Map.of("sourceId", "atlas", "table", "archive", "writeMode", "merge"));
+        assertCompileFails(withWizard(template, template.wizard().root(), List.of(), List.of(), invalidMode),
+                "unsupported wizard output write mode: merge");
+        assertCompileFails(withWizard(template, template.wizard().root(), List.of(), List.of(),
+                new PipelineDraft.Output("source", Map.of("sourceId", "warehouse"))),
+                "wizard output requires sourceId and table");
+    }
+
+    @Test
+    void rejectsUnsupportedTransformsAndMalformedGraphNodes() {
+        PipelineDraft template = wizardDraft();
+        assertCompileFails(withWizard(template, template.wizard().root(), List.of(),
+                List.of(new PipelineDraft.Transform("step", "union", Map.of())), template.wizard().output()),
+                "unsupported wizard transform: union");
+        assertCompileFails(withWizard(template, template.wizard().root(), List.of(),
+                List.of(new PipelineDraft.Transform("step", "filter", Map.of())), template.wizard().output()),
+                "transform field must be non-blank: expr");
+
+        PipelineDraft.Graph unsupported = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "mysql", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("unknown", "join", null, null, Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("edge", "source", "unknown")), new PipelineDraft.Viewport(0, 0, 1));
+        assertCompileFails(dagDraft(unsupported), "unsupported graph node: join");
+
+        PipelineDraft.Graph unknownEdge = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "mysql", "orders", Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("edge", "source", "missing")), new PipelineDraft.Viewport(0, 0, 1));
+        assertCompileFails(dagDraft(unknownEdge), "graph edge references an unknown node: edge");
+
+        PipelineDraft.Graph noInput = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("filter", "filter", null, null, Map.of("expr", "active"), Map.of())),
+                List.of(), new PipelineDraft.Viewport(0, 0, 1));
+        assertCompileFails(dagDraft(noInput), "graph node requires an input: filter");
+    }
+
+    @Test
+    void rejectsGraphCyclesAndMultipleTerminalNodes() {
+        PipelineDraft.Graph cycle = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("filter-a", "filter", null, null, Map.of("expr", "a"), Map.of()),
+                new PipelineDraft.Node("filter-b", "filter", null, null, Map.of("expr", "b"), Map.of())),
+                List.of(new PipelineDraft.Edge("a-b", "filter-a", "filter-b"),
+                        new PipelineDraft.Edge("b-a", "filter-b", "filter-a")),
+                new PipelineDraft.Viewport(0, 0, 1));
+        assertCompileFails(dagDraft(cycle), "graph contains a cycle at: filter-a");
+
+        PipelineDraft.Graph duplicateViews = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "mysql", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("view-a", "view", null, null, Map.of(), Map.of()),
+                new PipelineDraft.Node("view-b", "view", null, null, Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("source-a", "source", "view-a"),
+                        new PipelineDraft.Edge("source-b", "source", "view-b")),
+                new PipelineDraft.Viewport(0, 0, 1));
+        assertCompileFails(dagDraft(duplicateViews), "graph has more than one view node");
+
+        PipelineDraft.Graph duplicateTargets = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "mysql", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("target-a", "target", "mongo", null, Map.of(), Map.of()),
+                new PipelineDraft.Node("target-b", "target", "mongo", null, Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("source-a", "source", "target-a"),
+                        new PipelineDraft.Edge("source-b", "source", "target-b")),
+                new PipelineDraft.Viewport(0, 0, 1));
+        assertCompileFails(dagDraft(duplicateTargets), "graph has more than one target node");
+    }
+
+    private void assertCompileFails(PipelineDraft draft, String message) {
+        assertThatThrownBy(() -> compiler.compile(draft))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(message);
+    }
+
+    private static PipelineDraft withWizard(PipelineDraft template, PipelineDraft.Root root,
+            List<PipelineDraft.Related> related, List<PipelineDraft.Transform> transforms,
+            PipelineDraft.Output output) {
+        return new PipelineDraft(template.pipelineId(), template.schemaVersion(), template.revision(),
+                PipelineDraft.Mode.WIZARD, template.name(), template.description(), null,
+                new PipelineDraft.Wizard(root, related, transforms, output),
+                template.baseArtifactHash(), template.publishedDraftRevision(), template.publishedArtifactHash(),
+                template.createdAt(), template.updatedAt(), template.updatedBy());
+    }
+
+    private static PipelineDraft.Related related(String id, String parentId, PipelineDraft.Shape shape,
+            String path, List<String> keys, List<PipelineDraft.FieldPair> conditions) {
+        return new PipelineDraft.Related(id, parentId, "crm", "child_table",
+                new PipelineDraft.Relation(conditions, shape, path, keys,
+                        shape == PipelineDraft.Shape.ARRAY ? List.of("id") : List.of()), List.of());
+    }
+
     private static PipelineDraft dagDraft(PipelineDraft.Graph graph) {
         return new PipelineDraft("p1", 1, 1, PipelineDraft.Mode.DAG, "p1", "", graph, null,
                 null, null, null, java.time.Instant.parse("2026-09-21T00:00:00Z"),
