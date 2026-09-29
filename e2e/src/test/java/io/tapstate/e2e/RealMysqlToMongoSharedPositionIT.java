@@ -2,7 +2,6 @@ package io.tapstate.e2e;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.mongodb.ConnectionString;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import io.tapstate.core.lifecycle.LifecycleVerb;
@@ -72,7 +71,7 @@ class RealMysqlToMongoSharedPositionIT {
                 // It is absent until CDC has delivered and acknowledged a real change.
                 Await.until("the first reader's tail position", () -> !control.resumePoint(first).isEmpty(),
                         () -> control.logs(first));
-                chain = chainOf(store, first);
+                chain = ChainNotes.chainOf(store, first);
                 identity = chainIdentity(store, chain);
                 assertThat(nodeIdentity(store, first, "first_source"))
                         .as("the reader's identity is the chain's, not the pipeline that opened it")
@@ -83,7 +82,7 @@ class RealMysqlToMongoSharedPositionIT {
                 apply(control, mysql, targetUri, second, "second_source", "later_orders", "cdc_only");
                 sql(mysql, "INSERT INTO later_orders VALUES (2, 'second-tail')");
                 awaitIds(control, second, mongo, target, "later_orders", List.of(2L));
-                assertThat(chainOf(store, second)).as("both pipelines read one chain").isEqualTo(chain);
+                assertThat(ChainNotes.chainOf(store, second)).as("both pipelines read one chain").isEqualTo(chain);
                 assertThat(chainIdentity(store, chain))
                         .as("the chain's one reader kept its identity when it took the second table on")
                         .isEqualTo(identity);
@@ -161,15 +160,6 @@ class RealMysqlToMongoSharedPositionIT {
     }
 
     /** The chain {@code pipeline} reads, as its cursor on the store names it. */
-    private static String chainOf(String store, String pipeline) {
-        try (MongoClient client = MongoClients.create(store)) {
-            Document cursor = client.getDatabase(new ConnectionString(store).getDatabase())
-                    .getCollection("srs_consumer_offsets").find(new Document("_id.pipeline", pipeline)).first();
-            assertThat(cursor).as("%s has a cursor on a chain", pipeline).isNotNull();
-            return cursor.get("_id", Document.class).getString("chain");
-        }
-    }
-
     /** The reader identity the chain's notes hold; it has to be there. */
     private static byte[] chainIdentity(String store, String chain) {
         return identityIn(store, "pdk.chain." + chain)
