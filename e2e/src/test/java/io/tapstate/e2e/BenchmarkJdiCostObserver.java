@@ -207,7 +207,8 @@ final class BenchmarkJdiCostObserver {
             "core-model-0.5.0.jar", "core-event-0.5.0.jar", "spi-metrics-0.5.0.jar", "bson-5.8.0.jar",
             "bson-record-codec-5.8.0.jar", "mongodb-driver-core-5.8.0.jar",
             "mongodb-driver-sync-5.8.0.jar", "slf4j-api-2.0.18.jar");
-    private static final List<String> TARGET_CLASSES = List.of(TARGET, LATEST_TARGET, LATEST_TARGET + "$Chunks");
+    private static final List<String> TARGET_CLASSES = List.of(TARGET, LATEST_TARGET,
+            LATEST_TARGET + "$Chunks", LATEST_TARGET + "$ChunkFixture");
     private static final Duration TIMEOUT = Duration.ofSeconds(30);
 
     private BenchmarkJdiCostObserver() {
@@ -361,7 +362,7 @@ final class BenchmarkJdiCostObserver {
     }
 
     static Summary run(Artifact artifact, String mode, Options options, String mongoUri) throws Exception {
-        boolean latest = mode.equals("latest");
+        boolean latest = mode.equals("latest") || mode.equals("latest-chunk");
         boolean wire = mode.startsWith("wire");
         if (latest && !artifact.latestAvailable()) {
             throw invalid("latest binary encoder is unavailable in the selected arm");

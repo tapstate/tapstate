@@ -303,6 +303,78 @@ class HistoryRollupWorkerMongoIT {
         }
     }
 
+    @Test
+    void oneNonemptyClosedBucketHasSixCommandsAndRestartNeedsOnlyTwoReads() {
+        String databaseName = "history_closed_bucket_cost_it";
+        List<String> commands = new CopyOnWriteArrayList<>();
+        CommandListener listener = new CommandListener() {
+            @Override
+            public void commandStarted(CommandStartedEvent event) {
+                if (databaseName.equals(event.getDatabaseName())) {
+                    String name = event.getCommandName();
+                    var collection = event.getCommand().get(name.equals("getMore") ? "collection" : name);
+                    commands.add(name + ":" + (collection != null && collection.isString()
+                            ? collection.asString().getValue() : "UNMAPPED"));
+                }
+            }
+        };
+        MongoClientSettings settings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl(databaseName)))
+                .addCommandListener(listener).build();
+        Instant now = Instant.now().truncatedTo(java.time.temporal.ChronoUnit.MILLIS);
+        Instant start = Instant.ofEpochSecond(Math.floorDiv(now.getEpochSecond(), 300) * 300 - 300);
+        Clock clock = Clock.fixed(now, ZoneOffset.UTC);
+        Scope scope = Scope.incarnation("inc-closed-cost");
+        Key key = new Key("orders", scope, Resolution.PT5M, start);
+        try (MongoClient client = MongoClients.create(settings)) {
+            MongoDatabase database = client.getDatabase(databaseName);
+            database.drop();
+            var raw = new MongoRateHistoryStore(database,
+                    database.getCollection(MongoStorePort.PIPELINE_RATE_HISTORY), Duration.ofDays(15));
+            var rollups = new MongoHistoryRollupStore(database,
+                    database.getCollection(MongoStorePort.PIPELINE_HISTORY_ROLLUPS), Duration.ofDays(15));
+            var execution = new ObservationStore.Scope("inc-closed-cost", 1);
+            for (int minute = 0; minute < 3; minute++) {
+                raw.appendScoped(new RateSample("orders", start.plusSeconds(minute * 60L),
+                        Map.of("records.out", minute * 10L), Map.of(), start), execution);
+            }
+            List<HistoryRollupWorker.Work> work = List.of(new HistoryRollupWorker.Work("orders", scope));
+            commands.clear();
+            try (HistoryRollupWorker worker = new HistoryRollupWorker(raw, rollups, clock,
+                    Duration.ofMinutes(1), 1, Duration.ofSeconds(5), () -> work, ignored -> true, false)) {
+                worker.runOneBatch();
+                assertThat(worker.health().levels().get(Resolution.PT5M).computed()).isEqualTo(1);
+            }
+            if ("rollup-extra-read".equals(System.getProperty("tapstate.cost-gate.family-mutation"))) {
+                database.getCollection(MongoStorePort.PIPELINE_RATE_HISTORY).find().limit(1).first();
+            }
+            assertThat(List.copyOf(commands)).as("one closed bucket uses four raw finds, one cache find, and one upsert")
+                    .containsExactly("find:" + MongoStorePort.PIPELINE_RATE_HISTORY,
+                            "find:" + MongoStorePort.PIPELINE_HISTORY_ROLLUPS,
+                            "find:" + MongoStorePort.PIPELINE_RATE_HISTORY,
+                            "find:" + MongoStorePort.PIPELINE_RATE_HISTORY,
+                            "find:" + MongoStorePort.PIPELINE_RATE_HISTORY,
+                            "update:" + MongoStorePort.PIPELINE_HISTORY_ROLLUPS);
+            Bucket persisted = rollups.read(key).orElseThrow();
+            assertThat(persisted.inWindowSamples()).isEqualTo(3);
+            assertThat(persisted.fragments().stream().map(fragment -> fragment.recordsOut() == null
+                    ? BigDecimal.ZERO : fragment.recordsOut().delta()).reduce(BigDecimal.ZERO, BigDecimal::add))
+                    .isEqualByComparingTo("20");
+            commands.clear();
+            try (HistoryRollupWorker restarted = new HistoryRollupWorker(raw, rollups, clock,
+                    Duration.ofMinutes(1), 1, Duration.ofSeconds(5), () -> work, ignored -> true, false)) {
+                restarted.runOneBatch();
+                assertThat(restarted.health().levels().get(Resolution.PT5M).computed()).isZero();
+            }
+            assertThat(List.copyOf(commands)).as("a restarted worker reuses the persisted nonempty bucket")
+                    .containsExactly("find:" + MongoStorePort.PIPELINE_RATE_HISTORY,
+                            "find:" + MongoStorePort.PIPELINE_HISTORY_ROLLUPS);
+            System.out.println("history-nonempty-rollup-cost firstBatchCommands=6 restartCommands=2"
+                    + " firstRawFinds=4 firstRollupFinds=1 firstRollupUpserts=1 restartUpserts=0 inputSamples=3");
+            assertThat(rollups.read(key)).contains(persisted);
+        }
+    }
+
     private static HistoryRollupWorker worker(MongoStorePort store, Clock clock,
             List<HistoryRollupWorker.Work> work) {
         return worker(store, clock, work, 1);

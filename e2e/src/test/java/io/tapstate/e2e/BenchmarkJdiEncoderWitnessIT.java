@@ -123,6 +123,19 @@ class BenchmarkJdiEncoderWitnessIT {
     }
 
     @Test
+    void aNonemptyChunkUsesOneProtectedLatestPayloadEncoding() throws Exception {
+        var candidate = BenchmarkJdiCostObserver.run(
+                ARTIFACTS.get(Arm.OBSERVABILITY), "latest-chunk", Options.NORMAL, null);
+        assertThat(candidate.require(Unit.LATEST_OBSERVATION_BINARY_ENCODER_INVOCATION))
+                .isEqualTo(new Count(1, 1));
+        assertThat(candidate.breakpointEvents()).isEqualTo(2);
+        assertThat(candidate.closedAndDrained()).isTrue();
+        assertThatThrownBy(() -> BenchmarkJdiCostObserver.run(
+                ARTIFACTS.get(Arm.REFERENCE), "latest-chunk", Options.NORMAL, null))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("unavailable");
+    }
+
+    @Test
     void losingAnEntryEventInvalidatesTheWholeWindow() {
         assertThatThrownBy(() -> BenchmarkJdiCostObserver.run(ARTIFACTS.get(Arm.REFERENCE), "normal",
                 new Options(true, 10_000), null))
