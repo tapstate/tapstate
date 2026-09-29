@@ -38,15 +38,15 @@ connector is loaded through the same plugin interface.
 
 ## Connector support boundary
 
-This preview certifies the following database kinds and one managed variant, with certification
-scoped by direction:
+This preview certifies the following database kinds, with certification scoped by direction.
+The certified `mongodb-atlas` managed id belongs to the MongoDB kind and is described below rather
+than being presented as another database kind:
 
 | Database | Connector kind | Certified use |
 |---|---|---|
 | MySQL | `mysql` | Read |
 | PostgreSQL | `postgres` | Read |
 | MongoDB | `mongodb` | Read and write |
-| MongoDB Atlas | `mongodb-atlas` | Read and write in the existing on-prem runtime |
 | Oracle | `oracle` | Read |
 | SQL Server | `sqlserver` | Read |
 

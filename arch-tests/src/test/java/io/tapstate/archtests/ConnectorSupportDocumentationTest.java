@@ -67,11 +67,15 @@ class ConnectorSupportDocumentationTest {
                             "installs onto the `mongodb` kind and no other",
                             "on any of its accepted ids",
                             "Oracle Free 23", "SQL Server 2022", "DECIMAL(18,4)", "schema rediscovery",
-                            "16 connector ids", "managed variants", "not been live-verified",
+                            "16 connector ids", "managed variants", "Except for `mongodb-atlas`",
+                            "live-verified individually", "Atlas connector was verified",
+                            "Cloud-mode verification is pending", "`aws-rds-mysql`", "unverified preview",
+                            "issue #529",
                             "on this server", "outside the supported configuration",
                             "server's actual accepted set", "including any additional ids",
                             "separate assets", "`connectors-preview`", "versioned Tapstate releases",
-                            "register oracle", "register sqlserver", "Oracle Free Use Terms",
+                            "register oracle", "register sqlserver", "register mongodb-atlas",
+                            "register aws-rds-mysql", "Oracle Free Use Terms",
                             "Microsoft JDBC Driver 12.2.0", "no LICENSE file");
         }
     }
