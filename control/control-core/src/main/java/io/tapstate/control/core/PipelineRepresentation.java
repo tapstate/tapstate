@@ -188,7 +188,7 @@ public final class PipelineRepresentation {
         throw malformed(path + ".type is required");
     }
 
-    private static TransformBody body(String type, Map<String, Object> payload, String path) {
+    static TransformBody body(String type, Map<String, Object> payload, String path) {
         return switch (type) {
             case "js" -> new TransformBody.Js(requiredText(payload, "script", path));
             case "map" -> new TransformBody.MapProjection(

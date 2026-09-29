@@ -294,7 +294,7 @@ class PipelineDraftCompilerTest {
         assertThat(serve.sync()).extracting(sync -> sync.source()).containsExactly("warehouse");
         assertThat(serve.sync().getFirst().writeMode().yaml()).isEqualTo("append");
         assertThat(serve.sync().getFirst().rename())
-                .isEqualTo(new RenameSpec(Map.of("orders", "orders_archive"), null, null, null));
+                .isEqualTo(new RenameSpec(Map.of("active-orders", "orders_archive"), null, null, null));
     }
 
     @Test
@@ -313,6 +313,133 @@ class PipelineDraftCompilerTest {
                 .isEqualTo("p1_view_1");
         String canonical = new CanonicalWriter().write(compiled);
         assertThat(new CanonicalWriter().write(new DslParser().parse(canonical))).isEqualTo(canonical);
+    }
+
+    @Test
+    void compilesDagTransformEditorsIntoTypedDslAndUsesConfiguredStepIds() {
+        Map<String, Object> nestBody = Map.of("root", Map.of(
+                "from", "orders",
+                "key", List.of("id"),
+                "embed", List.of(Map.of(
+                        "from", "items",
+                        "on", Map.of("order_id", "id"),
+                        "as", "array",
+                        "path", "items"))));
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("orders-source", "source", "mysql", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("archive-source", "source", "mysql", "archive_orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("customers-source", "source", "mysql", "customers", Map.of(), Map.of()),
+                new PipelineDraft.Node("items-source", "source", "mysql", "order_items", Map.of(), Map.of()),
+                new PipelineDraft.Node("draft:transform:map", "map", null, null,
+                        Map.of("fields", Map.of("customer_id", Map.of("sourceField", "customerId"),
+                                "obsolete", false)), Map.of("stepId", "normalize_orders")),
+                new PipelineDraft.Node("draft:transform:filter", "filter", null, null,
+                        Map.of("expr", "after.active == true"), Map.of("stepId", "active_orders")),
+                new PipelineDraft.Node("draft:transform:js", "js", null, null,
+                        Map.of("script", "function process(record) { return record; }"),
+                        Map.of("stepId", "scripted_orders")),
+                new PipelineDraft.Node("draft:transform:union", "union", null, null,
+                        Map.of("from", List.of("mysql.orders", "mysql.archive_orders")),
+                        Map.of("stepId", "all_orders")),
+                new PipelineDraft.Node("draft:transform:join", "join", null, null,
+                        Map.of("from", Map.of("o", "mysql.orders", "c", "mysql.customers"),
+                                "engine", "builtin", "sql", "SELECT o.id AS id FROM o LEFT JOIN c ON o.customer_id = c.id"),
+                        Map.of("stepId", "joined_orders")),
+                new PipelineDraft.Node("draft:transform:nest", "nest", null, null,
+                        Map.of("from", Map.of("orders", "mysql.orders", "items", "mysql.order_items"),
+                                "root", nestBody.get("root")), Map.of("stepId", "customer_document")),
+                new PipelineDraft.Node("draft:transform:unwind", "unwind", null, null,
+                        Map.of("path", "items", "includeArrayIndex", "item_index",
+                                "preserveNullAndEmptyArrays", true), Map.of("stepId", "expanded_orders"))),
+                List.of(
+                        new PipelineDraft.Edge("orders-to-map", "orders-source", "draft:transform:map"),
+                        new PipelineDraft.Edge("map-to-filter", "draft:transform:map", "draft:transform:filter"),
+                        new PipelineDraft.Edge("filter-to-js", "draft:transform:filter", "draft:transform:js"),
+                        new PipelineDraft.Edge("orders-to-union", "orders-source", "draft:transform:union"),
+                        new PipelineDraft.Edge("archive-to-union", "archive-source", "draft:transform:union"),
+                        new PipelineDraft.Edge("orders-to-join", "orders-source", "draft:transform:join"),
+                        new PipelineDraft.Edge("customers-to-join", "customers-source", "draft:transform:join"),
+                        new PipelineDraft.Edge("orders-to-nest", "orders-source", "draft:transform:nest"),
+                        new PipelineDraft.Edge("items-to-nest", "items-source", "draft:transform:nest"),
+                        new PipelineDraft.Edge("orders-to-unwind", "orders-source", "draft:transform:unwind")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        PipelineResource compiled = compiler.compile(dagDraft(graph));
+
+        assertThat(compiled.transforms()).extracting(Step::id).containsExactly(
+                "normalize_orders", "active_orders", "scripted_orders", "all_orders", "joined_orders",
+                "customer_document", "expanded_orders");
+        Step.Inline map = (Step.Inline) compiled.transforms().getFirst();
+        assertThat(((TransformBody.MapProjection) map.body()).fields())
+                .containsEntry("customer_id", FieldRule.rename("customerId"))
+                .containsEntry("obsolete", FieldRule.drop());
+        assertThat(((TransformBody.Filter) ((Step.Inline) compiled.transforms().get(1)).body()).expr())
+                .isEqualTo("after.active == true");
+        assertThat(((TransformBody.Js) ((Step.Inline) compiled.transforms().get(2)).body()).script())
+                .isEqualTo("function process(record) { return record; }");
+        Step.Inline union = (Step.Inline) compiled.transforms().get(3);
+        assertThat(union.body()).isInstanceOf(TransformBody.Union.class);
+        assertThat(((FromClause.Flow) union.from()).refs()).containsExactly(
+                FromRef.literal("mysql.orders"), FromRef.literal("mysql.archive_orders"));
+        Step.Inline join = (Step.Inline) compiled.transforms().get(4);
+        assertThat(join.body()).isEqualTo(new TransformBody.Join(
+                io.tapstate.core.model.JoinEngine.BUILTIN,
+                "SELECT o.id AS id FROM o LEFT JOIN c ON o.customer_id = c.id"));
+        assertThat(((FromClause.Aliases) join.from()).aliases())
+                .containsEntry("o", FromRef.literal("mysql.orders"))
+                .containsEntry("c", FromRef.literal("mysql.customers"));
+        Step.Inline nest = (Step.Inline) compiled.transforms().get(5);
+        assertThat(((TransformBody.Nest) nest.body()).root().from()).isEqualTo("orders");
+        assertThat(((FromClause.Aliases) nest.from()).aliases())
+                .containsEntry("orders", FromRef.literal("mysql.orders"))
+                .containsEntry("items", FromRef.literal("mysql.order_items"));
+        TransformBody.Unwind unwind = (TransformBody.Unwind) ((Step.Inline) compiled.transforms().get(6)).body();
+        assertThat(unwind.path()).isEqualTo("items");
+        assertThat(unwind.includeArrayIndex()).isEqualTo("item_index");
+        assertThat(unwind.preserveNullAndEmptyArrays()).isTrue();
+
+        String canonical = new CanonicalWriter().write(compiled);
+        assertThat(new CanonicalWriter().write(new DslParser().parse(canonical))).isEqualTo(canonical);
+    }
+
+    @Test
+    void compilesRegexAndMultipleSelectedTablesFromOneSourceNode() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "mysql", "orders_.*",
+                        Map.of("tables", List.of(
+                                Map.of("table", "orders_.*", "tableKind", "regex"),
+                                Map.of("table", "archive_orders"))), Map.of()),
+                new PipelineDraft.Node("target", "target", "mongo", null, Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("source-to-target", "source", "target")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiler.compile(dagDraft(graph)).serve();
+
+        assertThat(((FromClause.Flow) serve.from()).refs()).containsExactly(
+                FromRef.regex("\\Qmysql\\E\\.orders_.*"), FromRef.literal("mysql.archive_orders"));
+        String canonical = new CanonicalWriter().write(compiler.compile(dagDraft(graph)));
+        assertThat(new CanonicalWriter().write(new DslParser().parse(canonical))).isEqualTo(canonical);
+    }
+
+    @Test
+    void compilesMultipleDagSourceTablesAndExplicitTargetMappings() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "mysql", "orders",
+                        Map.of("tables", List.of(Map.of("table", "orders"),
+                                Map.of("table", "archive_orders"))), Map.of()),
+                new PipelineDraft.Node("target", "target", "mongo", "orders_out",
+                        Map.of("tableMappings", List.of(
+                                Map.of("sourceTable", "orders", "targetTable", "orders_out"),
+                                Map.of("sourceTable", "archive_orders", "targetTable", "archive_out"))), Map.of())),
+                List.of(new PipelineDraft.Edge("source-to-target", "source", "target")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiler.compile(dagDraft(graph)).serve();
+
+        assertThat(((FromClause.Flow) serve.from()).refs()).containsExactly(
+                FromRef.literal("mysql.orders"), FromRef.literal("mysql.archive_orders"));
+        assertThat(serve.sync().getFirst().rename().map())
+                .containsExactlyInAnyOrderEntriesOf(Map.of("orders", "orders_out", "archive_orders", "archive_out"));
     }
 
     @Test
@@ -339,7 +466,8 @@ class PipelineDraftCompilerTest {
 
         ServeBlock.Inline serve = (ServeBlock.Inline) compiler.compile(dagDraft(graph)).serve();
         assertThat(serve.id()).isEqualTo("target__serve_");
-        assertThat(serve.sync().getFirst().rename()).isNull();
+        assertThat(serve.sync().getFirst().rename())
+                .isEqualTo(new RenameSpec(Map.of("target__serve", "orders"), null, null, null));
     }
 
     @Test
@@ -456,9 +584,9 @@ class PipelineDraftCompilerTest {
 
         PipelineDraft.Graph unsupported = new PipelineDraft.Graph(List.of(
                 new PipelineDraft.Node("source", "source", "mysql", "orders", Map.of(), Map.of()),
-                new PipelineDraft.Node("unknown", "join", null, null, Map.of(), Map.of())),
+                new PipelineDraft.Node("unknown", "custom", null, null, Map.of(), Map.of())),
                 List.of(new PipelineDraft.Edge("edge", "source", "unknown")), new PipelineDraft.Viewport(0, 0, 1));
-        assertCompileFails(dagDraft(unsupported), "unsupported graph node: join");
+        assertCompileFails(dagDraft(unsupported), "unsupported graph node: custom");
 
         PipelineDraft.Graph unknownEdge = new PipelineDraft.Graph(List.of(
                 new PipelineDraft.Node("source", "source", "mysql", "orders", Map.of(), Map.of())),
