@@ -98,6 +98,7 @@ has   "the ordinary image builds the on-prem Web profile" server-image 'pnpm --f
 has   "Cloud builds its own Web-bearing Boot JAR"         cloud-server-jar 'name: cloud-server-boot-jar'
 has   "Cloud compiles the Cloud Web profile"              cloud-server-jar 'pnpm --filter web build --mode cloud'
 has   "Cloud compiles an explicit Console return URL"     cloud-server-jar 'VITE_CLOUD_CONSOLE_URL:'
+has   "Cloud reads release Web configuration from its environment" cloud-server-jar 'environment: cloud-ecr-release'
 has   "Cloud waits for its profile-specific Boot JAR"     cloud-image 'needs:.*cloud-server-jar'
 has   "Cloud downloads that exact Boot JAR"               cloud-image 'name: cloud-server-boot-jar'
 has   "Cloud uses the checked-in connector lock"    cloud-image 'deploy/cloud/connectors.lock.json'

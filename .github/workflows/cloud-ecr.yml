@@ -11,11 +11,6 @@ on:
         description: Full tapstate-web commit SHA to embed
         required: true
         type: string
-      cloud_console_url:
-        description: HTTPS Cloud Console URL compiled into the Cloud Web bundle
-        required: true
-        default: https://dev.cloud.tapstate.com/
-        type: string
       target_environment:
         description: GitHub Environment holding the ECR destination and authentication
         required: true
@@ -34,13 +29,14 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    environment: ${{ inputs.target_environment }}
     outputs:
       digest: ${{ steps.verify.outputs.digest }}
       tag: ${{ steps.identity.outputs.tag }}
     steps:
       - name: validate immutable inputs
         env:
-          CLOUD_CONSOLE_URL: ${{ inputs.cloud_console_url }}
+          CLOUD_CONSOLE_URL: ${{ vars.VITE_CLOUD_CONSOLE_URL }}
         shell: bash
         run: |
           set -euo pipefail
@@ -74,7 +70,7 @@ jobs:
       - name: build the pinned Cloud Web production bundle
         working-directory: tapstate-web
         env:
-          VITE_CLOUD_CONSOLE_URL: ${{ inputs.cloud_console_url }}
+          VITE_CLOUD_CONSOLE_URL: ${{ vars.VITE_CLOUD_CONSOLE_URL }}
         shell: bash
         run: |
           set -euo pipefail

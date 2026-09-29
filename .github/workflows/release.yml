@@ -458,6 +458,7 @@ jobs:
     # assets, so reusing the ordinary Boot JAR would silently ship on-prem login behavior.
     needs: version
     runs-on: ubuntu-latest
+    environment: cloud-ecr-release
     outputs:
       web_revision: ${{ steps.web-provenance.outputs.revision }}
       web_files_sha256: ${{ steps.web-provenance.outputs.files-sha256 }}
