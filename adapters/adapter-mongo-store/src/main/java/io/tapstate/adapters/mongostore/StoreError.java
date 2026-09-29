@@ -8,8 +8,8 @@ import java.util.Set;
 /**
  * The {@code store} domain's error codes: reaching the backing store at startup. These are
  * user-facing, diagnosable failures — the operator supplied an invalid store setting, pointed the
- * server at a store that is not reachable, or used a standalone server where transactions require a
- * replica set or sharded cluster (the checkpoint compare-and-swap uses a multi-document transaction).
+ * server at a store that is not reachable, used a standalone server where transactions require a
+ * replica set or sharded cluster, or opened metadata whose Source config keyring cannot safely be used.
  *
  * <p>Driver exceptions are translated into these coded diagnostics inside this module, so no
  * driver type escapes it (rule R3). {@code placeholders()} is the named-argument contract: every
@@ -32,6 +32,15 @@ public enum StoreError implements TapstateErrorCode {
      * echoing the raw URI back could leak an embedded credential.
      */
     INVALID_URI("store.invalid-uri", Set.of()),
+
+    /** The metadata-backed Source config keyring is absent, malformed, or internally inconsistent. */
+    SOURCE_CONFIG_KEYRING_INVALID("store.source-config-keyring-invalid", Set.of()),
+
+    /** This node could not bind its live node-session generation to the current keyring epoch. */
+    SOURCE_CONFIG_KEYRING_NOT_READY("store.source-config-keyring-not-ready", Set.of()),
+
+    /** A prepared key cannot become active until every live node session has acknowledged its epoch. */
+    SOURCE_CONFIG_KEYRING_ROTATION_BLOCKED("store.source-config-keyring-rotation-blocked", Set.of()),
 
     /**
      * The configured TLS CA certificate file could not be read or parsed. {@code path} is the CA

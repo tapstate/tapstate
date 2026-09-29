@@ -48,6 +48,7 @@ public final class MongoConnection implements AutoCloseable {
     private final MongoConnectionSettings settings;
     private MongoClient client;
     private String databaseName;
+    private SourceConfigKeyringHandle sourceConfigKeyring;
 
     public MongoConnection(MongoConnectionSettings settings) {
         this.settings = Objects.requireNonNull(settings, "settings");
@@ -64,6 +65,7 @@ public final class MongoConnection implements AutoCloseable {
         verifyConnectivity();
         try {
             MigrationRunner.migrate(database());
+            sourceConfigKeyring = new SourceConfigKeyringHandle(new SourceConfigKeyringStore(database()));
         } catch (RuntimeException e) {
             close();
             throw e;
@@ -190,6 +192,14 @@ public final class MongoConnection implements AutoCloseable {
         return client;
     }
 
+    /** The verified keyring view used by the artifact store after migration has completed. */
+    public SourceConfigKeyringHandle sourceConfigKeyring() {
+        if (sourceConfigKeyring == null) {
+            throw new IllegalStateException("Source config keyring not verified");
+        }
+        return sourceConfigKeyring;
+    }
+
     /** The database named in the connection string, or the default when it names none. */
     static String resolveDatabaseName(ConnectionString connectionString) {
         return connectionString.getDatabase() != null ? connectionString.getDatabase() : DEFAULT_DATABASE;
@@ -263,6 +273,7 @@ public final class MongoConnection implements AutoCloseable {
 
     @Override
     public void close() {
+        sourceConfigKeyring = null;
         if (client != null) {
             client.close();
             client = null;

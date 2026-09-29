@@ -77,6 +77,9 @@ final class StoreIo {
 
     /** Translates a driver failure into its coded io diagnostic (without throwing it). */
     static TapstateException coded(MongoException e) {
+        if (DOCUMENT_TOO_LARGE_CODES.contains(errorCode(e))) {
+            return new TapstateException(IoError.DOCUMENT_TOO_LARGE, Map.of("id", UNNAMED), null);
+        }
         if (e instanceof MongoSecurityException) {
             return new TapstateException(IoError.STORE_UNAUTHORIZED, Map.of(), null);
         }

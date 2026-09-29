@@ -66,6 +66,9 @@ public enum ControlError implements TapstateErrorCode {
     /** A Cloud author attempted to select the deployment-owned Nest state database. */
     STATE_DATABASE_UNAVAILABLE("control.state-database-unavailable", Set.of()),
 
+    /** The reserved Source plaintext flow has no production authorizer in this release. */
+    SOURCE_CONFIG_REVEAL_UNAVAILABLE("control.source-config-reveal-unavailable", Set.of()),
+
     /**
      * A protected operation was reached with no valid credential — none was presented, or the one
      * presented is malformed, unknown, revoked, expired or unsigned. It carries no placeholder on

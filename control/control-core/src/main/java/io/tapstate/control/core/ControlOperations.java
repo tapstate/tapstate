@@ -81,6 +81,10 @@ public final class ControlOperations {
     public static final Operation SOURCE_GET = new Operation(
             "source.get", Scope.READ, false, ControlApiSchema.ref("source.get"),
             "Get one Source with secret-redacted config and configured-secret field names.", CLI_ONLY);
+    public static final Operation SOURCE_REVEAL_CONFIG = new Operation(
+            "source.reveal-config", Scope.ADMIN, true, ControlApiSchema.ref("source.reveal-config"),
+            "Reserved single-Source plaintext config flow. This release has no successful production "
+                    + "authorizer and exposes it on no CLI, MCP, or Web face.", Map.of());
     public static final Operation SOURCE_SCHEMA = new Operation(
             "source.schema", Scope.READ, false, null,
             "Read a Source's latest discovered schema, limited to the tables that Source declares.", CLI_ONLY);
@@ -289,6 +293,7 @@ public final class ControlOperations {
             SOURCE_DRAFT,
             SOURCE_LIST,
             SOURCE_GET,
+            SOURCE_REVEAL_CONFIG,
             SOURCE_SCHEMA,
             SOURCE_UPDATE,
             SOURCE_DELETE,

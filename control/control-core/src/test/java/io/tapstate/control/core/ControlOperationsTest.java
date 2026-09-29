@@ -24,6 +24,7 @@ class ControlOperationsTest {
                         "source.draft",
                         "source.list",
                         "source.get",
+                        "source.reveal-config",
                         "source.schema",
                         "source.update",
                         "source.delete",
@@ -80,6 +81,7 @@ class ControlOperationsTest {
         assertThat(registry.resolve("source.draft").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("source.list").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("source.get").scope()).isEqualTo(Scope.READ);
+        assertThat(registry.resolve("source.reveal-config").scope()).isEqualTo(Scope.ADMIN);
         assertThat(registry.resolve("source.schema").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("source.update").scope()).isEqualTo(Scope.WRITE);
         assertThat(registry.resolve("source.delete").scope()).isEqualTo(Scope.WRITE);
@@ -135,6 +137,7 @@ class ControlOperationsTest {
                         "source.create",
                         "source.update",
                         "source.delete",
+                        "source.reveal-config",
                         "connection.test",
                         "connection.discover-schema",
                         "connector.register",
@@ -185,22 +188,27 @@ class ControlOperationsTest {
     }
 
     @Test
-    void theRegistryOpensEveryL1OperationOnTheCliFace() {
-        // A scope statement about the registry alone: the CLI face opens every registered operation and
-        // clips none of them. Whether each one has a verb behind it is not knowable from here
-        // — control-core cannot see the CLI — and is gated where both are visible, in arch-tests.
+    void theRegistryOpensEveryUsableOperationOnCliAndKeepsTheRevealReservationClosed() {
+        // Every usable operation remains on CLI. The reveal reservation is the sole exception: its schema
+        // and authorizer seam exist, but publishing it on a face would turn a future contract into a
+        // callable plaintext feature before the dedicated authorizer exists.
         assertThat(registry.exposedOn(Frontend.CLI)).hasSize(51);
-        assertThat(registry.all()).allSatisfy(op ->
+        assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
+        assertThat(registry.resolve("source.reveal-config").exposure()).isEmpty();
     }
 
     @Test
     void everyOperationIsStagedAtTheOneShippedStageOnEveryFaceItIsOpenOn() {
-        // One stage across the whole registry, not one per face. A second stage in here is what makes a
+        // One stage across every published face, not one per face. The reserved reveal operation has no
+        // published face in this release; an empty exposure is the fail-closed state this test excludes.
+        // A second non-empty stage in here is what makes a
         // face's surface depend on which ceiling it happened to name, which is the thing the ceilingless
         // exposedOn(Frontend) exists to remove — an entry left at another stage would put it back.
-        assertThat(registry.all()).allSatisfy(op ->
+        assertThat(registry.all()).filteredOn(op -> !op.exposure().isEmpty()).allSatisfy(op ->
                 assertThat(op.exposure().values()).as(op.id()).containsOnly(Maturity.CURRENT));
+        assertThat(registry.all()).filteredOn(op -> op.exposure().isEmpty())
+                .extracting(Operation::id).containsExactly("source.reveal-config");
     }
 
     @Test

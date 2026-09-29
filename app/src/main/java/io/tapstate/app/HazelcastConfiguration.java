@@ -14,6 +14,7 @@ import com.hazelcast.core.HazelcastException;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.core.HazelcastInstanceNotActiveException;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
+import io.tapstate.adapters.mongostore.SourceConfigKeyringSession;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.runtime.engine.EnvelopeSerializer;
@@ -98,15 +99,29 @@ class HazelcastConfiguration {
             @Nullable OperatorStateStores operatorStateStores, @Nullable SrsLogStore srsLogStore,
             ObjectProvider<ClusterIdentityStore> clusterIdentities,
             ObjectProvider<WorkloadClaimStore> workloadClaims,
+            ObjectProvider<SourceConfigKeyringSession> sourceConfigKeyrings,
             ClusterMembershipGate membershipGate) {
         ClusterMemberPreflight.Identity identity =
                 ClusterMemberPreflight.validate(properties, clusterProperties, controlProperties);
         warnAboutClusterProfile(clusterProperties);
         WorkloadClaimStore claimStore = workloadClaims.getIfAvailable();
+        SourceConfigKeyringSession sourceConfigKeyring = sourceConfigKeyrings.getIfAvailable();
         long sessionAskedAt = System.nanoTime();
         if (identity != null) {
-            identity = ClusterMemberPreflight.reserve(identity, clusterProperties,
-                    clusterIdentities.getIfAvailable(), claimStore, UUID.randomUUID().toString());
+            try {
+                identity = ClusterMemberPreflight.reserve(identity, clusterProperties,
+                        clusterIdentities.getIfAvailable(), claimStore, UUID.randomUUID().toString());
+                if (sourceConfigKeyring == null) {
+                    throw new IllegalStateException("cluster member started without its Source config keyring");
+                }
+                sourceConfigKeyring.acknowledge(identity.nodeSession(), clusterProperties.getNodeSessionTtl());
+            } catch (RuntimeException startupFailure) {
+                if (identity.nodeSession() != null && claimStore != null) {
+                    claimStore.release(identity.nodeSession());
+                    if (sourceConfigKeyring != null) sourceConfigKeyring.release(identity.nodeSession());
+                }
+                throw startupFailure;
+            }
         }
         Config config = memberConfig(properties, nestStateStore, nestSettings, srsLogStore);
         if (identity != null) {
@@ -119,6 +134,7 @@ class HazelcastConfiguration {
         } catch (RuntimeException startupFailure) {
             if (identity != null && claimStore != null) {
                 claimStore.release(identity.nodeSession());
+                if (sourceConfigKeyring != null) sourceConfigKeyring.release(identity.nodeSession());
             }
             throw startupFailure;
         }
@@ -222,7 +238,8 @@ class HazelcastConfiguration {
     NodeSessionLease nodeSessionLease(
             HazelcastInstance member,
             ClusterProperties clusterProperties,
-            ObjectProvider<WorkloadClaimStore> workloadClaims) {
+            ObjectProvider<WorkloadClaimStore> workloadClaims,
+            ObjectProvider<SourceConfigKeyringSession> sourceConfigKeyrings) {
         Object stored = member.getUserContext().get(NODE_SESSION_CONTEXT_KEY);
         if (!(stored instanceof io.tapstate.spi.store.WorkloadClaim claim)) {
             return NodeSessionLease.inactive();
@@ -235,7 +252,8 @@ class HazelcastConfiguration {
             throw new IllegalStateException("cluster member started without the time its node session was asked for");
         }
         return new NodeSessionLease(store, claim, askedAt, clusterProperties.getNodeSessionTtl(),
-                clusterProperties.getNodeSessionRenewInterval(), member::shutdown);
+                clusterProperties.getNodeSessionRenewInterval(), sourceConfigKeyrings.getIfAvailable(),
+                member::shutdown);
     }
 
     /** Keeps the local gate aligned with the majority-committed ACTIVE node set. */
@@ -264,7 +282,7 @@ class HazelcastConfiguration {
         return hazelcastMember(properties, new ClusterProperties(), new ControlEndpointProperties(),
                 srsMetaStore, connectorProvisioner, snapshotBuffer, nestStateStore, nestSettings,
                 nestDeadLetterStore, null, srsLogStore, emptyProvider(), emptyProvider(),
-                new ClusterMembershipGate(new ClusterProperties()));
+                emptyProvider(), new ClusterMembershipGate(new ClusterProperties()));
     }
 
     private static <T> ObjectProvider<T> emptyProvider() {

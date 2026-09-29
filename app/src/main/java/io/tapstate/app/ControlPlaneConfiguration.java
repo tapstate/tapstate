@@ -62,6 +62,8 @@ import io.tapstate.control.core.DerivedSchemas;
 import io.tapstate.control.core.SourceConnectionResolver;
 import io.tapstate.control.core.SchemaDerivation;
 import io.tapstate.control.core.SourceDraftService;
+import io.tapstate.control.core.SourceConfigRevealAuthorizer;
+import io.tapstate.control.core.SourceConfigRevealService;
 import org.springframework.beans.factory.ObjectProvider;
 import io.tapstate.control.core.SourceRepresentation;
 import io.tapstate.control.core.SourceSchemaQueryService;
@@ -396,6 +398,17 @@ class ControlPlaneConfiguration {
     @Bean
     ArtifactQueryService artifactQueryService(ArtifactStore artifactStore) {
         return new ArtifactQueryService(artifactStore);
+    }
+
+    @Bean
+    SourceConfigRevealAuthorizer sourceConfigRevealAuthorizer() {
+        return SourceConfigRevealAuthorizer.denyAll();
+    }
+
+    @Bean
+    SourceConfigRevealService sourceConfigRevealService(
+            SourceConfigRevealAuthorizer authorizer, ArtifactStore artifactStore) {
+        return new SourceConfigRevealService(authorizer, artifactStore);
     }
 
     /**

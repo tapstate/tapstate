@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.mongostore.SourceConfigKeyringSession;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import org.slf4j.Logger;
@@ -37,6 +38,7 @@ final class NodeSessionLease implements AutoCloseable {
     private final AtomicReference<WorkloadClaim> current;
     private final Duration ttl;
     private final Runnable lost;
+    private final SourceConfigKeyringSession sourceConfigKeyring;
     private final ScheduledExecutorService renewer;
     private final AtomicBoolean closed = new AtomicBoolean();
 
@@ -48,6 +50,7 @@ final class NodeSessionLease implements AutoCloseable {
         this.current = null;
         this.ttl = Duration.ZERO;
         this.lost = () -> { };
+        this.sourceConfigKeyring = null;
         this.renewer = null;
         this.closed.set(true);
     }
@@ -67,10 +70,22 @@ final class NodeSessionLease implements AutoCloseable {
             Duration ttl,
             Duration renewInterval,
             Runnable lost) {
+        this(store, initial, askedAt, ttl, renewInterval, null, lost);
+    }
+
+    NodeSessionLease(
+            WorkloadClaimStore store,
+            WorkloadClaim initial,
+            long askedAt,
+            Duration ttl,
+            Duration renewInterval,
+            SourceConfigKeyringSession sourceConfigKeyring,
+            Runnable lost) {
         this.store = Objects.requireNonNull(store, "store");
         this.current = new AtomicReference<>(Objects.requireNonNull(initial, "initial"));
         this.ttl = Objects.requireNonNull(ttl, "ttl");
         this.lost = Objects.requireNonNull(lost, "lost");
+        this.sourceConfigKeyring = sourceConfigKeyring;
         Objects.requireNonNull(renewInterval, "renewInterval");
         this.provenUntil = askedAt + ttl.toNanos();
         // Two threads: a renewal the store never answers holds one of them, and the lapse still has to be
@@ -95,7 +110,9 @@ final class NodeSessionLease implements AutoCloseable {
         try {
             Optional<WorkloadClaim> renewed = store.renew(expected, ttl);
             if (renewed.isPresent()) {
-                current.set(renewed.get());
+                WorkloadClaim accepted = renewed.get();
+                if (sourceConfigKeyring != null) sourceConfigKeyring.acknowledge(accepted, ttl);
+                current.set(accepted);
                 provenUntil = askedAt + ttl.toNanos();
                 return;
             }
@@ -140,10 +157,19 @@ final class NodeSessionLease implements AutoCloseable {
             return;
         }
         renewer.shutdownNow();
+        WorkloadClaim ending = current.get();
         try {
-            store.release(current.get());
+            store.release(ending);
         } catch (RuntimeException unavailable) {
             LOG.warn("Could not release the node session during shutdown; it will expire by lease.", unavailable);
+        }
+        if (sourceConfigKeyring != null) {
+            try {
+                sourceConfigKeyring.release(ending);
+            } catch (RuntimeException unavailable) {
+                LOG.warn("Could not release the Source config keyring acknowledgement; it will expire by lease.",
+                        unavailable);
+            }
         }
     }
 }

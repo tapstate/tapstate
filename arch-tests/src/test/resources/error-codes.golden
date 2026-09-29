@@ -160,6 +160,7 @@ control.cloud-auth-unavailable
 control.forbidden
 control.malformed-request
 control.schema-derivation-incomplete
+control.source-config-reveal-unavailable
 control.state-database-unavailable
 control.unauthenticated
 control.unreachable
@@ -283,6 +284,9 @@ source.version-conflict
 store.invalid-operator-state-database
 store.invalid-uri
 store.not-replica-set
+store.source-config-keyring-invalid
+store.source-config-keyring-not-ready
+store.source-config-keyring-rotation-blocked
 store.tls-ca-unreadable
 store.unreachable
 transform.expression-failed

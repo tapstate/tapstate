@@ -447,6 +447,15 @@ store.invalid-operator-state-database:
 store.invalid-uri:
   message: "The store connection string is not a valid MongoDB URI."
   solution: "Check the store URI setting; it must start with mongodb:// or mongodb+srv://."
+store.source-config-keyring-invalid:
+  message: "The metadata store's Source config encryption keyring is missing or invalid."
+  solution: "Restore a complete metadata backup that includes the original keyring. Do not generate a replacement for existing encrypted Source configs."
+store.source-config-keyring-not-ready:
+  message: "This node could not join the current Source config keyring epoch."
+  solution: "Check metadata-store availability and confirm this node still owns its current node session, then restart it."
+store.source-config-keyring-rotation-blocked:
+  message: "The prepared Source config key cannot become active because a live node has not loaded it."
+  solution: "Wait for every current node session to renew, or remove the failed node and wait for its lease to expire, then retry rotation."
 store.tls-ca-unreadable:
   message: "The store TLS CA certificate file at {path} could not be read."
   solution: "Check the path points at a readable PEM certificate for the store's TLS chain."
@@ -591,6 +600,9 @@ control.cloud-auth-unavailable:
 control.state-database-unavailable:
   message: "Cloud mode does not allow an explicit Nest state.database."
   solution: "Remove state.database to use the deployment-owned operator-state database. On-prem deployments can still select a database."
+control.source-config-reveal-unavailable:
+  message: "Stored Source configuration cannot be revealed by this release."
+  solution: "Use the normal Source edit flow to replace configuration. A later audited reveal flow requires dedicated permission, recent step-up authentication, and a one-time grant."
 control.bootstrap-closed:
   message: "The initial-admin bootstrap channel is closed because an admin account already exists."
   solution: "Sign in with an existing admin account to create more users."

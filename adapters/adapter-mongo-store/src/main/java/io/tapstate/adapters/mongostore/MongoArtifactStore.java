@@ -30,9 +30,11 @@ import java.util.Optional;
 
 /**
  * The MongoDB artifact truth layer: stores each applied resource as one document keyed by the
- * resource's top-level id, holding the resource's canonical structure and its content hash. Reading
- * binds that structure straight back to the model and parses no text on the way, so the canonical
- * form is something the store renders on request rather than something it keeps.
+ * resource's top-level id, holding the resource's canonical structure and its logical content hash.
+ * A Source is the physical exception inside that structure: its whole config is one authenticated
+ * ciphertext envelope, decrypted only while reconstructing the in-memory model. Reading binds the
+ * resulting structure straight back to the model and parses no canonical text on the way, so the
+ * canonical form is something the store renders on request rather than something it keeps.
  *
  * <p>The document carries the id (as {@code _id}), the kind, the structure (as {@code body}), and the
  * content hash. Kind is kept beside the body rather than only inside it because it is what a read by
@@ -53,10 +55,18 @@ public final class MongoArtifactStore implements ArtifactStore {
 
     private final MongoClient client;
     private final MongoCollection<Document> collection;
+    private final EncryptedArtifactCodec codec;
 
-    public MongoArtifactStore(MongoClient client, MongoCollection<Document> collection) {
+    public MongoArtifactStore(
+            MongoClient client, MongoCollection<Document> collection, SourceConfigCipher cipher) {
+        this(client, collection, SourceConfigCipherProvider.fixed(Objects.requireNonNull(cipher, "cipher")));
+    }
+
+    MongoArtifactStore(
+            MongoClient client, MongoCollection<Document> collection, SourceConfigCipherProvider ciphers) {
         this.client = Objects.requireNonNull(client, "client");
         this.collection = Objects.requireNonNull(collection, "collection");
+        this.codec = new EncryptedArtifactCodec(Objects.requireNonNull(ciphers, "ciphers"));
     }
 
     @Override
@@ -64,7 +74,7 @@ public final class MongoArtifactStore implements ArtifactStore {
         Objects.requireNonNull(artifact, "artifact");
         return StoreIo.call(() -> {
             try {
-                collection.insertOne(toDocument(artifact));
+                collection.insertOne(codec.encode(artifact));
                 return ArtifactMutation.CREATED;
             } catch (MongoException e) {
                 if (ErrorCategory.fromErrorCode(e.getCode()) == ErrorCategory.DUPLICATE_KEY) {
@@ -85,7 +95,7 @@ public final class MongoArtifactStore implements ArtifactStore {
         }
         return StoreIo.call(() -> {
             Document filter = new Document("_id", id).append("contentHash", expectedContentHash);
-            if (collection.replaceOne(filter, toDocument(replacement)).getMatchedCount() == 1) {
+            if (collection.replaceOne(filter, codec.encode(replacement)).getMatchedCount() == 1) {
                 return ArtifactMutation.REPLACED;
             }
             return collection.find(new Document("_id", id)).first() == null
@@ -174,7 +184,7 @@ public final class MongoArtifactStore implements ArtifactStore {
             case CREATE_ONLY -> insertOnly(session, write);
             case REPLACE_ONLY -> replaceOnly(session, write);
             case UPSERT -> {
-                collection.replaceOne(session, new Document("_id", write.resource().id()), toDocument(write.resource()),
+                collection.replaceOne(session, new Document("_id", write.resource().id()), codec.encode(write.resource()),
                         new ReplaceOptions().upsert(true));
                 yield ArtifactBatchWrite.applied();
             }
@@ -183,7 +193,7 @@ public final class MongoArtifactStore implements ArtifactStore {
 
     private ArtifactBatchWrite insertOnly(ClientSession session, ArtifactWrite write) {
         try {
-            collection.insertOne(session, toDocument(write.resource()));
+            collection.insertOne(session, codec.encode(write.resource()));
             return ArtifactBatchWrite.applied();
         } catch (MongoException error) {
             if (ErrorCategory.fromErrorCode(error.getCode()) == ErrorCategory.DUPLICATE_KEY) {
@@ -196,7 +206,7 @@ public final class MongoArtifactStore implements ArtifactStore {
     private ArtifactBatchWrite replaceOnly(ClientSession session, ArtifactWrite write) {
         Document filter = new Document("_id", write.resource().id())
                 .append("contentHash", write.expectedContentHash());
-        if (collection.replaceOne(session, filter, toDocument(write.resource())).getMatchedCount() == 1) {
+        if (collection.replaceOne(session, filter, codec.encode(write.resource())).getMatchedCount() == 1) {
             return ArtifactBatchWrite.applied();
         }
         return collection.find(session, new Document("_id", write.resource().id())).first() == null
@@ -240,7 +250,7 @@ public final class MongoArtifactStore implements ArtifactStore {
                         return;
                     }
                     for (Resource artifact : artifacts) {
-                        collection.replaceOne(session, new Document("_id", artifact.id()), toDocument(artifact),
+                        collection.replaceOne(session, new Document("_id", artifact.id()), codec.encode(artifact),
                                 new ReplaceOptions().upsert(true));
                     }
                 } catch (RuntimeException e) {
@@ -288,7 +298,7 @@ public final class MongoArtifactStore implements ArtifactStore {
     public Optional<Resource> get(String id) {
         Objects.requireNonNull(id, "id");
         Document document = StoreIo.call(() -> collection.find(new Document("_id", id)).first());
-        return document == null ? Optional.empty() : Optional.of(toResource(document));
+        return document == null ? Optional.empty() : Optional.of(codec.decode(document));
     }
 
     @Override
@@ -300,7 +310,7 @@ public final class MongoArtifactStore implements ArtifactStore {
             List<Resource> resources = new ArrayList<>();
             try (MongoCursor<Document> cursor = collection.find().iterator()) {
                 while (cursor.hasNext()) {
-                    resources.add(toResource(cursor.next()));
+                    resources.add(codec.decode(cursor.next()));
                 }
             }
             return resources;
@@ -330,14 +340,14 @@ public final class MongoArtifactStore implements ArtifactStore {
             List<StoredArtifactRecord> rows = new ArrayList<>();
             try (MongoCursor<Document> cursor = found.iterator()) {
                 while (cursor.hasNext()) {
-                    rows.add(toStoredArtifactRecord(cursor.next()));
+                    rows.add(codec.browse(cursor.next()));
                 }
             }
             return rows;
         });
     }
 
-    /** Maps a resource to its stored id, kind, canonical structure, and content hash. */
+    /** Legacy plaintext structural mapping retained for migrations and codec-focused tests. */
     static Document toDocument(Resource artifact) {
         return new Document("_id", artifact.id())
                 .append("kind", artifact.kind())
@@ -345,7 +355,7 @@ public final class MongoArtifactStore implements ArtifactStore {
                 .append("contentHash", CanonicalHash.of(artifact));
     }
 
-    /** Binds a resource back out of its stored document's structure, parsing no text. */
+    /** Legacy plaintext structural reader retained for migrations and codec-focused tests. */
     static Resource toResource(Document document) {
         String id = String.valueOf(document.get("_id"));
         if (!(document.get("body") instanceof Document body)) {

@@ -170,6 +170,11 @@ class SharedConnectorSourceModesIT {
         try (var raw = MongoClients.create(uri)) {
             Document body = SystemCollections.ARTIFACTS.on(raw.getDatabase(database))
                     .find(new Document("_id", fixture.id)).first().get("body", Document.class);
+            assertThat(body.get("config"))
+                    .as("every Source type stores its whole config as one envelope in both modes")
+                    .isInstanceOf(String.class)
+                    .asString().startsWith("tscfg:1:");
+            assertThat(body.toJson()).doesNotContain(original, "db.example", "reader", "rows");
             Document metadata = body.get("metadata", Document.class);
             if (cloud) assertThat(metadata).containsEntry("cloud", true).containsEntry("user_id", USER);
             else assertThat(metadata).doesNotContainKeys("cloud", "user_id");
