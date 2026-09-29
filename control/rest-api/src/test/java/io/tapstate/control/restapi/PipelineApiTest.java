@@ -28,6 +28,7 @@ import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.PasswordHasher;
 import io.tapstate.control.core.PipelineLifecycleService;
 import io.tapstate.control.core.PipelineDraftService;
+import io.tapstate.control.core.PipelineCatalogService;
 import io.tapstate.control.core.PipelineLayoutService;
 import io.tapstate.control.core.PipelineLogQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
@@ -237,6 +238,68 @@ class PipelineApiTest {
         assertThat(replaced.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(replaced.getHeaders().getETag()).isEqualTo("\"2\"");
         assertThat(replaced.getBody()).containsEntry("revision", 2);
+
+        String overlayDraft = """
+                {"pipelineId":"pl1","mode":"wizard","name":"Orders pipeline","description":"Updated definition",
+                 "wizard":{"root":{"id":"root","sourceId":"src_x","table":"orders","key":[],
+                   "preTransforms":[]},"related":[],"transforms":[]}}
+                """;
+        client().post().uri("/api/pipelines/pl1/draft")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(overlayDraft).retrieve().toBodilessEntity();
+
+        ResponseEntity<Map> catalog = client().get().uri("/api/pipelines")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(Map.class);
+        List<?> catalogItems = (List<?>) catalog.getBody().get("items");
+        assertThat(catalogItems).hasSize(2);
+        Map<?, ?> draftOnly = catalogItems.stream()
+                .map(item -> (Map<?, ?>) item)
+                .filter(item -> "draft-p1".equals(item.get("id")))
+                .findFirst().orElseThrow();
+        assertThat(draftOnly.get("id")).isEqualTo("draft-p1");
+        assertThat(draftOnly.get("name")).isEqualTo("Orders");
+        assertThat(draftOnly.get("mode")).isEqualTo("dag");
+        assertThat(draftOnly.get("revision")).isEqualTo(2);
+        assertThat(draftOnly.get("hasArtifact")).isEqualTo(false);
+        for (String forbidden : List.of("graph", "wizard", "dag", "transforms")) {
+            assertThat(draftOnly.containsKey(forbidden)).as(forbidden).isFalse();
+        }
+        assertThat(((Map<?, ?>) draftOnly.get("status")).get("state")).isEqualTo("NEW");
+
+        Map<?, ?> merged = catalogItems.stream()
+                .map(item -> (Map<?, ?>) item)
+                .filter(item -> "pl1".equals(item.get("id")))
+                .findFirst().orElseThrow();
+        assertThat(merged.get("name")).isEqualTo("Orders pipeline");
+        assertThat(merged.get("mode")).isEqualTo("wizard");
+        assertThat(merged.get("hasArtifact")).isEqualTo(true);
+        assertThat(merged.get("contentHash")).isInstanceOf(String.class);
+        assertThat(((Map<?, ?>) merged.get("status")).get("state")).isEqualTo("NEW");
+
+        client().post().uri("/api/pipelines/pl1:start")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .retrieve().toBodilessEntity();
+        ResponseEntity<Map> afterStart = client().get().uri("/api/pipelines")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(Map.class);
+        Map<?, ?> starting = ((List<?>) afterStart.getBody().get("items")).stream()
+                .map(item -> (Map<?, ?>) item)
+                .filter(item -> "pl1".equals(item.get("id")))
+                .findFirst().orElseThrow();
+        assertThat(((Map<?, ?>) starting.get("status")).get("state")).isEqualTo("STARTING");
+        assertThat(((Map<?, ?>) starting.get("status")).get("desiredState")).isEqualTo("RUNNING");
+
+        stop(token, "pl1", false);
+        ResponseEntity<Map> afterStop = client().get().uri("/api/pipelines")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(Map.class);
+        Map<?, ?> stopping = ((List<?>) afterStop.getBody().get("items")).stream()
+                .map(item -> (Map<?, ?>) item)
+                .filter(item -> "pl1".equals(item.get("id")))
+                .findFirst().orElseThrow();
+        assertThat(((Map<?, ?>) stopping.get("status")).get("state")).isEqualTo("STOPPING");
+        assertThat(((Map<?, ?>) stopping.get("status")).get("desiredState")).isEqualTo("STOPPED");
 
         ApiError stale = client().put().uri("/api/pipelines/draft-p1/draft")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
@@ -1006,6 +1069,15 @@ class PipelineApiTest {
         PipelineViewService pipelineViewService(
                 ArtifactQueryService artifactQueryService, PipelineRepresentation representation) {
             return new PipelineViewService(artifactQueryService, representation);
+        }
+
+        @Bean
+        PipelineCatalogService pipelineCatalogService(
+                ArtifactQueryService artifacts,
+                PipelineDraftService drafts,
+                PipelineObservationQueryService observations,
+                FakeDesiredStore desired) {
+            return new PipelineCatalogService(artifacts, drafts, desired, observations);
         }
 
         @Bean
