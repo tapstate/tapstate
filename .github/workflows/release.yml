@@ -458,10 +458,11 @@ jobs:
     # assets, so reusing the ordinary Boot JAR would silently ship on-prem login behavior.
     needs: version
     runs-on: ubuntu-latest
-    environment: cloud-ecr-release
+    environment: cloud-ghcr-release
     outputs:
       web_revision: ${{ steps.web-provenance.outputs.revision }}
       web_files_sha256: ${{ steps.web-provenance.outputs.files-sha256 }}
+      sealed_context: ${{ steps.seal.outputs.context }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -540,21 +541,36 @@ jobs:
           [[ "$files_sha256" =~ ^[0-9a-f]{64}$ ]]
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
           echo "files-sha256=$files_sha256" >> "$GITHUB_OUTPUT"
+      - name: seal the Cloud Boot JAR before public artifact storage
+        id: seal
+        env:
+          CLOUD_ARTIFACT_KEY: ${{ secrets.CLOUD_ARTIFACT_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t jars < <(find app/target -maxdepth 1 -type f -name 'app-*-boot.jar')
+          test "${#jars[@]}" -eq 1
+          context="$GITHUB_REPOSITORY:$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT:boot-jar"
+          node scripts/seal-cloud-artifact.mjs seal --input "${jars[0]}" \
+            --output "$RUNNER_TEMP/cloud-server-boot-jar.enc" --context "$context"
+          echo "context=$context" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
-          name: cloud-server-boot-jar
-          path: app/target/app-*-boot.jar
+          name: cloud-server-boot-jar-sealed
+          path: ${{ runner.temp }}/cloud-server-boot-jar.enc
           if-no-files-found: error
 
   cloud-image:
-    # The image is built and verified before approval, without touching ECR. Its seven connector
+    # The image is built and verified before approval, without pushing it. Its seven connector
     # bytes and companion license texts must match the versioned lock in this release commit.
     needs: [version, cloud-server-jar]
     runs-on: ubuntu-latest
+    environment: cloud-ghcr-release
     permissions:
       contents: read
     outputs:
       digest: ${{ steps.verify.outputs.digest }}
+      sealed_context: ${{ steps.seal.outputs.context }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -562,8 +578,23 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: cloud-server-boot-jar
-          path: app/target
+          name: cloud-server-boot-jar-sealed
+          path: ${{ runner.temp }}/cloud-boot-jar
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: open the authenticated Cloud Boot JAR
+        env:
+          CLOUD_ARTIFACT_KEY: ${{ secrets.CLOUD_ARTIFACT_KEY }}
+          ARTIFACT_CONTEXT: ${{ needs.cloud-server-jar.outputs.sealed_context }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p app/target
+          node scripts/seal-cloud-artifact.mjs open \
+            --input "$RUNNER_TEMP/cloud-boot-jar/cloud-server-boot-jar.enc" \
+            --output "app/target/app-${{ needs.version.outputs.version }}-boot.jar" \
+            --context "$ARTIFACT_CONTEXT"
       - name: stage the exact published connector and license bytes
         env:
           GH_TOKEN: ${{ github.token }}
@@ -621,10 +652,21 @@ jobs:
             "$RUNNER_TEMP/cloud-layout/index.json")"
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: seal the checked Cloud OCI archive before public artifact storage
+        id: seal
+        env:
+          CLOUD_ARTIFACT_KEY: ${{ secrets.CLOUD_ARTIFACT_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          context="$GITHUB_REPOSITORY:$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT:cloud-image"
+          node scripts/seal-cloud-artifact.mjs seal --input "$RUNNER_TEMP/cloud-image.tar" \
+            --output "$RUNNER_TEMP/cloud-image.enc" --context "$context"
+          echo "context=$context" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
-          name: cloud-image
-          path: ${{ runner.temp }}/cloud-image.tar
+          name: cloud-image-sealed
+          path: ${{ runner.temp }}/cloud-image.enc
           if-no-files-found: error
 
   connectors:
@@ -1171,15 +1213,17 @@ jobs:
             --followups "$RUNNER_TEMP/docs-open.tsv" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
-  cloud-ecr:
-    # ECR is the final runtime publication: it consumes the Cloud archive already checked before
-    # approval and waits until Tapstate and its satellites have been published. It never rebuilds.
+  cloud-ghcr:
+    # Only release publishes this private package. Approval precedes every registry write; the
+    # authenticated archive is the exact one checked before approval, never rebuilt here.
     needs: [version, cloud-image, satellites]
     runs-on: ubuntu-latest
-    environment: cloud-ecr-release
+    environment: cloud-ghcr-release
+    concurrency:
+      group: tapstate-cloud-${{ needs.version.outputs.version }}
+      cancel-in-progress: false
     permissions:
       contents: read
-      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1187,55 +1231,37 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: cloud-image
+          name: cloud-image-sealed
           path: ${{ runner.temp }}/cloud-image
-      - name: choose exactly one AWS authentication mode
-        id: auth
-        env:
-          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
-          ECR_STATIC_AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          ECR_STATIC_AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          ECR_STATIC_AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-        run: deploy/cloud/ecr-publish.sh auth-mode
-      - name: obtain short-lived AWS credentials through GitHub OIDC
-        if: steps.auth.outputs.mode == 'oidc'
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: actions/setup-node@v4
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-      - name: publish the checked archive with OIDC credentials
-        if: steps.auth.outputs.mode == 'oidc'
-        id: publish-oidc
+          node-version: "22"
+      - uses: docker/setup-buildx-action@v3
+      - name: open the authenticated pre-approved Cloud archive
         env:
-          AWS_REGION: ${{ vars.AWS_REGION }}
-          AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
-          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
-        run: >-
-          deploy/cloud/ecr-publish.sh publish
-          --archive "$RUNNER_TEMP/cloud-image/cloud-image.tar"
-          --tag '${{ needs.version.outputs.version }}'
-          --expected-digest '${{ needs.cloud-image.outputs.digest }}'
-      - name: publish the checked archive with static credentials
-        if: steps.auth.outputs.mode == 'static'
-        id: publish-static
-        env:
-          AWS_REGION: ${{ vars.AWS_REGION }}
-          AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
-          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-        run: >-
-          deploy/cloud/ecr-publish.sh publish
-          --archive "$RUNNER_TEMP/cloud-image/cloud-image.tar"
-          --tag '${{ needs.version.outputs.version }}'
-          --expected-digest '${{ needs.cloud-image.outputs.digest }}'
-      - name: report deployable Cloud image identity
+          CLOUD_ARTIFACT_KEY: ${{ secrets.CLOUD_ARTIFACT_KEY }}
+          ARTIFACT_CONTEXT: ${{ needs.cloud-image.outputs.sealed_context }}
         shell: bash
         run: |
-          image='${{ steps.publish-oidc.outputs.image }}${{ steps.publish-static.outputs.image }}'
-          test -n "$image"
-          echo "Cloud image: \`$image\`" >> "$GITHUB_STEP_SUMMARY"
+          node scripts/seal-cloud-artifact.mjs open \
+            --input "$RUNNER_TEMP/cloud-image/cloud-image.enc" \
+            --output "$RUNNER_TEMP/cloud-image/cloud-image.tar" --context "$ARTIFACT_CONTEXT"
+      - name: publish the checked private Cloud release image
+        id: image
+        env:
+          CLOUD_GHCR_USERNAME: ${{ vars.CLOUD_GHCR_USERNAME }}
+          CLOUD_GHCR_TOKEN: ${{ secrets.CLOUD_GHCR_TOKEN }}
+        run: >-
+          bash deploy/cloud/ghcr-publish.sh publish
+          --archive "$RUNNER_TEMP/cloud-image/cloud-image.tar"
+          --version '${{ needs.version.outputs.version }}'
+          --expected-digest '${{ needs.cloud-image.outputs.digest }}'
+      - name: report deployable Cloud image identity
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          test -n "$IMAGE"
+          echo "Cloud image: \`$IMAGE\`" >> "$GITHUB_STEP_SUMMARY"
 
 
   roadmap:
@@ -1384,7 +1410,7 @@ jobs:
     # Guarded on the version output rather than on the pin job's result: a pin that failed part way
     # through creating four refs is exactly the case with orphans to clear, and its job result is
     # `failure`. The output exists as soon as the version was computed, which is before any ref.
-    needs: [version, draft, publish, satellites, cloud-ecr, roadmap, write-back]
+    needs: [version, draft, publish, satellites, cloud-ghcr, roadmap, write-back]
     if: >-
       always()
       && needs.version.outputs.version != ''

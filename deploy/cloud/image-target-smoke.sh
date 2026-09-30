@@ -90,6 +90,8 @@ fi
 docker run --rm --entrypoint sh "$SERVER_TAG" -ec \
     'test ! -e /opt/tapstate/connectors; test -z "${TAPSTATE_CONNECTORS_SEED_DIR:-}"'
 test "$(docker image inspect "$SERVER_TAG" --format '{{ index .Config.Labels "org.opencontainers.image.licenses" }}')" = Apache-2.0
+test "$(docker image inspect "$SERVER_TAG" --format '{{ index .Config.Labels "org.opencontainers.image.source" }}')" = https://github.com/tapstate/tapstate
+test "$(docker image inspect "$SERVER_TAG" --format '{{ index .Config.Labels "io.tapstate.distribution" }}')" = onprem
 
 if ! docker buildx build --progress=plain --load --target cloud \
     --build-context "cloud_connectors=$TEMP_ROOT/staged" \
@@ -104,6 +106,8 @@ docker run --rm --entrypoint sh "$CLOUD_TAG" -ec \
      sha256sum -c /opt/tapstate/release/connectors.sha256; \
      test "$(find . -maxdepth 1 -type f -name "*-connector.jar" | wc -l | tr -d " ")" = 7'
 test "$(docker image inspect "$CLOUD_TAG" --format '{{ index .Config.Labels "org.opencontainers.image.licenses" }}')" = NOASSERTION
+docker image inspect "$CLOUD_TAG" --format '{{json .Config.Labels}}' \
+    | jq -e '(."org.opencontainers.image.source" // "") == "" and ."io.tapstate.distribution" == "cloud"' >/dev/null
 
 if ! docker buildx build --progress=plain --target cloud \
     --platform linux/amd64,linux/arm64 \

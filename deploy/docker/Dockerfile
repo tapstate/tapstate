@@ -35,12 +35,10 @@ RUN set -eu; \
 
 FROM eclipse-temurin:21-jre AS runtime-base
 
-# Image self-description (OCI). The source label connects this package to its repository, so the
-# registry renders the repository README on the package page; the description states the preview
-# posture up front so the image is not mistaken for a production default.
+# Common OCI self-description. Only the public server target associates its package with the
+# public source repository; the Cloud package has independent, private access permissions.
 LABEL org.opencontainers.image.title="Tapstate server" \
       org.opencontainers.image.description="Preview runtime: single-node, in-memory; a restart replays from the source rather than resuming a persisted offset. Not for production." \
-      org.opencontainers.image.source="https://github.com/tapstate/tapstate" \
       org.opencontainers.image.url="https://tapstate.com" \
       org.opencontainers.image.documentation="https://github.com/tapstate/tapstate/blob/main/docs/quickstart-online.md" \
       org.opencontainers.image.licenses="Apache-2.0" \
@@ -103,6 +101,8 @@ CMD ["--role=all"]
 FROM runtime-base AS cloud
 LABEL org.opencontainers.image.title="Tapstate Cloud cluster" \
       org.opencontainers.image.description="Tapstate Cloud cluster runtime with a verified connector seed" \
+      io.tapstate.source="https://github.com/tapstate/tapstate" \
+      io.tapstate.distribution="cloud" \
       org.opencontainers.image.licenses="NOASSERTION"
 COPY --from=cloud_connectors --chown=tapstate:tapstate /connectors/ /opt/tapstate/connectors/
 COPY --from=cloud_connectors --chown=tapstate:tapstate /release/ /opt/tapstate/release/
@@ -114,3 +114,5 @@ RUN set -eu; \
 
 # Keep the standard image as the default target and preserve its on-prem connector lifecycle.
 FROM runtime-base AS server
+LABEL org.opencontainers.image.source="https://github.com/tapstate/tapstate" \
+      io.tapstate.distribution="onprem"

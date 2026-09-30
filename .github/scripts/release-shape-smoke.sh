@@ -76,9 +76,9 @@ hasnt "the publish path retires no branches of its own" satellites 'unbranch'
 # does not need the approval, is the failure this file exists for. Checked over every job there is,
 # so a new one is covered without this list being edited.
 for j in $jobs_list; do
-  case "$j" in publish|satellites|cloud-ecr) continue ;; esac
+  case "$j" in publish|satellites|cloud-ghcr) continue ;; esac
   body="$(job "$j")"
-  if grep -qE 'imagetools create|docker push|push: true|draft=false|--latest=|make_latest|satellites[.]sh release|docs-release[.]sh settle' <<<"$body"; then
+  if grep -qE 'imagetools create|docker push|ghcr-publish[.]sh publish|push: true|draft=false|--latest=|make_latest|satellites[.]sh release|docs-release[.]sh settle' <<<"$body"; then
     bad "no irreversible act in '$j'" \
         "$(grep -E 'imagetools create|docker push|push: true|draft=false|--latest=|make_latest|satellites[.]sh release|docs-release[.]sh settle' <<<"$body" | head -1)"
   else
@@ -95,34 +95,40 @@ hasnt "the image is not rebuilt after approval" publish      'build-push-action'
 # The two deployment profiles compile different Web authentication behavior. Both use the same
 # staging and Boot JAR path, but Cloud must never inherit the ordinary image's on-prem bundle.
 has   "the ordinary image builds the on-prem Web profile" server-image 'pnpm --filter web build --mode onprem'
-has   "Cloud builds its own Web-bearing Boot JAR"         cloud-server-jar 'name: cloud-server-boot-jar'
+has   "Cloud builds its own Web-bearing Boot JAR"         cloud-server-jar 'name: cloud-server-boot-jar-sealed'
 has   "Cloud compiles the Cloud Web profile"              cloud-server-jar 'pnpm --filter web build --mode cloud'
 has   "Cloud compiles an explicit Console return URL"     cloud-server-jar 'VITE_CLOUD_CONSOLE_URL:'
-has   "Cloud reads release Web configuration from its environment" cloud-server-jar 'environment: cloud-ecr-release'
+has   "Cloud reads release Web configuration from its environment" cloud-server-jar 'environment: cloud-ghcr-release'
 has   "Cloud waits for its profile-specific Boot JAR"     cloud-image 'needs:.*cloud-server-jar'
-has   "Cloud downloads that exact Boot JAR"               cloud-image 'name: cloud-server-boot-jar'
+has   "Cloud downloads that exact Boot JAR"               cloud-image 'name: cloud-server-boot-jar-sealed'
 has   "Cloud uses the checked-in connector lock"    cloud-image 'deploy/cloud/connectors.lock.json'
 has   "Cloud stages published connector bytes"      cloud-image 'stage-connectors[.]py'
 has   "Cloud builds its own OCI archive"             cloud-image 'type=oci'
 has   "Cloud verifies its Boot JAR and seed bytes"  cloud-image 'verify-image[.]py'
 has   "Cloud compares the server Boot JAR"           cloud-image '\-\-boot-jar'
 has   "Cloud checks Web files and revision"         cloud-image 'web-provenance[.]py create'
-has   "Cloud retains the checked archive"           cloud-image 'name: cloud-image'
+has   "Cloud retains the checked archive"           cloud-image 'name: cloud-image-sealed'
 has   "a failed Cloud image blocks approval"         gates       'needs:.*cloud-image'
 hasnt "Cloud does not rebuild Web"                   cloud-image 'pnpm build|prepare-web-assets[.]sh|mvn .*package'
 
-# The release ECR publication happens only after the ordinary release and satellites are out. It
-# consumes the archive checked above, calls the same publisher as the independent validation
-# workflow, and never gains a second path that rebuilds the image or downloads connector bytes.
-has   "ECR waits until satellite publication is complete" cloud-ecr 'needs:.*satellites'
-has   "ECR consumes the checked Cloud archive"             cloud-ecr 'name: cloud-image'
-has   "ECR uses the production GitHub Environment"         cloud-ecr 'environment: cloud-ecr-release'
-has   "ECR selects one authentication mode"                cloud-ecr 'ecr-publish[.]sh auth-mode'
-has   "ECR uses the shared digest publisher"               cloud-ecr 'ecr-publish[.]sh publish'
-has   "ECR publishes the verified archive digest"          cloud-ecr 'needs[.]cloud-image[.]outputs[.]digest'
-hasnt "ECR never rebuilds the approved image"              cloud-ecr 'buildx build|build-push-action'
-hasnt "ECR never downloads connector bytes again"          cloud-ecr 'stage-connectors|release download'
-has   "cleanup waits for the final ECR publication"        cleanup   'needs:.*cloud-ecr'
+# Cloud publishes only through release, after the same approval as OP. Intermediate artifacts
+# must remain authenticated ciphertext even though this repository's Actions runs are public.
+has   "Cloud GHCR waits until satellite publication is complete" cloud-ghcr 'needs:.*satellites'
+has   "Cloud GHCR consumes the checked sealed archive" cloud-ghcr 'name: cloud-image-sealed'
+has   "Cloud GHCR uses the production environment" cloud-ghcr 'environment: cloud-ghcr-release'
+has   "Cloud GHCR uses the private digest publisher" cloud-ghcr 'ghcr-publish[.]sh publish'
+has   "Cloud and OP use the same release version" cloud-ghcr 'needs[.]version[.]outputs[.]version'
+has   "Cloud GHCR publishes the verified archive digest" cloud-ghcr 'needs[.]cloud-image[.]outputs[.]digest'
+hasnt "Cloud never rebuilds the approved image" cloud-ghcr 'buildx build|build-push-action'
+hasnt "Cloud never downloads connector bytes again" cloud-ghcr 'stage-connectors|release download'
+has   "cleanup waits for final Cloud publication" cleanup 'needs:.*cloud-ghcr'
+has   "Cloud Boot JAR is sealed before public artifact storage" cloud-server-jar 'seal-cloud-artifact[.]mjs seal'
+has   "Cloud OCI is sealed before public artifact storage" cloud-image 'seal-cloud-artifact[.]mjs seal'
+has   "Cloud Boot JAR opens only with its producing attempt context" cloud-image 'needs[.]cloud-server-jar[.]outputs[.]sealed_context'
+has   "Cloud OCI opens only with its producing attempt context" cloud-ghcr 'needs[.]cloud-image[.]outputs[.]sealed_context'
+hasnt "the public artifact path cannot contain a plaintext Boot JAR" cloud-server-jar 'path: app/target/app-.*boot[.]jar'
+hasnt "the public artifact path cannot contain a plaintext Cloud OCI" cloud-image 'path:.*cloud-image[.]tar'
+hasnt "Cloud GHCR never receives AWS credentials" cloud-ghcr 'AWS_|ECR_|configure-aws-credentials'
 
 # C6. The publish step edits the existing release; it never re-sends a body. Re-running the action
 # that assembled the draft would overwrite whatever the approver wrote, and nothing would say so.
