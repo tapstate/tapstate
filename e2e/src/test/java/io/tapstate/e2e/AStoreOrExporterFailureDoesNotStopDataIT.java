@@ -4,6 +4,7 @@ import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.MongoObservationStore;
+import io.tapstate.adapters.mongostore.MongoStateStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.control.core.MonitorError;
 import io.tapstate.core.lifecycle.MetricAttributes;
@@ -11,6 +12,7 @@ import io.tapstate.core.lifecycle.Observation;
 import com.sun.net.httpserver.HttpServer;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.testsupport.RequiresDocker;
 import io.tapstate.spi.store.ObservationStore;
 import org.bson.Document;
@@ -153,6 +155,152 @@ class AStoreOrExporterFailureDoesNotStopDataIT {
         Document claim = database.getCollection(MongoStorePort.WORKLOAD_CLAIMS)
                 .find(new Document("resourceType", "PIPELINE_ACTUATION").append("resourceId", PIPELINE)).first();
         return claim == null ? -1 : ((Number) claim.get("executionGeneration")).longValue();
+    }
+
+    @Test
+    void aRejectedDurableAdvanceDoesNotSubmitAJobAndRecoverySubmitsExactlyOnce() throws Exception {
+        String databaseName = "admission_cas_store";
+        String appName = "tapstate-admission-cas-store";
+        Map<String, Object> mysql = SharedMySql.settings("admission_cas_source");
+        seed(mysql);
+        String rawStoreUri = STORE.getReplicaSetUrl(databaseName);
+        String storeUri = rawStoreUri + (rawStoreUri.contains("?") ? "&" : "?") + "appName=" + appName;
+        String targetUri = SharedMongo.replicaSetUrl("admission_cas_target");
+        EndpointAddress target = EndpointAddress.uri(targetUri);
+        Path jar = Path.of(System.getProperty(BOOT_JAR_PROPERTY));
+        String jarSha = PipelineBenchmarkLiveRunIT.sha256(jar);
+        try (MongoClient admin = MongoClients.create(STORE.getReplicaSetUrl());
+                MongoEndpoints targetMongo = new MongoEndpoints();
+                ExecutionAdmissionJdiSession observer = ExecutionAdmissionJdiSession.start(
+                        storeUri, "admission_cas_operator", jar, PIPELINE)) {
+            RealProcessServer server = observer.server();
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            control.bootstrapAndLogin("admission-cas", "admission-cas-password");
+            control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
+            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+            control.apply(resources(mysql, targetUri));
+            control.discoverSchema("fault_source", "mysql", mysql);
+            control.lifecycle(PIPELINE, LifecycleVerb.START);
+            Await.until("actual initial snapshot and running pipeline", WAIT,
+                    () -> "before".equals(customer(targetMongo, target))
+                            && control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent(),
+                    () -> "target=" + customer(targetMongo, target));
+            update(mysql, "before-admission");
+            Await.until("real initial CDC before testing admission recovery", WAIT,
+                    () -> "before-admission".equals(customer(targetMongo, target)),
+                    () -> "target=" + customer(targetMongo, target));
+            var initial = observer.boundary();
+            assertThat(initial.drained()).isTrue();
+            for (var item : initial.counts().values()) {
+                assertThat(item.entries()).isEqualTo(1);
+                assertThat(item.normalReturns()).isEqualTo(1);
+                assertThat(item.exceptionalExits()).isZero();
+                assertThat(item.inFlight()).isZero();
+            }
+            assertThat(initial.bindings()).hasSize(2);
+            MongoDatabase database = admin.getDatabase(databaseName);
+            long oldGeneration = generation(database);
+            assertThat(oldGeneration).isPositive();
+            control.stop(PIPELINE, false);
+            Await.until("the initial job to stop before the admission failure", WAIT,
+                    () -> checkpointState(database) == PipelineState.STOPPED
+                            && control.state(PIPELINE).filter(PipelineState.STOPPED::equals).isPresent(),
+                    () -> "checkpoint=" + checkpointState(database) + ", state=" + control.state(PIPELINE));
+            var baseline = observer.boundary();
+            configureFault(admin, true, databaseName, appName, "workload_claims", "findAndModify");
+            ExecutionAdmissionJdiSession.Boundary failed;
+            String refusalCode;
+            try {
+                control.lifecycle(PIPELINE, LifecycleVerb.START);
+                Await.until("the actual durable advance to fail with its canonical code", WAIT,
+                        () -> control.failureCode(PIPELINE)
+                                .filter("actuation.execution-generation-unavailable"::equals).isPresent(),
+                        () -> "failure=" + control.failureCode(PIPELINE));
+                refusalCode = control.failureCode(PIPELINE).orElseThrow();
+                failed = observer.boundary();
+                assertThat(failed.drained()).isTrue();
+                var beforeAdvance = baseline.counts().get(ExecutionAdmissionJdiSession.Target.ADVANCE_STANDALONE);
+                var afterAdvance = failed.counts().get(ExecutionAdmissionJdiSession.Target.ADVANCE_STANDALONE);
+                assertThat(afterAdvance.entries() - beforeAdvance.entries()).isPositive();
+                assertThat(afterAdvance.normalReturns()).isEqualTo(beforeAdvance.normalReturns());
+                assertThat(afterAdvance.exceptionalExits() - beforeAdvance.exceptionalExits())
+                        .isEqualTo(afterAdvance.entries() - beforeAdvance.entries());
+                assertThat(afterAdvance.inFlight()).isZero();
+                var beforeSubmit = baseline.counts().get(ExecutionAdmissionJdiSession.Target.SUBMIT_JOB);
+                var afterSubmit = failed.counts().get(ExecutionAdmissionJdiSession.Target.SUBMIT_JOB);
+                assertThat(afterSubmit).isEqualTo(beforeSubmit);
+                assertThat(generation(database)).isEqualTo(oldGeneration);
+                assertThat(checkpointState(database)).isEqualTo(PipelineState.FAILED);
+                Document claim = database.getCollection(MongoStorePort.WORKLOAD_CLAIMS)
+                        .find(new Document("resourceType", "PIPELINE_ACTUATION").append("resourceId", PIPELINE)).first();
+                assertThat(claim).isNotNull();
+                assertThat(claim).doesNotContainKeys("ownerNodeId", "ownerBootId", "claimGeneration", "leaseUntil");
+            } finally {
+                configureFault(admin, false, databaseName, appName, "workload_claims", "findAndModify");
+            }
+            System.out.printf("admission-failure-cleanup meta=%s%n", physicalCaptureDiagnostic(database));
+            control.stop(PIPELINE, false);
+            Await.until("failed admission to reach a restartable stopped state", WAIT,
+                    // A final observation from the preceding run may already say STOPPED.
+                    () -> checkpointState(database) == PipelineState.STOPPED
+                            && control.state(PIPELINE).filter(PipelineState.STOPPED::equals).isPresent(),
+                    () -> "checkpoint=" + checkpointState(database) + ", state=" + control.state(PIPELINE));
+            control.lifecycle(PIPELINE, LifecycleVerb.START);
+            System.out.printf("admission-recovery-start serverOutput=%s failureCounts=%s%n",
+                    server.output(), failed.counts());
+            try {
+                Await.until("recovery to submit the new real execution", WAIT,
+                        () -> generation(database) == oldGeneration + 1
+                                && control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent(),
+                        () -> "generation=" + generation(database) + ", checkpoint=" + checkpointState(database)
+                                + ", state=" + control.state(PIPELINE) + ", failure=" + control.failureCode(PIPELINE)
+                                + ", server=" + server.output());
+            } catch (AssertionError stalled) {
+                System.out.printf("admission-recovery-diagnostic counts=%s checkpoint=%s generation=%d%n",
+                        observer.boundary().counts(), checkpointState(database), generation(database));
+                System.out.printf("admission-recovery-capture meta=%s%n", physicalCaptureDiagnostic(database));
+                throw stalled;
+            }
+            update(mysql, "after-admission");
+            Await.until("real CDC after generation admission recovers", WAIT,
+                    () -> "after-admission".equals(customer(targetMongo, target)),
+                    () -> "target=" + customer(targetMongo, target));
+            var recovered = observer.boundary();
+            assertThat(recovered.drained()).isTrue();
+            for (var key : ExecutionAdmissionJdiSession.Target.values()) {
+                var before = failed.counts().get(key);
+                var after = recovered.counts().get(key);
+                assertThat(after.entries() - before.entries()).isEqualTo(1);
+                assertThat(after.normalReturns() - before.normalReturns()).isEqualTo(1);
+                assertThat(after.exceptionalExits()).isEqualTo(before.exceptionalExits());
+                assertThat(after.inFlight()).isZero();
+            }
+            System.out.printf("admission-cas-live jarSha=%s generationFrom=%d generationTo=%d"
+                            + " failure=%s failureCounts=%s recoveryCounts=%s bindings=%s%n", jarSha,
+                    oldGeneration, generation(database), refusalCode, failed.counts(),
+                    recovered.counts(), recovered.bindings());
+            control.stop(PIPELINE, false);
+        }
+        assertThat(PipelineBenchmarkLiveRunIT.sha256(jar)).isEqualTo(jarSha);
+    }
+
+    private static PipelineState checkpointState(MongoDatabase database) {
+        return new MongoStateStore(database.getCollection(MongoStorePort.PIPELINE_STATE)).read(PIPELINE)
+                .map(checkpoint -> StateJson.parse(checkpoint.stateJson())).orElse(null);
+    }
+
+    private static List<Document> physicalCaptureDiagnostic(MongoDatabase database) {
+        Document fields = new Document("epoch", 1).append("sourceReadOffset", 1)
+                .append("sourceReadEpoch", 1).append("sourceReadSeq", 1).append("physicalPrefixTrusted", 1)
+                .append("physicalCaptureEpoch", 1).append("physicalCaptureRevision", 1)
+                .append("physicalCaptureTables", 1).append("physicalCaptureRequested", 1)
+                .append("physicalRingStarts", 1);
+        List<Document> roots = database.getCollection(MongoStorePort.SRS_META).find().projection(fields)
+                .limit(5).into(new java.util.ArrayList<>());
+        assertThat(roots).hasSizeLessThanOrEqualTo(4);
+        // Only presence is diagnostic; opaque source tokens do not enter the output.
+        roots.forEach(root -> root.put("hasSourceReadOffset", root.remove("sourceReadOffset") != null));
+        return roots;
     }
 
     private static Instant outputStart(Observation observation) {

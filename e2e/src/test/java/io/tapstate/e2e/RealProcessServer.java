@@ -140,6 +140,19 @@ final class RealProcessServer implements ServerHandle {
         return server;
     }
 
+    /** Starts an explicit artifact and operator store on the address required by a cluster member. */
+    static RealProcessServer start(String storeUri, String operatorStateDatabase, Path jar,
+            String listenAddress, IntFunction<List<String>> extraArguments) {
+        RealProcessServer server = launching(storeUri, operatorStateDatabase, jar, listenAddress, extraArguments);
+        try {
+            awaitHealthy(server.process, server.baseUrl, server.output);
+        } catch (RuntimeException | AssertionError e) {
+            server.process.destroyForcibly();
+            throw e;
+        }
+        return server;
+    }
+
     /**
      * Launches the deliverable and returns straight away, without waiting for it to serve.
      *
@@ -199,7 +212,7 @@ final class RealProcessServer implements ServerHandle {
         return launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, jar, listenAddress, extraArguments);
     }
 
-    private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
+    static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
             String listenAddress, IntFunction<List<String>> extraArguments) {
         return launching(storeUri, operatorStateDatabase, jar, listenAddress, extraArguments, List.of());
     }
@@ -253,6 +266,11 @@ final class RealProcessServer implements ServerHandle {
     /** Whether it is still running, so a witness waiting on it can tell waiting from waiting forever. */
     boolean isAlive() {
         return process.isAlive();
+    }
+
+    /** Waits for the owned child using the same startup health contract as ordinary launches. */
+    void awaitHealthy() {
+        awaitHealthy(process, baseUrl, output);
     }
 
     /** The child JVM identity used by external benchmark resource sampling. */

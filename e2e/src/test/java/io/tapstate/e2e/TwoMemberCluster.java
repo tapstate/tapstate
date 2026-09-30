@@ -1,11 +1,14 @@
 package io.tapstate.e2e;
 
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.IntFunction;
 
 /**
  * Two server processes of one cluster, brought up together over one coordination store.
@@ -17,7 +20,8 @@ import java.util.concurrent.atomic.AtomicReference;
  * loopback. So each member listens everywhere, is dialled on the loopback, and advertises the address
  * another machine could reach it at - the one arrangement that satisfies all three at once.
  *
- * <p>Each bring-up gets a cluster id of its own. In cluster mode that id is also the name of the member
+ * <p>Each independent bring-up gets a cluster id of its own; a mode change reuses its own stored identity.
+ * In cluster mode that id is also the name of the member
  * protocol's cluster, the protocol is unauthenticated, and these members bind a real interface - so a
  * shared id would let two runs on one network join each other, and anything asserted about the
  * membership would have somebody else's process in it.
@@ -50,9 +54,20 @@ final class TwoMemberCluster implements AutoCloseable {
     private final String bindAddress;
     private final String seeds;
     private final Duration nodeSessionTtl;
+    private final Path applicationJar;
+    private final String operatorStateDatabase;
+    private final String administrator;
+    private final String password;
 
     private TwoMemberCluster(RealProcessServer first, RealProcessServer second, String storeUri,
             String clusterId, String bindAddress, String seeds, Duration nodeSessionTtl) {
+        this(first, second, storeUri, clusterId, bindAddress, seeds, nodeSessionTtl,
+                null, null, ADMIN, PASSWORD);
+    }
+
+    private TwoMemberCluster(RealProcessServer first, RealProcessServer second, String storeUri,
+            String clusterId, String bindAddress, String seeds, Duration nodeSessionTtl,
+            Path applicationJar, String operatorStateDatabase, String administrator, String password) {
         this.first = first;
         this.second = second;
         this.a = new ControlPlane(first.baseUrl());
@@ -62,6 +77,10 @@ final class TwoMemberCluster implements AutoCloseable {
         this.bindAddress = bindAddress;
         this.seeds = seeds;
         this.nodeSessionTtl = nodeSessionTtl;
+        this.applicationJar = applicationJar;
+        this.operatorStateDatabase = operatorStateDatabase;
+        this.administrator = administrator;
+        this.password = password;
     }
 
     /**
@@ -109,6 +128,43 @@ final class TwoMemberCluster implements AutoCloseable {
             cluster.a.bootstrapAndLogin(ADMIN, PASSWORD);
             // The administrator lives in the store both of them share, so the second does not create one.
             cluster.b.login(ADMIN, PASSWORD);
+        } catch (RuntimeException | Error failure) {
+            cluster.close();
+            throw failure;
+        }
+        return cluster;
+    }
+
+    /** Reopens one existing store and cluster identity with the same explicit application and operator store. */
+    static TwoMemberCluster start(String storeUri, String operatorStateDatabase, Path applicationJar,
+            String clusterId, String administrator, String password) {
+        Objects.requireNonNull(applicationJar, "applicationJar");
+        Objects.requireNonNull(operatorStateDatabase, "operatorStateDatabase");
+        Objects.requireNonNull(clusterId, "clusterId");
+        Objects.requireNonNull(administrator, "administrator");
+        Objects.requireNonNull(password, "password");
+        if (operatorStateDatabase.isBlank() || clusterId.isBlank() || administrator.isBlank() || password.isBlank()) {
+            throw new IllegalArgumentException("an existing cluster needs its store, identity, and administrator");
+        }
+        String bindAddress = RoutableAddress.ofThisMachine();
+        int memberPortA = RealProcessServer.reservePort();
+        int memberPortB = RealProcessServer.reservePort();
+        String seeds = bindAddress + ":" + memberPortA + "," + bindAddress + ":" + memberPortB;
+        RealProcessServer first = RealProcessServer.start(storeUri, operatorStateDatabase, applicationJar, "0.0.0.0",
+                httpPort -> arguments(clusterId, NODE_A, memberPortA, seeds, httpPort, bindAddress, null));
+        RealProcessServer second;
+        try {
+            second = RealProcessServer.start(storeUri, operatorStateDatabase, applicationJar, "0.0.0.0",
+                    httpPort -> arguments(clusterId, NODE_B, memberPortB, seeds, httpPort, bindAddress, null));
+        } catch (RuntimeException | Error failure) {
+            first.close();
+            throw failure;
+        }
+        TwoMemberCluster cluster = new TwoMemberCluster(first, second, storeUri, clusterId, bindAddress,
+                seeds, null, applicationJar, operatorStateDatabase, administrator, password);
+        try {
+            cluster.a.login(administrator, password);
+            cluster.b.login(administrator, password);
         } catch (RuntimeException | Error failure) {
             cluster.close();
             throw failure;
@@ -165,9 +221,10 @@ final class TwoMemberCluster implements AutoCloseable {
      */
     RealProcessServer launching(String nodeId) {
         int memberPort = RealProcessServer.reservePort();
-        return RealProcessServer.launching(storeUri, "0.0.0.0",
-                httpPort -> arguments(
-                        clusterId, nodeId, memberPort, seeds, httpPort, bindAddress, nodeSessionTtl));
+        IntFunction<List<String>> options = httpPort -> arguments(
+                clusterId, nodeId, memberPort, seeds, httpPort, bindAddress, nodeSessionTtl);
+        return applicationJar == null ? RealProcessServer.launching(storeUri, "0.0.0.0", options)
+                : RealProcessServer.launching(storeUri, operatorStateDatabase, applicationJar, "0.0.0.0", options);
     }
 
     /**
@@ -179,7 +236,7 @@ final class TwoMemberCluster implements AutoCloseable {
      */
     ControlPlane signedInAt(RealProcessServer member) {
         ControlPlane control = new ControlPlane(member.baseUrl());
-        control.login(ADMIN, PASSWORD);
+        control.login(administrator, password);
         return control;
     }
 
