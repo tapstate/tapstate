@@ -113,12 +113,15 @@ class ARunIsLeftAloneWhenAMemberJoinsTest {
         while (System.nanoTime() < deadline) {
             last = first.getJet().getJob(PIPELINE) == null
                     ? null : first.getJet().getJob(PIPELINE).getStatus();
-            if (last == JobStatus.RUNNING) {
+            // Jet reports RUNNING before the execution thread initializes the source. The join
+            // must happen after the source starts, or it is not joining an already running source.
+            if (last == JobStatus.RUNNING && STARTS.get() > 0) {
                 return;
             }
             sleep(25);
         }
-        throw new AssertionError("the run never reached RUNNING; its last status was " + last);
+        throw new AssertionError("the source never started in a RUNNING job; its last status was "
+                + last + " and its start count was " + STARTS.get());
     }
 
     private void awaitBothMembersSeeEachOther() {

@@ -177,7 +177,7 @@ public final class MongoSrsLogStore implements SrsLogStore {
                 .append("ts", record.ts())
                 .append("schemaVer", record.schemaVer());
         if (record.captureFence() != null) {
-            document.append("captureFence", fenceDocument(record.captureFence()));
+            document.append("captureFence", WorkloadClaimDocuments.stored(record.captureFence()));
         }
         // The nullable fields are written only when present, never as explicit nulls -- the same shape the
         // meta store uses, so a reader tells "no position" from "a position that is the empty string".
@@ -235,7 +235,8 @@ public final class MongoSrsLogStore implements SrsLogStore {
         StoreIo.run(() -> {
             try (ClientSession session = client.startSession()) {
                 session.withTransaction(() -> {
-                    UpdateResult proved = workloadClaims.updateOne(session, liveClaim(fence), PROVE_THE_CLAIM);
+                    UpdateResult proved = workloadClaims.updateOne(
+                            session, WorkloadClaimDocuments.live(fence), PROVE_THE_CLAIM);
                     if (proved.getMatchedCount() != 1) {
                         throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
                     }
@@ -244,30 +245,6 @@ public final class MongoSrsLogStore implements SrsLogStore {
                 });
             }
         });
-    }
-
-    private static Document liveClaim(WorkloadClaimFence fence) {
-        Document id = new Document("clusterId", fence.key().clusterId())
-                .append("resourceType", fence.key().type().name())
-                .append("resourceId", fence.key().resourceId());
-        return new Document("_id", id)
-                .append("ownerNodeId", fence.owner().nodeId())
-                .append("ownerBootId", fence.owner().bootId())
-                .append("claimGeneration", fence.claimGeneration())
-                .append("executionGeneration", fence.executionGeneration())
-                .append("topologyRevision", fence.topologyRevision())
-                .append("$expr", new Document("$gt", List.of("$leaseUntil", "$$NOW")));
-    }
-
-    private static Document fenceDocument(WorkloadClaimFence fence) {
-        return new Document("clusterId", fence.key().clusterId())
-                .append("resourceType", fence.key().type().name())
-                .append("resourceId", fence.key().resourceId())
-                .append("ownerNodeId", fence.owner().nodeId())
-                .append("ownerBootId", fence.owner().bootId())
-                .append("claimGeneration", fence.claimGeneration())
-                .append("executionGeneration", fence.executionGeneration())
-                .append("topologyRevision", fence.topologyRevision());
     }
 
     private static WorkloadClaimFence readFence(Document fence) {
