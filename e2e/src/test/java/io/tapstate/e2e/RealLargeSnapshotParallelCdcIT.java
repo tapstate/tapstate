@@ -67,6 +67,9 @@ class RealLargeSnapshotParallelCdcIT {
                     () -> "before".equals(fastStatus(mongo, target)),
                     () -> "state=" + control.state(FAST_PIPELINE) + ", target=" + fastStatus(mongo, target));
             assertThat(control.state(FAST_PIPELINE)).contains(PipelineState.RUNNING);
+            long firstFastRecords = Await.answered("parallel CDC records-out baseline",
+                    () -> control.recordsOut(FAST_PIPELINE).filter(count -> count > 0));
+            Instant firstFastObserved = control.statusObservedAt(FAST_PIPELINE);
 
             control.lifecycle(BULK_PIPELINE, LifecycleVerb.START);
             Await.until("bulk snapshot to be visibly in flight", Duration.ofMinutes(3),
@@ -88,6 +91,18 @@ class RealLargeSnapshotParallelCdcIT {
             assertThat(rowsAtFastDelivery)
                     .as("the other pipeline delivered CDC before the bulk load finished")
                     .isBetween(1L, BULK_ROWS - 1L);
+            awaitFastProgress(control, firstFastRecords, firstFastObserved);
+            long secondFastRecords = control.recordsOut(FAST_PIPELINE).orElseThrow();
+            Instant secondFastObserved = control.statusObservedAt(FAST_PIPELINE);
+            updateFast(fastMysql, "after_again");
+            Await.until("second CDC change during the other snapshot", Duration.ofMinutes(2),
+                    () -> "after_again".equals(fastStatus(mongo, target)),
+                    () -> "fast=" + control.state(FAST_PIPELINE)
+                            + ", target=" + fastStatus(mongo, target)
+                            + ", bulkRows=" + inFlightRows(control));
+            awaitFastProgress(control, secondFastRecords, secondFastObserved);
+            long finalFastRecords = control.recordsOut(FAST_PIPELINE).orElseThrow();
+            Instant finalFastObserved = control.statusObservedAt(FAST_PIPELINE);
             Await.until("snapshot rows and freshness to progress while CDC stays live", Duration.ofSeconds(20),
                     () -> inFlightRows(control) > firstRows && inFlightRows(control) < BULK_ROWS
                             && control.statusObservedAt(BULK_PIPELINE).isAfter(firstObserved),
@@ -106,14 +121,28 @@ class RealLargeSnapshotParallelCdcIT {
             assertThat(control.errorCount(FAST_PIPELINE)).contains(0L);
             System.out.printf("large-snapshot-live jar=%s bulkRows=%d firstObservedRows=%d"
                             + " rowsWhenParallelCdcDelivered=%d parallelCdcMs=%.3f"
+                            + " fastRecordsFrom=%d fastRecordsMid=%d fastRecordsTo=%d"
+                            + " fastObservedFrom=%s fastObservedMid=%s fastObservedTo=%s"
                             + " physicallyDelivered=%d%n",
                     jar, BULK_ROWS, firstRows, rowsAtFastDelivery,
-                    deliveredNanos / 1_000_000.0, physicallyDelivered);
+                    deliveredNanos / 1_000_000.0, firstFastRecords, secondFastRecords, finalFastRecords,
+                    firstFastObserved, secondFastObserved, finalFastObserved, physicallyDelivered);
         }
     }
 
     private static long inFlightRows(ControlPlane control) {
         return control.snapshotRowsRead(BULK_PIPELINE).getOrDefault("bulk_orders", 0L);
+    }
+
+    private static void awaitFastProgress(ControlPlane control, long previousRecords, Instant previousObserved) {
+        Await.until("parallel CDC freshness and records-out during the other snapshot", Duration.ofSeconds(20),
+                () -> inFlightRows(control) > 0
+                        && inFlightRows(control) < BULK_ROWS
+                        && control.recordsOut(FAST_PIPELINE).orElse(0L) > previousRecords
+                        && control.statusObservedAt(FAST_PIPELINE).isAfter(previousObserved),
+                () -> "recordsOut=" + control.recordsOut(FAST_PIPELINE)
+                        + ", observedAt=" + control.statusObservedAt(FAST_PIPELINE)
+                        + ", bulkRows=" + inFlightRows(control));
     }
 
     private static String fastStatus(MongoEndpoints mongo, EndpointAddress target) {
@@ -142,9 +171,14 @@ class RealLargeSnapshotParallelCdcIT {
     }
 
     private static void updateFast(Map<String, Object> mysql) throws Exception {
+        updateFast(mysql, "after");
+    }
+
+    private static void updateFast(Map<String, Object> mysql, String status) throws Exception {
         try (Connection connection = SharedMySql.connect(mysql);
-                Statement statement = connection.createStatement()) {
-            statement.execute("UPDATE fast_orders SET status='after' WHERE id=1");
+                var statement = connection.prepareStatement("UPDATE fast_orders SET status=? WHERE id=1")) {
+            statement.setString(1, status);
+            statement.executeUpdate();
         }
     }
 
