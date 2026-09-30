@@ -143,6 +143,9 @@ final class ConvergenceDriver {
     void reconcile() {
         if (!businessEligible.getAsBoolean()) {
             lifecycleWork.cancelAll();
+            if (observationScopes != null) {
+                observationScopes.cancelRestorations();
+            }
             if (pendingWork != null) {
                 pendingWork.clearAll();
             }
@@ -177,6 +180,9 @@ final class ConvergenceDriver {
                     // starts one in -- and publishing here would overwrite the driver's observation with
                     // this member's own run statistics, which are absent because the run is not here.
                     lifecycleWork.cancel(pipelineId);
+                    if (observationScopes != null) {
+                        observationScopes.cancelRestoration(pipelineId);
+                    }
                     if (pendingWork != null) {
                         pendingWork.clear(pipelineId);
                     }
@@ -229,7 +235,7 @@ final class ConvergenceDriver {
                             failure.code(), result.failure().orElse(null));
                 }
                 offerEvents(pipelineId, result, failure);
-                publish(pipelineId, failure).ifPresent(published -> {
+                publish(pipelineId, failure, result, permit).ifPresent(published -> {
                     sample(published);
                     export(published);
                 });
@@ -316,7 +322,7 @@ final class ConvergenceDriver {
         try {
             PipelineStateEvents.of(pipelineId, scope, result, failure, recovering)
                     .forEach(telemetryWork::offerEvent);
-            if (after == PipelineState.FAILED && failure != null) {
+            if (after == PipelineState.FAILED) {
                 failedIncarnations.put(pipelineId, scope.pipelineIncarnationId());
             } else if (recovering) {
                 failedIncarnations.remove(pipelineId);
@@ -358,10 +364,20 @@ final class ConvergenceDriver {
     }
 
     private Optional<io.tapstate.core.lifecycle.Observation> publish(String pipelineId, ObservationFailure failure) {
+        return publish(pipelineId, failure, null, null);
+    }
+
+    private Optional<io.tapstate.core.lifecycle.Observation> publish(String pipelineId, ObservationFailure failure,
+            ConvergeResult result, PipelineActuationOwnership.Permit permit) {
         if (telemetryWork != null) {
             Optional<io.tapstate.spi.store.ObservationStore.Scope> scope = observationScopes == null
                     ? Optional.empty() : observationScopes.current(pipelineId);
             if (observationScopes != null && scope.isEmpty()) {
+                if (permit != null && permit.granted()) {
+                    telemetryWork.offerScopeRecovery(pipelineId, result, failure,
+                            ObservationScopeRecovery.Owner.of(permit.claim()),
+                            () -> stillOwner(pipelineId, permit));
+                }
                 return Optional.empty();
             }
             (scope.isPresent()
@@ -375,6 +391,26 @@ final class ConvergenceDriver {
         }
         return observationScopes.current(pipelineId)
                 .flatMap(scope -> publisher.publishScoped(pipelineId, failure, scope));
+    }
+
+    /** Lease renewal time may move; the actual owner and both fencing generations must not. */
+    private boolean stillOwner(String pipelineId, PipelineActuationOwnership.Permit expected) {
+        if (!businessEligible.getAsBoolean()) {
+            return false;
+        }
+        PipelineActuationOwnership.Permit current = actuation.permit(pipelineId);
+        if (!current.granted()) {
+            return false;
+        }
+        var before = expected.claim();
+        var now = current.claim();
+        if (before == null || now == null) {
+            return before == now;
+        }
+        return before.key().equals(now.key()) && before.owner().equals(now.owner())
+                && before.claimGeneration() == now.claimGeneration()
+                && before.executionGeneration() == now.executionGeneration()
+                && before.topologyRevision() == now.topologyRevision();
     }
 
     /** Offers the same measured facts to export on the inline compatibility path. */

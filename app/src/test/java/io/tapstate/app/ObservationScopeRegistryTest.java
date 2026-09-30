@@ -8,6 +8,10 @@ import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
+import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
@@ -15,10 +19,139 @@ import java.util.List;
 import java.util.ArrayList;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 class ObservationScopeRegistryTest {
+
+    @Test
+    void aFactsAbsentFrameRetainsItsLegacyMetricsWithoutInventingMeasurements() {
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        var scope = scopes.begin(PIPELINE, "inc-a", 41);
+        Observation legacy = new Observation(PIPELINE, PipelineState.RUNNING,
+                Map.of("records.out", 7L, "lag.orders", 2L), Map.of(), Map.of(), null, START);
+        var prepared = new ObservationPublisher.Prepared(legacy, false, Map.of(), Map.of(), Map.of());
+
+        var continued = scopes.continueFrame(prepared, scope).observation();
+
+        assertThat(continued.metrics()).containsExactlyInAnyOrderEntriesOf(legacy.metrics());
+        assertThat(continued.facts()).isEmpty();
+        InMemoryRateHistoryStore history = new InMemoryRateHistoryStore();
+        assertThat(new io.tapstate.runtime.scheduler.RateSampler(history, java.time.Duration.ofMinutes(1))
+                .appendIfDue(continued, scope)).isTrue();
+        assertThat(history.readPage(PIPELINE, START, START.plusSeconds(1), null, 10).entries())
+                .singleElement().satisfies(entry -> assertThat(entry.sample().countingSince()).isNull());
+
+        scopes.prepareRebuildingResume(PIPELINE, Optional.empty());
+        var rebuilt = scopes.begin(PIPELINE, "inc-a", 42);
+        Observation nextLegacy = new Observation(PIPELINE, PipelineState.RUNNING,
+                legacy.metrics(), Map.of(), Map.of(), null, START.plusSeconds(1));
+        var nextPrepared = new ObservationPublisher.Prepared(nextLegacy, false, Map.of(), Map.of(), Map.of());
+        assertThat(scopes.continueFrame(nextPrepared, rebuilt).observation()).satisfies(next -> {
+            assertThat(next.metrics()).containsExactlyInAnyOrderEntriesOf(legacy.metrics());
+            assertThat(next.facts()).isEmpty();
+        });
+    }
+
+    @Test
+    void aTypedCounterWithMixedNativeStartsDoesNotRestoreItsLegacyFlatValue() {
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        var scope = scopes.begin(PIPELINE, "inc-a", 41);
+        MetricFact unknown = new MetricFact("tapstate.pipeline.records", MetricType.COUNTER, "{record}",
+                List.of(MetricPoint.accumulated(Map.of(MetricAttributes.PIPELINE_ID, PIPELINE,
+                                MetricAttributes.DIRECTION, "out", MetricAttributes.TABLE_ID, "table-a"),
+                                START, START.plusSeconds(1), 4),
+                        MetricPoint.accumulated(Map.of(MetricAttributes.PIPELINE_ID, PIPELINE,
+                                MetricAttributes.DIRECTION, "out", MetricAttributes.TABLE_ID, "table-b"),
+                                START.minusSeconds(1), START.plusSeconds(1), 3)));
+        Observation observation = new Observation(PIPELINE, PipelineState.RUNNING,
+                Map.of("records.out", 7L), Map.of(), Map.of(), null, START.plusSeconds(1), List.of(unknown));
+        var prepared = new ObservationPublisher.Prepared(observation, false, Map.of(), Map.of(), Map.of());
+
+        var continued = scopes.continueFrame(prepared, scope).observation();
+
+        assertThat(continued.metrics()).doesNotContainKey("records.out");
+        assertThat(continued.facts()).flatExtracting(MetricFact::points).isEmpty();
+    }
+
+    @Test
+    void leaseRenewalKeepsOneTicketWhileAnotherOwnerOrFenceInvalidatesIt() {
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        var key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, PIPELINE);
+        var owner = new WorkloadOwner("node-a", "boot-a");
+        var first = new WorkloadClaim(key, owner, 1, 41, 3, START.plusSeconds(5));
+        var renewed = new WorkloadClaim(key, owner, 1, 41, 3, START.plusSeconds(10));
+        var ticket = scopes.restoration(PIPELINE, null, null, ObservationScopeRecovery.Owner.of(first))
+                .orElseThrow();
+        assertThat(scopes.restoration(PIPELINE, null, null, ObservationScopeRecovery.Owner.of(renewed))
+                .orElseThrow()).isSameAs(ticket);
+        var next = new WorkloadClaim(key, new WorkloadOwner("node-b", "boot-b"),
+                2, 41, 3, START.plusSeconds(10));
+        var replacement = scopes.restoration(PIPELINE, null, null, ObservationScopeRecovery.Owner.of(next))
+                .orElseThrow();
+        assertThat(scopes.awaiting(ticket)).isFalse();
+        assertThat(scopes.awaiting(replacement)).isTrue();
+    }
+
+    @Test
+    void aLateRestoreCannotCrossBeginDiscardDeleteOrRetainEvenWhenCurrentWasAbsent() {
+        List<Consumer<ObservationScopeRegistry>> invalidations = List.of(
+                scopes -> scopes.begin(PIPELINE, "inc-a", 42),
+                scopes -> {
+                    var next = scopes.begin(PIPELINE, "inc-a", 42);
+                    scopes.discard(PIPELINE, next);
+                },
+                scopes -> scopes.discard(PIPELINE, new ObservationStore.Scope("inc-a", 41)),
+                scopes -> scopes.forgetIncarnation(PIPELINE, "inc-a"),
+                scopes -> scopes.retain(List.of()),
+                scopes -> scopes.cancelRestoration(PIPELINE));
+        var saved = new ObservationStore.Stored(frame(START, START, 7).observation(),
+                Optional.of(new ObservationStore.Scope("inc-a", 41)));
+        for (var invalidate : invalidations) {
+            ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+            var ticket = scopes.restoration(PIPELINE, null, null).orElseThrow();
+            assertThat(scopes.awaiting(ticket)).isTrue();
+            invalidate.accept(scopes);
+            assertThat(scopes.awaiting(ticket)).isFalse();
+            assertThat(scopes.restore(ticket, saved)).isFalse();
+            assertThat(scopes.current(PIPELINE)).isNotEqualTo(saved.scope());
+        }
+    }
+
+    @Test
+    void restoredHistoryIsNotANativeProducerButSuppliesAStoppedFinalAndExplicitRebuildFloor() {
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        var owner = new ObservationStore.Scope("inc-a", 41);
+        var saved = new ObservationStore.Stored(frame(START, START.minusSeconds(60), 7).observation(),
+                Optional.of(owner));
+        var ticket = scopes.restoration(PIPELINE, null, null).orElseThrow();
+        assertThat(scopes.restore(ticket, saved)).isTrue();
+        scopes.restored(ticket);
+        assertThat(scopes.continuing(PIPELINE, owner)).isFalse();
+        assertThat(scopes.needsStoredFallback(PIPELINE)).isFalse();
+        var failed = scopes.continueFrame(gaugeFrame(START.plusSeconds(1), 22, PipelineState.FAILED), owner);
+        assertThat(failed.observation().facts()).allMatch(fact -> fact.type() == MetricType.GAUGE);
+
+        scopes.prepareRebuildingResume(PIPELINE, Optional.empty());
+        var next = scopes.begin(PIPELINE, "inc-a", 42);
+        var resumed = scopes.continueFrame(frame(START.plusSeconds(2), START.plusSeconds(2), 2), next);
+        assertThat(counter(resumed)).isEqualTo(9);
+        assertThat(start(resumed)).isEqualTo(START.minusSeconds(60));
+
+        scopes.clearContinuation(PIPELINE);
+        var fresh = scopes.begin(PIPELINE, "inc-a", 43);
+        assertThat(counter(scopes.continueFrame(frame(START.plusSeconds(3), START.plusSeconds(3), 1), fresh)))
+                .isEqualTo(1);
+
+        ObservationScopeRegistry stoppedScopes = new ObservationScopeRegistry();
+        var stoppedTicket = stoppedScopes.restoration(PIPELINE, null, null).orElseThrow();
+        assertThat(stoppedScopes.restore(stoppedTicket, saved)).isTrue();
+        stoppedScopes.restored(stoppedTicket);
+        var stopped = stoppedScopes.continueFrame(gaugeFrame(START.plusSeconds(4), 22, PipelineState.STOPPED), owner);
+        assertThat(counter(stopped)).isEqualTo(7);
+        assertThat(start(stopped)).isEqualTo(START.minusSeconds(60));
+    }
 
     @Test
     void removingAnOldIncarnationInvalidatesItsScopeButCannotEraseARecreatedOne() {

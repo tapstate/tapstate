@@ -4,6 +4,7 @@ import io.tapstate.core.lifecycle.PipelineEvent;
 import io.tapstate.spi.store.ObservationStore;
 
 import java.time.Clock;
+import java.time.Instant;
 import java.util.Collection;
 import java.util.EnumMap;
 import java.util.LinkedHashMap;
@@ -41,6 +42,12 @@ final class TelemetryBoundaryEvents {
     }
 
     synchronized void failed(String id, ObservationStore.Scope scope, TelemetryDispatcher.Sink sink) {
+        failed(id, scope, sink, clock.instant(), System.nanoTime());
+    }
+
+    /** A qualified cold recovery can replay the original failure time after its scope becomes current. */
+    synchronized void failed(String id, ObservationStore.Scope scope, TelemetryDispatcher.Sink sink,
+            Instant occurredAt, long failedNanos) {
         requireDataSink(sink);
         if (scope == null || !current.test(id, scope)) {
             return;
@@ -55,14 +62,18 @@ final class TelemetryBoundaryEvents {
                 episodes.entrySet().removeIf(entry -> !current.test(entry.getKey(), entry.getValue().scope()));
             }
             if (episodes.size() >= capacity) {
-                lost.accept(event(id, scope, sink, PipelineEvent.Kind.TELEMETRY_DEGRADED));
+                lost.accept(event(id, scope, sink, PipelineEvent.Kind.TELEMETRY_DEGRADED, occurredAt));
                 return;
             }
             episode = new Episode(scope, new EnumMap<>(TelemetryDispatcher.Sink.class));
             episodes.put(id, episode);
         }
-        if (episode.failures().put(sink, System.nanoTime()) == null) {
-            offer.accept(event(id, scope, sink, PipelineEvent.Kind.TELEMETRY_DEGRADED));
+        Long before = episode.failures().get(sink);
+        if (before == null || failedNanos - before > 0) {
+            episode.failures().put(sink, failedNanos);
+        }
+        if (before == null) {
+            offer.accept(event(id, scope, sink, PipelineEvent.Kind.TELEMETRY_DEGRADED, occurredAt));
         }
     }
 
@@ -97,6 +108,11 @@ final class TelemetryBoundaryEvents {
 
     private PipelineEvent event(String id, ObservationStore.Scope scope,
             TelemetryDispatcher.Sink sink, PipelineEvent.Kind kind) {
+        return event(id, scope, sink, kind, clock.instant());
+    }
+
+    private PipelineEvent event(String id, ObservationStore.Scope scope,
+            TelemetryDispatcher.Sink sink, PipelineEvent.Kind kind, Instant occurredAt) {
         String reason = switch (sink) {
             case LATEST -> "latest observation write";
             case HISTORY -> "history sample";
@@ -107,7 +123,7 @@ final class TelemetryBoundaryEvents {
         // Preserve transition order in the public (millisecond time, opaque id) query key.
         String eventId = "telemetry-" + streamId + "-" + String.format(Locale.ROOT, "%019d", sequence);
         return new PipelineEvent(eventId, id, scope.pipelineIncarnationId(),
-                scope.executionGeneration(), kind, clock.instant(), null, null, null, reason, null);
+                scope.executionGeneration(), kind, occurredAt, null, null, null, reason, null);
     }
 
     private static void requireDataSink(TelemetryDispatcher.Sink sink) {

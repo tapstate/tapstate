@@ -16,6 +16,7 @@ import io.tapstate.adapters.otel.OtelMetricsExport;
 import io.tapstate.spi.metrics.MetricsExport;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.spi.store.ClusterIdentityStore;
+import io.tapstate.spi.store.ExecutionGenerationStore;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.beans.factory.annotation.Value;
@@ -144,8 +145,14 @@ class RuntimeConvergenceConfiguration {
 
     @Bean(destroyMethod = "close")
     TelemetryDispatcher telemetryDispatcher(ObservationPublisher publisher, RateSampler sampler,
-            MetricsExport export, ObservationScopeRegistry scopes, StorePort storePort) {
-        return new TelemetryDispatcher(publisher, sampler, export, scopes, storePort.events(),
+            MetricsExport export, ObservationScopeRegistry scopes, StorePort storePort,
+            ExecutionGenerationStore generations, ClusterProperties cluster, ClusterIdentityStore identities) {
+        String clusterId = cluster.getProfile() == ClusterProperties.Profile.SINGLE
+                ? DataPlaneActuationConfiguration.standaloneClusterId(cluster, identities)
+                : cluster.getId();
+        ObservationScopeRecovery recovery = new ObservationScopeRecovery(storePort.artifacts(), generations,
+                storePort.observations(), storePort.state(), clusterId);
+        return new TelemetryDispatcher(publisher, sampler, export, scopes, storePort.events(), recovery,
                 TelemetryDispatcher.DEFAULT_LATEST_WORKERS, TelemetryDispatcher.DEFAULT_QUEUE_CAPACITY);
     }
 

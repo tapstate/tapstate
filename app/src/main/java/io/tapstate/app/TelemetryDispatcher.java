@@ -1,7 +1,11 @@
 package io.tapstate.app;
 
 import io.tapstate.core.lifecycle.Observation;
+import io.tapstate.core.lifecycle.ObservationFailure;
+import io.tapstate.core.lifecycle.MetricAttributes;
+import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.core.lifecycle.PipelineEvent;
+import io.tapstate.runtime.scheduler.ConvergeResult;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.runtime.scheduler.RateSampler;
 import io.tapstate.spi.metrics.MetricsExport;
@@ -43,6 +47,7 @@ final class TelemetryDispatcher implements AutoCloseable {
     private static final Duration DEFAULT_WRITE_DEADLINE = Duration.ofSeconds(5);
     private static final Duration CLOSE_DEADLINE = Duration.ofSeconds(2);
     private static final Duration BREAKER_COOLDOWN = Duration.ofSeconds(1);
+    private record FailureTime(Instant occurredAt, long nanos) { }
 
     enum Sink {
         LATEST, HISTORY, EXPORT, EVENT
@@ -120,7 +125,9 @@ final class TelemetryDispatcher implements AutoCloseable {
         private static final class Operation {
             private final long started = System.nanoTime();
             private final String pipelineId;
-            private final ObservationStore.Scope scope;
+            private volatile ObservationStore.Scope scope;
+            private volatile ObservationScopeRegistry.RestoreTicket restoreTicket;
+            private volatile FailureTime failureTime;
             /** 0 running, 1 timed out while running, 2 finished. */
             private final AtomicInteger state = new AtomicInteger();
 
@@ -236,8 +243,12 @@ final class TelemetryDispatcher implements AutoCloseable {
         private void watch(String sink, Duration deadline, Consumer<Operation> onTimeout) {
             long now = System.nanoTime();
             for (Operation operation : inFlight.values()) {
-                if (now - operation.started >= deadline.toNanos()
-                        && operation.state.compareAndSet(0, 1)) {
+                if (now - operation.started >= deadline.toNanos() && operation.state.get() == 0) {
+                    operation.failureTime = new FailureTime(Instant.now(), now);
+                    if (!operation.state.compareAndSet(0, 1)) {
+                        operation.failureTime = null;
+                        continue;
+                    }
                     timeouts.incrementAndGet();
                     lastProblemNanos.accumulateAndGet(now, Stats::laterTimestamp);
                     openUntilNanos.set(now + BREAKER_COOLDOWN.toNanos());
@@ -268,7 +279,7 @@ final class TelemetryDispatcher implements AutoCloseable {
         }
     }
 
-    private sealed interface Frame permits ObservationFrame, ReconcileFailureFrame {
+    private sealed interface Frame permits ObservationFrame, ReconcileFailureFrame, RecoveryFrame {
         ObservationStore.Scope scope();
     }
 
@@ -280,10 +291,16 @@ final class TelemetryDispatcher implements AutoCloseable {
             implements Frame {
     }
 
+    private record RecoveryFrame(ObservationScopeRegistry.RestoreTicket ticket, BooleanSupplier owner)
+            implements Frame {
+        @Override public ObservationStore.Scope scope() { return null; }
+    }
+
     private final ObservationPublisher publisher;
     private final RateSampler sampler;
     private final MetricsExport export;
     private final ObservationScopeRegistry scopes;
+    private final ObservationScopeRecovery scopeRecovery;
     private final PipelineEventStore events;
     private final TelemetryBoundaryEvents boundaryEvents;
     private final ThreadPoolExecutor latestWorkers;
@@ -338,10 +355,24 @@ final class TelemetryDispatcher implements AutoCloseable {
     TelemetryDispatcher(ObservationPublisher publisher, RateSampler sampler, MetricsExport export,
             ObservationScopeRegistry scopes, PipelineEventStore events,
             int latestConcurrency, int queueCapacity, Duration writeDeadline) {
+        this(publisher, sampler, export, scopes, events, null, latestConcurrency, queueCapacity, writeDeadline);
+    }
+
+    TelemetryDispatcher(ObservationPublisher publisher, RateSampler sampler, MetricsExport export,
+            ObservationScopeRegistry scopes, PipelineEventStore events, ObservationScopeRecovery scopeRecovery,
+            int latestConcurrency, int queueCapacity) {
+        this(publisher, sampler, export, scopes, events, scopeRecovery, latestConcurrency, queueCapacity,
+                DEFAULT_WRITE_DEADLINE);
+    }
+
+    TelemetryDispatcher(ObservationPublisher publisher, RateSampler sampler, MetricsExport export,
+            ObservationScopeRegistry scopes, PipelineEventStore events, ObservationScopeRecovery scopeRecovery,
+            int latestConcurrency, int queueCapacity, Duration writeDeadline) {
         this.publisher = Objects.requireNonNull(publisher, "publisher");
         this.sampler = sampler;
         this.export = Objects.requireNonNull(export, "export");
         this.scopes = scopes;
+        this.scopeRecovery = scopeRecovery;
         if (scopes != null) {
             export.bindCurrentScopes(id -> scopes.current(id).map(owner -> new MetricsExport.ScopeToken(
                     owner.pipelineIncarnationId(), owner.executionGeneration())));
@@ -369,7 +400,7 @@ final class TelemetryDispatcher implements AutoCloseable {
         });
         long periodMillis = Math.max(10, Math.min(1000, writeDeadline.toMillis() / 4));
         watchdog.scheduleWithFixedDelay(() -> {
-            latestStats.watch("latest", writeDeadline, op -> boundaryFailed(op.pipelineId, op.scope, Sink.LATEST));
+            latestStats.watch("latest", writeDeadline, this::latestFailure);
             historyStats.watch("history", writeDeadline, op -> boundaryFailed(op.pipelineId, op.scope, Sink.HISTORY));
             exportStats.watch("export", writeDeadline, op -> boundaryFailed(op.pipelineId, op.scope, Sink.EXPORT));
             if (eventWorker != null) {
@@ -631,6 +662,11 @@ final class TelemetryDispatcher implements AutoCloseable {
         ObservationPublisher.Prepared frame = scopes == null ? prepared : scopes.continueFrame(prepared, scope);
         Observation observation = frame.observation();
         offerLatest(observation.pipelineId(), new ObservationFrame(frame, scope));
+        offerProjections(frame, scope);
+    }
+
+    private void offerProjections(ObservationPublisher.Prepared frame, ObservationStore.Scope scope) {
+        Observation observation = frame.observation();
         if (sampler != null) {
             offerSide(historyWorker, historyStats, observation.pipelineId(), Sink.HISTORY, scope,
                     () -> stillCurrent(observation.pipelineId(), scope)
@@ -679,6 +715,31 @@ final class TelemetryDispatcher implements AutoCloseable {
         }
     }
 
+    private void rememberColdFailure(Stats.Operation operation) {
+        if (operation.restoreTicket != null && scopes != null) {
+            FailureTime failed = operation.state.get() == 1 && operation.failureTime != null
+                    ? operation.failureTime : new FailureTime(Instant.now(), System.nanoTime());
+            scopes.rememberRestorationFailure(operation.restoreTicket, operation.scope,
+                    failed.occurredAt(), failed.nanos());
+        }
+    }
+
+    private void latestFailure(Stats.Operation operation) {
+        rememberColdFailure(operation);
+        if (operation.restoreTicket != null && scopes != null && boundaryEvents != null) {
+            var retained = scopes.restorationTelemetryFailure(operation.restoreTicket, operation.scope)
+                    .orElse(null);
+            FailureTime failed = retained != null
+                    ? new FailureTime(retained.occurredAt(), retained.lastFailureNanos())
+                    : operation.failureTime != null ? operation.failureTime
+                            : new FailureTime(Instant.now(), System.nanoTime());
+            boundaryEvents.failed(operation.pipelineId, operation.scope, Sink.LATEST,
+                    failed.occurredAt(), failed.nanos());
+            return;
+        }
+        boundaryFailed(operation.pipelineId, operation.scope, Sink.LATEST);
+    }
+
     private void successfulCompletion(Stats stats, Stats.Operation operation, Sink sink) {
         if (stats.completed(operation, true)) {
             if (boundaryEvents != null && (sink != Sink.HISTORY
@@ -713,6 +774,91 @@ final class TelemetryDispatcher implements AutoCloseable {
             return;
         }
         offerLatest(pipelineId, new ReconcileFailureFrame(pipelineId, failures, scope));
+    }
+
+    /** Identity and latest reads share the same bounded, coalescing cold lane as latest writes. */
+    void offerScopeRecovery(String pipelineId, ConvergeResult result, ObservationFailure failure,
+            BooleanSupplier owner) {
+        offerScopeRecovery(pipelineId, result, failure, null, owner);
+    }
+
+    void offerScopeRecovery(String pipelineId, ConvergeResult result, ObservationFailure failure,
+            ObservationScopeRecovery.Owner ownerVersion, BooleanSupplier owner) {
+        if (closed.get() || scopes == null || scopeRecovery == null) {
+            return;
+        }
+        scopes.restoration(pipelineId, result, failure, ownerVersion).ifPresent(ticket ->
+                offerLatest(pipelineId, new RecoveryFrame(ticket, Objects.requireNonNull(owner, "owner"))));
+    }
+
+    private boolean recover(String pipelineId, RecoveryFrame frame, Stats.Operation operation) {
+        var ticket = frame.ticket();
+        if (!scopes.awaiting(ticket) || !frame.owner().getAsBoolean()) {
+            return false;
+        }
+        var qualified = scopeRecovery.resolve(pipelineId).orElse(null);
+        if (qualified == null || !scopes.awaiting(ticket) || !frame.owner().getAsBoolean()
+                || !scopeRecovery.matchesOwner(pipelineId, qualified, ticket.owner())
+                || !scopeRecovery.unchanged(pipelineId, qualified)) {
+            return false;
+        }
+        operation.scope = qualified.scope();
+        var prepared = scopes.restorationPrepared(ticket, qualified).orElse(null);
+        if (prepared == null) {
+            var attempt = scopes.restorationFailure(ticket, qualified.checkpoint());
+            prepared = publisher.prepareScoped(pipelineId,
+                    attempt != null && attempt.first() ? attempt.failure() : null, qualified.scope()).orElse(null);
+            // Preparation can fail before or after its local failure account is updated. A neutral
+            // retry reads that account; only a still unrecorded cause is handed back for counting.
+            if (prepared != null && attempt != null && !attempt.first()
+                    && prepared.observation().state() == StateJson.parse(qualified.checkpoint().stateJson())
+                    && !recordedFailure(prepared, attempt.failure())) {
+                prepared = publisher.prepareScoped(pipelineId, attempt.failure(), qualified.scope()).orElse(null);
+            }
+            if (prepared == null || !scopes.rememberRestoration(ticket, qualified, prepared)) {
+                return false;
+            }
+        }
+        if (prepared == null || prepared.observation().state() != StateJson.parse(qualified.checkpoint().stateJson())
+                || !scopes.awaiting(ticket) || !frame.owner().getAsBoolean()
+                || !scopeRecovery.unchanged(pipelineId, qualified)) {
+            return false;
+        }
+        ObservationStore.Scope scope = qualified.scope();
+        var persisted = publisher.commit(scopes.restorationFrame(ticket, qualified.stored(), prepared), scope);
+        if (persisted.isEmpty()) {
+            scopes.retryRestoration(ticket);
+            return false;
+        }
+        if (operation.state.get() == 1) {
+            rememberColdFailure(operation);
+        }
+        // No local scope exists during a slow/failed write. A late callback cannot open publication
+        // after its owner, authority, checkpoint or registry ticket has changed.
+        if (!scopes.awaiting(ticket) || !frame.owner().getAsBoolean()
+                || !scopeRecovery.unchanged(pipelineId, qualified)
+                || !scopes.restore(ticket, qualified.stored())) {
+            return false;
+        }
+        // A historical transition retains its own checkpoint version, independently of latest state.
+        for (var signal : scopes.restorationSignals(ticket)) {
+            PipelineStateEvents.of(pipelineId, scope, signal.result(), signal.failure()).forEach(this::offerEvent);
+        }
+        if (boundaryEvents != null) {
+            scopes.restorationTelemetryFailure(ticket, scope).ifPresent(failed -> boundaryEvents.failed(
+                    pipelineId, scope, Sink.LATEST, failed.occurredAt(), failed.lastFailureNanos()));
+        }
+        scopes.restored(ticket);
+        offerProjections(scopes.continueFrame(prepared, scope), scope);
+        return true;
+    }
+
+    private static boolean recordedFailure(ObservationPublisher.Prepared prepared, ObservationFailure failure) {
+        return prepared.observation().facts().stream()
+                .filter(fact -> "tapstate.pipeline.errors".equals(fact.name()))
+                .flatMap(fact -> fact.points().stream())
+                .anyMatch(point -> failure.code().equals(point.attributes().get(MetricAttributes.CODE))
+                        && point.value() > 0);
     }
 
     private void offerLatest(String pipelineId, Frame frame) {
@@ -940,6 +1086,9 @@ final class TelemetryDispatcher implements AutoCloseable {
                     continue;
                 }
                 Stats.Operation operation = latestStats.begin(pipelineId, frame.scope());
+                if (frame instanceof RecoveryFrame recovery) {
+                    operation.restoreTicket = recovery.ticket();
+                }
                 try {
                     if (frame instanceof ObservationFrame observation) {
                         if (publisher.commit(observation.prepared(), observation.scope()).isPresent()) {
@@ -954,10 +1103,16 @@ final class TelemetryDispatcher implements AutoCloseable {
                         } else {
                             latestStats.skipped(operation);
                         }
+                    } else if (frame instanceof RecoveryFrame recovery) {
+                        if (recover(pipelineId, recovery, operation)) {
+                            successfulCompletion(latestStats, operation, Sink.LATEST);
+                        } else {
+                            latestStats.skipped(operation);
+                        }
                     }
                 } catch (RuntimeException failed) {
+                    latestFailure(operation);
                     latestStats.completed(operation, false);
-                    boundaryFailed(pipelineId, frame.scope(), Sink.LATEST);
                     LOG.warn("Could not write latest observation for pipeline {}", pipelineId, failed);
                 } catch (Error defect) {
                     latestStats.completed(operation, false);
