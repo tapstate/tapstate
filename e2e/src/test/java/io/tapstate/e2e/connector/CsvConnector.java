@@ -104,6 +104,13 @@ public class CsvConnector implements TapConnector {
     private static final String FAIL_WRITES = "fail_writes";
 
     /**
+     * A test affordance naming a signal directory that holds a target write until {@code release}
+     * appears. The connector creates {@code waiting} after the write has reached it, so an end-to-end
+     * case can put two real sink vertices at different durable positions without guessing from timing.
+     */
+    private static final String HOLD_WRITES = "hold_writes";
+
+    /**
      * A test affordance on the read side, the mirror of {@link #FAIL_WRITES}: when set truthy for one source
      * use, the cdc tail starts and then throws. The connector declares it on its node form and reads it only
      * from the node config, so the published failure case also witnesses that node parameters cross the host
@@ -260,6 +267,9 @@ public class CsvConnector implements TapConnector {
                 .supportTimestampToStreamOffset((context, startTime) -> highWaterMarks(context))
                 .supportWriteRecord((context, events, table, consumer) ->
                         consumer.accept(write(context, events, table)))
+                .supportClearTable((context, event) -> clear(context, event.getTableId()))
+                .supportCountByPartitionFilterFunction((context, table, filter) ->
+                        rows(file(context, table.getId())).size())
                 // The three the read face drives. Registering them is what lets a specification exercise
                 // the browse chain without a real database at the far end; a connector missing any one of
                 // them is refused by name before the read starts.
@@ -452,6 +462,12 @@ public class CsvConnector implements TapConnector {
 
     // ---- writes ----------------------------------------------------------------------------------
 
+    /** Clears an existing table while retaining its declared columns for the next write. */
+    private static void clear(TapConnectorContext context, String table) {
+        Path file = file(context, table);
+        write(file, header(file), List.of());
+    }
+
     /**
      * Applies a batch to the target file, creating it when this is the first write. Rows are keyed on
      * the target model's primary key when it declares one, and appended when it does not - the product
@@ -460,6 +476,7 @@ public class CsvConnector implements TapConnector {
      */
     private WriteListResult<TapRecordEvent> write(
             TapConnectionContext context, List<TapRecordEvent> events, TapTable target) {
+        awaitWriteRelease(context);
         if (writesRejected(context)) {
             // The product wraps whatever a connector's write throws into a coded write failure, so the type
             // here is immaterial; what matters is that the batch does not complete.
@@ -601,6 +618,28 @@ public class CsvConnector implements TapConnector {
                 .insertedCount(inserted)
                 .modifiedCount(modified)
                 .removedCount(removed);
+    }
+
+    /** Holds this target's write at the connector boundary until the harness releases it. */
+    private static void awaitWriteRelease(TapConnectionContext context) {
+        Object configured = context.getConnectionConfig() == null
+                ? null
+                : context.getConnectionConfig().getObject(HOLD_WRITES);
+        if (configured == null || String.valueOf(configured).isBlank()) {
+            return;
+        }
+        Path signals = Path.of(String.valueOf(configured));
+        try {
+            Files.createDirectories(signals);
+            Files.writeString(signals.resolve("waiting"), "");
+        } catch (IOException failure) {
+            throw new UncheckedIOException("publishing the held-write signal at " + signals, failure);
+        }
+        while (!Files.exists(signals.resolve("release"))) {
+            if (!pausedBetweenPolls(20)) {
+                throw new IllegalStateException("a held target write was interrupted before release");
+            }
+        }
     }
 
     /**

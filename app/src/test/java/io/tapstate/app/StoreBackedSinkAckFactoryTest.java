@@ -416,6 +416,28 @@ class StoreBackedSinkAckFactoryTest {
     }
 
     /**
+     * Where a pipeline starts reading a ring is not a place any of its sinks got to. The first writer to report
+     * past it moves nothing while the other has reported nothing, and nothing claims a confirmed position.
+     */
+    @Test
+    void aRingCursorAloneIsNotProgressAnySinkMade() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        store.startRingAfter("mc-orders", "pipe-1", "orders", 40);
+        HazelcastInstance member = memberWith(store);
+        StoreBackedSinkAckFactory factory = startedRun(member, Map.of("orders", "mc-orders"), "pipe-1",
+                Map.of("orders", List.of(WRITER, OTHER_WRITER)));
+        SinkAck fast = factory.resolve(member).forWriter(WRITER);
+
+        fast.advance("orders", at(41, "w41"));
+
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1"))
+                .as("the cursor stands for both writers until the one that has reported nothing reports")
+                .containsEntry("orders", 40L);
+        assertThat(ackedChainPosition(store, "mc-orders", "pipe-1")).isNull();
+    }
+
+    /**
      * Each writer works the table's position out from what it read back and reports it on its own, so what one
      * worked out before another's later answer can reach the store after it. Here the answer that the load has
      * landed is held on its way while the table's first change lands, and then let through: the position stays

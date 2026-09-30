@@ -57,6 +57,7 @@ import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.spi.sink.WriteMode;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.DiscoveredSourceModel;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SourceIndex;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
@@ -180,9 +181,14 @@ final class StoreBackedDagSource implements DagSource {
         captured.validateStart(pipelineId);
         NestCapacity capacity = captured.capacityOf(pipelineId);
         Set<OperatorStateLocation> locations = captured.stateLocations(pipelineId, defaultDatabase);
+        PipelineResource pipeline = PipelineInlining.inline(
+                StoredArtifacts.requirePipeline(captured.artifacts(), pipelineId), captured.artifacts());
+        // Freshness belongs to the start before capture registers its ring cursor and snapshot seam.
+        // Carry that answer into the deferred build rather than re-reading capture's own mutations.
+        boolean freshFullLoad = captured.freshFullLoad(pipeline);
         return new StartPreparation(
                 capacity, locations, Optional.of(snapshot),
-                () -> captured.plannedTopology(pipelineId), captured.sinkConnectors(pipelineId));
+                () -> captured.plannedTopology(pipelineId, freshFullLoad), captured.sinkConnectors(pipelineId));
     }
 
     /**
@@ -316,11 +322,28 @@ final class StoreBackedDagSource implements DagSource {
      * the ring generation the capture opens and how far into each ring the pipeline is done.
      */
     Function<ExecutionFence, PlannedDag> plannedTopology(String pipelineId) {
-        // Expanded before anything reads the blocks, so every later step - target resolution included -
-        // sees one shape rather than having to know a reference from a body.
         PipelineResource pipeline = PipelineInlining.inline(
                 StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        return plannedTopology(pipelineId, pipeline, freshFullLoad(pipeline));
+    }
+
+    /**
+     * As above, for a start that has already worked out whether its pipeline loads from nothing. That answer
+     * belongs to the start before its capture registers a ring cursor and a snapshot seam, both of which a later
+     * read would take for progress.
+     */
+    Function<ExecutionFence, PlannedDag> plannedTopology(String pipelineId, boolean freshFullLoad) {
+        PipelineResource pipeline = PipelineInlining.inline(
+                StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        return plannedTopology(pipelineId, pipeline, freshFullLoad);
+    }
+
+    private Function<ExecutionFence, PlannedDag> plannedTopology(
+            String pipelineId, PipelineResource pipeline, boolean freshFullLoad) {
+        // Expanded before anything reads the blocks, so every later step - target resolution included -
+        // sees one shape rather than having to know a reference from a body.
         Map<String, SourceVertex> sourceVertices = sourceVertices(pipeline);
+        refuseProgressNoSinkCanAnswerFor(pipelineId, pipeline, sourceVertices);
         // The pipeline takes its own copy of what discovery found for each table it reads, before anything
         // downstream is worked out from it. Reading the discovery directly instead would let a
         // re-discovery change the shape of this run's input while the run is already using it.
@@ -411,7 +434,7 @@ final class StoreBackedDagSource implements DagSource {
             DAG dag = PipelineDagBuilder.build(
                     builtPipeline,
                     bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets, viewTargets,
-                            serveStreams, viewStreams, stepIds, frontier, compiledJoins, fence),
+                            serveStreams, viewStreams, stepIds, frontier, compiledJoins, freshFullLoad, fence),
                     FencedSinkAckFactory.heldTo(sinkAckFactory(pipeline, pipelineId, fence), fence), frontier,
                     shape, drawn);
             return new PlannedDag(dag, shape, planned, nodeBatches(pipeline, sourceVertices), drawn.byNode(),
@@ -1486,6 +1509,7 @@ final class StoreBackedDagSource implements DagSource {
             Set<String> stepIds,
             FrontierBinding frontier,
             Map<String, CompiledJoin> compiledJoins,
+            boolean freshFullLoad,
             ExecutionFence fence) {
         ChainAxes axes = frontier.axes();
         boolean snapshotOnly = readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY;
@@ -1499,7 +1523,7 @@ final class StoreBackedDagSource implements DagSource {
                 key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch, freshStart),
                 step -> transformBinding(step, stepsById, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds),
                 element -> FencedSinkWriterFactory.heldTo(
-                        sinkWriter(pipeline, element, targets, serveStreams), fence),
+                        sinkWriter(pipeline, element, targets, serveStreams, freshFullLoad), fence),
                 ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
                 sourceKeysById::get,
                 view -> FencedSinkWriterFactory.heldTo(
@@ -1921,6 +1945,65 @@ final class StoreBackedDagSource implements DagSource {
             return List.copyOf(aliases.aliases().values());
         }
         return List.of();
+    }
+
+    /**
+     * Refuses a run whose retained progress no one sink can answer for. Before each sink kept its own progress,
+     * a pipeline kept one confirmed position per chain - moved by whichever of its sinks confirmed first - and one
+     * list of the loads its sinks had finished. Where more than one sink reads the chain, that position may be one
+     * only the fastest sink reached, and resuming from it would skip for good what a slower sink had not written.
+     * So a chain holding such progress, with nothing kept per writer beside it, is refused before the run opens
+     * anything: the pipeline's retained state has to be cleared and its data loaded again, or a new starting point
+     * accepted on purpose. Where reading starts is not progress a sink made, so a ring cursor alone does not count;
+     * and a chain only one sink reads is exempt, since whatever position it holds, that sink reached.
+     */
+    private void refuseProgressNoSinkCanAnswerFor(
+            String pipelineId, PipelineResource pipeline, Map<String, SourceVertex> sourceVertices) {
+        Map<String, String> sourceKeyByTable = sourceKeyByTable(sourceVertices);
+        Map<String, List<String>> sourceKeysById = sourceKeysById(sourceVertices);
+        Set<String> stepIds = stepIds(pipeline);
+        Map<String, Integer> sinksByChain = new LinkedHashMap<>();
+        if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null && !serve.sync().isEmpty()) {
+            Set<String> read = sourceIdsReaching(
+                    pipeline, serve.from(), sourceKeyByTable, sourceKeysById, sourceVertices, stepIds);
+            int sinks = serve.sync().size();
+            chainsOf(read, sourceVertices).forEach(chain -> sinksByChain.merge(chain, sinks, Integer::sum));
+        }
+        if (pipeline.view() instanceof ViewBlock.Inline view) {
+            Set<String> read = sourceIdsReaching(
+                    pipeline, FromClause.list(view.from()), sourceKeyByTable, sourceKeysById, sourceVertices, stepIds);
+            chainsOf(read, sourceVertices).forEach(chain -> sinksByChain.merge(chain, 1, Integer::sum));
+        }
+        sinksByChain.forEach((chain, sinks) -> {
+            if (sinks > 1 && heldForEverySinkAtOnce(chain, pipelineId)) {
+                throw new TapstateException(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS, Map.of("pipeline", pipelineId),
+                        null);
+            }
+        });
+    }
+
+    /** The chains the sources named in {@code sourceIds} are read on. */
+    private static Set<String> chainsOf(Set<String> sourceIds, Map<String, SourceVertex> sourceVertices) {
+        Set<String> chains = new LinkedHashSet<>();
+        sourceVertices.values().forEach(vertex -> {
+            if (sourceIds.contains(vertex.sourceId())) {
+                chains.add(vertex.resolution().chainId().value());
+            }
+        });
+        return chains;
+    }
+
+    /**
+     * Whether {@code pipelineId} holds progress on {@code chain} recorded once for all its sinks - a confirmed
+     * position, or a load marked finished - with no writer's own progress kept beside it.
+     */
+    private boolean heldForEverySinkAtOnce(String chain, String pipelineId) {
+        boolean recordedForAll = storePort.meta().read(chain)
+                .map(meta -> meta.consumerOffsets().stream().anyMatch(consumer ->
+                        consumer.pipelineId().equals(pipelineId)
+                                && (consumer.sinkAcked() != null || !consumer.snapshotCompletedTables().isEmpty())))
+                .orElse(false);
+        return recordedForAll && storePort.meta().writerRun(chain, pipelineId).isEmpty();
     }
 
     /** The source artifacts whose rows can reach one terminal reference. */
@@ -2600,17 +2683,17 @@ final class StoreBackedDagSource implements DagSource {
      */
     private SupplierEx<? extends SinkWriter> sinkWriter(
             PipelineResource pipeline, SyncElement element, Map<String, TargetTable> targets,
-            Set<String> serveStreams) {
+            Set<String> serveStreams, boolean freshFullLoad) {
         SourceResource sink = StoredArtifacts.requireSource(artifacts(), element.source());
         return sinkWriterBinder.bind(
                 sink.connector(), sink.config(), writeMode(element.writeMode()), ddl(element.ddl()),
                 TargetModelResolver.renameAll(targets, serveStreams, element.rename()),
                 new PipelineNode(pipeline.id(), syncNodeId(element)),
                 element.onFullLoad() == null ? OnFullLoad.APPEND : OnFullLoad.valueOf(element.onFullLoad().name()),
-                freshFullLoad(pipeline));
+                freshFullLoad);
     }
 
-    /** A CDC-only read and any previously delivered load suppress destructive target preparation. */
+    /** A CDC-only read and any durable consumer state suppress target preparation. */
     private boolean freshFullLoad(PipelineResource pipeline) {
         if (pipeline.settings() != null
                 && pipeline.settings().readMode() == io.tapstate.core.model.ReadMode.CDC_ONLY) {
@@ -2619,7 +2702,11 @@ final class StoreBackedDagSource implements DagSource {
         return sourceVertices(pipeline).values().stream().noneMatch(vertex ->
                 storePort.meta().read(vertex.resolution().chainId().value())
                         .map(meta -> meta.consumerOffsets().stream().anyMatch(
-                                consumer -> consumer.pipelineId().equals(pipeline.id())))
+                                consumer -> consumer.pipelineId().equals(pipeline.id())
+                                        && (!consumer.perTableSeq().isEmpty()
+                                                || consumer.sinkAcked() != null
+                                                || !consumer.snapshotCompletedTables().isEmpty()
+                                                || consumer.cdcStartPosition() != null)))
                         .orElse(false));
     }
 

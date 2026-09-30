@@ -8,6 +8,8 @@ import com.hazelcast.jet.core.Edge;
 import com.hazelcast.jet.core.Vertex;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.FromClause;
@@ -38,6 +40,7 @@ import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ConnectionTester;
 import io.tapstate.spi.store.DerivedSchema;
 import io.tapstate.spi.store.DiscoveredSourceModel;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.SchemaStore;
@@ -723,6 +726,114 @@ class StoreBackedDagSourceTest {
         DAG dag = new StoreBackedDagSource(store).dagFor("p");
 
         assertThat(vertexNames(dag)).contains("orders_src");
+    }
+
+    @Test
+    void refuses_legacy_aggregate_progress_before_a_multi_sink_dag_can_run() {
+        FakeStorePort store = new FakeStorePort();
+        SourceResource source = cdcSource("orders_src", "orders");
+        PipelineResource pipeline = new PipelineResource(
+                "p", null,
+                List.of(SourceRef.spec("orders_src", true)),
+                null,
+                null,
+                serve(
+                        FromRef.literal("orders_src"),
+                        sync("fast", "fast_dest"),
+                        sync("slow", "slow_dest")),
+                null, null);
+        store.artifacts().save(source);
+        store.artifacts().save(connectionSupplier("fast_dest"));
+        store.artifacts().save(connectionSupplier("slow_dest"));
+        store.artifacts().save(pipeline);
+        discovered(store, "orders_src", "orders");
+        String chain = SourceCaptureResolution.of(source).chainId().value();
+        store.meta().create(chain, null);
+        store.meta().advanceSinkAcked(
+                chain, "p", "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
+
+        assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("p"))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(thrown -> assertThat(((TapstateException) thrown).code())
+                        .isEqualTo(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS));
+        assertThat(store.meta().ringDoneThrough(chain, "p"))
+                .containsEntry("orders", 100L);
+    }
+
+    @Test
+    void a_multi_sink_pipeline_cleared_of_its_legacy_progress_can_run_again() {
+        FakeStorePort store = new FakeStorePort();
+        String chain = servedBy(store, "fast", "slow");
+        store.meta().advanceSinkAcked(
+                chain, "p", "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
+        assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("p"))
+                .isInstanceOf(TapstateException.class);
+
+        // Clearing what the pipeline holds on the chain is the store's half of loading it all again.
+        store.meta().detachConsumer(chain, "p");
+
+        assertThat(vertexNames(new StoreBackedDagSource(store).dagFor("p"))).contains("orders_src");
+    }
+
+    @Test
+    void a_single_sink_resumes_from_legacy_progress_it_alone_can_have_made() {
+        FakeStorePort store = new FakeStorePort();
+        String chain = servedBy(store, "only");
+        store.meta().advanceSinkAcked(
+                chain, "p", "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
+
+        assertThat(vertexNames(new StoreBackedDagSource(store).dagFor("p"))).contains("orders_src");
+    }
+
+    @Test
+    void a_ring_cursor_alone_is_no_progress_that_two_sinks_could_disagree_on() {
+        FakeStorePort store = new FakeStorePort();
+        String chain = servedBy(store, "fast", "slow");
+        store.meta().startRingAfter(chain, "p", "orders", 40);
+
+        assertThat(vertexNames(new StoreBackedDagSource(store).dagFor("p"))).contains("orders_src");
+    }
+
+    @Test
+    void a_load_marked_finished_for_every_sink_at_once_is_refused_like_a_position() {
+        FakeStorePort store = new FakeStorePort();
+        String chain = servedBy(store, "fast", "slow");
+        store.meta().markSnapshotComplete(chain, "p", "orders");
+
+        assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("p"))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(thrown -> assertThat(((TapstateException) thrown).code())
+                        .isEqualTo(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS));
+    }
+
+    @Test
+    void progress_kept_writer_by_writer_is_not_mistaken_for_legacy_progress() {
+        FakeStorePort store = new FakeStorePort();
+        String chain = servedBy(store, "fast", "slow");
+        store.meta().advanceSinkAcked(
+                chain, "p", "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
+        store.meta().beginWriterRun(
+                chain, "p", "g1", Map.of("orders", List.of("serve.fast#0", "serve.slow#0")));
+
+        assertThat(vertexNames(new StoreBackedDagSource(store).dagFor("p"))).contains("orders_src");
+    }
+
+    /** Pipeline {@code p} reading orders_src into one serve sink per name, its chain created; answers the chain. */
+    private static String servedBy(FakeStorePort store, String... sinks) {
+        SourceResource source = cdcSource("orders_src", "orders");
+        SyncElement[] elements = new SyncElement[sinks.length];
+        for (int i = 0; i < sinks.length; i++) {
+            elements[i] = sync(sinks[i], sinks[i] + "_dest");
+            store.artifacts().save(connectionSupplier(sinks[i] + "_dest"));
+        }
+        store.artifacts().save(source);
+        store.artifacts().save(new PipelineResource(
+                "p", null, List.of(SourceRef.spec("orders_src", true)), null, null,
+                serve(FromRef.literal("orders_src"), elements), null, null));
+        discovered(store, "orders_src", "orders");
+        String chain = SourceCaptureResolution.of(source).chainId().value();
+        store.meta().create(chain, null);
+        return chain;
     }
 
     @Test

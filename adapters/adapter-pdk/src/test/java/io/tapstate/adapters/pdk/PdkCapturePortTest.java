@@ -802,6 +802,44 @@ class PdkCapturePortTest {
         assertThatCode(sub::close).doesNotThrowAnyException();
     }
 
+    @Test
+    void closingACdcSubscriptionDoesNotReportItsInterruptedBatchAsAFailure(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.emittingSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.EmittingSource", null));
+        CountDownLatch batchEntered = new CountDownLatch(1);
+        CountDownLatch keepBatchParked = new CountDownLatch(1);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        CaptureListener listener = new CaptureListener() {
+            @Override
+            public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                batchEntered.countDown();
+                try {
+                    keepBatchParked.await();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new CancellationException("the cdc batch was interrupted while it waited for room");
+                }
+            }
+
+            @Override
+            public void onError(Throwable error) {
+                failure.set(error);
+            }
+        };
+        try (Subscription sub = port.cdc(config("t1"), CaptureStart.present(), listener)) {
+            assertThat(batchEntered.await(5, TimeUnit.SECONDS)).as("the stream reached its parked batch").isTrue();
+
+            long closing = System.nanoTime();
+            sub.close();
+
+            assertThat(Duration.ofNanos(System.nanoTime() - closing))
+                    .as("close interrupts and joins the parked stream without waiting out its backpressure")
+                    .isLessThan(Duration.ofSeconds(1));
+        }
+        assertThat(failure.get())
+                .as("an interruption caused by subscription close is normal teardown")
+                .isNull();
+    }
 
     @Test
     void handsARecordedPositionBackToTheConnectorAsTheObjectItIssued(@TempDir Path dir) throws Exception {
