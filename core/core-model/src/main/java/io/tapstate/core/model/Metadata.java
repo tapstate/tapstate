@@ -1,6 +1,7 @@
 package io.tapstate.core.model;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
 import java.util.Collections;
@@ -35,6 +36,7 @@ public record Metadata(
         this(labels, description, null, null);
     }
 
+    @JsonIgnore
     public boolean isEmpty() {
         return labels.isEmpty()
                 && (description == null || description.isEmpty())
