@@ -128,7 +128,7 @@ final class RealProcessServer implements ServerHandle {
         return start(storeUri, operatorStateDatabase, jar, List.of());
     }
 
-    private static RealProcessServer start(String storeUri, String operatorStateDatabase, Path jar,
+    static RealProcessServer start(String storeUri, String operatorStateDatabase, Path jar,
             List<String> additionalArguments) {
         RealProcessServer server = launching(storeUri, operatorStateDatabase, jar, additionalArguments);
         try {

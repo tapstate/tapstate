@@ -3,8 +3,16 @@ package io.tapstate.e2e;
 import com.mongodb.ConnectionString;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoDatabase;
+import io.tapstate.core.common.JsonWriter;
+import io.tapstate.adapters.mongostore.MongoObservationStore;
+import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.core.lifecycle.MetricAttributes;
+import io.tapstate.core.lifecycle.MetricPoint;
+import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.testsupport.RequiresDocker;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -15,6 +23,7 @@ import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -128,6 +137,235 @@ class RealLargeSnapshotParallelCdcIT {
                     deliveredNanos / 1_000_000.0, firstFastRecords, secondFastRecords, finalFastRecords,
                     firstFastObserved, secondFastObserved, finalFastObserved, physicallyDelivered);
         }
+    }
+
+    @Test
+    void rebuildingAPausedSnapshotKeepsCumulativeFactsAndParallelCdcMoving() throws Exception {
+        Map<String, Object> bulkMysql = SharedMySql.settings("snapshot_resume_source");
+        Map<String, Object> fastMysql = SharedMySql.settings("snapshot_resume_cdc_source");
+        seedBulk(bulkMysql);
+        seedFast(fastMysql);
+        String storeUri = SharedMongo.replicaSetUrl("snapshot_resume_store");
+        String targetUri = SharedMongo.replicaSetUrl("snapshot_resume_target");
+        EndpointAddress target = EndpointAddress.uri(targetUri);
+        Path jar = Path.of(System.getProperty(BOOT_JAR_PROPERTY));
+        String jarSha = PipelineBenchmarkLiveRunIT.sha256(jar);
+
+        try (MongoEndpoints mongo = new MongoEndpoints();
+                MongoClient targetClient = MongoClients.create(targetUri);
+                MongoClient storeClient = MongoClients.create(storeUri);
+                RealProcessServer server = RealProcessServer.start(storeUri, "snapshot_resume_operator", jar,
+                        List.of("--tapstate.metrics.history.sample-interval=PT2S"))) {
+            MongoDatabase database = storeClient.getDatabase(new ConnectionString(storeUri).getDatabase());
+            var latest = new MongoObservationStore(storeClient,
+                    database.getCollection(MongoStorePort.PIPELINE_OBSERVATION),
+                    database.getCollection(MongoStorePort.PIPELINE_OBSERVATION_CHUNKS));
+            MongoDatabase targetDatabase = targetClient.getDatabase(new ConnectionString(targetUri).getDatabase());
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            control.bootstrapAndLogin("snapshot-resume", "snapshot-resume-password");
+            control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
+            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+            control.apply(resources(bulkMysql, fastMysql, targetUri));
+            control.discoverSchema("bulk_source", "mysql", bulkMysql);
+            control.discoverSchema("fast_source", "mysql", fastMysql);
+            control.lifecycle(FAST_PIPELINE, LifecycleVerb.START);
+            Await.until("real CDC target baseline", Duration.ofMinutes(2),
+                    () -> "before".equals(fastStatus(mongo, target)),
+                    () -> "target=" + fastStatus(mongo, target));
+            long fastBefore = Await.answered("known CDC output before snapshot pause",
+                    () -> control.recordsOut(FAST_PIPELINE).filter(count -> count > 0));
+            Instant fastObservedBefore = control.statusObservedAt(FAST_PIPELINE);
+            control.lifecycle(BULK_PIPELINE, LifecycleVerb.START);
+            ObservationStore.Stored before = Await.answered("actual partial snapshot delivery with all counters",
+                    Duration.ofMinutes(3), () -> latest.readStored(BULK_PIPELINE).filter(value ->
+                            value.scope().isPresent() && hasCumulativeDelivery(value.observation())
+                            && inFlightRows(control) > 0 && inFlightRows(control) < BULK_ROWS
+                            && bulkTargetRows(targetDatabase) > 0 && bulkTargetRows(targetDatabase) < BULK_ROWS));
+            ObservationStore.Scope oldScope = before.scope().orElseThrow();
+            assertThat(claimGeneration(database, BULK_PIPELINE)).isEqualTo(oldScope.executionGeneration());
+            Document oldSample = actualHistorySample(database, oldScope);
+            control.lifecycle(BULK_PIPELINE, LifecycleVerb.PAUSE);
+            Await.until("the unfinished snapshot to be actually paused", Duration.ofMinutes(2),
+                    () -> control.state(BULK_PIPELINE).filter(PipelineState.PAUSED::equals).isPresent(),
+                    () -> "state=" + control.state(BULK_PIPELINE));
+            long pausedRows = bulkTargetRows(targetDatabase);
+            assertThat(pausedRows).as("the pause reached the data plane before snapshot completion")
+                    .isBetween(1L, BULK_ROWS - 1);
+            var paused = Await.answered("scoped paused observation", () -> latest.readStored(BULK_PIPELINE)
+                    .filter(value -> value.observation().state() == PipelineState.PAUSED));
+            assertThat(paused.scope()).contains(oldScope);
+            assertThat(claimGeneration(database, BULK_PIPELINE)).isEqualTo(oldScope.executionGeneration());
+
+            updateFast(fastMysql, "while_paused");
+            awaitFastTargetAndObservation(control, mongo, target, "while_paused", fastBefore, fastObservedBefore);
+            long fastPaused = control.recordsOut(FAST_PIPELINE).orElseThrow();
+            Instant fastObservedPaused = control.statusObservedAt(FAST_PIPELINE);
+            control.lifecycle(BULK_PIPELINE, LifecycleVerb.RESUME);
+            ObservationStore.Scope resumedScope = new ObservationStore.Scope(oldScope.pipelineIncarnationId(),
+                    oldScope.executionGeneration() + 1);
+            ObservationStore.Stored resumed = Await.answered("new scoped snapshot to make real target progress",
+                    Duration.ofMinutes(3), () -> latest.readStored(BULK_PIPELINE).filter(value ->
+                            value.scope().filter(resumedScope::equals).isPresent()
+                            && value.observation().state() == PipelineState.RUNNING
+                            && hasCumulativeDelivery(value.observation())
+                            && cumulativeDeliveryAdvanced(before.observation(), value.observation())
+                            && bulkTargetRows(targetDatabase) > pausedRows
+                            && bulkTargetRows(targetDatabase) < BULK_ROWS));
+            assertThat(claimGeneration(database, BULK_PIPELINE)).isEqualTo(resumedScope.executionGeneration());
+            assertCumulativeDeliveryContinued(before.observation(), resumed.observation());
+            Document resumedSample = actualHistorySample(database, resumedScope);
+            assertThat(resumedSample.getDate("countingSince")).isEqualTo(oldSample.getDate("countingSince"));
+
+            updateFast(fastMysql, "after_resume");
+            awaitFastTargetAndObservation(control, mongo, target, "after_resume", fastPaused, fastObservedPaused);
+            assertThat(bulkTargetRows(targetDatabase)).as("CDC advanced during the resumed partial load")
+                    .isBetween(1L, BULK_ROWS - 1);
+            Map<?, ?> history = control.history(BULK_PIPELINE,
+                    oldSample.getDate("observedAt").toInstant().minusSeconds(1), Instant.now());
+            List<String> rawTrace = database.getCollection(MongoStorePort.PIPELINE_RATE_HISTORY)
+                    .find(new Document("pipelineId", BULK_PIPELINE))
+                    .sort(new Document("observedAt", 1).append("_id", 1)).limit(64)
+                    .into(new java.util.ArrayList<>()).stream().map(Document::toJson).toList();
+            System.out.println("snapshot-resume-history=" + JsonWriter.write(Map.of(
+                    "jarSha", jarSha, "rawSamples", rawTrace, "response", history)));
+            assertThat(history.get("segments")).isInstanceOf(List.class);
+            List<?> segments = (List<?>) history.get("segments");
+            long points = segments.stream().map(Map.class::cast)
+                    .mapToLong(segment -> ((List<?>) segment.get("points")).size()).sum();
+            assertThat(points).as("history contains actual samples on both sides of the rebuild")
+                    .isGreaterThanOrEqualTo(2);
+            assertThat(segments.stream().map(Map.class::cast).map(segment -> segment.get("startReason")))
+                    .doesNotContain("COUNTER_RESET");
+            Await.until("the resumed snapshot to reach its complete physical target", WAIT,
+                    () -> bulkTargetRows(targetDatabase) == BULK_ROWS,
+                    () -> "targetRows=" + bulkTargetRows(targetDatabase));
+            Await.answered("final cumulative delivery records and histogram to cover the full snapshot", () ->
+                    latest.readStored(BULK_PIPELINE).filter(value -> value.scope().filter(resumedScope::equals).isPresent()
+                            && deliveryPoints(value.observation(), "tapstate.pipeline.records").stream()
+                                    .mapToLong(MetricPoint::value).sum() >= BULK_ROWS
+                            && deliveryPoints(value.observation(), "tapstate.pipeline.record.delivery.duration").stream()
+                                    .mapToLong(point -> point.histogram().count()).sum() >= BULK_ROWS));
+            assertThat(control.errorCount(BULK_PIPELINE)).contains(0L);
+            assertThat(control.errorCount(FAST_PIPELINE)).contains(0L);
+            control.stop(BULK_PIPELINE, false);
+            control.stop(FAST_PIPELINE, false);
+            System.out.printf("snapshot-resume-live jarSha=%s generationFrom=%d generationTo=%d"
+                            + " pausedTargetRows=%d recordsBefore=%d recordsAfter=%d targetRows=%d"
+                            + " publicHistoryPoints=%d counterStart=%s%n", jarSha,
+                    oldScope.executionGeneration(), resumedScope.executionGeneration(), pausedRows,
+                    deliveryPoints(before.observation(), "tapstate.pipeline.records").stream()
+                            .mapToLong(MetricPoint::value).sum(),
+                    deliveryPoints(resumed.observation(), "tapstate.pipeline.records").stream()
+                            .mapToLong(MetricPoint::value).sum(), bulkTargetRows(targetDatabase), points,
+                    deliveryPoints(before.observation(), "tapstate.pipeline.records").getFirst().startTime());
+        }
+        assertThat(PipelineBenchmarkLiveRunIT.sha256(jar)).isEqualTo(jarSha);
+    }
+
+    private static long bulkTargetRows(MongoDatabase target) {
+        return target.getCollection("bulk_orders").countDocuments();
+    }
+
+    private static long claimGeneration(MongoDatabase database, String pipeline) {
+        Document claim = database.getCollection(MongoStorePort.WORKLOAD_CLAIMS)
+                .find(new Document("resourceType", "PIPELINE_ACTUATION").append("resourceId", pipeline)).first();
+        assertThat(claim).as("the real submission has a durable generation").isNotNull();
+        assertThat(claim.get("executionGeneration")).isInstanceOf(Number.class);
+        return ((Number) claim.get("executionGeneration")).longValue();
+    }
+
+    private static Document actualHistorySample(MongoDatabase database, ObservationStore.Scope scope) {
+        List<Document> samples = Await.answered("two real increasing history samples for scope " + scope, () -> {
+            List<Document> positive = database.getCollection(MongoStorePort.PIPELINE_RATE_HISTORY)
+                        .find(new Document("pipelineId", BULK_PIPELINE)
+                                .append("pipelineIncarnationId", scope.pipelineIncarnationId())
+                                .append("executionGeneration", scope.executionGeneration()))
+                        .sort(new Document("observedAt", 1).append("_id", 1)).limit(64)
+                        .into(new java.util.ArrayList<>()).stream().filter(value -> {
+                            Object counters = value.get("counters");
+                            return counters instanceof Document values
+                                    && values.get("records.out") instanceof Number count && count.longValue() > 0
+                                    && values.get("bytes.out") instanceof Number bytes && bytes.longValue() > 0
+                                    && value.getDate("countingSince") != null;
+                        }).toList();
+            if (positive.size() < 2) { return Optional.empty(); }
+            Document first = positive.getFirst();
+            return positive.stream().skip(1).filter(next ->
+                    first.getDate("countingSince").equals(next.getDate("countingSince"))
+                            && List.of("records.out", "bytes.out").stream().allMatch(counter ->
+                            ((Number) next.get("counters", Document.class).get(counter)).longValue()
+                                    > ((Number) first.get("counters", Document.class).get(counter)).longValue()))
+                    .findFirst().map(next -> List.of(first, next));
+        });
+        Document first = samples.getFirst();
+        Document second = samples.get(1);
+        assertThat(second.getDate("observedAt")).isAfter(first.getDate("observedAt"));
+        assertThat(second.getDate("countingSince")).isEqualTo(first.getDate("countingSince"));
+        for (String counter : List.of("records.out", "bytes.out")) {
+            assertThat(((Number) second.get("counters", Document.class).get(counter)).longValue())
+                    .isGreaterThan(((Number) first.get("counters", Document.class).get(counter)).longValue());
+        }
+        return first;
+    }
+
+    private static boolean cumulativeDeliveryAdvanced(Observation before, Observation after) {
+        for (String name : List.of("tapstate.pipeline.records", "tapstate.pipeline.bytes",
+                "tapstate.pipeline.record.delivery.duration")) {
+            List<MetricPoint> fresh = deliveryPoints(after, name);
+            for (MetricPoint old : deliveryPoints(before, name)) {
+                Optional<MetricPoint> now = fresh.stream()
+                        .filter(point -> point.attributes().equals(old.attributes())).findFirst();
+                if (now.isEmpty() || (old.histogram() == null ? now.get().value() <= old.value()
+                        : now.get().histogram().count() <= old.histogram().count())) { return false; }
+            }
+        }
+        return true;
+    }
+
+    private static boolean hasCumulativeDelivery(Observation observation) {
+        return List.of("tapstate.pipeline.records", "tapstate.pipeline.bytes",
+                "tapstate.pipeline.record.delivery.duration").stream().allMatch(name ->
+                deliveryPoints(observation, name).stream().anyMatch(point -> point.startTime() != null
+                        && (point.histogram() == null ? point.value() > 0 : point.histogram().count() > 0)));
+    }
+
+    private static List<MetricPoint> deliveryPoints(Observation observation, String name) {
+        return observation.facts().stream().filter(fact -> fact.name().equals(name))
+                .flatMap(fact -> fact.points().stream()).filter(point ->
+                        "bulk_orders".equals(point.attributes().get(MetricAttributes.TABLE_ID))
+                                && (name.endsWith(".duration")
+                                || "out".equals(point.attributes().get(MetricAttributes.DIRECTION)))).toList();
+    }
+
+    private static void assertCumulativeDeliveryContinued(Observation before, Observation after) {
+        for (String name : List.of("tapstate.pipeline.records", "tapstate.pipeline.bytes",
+                "tapstate.pipeline.record.delivery.duration")) {
+            List<MetricPoint> fresh = deliveryPoints(after, name);
+            for (MetricPoint old : deliveryPoints(before, name)) {
+                MetricPoint continued = fresh.stream().filter(point -> point.attributes().equals(old.attributes()))
+                        .findFirst().orElseThrow(() -> new AssertionError("known delivery point disappeared: " + name));
+                assertThat(continued.startTime()).isEqualTo(old.startTime());
+                if (old.histogram() == null) { assertThat(continued.value()).isGreaterThanOrEqualTo(old.value()); }
+                else {
+                    assertThat(continued.histogram().count()).isGreaterThanOrEqualTo(old.histogram().count());
+                    assertThat(continued.histogram().sum()).isGreaterThanOrEqualTo(old.histogram().sum());
+                    assertThat(continued.histogram().bounds()).isEqualTo(old.histogram().bounds());
+                    for (int bucket = 0; bucket < old.histogram().bucketCounts().size(); bucket++) {
+                        assertThat(continued.histogram().bucketCounts().get(bucket))
+                                .isGreaterThanOrEqualTo(old.histogram().bucketCounts().get(bucket));
+                    }
+                }
+            }
+        }
+    }
+
+    private static void awaitFastTargetAndObservation(ControlPlane control, MongoEndpoints mongo,
+            EndpointAddress target, String status, long records, Instant observed) {
+        Await.until("the real parallel CDC target and observation to advance", Duration.ofSeconds(30),
+                () -> status.equals(fastStatus(mongo, target))
+                        && control.recordsOut(FAST_PIPELINE).filter(count -> count > records).isPresent()
+                        && control.statusObservedAt(FAST_PIPELINE).isAfter(observed),
+                () -> "target=" + fastStatus(mongo, target) + ", output=" + control.recordsOut(FAST_PIPELINE));
     }
 
     private static long inFlightRows(ControlPlane control) {
