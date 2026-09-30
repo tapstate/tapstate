@@ -175,7 +175,7 @@ public final class PipelineDraftService {
                 expectedRevision + 1, current.mode(), current.name(), current.description(), current.graph(),
                 current.wizard(), actualHash, current.publishedDraftRevision(), current.publishedArtifactHash(),
                 current.createdAt(), Instant.now(clock), requirePrincipal(principal));
-        return store.replace(pipelineId, expectedRevision, rebased);
+        return store.rebase(pipelineId, expectedRevision, current.baseArtifactHash(), rebased);
     }
 
     /** Compiles the requested revision without writing an Artifact or publication marker. */

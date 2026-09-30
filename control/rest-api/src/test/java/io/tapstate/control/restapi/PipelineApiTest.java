@@ -1592,6 +1592,17 @@ class PipelineApiTest {
         @Override
         public synchronized PipelineDraftMutation replace(String pipelineId, long expectedRevision,
                 PipelineDraft replacement) {
+            return replaceGuarded(pipelineId, expectedRevision, replacement.baseArtifactHash(), replacement);
+        }
+
+        @Override
+        public synchronized PipelineDraftMutation rebase(String pipelineId, long expectedRevision,
+                String expectedBaseArtifactHash, PipelineDraft replacement) {
+            return replaceGuarded(pipelineId, expectedRevision, expectedBaseArtifactHash, replacement);
+        }
+
+        private PipelineDraftMutation replaceGuarded(String pipelineId, long expectedRevision,
+                String expectedBaseArtifactHash, PipelineDraft replacement) {
             PipelineDraft current = drafts.get(pipelineId);
             if (current == null) {
                 return PipelineDraftMutation.NOT_FOUND;
@@ -1602,7 +1613,8 @@ class PipelineApiTest {
             if (current.revision() != expectedRevision) {
                 return PipelineDraftMutation.REVISION_CONFLICT;
             }
-            if (!Objects.equals(current.publishedDraftRevision(), replacement.publishedDraftRevision())
+            if (!Objects.equals(current.baseArtifactHash(), expectedBaseArtifactHash)
+                    || !Objects.equals(current.publishedDraftRevision(), replacement.publishedDraftRevision())
                     || !Objects.equals(current.publishedArtifactHash(), replacement.publishedArtifactHash())) {
                 return PipelineDraftMutation.REVISION_CONFLICT;
             }

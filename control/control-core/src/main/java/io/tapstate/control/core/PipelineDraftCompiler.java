@@ -715,13 +715,46 @@ public final class PipelineDraftCompiler {
             String selectedTable = Objects.requireNonNull(table, "table");
             String pattern = isRegexReference(selectedTable)
                     ? selectedTable.substring(1, selectedTable.length() - 1) : selectedTable;
-            if (pattern.startsWith("^")) {
-                pattern = pattern.substring(1);
+            List<String> alternatives = topLevelAlternatives(pattern);
+            String scoped = alternatives.size() == 1 ? withoutOuterAnchors(pattern)
+                    : "(?:" + alternatives.stream().map(SourceTableSelection::withoutOuterAnchors)
+                            .collect(java.util.stream.Collectors.joining("|")) + ")";
+            return "/" + Pattern.quote(sourceId) + "\\." + scoped + "/";
+        }
+
+        private static String withoutOuterAnchors(String pattern) {
+            if (pattern.startsWith("^")) pattern = pattern.substring(1);
+            if (hasUnescapedTrailingAnchor(pattern)) pattern = pattern.substring(0, pattern.length() - 1);
+            return pattern;
+        }
+
+        private static List<String> topLevelAlternatives(String pattern) {
+            List<String> parts = new ArrayList<>();
+            int depth = 0;
+            boolean inClass = false;
+            boolean escaped = false;
+            int start = 0;
+            for (int i = 0; i < pattern.length(); i++) {
+                char ch = pattern.charAt(i);
+                if (escaped) {
+                    escaped = false;
+                } else if (ch == '\\') {
+                    escaped = true;
+                } else if (ch == '[' && !inClass) {
+                    inClass = true;
+                } else if (ch == ']' && inClass) {
+                    inClass = false;
+                } else if (!inClass && ch == '(') {
+                    depth++;
+                } else if (!inClass && ch == ')') {
+                    depth--;
+                } else if (!inClass && depth == 0 && ch == '|') {
+                    parts.add(pattern.substring(start, i));
+                    start = i + 1;
+                }
             }
-            if (hasUnescapedTrailingAnchor(pattern)) {
-                pattern = pattern.substring(0, pattern.length() - 1);
-            }
-            return "/" + Pattern.quote(sourceId) + "\\." + pattern + "/";
+            parts.add(pattern.substring(start));
+            return parts;
         }
 
         private static boolean hasUnescapedTrailingAnchor(String pattern) {

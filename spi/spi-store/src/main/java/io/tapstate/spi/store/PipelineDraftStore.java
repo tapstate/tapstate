@@ -40,6 +40,12 @@ public interface PipelineDraftStore {
 
     PipelineDraftMutation replace(String pipelineId, long expectedRevision, PipelineDraft replacement);
 
+    /** Changes the publication base only when the stored draft still has the base that was read. */
+    default PipelineDraftMutation rebase(String pipelineId, long expectedRevision,
+            String expectedBaseArtifactHash, PipelineDraft replacement) {
+        throw new UnsupportedOperationException("draft store does not support rebase");
+    }
+
     PipelineDraftMutation delete(String pipelineId, long expectedRevision);
 
     /** Atomically writes the candidate Artifact and advances the draft publication markers. */

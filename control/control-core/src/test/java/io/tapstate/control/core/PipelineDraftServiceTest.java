@@ -257,11 +257,23 @@ class PipelineDraftServiceTest {
         @Override
         public PipelineDraftMutation replace(String pipelineId, long expectedRevision,
                 PipelineDraft replacement) {
+            return replaceGuarded(pipelineId, expectedRevision, replacement.baseArtifactHash(), replacement);
+        }
+
+        @Override
+        public PipelineDraftMutation rebase(String pipelineId, long expectedRevision,
+                String expectedBaseArtifactHash, PipelineDraft replacement) {
+            return replaceGuarded(pipelineId, expectedRevision, expectedBaseArtifactHash, replacement);
+        }
+
+        private PipelineDraftMutation replaceGuarded(String pipelineId, long expectedRevision,
+                String expectedBaseArtifactHash, PipelineDraft replacement) {
             PipelineDraft current = drafts.get(pipelineId);
             if (current == null) return PipelineDraftMutation.NOT_FOUND;
             if (current.revision() != expectedRevision) return PipelineDraftMutation.REVISION_CONFLICT;
             if (current.mode() != replacement.mode()) return PipelineDraftMutation.MODE_CONFLICT;
-            if (!Objects.equals(current.publishedDraftRevision(), replacement.publishedDraftRevision())
+            if (!Objects.equals(current.baseArtifactHash(), expectedBaseArtifactHash)
+                    || !Objects.equals(current.publishedDraftRevision(), replacement.publishedDraftRevision())
                     || !Objects.equals(current.publishedArtifactHash(), replacement.publishedArtifactHash())) {
                 return PipelineDraftMutation.REVISION_CONFLICT;
             }

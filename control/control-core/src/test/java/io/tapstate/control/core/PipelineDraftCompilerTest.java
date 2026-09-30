@@ -438,6 +438,47 @@ class PipelineDraftCompilerTest {
     }
 
     @Test
+    void scopesEveryRegexAlternativeToTheSelectedSource() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "crm", "orders|users",
+                        Map.of("tableKind", "regex", "tables", List.of(
+                                Map.of("table", "orders|users", "tableKind", "regex"),
+                                Map.of("table", "^orders$|^users$", "tableKind", "regex"))), Map.of()),
+                new PipelineDraft.Node("target", "target", "mongo", null, Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("source-to-target", "source", "target")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiler.compile(dagDraft(graph)).serve();
+        List<FromRef> refs = ((FromClause.Flow) serve.from()).refs();
+        assertThat(refs).hasSize(2);
+        for (FromRef ref : refs) {
+            String regex = ((FromRef.Regex) ref).pattern();
+            assertThat(java.util.regex.Pattern.compile(regex).matcher("crm.orders").matches()).isTrue();
+            assertThat(java.util.regex.Pattern.compile(regex).matcher("crm.users").matches()).isTrue();
+            assertThat(java.util.regex.Pattern.compile(regex).matcher("users").matches()).isFalse();
+            assertThat(java.util.regex.Pattern.compile(regex).matcher("other.users").matches()).isFalse();
+        }
+    }
+
+    @Test
+    void rejectsExplicitNullMapLiteralAsMalformedDraft() {
+        Map<String, Object> literal = new java.util.LinkedHashMap<>();
+        literal.put("value", null);
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "crm", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("map", "map", null, null,
+                        Map.of("fields", Map.of("deleted_at", literal)), Map.of()),
+                new PipelineDraft.Node("target", "target", "mongo", null, Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("source-map", "source", "map"),
+                        new PipelineDraft.Edge("map-target", "map", "target")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        assertThatThrownBy(() -> compiler.compile(dagDraft(graph)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("deleted_at");
+    }
+
+    @Test
     void targetRenameAfterATransformUsesTheUnderlyingSourceTableName() {
         PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
                 new PipelineDraft.Node("source", "source", "mysql", "orders", Map.of(), Map.of()),

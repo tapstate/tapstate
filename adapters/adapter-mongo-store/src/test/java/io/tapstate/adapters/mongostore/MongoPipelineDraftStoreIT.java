@@ -121,6 +121,32 @@ class MongoPipelineDraftStoreIT {
     }
 
     @Test
+    void rebaseChangesOnlyThePublicationBaseWithThePriorBaseAsPrecondition() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            var database = client.getDatabase("tapstate_pipeline_draft_rebase_it");
+            var drafts = database.getCollection("pipeline_drafts");
+            var artifacts = database.getCollection("artifacts");
+            drafts.drop();
+            artifacts.drop();
+            MongoPipelineDraftStore store = new MongoPipelineDraftStore(client, drafts, artifacts);
+            assertThat(store.create(draft("orders", 1, PipelineDraft.Mode.DAG,
+                    "old-hash", 1L, "published-hash"))).isEqualTo(PipelineDraftMutation.CREATED);
+
+            PipelineDraft rebased = draft("orders", 2, PipelineDraft.Mode.DAG,
+                    "new-hash", 1L, "published-hash");
+            assertThat(store.replace("orders", 1, rebased)).isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+            assertThat(store.rebase("orders", 1, "wrong-hash", rebased))
+                    .isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+            assertThat(store.rebase("orders", 1, "old-hash", rebased))
+                    .isEqualTo(PipelineDraftMutation.REPLACED);
+            assertThat(store.get("orders").orElseThrow().baseArtifactHash()).isEqualTo("new-hash");
+            assertThat(store.get("orders").orElseThrow().publishedArtifactHash()).isEqualTo("published-hash");
+            assertThat(store.rebase("orders", 1, "old-hash", rebased))
+                    .isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+        }
+    }
+
+    @Test
     void publishDistinguishesMissingAndStaleDraftRevisions() {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
             var database = client.getDatabase("tapstate_pipeline_draft_it");

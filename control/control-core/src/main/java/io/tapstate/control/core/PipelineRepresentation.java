@@ -242,6 +242,9 @@ public final class PipelineRepresentation {
                     result.put(entry.getKey(), FieldRule.computed(
                             requiredString(typed.get("celExpr"), path + "." + entry.getKey())));
                 } else if (typed.size() == 1 && typed.containsKey("value")) {
+                    if (typed.get("value") == null) {
+                        throw malformed(path + "." + entry.getKey() + ".value cannot be null");
+                    }
                     result.put(entry.getKey(), FieldRule.literal(copyJsonValue(typed.get("value"))));
                 } else {
                     result.put(entry.getKey(), FieldRule.literal(copyJsonValue(value)));

@@ -166,6 +166,17 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
 
     @Override
     public PipelineDraftMutation replace(String pipelineId, long expectedRevision, PipelineDraft replacement) {
+        return replaceGuarded(pipelineId, expectedRevision, replacement.baseArtifactHash(), replacement);
+    }
+
+    @Override
+    public PipelineDraftMutation rebase(String pipelineId, long expectedRevision,
+            String expectedBaseArtifactHash, PipelineDraft replacement) {
+        return replaceGuarded(pipelineId, expectedRevision, expectedBaseArtifactHash, replacement);
+    }
+
+    private PipelineDraftMutation replaceGuarded(String pipelineId, long expectedRevision,
+            String expectedBaseArtifactHash, PipelineDraft replacement) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(replacement, "replacement");
         if (!pipelineId.equals(replacement.pipelineId())) {
@@ -183,7 +194,7 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
             }
             Document filter = activeDraft(pipelineId).append(REVISION, expectedRevision);
             if (migrated != null) {
-                filter.append("baseArtifactHash", replacement.baseArtifactHash())
+                filter.append("baseArtifactHash", expectedBaseArtifactHash)
                         .append("publishedDraftRevision", replacement.publishedDraftRevision())
                         .append("publishedArtifactHash", replacement.publishedArtifactHash());
             }
