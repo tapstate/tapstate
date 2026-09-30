@@ -23,7 +23,11 @@ if [[ "$2" == user ]]; then
 elif [[ "$2" == --paginate ]]; then
     printf '%s' "${STUB_EXISTING_DIGEST:-}"
 elif [[ "${STUB_MISSING:-false}" == true && ! -f "$STUB_PUSHED" ]]; then
-    printf '{"status":404,"message":"Package not found"}\n'
+    if [[ "${STUB_NOTFOUND_STRING:-false}" == true ]]; then
+        printf '{"status":"404","message":"Package not found"}\n'
+    else
+        printf '{"status":404,"message":"Package not found"}\n'
+    fi
     exit 1
 elif [[ "${STUB_API_FAIL:-false}" == true ]]; then
     exit 1
@@ -63,6 +67,7 @@ run_publish() {
         STUB_TOKEN="$TOKEN" STUB_ACTOR="${STUB_ACTOR:-publisher}" \
         STUB_LOG="$WORK/commands.log" STUB_PUSHED="$WORK/pushed" STUB_MANIFEST="$WORK/manifest.json" \
         STUB_MISSING="${STUB_MISSING:-false}" STUB_API_FAIL="${STUB_API_FAIL:-false}" \
+        STUB_NOTFOUND_STRING="${STUB_NOTFOUND_STRING:-false}" \
         STUB_VISIBILITY="${STUB_VISIBILITY:-private}" STUB_VISIBILITY_AFTER="${STUB_VISIBILITY_AFTER:-private}" \
         STUB_REPOSITORY="${STUB_REPOSITORY:-null}" STUB_EXISTING_DIGEST="${STUB_EXISTING_DIGEST:-}" \
         STUB_LOGIN_FAIL="${STUB_LOGIN_FAIL:-false}" STUB_PUSH_FAIL="${STUB_PUSH_FAIL:-false}" \
@@ -82,6 +87,13 @@ if STUB_MISSING=true run_publish > "$WORK/out" 2> "$WORK/err" \
         && grep -qF 'ghcr.io/tapstate/tapstate-cloud:0.6.0' "$WORK/commands.log"; then
     ok 'a new private Cloud package publishes exactly the checked release digest'
 else bad 'a new private Cloud package publishes exactly the checked release digest'; fi
+if STUB_MISSING=true STUB_NOTFOUND_STRING=true run_publish > "$WORK/out" 2> "$WORK/err" \
+        && grep -qF "ghcr.io/tapstate/tapstate-cloud@$DIGEST" "$WORK/out"; then
+    ok 'the real API string-valued 404 allows private first publication'
+else
+    bad 'the real API string-valued 404 allows private first publication'
+    grep -F 'could not be verified' "$WORK/err" || true
+fi
 TEST_TOKEN='' expect_failure 'missing dedicated credentials are refused' 'username and token'
 STUB_ACTOR=other expect_failure 'publishing identity must match the configured account' 'differs'
 STUB_VISIBILITY=public expect_failure 'a public package is refused before writing' 'must be private'

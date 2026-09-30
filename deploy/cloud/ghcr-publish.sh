@@ -57,7 +57,7 @@ check_private() {
             "$scratch/package.json" >/dev/null \
             || fail 'the Cloud package must be private and not linked to a public repository'
         package_exists=true
-    elif [[ "$1" == before ]] && jq -e '.status == 404' "$scratch/package.json" >/dev/null 2>&1; then
+    elif [[ "$1" == before ]] && jq -e '(.status | tostring) == "404"' "$scratch/package.json" >/dev/null 2>&1; then
         # New GHCR packages start private. Cloud images have no source label that would
         # automatically associate the package with the public code repository.
         package_exists=false
