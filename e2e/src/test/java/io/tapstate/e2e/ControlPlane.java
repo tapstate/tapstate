@@ -1156,6 +1156,12 @@ final class ControlPlane {
         return interpretRefusal(response.statusCode(), response.body(), "reading the status of " + pipelineId);
     }
 
+    /** Reads the metrics refusal itself, including its status and canonical error code. */
+    Refusal metricsExpectingRefusal(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + urlSegment(pipelineId) + "/metrics"));
+        return interpretRefusal(response.statusCode(), response.body(), "reading the metrics of " + pipelineId);
+    }
+
     /**
      * The published error count, or empty when the pipeline has published no observation yet.
      *

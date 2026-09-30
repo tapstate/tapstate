@@ -2,10 +2,17 @@ package io.tapstate.e2e;
 
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoDatabase;
+import io.tapstate.adapters.mongostore.MongoObservationStore;
+import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.control.core.MonitorError;
+import io.tapstate.core.lifecycle.MetricAttributes;
+import io.tapstate.core.lifecycle.Observation;
 import com.sun.net.httpserver.HttpServer;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.RequiresDocker;
+import io.tapstate.spi.store.ObservationStore;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -49,6 +56,110 @@ class AStoreOrExporterFailureDoesNotStopDataIT {
         RealConnectorGate.require("mysql", "mongodb");
         assertThat(Files.isRegularFile(Path.of(System.getProperty(BOOT_JAR_PROPERTY))))
                 .as("the explicitly requested boot JAR exists").isTrue();
+    }
+
+    @Test
+    void aNewExecutionIsPendingWhileThePreviousStoppedObservationStillExists() throws Exception {
+        String databaseName = "pending_execution_store";
+        String appName = "tapstate-pending-execution-store";
+        Map<String, Object> mysql = SharedMySql.settings("pending_execution_source");
+        seed(mysql);
+        String rawStoreUri = STORE.getReplicaSetUrl(databaseName);
+        String storeUri = rawStoreUri + (rawStoreUri.contains("?") ? "&" : "?") + "appName=" + appName;
+        String targetUri = SharedMongo.replicaSetUrl("pending_execution_target");
+        EndpointAddress target = EndpointAddress.uri(targetUri);
+        Path jar = Path.of(System.getProperty(BOOT_JAR_PROPERTY));
+        String jarSha = PipelineBenchmarkLiveRunIT.sha256(jar);
+        try (MongoClient admin = MongoClients.create(STORE.getReplicaSetUrl());
+                MongoEndpoints targetMongo = new MongoEndpoints();
+                RealProcessServer server = RealProcessServer.start(storeUri, "pending_execution_operator", jar,
+                        List.of())) {
+            MongoDatabase database = admin.getDatabase(databaseName);
+            var latest = new MongoObservationStore(admin,
+                    database.getCollection(MongoStorePort.PIPELINE_OBSERVATION),
+                    database.getCollection(MongoStorePort.PIPELINE_OBSERVATION_CHUNKS));
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            control.bootstrapAndLogin("pending-execution", "pending-execution-password");
+            control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
+            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+            control.apply(resources(mysql, targetUri));
+            control.discoverSchema("fault_source", "mysql", mysql);
+            control.lifecycle(PIPELINE, LifecycleVerb.START);
+            Await.until("real initial snapshot delivery", WAIT,
+                    () -> "before".equals(customer(targetMongo, target)),
+                    () -> "target=" + customer(targetMongo, target));
+            var running = Await.answered("known output and scoped initial execution", WAIT,
+                    () -> latest.readStored(PIPELINE).filter(value -> value.scope().isPresent()
+                            && value.observation().state() == PipelineState.RUNNING
+                            && outputStart(value.observation()) != null));
+            ObservationStore.Scope oldScope = running.scope().orElseThrow();
+            Instant oldStart = outputStart(running.observation());
+            control.stop(PIPELINE, false);
+            Await.answered("the old scoped STOPPED observation to physically commit", WAIT,
+                    () -> latest.readStored(PIPELINE).filter(value -> value.scope().filter(oldScope::equals).isPresent()
+                            && value.observation().state() == PipelineState.STOPPED));
+
+            int failuresBefore = logOccurrences(server.output(), "Could not write latest observation");
+            ObservationStore.Scope nextScope = new ObservationStore.Scope(oldScope.pipelineIncarnationId(),
+                    oldScope.executionGeneration() + 1);
+            configureFault(admin, true, databaseName, appName, "pipeline_observation", "update");
+            try {
+                var held = latest.readStored(PIPELINE).orElseThrow();
+                assertThat(held.scope()).contains(oldScope);
+                control.lifecycle(PIPELINE, LifecycleVerb.START);
+                Await.until("the actual new submission to advance its durable generation", WAIT,
+                        () -> generation(database) == nextScope.executionGeneration(),
+                        () -> "generation=" + generation(database));
+                Await.until("a new latest write to be refused by the observation-only failpoint", WAIT,
+                        () -> logOccurrences(server.output(), "Could not write latest observation") > failuresBefore,
+                        () -> "newGeneration=" + generation(database));
+                var physical = latest.readStored(PIPELINE).orElseThrow();
+                assertThat(physical.scope()).contains(oldScope);
+                assertThat(physical.observation().state()).isEqualTo(PipelineState.STOPPED);
+                assertThat(outputStart(physical.observation())).isEqualTo(oldStart);
+                assertThat(physical.observation()).isEqualTo(held.observation());
+                for (ControlPlane.Refusal refusal : List.of(control.stateExpectingRefusal(PIPELINE),
+                        control.metricsExpectingRefusal(PIPELINE))) {
+                    assertThat(refusal.status()).isEqualTo(404);
+                    assertThat(refusal.code()).isEqualTo(MonitorError.NO_OBSERVATION.code());
+                    assertThat(refusal.params()).containsEntry("pipeline", PIPELINE);
+                }
+                update(mysql, "during-pending");
+                Await.until("real CDC delivery while the new execution's latest is unavailable", WAIT,
+                        () -> "during-pending".equals(customer(targetMongo, target)),
+                        () -> "target=" + customer(targetMongo, target));
+                assertThat(control.metricsExpectingRefusal(PIPELINE).code())
+                        .isEqualTo(MonitorError.NO_OBSERVATION.code());
+            } finally {
+                configureFault(admin, false, databaseName, appName, "pipeline_observation", "update");
+            }
+            var current = Await.answered("recovery to a real new scoped observation", WAIT,
+                    () -> latest.readStored(PIPELINE).filter(value -> value.scope().filter(nextScope::equals).isPresent()
+                            && value.observation().state() == PipelineState.RUNNING
+                            && outputStart(value.observation()) != null
+                            && outputStart(value.observation()).isAfter(oldStart)));
+            assertThat(control.state(PIPELINE)).contains(PipelineState.RUNNING);
+            assertThat(generation(database)).isEqualTo(nextScope.executionGeneration());
+            System.out.printf("pending-execution-live jarSha=%s generationFrom=%d generationTo=%d"
+                            + " oldCounterStart=%s newCounterStart=%s target=%s statusRefusal=404 metricsRefusal=404%n",
+                    jarSha, oldScope.executionGeneration(), nextScope.executionGeneration(), oldStart,
+                    outputStart(current.observation()), customer(targetMongo, target));
+            control.stop(PIPELINE, false);
+        }
+        assertThat(PipelineBenchmarkLiveRunIT.sha256(jar)).isEqualTo(jarSha);
+    }
+
+    private static long generation(MongoDatabase database) {
+        Document claim = database.getCollection(MongoStorePort.WORKLOAD_CLAIMS)
+                .find(new Document("resourceType", "PIPELINE_ACTUATION").append("resourceId", PIPELINE)).first();
+        return claim == null ? -1 : ((Number) claim.get("executionGeneration")).longValue();
+    }
+
+    private static Instant outputStart(Observation observation) {
+        return observation.facts().stream().filter(fact -> fact.name().equals("tapstate.pipeline.records"))
+                .flatMap(fact -> fact.points().stream())
+                .filter(point -> "out".equals(point.attributes().get(MetricAttributes.DIRECTION)))
+                .map(io.tapstate.core.lifecycle.MetricPoint::startTime).findFirst().orElse(null);
     }
 
     @Test
@@ -293,12 +404,17 @@ class AStoreOrExporterFailureDoesNotStopDataIT {
 
     private static void configureFault(MongoClient admin, boolean enabled,
             String collection, String commandName) {
+        configureFault(admin, enabled, DATABASE, STORE_APP, collection, commandName);
+    }
+
+    private static void configureFault(MongoClient admin, boolean enabled, String databaseName, String appName,
+            String collection, String commandName) {
         Document command = new Document("configureFailPoint", "failCommand")
                 .append("mode", enabled ? "alwaysOn" : "off");
         if (enabled) {
             command.append("data", new Document("failCommands", List.of(commandName))
-                    .append("appName", STORE_APP)
-                    .append("namespace", DATABASE + "." + collection)
+                    .append("appName", appName)
+                    .append("namespace", databaseName + "." + collection)
                     .append("errorCode", 2));
         }
         admin.getDatabase("admin").runCommand(command);
