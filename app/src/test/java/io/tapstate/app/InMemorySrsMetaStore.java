@@ -7,6 +7,7 @@ import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -154,6 +155,15 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     }
 
     @Override
+    public synchronized void advanceSinkAcked(
+            String miningChainId,
+            String pipelineId,
+            ChainPosition position,
+            WorkloadClaimFence fence) {
+        advanceSinkAcked(miningChainId, pipelineId, position);
+    }
+
+    @Override
     public synchronized void setCdcStart(
             String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch) {
         SrsMeta m = require(miningChainId);
@@ -256,6 +266,16 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     }
 
     @Override
+    public synchronized void advanceSinkAcked(
+            String miningChainId,
+            String pipelineId,
+            String table,
+            ChainPosition position,
+            WorkloadClaimFence fence) {
+        advanceSinkAcked(miningChainId, pipelineId, table, position);
+    }
+
+    @Override
     public synchronized void configureSinkWriters(
             String miningChainId, String pipelineId, Map<String, List<String>> writerIdsByTable) {
         SrsMeta meta = require(miningChainId);
@@ -304,6 +324,15 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     }
 
     @Override
+    public synchronized void configureSinkWriters(
+            String miningChainId,
+            String pipelineId,
+            Map<String, List<String>> writerIdsByTable,
+            WorkloadClaimFence fence) {
+        configureSinkWriters(miningChainId, pipelineId, writerIdsByTable);
+    }
+
+    @Override
     public synchronized void advanceSinkWriterAcked(
             String miningChainId,
             String pipelineId,
@@ -335,6 +364,17 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     }
 
     @Override
+    public synchronized void advanceSinkWriterAcked(
+            String miningChainId,
+            String pipelineId,
+            String writerId,
+            String table,
+            ChainPosition position,
+            WorkloadClaimFence fence) {
+        advanceSinkWriterAcked(miningChainId, pipelineId, writerId, table, position);
+    }
+
+    @Override
     public synchronized void markSinkWriterSnapshotComplete(
             String miningChainId, String pipelineId, String writerId, String table) {
         require(miningChainId);
@@ -344,6 +384,22 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
                 .allMatch(expected -> writerProgress(writers, expected, table).snapshotComplete)) {
             markSnapshotComplete(miningChainId, pipelineId, table);
         }
+    }
+
+    @Override
+    public synchronized void markSnapshotComplete(
+            String miningChainId, String pipelineId, String table, WorkloadClaimFence fence) {
+        markSnapshotComplete(miningChainId, pipelineId, table);
+    }
+
+    @Override
+    public synchronized void markSinkWriterSnapshotComplete(
+            String miningChainId,
+            String pipelineId,
+            String writerId,
+            String table,
+            WorkloadClaimFence fence) {
+        markSinkWriterSnapshotComplete(miningChainId, pipelineId, writerId, table);
     }
 
     @Override
