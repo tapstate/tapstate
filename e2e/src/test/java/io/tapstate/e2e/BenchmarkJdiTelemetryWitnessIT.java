@@ -1,5 +1,16 @@
 package io.tapstate.e2e;
 
+import com.mongodb.ConnectionString;
+import com.mongodb.TransactionOptions;
+import com.mongodb.WriteConcern;
+import com.mongodb.client.MongoClients;
+import io.tapstate.adapters.mongostore.MongoHistoryRollupStore;
+import io.tapstate.adapters.mongostore.MongoObservationStore;
+import io.tapstate.adapters.mongostore.MongoRateHistoryStore;
+import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.core.common.JsonWriter;
+import io.tapstate.core.lifecycle.RateSample;
+import io.tapstate.spi.store.HistoryRollupStore;
 import io.tapstate.testsupport.DockerGate;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -7,7 +18,11 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import java.nio.file.Path;
+import java.math.BigDecimal;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Locale;
+import java.util.ArrayList;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.Executors;
@@ -193,6 +208,93 @@ class BenchmarkJdiTelemetryWitnessIT {
                 });
             }
         }
+    }
+
+    @Test
+    void aRealClosedRollupCapturesNestedEncodersBesideItsCommandCount(@TempDir Path directory) throws Exception {
+        String database = "jdi_nonempty_closed_rollup";
+        String uri = SharedMongo.replicaSetUrl(database);
+        try (var artifact = BenchmarkJdiCostObserver.Artifact.open(Path.of(System.getProperty(
+                    "tapstate.e2e.jdi-cost.observability-jar")), Arm.OBSERVABILITY);
+                var session = BenchmarkJdiTelemetrySession.launch(artifact, uri, database);
+                var client = MongoClients.create(uri)) {
+            ControlPlane control = new ControlPlane(session.server().baseUrl());
+            Await.until("nonempty rollup immutable boot readiness", control::healthy,
+                    () -> "owned process alive=" + session.server().isAlive());
+            session.begin();
+            RunningPipeline pipeline = RunningPipeline.started(session.server(), directory);
+            var mongo = client.getDatabase(new ConnectionString(uri).getDatabase());
+            var observations = new MongoObservationStore(client,
+                    mongo.getCollection(MongoStorePort.PIPELINE_OBSERVATION),
+                    mongo.getCollection(MongoStorePort.PIPELINE_OBSERVATION_CHUNKS));
+            Await.until("the actual allocated execution published its scope",
+                    () -> { session.checkCapture(); return observations.readStored(pipeline.pipelineId())
+                            .filter(stored -> stored.scope().isPresent()).isPresent(); },
+                    () -> "scoped latest is pending");
+            var owner = observations.readStored(pipeline.pipelineId()).orElseThrow().scope().orElseThrow();
+            Instant start = Instant.ofEpochSecond(Math.floorDiv(Instant.now().getEpochSecond(), 300) * 300 - 600);
+            var samples = new ArrayList<org.bson.Document>();
+            for (int sample = 0; sample < 3; sample++) {
+                samples.add(MongoRateHistoryStore.toDocument(new RateSample(pipeline.pipelineId(),
+                        start.plusSeconds(sample * 60L), Map.of("records.out", sample * 10L), Map.of(), start.minusSeconds(60)))
+                        .append("pipelineIncarnationId", owner.pipelineIncarnationId())
+                        .append("executionGeneration", owner.executionGeneration()));
+            }
+            // Publish the fixture atomically: the live worker must never cache a partial seed.
+            try (var transaction = client.startSession()) {
+                transaction.withTransaction(() -> {
+                    mongo.getCollection(MongoStorePort.PIPELINE_RATE_HISTORY).insertMany(transaction, samples);
+                    return null;
+                }, TransactionOptions.builder().writeConcern(WriteConcern.MAJORITY.withJournal(true)).build());
+            }
+            var key = new HistoryRollupStore.Key(pipeline.pipelineId(),
+                    HistoryRollupStore.Scope.incarnation(owner.pipelineIncarnationId()),
+                    HistoryRollupStore.Resolution.PT5M, start);
+            var rollups = new MongoHistoryRollupStore(mongo,
+                    mongo.getCollection(MongoStorePort.PIPELINE_HISTORY_ROLLUPS), Duration.ofDays(15));
+            // A normal miss offers a refresh hint even if the worker already passed this bucket.
+            pipeline.control().history(pipeline.pipelineId(), start, key.bucketEnd(), "PT5M");
+            var completeBucket = new AtomicReference<HistoryRollupStore.Bucket>();
+            Await.until("the protected worker persisted all three closed-bucket inputs",
+                    () -> {
+                        session.checkCapture();
+                        rollups.read(key).filter(found -> found.inWindowSamples() == 3
+                                && recordsOutDelta(found).compareTo(BigDecimal.valueOf(20)) == 0)
+                                .ifPresent(completeBucket::set);
+                        return completeBucket.get() != null;
+                    }, () -> "the requested bucket is absent or does not contain all three inputs");
+            var bucket = completeBucket.get();
+            assertThat(bucket.inWindowSamples()).isEqualTo(3);
+            assertThat(bucket.fragments()).isNotEmpty();
+            assertThat(bucket.requiresFinerResolution()).isFalse();
+            assertThat(recordsOutDelta(bucket)).isEqualByComparingTo("20");
+            pipeline.stopAndSettle(); session.cutoff();
+            var evidence = session.shutdownAndFinish();
+            assertThat(evidence.artifactSha256()).isEqualTo(Arm.OBSERVABILITY.sha256);
+            assertThat(evidence.fullyDrained()).isTrue();
+            for (Unit unit : new Unit[]{Unit.ROLLUP_DOCUMENT_BUILD, Unit.BSON_BINARY_ENCODER_INVOCATION,
+                    Unit.BSON_DOCUMENT_BINARY_ENCODER_INVOCATION, Unit.WIRE_COMMAND_BINARY_ENCODER_INVOCATION,
+                    Unit.SYNC_COMMAND_SEND}) {
+                var rows = evidence.costs().entrySet().stream().filter(entry -> entry.getKey().segment()
+                        == BenchmarkJdiTelemetrySession.Segment.WINDOW
+                        && entry.getKey().origin() == BenchmarkJdiTelemetrySession.Origin.ROLLUP_BATCH
+                        && entry.getKey().namespace() == Namespace.HISTORY_ROLLUPS
+                        && entry.getKey().unit() == unit).toList();
+                assertThat(rows).as("actual nonempty rollup cost unit %s", unit).isNotEmpty();
+                rows.forEach(entry -> {
+                    assertThat(entry.getValue().entries()).isPositive();
+                    assertThat(entry.getValue().normalReturns()).isEqualTo(entry.getValue().entries());
+                });
+            }
+            assertBoundary(evidence.begin()); assertBoundary(evidence.cutoff()); assertBoundary(evidence.shutdown());
+            System.out.println("benchmark-nonempty-rollup samples=3 delta=20 evidence="
+                    + JsonWriter.write(PipelineBenchmarkLiveRunIT.telemetryEvidence(java.util.Optional.of(evidence))));
+        }
+    }
+
+    private static BigDecimal recordsOutDelta(HistoryRollupStore.Bucket bucket) {
+        return bucket.fragments().stream().map(fragment -> fragment.recordsOut() == null
+                ? BigDecimal.ZERO : fragment.recordsOut().delta()).reduce(BigDecimal.ZERO, BigDecimal::add);
     }
 
     private static void assertBoundary(BenchmarkJdiTelemetrySession.Boundary boundary) {

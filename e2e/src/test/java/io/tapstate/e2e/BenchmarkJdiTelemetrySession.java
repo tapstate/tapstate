@@ -66,7 +66,7 @@ final class BenchmarkJdiTelemetrySession implements AutoCloseable {
     private record Scope(Spec spec, int depth, BenchmarkInvocationCohorts.Invocation<CallbackKey> callback) { }
     private record Call(Spec spec, int depth, BenchmarkInvocationCohorts.Invocation<CostKey> cost,
             BenchmarkInvocationCohorts.Invocation<WireCostKey> wire,
-            int requestId, long receiver) { }
+            int requestId, long receiver, BenchmarkImmutableWriterCache<ObjectReference> writerTypes) { }
     private record Template(Method method, long offset, Site site) { }
     private static final class ThreadState {
         final ThreadReference thread;
@@ -511,12 +511,13 @@ final class BenchmarkJdiTelemetrySession implements AutoCloseable {
                 if (arguments.size() != 3 || !(arguments.getFirst() instanceof ObjectReference writer)) {
                     throw invalid("typed BSON writer unavailable");
                 }
-                String writerType = writerType(writer);
+                Call command = state.calls.stream().filter(call -> call.spec().unit()
+                        == Unit.WIRE_COMMAND_BINARY_ENCODER_INVOCATION).findFirst().orElse(null);
+                String writerType = writerType(writer, command == null
+                        ? new BenchmarkImmutableWriterCache<>() : command.writerTypes());
                 if (writerType.equals("org.bson.BsonDocumentWriter")) {
                     unit = Unit.BSON_REPRESENTATION_CONVERSION;
                 } else if (writerType.equals("org.bson.BsonBinaryWriter")) {
-                    Call command = state.calls.stream().filter(call -> call.spec().unit()
-                            == Unit.WIRE_COMMAND_BINARY_ENCODER_INVOCATION).findFirst().orElse(null);
                     if (command == null) { throw invalid("binary codec lacked an exact command header scope"); }
                     namespace = command.cost().key().namespace();
                 } else { throw invalid("unmapped BSON writer type=" + safeType(writerType)); }
@@ -536,7 +537,8 @@ final class BenchmarkJdiTelemetrySession implements AutoCloseable {
             }
             Namespace actualNamespace = namespace; Unit actualUnit = unit;
             var cost = costs.enter(segment -> new CostKey(segment, origin(activeState), actualNamespace, actualUnit));
-            state.calls.push(new Call(spec, depth, cost, wire, requestId, receiver));
+            state.calls.push(new Call(spec, depth, cost, wire, requestId, receiver,
+                    unit == Unit.WIRE_COMMAND_BINARY_ENCODER_INVOCATION ? new BenchmarkImmutableWriterCache<>() : null));
         } else {
             Call top = state.calls.peek();
             if (top == null || !top.spec().equals(spec) || top.depth() != depth) { throw invalid("call return lost its entry"); }
@@ -554,42 +556,49 @@ final class BenchmarkJdiTelemetrySession implements AutoCloseable {
         }
     }
 
-    private String writerType(ObjectReference writer) throws Exception {
+    private String writerType(ObjectReference writer, BenchmarkImmutableWriterCache<ObjectReference> cache) throws Exception {
+        return cache.classify(writer, new BenchmarkImmutableWriterCache.Access<>() {
+            @Override public long identity(ObjectReference value) { return value.uniqueID(); }
+            @Override public BenchmarkImmutableWriterCache.Node<ObjectReference> inspect(ObjectReference value) throws Exception {
+                return inspectWriter(value);
+            }
+        });
+    }
+
+    private BenchmarkImmutableWriterCache.Node<ObjectReference> inspectWriter(ObjectReference writer) throws Exception {
         String appending = "com.mongodb.internal.connection.BsonWriterHelper$AppendingBsonWriter";
         Set<String> wrappers = Set.of(appending, "com.mongodb.internal.connection.FieldTrackingBsonWriter",
                 "com.mongodb.internal.connection.IdHoldingBsonWriter",
                 "com.mongodb.internal.connection.SplittablePayloadBsonWriter");
-        Set<Long> visited = new HashSet<>();
-        for (int depth = 0; depth < 8; depth++) {
-            if (!visited.add(writer.uniqueID())) { throw invalid("BSON writer delegate cycle"); }
-            String type = writer.referenceType().name();
-            if (wrappers.contains(type)) {
-                verifyWriter(writer.referenceType());
-                Field delegate = writer.referenceType().fieldByName("bsonWriter");
-                if (delegate == null || !delegate.signature().equals("Lorg/bson/BsonWriter;")
-                        || !delegate.declaringType().name()
-                                .equals("com.mongodb.internal.connection.BsonWriterDecorator")) {
-                    throw invalid("pinned BSON writer delegate unavailable");
-                }
-                verifyWriter(delegate.declaringType());
-                // The decorator output is distinct from an IdHolding writer's ancillary ID buffer.
-                writer = BenchmarkJdiCostObserver.object(writer.getValue(delegate));
-                continue;
+        ReferenceType actualType = writer.referenceType();
+        String type = actualType.name();
+        if (wrappers.contains(type)) {
+            verifyWriter(actualType);
+            Field delegate = actualType.fieldByName("bsonWriter");
+            if (delegate == null || delegate.isStatic() || !delegate.isFinal()
+                    || !delegate.signature().equals("Lorg/bson/BsonWriter;")
+                    || !delegate.declaringType().name()
+                            .equals("com.mongodb.internal.connection.BsonWriterDecorator")) {
+                throw invalid("pinned BSON writer delegate unavailable");
             }
-            if (type.equals(appending + "$InternalAppendingBsonBinaryWriter")) {
-                verifyWriter(writer.referenceType());
-                if (!(writer.referenceType() instanceof ClassType actual)
-                        || !actual.superclass().name().equals("org.bson.BsonBinaryWriter")) {
-                    throw invalid("appending writer superclass differs from pinned binary writer");
-                }
-                return "org.bson.BsonBinaryWriter";
-            }
-            if (type.equals("org.bson.BsonBinaryWriter") || type.equals("org.bson.BsonDocumentWriter")) {
-                verifyWriter(writer.referenceType());
-            }
-            return type;
+            verifyWriter(delegate.declaringType());
+            // The decorator output is distinct from an IdHolding writer's ancillary ID buffer.
+            return new BenchmarkImmutableWriterCache.Node<>(null,
+                    BenchmarkJdiCostObserver.object(writer.getValue(delegate)), true);
         }
-        throw invalid("BSON writer delegate depth exceeded its bound");
+        if (type.equals(appending + "$InternalAppendingBsonBinaryWriter")) {
+            verifyWriter(actualType);
+            if (!(actualType instanceof ClassType actual)
+                    || !actual.superclass().name().equals("org.bson.BsonBinaryWriter")) {
+                throw invalid("appending writer superclass differs from pinned binary writer");
+            }
+            return new BenchmarkImmutableWriterCache.Node<>("org.bson.BsonBinaryWriter", null, false);
+        }
+        if (type.equals("org.bson.BsonBinaryWriter") || type.equals("org.bson.BsonDocumentWriter")) {
+            verifyWriter(actualType);
+            return new BenchmarkImmutableWriterCache.Node<>(type, null, false);
+        }
+        throw invalid("unmapped BSON writer type=" + safeType(type));
     }
     private void verifyWriter(ReferenceType type) throws Exception {
         if (type.classLoader() == null || type.classLoader().uniqueID() != applicationLoader) {

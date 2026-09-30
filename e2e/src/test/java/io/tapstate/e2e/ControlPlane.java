@@ -1194,9 +1194,14 @@ final class ControlPlane {
 
     /** Reads the public raw history page and its explicit sample gaps. */
     Map<?, ?> history(String pipelineId, Instant from, Instant to) {
+        return history(pipelineId, from, to, "raw");
+    }
+
+    /** Reads a requested history resolution through the ordinary authenticated query path. */
+    Map<?, ?> history(String pipelineId, Instant from, Instant to, String resolution) {
         String path = "/api/pipelines/" + urlSegment(pipelineId) + "/metrics/history?from="
                 + urlSegment(from.toString()) + "&to=" + urlSegment(to.toString())
-                + "&resolution=raw&limit=100";
+                + "&resolution=" + urlSegment(resolution) + "&limit=100";
         HttpResponse<String> response = send(authedGet(path));
         expect(response, 200, "read retained pipeline history");
         if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> page)) {
