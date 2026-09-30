@@ -1,6 +1,7 @@
 package io.tapstate.runtime.srs;
 
 import static com.hazelcast.jet.core.Edge.between;
+import static io.tapstate.runtime.srs.SplitBrainProtectionTestSupport.awaitMinimumSize;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.hazelcast.config.Config;
@@ -71,6 +72,7 @@ class ASourceWhoseFirstRingReadIsRefusedWaitsForTheClusterTest {
     void aSourceRefusedItsFirstReadWaitsForTheClusterInsteadOfEndingTheRun() throws InterruptedException {
         first = Hazelcast.newHazelcastInstance(member());
         second = Hazelcast.newHazelcastInstance(member());
+        awaitMinimumSize(PROTECTION, first, second);
         // Written while the protection is satisfied, so what the source later cannot reach is a ring that
         // demonstrably holds these changes rather than one that was never filled.
         fill(first, CHANGES);
