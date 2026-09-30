@@ -63,6 +63,12 @@ import java.util.function.Supplier;
  */
 public final class MongoSrsMetaStore implements SrsMetaStore {
 
+    private static final String POSITION = "position";
+    private static final String POSITION_ORDER = "position order";
+    private static final String TABLE = "table";
+    private static final String PIPELINE_ID = "pipelineId";
+    private static final String SNAPSHOT_COMPLETED_TABLES = "snapshotCompletedTables";
+
     /**
      * A root-local fence advanced with every split-cursor write. It has no model meaning: its write is
      * what makes the root-existence check conflict with a concurrent lifecycle delete.
@@ -235,8 +241,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     @Override
     public void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
         Objects.requireNonNull(miningChainId, "miningChainId");
-        Objects.requireNonNull(position, "position");
-        Objects.requireNonNull(position.order(), "position order");
+        Objects.requireNonNull(position, POSITION);
+        Objects.requireNonNull(position.order(), POSITION_ORDER);
         // Two updates, and the split is the guard. The first carries the ordering condition in its own
         // filter, so the comparison and the write are one atomic act: a read-then-write would let a second
         // member land its advance in between and be overwritten by this one, which is the rewind this
@@ -343,8 +349,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             String pipelineId,
             ChainPosition position,
             WorkloadClaimFence fence) {
-        Objects.requireNonNull(position, "position");
-        Objects.requireNonNull(position.order(), "position order");
+        Objects.requireNonNull(position, POSITION);
+        Objects.requireNonNull(position.order(), POSITION_ORDER);
         mutateConsumer(miningChainId, pipelineId, fence, consumer -> {
             if (!sinkAckFenceMatches(consumer, pipelineId, fence)) {
                 return false;
@@ -367,9 +373,9 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             String table,
             ChainPosition position,
             WorkloadClaimFence fence) {
-        Objects.requireNonNull(table, "table");
-        Objects.requireNonNull(position, "position");
-        Objects.requireNonNull(position.order(), "position order");
+        Objects.requireNonNull(table, TABLE);
+        Objects.requireNonNull(position, POSITION);
+        Objects.requireNonNull(position.order(), POSITION_ORDER);
         mutateConsumer(miningChainId, pipelineId, fence, consumer -> {
             if (!sinkAckFenceMatches(consumer, pipelineId, fence)) {
                 return false;
@@ -416,8 +422,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             String writerId,
             String table,
             ChainPosition position) {
-        Objects.requireNonNull(position, "position");
-        Objects.requireNonNull(position.order(), "position order");
+        Objects.requireNonNull(position, POSITION);
+        Objects.requireNonNull(position.order(), POSITION_ORDER);
         mutateConsumer(miningChainId, pipelineId, consumer -> {
             advanceSinkWriter(consumer, pipelineId, writerId, table, position);
             return true;
@@ -432,8 +438,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             String table,
             ChainPosition position,
             WorkloadClaimFence fence) {
-        Objects.requireNonNull(position, "position");
-        Objects.requireNonNull(position.order(), "position order");
+        Objects.requireNonNull(position, POSITION);
+        Objects.requireNonNull(position.order(), POSITION_ORDER);
         mutateConsumer(miningChainId, pipelineId, fence, consumer -> {
             if (!sinkAckFenceMatches(consumer, pipelineId, fence)) {
                 return false;
@@ -445,7 +451,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
 
     @Override
     public void startRingAfter(String miningChainId, String pipelineId, String table, long seq) {
-        Objects.requireNonNull(table, "table");
+        Objects.requireNonNull(table, TABLE);
         // Read, then write only when there is no arrival yet: a pipeline arrives on a ring from one member
         // at a time, so nothing races this, and a raise over a place the pipeline already has would carry it
         // past changes it has not received.
@@ -480,7 +486,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
 
     /** The one update that publishes both halves of a consumer's first arrival on a table ring. */
     static Document consumerArrivalUpdate(String table, long seq) {
-        Objects.requireNonNull(table, "table");
+        Objects.requireNonNull(table, TABLE);
         return new Document("$max", new Document(PER_TABLE_RING_DONE + "." + table, seq)
                 .append("perTableSeq." + table, seq));
     }
@@ -488,7 +494,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     @Override
     public Map<String, Long> ringDoneThrough(String miningChainId, String pipelineId) {
         Objects.requireNonNull(miningChainId, "miningChainId");
-        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(pipelineId, PIPELINE_ID);
         Document consumer = StoreIo.call(() -> consumers.find(consumerKey(miningChainId, pipelineId))
                 .projection(Projections.include(PER_TABLE_RING_DONE)).first());
         Map<String, Long> seqs = new LinkedHashMap<>();
@@ -509,8 +515,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * addresses exactly one field. A deep {@code $max} creates the cursor map when none exists yet.
      */
     static Document consumerReadSeqUpdate(String pipelineId, String table, long lastReadSeq) {
-        Objects.requireNonNull(pipelineId, "pipelineId");
-        Objects.requireNonNull(table, "table");
+        Objects.requireNonNull(pipelineId, PIPELINE_ID);
+        Objects.requireNonNull(table, TABLE);
         return new Document("$max", new Document("perTableSeq." + table, lastReadSeq));
     }
 
@@ -534,9 +540,9 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * already declines to write down, leaving the offset where it stands.
      */
     static Document sinkAckedUpdate(String pipelineId, ChainPosition position) {
-        Objects.requireNonNull(pipelineId, "pipelineId");
-        Objects.requireNonNull(position, "position");
-        Objects.requireNonNull(position.order(), "position order");
+        Objects.requireNonNull(pipelineId, PIPELINE_ID);
+        Objects.requireNonNull(position, POSITION);
+        Objects.requireNonNull(position.order(), POSITION_ORDER);
         Document fields = new Document("sinkAckedEpoch", position.order().epoch())
                 .append("sinkAckedSeq", position.order().seq());
         Document update = new Document("$set", fields);
@@ -556,7 +562,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * ring, so it raises nothing.
      */
     static Document sinkAckedUpdate(String pipelineId, String table, ChainPosition position) {
-        Objects.requireNonNull(table, "table");
+        Objects.requireNonNull(table, TABLE);
         Document update = sinkAckedUpdate(pipelineId, position);
         if (position.order().seq() >= 0) {
             update.append("$max", new Document(PER_TABLE_RING_DONE + "." + table, position.order().seq()));
@@ -575,7 +581,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         LinkedHashSet<String> allWriterIds = new LinkedHashSet<>();
         Map<String, List<String>> normalizedPlan = new LinkedHashMap<>();
         for (Map.Entry<String, List<String>> entry : writerIdsByTable.entrySet()) {
-            String table = storedKey(entry.getKey(), "table");
+            String table = storedKey(entry.getKey(), TABLE);
             if (entry.getValue().isEmpty()) {
                 throw new IllegalArgumentException(
                         "sink writer plan for table '" + table + "' must name at least one writer");
@@ -631,7 +637,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             String table,
             ChainPosition position) {
         writerId = storedKey(writerId, "sink writer id");
-        table = storedKey(table, "table");
+        table = storedKey(table, TABLE);
         requireExpectedWriter(consumer, pipelineId, writerId, table);
         Document progress = nestedDocument(consumer, SINK_WRITER_PROGRESS, pipelineId, true);
         Document writer = writerProgress(progress, pipelineId, writerId, table, true);
@@ -664,7 +670,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     private static void markSinkWriterSnapshotComplete(
             Document consumer, String pipelineId, String writerId, String table) {
         String storedWriterId = storedKey(writerId, "sink writer id");
-        String storedTable = storedKey(table, "table");
+        String storedTable = storedKey(table, TABLE);
         List<String> expected = requireExpectedWriter(consumer, pipelineId, storedWriterId, storedTable);
         Document progress = nestedDocument(consumer, SINK_WRITER_PROGRESS, pipelineId, true);
         writerProgress(progress, pipelineId, storedWriterId, storedTable, true)
@@ -677,20 +683,20 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             List<String> completed = new ArrayList<>(snapshotCompletedFrom(consumer));
             if (!completed.contains(storedTable)) {
                 completed.add(storedTable);
-                consumer.put("snapshotCompletedTables", completed);
+                consumer.put(SNAPSHOT_COMPLETED_TABLES, completed);
             }
         }
     }
 
     /** Adds one direct snapshot-completion mark, answering whether the consumer changed. */
     private static boolean markSnapshotComplete(Document consumer, String table) {
-        Objects.requireNonNull(table, "table");
+        Objects.requireNonNull(table, TABLE);
         List<String> completed = new ArrayList<>(snapshotCompletedFrom(consumer));
         if (completed.contains(table)) {
             return false;
         }
         completed.add(table);
-        consumer.put("snapshotCompletedTables", completed);
+        consumer.put(SNAPSHOT_COMPLETED_TABLES, completed);
         return true;
     }
 
@@ -722,7 +728,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
 
     /** A sink fence is a submitted execution of this exact pipeline, never another workload type. */
     private static void requirePipelineFence(String pipelineId, WorkloadClaimFence fence) {
-        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(pipelineId, PIPELINE_ID);
         Objects.requireNonNull(fence, "fence");
         if (fence.key().type() != WorkloadClaimType.PIPELINE_ACTUATION
                 || !pipelineId.equals(fence.key().resourceId())
@@ -863,7 +869,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     @Override
     public void setCdcStart(
             String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch) {
-        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(pipelineId, PIPELINE_ID);
         Objects.requireNonNull(cdcStartPosition, "cdcStartPosition");
         if (snapshotEpoch < 0) {
             throw new IllegalArgumentException("snapshotEpoch must not be negative, got " + snapshotEpoch);
@@ -1045,14 +1051,14 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * never done. An upsert creates the consumer entry when the pipeline has none and touches nothing else.
      */
     static Document snapshotCompleteUpdate(String pipelineId, String table) {
-        Objects.requireNonNull(pipelineId, "pipelineId");
-        Objects.requireNonNull(table, "table");
-        return new Document("$addToSet", new Document("snapshotCompletedTables", table));
+        Objects.requireNonNull(pipelineId, PIPELINE_ID);
+        Objects.requireNonNull(table, TABLE);
+        return new Document("$addToSet", new Document(SNAPSHOT_COMPLETED_TABLES, table));
     }
 
     @Override
     public List<String> miningChainIdsWithConsumer(String pipelineId) {
-        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(pipelineId, PIPELINE_ID);
         // Include both shapes during the lazy migration window. Only ids are read, so enumeration never
         // reconstructs a cursor and a corrupt cursor cannot prevent a departing pipeline from detaching.
         LinkedHashSet<String> chains = new LinkedHashSet<>();
@@ -1060,7 +1066,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                 .projection(Projections.include("_id"))
                 .map(document -> document.getString("_id"))
                 .into(chains));
-        StoreIo.call(() -> consumers.find(new Document("pipelineId", pipelineId))
+        StoreIo.call(() -> consumers.find(new Document(PIPELINE_ID, pipelineId))
                 .projection(Projections.include("miningChainId"))
                 .map(document -> document.getString("miningChainId"))
                 .into(chains));
@@ -1088,7 +1094,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     @Override
     public void detachConsumer(String miningChainId, String pipelineId) {
         Objects.requireNonNull(miningChainId, "miningChainId");
-        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(pipelineId, PIPELINE_ID);
         // A detach is idempotent, so an absent chain is already the requested end state. Migration still
         // runs when the chain exists, preserving every other legacy cursor before this one is removed.
         // Its transaction also serializes any older migration snapshot before the delete, so no durable
@@ -1103,7 +1109,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * so the dotted path addresses exactly one field and cannot reach into a neighbouring consumer's.
      */
     static Document consumerPresenceFilter(String pipelineId) {
-        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(pipelineId, PIPELINE_ID);
         return new Document("consumerOffsets." + pipelineId, new Document("$exists", true));
     }
 
@@ -1137,7 +1143,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      */
     private void updateConsumer(String miningChainId, String pipelineId, Document update) {
         Objects.requireNonNull(miningChainId, "miningChainId");
-        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(pipelineId, PIPELINE_ID);
         migrateLegacyConsumers(miningChainId, true);
         update.append("$setOnInsert", consumerIdentity(miningChainId, pipelineId));
         writeConsumer(miningChainId, session -> consumers.updateOne(session,
@@ -1161,7 +1167,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             WorkloadClaimFence fence,
             ConsumerDocumentMutation mutation) {
         Objects.requireNonNull(miningChainId, "miningChainId");
-        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(pipelineId, PIPELINE_ID);
         migrateLegacyConsumers(miningChainId, true);
         writeConsumer(miningChainId, fence, session -> {
             Document key = consumerKey(miningChainId, pipelineId);
@@ -1339,10 +1345,10 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         List<Document> split = StoreIo.call(() -> consumers.find(consumersOfChain(miningChainId))
                 .into(new ArrayList<>()));
         for (Document document : split) {
-            String pipelineId = document.getString("pipelineId");
+            String pipelineId = document.getString(PIPELINE_ID);
             if (pipelineId == null) {
                 throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
-                        Map.of("id", String.valueOf(document.get("_id")), "field", "pipelineId"), null);
+                        Map.of("id", String.valueOf(document.get("_id")), "field", PIPELINE_ID), null);
             }
             merged.put(pipelineId, consumerFromDocument(pipelineId, document));
         }
@@ -1352,14 +1358,14 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     /** The collision-free id of one cursor document; chain roots keep scalar string ids. */
     private static Document consumerKey(String miningChainId, String pipelineId) {
         Objects.requireNonNull(miningChainId, "miningChainId");
-        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(pipelineId, PIPELINE_ID);
         return new Document("_id", new Document("chain", miningChainId).append("pipeline", pipelineId));
     }
 
     /** Fields every split cursor carries so both lookup directions can use declared indexes. */
     private static Document consumerIdentity(String miningChainId, String pipelineId) {
         return new Document("miningChainId", miningChainId)
-                .append("pipelineId", pipelineId);
+                .append(PIPELINE_ID, pipelineId);
     }
 
     /** One full split cursor document, used by replacement writes. */
@@ -1510,7 +1516,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * two position writers create it without this field.
      */
     private static List<String> snapshotCompletedFrom(Document document) {
-        Object raw = document.get("snapshotCompletedTables");
+        Object raw = document.get(SNAPSHOT_COMPLETED_TABLES);
         List<String> completed = new ArrayList<>();
         if (raw instanceof List<?> entries) {
             for (Object entry : entries) {
@@ -1597,7 +1603,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         }
         Document document = new Document("perTableSeq", perTable);
         if (!offset.snapshotCompletedTables().isEmpty()) {
-            document.append("snapshotCompletedTables", List.copyOf(offset.snapshotCompletedTables()));
+            document.append(SNAPSHOT_COMPLETED_TABLES, List.copyOf(offset.snapshotCompletedTables()));
         }
         if (offset.cdcStartPosition() != null) {
             document.append("cdcStartPosition", offset.cdcStartPosition());
