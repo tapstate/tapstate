@@ -13,12 +13,15 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.hazelcast.core.HazelcastInstance;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SrsMetaStore;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -148,6 +151,79 @@ class StoreBackedSinkAckFactoryTest {
         // apart and neither ring is positioned by the other's.
         assertThat(store.ringDoneThrough("mc-shop", "pipe-1"))
                 .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 7L, "items", 3L));
+    }
+
+    @Test
+    void durableRingPositionWaitsForTheSlowestSink() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        HazelcastInstance member = memberWith(store);
+        StoreBackedSinkAckFactory factory =
+                new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1");
+        SinkAck fasterSink = factory.resolve(member);
+        SinkAck slowerSink = factory.resolve(member);
+
+        fasterSink.advance("orders", at(100, "w100"));
+        slowerSink.advance("orders", at(50, "w50"));
+
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1").get("orders"))
+                .isEqualTo(50L);
+    }
+
+    @Test
+    void aLegacyAggregateIsRefusedBeforeTheDagCanRunWithTwoWriters() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        store.advanceSinkAcked("mc-orders", "pipe-1", "orders", at(100, "w100"));
+        Map<String, List<String>> plan = Map.of("orders", List.of("fast", "slow"));
+        StoreBackedSinkAckFactory factory = new StoreBackedSinkAckFactory(
+                Map.of("orders", "mc-orders"), "pipe-1", store);
+
+        assertThatThrownBy(() -> factory.prepareWriterPlan(plan))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(thrown -> assertThat(((TapstateException) thrown).code())
+                        .isEqualTo(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS));
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1"))
+                .containsEntry("orders", 100L);
+    }
+
+    @Test
+    void anInitialRingCursorCanPrepareTwoWritersBeforeEitherSinkRuns() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        store.startRingAfter("mc-orders", "pipe-1", "orders", 40);
+        StoreBackedSinkAckFactory factory = new StoreBackedSinkAckFactory(
+                Map.of("orders", "mc-orders"), "pipe-1", store);
+
+        factory.prepareWriterPlan(Map.of("orders", List.of("fast", "slow")));
+        store.advanceSinkWriterAcked("mc-orders", "pipe-1", "fast", "orders", at(41, "w41"));
+
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1"))
+                .containsEntry("orders", 40L);
+        assertThat(store.read("mc-orders").orElseThrow().consumerOffset("pipe-1").orElseThrow().sinkAcked())
+                .isNull();
+    }
+
+    @Test
+    void snapshotCompletionWaitsForEverySink() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        store.setCdcStart("mc-orders", "pipe-1", "w0", 1L);
+        HazelcastInstance member = memberWith(store);
+        StoreBackedSinkAckFactory factory =
+                new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1");
+        SinkAck firstSink = factory.resolve(member);
+        SinkAck secondSink = factory.resolve(member);
+
+        firstSink.advance("orders", new ChainPosition(SourceOrder.snapshotRow(1), null));
+
+        assertThat(store.read("mc-orders").orElseThrow().snapshotCompletedTables("pipe-1"))
+                .isEmpty();
+
+        secondSink.advance("orders", new ChainPosition(SourceOrder.snapshotRow(1), null));
+
+        assertThat(store.read("mc-orders").orElseThrow().snapshotCompletedTables("pipe-1"))
+                .containsExactly("orders");
     }
 
     @Test

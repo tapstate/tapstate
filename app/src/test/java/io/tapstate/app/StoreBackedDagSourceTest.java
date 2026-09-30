@@ -8,6 +8,8 @@ import com.hazelcast.jet.core.Edge;
 import com.hazelcast.jet.core.Vertex;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
@@ -36,6 +38,7 @@ import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ConnectionTester;
 import io.tapstate.spi.store.DerivedSchema;
 import io.tapstate.spi.store.DiscoveredSourceModel;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.SchemaStore;
@@ -715,6 +718,38 @@ class StoreBackedDagSourceTest {
         DAG dag = new StoreBackedDagSource(store).dagFor("p");
 
         assertThat(vertexNames(dag)).contains("orders_src");
+    }
+
+    @Test
+    void refuses_legacy_aggregate_progress_before_a_multi_sink_dag_can_run() {
+        FakeStorePort store = new FakeStorePort();
+        SourceResource source = cdcSource("orders_src", "orders");
+        PipelineResource pipeline = new PipelineResource(
+                "p", null,
+                List.of(SourceRef.spec("orders_src", true)),
+                null,
+                null,
+                serve(
+                        FromRef.literal("orders_src"),
+                        sync("fast", "fast_dest"),
+                        sync("slow", "slow_dest")),
+                null, null);
+        store.artifacts().save(source);
+        store.artifacts().save(connectionSupplier("fast_dest"));
+        store.artifacts().save(connectionSupplier("slow_dest"));
+        store.artifacts().save(pipeline);
+        discovered(store, "orders_src", "orders");
+        String chain = SourceCaptureResolution.of(source).chainId().value();
+        store.meta().create(chain, null);
+        store.meta().advanceSinkAcked(
+                chain, "p", "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
+
+        assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("p"))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(thrown -> assertThat(((TapstateException) thrown).code())
+                        .isEqualTo(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS));
+        assertThat(store.meta().ringDoneThrough(chain, "p"))
+                .containsEntry("orders", 100L);
     }
 
     @Test

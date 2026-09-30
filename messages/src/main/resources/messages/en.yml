@@ -486,6 +486,9 @@ io.schema-read-contention:
 io.schema-write-contention:
   message: "The schema for connection '{connectionId}' could not be published because its writer lease was reclaimed or concurrent discovery kept changing it."
   solution: "Wait for re-discovery to finish, then retry discovery."
+io.sink-writer-progress-ambiguous:
+  message: "Pipeline '{pipeline}' has retained sink progress from before progress was recorded per writer, but it now has multiple sink writers."
+  solution: "Stop the pipeline to clear its retained state. Then run a full resync, or explicitly choose and accept a new incremental starting point knowing earlier changes will not be replayed. The old aggregate may belong only to the fastest sink, so it cannot be used as evidence for every target."
 io.document-too-large:
   message: "The record for '{id}' no longer fits in one stored document."
   solution: "The store is healthy and retrying will not help. Reduce what is held under this one id."

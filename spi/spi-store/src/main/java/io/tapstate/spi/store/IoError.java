@@ -58,6 +58,15 @@ public enum IoError implements TapstateErrorCode {
     WORKLOAD_CLAIM_FENCED("io.workload-claim-fenced", Set.of()),
 
     /**
+     * A pipeline has aggregate sink progress from before progress was recorded per writer, and now names
+     * multiple writers. The aggregate may have been advanced by only the fastest writer, so it cannot be
+     * promoted into evidence that every writer reached that position. {@code pipeline} identifies the
+     * consumer whose retained state must be cleared before a full resync or an explicitly accepted new
+     * incremental baseline.
+     */
+    SINK_WRITER_PROGRESS_AMBIGUOUS("io.sink-writer-progress-ambiguous", Set.of("pipeline")),
+
+    /**
      * A document a store operation had to write is larger than the store will accept. {@code id} is
      * the document's id, or {@code unknown} where the failing call did not name one.
      *
