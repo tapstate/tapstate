@@ -28,6 +28,17 @@ final class JoinProjectionProcessor extends AbstractProcessor implements Staged 
         this.projection = projection;
     }
 
+    /**
+     * Like every other vertex that reaches the state layer, and for the same reason: every call into the
+     * join's state is a call into the cluster, and one the cluster refuses while a member joining catches up
+     * is waited out where it was made. A call that waits on a cooperative thread stops every other vertex
+     * sharing that thread rather than only this one.
+     */
+    @Override
+    public boolean isCooperative() {
+        return false;
+    }
+
     // Times each drain of arrivals, which is this stage's unit of work.
     private StageTimer timer = StageTimer.none(Stage.JOIN);
 

@@ -642,6 +642,9 @@ engine.routing-key-missing:
 engine.key-change-on-parallel-node:
   message: "An update on stream {stream} changed its row's key at node {node}, which runs on several processors; the change cannot be kept in order with both keys."
   solution: "Set execution.parallelism to 1 on {node} if rows on {stream} change their key; one processor applies such changes in order."
+engine.cluster-refused-the-state:
+  message: "The cluster refused operations on operator state `{state}` for {seconds}s, so the run stopped."
+  solution: "Check that every member can reach the coordination store and see the others; start the pipeline again once the cluster reports its full membership."
 engine.membership-changed-before-start:
   message: "Pipeline {pipeline} was planned for {planned} members but started on {actual}; it was stopped before any processor ran."
   solution: "Nothing to do: the next start works the plan out again for the members present then."

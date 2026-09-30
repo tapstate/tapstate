@@ -136,7 +136,16 @@ public enum EngineError implements TapstateErrorCode {
      * ran, because every processor count and every set of writers worked out for the plan would be wrong.
      */
     MEMBERSHIP_CHANGED_BEFORE_START("engine.membership-changed-before-start",
-            Set.of("pipeline", "planned", "actual"));
+            Set.of("pipeline", "planned", "actual")),
+
+    /**
+     * The cluster refused operations on a pipeline's operator state for the whole stretch a run waits such a
+     * refusal out. A member that has just joined takes over parts of that state before every member's
+     * protection verdict agrees, and refuses operations on them until it does; waiting is the answer while the
+     * verdicts converge, and this is the one that never cleared. {@code state} names the state, {@code seconds}
+     * how long the run waited.
+     */
+    CLUSTER_REFUSED_THE_STATE("engine.cluster-refused-the-state", Set.of("state", "seconds"));
 
     private final String code;
     private final Set<String> placeholders;
