@@ -19,6 +19,7 @@ public record Metadata(
         @Doc("Arbitrary key/value labels attached to the resource for grouping and selection.")
         Map<String, String> labels,
         @Doc("Free-text description of the resource; never identity.")
+        @JsonInclude(JsonInclude.Include.ALWAYS)
         String description,
         @Doc("Server-managed marker carried by resources created in a managed Cloud Cluster.")
         Boolean cloud,

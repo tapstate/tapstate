@@ -221,6 +221,21 @@ class PipelineApiTest {
     }
 
     @Test
+    void provenanceOnlySourceMetadataKeepsTheNullableDescriptionInPipelineResponses() {
+        context.getBean(FakeArtifactStore.class).seed(SOURCE_X.replace(
+                "id: src_x", "id: src_x\nmetadata: {cloud: true, user_id: fixture-cloud-user}"));
+        Map<?, ?> pipeline = client().get().uri("/api/pipelines/pl1")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(Map.class);
+        Map<?, ?> source = (Map<?, ?>) ((List<?>) pipeline.get("sources")).getFirst();
+        Map<String, Object> metadata = (Map<String, Object>) source.get("metadata");
+        assertThat(metadata).containsKey("description");
+        assertThat(metadata.get("description")).isNull();
+        assertThat(metadata).containsEntry("cloud", true).containsEntry("user_id", "fixture-cloud-user");
+        assertThat(metadata).doesNotContainKey("empty");
+    }
+
+    @Test
     void createPersistsABlankEditorDraftBeforeTheFirstTypedDagSave() {
         String mutation = """
                 {"id":"blank_draft","metadata":{"labels":{},"description":"draft"},
