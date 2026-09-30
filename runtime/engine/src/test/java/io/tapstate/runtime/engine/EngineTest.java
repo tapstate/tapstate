@@ -9,6 +9,7 @@ import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.Job;
+import com.hazelcast.jet.core.metrics.MetricTags;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Edge;
@@ -21,6 +22,7 @@ import io.tapstate.core.common.Severity;
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 import java.time.Duration;
@@ -356,6 +358,37 @@ class EngineTest {
     }
 
     @Test
+    void aRealSinkExposesOneTaggedDeliveryExecutionToTheCoherentReader() throws Exception {
+        Engine engine = new Engine(member);
+        engine.submit("orders-pipe", liveDeliveryDag());
+        Job job = member.getJet().getJob("orders-pipe");
+        awaitStatus(job, JobStatus.RUNNING);
+
+        DeliveryReading reading = DeliveryReading.NONE;
+        long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+        while (System.nanoTime() - deadline < 0) {
+            reading = engine.deliveryReading("orders-pipe");
+            if (reading.start().isPresent() && reading.rowsByTableAndOp().containsKey("orders")) {
+                break;
+            }
+            Thread.sleep(50);
+        }
+
+        assertThat(reading.start()).isPresent();
+        long rows = reading.rowsByTableAndOp().get("orders").values().stream()
+                .mapToLong(Long::longValue).sum();
+        assertThat(rows).isPositive();
+        assertThat(reading.bytesByTable().get("orders")).isPositive();
+        assertThat(reading.newestEventTimeByTable()).containsKey("orders");
+        assertThat(reading.deliveryDurationByTable().get("orders").count()).isEqualTo(rows);
+        assertThat(job.getMetrics().get(JetDeliveryGauge.SINCE_METRIC)).isNotEmpty()
+                .allSatisfy(point -> {
+                    assertThat(point.tag(MetricTags.JOB)).isEqualTo(job.getIdString());
+                    assertThat(point.tag(MetricTags.EXECUTION)).isNotBlank();
+                });
+    }
+
+    @Test
     void recordCount_is_empty_for_a_pipeline_with_no_live_job() {
         Engine engine = new Engine(member);
         // An unknown pipeline has no job at all.
@@ -623,6 +656,45 @@ class EngineTest {
         Vertex sink = dag.newVertex("serve.out", SinkProcessor.metaSupplier("serve.out", RefusingWriter::new));
         dag.edge(Edge.between(source, sink));
         return dag;
+    }
+
+    /** Keeps one real sink collecting native delivery metrics while its source remains live. */
+    private static DAG liveDeliveryDag() {
+        DAG dag = new DAG();
+        Vertex source = dag.newVertex("src", ProcessorMetaSupplier.forceTotalParallelismOne(
+                ProcessorSupplier.of((SupplierEx<Processor>) EmitDeliveryRows::new)));
+        Vertex sink = dag.newVertex("serve.out", SinkProcessor.metaSupplier("serve.out", SuccessfulWriter::new));
+        dag.edge(Edge.between(source, sink));
+        return dag;
+    }
+
+    private static final class EmitDeliveryRows extends AbstractProcessor {
+        private long nextId;
+
+        @Override public boolean isCooperative() { return false; }
+
+        @Override
+        public boolean complete() {
+            try {
+                Thread.sleep(5);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+            if (tryEmit(Envelope.insert(System.currentTimeMillis(), "orders", Map.of("id", nextId), null))) {
+                nextId++;
+            }
+            return false;
+        }
+    }
+
+    private static final class SuccessfulWriter implements SinkWriter {
+        @Override
+        public CompletionStage<WriteResult> write(List<Envelope> records) {
+            return CompletableFuture.completedFuture(new WriteResult(records.size()));
+        }
+
+        @Override public void close() { }
     }
 
     /** Emits exactly one row then completes, so the sink vertex gets a batch to fail on. */

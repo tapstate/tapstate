@@ -18,6 +18,8 @@ import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
+import io.tapstate.core.lifecycle.SnapshotReading;
+import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
@@ -80,6 +82,67 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * pipeline id alone.
  */
 class EngineLifecycleActuatorTest {
+
+    @Test
+    void pausingFreezesKnownCountersBeforeTheNativeProducerIsSuspended() {
+        freezeAtLifecycleBoundary(true);
+    }
+
+    @Test
+    void stoppingFreezesKnownCountersBeforeTheNativeProducerIsReleased() {
+        freezeAtLifecycleBoundary(false);
+    }
+
+    private void freezeAtLifecycleBoundary(boolean pause) {
+        List<String> events = new CopyOnWriteArrayList<>();
+        var scopes = new ObservationScopeRegistry();
+        var state = new InMemoryStateStore();
+        state.create(PIPE, StateJson.of(PipelineState.RUNNING), Instant.now());
+        var store = new InMemoryObservationStore();
+        Instant since = Instant.now();
+        var snapshot = new AtomicReference<>(new SnapshotReading(Map.of("orders",
+                new TableSnapshot(7, null, null)), since));
+        var publisher = new ObservationPublisher(state, store, id -> OptionalLong.empty(), id -> Map.of(),
+                id -> {
+                    events.add("sample:" + member.getJet().getJob(PIPE).getStatus());
+                    return snapshot.get();
+                });
+        ArtifactStore artifacts = new ArtifactStore() {
+            @Override public void saveAll(List<io.tapstate.core.model.Resource> resources) {
+                throw new UnsupportedOperationException();
+            }
+            @Override public Optional<io.tapstate.core.model.Resource> get(String id) { return Optional.empty(); }
+            @Override public List<io.tapstate.core.model.Resource> list() { return List.of(); }
+            @Override public Optional<String> ensurePipelineIncarnationId(String id, String candidate) {
+                return Optional.of("inc-a");
+            }
+        };
+        var actuator = new EngineLifecycleActuator(new Engine(member), new RecordingDagSource(events),
+                new RecordingCaptureCoordinator(events), teardown(),
+                PipelineActuationOwnership.single("single", new InMemoryWorkloadClaimStore()),
+                new PipelineIncarnationService(artifacts), scopes, publisher, store);
+        actuator.start(PIPE);
+        awaitStatus(member.getJet().getJob(PIPE), JobStatus.RUNNING);
+        var scope = scopes.current(PIPE).orElseThrow();
+        if (pause) { actuator.pause(PIPE); }
+        else { actuator.stop(PIPE, false); }
+        assertThat(events).contains("sample:RUNNING");
+
+        if (pause) {
+            awaitStatus(member.getJet().getJob(PIPE), JobStatus.SUSPENDED);
+            actuator.resume(PIPE);
+            awaitStatus(member.getJet().getJob(PIPE), JobStatus.RUNNING);
+            snapshot.set(new SnapshotReading(Map.of("orders", new TableSnapshot(2, null, null)), Instant.now()));
+        } else {
+            state.create(PIPE, StateJson.of(PipelineState.STOPPED), Instant.now());
+            snapshot.set(SnapshotReading.NONE);
+        }
+        var frame = scopes.continueFrame(publisher.prepareScoped(PIPE, null, scope).orElseThrow(), scope);
+        MetricPoint point = point(frame.observation(), "tapstate.pipeline.snapshot.rows");
+        assertThat(point.value()).isEqualTo(pause ? 9 : 7);
+        assertThat(point.startTime()).isEqualTo(since);
+        assertThat(scopes.current(PIPE)).contains(scope);
+    }
 
     @Test
     void rebuildingResumeCarriesKnownCountersAndHistogramsButRemeasuresGauges() throws Exception {

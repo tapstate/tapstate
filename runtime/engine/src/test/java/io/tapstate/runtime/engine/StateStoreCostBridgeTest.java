@@ -6,6 +6,7 @@ import com.hazelcast.config.Config;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.jet.Job;
+import com.hazelcast.jet.core.JobStatus;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Outbox;
@@ -13,6 +14,7 @@ import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.metrics.Measurement;
+import com.hazelcast.jet.core.metrics.MetricNames;
 import com.hazelcast.jet.core.metrics.MetricTags;
 import com.hazelcast.jet.core.test.TestProcessorContext;
 import io.tapstate.core.lifecycle.StateStoreCostReading;
@@ -23,6 +25,7 @@ import io.tapstate.runtime.engine.nest.HeapKeyedStateStore;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Proxy;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -106,6 +109,50 @@ class StateStoreCostBridgeTest {
                         .containsEntry("id", 1L);
                 await(() -> values(first, Kind.LOAD_COMPLETED).equals(Map.of(local, 0L, remote, 1L)));
                 assertThat(values(first, Kind.DECODE_COMPLETED).get(remote)).isEqualTo(1);
+
+                one.<String, Map<String, Object>>getMap(NAMESPACE).set(
+                        keyOwnedBy(one, remote, "before-resume-two-"), Map.of("id", 2L));
+                one.<String, Map<String, Object>>getMap(NAMESPACE).set(
+                        keyOwnedBy(one, remote, "before-resume-three-"), Map.of("id", 3L));
+                await(() -> values(first, Kind.SAVE_COMPLETED).equals(Map.of(local, 0L, remote, 3L))
+                        && values(first, Kind.ENCODE_COMPLETED).equals(Map.of(local, 0L, remote, 3L)));
+                String firstExecution = executionStarts(first).getFirst().tag(MetricTags.EXECUTION);
+                assertThat(firstExecution).isNotBlank();
+                assertThat(engine.stateStoreCostReadings("state-cost-job-first").get(NAMESPACE)
+                        .operations().get("save").completed()).isEqualTo(3);
+
+                engine.suspend("state-cost-job-first");
+                await(() -> first.getStatus() == JobStatus.SUSPENDED);
+                engine.resume("state-cost-job-first");
+                await(() -> first.getStatus() == JobStatus.RUNNING);
+                await(() -> executionStarts(first).size() == 2 && executionStarts(first).stream()
+                        .allMatch(value -> value.tag(MetricTags.EXECUTION) != null
+                                && !firstExecution.equals(value.tag(MetricTags.EXECUTION))));
+                String resumedExecution = executionStarts(first).getFirst().tag(MetricTags.EXECUTION);
+                assertThat(executionStarts(first)).allSatisfy(value ->
+                        assertThat(value.tag(MetricTags.EXECUTION)).isEqualTo(resumedExecution));
+                await(() -> values(first, Kind.READY).equals(Map.of(local, 1L, remote, 1L)));
+                assertThat(engine.stateStoreCostReadings("state-cost-job-first"))
+                        .as("a resumed but quiet physical execution has no cost point").isEmpty();
+
+                one.<String, Map<String, Object>>getMap(NAMESPACE).set(
+                        keyOwnedBy(one, remote, "after-resume-one-"), Map.of("id", 4L));
+                one.<String, Map<String, Object>>getMap(NAMESPACE).set(
+                        keyOwnedBy(one, remote, "after-resume-two-"), Map.of("id", 5L));
+                await(() -> values(first, Kind.SAVE_COMPLETED).equals(Map.of(local, 0L, remote, 2L))
+                        && values(first, Kind.ENCODE_COMPLETED).equals(Map.of(local, 0L, remote, 2L)));
+                await(() -> engine.stateStoreCostReadings("state-cost-job-first").containsKey(NAMESPACE));
+                StateStoreCostReading resumedCost = engine.stateStoreCostReadings("state-cost-job-first")
+                        .get(NAMESPACE);
+                assertThat(resumedCost.operations().get("save").completed()).isEqualTo(2);
+                assertThat(resumedCost.codecs().get("encode").count()).isEqualTo(2);
+                Instant nativeStart = Instant.ofEpochMilli(executionStarts(first).stream()
+                        .mapToLong(Measurement::value).max().orElseThrow());
+                assertThat(nativeStart).isAfter(firstCost.countingSince());
+                assertThat(resumedCost.countingSince()).isEqualTo(nativeStart);
+                assertThat(engine.stateStoreCostReadings("state-cost-job-first").get(NAMESPACE))
+                        .as("re-reading one native execution cannot move its counter start")
+                        .isEqualTo(resumedCost);
             } finally {
                 first.cancel();
             }
@@ -192,6 +239,12 @@ class StateStoreCostBridgeTest {
                 .toList();
         return matching.stream().collect(Collectors.toMap(
                 value -> value.tag(MetricTags.MEMBER), Measurement::value));
+    }
+
+    private static List<Measurement> executionStarts(Job job) {
+        return job.getMetrics().get(MetricNames.EXECUTION_START_TIME).stream()
+                .filter(value -> job.getIdString().equals(value.tag(MetricTags.JOB)))
+                .toList();
     }
 
     private static void await(BooleanSupplier condition) throws Exception {

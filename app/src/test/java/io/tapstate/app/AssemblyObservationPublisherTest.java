@@ -11,6 +11,7 @@ import static org.mockito.Mockito.when;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.jet.JetService;
 import io.tapstate.core.lifecycle.Observation;
+import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.SinkBatchReading;
 import io.tapstate.core.lifecycle.QueueReading;
@@ -46,6 +47,38 @@ class AssemblyObservationPublisherTest {
     private static final String PIPELINE = "orders-pipe";
     private static final String TABLE = "orders";
     private static final Instant T0 = Instant.parse("2026-07-19T00:00:00Z");
+
+    @Test
+    void bindsOneCompleteDeliveryReadingAndKeepsAnUnavailableReadingAbsent() {
+        InMemoryStorePort store = new InMemoryStorePort(new InMemoryArtifactStore());
+        store.state().create(PIPELINE, StateJson.of(PipelineState.RUNNING), T0);
+        Engine engine = mock(Engine.class);
+        DeliveryReading measured = new DeliveryReading(Map.of(TABLE, Map.of("i", 4L)),
+                Map.of(TABLE, 40L), Map.of(TABLE, T0.toEpochMilli()), T0, Map.of());
+        when(engine.deliveryReading(PIPELINE)).thenReturn(measured, DeliveryReading.NONE);
+        ObservationPublisher publisher = new RuntimeConvergenceConfiguration()
+                .observationPublisher(store, engine, new NoOpCaptureCoordinator());
+
+        publisher.publish(PIPELINE);
+
+        Observation present = store.observations().read(PIPELINE).orElseThrow();
+        assertThat(present.metrics()).containsEntry("records.out", 4L).containsEntry("bytes.out", 40L);
+        assertThat(present.facts()).filteredOn(fact -> fact.name().equals("tapstate.pipeline.records"))
+                .singleElement().satisfies(fact ->
+                        assertThat(fact.points().getFirst().startTime()).isEqualTo(T0));
+        org.mockito.Mockito.verify(engine).deliveryReading(PIPELINE);
+        org.mockito.Mockito.verify(engine, org.mockito.Mockito.never()).countingSince(PIPELINE);
+        org.mockito.Mockito.verify(engine, org.mockito.Mockito.never()).recordsDelivered(PIPELINE);
+        org.mockito.Mockito.verify(engine, org.mockito.Mockito.never()).bytesDelivered(PIPELINE);
+        org.mockito.Mockito.verify(engine, org.mockito.Mockito.never()).newestDeliveredEventTime(PIPELINE);
+        org.mockito.Mockito.verify(engine, org.mockito.Mockito.never()).deliveryDurations(PIPELINE);
+
+        publisher.publish(PIPELINE);
+
+        Observation quiet = store.observations().read(PIPELINE).orElseThrow();
+        assertThat(quiet.metrics()).doesNotContainKeys("records.out", "bytes.out");
+        assertThat(quiet.facts()).noneMatch(fact -> fact.name().equals("tapstate.pipeline.records"));
+    }
 
     @Test
     void bindsCompleteActiveBusinessWorkWithoutRedatingTheCollectedSample() {

@@ -1,6 +1,5 @@
 package io.tapstate.app;
 
-import java.util.OptionalLong;
 import java.time.Instant;
 import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
@@ -116,20 +115,9 @@ class RuntimeConvergenceConfiguration {
                 Clock.systemUTC());
     }
 
-    /**
-     * What {@code engine}'s live job for {@code pipelineId} reports about rows that reached a target.
-     * A run with no start reported has counted nothing, so it reports nothing rather than totals nobody
-     * could place against a starting point.
-     */
+    /** Reads the sink's complete delivery tuple from one live job-metrics collection. */
     private static DeliveryReading deliveredBy(Engine engine, String pipelineId) {
-        OptionalLong since = engine.countingSince(pipelineId);
-        if (since.isEmpty()) {
-            return DeliveryReading.NONE;
-        }
-        return new DeliveryReading(engine.recordsDelivered(pipelineId),
-                engine.bytesDelivered(pipelineId),
-                engine.newestDeliveredEventTime(pipelineId), Instant.ofEpochMilli(since.getAsLong()),
-                engine.deliveryDurations(pipelineId));
+        return engine.deliveryReading(pipelineId);
     }
 
     /**

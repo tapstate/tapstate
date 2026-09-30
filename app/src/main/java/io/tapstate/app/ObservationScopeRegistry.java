@@ -3,6 +3,7 @@ package io.tapstate.app;
 import io.tapstate.core.lifecycle.CardinalityBudget;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.Observation;
+import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.spi.store.ObservationStore;
 
@@ -21,6 +22,7 @@ final class ObservationScopeRegistry {
         private ObservationStore.Scope pendingFrom;
         private MetricContinuation pending;
         private MetricContinuation active;
+        private MetricProducerEpochs epochs = new MetricProducerEpochs();
         private CardinalityBudget.Folder folder = CardinalityBudget.folder();
     }
 
@@ -44,6 +46,7 @@ final class ObservationScopeRegistry {
                 entry.folder = CardinalityBudget.folder();
             }
             entry.last = null;
+            entry.epochs = new MetricProducerEpochs();
             entry.current = scope;
         }
         return scope;
@@ -72,6 +75,7 @@ final class ObservationScopeRegistry {
             entry.pendingFrom = null;
             entry.pending = null;
             entry.active = null;
+            entry.epochs = new MetricProducerEpochs();
             entry.folder = CardinalityBudget.folder();
         }
     }
@@ -113,7 +117,12 @@ final class ObservationScopeRegistry {
                 source = stored.filter(saved -> saved.scope().filter(owner::equals).isPresent())
                         .map(ObservationStore.Stored::observation).orElse(source);
             }
-            entry.pending = MetricContinuation.capture(source).boundedBy(entry.folder);
+            List<MetricFact> known = source == null ? List.of() : source.facts();
+            if (source != null && source.observedAt() != null) {
+                known = MetricContinuation.captureFacts(entry.epochs.knownFacts(source.observedAt()))
+                        .atLeast(known, source.observedAt());
+            }
+            entry.pending = MetricContinuation.captureFacts(known).boundedBy(entry.folder);
             entry.pendingFrom = owner;
         }
     }
@@ -142,9 +151,14 @@ final class ObservationScopeRegistry {
             if (!scope.equals(entry.current)) {
                 return prepared;
             }
+            if (!newer(observation, entry.last)) {
+                return prepared;
+            }
             ObservationPublisher.Prepared continued = prepared;
+            List<MetricFact> nativeFacts = observation.facts().stream().map(entry.folder::fold).toList();
             if (entry.active != null && observation.observedAt() != null) {
-                List<MetricFact> measured = entry.active.apply(observation.facts(), observation.observedAt());
+                List<MetricFact> measured = entry.active.apply(nativeFacts, observation.observedAt())
+                        .stream().map(entry.folder::fold).toList();
                 if (entry.last != null) {
                     measured = MetricContinuation.capture(entry.last).atLeast(measured, observation.observedAt());
                 }
@@ -153,6 +167,16 @@ final class ObservationScopeRegistry {
                     entry.pending = null;
                     entry.pendingFrom = null;
                 }
+            }
+            if (observation.observedAt() != null) {
+                List<MetricFact> projected = continued.observation().facts().stream().map(entry.folder::fold).toList();
+                List<MetricFact> facts = entry.epochs.continueNative(observation.facts(), nativeFacts,
+                        projected, observation.observedAt());
+                if (observation.state() == PipelineState.STOPPED) {
+                    facts = MetricContinuation.captureFacts(entry.epochs.knownFacts(observation.observedAt()))
+                            .atLeast(facts, observation.observedAt());
+                }
+                continued = continued.withFacts(facts);
             }
             if (newer(continued.observation(), entry.last)) {
                 entry.last = continued.observation();
@@ -176,6 +200,7 @@ final class ObservationScopeRegistry {
                 entry.current = null;
                 entry.last = null;
                 entry.active = null;
+                entry.epochs = new MetricProducerEpochs();
             }
         }
     }

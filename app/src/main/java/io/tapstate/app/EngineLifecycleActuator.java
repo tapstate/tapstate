@@ -279,6 +279,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
 
     @Override
     public void pause(String pipelineId) {
+        captureCurrentMetrics(pipelineId);
         engine.suspend(pipelineId);
     }
 
@@ -315,6 +316,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
 
     @Override
     public void stop(String pipelineId, boolean purgeState) {
+        captureCurrentMetrics(pipelineId);
         if (observationScopes != null) {
             observationScopes.clearContinuation(pipelineId);
         }
@@ -338,15 +340,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         if (owner.isEmpty()) {
             return;
         }
-        if (observationPublisher != null) {
-            try {
-                observationPublisher.prepareScoped(pipelineId, null, owner.get())
-                        .ifPresent(frame -> observationScopes.continueFrame(frame, owner.get()));
-            } catch (RuntimeException unavailable) {
-                LOG.warn("Could not measure the final cumulative metrics for pipeline {}", pipelineId,
-                        unavailable);
-            }
-        }
+        captureCurrentMetrics(pipelineId, owner.get());
         Optional<ObservationStore.Stored> stored = Optional.empty();
         if (observations != null && observationScopes.needsStoredFallback(pipelineId)) {
             try {
@@ -359,6 +353,25 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         observationScopes.prepareRebuildingResume(pipelineId, stored);
         if (observationPublisher != null) {
             observationPublisher.prepareRebuildingResume(pipelineId);
+        }
+    }
+
+    /** Takes only local measurements before suspension or teardown releases their native producer. */
+    private void captureCurrentMetrics(String pipelineId) {
+        if (observationScopes != null) {
+            observationScopes.current(pipelineId).ifPresent(owner -> captureCurrentMetrics(pipelineId, owner));
+        }
+    }
+
+    private void captureCurrentMetrics(String pipelineId, ObservationStore.Scope owner) {
+        if (observationPublisher != null) {
+            try {
+                observationPublisher.prepareScoped(pipelineId, null, owner)
+                        .ifPresent(frame -> observationScopes.continueFrame(frame, owner));
+            } catch (RuntimeException unavailable) {
+                LOG.warn("Could not measure the final cumulative metrics for pipeline {}", pipelineId,
+                        unavailable);
+            }
         }
     }
 

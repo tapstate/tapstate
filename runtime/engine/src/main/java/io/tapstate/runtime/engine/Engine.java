@@ -14,6 +14,7 @@ import com.hazelcast.jet.core.metrics.MetricTags;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.HistogramValue;
+import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.core.lifecycle.QueueReading;
 import io.tapstate.core.lifecycle.SinkBatchReading;
@@ -478,6 +479,115 @@ public final class Engine {
     public Map<String, Map<String, Long>> recordsDelivered(String pipelineId) {
         Job job = liveJob(pipelineId);
         return job == null ? Map.of() : deliveredRowsIn(job.getMetrics());
+    }
+
+    /**
+     * Reads all sink delivery components from one job collection. An execution transition can leave
+     * measurements from both physical runs in the collection; neither run is a complete reading then.
+     * A quiet or unwired job has no delivery reading, never a synthetic zero counter.
+     */
+    public DeliveryReading deliveryReading(String pipelineId) {
+        Job job = liveJob(pipelineId);
+        if (job == null) {
+            return DeliveryReading.NONE;
+        }
+        Set<String> members = memberIds();
+        if (members.isEmpty()) {
+            return DeliveryReading.NONE;
+        }
+        JobMetrics collected = job.getMetrics();
+        if (job.getStatus().isTerminal() || !members.equals(memberIds())) {
+            return DeliveryReading.NONE;
+        }
+        DeliveryReading reading = deliveryReadingIn(collected, job.getIdString(), members);
+        return job.getStatus().isTerminal() || !members.equals(memberIds())
+                ? DeliveryReading.NONE : reading;
+    }
+
+    /** Reassembles only measurements of one job and one Jet execution from a single collection. */
+    static DeliveryReading deliveryReadingIn(JobMetrics collected, String jobId) {
+        Set<String> reported = new java.util.HashSet<>();
+        for (Measurement reading : collected.get(MetricNames.EXECUTION_START_TIME)) {
+            String source = reading.tag(MetricTags.MEMBER);
+            if (source != null) {
+                reported.add(source);
+            }
+        }
+        return deliveryReadingIn(collected, jobId, reported);
+    }
+
+    static DeliveryReading deliveryReadingIn(JobMetrics collected, String jobId, Set<String> members) {
+        Objects.requireNonNull(collected, "collected job metrics");
+        Objects.requireNonNull(jobId, "job id");
+        Optional<CostExecution> nativeExecution = costExecutionIn(collected, jobId, members);
+        if (nativeExecution.isEmpty()) {
+            return DeliveryReading.NONE;
+        }
+        CostExecution anchor = nativeExecution.get();
+        Map<String, List<Measurement>> parts = new HashMap<>();
+        for (String metric : collected.metrics()) {
+            if (!deliveryMetric(metric)) {
+                continue;
+            }
+            if (metric.startsWith(JetDeliveryGauge.DURATION_BUCKET_PREFIX)) {
+                JetDeliveryGauge.DurationBucket bucket = JetDeliveryGauge.durationBucketOf(metric);
+                if (bucket == null || bucket.index() < 0
+                        || bucket.index() >= HistogramBounds.RECORD_DELIVERY_DURATION.buckets()) {
+                    return DeliveryReading.NONE;
+                }
+            }
+            List<Measurement> readings = collected.get(metric);
+            for (Measurement reading : readings) {
+                String source = reading.tag(MetricTags.MEMBER);
+                if (!jobId.equals(reading.tag(MetricTags.JOB))
+                        || !anchor.execution().equals(reading.tag(MetricTags.EXECUTION))
+                        || source == null || !anchor.collectionTimes().containsKey(source)
+                        || reading.timestamp() != anchor.collectionTimes().get(source)) {
+                    return DeliveryReading.NONE;
+                }
+            }
+            if (!readings.isEmpty()) {
+                parts.put(metric, readings);
+            }
+        }
+        JobMetrics sameExecution = JobMetrics.of(parts);
+        OptionalLong since = countingSinceIn(sameExecution);
+        if (since.isEmpty()) {
+            return DeliveryReading.NONE;
+        }
+        Map<String, Map<String, Long>> rows = deliveredRowsIn(sameExecution);
+        if (rows.isEmpty()) {
+            return DeliveryReading.NONE;
+        }
+        Map<String, Long> bytes = settledBytesIn(sameExecution);
+        Map<String, Long> newest = highestIn(sameExecution, JetDeliveryGauge::reachedTableOf);
+        Map<String, HistogramValue> durations = settledDurationsIn(sameExecution);
+        if (!rows.keySet().equals(bytes.keySet()) || !rows.keySet().equals(newest.keySet())
+                || !rows.keySet().equals(durations.keySet())) {
+            return DeliveryReading.NONE;
+        }
+        for (Map.Entry<String, Map<String, Long>> table : rows.entrySet()) {
+            long count = 0;
+            for (long value : table.getValue().values()) {
+                count = Math.addExact(count, value);
+            }
+            HistogramValue duration = durations.get(table.getKey());
+            if (count != duration.count()
+                    || duration.bucketCounts().stream().mapToLong(Long::longValue).sum() != count) {
+                return DeliveryReading.NONE;
+            }
+        }
+        return new DeliveryReading(rows, bytes, newest, anchor.since(), durations);
+    }
+
+    private static boolean deliveryMetric(String metric) {
+        return JetDeliveryGauge.SINCE_METRIC.equals(metric)
+                || metric.startsWith(JetDeliveryGauge.DELIVERED_PREFIX)
+                || metric.startsWith(JetDeliveryGauge.CARRIED_PREFIX)
+                || metric.startsWith(JetDeliveryGauge.REACHED_PREFIX)
+                || metric.startsWith(JetDeliveryGauge.DURATION_COUNT_PREFIX)
+                || metric.startsWith(JetDeliveryGauge.DURATION_SUM_PREFIX)
+                || metric.startsWith(JetDeliveryGauge.DURATION_BUCKET_PREFIX);
     }
 
     /**
@@ -1368,7 +1478,10 @@ public final class Engine {
         if (job == null) {
             return OptionalLong.empty();
         }
-        JobMetrics collected = job.getMetrics();
+        return countingSinceIn(job.getMetrics());
+    }
+
+    private static OptionalLong countingSinceIn(JobMetrics collected) {
         OptionalLong latest = OptionalLong.empty();
         for (Measurement measurement : collected.get(JetDeliveryGauge.SINCE_METRIC)) {
             latest = latest.isPresent()
@@ -1468,7 +1581,7 @@ public final class Engine {
      */
     public Map<String, StateStoreCostReading> stateStoreCostReadings(String pipelineId) {
         Job job = liveJob(pipelineId);
-        if (job == null || job.getSubmissionTime() <= 0) {
+        if (job == null) {
             return Map.of();
         }
         Set<String> members = memberIds();
@@ -1480,6 +1593,18 @@ public final class Engine {
         if (job.getStatus().isTerminal() || !members.equals(memberIds())) {
             return Map.of();
         }
+        Map<String, StateStoreCostReading> readings = stateStoreCostReadingsIn(collected, jobTag, members);
+        return job.getStatus().isTerminal() || !members.equals(memberIds()) ? Map.of() : readings;
+    }
+
+    /** Keeps every state cost in the native execution whose member collected it. */
+    static Map<String, StateStoreCostReading> stateStoreCostReadingsIn(
+            JobMetrics collected, String jobTag, Set<String> members) {
+        Optional<CostExecution> nativeExecution = costExecutionIn(collected, jobTag, members);
+        if (nativeExecution.isEmpty()) {
+            return Map.of();
+        }
+        CostExecution anchor = nativeExecution.get();
         Map<String, CostMeasurements> byNamespace = new HashMap<>();
         for (String metric : collected.metrics()) {
             StateStoreCostMetricNames.Reading reading = StateStoreCostMetricNames.readingOf(metric);
@@ -1495,22 +1620,49 @@ public final class Engine {
                 String source = measurement.tag(MetricTags.MEMBER);
                 String execution = measurement.tag(MetricTags.EXECUTION);
                 if (!jobTag.equals(measurement.tag(MetricTags.JOB)) || source == null
-                        || !members.contains(source) || execution == null || measurement.value() < 0) {
+                        || !members.contains(source) || !anchor.execution().equals(execution)
+                        || measurement.timestamp() != anchor.collectionTimes().get(source)
+                        || measurement.value() < 0) {
                     costs.invalid = true;
                 } else {
                     costs.add(reading.kind(), source, execution, measurement.value());
                 }
             }
         }
-        if (job.getStatus().isTerminal() || !members.equals(memberIds())) {
-            return Map.of();
-        }
-        Instant since = Instant.ofEpochMilli(job.getSubmissionTime());
         Map<String, StateStoreCostReading> readings = new HashMap<>();
-        byNamespace.forEach((namespace, costs) -> costs.complete(members, since)
+        byNamespace.forEach((namespace, costs) -> costs.complete(members, anchor.since())
                 .ifPresent(complete -> readings.put(namespace, complete)));
         return Map.copyOf(readings);
     }
+
+    private static Optional<CostExecution> costExecutionIn(
+            JobMetrics collected, String jobTag, Set<String> members) {
+        if (members.isEmpty()) {
+            return Optional.empty();
+        }
+        Map<String, Long> collectionTimes = new HashMap<>();
+        String execution = null;
+        long latestStart = Long.MIN_VALUE;
+        for (Measurement reading : collected.get(MetricNames.EXECUTION_START_TIME)) {
+            String source = reading.tag(MetricTags.MEMBER);
+            String observedExecution = reading.tag(MetricTags.EXECUTION);
+            if (!jobTag.equals(reading.tag(MetricTags.JOB)) || source == null
+                    || !members.contains(source) || observedExecution == null || observedExecution.isBlank()
+                    || reading.timestamp() <= 0 || reading.value() <= 0
+                    || collectionTimes.putIfAbsent(source, reading.timestamp()) != null
+                    || execution != null && !execution.equals(observedExecution)) {
+                return Optional.empty();
+            }
+            execution = observedExecution;
+            latestStart = Math.max(latestStart, reading.value());
+        }
+        return execution == null || !collectionTimes.keySet().equals(members)
+                ? Optional.empty()
+                : Optional.of(new CostExecution(execution, Map.copyOf(collectionTimes),
+                        Instant.ofEpochMilli(latestStart)));
+    }
+
+    private record CostExecution(String execution, Map<String, Long> collectionTimes, Instant since) { }
 
     private Set<String> memberIds() {
         return member.getCluster().getMembers().stream()

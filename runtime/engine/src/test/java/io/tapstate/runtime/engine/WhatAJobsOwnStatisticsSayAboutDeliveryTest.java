@@ -2,12 +2,17 @@ package io.tapstate.runtime.engine;
 
 import com.hazelcast.jet.core.metrics.JobMetrics;
 import com.hazelcast.jet.core.metrics.Measurement;
+import com.hazelcast.jet.core.metrics.MetricNames;
+import com.hazelcast.jet.core.metrics.MetricTags;
+import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.HistogramValue;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.util.LinkedHashMap;
+import java.util.ArrayList;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 
@@ -30,6 +35,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * combining rules apart. With a single sink, adding and keeping the widest give the same answer.
  */
 class WhatAJobsOwnStatisticsSayAboutDeliveryTest {
+
+    private static final String JOB = "job-a";
+    private static final String EXECUTION = "execution-a";
 
     private static JobMetrics statistics(Map<String, List<Long>> valuesByMetric) {
         Map<String, List<Measurement>> measurements = new LinkedHashMap<>();
@@ -199,5 +207,119 @@ class WhatAJobsOwnStatisticsSayAboutDeliveryTest {
                 "outCountingSince", List.of(1_700_000_000_000L))));
 
         assertThat(Engine.settledDurationsIn(collected)).isEmpty();
+    }
+
+    @Test
+    void oneCollectionCarriesACompleteNativeDeliveryTupleFromOneExecution() {
+        DeliveryReading reading = Engine.deliveryReadingIn(JobMetrics.of(deliveryFixture()), JOB);
+
+        assertThat(reading.rowsByTableAndOp()).containsExactly(Map.entry("orders", Map.of("i", 9L)));
+        assertThat(reading.bytesByTable()).containsExactly(Map.entry("orders", 90L));
+        assertThat(reading.newestEventTimeByTable()).containsExactly(Map.entry("orders", 2_000L));
+        assertThat(reading.start()).contains(Instant.ofEpochMilli(1_700_000_000_000L));
+        assertThat(reading.deliveryDurationByTable().get("orders").count()).isEqualTo(9);
+        assertThat(reading.deliveryDurationByTable().get("orders").sum()).isEqualTo(2.7);
+    }
+
+    @Test
+    void aLaterSinkInTheSameExecutionDoesNotMoveThePhysicalCounterStart() {
+        Map<String, List<Measurement>> firstSink = deliveryFixture();
+        firstSink.replaceAll((name, readings) -> List.of(readings.getFirst()));
+        Map<String, List<Measurement>> bothSinks = deliveryFixture();
+
+        DeliveryReading first = Engine.deliveryReadingIn(JobMetrics.of(firstSink), JOB);
+        DeliveryReading second = Engine.deliveryReadingIn(JobMetrics.of(bothSinks), JOB);
+
+        assertThat(first.rowsByTableAndOp().get("orders").get("i")).isEqualTo(3);
+        assertThat(second.rowsByTableAndOp().get("orders").get("i")).isEqualTo(9);
+        assertThat(first.start()).contains(Instant.ofEpochMilli(1_700_000_000_000L));
+        assertThat(second.start()).isEqualTo(first.start());
+    }
+
+    @Test
+    void aMissingOrMixedExecutionOnAnyDeliveryPartInvalidatesTheWholeTuple() {
+        for (String metric : List.of("recordsOut.i.orders", "bytesOut.orders", "outEventTime.orders",
+                JetDeliveryGauge.SINCE_METRIC, "outDeliveryCount.orders", "outDeliveryBucket.8.orders")) {
+            Map<String, List<Measurement>> missing = deliveryFixture();
+            replaceFirst(missing, metric, Map.of(MetricTags.JOB, JOB,
+                    MetricTags.MEMBER, "member-a"));
+            assertThat(Engine.deliveryReadingIn(JobMetrics.of(missing), JOB)).as("missing execution on %s", metric)
+                    .isEqualTo(DeliveryReading.NONE);
+
+            Map<String, List<Measurement>> mixed = deliveryFixture();
+            replaceFirst(mixed, metric, tags("execution-b"));
+            assertThat(Engine.deliveryReadingIn(JobMetrics.of(mixed), JOB)).as("mixed execution on %s", metric)
+                    .isEqualTo(DeliveryReading.NONE);
+        }
+        Map<String, List<Measurement>> foreignJob = deliveryFixture();
+        replaceFirst(foreignJob, "bytesOut.orders", Map.of(MetricTags.JOB, "job-b",
+                MetricTags.EXECUTION, EXECUTION, MetricTags.MEMBER, "member-a"));
+        assertThat(Engine.deliveryReadingIn(JobMetrics.of(foreignJob), JOB)).isEqualTo(DeliveryReading.NONE);
+    }
+
+    @Test
+    void aQuietJobOrHalfCollectedTupleRemainsAbsentWithoutInventingZeroes() {
+        assertThat(Engine.deliveryReadingIn(JobMetrics.empty(), JOB)).isEqualTo(DeliveryReading.NONE);
+        Map<String, List<Measurement>> onlyStart = Map.of(
+                JetDeliveryGauge.SINCE_METRIC,
+                List.of(Measurement.of(JetDeliveryGauge.SINCE_METRIC, 1_700_000_000_100L, 1L,
+                        tags(EXECUTION))),
+                MetricNames.EXECUTION_START_TIME, deliveryFixture().get(MetricNames.EXECUTION_START_TIME));
+        assertThat(Engine.deliveryReadingIn(JobMetrics.of(onlyStart), JOB)).isEqualTo(DeliveryReading.NONE);
+
+        Map<String, List<Measurement>> withoutStart = deliveryFixture();
+        withoutStart.remove(JetDeliveryGauge.SINCE_METRIC);
+        assertThat(Engine.deliveryReadingIn(JobMetrics.of(withoutStart), JOB)).isEqualTo(DeliveryReading.NONE);
+
+        Map<String, List<Measurement>> withoutBucket = deliveryFixture();
+        withoutBucket.remove("outDeliveryBucket.15.orders");
+        assertThat(Engine.deliveryReadingIn(JobMetrics.of(withoutBucket), JOB)).isEqualTo(DeliveryReading.NONE);
+
+        Map<String, List<Measurement>> tornCount = deliveryFixture();
+        replaceFirst(tornCount, "recordsOut.i.orders", tags(EXECUTION), 4L);
+        assertThat(Engine.deliveryReadingIn(JobMetrics.of(tornCount), JOB)).isEqualTo(DeliveryReading.NONE);
+
+        assertThat(Engine.deliveryReadingIn(JobMetrics.of(deliveryFixture()), JOB,
+                java.util.Set.of("member-a", "member-b")))
+                .as("one member cannot stand in for the complete current roster")
+                .isEqualTo(DeliveryReading.NONE);
+
+        Map<String, List<Measurement>> mixedNative = deliveryFixture();
+        replaceFirst(mixedNative, MetricNames.EXECUTION_START_TIME, tags("execution-b"));
+        assertThat(Engine.deliveryReadingIn(JobMetrics.of(mixedNative), JOB))
+                .as("the native start and delivery parts name different executions")
+                .isEqualTo(DeliveryReading.NONE);
+    }
+
+    private static Map<String, List<Measurement>> deliveryFixture() {
+        Map<String, List<Long>> values = aDistribution("orders", 3, 900, 8, List.of(1L, 2L));
+        values.put("recordsOut.i.orders", List.of(3L, 6L));
+        values.put("bytesOut.orders", List.of(30L, 60L));
+        values.put("outEventTime.orders", List.of(1_000L, 2_000L));
+        values.put(JetDeliveryGauge.SINCE_METRIC,
+                List.of(1_700_000_000_000L, 1_700_000_000_100L));
+        Map<String, List<Measurement>> result = new LinkedHashMap<>();
+        values.forEach((name, readings) -> result.put(name, readings.stream()
+                .map(value -> Measurement.of(name, value, 1L, tags(EXECUTION))).toList()));
+        result.put(MetricNames.EXECUTION_START_TIME, List.of(Measurement.of(
+                MetricNames.EXECUTION_START_TIME, 1_700_000_000_000L, 1L, tags(EXECUTION))));
+        return result;
+    }
+
+    private static Map<String, String> tags(String execution) {
+        return Map.of(MetricTags.JOB, JOB, MetricTags.EXECUTION, execution,
+                MetricTags.MEMBER, "member-a");
+    }
+
+    private static void replaceFirst(Map<String, List<Measurement>> fixture, String name,
+            Map<String, String> tags) {
+        replaceFirst(fixture, name, tags, fixture.get(name).getFirst().value());
+    }
+
+    private static void replaceFirst(Map<String, List<Measurement>> fixture, String name,
+            Map<String, String> tags, long value) {
+        List<Measurement> readings = new ArrayList<>(fixture.get(name));
+        readings.set(0, Measurement.of(name, value, 1L, tags));
+        fixture.put(name, readings);
     }
 }

@@ -24,12 +24,14 @@ final class MetricContinuation {
     }
 
     static MetricContinuation capture(Observation observation) {
+        return captureFacts(observation == null ? List.of() : observation.facts());
+    }
+
+    static MetricContinuation captureFacts(List<MetricFact> facts) {
         Map<String, MetricFact> known = new LinkedHashMap<>();
-        if (observation != null) {
-            for (MetricFact fact : observation.facts()) {
-                if (fact.type() != MetricType.GAUGE && !fact.points().isEmpty()) {
-                    known.put(fact.name(), fact);
-                }
+        for (MetricFact fact : facts) {
+            if (fact.type() != MetricType.GAUGE && !fact.points().isEmpty()) {
+                known.put(fact.name(), fact);
             }
         }
         return new MetricContinuation(known);
@@ -90,11 +92,7 @@ final class MetricContinuation {
             List<MetricPoint> kept = new ArrayList<>(current.points().size() + oldPoints.size());
             for (MetricPoint fresh : current.points()) {
                 MetricPoint old = oldPoints.remove(fresh.attributes());
-                if (old == null || !behind(current.type(), fresh, old)) {
-                    kept.add(fresh);
-                } else {
-                    kept.add(at(old, current.type(), at));
-                }
+                kept.add(old == null ? fresh : atLeast(current.type(), fresh, old, at));
             }
             oldPoints.values().forEach(old -> kept.add(at(old, current.type(), at)));
             result.add(new MetricFact(current.name(), current.type(), current.unit(), kept));
@@ -121,7 +119,11 @@ final class MetricContinuation {
         return false;
     }
 
-    private static MetricPoint add(MetricType type, MetricPoint old, MetricPoint fresh, Instant at) {
+    static MetricPoint atLeast(MetricType type, MetricPoint current, MetricPoint previous, Instant at) {
+        return behind(type, current, previous) ? at(previous, type, at) : current;
+    }
+
+    static MetricPoint add(MetricType type, MetricPoint old, MetricPoint fresh, Instant at) {
         Instant start = old.startTime() == null ? fresh.startTime() : old.startTime();
         if (type == MetricType.COUNTER) {
             return MetricPoint.accumulated(fresh.attributes(), start, at,
@@ -141,7 +143,7 @@ final class MetricContinuation {
                         before.bounds(), buckets));
     }
 
-    private static MetricPoint at(MetricPoint point, MetricType type, Instant at) {
+    static MetricPoint at(MetricPoint point, MetricType type, Instant at) {
         return type == MetricType.COUNTER
                 ? MetricPoint.accumulated(point.attributes(), point.startTime(), at, point.value())
                 : MetricPoint.distribution(point.attributes(), point.startTime(), at, point.histogram());
