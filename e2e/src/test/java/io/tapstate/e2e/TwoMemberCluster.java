@@ -138,6 +138,14 @@ final class TwoMemberCluster implements AutoCloseable {
     /** Reopens one existing store and cluster identity with the same explicit application and operator store. */
     static TwoMemberCluster start(String storeUri, String operatorStateDatabase, Path applicationJar,
             String clusterId, String administrator, String password) {
+        return start(storeUri, operatorStateDatabase, applicationJar, clusterId, administrator, password,
+                List.of(), List.of());
+    }
+
+    /** Adds member-specific JVM settings for an owned callback fault witness. */
+    static TwoMemberCluster start(String storeUri, String operatorStateDatabase, Path applicationJar,
+            String clusterId, String administrator, String password,
+            List<String> firstJvmArguments, List<String> secondJvmArguments) {
         Objects.requireNonNull(applicationJar, "applicationJar");
         Objects.requireNonNull(operatorStateDatabase, "operatorStateDatabase");
         Objects.requireNonNull(clusterId, "clusterId");
@@ -151,11 +159,13 @@ final class TwoMemberCluster implements AutoCloseable {
         int memberPortB = RealProcessServer.reservePort();
         String seeds = bindAddress + ":" + memberPortA + "," + bindAddress + ":" + memberPortB;
         RealProcessServer first = RealProcessServer.start(storeUri, operatorStateDatabase, applicationJar, "0.0.0.0",
-                httpPort -> arguments(clusterId, NODE_A, memberPortA, seeds, httpPort, bindAddress, null));
+                httpPort -> arguments(clusterId, NODE_A, memberPortA, seeds, httpPort, bindAddress, null),
+                firstJvmArguments);
         RealProcessServer second;
         try {
             second = RealProcessServer.start(storeUri, operatorStateDatabase, applicationJar, "0.0.0.0",
-                    httpPort -> arguments(clusterId, NODE_B, memberPortB, seeds, httpPort, bindAddress, null));
+                    httpPort -> arguments(clusterId, NODE_B, memberPortB, seeds, httpPort, bindAddress, null),
+                    secondJvmArguments);
         } catch (RuntimeException | Error failure) {
             first.close();
             throw failure;

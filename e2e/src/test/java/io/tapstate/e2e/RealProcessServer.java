@@ -143,7 +143,14 @@ final class RealProcessServer implements ServerHandle {
     /** Starts an explicit artifact and operator store on the address required by a cluster member. */
     static RealProcessServer start(String storeUri, String operatorStateDatabase, Path jar,
             String listenAddress, IntFunction<List<String>> extraArguments) {
-        RealProcessServer server = launching(storeUri, operatorStateDatabase, jar, listenAddress, extraArguments);
+        return start(storeUri, operatorStateDatabase, jar, listenAddress, extraArguments, List.of());
+    }
+
+    /** Starts an owned cluster process with explicit JVM options before the application arguments. */
+    static RealProcessServer start(String storeUri, String operatorStateDatabase, Path jar,
+            String listenAddress, IntFunction<List<String>> extraArguments, List<String> jvmArguments) {
+        RealProcessServer server = launching(storeUri, operatorStateDatabase, jar, listenAddress, extraArguments,
+                List.copyOf(jvmArguments));
         try {
             awaitHealthy(server.process, server.baseUrl, server.output);
         } catch (RuntimeException | AssertionError e) {

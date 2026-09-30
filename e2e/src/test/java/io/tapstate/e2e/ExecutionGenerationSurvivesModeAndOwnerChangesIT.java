@@ -31,6 +31,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 /** Real submissions share one durable sequence across discovery modes and a controller process loss. */
 @RequiresDocker
 class ExecutionGenerationSurvivesModeAndOwnerChangesIT {
+    private static final String CALLBACK_PREFIX = "tapstate.e2e.execution-old-callback.";
+    private static final Duration CALLBACK_WAIT = Duration.ofMinutes(2);
     private static final String PREFIX = "tapstate.e2e.execution-mode-owner.";
     private static final Duration WAIT = Duration.ofMinutes(3);
     private static final List<String> LEASE_FIELDS = List.of(
@@ -171,6 +173,153 @@ class ExecutionGenerationSurvivesModeAndOwnerChangesIT {
             try { report.fail(failure); } catch (RuntimeException writeFailure) { failure.addSuppressed(writeFailure); }
             throw failure;
         }
+    }
+
+    @Test
+    void anActualOldLatestWriteCannotReplaceTheSuccessorsObservation() throws Exception {
+        Assumptions.assumeTrue(System.getProperty(CALLBACK_PREFIX + "jar") != null,
+                "the actual old callback witness is opt-in");
+        Path jar = Path.of(callbackRequired("jar")).toAbsolutePath().normalize();
+        assertThat(Files.isRegularFile(jar)).isTrue();
+        BenchmarkCaptureCalibrationLiveRunIT.requireConnectors();
+        Path output = Path.of(callbackRequired("output"));
+        PipelineBenchmarkLiveRunIT.requireSafeOutput(output, PipelineBenchmarkLiveRunIT.harnessRoot());
+        BenchmarkLiveReport report = new BenchmarkLiveReport(output);
+        try {
+            Map<String, Object> application = PipelineBenchmarkLiveRunIT.artifact(jar);
+            Map<String, Map<String, Object>> connectors = new LinkedHashMap<>();
+            for (String id : List.of("mysql", "postgres", "mongodb")) {
+                connectors.put(id, PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor(id)));
+            }
+            var workload = BenchmarkWorkloadDefinitions.byId("copy");
+            String pipeline = workload.pipelineIds().getFirst();
+            report.begin(Map.of("purpose", "REAL_OLD_EXECUTION_LATEST_CALLBACK",
+                    "application", application, "connectors", connectors, "workload", workload.id(),
+                    "clusterProfile", "process-failure-only", "clusterMembers", 2),
+                    PipelineBenchmarkLiveRunIT.environment(), List.of());
+            try (var fork = BenchmarkForkEnvironment.open(workload, jar, "old-execution-callback");
+                    var client = MongoClients.create(fork.storeUri())) {
+                MongoDatabase database = client.getDatabase(new ConnectionString(fork.storeUri()).getDatabase());
+                var latest = new MongoObservationStore(client,
+                        database.getCollection(MongoStorePort.PIPELINE_OBSERVATION),
+                        database.getCollection(MongoStorePort.PIPELINE_OBSERVATION_CHUNKS));
+                var claims = new MongoWorkloadClaimStore(database.getCollection(MongoStorePort.WORKLOAD_CLAIMS));
+                for (var phase : workload.phases()) {
+                    fork.runPhase(phase, true);
+                }
+                Document standalone = standaloneDocument(database, pipeline);
+                String clusterId = standalone.getString("clusterId");
+                Document documentId = new Document(standalone.get("_id", Document.class));
+                var key = new WorkloadClaimKey(clusterId, WorkloadClaimType.PIPELINE_ACTUATION, pipeline);
+                long n = generation(standalone);
+                fork.control().stop(pipeline, false);
+                awaitState(fork.control(), pipeline, PipelineState.STOPPED);
+                stored(latest, pipeline, n, PipelineState.STOPPED);
+                fork.server().close();
+                assertThat(fork.server().isAlive()).isFalse();
+
+                int debugA = RealProcessServer.reservePort();
+                int debugB = RealProcessServer.reservePort();
+                for (int attempt = 0; debugB == debugA && attempt < 8; attempt++) {
+                    debugB = RealProcessServer.reservePort();
+                }
+                assertThat(debugB).as("each member owns a distinct loopback debug endpoint").isNotEqualTo(debugA);
+                String operatorDatabase = new ConnectionString(fork.operatorStateUri()).getDatabase();
+                try (var cluster = TwoMemberCluster.start(fork.storeUri(), operatorDatabase, jar, clusterId,
+                        "benchmark", "benchmark-password", callbackJvmArguments(debugA), callbackJvmArguments(debugB))) {
+                    assertThat(cluster.awaitBothMembers())
+                            .containsExactly(TwoMemberCluster.NODE_A, TwoMemberCluster.NODE_B);
+                    cluster.first().lifecycle(pipeline, LifecycleVerb.START);
+                    long oldGeneration = Math.addExact(n, 1);
+                    var initialOwner = leasedClaim(claims, key, oldGeneration, null);
+                    stored(latest, pipeline, oldGeneration, PipelineState.RUNNING);
+                    awaitState(cluster.first(), pipeline, PipelineState.RUNNING);
+                    assertCdc(fork, client);
+                    var readyOwner = leasedClaim(claims, key, oldGeneration, null);
+                    assertThat(readyOwner.claim().owner()).isEqualTo(initialOwner.claim().owner());
+                    WorkloadClaim oldClaim = readyOwner.claim();
+                    String oldNode = oldClaim.owner().nodeId();
+                    assertThat(oldNode).isIn(TwoMemberCluster.NODE_A, TwoMemberCluster.NODE_B);
+                    var oldProcess = cluster.processCarrying(oldNode);
+                    ControlPlane survivor = cluster.memberOtherThan(oldNode);
+                    int debugPort = TwoMemberCluster.NODE_A.equals(oldNode) ? debugA : debugB;
+                    var oldStored = stored(latest, pipeline, oldGeneration, PipelineState.RUNNING);
+                    var oldScope = oldStored.scope().orElseThrow();
+                    long takeoverGeneration = Math.addExact(oldGeneration, 1);
+                    try (var witness = OldExecutionWriteJdiSession.attach(debugPort, jar, pipeline, oldScope)) {
+                        var held = witness.awaitHeld(CALLBACK_WAIT);
+                        assertThat(oldProcess.isAlive()).as("the old callback JVM remains alive while held").isTrue();
+                        oneDocument(database, key, documentId, oldGeneration);
+                        var heldOwner = claims.read(key).orElseThrow();
+                        assertThat(heldOwner.claim().owner()).isEqualTo(oldClaim.owner());
+                        assertThat(heldOwner.claim().claimGeneration()).isEqualTo(oldClaim.claimGeneration());
+                        Map<String, Object> entry = new LinkedHashMap<>(held.evidence());
+                        entry.put("action", "actual-old-write-held");
+                        entry.put("oldOwnerPid", oldProcess.pid());
+                        entry.put("oldOwnerAlive", oldProcess.isAlive());
+                        report.addFork(entry);
+
+                        var successor = leasedClaim(claims, key, takeoverGeneration, oldNode);
+                        var beforeRelease = stored(latest, pipeline, takeoverGeneration, PipelineState.RUNNING);
+                        assertThat(beforeRelease.scope().orElseThrow().pipelineIncarnationId())
+                                .isEqualTo(oldScope.pipelineIncarnationId());
+                        awaitState(survivor, pipeline, PipelineState.RUNNING);
+                        assertCdc(fork, client);
+                        var readySuccessor = leasedClaim(claims, key, takeoverGeneration, oldNode);
+                        assertThat(readySuccessor.claim().owner()).isEqualTo(successor.claim().owner());
+                        assertThat(readySuccessor.claim().claimGeneration()).isGreaterThan(oldClaim.claimGeneration());
+                        assertThat(survivor.pipelineControllerOf(pipeline)).contains(readySuccessor.claim().owner().nodeId());
+                        record(report, "successor-published-before-old-release",
+                                stored(latest, pipeline, takeoverGeneration, PipelineState.RUNNING),
+                                document(database, documentId), readySuccessor);
+
+                        var returned = witness.releaseAndAwaitRejected(CALLBACK_WAIT);
+                        assertThat(oldProcess.isAlive()).as("the original JVM returned from its actual callback").isTrue();
+                        var after = latest.readStored(pipeline).orElseThrow();
+                        assertThat(after.scope()).isEqualTo(beforeRelease.scope());
+                        assertThat(after.observation().state()).isEqualTo(PipelineState.RUNNING);
+                        assertThat(after.observation().observedAt()).isAfterOrEqualTo(beforeRelease.observation().observedAt());
+                        oneDocument(database, key, documentId, takeoverGeneration);
+                        assertThat(claims.currentGeneration(clusterId, pipeline)).hasValue(takeoverGeneration);
+                        Map<String, Object> completion = new LinkedHashMap<>(returned.evidence());
+                        completion.put("action", "actual-old-write-returned-false");
+                        completion.put("oldOwnerAlive", oldProcess.isAlive());
+                        completion.put("retainedGeneration", after.scope().orElseThrow().executionGeneration());
+                        report.addFork(completion);
+                    } finally {
+                        oldProcess.kill();
+                        assertThat(oldProcess.isAlive()).isFalse();
+                    }
+                    survivor.stop(pipeline, false);
+                    awaitState(survivor, pipeline, PipelineState.STOPPED);
+                    stored(latest, pipeline, takeoverGeneration, PipelineState.STOPPED);
+                }
+            }
+            assertThat(PipelineBenchmarkLiveRunIT.artifact(jar)).isEqualTo(application);
+            for (var connector : connectors.entrySet()) {
+                assertThat(PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor(connector.getKey())))
+                        .isEqualTo(connector.getValue());
+            }
+            report.completeDiagnostic(Map.of("correctness", "ACTUAL_OLD_LATEST_CALLBACK_REFUSED",
+                    "performanceAcceptanceEligible", false,
+                    "unverified", List.of("GENERATION_FENCE_CAUSAL_ISOLATION", "OLD_LIFECYCLE_SUBMISSION",
+                            "OTHER_TELEMETRY_CALLBACKS", "POST_SWITCH_FULL_TABLE_ORACLE")));
+        } catch (Exception | Error failure) {
+            try { report.fail(failure); } catch (RuntimeException writeFailure) { failure.addSuppressed(writeFailure); }
+            throw failure;
+        }
+    }
+
+    private static List<String> callbackJvmArguments(int port) {
+        return List.of("-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=127.0.0.1:" + port);
+    }
+
+    private static String callbackRequired(String name) {
+        String value = System.getProperty(CALLBACK_PREFIX + name);
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException("old callback witness requires -D" + CALLBACK_PREFIX + name);
+        }
+        return value;
     }
 
     private static Document standaloneDocument(MongoDatabase database, String pipeline) {
