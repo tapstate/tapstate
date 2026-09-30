@@ -843,7 +843,10 @@ public final class PipelineHistoryQueryService {
                 && elapsed.compareTo(sampleInterval.multipliedBy(2)) >= 0) {
             return StartReason.GAP;
         }
-        if (!Objects.equals(left.countingSince(), right.countingSince())
+        // Only two known starts can prove a changed accumulation epoch.
+        boolean changedKnownStart = left.countingSince() != null && right.countingSince() != null
+                && !left.countingSince().equals(right.countingSince());
+        if (changedKnownStart
                 || decreased(left, right, HistoryAggregator.RECORDS_OUT)
                 || decreased(left, right, HistoryAggregator.BYTES_OUT)) {
             return StartReason.COUNTER_RESET;

@@ -74,6 +74,62 @@ class ScopedPipelineHistoryQueryTest {
         }
     }
 
+    @Test
+    void acquiringAKnownOutboundStartDoesNotTurnAnUnavailableStartupFrameIntoAReset() {
+        Artifacts artifacts = new Artifacts();
+        History history = new History();
+        history.addScopedMetrics(START, Map.of("recordCount", 0L), null, 41);
+        history.addScopedMetrics(START.plusSeconds(30), Map.of("records.out", 10L), START, 41);
+        history.addScopedMetrics(START.plusSeconds(60), Map.of("records.out", 20L), START, 41);
+
+        for (HistoryResolution resolution : List.of(HistoryResolution.RAW, HistoryResolution.PT5M)) {
+            PipelineMetricsHistory result = service(artifacts, history).query(new PipelineHistoryQuery("orders",
+                    START, NOW, resolution, 10, List.of(), null));
+            assertThat(result.segments()).extracting(PipelineMetricsHistory.Segment::startReason)
+                    .doesNotContain(PipelineMetricsHistory.StartReason.COUNTER_RESET);
+            assertThat(result.segments()).flatExtracting(PipelineMetricsHistory.Segment::points)
+                    .anySatisfy(point -> {
+                        assertThat(point.recordsOut()).isNotNull();
+                        assertThat(point.recordsOut().delta()).isEqualByComparingTo("10");
+                    });
+        }
+    }
+
+    @Test
+    void quietFramesBetweenContinuedExecutionsRemainUnavailableWithoutAFalseCounterReset() {
+        Artifacts artifacts = new Artifacts();
+        History history = new History();
+        history.addScopedMetrics(START, Map.of("records.out", 10L, "bytes.out", 100L), START, 41);
+        history.addScopedMetrics(START.plusSeconds(30), Map.of("records.out", 20L, "bytes.out", 200L), START, 41);
+        history.addScopedMetrics(START.plusSeconds(60), Map.of("recordCount", 0L), null, 41);
+        history.addScopedMetrics(START.plusSeconds(90), Map.of("recordCount", 0L), null, 42);
+        history.addScopedMetrics(START.plusSeconds(120), Map.of("records.out", 20L, "bytes.out", 200L), START, 42);
+        history.addScopedMetrics(START.plusSeconds(150), Map.of("records.out", 30L, "bytes.out", 300L), START, 42);
+
+        for (HistoryResolution resolution : List.of(HistoryResolution.RAW, HistoryResolution.PT5M)) {
+            PipelineMetricsHistory result = service(artifacts, history).query(new PipelineHistoryQuery("orders",
+                    START, NOW, resolution, 20, List.of(), null));
+            assertThat(result.segments()).extracting(PipelineMetricsHistory.Segment::startReason)
+                    .doesNotContain(PipelineMetricsHistory.StartReason.COUNTER_RESET);
+            var points = result.segments().stream().flatMap(segment -> segment.points().stream()).toList();
+            assertThat(points.stream().filter(point -> point.recordsOut() != null)
+                    .map(point -> point.recordsOut().delta()).reduce(java.math.BigDecimal.ZERO, java.math.BigDecimal::add))
+                    .isEqualByComparingTo("20");
+            assertThat(points.stream().filter(point -> point.bytesOut() != null)
+                    .map(point -> point.bytesOut().delta()).reduce(java.math.BigDecimal.ZERO, java.math.BigDecimal::add))
+                    .isEqualByComparingTo("200");
+            assertThat(points).filteredOn(point -> point.recordsOut() != null).allSatisfy(point ->
+                    assertThat(point.recordsOut().averageRate()).isEqualByComparingTo("0.333333333"));
+            if (resolution == HistoryResolution.RAW) {
+                assertThat(points).filteredOn(point -> point.intervalEnd().isAfter(START.plusSeconds(30))
+                        && !point.intervalEnd().isAfter(START.plusSeconds(120))).allSatisfy(point -> {
+                            assertThat(point.recordsOut()).isNull();
+                            assertThat(point.bytesOut()).isNull();
+                        });
+            }
+        }
+    }
+
     private static PipelineHistoryQueryService service(Artifacts artifacts, History history) {
         Clock clock = Clock.fixed(NOW, ZoneOffset.UTC);
         return new PipelineHistoryQueryService(new ArtifactQueryService(artifacts), history,
@@ -126,6 +182,12 @@ class ScopedPipelineHistoryQueryTest {
                     Map.of(), START);
             samples.add(new Scoped(new Entry(new Key(at, "key-" + value), sample,
                     Optional.of(new ObservationStore.Scope(incarnation, generation)), gapFrom), incarnation));
+        }
+
+        void addScopedMetrics(Instant at, Map<String, Long> counters, Instant since, long generation) {
+            RateSample sample = new RateSample("orders", at, counters, Map.of(), since);
+            samples.add(new Scoped(new Entry(new Key(at, "key-" + at), sample,
+                    Optional.of(new ObservationStore.Scope("inc-old", generation))), "inc-old"));
         }
 
         @Override public void append(RateSample sample) { throw new UnsupportedOperationException(); }

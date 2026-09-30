@@ -216,7 +216,10 @@ public final class HistoryAggregator {
         if (!elapsed.isZero() && elapsed.compareTo(gapThreshold) >= 0) {
             return StartReason.GAP;
         }
-        if (!Objects.equals(left.countingSince(), right.countingSince())
+        // Only two known starts can prove a changed accumulation epoch.
+        boolean changedKnownStart = left.countingSince() != null && right.countingSince() != null
+                && !left.countingSince().equals(right.countingSince());
+        if (changedKnownStart
                 || decreased(left, right, RECORDS_OUT)
                 || decreased(left, right, BYTES_OUT)) {
             return StartReason.COUNTER_RESET;
