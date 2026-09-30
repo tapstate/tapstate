@@ -574,6 +574,9 @@ class CaptureToSinkAckFrontierTest {
 
         @Override
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+            SourcePosition initial = start instanceof CaptureStart.Resume resumed
+                    ? resumed.position() : new SourcePosition("src-before-first-change");
+            listener.onStart(Optional.of(initial));
             running = true;
             daemon = new Thread(() -> {
                 while (running) {

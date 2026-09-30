@@ -377,9 +377,10 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             if (!storePort.meta().requestPhysicalTables(chain.value(), record.epoch(), wanted)) {
                 throw new RingNotOpenYet(plan.captureId());
             }
-            if (selection == null) {
-                // A tail not yet published must include every request in its first subscription. Its
-                // conditional publication refuses a union that raced this request.
+            if (selection == null || selection.epoch() < record.epoch()) {
+                // An abandoned preparation can leave the preceding generation's published selection.
+                // This generation's first subscription must include every request; its conditional
+                // publication refuses a union that raced this request.
                 continue;
             }
             OwnedCapture owned = ownedCaptures.get(plan.captureId());
