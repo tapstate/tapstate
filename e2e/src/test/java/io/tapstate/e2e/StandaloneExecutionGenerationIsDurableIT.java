@@ -97,7 +97,7 @@ class StandaloneExecutionGenerationIsDurableIT {
                 assertThat(generation(claim(database, pipeline))).isEqualTo(firstGeneration);
                 record(report, "ordinary-resume", resumed, claim(database, pipeline));
 
-                control.lifecycle(pipeline, LifecycleVerb.STOP);
+                control.stop(pipeline, false);
                 var stopped = stored(latest, pipeline, firstGeneration, PipelineState.STOPPED);
                 assertThat(stopped.scope()).isEqualTo(first.scope());
                 long resumedRecords = outputCounter(resumed.observation()).value();
@@ -117,7 +117,7 @@ class StandaloneExecutionGenerationIsDurableIT {
                 assertThat(generation(claim(database, pipeline))).isEqualTo(firstGeneration + 1);
                 record(report, "stop-start", restarted, claim(database, pipeline));
 
-                control.lifecycle(pipeline, LifecycleVerb.STOP);
+                control.stop(pipeline, false);
                 stored(latest, pipeline, firstGeneration + 1, PipelineState.STOPPED);
                 fork.server().close();
                 assertThat(generation(claim(database, pipeline))).isEqualTo(firstGeneration + 1);
@@ -137,7 +137,7 @@ class StandaloneExecutionGenerationIsDurableIT {
                             .isAfter(restartCounter.startTime());
                     record(report, "process-restart-start", afterProcessRestart, claim(database, pipeline));
 
-                    restored.lifecycle(pipeline, LifecycleVerb.STOP);
+                    restored.stop(pipeline, false);
                     stored(latest, pipeline, firstGeneration + 2, PipelineState.STOPPED);
                     restored.deleteArtifact(pipeline, restored.contentHash(pipeline));
                     assertThat(restored.artifact(pipeline)).isEmpty();
@@ -154,7 +154,7 @@ class StandaloneExecutionGenerationIsDurableIT {
                     assertThat(outputCounter(recreated.observation()).startTime())
                             .isAfter(outputCounter(afterProcessRestart.observation()).startTime());
                     record(report, "delete-recreate-start", recreated, claim(database, pipeline));
-                    restored.lifecycle(pipeline, LifecycleVerb.STOP);
+                    restored.stop(pipeline, false);
                     stored(latest, pipeline, firstGeneration + 3, PipelineState.STOPPED);
                 }
             }
