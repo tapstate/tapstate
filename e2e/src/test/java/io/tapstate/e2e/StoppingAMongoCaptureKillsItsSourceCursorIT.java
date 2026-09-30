@@ -13,6 +13,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -77,18 +78,15 @@ class StoppingAMongoCaptureKillsItsSourceCursorIT {
             control.stop(PIPELINE, false);
             await(() -> control.state(PIPELINE).orElse(null) == PipelineState.STOPPED,
                     "the last pipeline stopped");
-            long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
-            List<Document> remaining;
-            do {
-                remaining = cursors(observer).stream().filter(op -> cursorId(op) == cursorId).toList();
-                if (remaining.isEmpty()) {
-                    break;
-                }
-                Thread.sleep(50);
-            } while (System.nanoTime() < deadline);
-            assertThat(remaining)
+            AtomicReference<List<Document>> remaining = new AtomicReference<>(List.of());
+            Await.until("stopping the last pipeline must kill source cursor " + cursorId,
+                    Duration.ofSeconds(5), () -> {
+                        remaining.set(cursors(observer).stream().filter(op -> cursorId(op) == cursorId).toList());
+                        return remaining.get().isEmpty();
+                    }, () -> "$currentOp: " + remaining.get());
+            assertThat(remaining.get())
                     .as("stopping the last pipeline must kill source cursor %s; $currentOp: %s",
-                            cursorId, remaining)
+                            cursorId, remaining.get())
                     .isEmpty();
         } finally {
             if (previousWebType == null) {
@@ -123,14 +121,7 @@ class StoppingAMongoCaptureKillsItsSourceCursorIT {
                 """.formatted(id, uri, database);
     }
 
-    private static void await(BooleanSupplier ready, String description) throws InterruptedException {
-        long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
-        while (System.nanoTime() < deadline) {
-            if (ready.getAsBoolean()) {
-                return;
-            }
-            Thread.sleep(50);
-        }
-        assertThat(ready.getAsBoolean()).as(description).isTrue();
+    private static void await(BooleanSupplier ready, String description) {
+        Await.until(description, Duration.ofSeconds(30), ready, () -> "condition not yet met");
     }
 }
