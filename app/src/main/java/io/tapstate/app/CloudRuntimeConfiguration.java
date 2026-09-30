@@ -4,6 +4,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.CloudAuthenticationObserver;
 import io.tapstate.control.core.CloudRuntimeStatusProvider;
+import io.tapstate.control.restapi.RuntimeVersion;
 import io.tapstate.control.core.CloudSessionService;
 import io.tapstate.control.core.CloudStatusReporter;
 import io.tapstate.control.core.TokenSecrets;
@@ -123,9 +124,8 @@ class CloudRuntimeConfiguration {
         if (store == null || clock == null) {
             return null;
         }
-        String version = Bootstrap.class.getPackage().getImplementationVersion();
         return new StoreBackedCloudRuntimeStatusProvider(
-                store, version == null || version.isBlank() ? "development" : version, clock, Instant.now(clock));
+                store, RuntimeVersion.current(), clock, Instant.now(clock));
     }
 
     @Bean
