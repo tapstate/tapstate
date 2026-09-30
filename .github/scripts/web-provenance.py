@@ -110,7 +110,7 @@ def metadata_from_layer(layer: bytes, platform: str) -> dict[str, str]:
     raise ProvenanceError(f"{platform} OCI image does not contain /opt/tapstate/tapstate.jar")
 
 
-def image_metadata(layout: Path) -> tuple[str, dict[str, dict[str, str]]]:
+def image_metadata(layout: Path) -> tuple[str, dict[str, str]]:
     root = load_json(layout / "index.json")
     roots = root.get("manifests")
     if not isinstance(roots, list) or len(roots) != 1 or not isinstance(roots[0], dict):
@@ -166,6 +166,12 @@ def image_metadata(layout: Path) -> tuple[str, dict[str, dict[str, str]]]:
                 raise ProvenanceError(f"{platform} image is missing label {label}")
             if labels[label] != jar_props.get(property_name):
                 raise ProvenanceError(f"{platform} label {label} disagrees with Boot JAR metadata")
+        # Legacy public server images predate this label. New Cloud images must identify the
+        # independent distribution, and both platforms must agree before package identity is inferred.
+        distribution = labels.get("io.tapstate.distribution", "onprem")
+        if distribution not in {"cloud", "onprem"}:
+            raise ProvenanceError(f"{platform} image has an unknown distribution")
+        jar_props["image.distribution"] = distribution
         metadata[platform] = jar_props
 
     if set(metadata) != {"linux/amd64", "linux/arm64"}:
@@ -182,6 +188,13 @@ def expected_metadata(version: str, tapstate_revision: str, web_revision: str) -
         "tapstate.revision": tapstate_revision,
         "release.version": version,
     }
+
+
+def image_repository(props: dict[str, str]) -> str:
+    distribution = props.get("image.distribution", "onprem")
+    if distribution not in {"cloud", "onprem"}:
+        raise ProvenanceError("image has an unknown distribution")
+    return "ghcr.io/tapstate/tapstate-cloud" if distribution == "cloud" else "ghcr.io/tapstate/tapstate"
 
 
 def create(args: argparse.Namespace) -> None:
@@ -202,7 +215,7 @@ def create(args: argparse.Namespace) -> None:
             "filesSha256": files_digest,
         },
         "image": {
-            "repository": "ghcr.io/tapstate/tapstate",
+            "repository": image_repository(props),
             "tag": args.version,
             "manifestDigest": digest,
             "platforms": ["linux/amd64", "linux/arm64"],
@@ -234,7 +247,7 @@ def verify_values(provenance: dict[str, Any], digest: str, props: dict[str, str]
         raise ProvenanceError("provenance Tapstate repository is unexpected")
     if web.get("repository") != "tapstate/tapstate-web":
         raise ProvenanceError("provenance Web repository is unexpected")
-    if image.get("repository") != "ghcr.io/tapstate/tapstate":
+    if image.get("repository") != image_repository(props):
         raise ProvenanceError("provenance image repository is unexpected")
     if image.get("tag") != version:
         raise ProvenanceError("provenance image tag disagrees with the release version")

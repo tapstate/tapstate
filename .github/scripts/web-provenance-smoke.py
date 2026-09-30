@@ -77,7 +77,8 @@ def image_layer(jar_bytes: bytes) -> bytes:
     return output.getvalue()
 
 
-def write_layout(layout: Path, jar_bytes: bytes = b"") -> None:
+def write_layout(layout: Path, jar_bytes: bytes = b"", distribution: str | None = None,
+                 arm64_distribution: str | None = None) -> None:
     if not jar_bytes:
         jar_bytes = boot_jar()
     with zipfile.ZipFile(io.BytesIO(jar_bytes)) as jar:
@@ -91,6 +92,9 @@ def write_layout(layout: Path, jar_bytes: bytes = b"") -> None:
             "io.tapstate.web.revision": WEB_REVISION,
             "io.tapstate.web.files.sha256": web_files_sha256,
         }
+        target = arm64_distribution if architecture == "arm64" and arm64_distribution else distribution
+        if target is not None:
+            labels["io.tapstate.distribution"] = target
         config_digest = add_blob(layout, json_bytes({"config": {"Labels": labels}}))
         image_manifest_digest = add_blob(
             layout,
@@ -157,6 +161,63 @@ def main() -> int:
             print("not ok - an asset that disagrees with the JAR manifest is rejected", file=sys.stderr)
             return 1
         print("ok - an asset that disagrees with the JAR manifest is rejected")
+
+        cloud_layout = root / "cloud-oci"
+        cloud_layout.mkdir()
+        write_layout(cloud_layout, distribution="cloud")
+        cloud_provenance = root / "cloud.json"
+        created = invoke(
+            "create", "--oci-layout", str(cloud_layout), "--output", str(cloud_provenance),
+            "--version", VERSION, "--tapstate-revision", TAPSTATE_REVISION, "--web-revision", WEB_REVISION,
+        )
+        if created.returncode or json.loads(cloud_provenance.read_text())["image"]["repository"] != "ghcr.io/tapstate/tapstate-cloud":
+            print("not ok - Cloud provenance must name the private Cloud package, not OP", file=sys.stderr)
+            return 1
+        verified = invoke("verify", "--oci-layout", str(cloud_layout), "--provenance", str(cloud_provenance))
+        if verified.returncode:
+            print(verified.stderr, file=sys.stderr)
+            return 1
+        print("ok - Cloud provenance names and verifies the private Cloud package")
+        value = json.loads(cloud_provenance.read_text())
+        value["image"]["repository"] = "ghcr.io/tapstate/tapstate"
+        cloud_provenance.write_text(json.dumps(value))
+        wrong_package = invoke("verify", "--oci-layout", str(cloud_layout), "--provenance", str(cloud_provenance))
+        if wrong_package.returncode == 0:
+            print("not ok - Cloud provenance cannot name the OP package", file=sys.stderr)
+            return 1
+        print("ok - Cloud provenance cannot name the OP package")
+        op_layout = root / "explicit-op-oci"
+        op_layout.mkdir()
+        write_layout(op_layout, distribution="onprem")
+        op_provenance = root / "explicit-op.json"
+        created = invoke(
+            "create", "--oci-layout", str(op_layout), "--output", str(op_provenance),
+            "--version", VERSION, "--tapstate-revision", TAPSTATE_REVISION, "--web-revision", WEB_REVISION,
+        )
+        if created.returncode or json.loads(op_provenance.read_text())["image"]["repository"] != "ghcr.io/tapstate/tapstate":
+            print("not ok - explicit on-prem images retain the public package", file=sys.stderr)
+            return 1
+        print("ok - explicit on-prem images retain the public package")
+        value = json.loads(op_provenance.read_text())
+        value["image"]["repository"] = "ghcr.io/tapstate/tapstate-cloud"
+        op_provenance.write_text(json.dumps(value))
+        swapped = invoke("verify", "--oci-layout", str(op_layout), "--provenance", str(op_provenance))
+        if swapped.returncode == 0:
+            print("not ok - OP provenance cannot name the Cloud package", file=sys.stderr)
+            return 1
+        print("ok - OP provenance cannot name the Cloud package")
+        for name, target, arm_target in (("unknown", "unknown", None), ("mixed", "cloud", "onprem")):
+            other = root / name
+            other.mkdir()
+            write_layout(other, distribution=target, arm64_distribution=arm_target)
+            rejected = invoke(
+                "create", "--oci-layout", str(other), "--output", str(root / f"{name}.json"),
+                "--version", VERSION, "--tapstate-revision", TAPSTATE_REVISION, "--web-revision", WEB_REVISION,
+            )
+            if rejected.returncode == 0:
+                print(f"not ok - {name} distribution must be rejected", file=sys.stderr)
+                return 1
+            print(f"ok - {name} distribution is rejected")
     return 0
 
 
