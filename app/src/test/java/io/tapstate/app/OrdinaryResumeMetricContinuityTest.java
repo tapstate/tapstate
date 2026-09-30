@@ -121,6 +121,42 @@ class OrdinaryResumeMetricContinuityTest {
     }
 
     @Test
+    void anUncertainFirstReadingAfterRebuildCannotLoseTheBaselineOfTheNextRebuild() {
+        var scopes = new ObservationScopeRegistry();
+        var first = scopes.begin(PIPELINE, "inc-a", 1);
+        scopes.continueFrame(records(1, START, Map.of("update", 7L, "read", 5L)), first);
+        scopes.prepareRebuildingResume(PIPELINE, Optional.empty());
+        var second = scopes.begin(PIPELINE, "inc-a", 2);
+        var mixed = List.of(
+                MetricPoint.accumulated(attributes("out"), START.plusSeconds(2), START.plusSeconds(3), 1),
+                MetricPoint.accumulated(Map.of(MetricAttributes.PIPELINE_ID, PIPELINE,
+                        MetricAttributes.TABLE_ID, "orders", MetricAttributes.DIRECTION, "out",
+                        MetricAttributes.OP, "read"), START.plusSeconds(3), START.plusSeconds(3), 1));
+        var unavailable = scopes.continueFrame(facts(3, List.of(new MetricFact("tapstate.pipeline.records",
+                MetricType.COUNTER, "{record}", mixed))), second);
+        assertThat(points(unavailable, "out")).isEmpty();
+        scopes.prepareRebuildingResume(PIPELINE, Optional.empty());
+        var third = scopes.begin(PIPELINE, "inc-a", 3);
+        var continued = scopes.continueFrame(records(5, START.plusSeconds(5), Map.of("update", 2L)), third);
+        assertThat(total(continued, "tapstate.pipeline.records")).isEqualTo(14);
+    }
+
+    @Test
+    void anUnknownHistogramAfterRebuildKeepsItsKnownPredecessorForAnotherRebuild() {
+        var scopes = new ObservationScopeRegistry();
+        var first = scopes.begin(PIPELINE, "inc-a", 1);
+        scopes.continueFrame(histograms(1, START, Map.of("a", 7L, "b", 2L)), first);
+        scopes.prepareRebuildingResume(PIPELINE, Optional.empty());
+        var second = scopes.begin(PIPELINE, "inc-a", 2);
+        var unknown = scopes.continueFrame(histograms(2, null, Map.of("a", 1L)), second);
+        assertThat(unknown.observation().facts().getFirst().points()).isEmpty();
+        scopes.prepareRebuildingResume(PIPELINE, Optional.empty());
+        var third = scopes.begin(PIPELINE, "inc-a", 3);
+        var continued = scopes.continueFrame(histograms(3, START.plusSeconds(3), Map.of("a", 2L)), third);
+        assertThat(histogramCount(continued)).isEqualTo(11);
+    }
+
+    @Test
     void foldedCounterAndHistogramTotalsGrowOnlyByTheNewNativeDelta() {
         for (boolean histogram : List.of(false, true)) {
             var scopes = new ObservationScopeRegistry();

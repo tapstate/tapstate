@@ -144,6 +144,9 @@ final class MetricContinuation {
     }
 
     static MetricPoint at(MetricPoint point, MetricType type, Instant at) {
+        if (at == null) {
+            return point;
+        }
         return type == MetricType.COUNTER
                 ? MetricPoint.accumulated(point.attributes(), point.startTime(), at, point.value())
                 : MetricPoint.distribution(point.attributes(), point.startTime(), at, point.histogram());

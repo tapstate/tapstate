@@ -118,10 +118,11 @@ final class ObservationScopeRegistry {
                         .map(ObservationStore.Stored::observation).orElse(source);
             }
             List<MetricFact> known = source == null ? List.of() : source.facts();
-            if (source != null && source.observedAt() != null) {
-                known = MetricContinuation.captureFacts(entry.epochs.knownFacts(source.observedAt()))
-                        .atLeast(known, source.observedAt());
+            java.time.Instant at = source == null ? null : source.observedAt();
+            if (entry.active != null) {
+                known = entry.active.atLeast(known, at);
             }
+            known = MetricContinuation.captureFacts(entry.epochs.knownFacts(at)).atLeast(known, at);
             entry.pending = MetricContinuation.captureFacts(known).boundedBy(entry.folder);
             entry.pendingFrom = owner;
         }
