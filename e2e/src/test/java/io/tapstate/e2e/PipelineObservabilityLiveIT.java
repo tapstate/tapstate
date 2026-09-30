@@ -1,11 +1,22 @@
 package io.tapstate.e2e;
 
+import com.mongodb.ConnectionString;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoDatabase;
+import io.tapstate.adapters.mongostore.MongoDesiredStore;
+import io.tapstate.adapters.mongostore.MongoObservationStore;
+import io.tapstate.adapters.mongostore.MongoStateStore;
+import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.JsonWriter;
+import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.testsupport.DockerGate;
 import org.bson.Document;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -34,6 +45,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -48,6 +60,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * deliberately absent for longer than that before it is restarted. The final target refusal uses the
  * same real Mongo connector with an unreachable address, so the coded failure is produced by the
  * running product rather than placed into a fixture.
+ * A separate opt-in case loses a suspended job with its owned process and reads the resulting failure
+ * through the same public clients.
  *
  * <p>Run with a packaged app and MCP sidecar, Docker, and real connector jars:
  *
@@ -67,6 +81,7 @@ class PipelineObservabilityLiveIT {
     private static final Duration DELIBERATE_GAP = Duration.ofSeconds(22);
     private static final Duration REAL_CONNECTOR_WAIT = Duration.ofMinutes(2);
     private static final String MCP_BOOT_JAR_PROPERTY = "tapstate.e2e.mcp-boot-jar";
+    private static final String PAUSED_LOSS_PROPERTY_PREFIX = "tapstate.e2e.paused-job-loss.";
 
     @TempDir
     private Path temporaryDirectory;
@@ -200,6 +215,170 @@ class PipelineObservabilityLiveIT {
                     second.close();
                 }
             }
+        }
+    }
+
+    @Test
+    void aPausedJobLostWithItsProcessIsCodedAcrossRestCliAndMcp() throws Exception {
+        Assumptions.assumeTrue(System.getProperty(PAUSED_LOSS_PROPERTY_PREFIX + "jar") != null
+                        || System.getProperty(PAUSED_LOSS_PROPERTY_PREFIX + "output") != null,
+                "no paused-job-loss properties supplied; the real process-loss witness is opt-in");
+        Path jar = Path.of(pausedLossRequired("jar")).toRealPath();
+        assertThat(jar).as("the selected application artifact").isRegularFile();
+        Path output = Path.of(pausedLossRequired("output"));
+        PipelineBenchmarkLiveRunIT.requireSafeOutput(output, PipelineBenchmarkLiveRunIT.harnessRoot());
+        Map<String, Object> application = PipelineBenchmarkLiveRunIT.artifact(jar);
+        Map<String, Object> connectors = Map.of(
+                "mysql", PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor("mysql")),
+                "mongodb", PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor("mongodb")));
+        BenchmarkLiveReport report = new BenchmarkLiveReport(output);
+        report.begin(Map.of("purpose", "REAL_PAUSED_PROCESS_LOSS_PARITY",
+                        "application", application, "connectors", connectors),
+                Map.of("kind", "correctness-only"), List.of());
+        String suffix = UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+        String storeUri = SharedMongo.replicaSetUrl("observability_paused_" + suffix + "_store");
+        String targetUri = SharedMongo.replicaSetUrl("observability_paused_" + suffix + "_target");
+        String operatorDatabase = "observability_paused_" + suffix + "_operator";
+        EndpointAddress target = EndpointAddress.uri(targetUri);
+        try (MySQLContainer<?> mysql = new MySQLContainer<>(DockerImageName.parse("mysql:8.0"));
+                MongoEndpoints targetMongo = new MongoEndpoints();
+                MongoClient storeClient = MongoClients.create(storeUri)) {
+            mysql.start();
+            SharedMySql.grantReplication(mysql);
+            seed(mysql);
+            MongoDatabase database = storeClient.getDatabase(new ConnectionString(storeUri).getDatabase());
+            MongoDesiredStore desired = new MongoDesiredStore(
+                    database.getCollection(MongoStorePort.PIPELINE_DESIRED));
+            MongoStateStore actual = new MongoStateStore(
+                    database.getCollection(MongoStorePort.PIPELINE_STATE));
+            MongoObservationStore latest = new MongoObservationStore(storeClient,
+                    database.getCollection(MongoStorePort.PIPELINE_OBSERVATION),
+                    database.getCollection(MongoStorePort.PIPELINE_OBSERVATION_CHUNKS));
+            RealProcessServer first = null;
+            RealProcessServer restored = null;
+            try {
+                first = RealProcessServer.start(storeUri, operatorDatabase, jar);
+                ControlPlane control = new ControlPlane(first.baseUrl());
+                control.bootstrapAndLogin(USER, PASSWORD);
+                control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
+                control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+                Map<String, Object> mysqlConfig = mysqlConfig(mysql);
+                control.apply(resources(mysqlConfig, targetUri));
+                control.discoverSchema("src_mysql", "mysql", mysqlConfig);
+                control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
+                awaitState(control, PipelineState.RUNNING);
+                awaitCustomer(targetMongo, target, "seeded", "the real snapshot before process loss");
+                update(mysql, "before-paused-loss");
+                awaitCustomer(targetMongo, target, "before-paused-loss",
+                        "a real CDC update before pausing the job");
+
+                control.lifecycle(PIPELINE_ID, LifecycleVerb.PAUSE);
+                awaitState(control, PipelineState.PAUSED);
+                Await.until("the durable desired, actual and latest state to agree on PAUSED",
+                        REAL_CONNECTOR_WAIT,
+                        () -> desired.read(PIPELINE_ID)
+                                        .map(value -> value.targetState() == PipelineState.PAUSED).orElse(false)
+                                && actual.read(PIPELINE_ID).map(value ->
+                                        StateJson.parse(value.stateJson()) == PipelineState.PAUSED).orElse(false)
+                                && latest.readStored(PIPELINE_ID).map(value ->
+                                        value.observation().state() == PipelineState.PAUSED).orElse(false),
+                        () -> "desired=" + desired.read(PIPELINE_ID) + ", actual=" + actual.read(PIPELINE_ID)
+                                + ", latest=" + latest.readStored(PIPELINE_ID));
+                var paused = latest.readStored(PIPELINE_ID).orElseThrow();
+                assertThat(paused.scope()).as("the paused observation still belongs to the real execution")
+                        .isPresent();
+                assertThat(paused.observation().failure()).as("the paused job had not already failed").isNull();
+                assertThat(first.isAlive()).as("the job-bearing process was alive before the fault").isTrue();
+                Path firstOutput = first.output();
+                first.kill();
+                assertThat(first.isAlive()).as("the process carrying the suspended job died").isFalse();
+                assertThat(desired.read(PIPELINE_ID).orElseThrow().targetState())
+                        .as("process loss did not rewrite desired intent").isEqualTo(PipelineState.PAUSED);
+
+                restored = RealProcessServer.start(storeUri, operatorDatabase, jar);
+                ControlPlane restarted = new ControlPlane(restored.baseUrl());
+                restarted.login(USER, PASSWORD);
+                Await.until("the lost paused execution to publish its coded failure", REAL_CONNECTOR_WAIT,
+                        () -> restarted.state(PIPELINE_ID).filter(PipelineState.FAILED::equals).isPresent()
+                                && restarted.failureCode(PIPELINE_ID)
+                                        .filter(LifecycleError.PAUSED_JOB_MISSING.code()::equals).isPresent()
+                                && desired.read(PIPELINE_ID)
+                                        .map(value -> value.targetState() == PipelineState.PAUSED).orElse(false)
+                                && actual.read(PIPELINE_ID).map(value ->
+                                        StateJson.parse(value.stateJson()) == PipelineState.FAILED).orElse(false)
+                                && latest.readStored(PIPELINE_ID).map(value ->
+                                        value.observation().state() == PipelineState.FAILED
+                                                && value.observation().failure() != null
+                                                && LifecycleError.PAUSED_JOB_MISSING.code()
+                                                        .equals(value.observation().failure().code())).orElse(false),
+                        () -> "state=" + restarted.state(PIPELINE_ID)
+                                + ", failure=" + restarted.failureCode(PIPELINE_ID)
+                                + ", desired=" + desired.read(PIPELINE_ID)
+                                + ", actual=" + actual.read(PIPELINE_ID));
+                var failed = latest.readStored(PIPELINE_ID).orElseThrow();
+                assertThat(failed.scope()).as("a missing paused job did not allocate another execution")
+                        .isEqualTo(paused.scope());
+                assertThat(failed.observation().observedAt()).isAfter(paused.observation().observedAt());
+
+                Map<String, Object> restStatus = get(restored.baseUrl(), restarted.credential(),
+                        "/api/pipelines/" + PIPELINE_ID + "/status");
+                assertThat(restStatus.get("state")).isEqualTo(PipelineState.FAILED.name());
+                assertThat(restStatus.get("failure")).isInstanceOf(Map.class);
+                Map<?, ?> failure = (Map<?, ?>) restStatus.get("failure");
+                assertThat(failure.get("code")).isEqualTo(LifecycleError.PAUSED_JOB_MISSING.code());
+                assertThat(failure.get("params")).isEqualTo(Map.of("pipeline", PIPELINE_ID));
+                assertThat(failure.get("message")).isInstanceOf(String.class).isNotEqualTo("");
+                Map<String, Object> restExplain = awaitExplanation(restored.baseUrl(), restarted.credential(),
+                        "CODED_FAILURE"::equals, "the actual paused-job loss to be explained");
+                assertThat(restExplain).containsEntry("pipelineId", PIPELINE_ID)
+                        .containsEntry("state", PipelineState.FAILED.name())
+                        .containsEntry("freshness", "FRESH");
+                assertThat(failureEvidence(restExplain)).isEqualTo(failure);
+
+                Map<String, Object> mcpExplain = readExplanationThroughMcp(
+                        restored.baseUrl(), restarted.mintToken("read"));
+                assertThat(mcpExplain.get("pipelineId")).isEqualTo(PIPELINE_ID);
+                assertThat(explanationContract(mcpExplain)).isEqualTo(explanationContract(restExplain));
+                CliOnce.Run cliExplain = CliOnce.runWithPassword(PASSWORD,
+                        "-c", restored.baseUrl().toString(), "-u", USER, "explain", PIPELINE_ID);
+                assertThat(cliExplain.exitCode()).isZero();
+                assertThat(cliExplain.stdout()).contains("kind       CODED_FAILURE", "status.failure",
+                        LifecycleError.PAUSED_JOB_MISSING.code(), "pipeline=" + PIPELINE_ID,
+                        (String) failure.get("message"));
+                assertThat(desired.read(PIPELINE_ID).orElseThrow().targetState())
+                        .as("all three readers left desired intent paused").isEqualTo(PipelineState.PAUSED);
+                assertThat(actual.read(PIPELINE_ID).map(value -> StateJson.parse(value.stateJson())))
+                        .contains(PipelineState.FAILED);
+
+                Map<String, Object> evidence = new LinkedHashMap<>();
+                evidence.put("applicationSha256", application.get("sha256"));
+                evidence.put("initialProcessOutput", firstOutput.toString());
+                evidence.put("restoredProcessOutput", restored.output().toString());
+                evidence.put("desiredBeforeLoss", PipelineState.PAUSED.name());
+                evidence.put("desiredAfterLoss", PipelineState.PAUSED.name());
+                evidence.put("actualAfterLoss", PipelineState.FAILED.name());
+                evidence.put("restStatus", restStatus);
+                evidence.put("restExplain", restExplain);
+                evidence.put("mcpExplain", mcpExplain);
+                evidence.put("cliExplain", cliExplain.stdout());
+                report.addFork(evidence);
+            } finally {
+                if (first != null) { first.close(); }
+                if (restored != null) { restored.close(); }
+            }
+            assertThat(PipelineBenchmarkLiveRunIT.artifact(jar)).isEqualTo(application);
+            assertThat(PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor("mysql")))
+                    .isEqualTo(connectors.get("mysql"));
+            assertThat(PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor("mongodb")))
+                    .isEqualTo(connectors.get("mongodb"));
+            report.completeDiagnostic(Map.of(
+                    "correctness", "REAL_PAUSED_PROCESS_LOSS_CODED_PARITY",
+                    "performanceAcceptanceEligible", false,
+                    "unverified", List.of("SAME_LIVE_JVM_JOB_ONLY_CANCEL", "OTHER_CLUSTER_MODES")));
+        } catch (Exception | Error failure) {
+            try { report.fail(failure); }
+            catch (RuntimeException writeFailure) { failure.addSuppressed(writeFailure); }
+            throw failure;
         }
     }
 
@@ -402,6 +581,29 @@ class PipelineObservabilityLiveIT {
                 "evidence", "cannotSay", "next", "pending"));
     }
 
+    private static Map<?, ?> failureEvidence(Map<String, Object> explanation) {
+        if (explanation.get("evidence") instanceof List<?> readings) {
+            for (Object reading : readings) {
+                if (reading instanceof Map<?, ?> evidence
+                        && "status".equals(evidence.get("source"))
+                        && "failure".equals(evidence.get("field"))
+                        && evidence.get("value") instanceof Map<?, ?> failure) {
+                    return failure;
+                }
+            }
+        }
+        throw new AssertionError("coded explanation carried no status.failure evidence: " + explanation);
+    }
+
+    private static String pausedLossRequired(String name) {
+        String value = System.getProperty(PAUSED_LOSS_PROPERTY_PREFIX + name);
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException("paused process-loss witness requires -D"
+                    + PAUSED_LOSS_PROPERTY_PREFIX + name);
+        }
+        return value;
+    }
+
     private static Map<String, Object> historyContract(Map<String, Object> value) {
         return selected(value, List.of("from", "to", "effectiveFrom", "effectiveTo",
                 "effectiveResolution", "status", "consistency", "segments", "gaps",
@@ -449,6 +651,35 @@ class PipelineObservabilityLiveIT {
             }
             assertThat(process.exitValue()).isZero();
             assertThat(Files.readString(stderr)).doesNotContain(token);
+        }
+    }
+
+    private Map<String, Object> readExplanationThroughMcp(URI server, String token) throws Exception {
+        Path stderr = temporaryDirectory.resolve("paused-loss-mcp.stderr");
+        Process process = startMcp(server, token, stderr);
+        try (Writer input = new OutputStreamWriter(process.getOutputStream(), StandardCharsets.UTF_8);
+                BufferedReader output = process.inputReader(StandardCharsets.UTF_8)) {
+            send(input, Map.of(
+                    "jsonrpc", "2.0", "id", 1, "method", "initialize",
+                    "params", Map.of(
+                            "protocolVersion", "2025-06-18",
+                            "capabilities", Map.of(),
+                            "clientInfo", Map.of("name", "paused-loss-live", "version", "1"))));
+            receive(output);
+            send(input, Map.of("jsonrpc", "2.0", "method", "notifications/initialized"));
+            send(input, toolCall(2, "pipeline_explain", Map.of("id", PIPELINE_ID)));
+            return structured(receive(output), "pipeline_explain");
+        } finally {
+            try {
+                process.getOutputStream().close();
+            } finally {
+                if (!process.waitFor(10, TimeUnit.SECONDS)) {
+                    process.destroyForcibly();
+                    assertThat(process.waitFor(10, TimeUnit.SECONDS)).isTrue();
+                }
+                assertThat(process.exitValue()).isZero();
+                assertThat(Files.readString(stderr)).doesNotContain(token);
+            }
         }
     }
 
