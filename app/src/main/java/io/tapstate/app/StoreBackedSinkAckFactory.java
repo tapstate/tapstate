@@ -14,6 +14,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -143,7 +144,7 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
         WriterBinding writer = writerId == null
                 ? bindResolvedWriter()
                 : new WriterBinding(writerId, writerStreams, writerIdsByStream);
-        ConcurrentMap<String, Boolean> configuredMiningChains = new ConcurrentHashMap<>();
+        ConcurrentMap<String, Optional<WorkloadClaimFence>> configuredMiningChains = new ConcurrentHashMap<>();
         Map<String, ChainPosition> recorded = new ConcurrentHashMap<>();
         return new SinkAck() {
             @Override
@@ -162,7 +163,7 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
     private void acknowledge(
             SrsMetaStore meta,
             WriterBinding writer,
-            ConcurrentMap<String, Boolean> configuredMiningChains,
+            ConcurrentMap<String, Optional<WorkloadClaimFence>> configuredMiningChains,
             Map<String, ChainPosition> recorded,
             String chain,
             ChainPosition position,
@@ -210,14 +211,18 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
         }
     }
 
-    /** Registers a writer's complete plan for one mining chain before its first acknowledgement there. */
+    /** Registers a writer's complete plan for one mining chain whenever its authorized fence changes. */
     private void ensureConfigured(
             SrsMetaStore meta,
             WriterBinding writer,
             String miningChainId,
-            ConcurrentMap<String, Boolean> configuredMiningChains,
+            ConcurrentMap<String, Optional<WorkloadClaimFence>> configuredMiningChains,
             WorkloadClaimFence fence) {
-        configuredMiningChains.computeIfAbsent(miningChainId, ignored -> {
+        Optional<WorkloadClaimFence> expected = Optional.ofNullable(fence);
+        configuredMiningChains.compute(miningChainId, (ignored, configured) -> {
+            if (expected.equals(configured)) {
+                return configured;
+            }
             Map<String, List<String>> plan = writer.plan();
             if (plan == null) {
                 synchronized (resolvedWriterIdsByStream) {
@@ -225,7 +230,7 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                 }
             }
             configure(meta, miningChainId, plan, fence);
-            return Boolean.TRUE;
+            return expected;
         });
     }
 

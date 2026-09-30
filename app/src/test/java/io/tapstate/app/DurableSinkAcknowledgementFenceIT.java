@@ -15,12 +15,15 @@ import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
@@ -37,6 +40,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
@@ -59,6 +63,71 @@ class DurableSinkAcknowledgementFenceIT {
     @Container
     private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE)
             .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
+
+    @ParameterizedTest(name = "snapshot completion: {0}")
+    @ValueSource(booleans = {false, true})
+    void theSameExecutionKeepsAcknowledgingAfterItsTopologyRevisionChanges(boolean snapshot) {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            var database = client.getDatabase("tapstate_sink_ack_topology_" + System.nanoTime());
+            MongoWorkloadClaimStore claims = new MongoWorkloadClaimStore(
+                    database.getCollection("workload_claims"));
+            MongoSrsMetaStore meta = new MongoSrsMetaStore(
+                    client, database.getCollection("srs_meta"), database.getCollection("srs_consumer_offsets"));
+            meta.create(CHAIN, null);
+            if (snapshot) {
+                meta.setCdcStart(CHAIN, PIPELINE, "w0", 1L);
+            }
+
+            WorkloadClaimKey key = new WorkloadClaimKey(
+                    "cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, PIPELINE);
+            WorkloadOwner owner = new WorkloadOwner("node-a", "boot-a");
+            WorkloadClaim claim = claims.acquire(key, owner, 7, Duration.ofSeconds(30)).claim();
+            WorkloadClaim run = claims.advanceExecution(claim, 7, Set.of("node-a")).orElseThrow();
+            ExecutionFence execution = new ExecutionFence(
+                    PIPELINE, run.claimGeneration(), run.executionGeneration());
+            AtomicLong now = new AtomicLong();
+            Duration window = Duration.ofSeconds(10);
+
+            try (ExecutionAuthorization authorization = new ExecutionAuthorization(
+                    "cluster-a", claims, window, now::get)) {
+                Map<String, List<String>> plan = snapshot
+                        ? Map.of(TABLE, List.of("writer-1"), "items", List.of("writer-1"))
+                        : Map.of(TABLE, List.of("writer-1"));
+                StoreBackedSinkAckFactory durable = new StoreBackedSinkAckFactory(
+                        Map.of(TABLE, CHAIN, "items", CHAIN), PIPELINE, meta);
+                durable.prepareWriterPlan(plan);
+                SinkAckFactory writer = durable.forWriter("writer-1", List.copyOf(plan.keySet()), plan);
+                SinkAck ack = FencedSinkAckFactory.heldTo(writer, execution)
+                        .resolve(memberWith(meta, authorization));
+                ChainPosition snapshotPosition = new ChainPosition(SourceOrder.snapshotRow(1), null);
+                ack.advance(TABLE, snapshot ? snapshotPosition : position(1));
+                if (snapshot) {
+                    assertThat(meta.read(CHAIN).orElseThrow().snapshotCompletedTables(PIPELINE))
+                            .containsExactly(TABLE);
+                } else {
+                    assertThat(ackedBy(meta)).isEqualTo(position(1));
+                }
+
+                WorkloadClaim rebound = claims.acquire(key, owner, 8, Duration.ofSeconds(30)).claim();
+                assertThat(rebound.claimGeneration()).isEqualTo(run.claimGeneration());
+                assertThat(rebound.executionGeneration()).isEqualTo(run.executionGeneration());
+                now.addAndGet(window.toNanos());
+                assertThat(authorization.require(execution)).isEqualTo(WorkloadClaimFence.from(rebound));
+
+                ack.advance(snapshot ? "items" : TABLE, snapshot ? snapshotPosition : position(2));
+
+                if (snapshot) {
+                    assertThat(meta.read(CHAIN).orElseThrow().snapshotCompletedTables(PIPELINE))
+                            .containsExactlyInAnyOrder(TABLE, "items");
+                    assertThat(ackedBy(meta).token()).isEqualTo("w0");
+                } else {
+                    assertThat(ackedBy(meta)).isEqualTo(position(2));
+                    assertThat(meta.ringDoneThrough(CHAIN, PIPELINE)).containsEntry(TABLE, 2L);
+                    assertThat(meta.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("w2");
+                }
+            }
+        }
+    }
 
     @Test
     void anAcknowledgementAlreadyInFlightCannotAdvanceAfterItsRunIsSuperseded() throws Exception {
