@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.core.env.StandardEnvironment;
 
 import java.util.ArrayList;
@@ -43,6 +44,7 @@ class CloudFourParameterGateTest {
         runner.run(context -> {
             assertThat(context).hasNotFailed();
             assertThat(context.getBean(CloudRuntimeSettings.class).cloud()).isFalse();
+            assertThat(context.getBean("cloudHttpDiagnostics", FilterRegistrationBean.class).isEnabled()).isFalse();
         });
     }
 
@@ -51,6 +53,7 @@ class CloudFourParameterGateTest {
         runner.withPropertyValues(values(15)).run(context -> {
             assertThat(context).hasNotFailed();
             assertThat(context.getBean(CloudRuntimeSettings.class).cloud()).isTrue();
+            assertThat(context.getBean("cloudHttpDiagnostics", FilterRegistrationBean.class).isEnabled()).isTrue();
         });
     }
 

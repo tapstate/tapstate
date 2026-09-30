@@ -23,9 +23,9 @@ final class CodedAccessDeniedHandler implements AccessDeniedHandler {
             AccessDeniedException accessDeniedException) throws IOException {
         Object resolved = request.getAttribute(OperationAuthorizationManager.OPERATION_ATTRIBUTE);
         if (resolved instanceof Operation operation) {
-            errors.forbidden(response, operation.id(), operation.scope().name());
+            errors.forbidden(request, response, operation.id(), operation.scope().name());
             return;
         }
-        errors.forbidden(response, "unknown", "unknown");
+        errors.forbidden(request, response, "unknown", "unknown");
     }
 }

@@ -13,12 +13,19 @@ public final class CloudAuthenticationService {
     private final CloudCodeExchanger exchanger;
     private final CloudJwtValidator validator;
     private final CloudSessionService sessions;
+    private final CloudAuthenticationObserver observer;
 
     public CloudAuthenticationService(
             CloudCodeExchanger exchanger, CloudJwtValidator validator, CloudSessionService sessions) {
+        this(exchanger, validator, sessions, CloudAuthenticationObserver.NONE);
+    }
+
+    public CloudAuthenticationService(CloudCodeExchanger exchanger, CloudJwtValidator validator,
+            CloudSessionService sessions, CloudAuthenticationObserver observer) {
         this.exchanger = Objects.requireNonNull(exchanger, "exchanger");
         this.validator = Objects.requireNonNull(validator, "validator");
         this.sessions = Objects.requireNonNull(sessions, "sessions");
+        this.observer = Objects.requireNonNull(observer, "observer");
     }
 
     public CreatedCloudSession exchangeCode(String code) {
@@ -26,12 +33,15 @@ public final class CloudAuthenticationService {
             throw new TapstateException(ControlError.MALFORMED_REQUEST,
                     Map.of("reason", "an exchange code is required"), null);
         }
+        observer.entering(CloudAuthenticationObserver.Stage.CODE_EXCHANGE);
         String jwt = exchanger.exchange(code, sessions.identity().clusterId());
         if (jwt == null || jwt.isBlank()) {
             throw unavailable();
         }
+        observer.entering(CloudAuthenticationObserver.Stage.JWT_VERIFICATION);
         CloudLoginIdentity login = validator.validate(jwt, sessions.identity())
                 .orElseThrow(CloudAuthenticationService::unauthenticated);
+        observer.entering(CloudAuthenticationObserver.Stage.SESSION_CREATE);
         return sessions.create(login).orElseThrow(CloudAuthenticationService::unauthenticated);
     }
 

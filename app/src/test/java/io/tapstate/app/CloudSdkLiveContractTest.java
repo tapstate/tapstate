@@ -13,6 +13,8 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CloudSessionIdentity;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
+import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.mock.web.MockHttpServletResponse;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -41,6 +43,46 @@ class CloudSdkLiveContractTest {
     private static final String KID = "test-key-one";
 
     @Test
+    void jwtVerificationRejectionsKeepAnInternalClassificationWithoutLoggingTheJwt() throws Exception {
+        KeyPair keyPair = rsaKeyPair();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/api/jwks.json", exchange -> respond(exchange, jwks(keyPair)));
+        server.start();
+        Logger logger = (Logger) LoggerFactory.getLogger(CloudSdkBridge.class);
+        ListAppender<ILoggingEvent> captured = new ListAppender<>();
+        captured.start();
+        logger.addAppender(captured);
+        try {
+            String baseUrl = "http://127.0.0.1:" + server.getAddress().getPort();
+            CloudProperties properties = new CloudProperties();
+            properties.setBaseUrl(baseUrl);
+            properties.setToken(TOKEN);
+            properties.setAtlasUri("mongodb://user:secret@atlas.example/cluster_meta");
+            properties.setClusterId(CLUSTER);
+            String rawJwt = jwt(keyPair, "http://wrong-issuer.example");
+            CloudSdkBridge bridge = new CloudSdkBridge(CloudRuntimeSettings.resolve(properties));
+            MockHttpServletRequest request = new MockHttpServletRequest("GET", "/auth/exchange");
+            request.setQueryString("code=request-code-secret-sentinel");
+            MockHttpServletResponse response = new MockHttpServletResponse();
+            new CloudHttpDiagnosticsFilter().doFilter(request, response, (incoming, outgoing) -> {
+                assertThat(bridge.validate(rawJwt, new CloudSessionIdentity(
+                        baseUrl, CloudSdkBridge.DEPLOYMENT_ORGANIZATION, CLUSTER))).isEmpty();
+                response.setStatus(401);
+            });
+            assertThat(captured.list).extracting(ILoggingEvent::getFormattedMessage)
+                    .anySatisfy(message -> assertThat(message)
+                            .contains("stage=jwt-verification", "reason=bad-issuer")
+                            .contains(response.getHeader("X-Request-ID"))
+                            .doesNotContain(rawJwt, TOKEN, "atlas.example"));
+            assertThat(captured.list).allSatisfy(event -> assertThat(event.getThrowableProxy()).isNull());
+        } finally {
+            logger.detachAppender(captured);
+            captured.stop();
+            server.stop(0);
+        }
+    }
+
+    @Test
     void exchangeFailuresLogTheirStatusAndCodeWithoutProviderPayloads() throws Exception {
         AtomicReference<String> failureCode = new AtomicReference<>("exchange.code-expired");
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
@@ -66,8 +108,8 @@ class CloudSdkLiveContractTest {
             }
             assertThat(captured.list).extracting(ILoggingEvent::getFormattedMessage)
                     .containsExactly(
-                            "Cloud SDK code exchange failed [http=401, code=exchange.code-expired]",
-                            "Cloud SDK code exchange failed [http=401, code=unclassified]");
+                            "Cloud authentication rejected [request_id=none, stage=code-exchange, http=401, reason=exchange.code-expired]",
+                            "Cloud authentication rejected [request_id=none, stage=code-exchange, http=401, reason=unclassified]");
             for (ILoggingEvent event : captured.list) {
                 assertThat(event.getFormattedMessage()).doesNotContain(
                         TOKEN, "request-code-secret-sentinel", "provider-message-secret-sentinel",

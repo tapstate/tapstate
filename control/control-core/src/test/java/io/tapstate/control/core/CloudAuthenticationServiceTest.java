@@ -38,6 +38,61 @@ class CloudAuthenticationServiceTest {
     private final CloudSessionService sessions = new CloudSessionService(store, DEPLOYMENT, secrets, clock);
 
     @Test
+    void diagnosticsIdentifyTheFailingPhaseWithoutRepeatingTheExchange() {
+        List<CloudAuthenticationObserver.Stage> phases = new ArrayList<>();
+        List<CloudAuthenticationObserver.SessionRejection> rejections = new ArrayList<>();
+        AtomicInteger exchanges = new AtomicInteger();
+        CloudAuthenticationObserver observer = new CloudAuthenticationObserver() {
+            @Override public void entering(Stage stage) { phases.add(stage); }
+            @Override public void sessionRejected(SessionRejection reason) { rejections.add(reason); }
+        };
+        CloudSessionService observedSessions = new CloudSessionService(store, DEPLOYMENT, secrets, clock, observer);
+        CloudAuthenticationService deniedProof = new CloudAuthenticationService((code, cluster) -> {
+            exchanges.incrementAndGet();
+            return "jwt";
+        }, (jwt, target) -> Optional.empty(), observedSessions, observer);
+        assertThatThrownBy(() -> deniedProof.exchangeCode("code"))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(ControlError.UNAUTHENTICATED));
+        assertThat(phases).containsExactly(CloudAuthenticationObserver.Stage.CODE_EXCHANGE,
+                CloudAuthenticationObserver.Stage.JWT_VERIFICATION);
+        assertThat(exchanges.get()).isEqualTo(1);
+        assertThat(rejections).isEmpty();
+
+        phases.clear();
+        CloudAuthenticationService expiredProof = new CloudAuthenticationService((code, cluster) -> "jwt",
+                (jwt, target) -> Optional.of(login("expired", NOW)), observedSessions, observer);
+        assertThatThrownBy(() -> expiredProof.exchangeCode("new-code"))
+                .isInstanceOf(TapstateException.class);
+        assertThat(phases).containsExactly(CloudAuthenticationObserver.Stage.CODE_EXCHANGE,
+                CloudAuthenticationObserver.Stage.JWT_VERIFICATION, CloudAuthenticationObserver.Stage.SESSION_CREATE);
+        assertThat(rejections).containsExactly(CloudAuthenticationObserver.SessionRejection.JWT_EXPIRED);
+    }
+
+    @Test
+    void sessionDiagnosticsDistinguishContextScopeAndDuplicateOrEarlyRevocationRejections() {
+        List<CloudAuthenticationObserver.SessionRejection> rejections = new ArrayList<>();
+        CloudAuthenticationObserver observer = new CloudAuthenticationObserver() {
+            @Override public void sessionRejected(SessionRejection reason) { rejections.add(reason); }
+        };
+        CloudSessionService observed = new CloudSessionService(store, DEPLOYMENT, secrets, clock, observer);
+        assertThat(observed.create(new CloudLoginIdentity(
+                new CloudSessionIdentity(DEPLOYMENT.issuer(), "other-org", "cluster-a"),
+                "stable-user", "wrong-deployment", Scope.WRITE, NOW.plusSeconds(900)))).isEmpty();
+        assertThat(observed.create(new CloudLoginIdentity(DEPLOYMENT,
+                "stable-user", "admin", Scope.ADMIN, NOW.plusSeconds(900)))).isEmpty();
+        assertThat(observed.create(login("duplicate", NOW.plusSeconds(900)))).isPresent();
+        assertThat(observed.create(login("duplicate", NOW.plusSeconds(900)))).isEmpty();
+        observed.invalidateJwt("early-revocation");
+        assertThat(observed.create(login("early-revocation", NOW.plusSeconds(900)))).isEmpty();
+        assertThat(rejections).containsExactly(
+                CloudAuthenticationObserver.SessionRejection.DEPLOYMENT_MISMATCH,
+                CloudAuthenticationObserver.SessionRejection.ADMIN_SCOPE,
+                CloudAuthenticationObserver.SessionRejection.DUPLICATE_OR_REVOKED_JTI,
+                CloudAuthenticationObserver.SessionRejection.DUPLICATE_OR_REVOKED_JTI);
+    }
+
+    @Test
     void exchangeIsUntrustedUntilOnlineValidationThenOnlyMinimalLocalLoginFactsAreStored() {
         List<String> order = new ArrayList<>();
         CloudAuthenticationService authentication = new CloudAuthenticationService((code, cluster) -> {

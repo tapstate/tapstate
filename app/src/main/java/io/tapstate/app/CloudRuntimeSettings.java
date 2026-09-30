@@ -1,6 +1,6 @@
 package io.tapstate.app;
 
-import com.mongodb.MongoNamespace;
+import io.tapstate.adapters.mongostore.MongoDatabaseNames;
 import io.tapstate.core.common.TapstateException;
 
 import java.net.URI;
@@ -155,7 +155,7 @@ final class CloudRuntimeSettings {
             // literal plus before decoding percent escapes so a path cannot silently name another DB.
             String database = URLDecoder.decode(path.substring(1).replace("+", "%2B"), StandardCharsets.UTF_8);
             if (database.isBlank()) throw new IllegalArgumentException("missing database");
-            MongoNamespace.checkDatabaseNameValidity(database);
+            if (!MongoDatabaseNames.isValid(database)) throw new IllegalArgumentException("invalid database");
             return database;
         } catch (URISyntaxException | IllegalArgumentException invalid) {
             // Driver diagnostics quote connection strings and can therefore carry credentials.

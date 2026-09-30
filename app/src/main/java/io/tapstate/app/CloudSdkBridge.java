@@ -19,6 +19,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CloudSessionIdentity;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 
 import java.time.Instant;
 import java.util.List;
@@ -52,6 +53,7 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
     @Override
     public String exchange(String exchangeCode, String clusterId) {
         if (!settings.clusterId().equals(clusterId)) {
+            logValidationFailure("code-exchange", "configured-cluster-mismatch");
             throw CloudAuthenticationService.unavailable();
         }
         try {
@@ -64,23 +66,33 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
     @Override
     public Optional<CloudLoginIdentity> validate(String rawJwt, CloudSessionIdentity expectedDeployment) {
         if (!deploymentMatches(expectedDeployment)) {
+            logValidationFailure("claims-validation", "deployment-mismatch");
             return Optional.empty();
         }
         try {
             VerifiedClaims claims = sdk.verify(rawJwt);
-            if (!text(claims.userId()) || !text(claims.organizationId()) || !text(claims.jwtId())
-                    || !settings.clusterId().equals(claims.clusterId())
-                    || !settings.baseUrl().toString().equals(claims.issuer())
-                    || !(settings.clusterId() + AUDIENCE_SUFFIX).equals(claims.audience())) {
+            String rejected = !text(claims.userId()) ? "missing-user-id"
+                    : !text(claims.organizationId()) ? "missing-org-id"
+                    : !text(claims.jwtId()) ? "missing-jti"
+                    : !settings.clusterId().equals(claims.clusterId()) ? "cluster-id-mismatch"
+                    : !settings.baseUrl().toString().equals(claims.issuer()) ? "issuer-mismatch"
+                    : !(settings.clusterId() + AUDIENCE_SUFFIX).equals(claims.audience()) ? "audience-mismatch"
+                    : null;
+            if (rejected != null) {
+                logValidationFailure("claims-validation", rejected);
                 return Optional.empty();
             }
             Scope scope = scope(claims.scopes());
             if (scope == null) {
+                logValidationFailure("claims-validation", "unsupported-scope");
                 return Optional.empty();
             }
             return Optional.of(new CloudLoginIdentity(
                     expectedDeployment, claims.userId(), claims.jwtId(), scope, claims.expiresAt()));
-        } catch (ProviderFailure | IllegalArgumentException unavailable) {
+        } catch (ProviderFailure unavailable) {
+            return Optional.empty();
+        } catch (IllegalArgumentException invalid) {
+            logValidationFailure("claims-validation", "invalid-verified-claims");
             return Optional.empty();
         }
     }
@@ -141,7 +153,26 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
         int status = failure.getHttpStatus();
         if (status < 0 || status > 599) status = 0;
         // Provider messages, response bodies and exception causes can contain authentication inputs.
-        LOG.warn("Cloud SDK code exchange failed [http={}, code={}]", status, diagnostic);
+        markFailure("code-exchange", diagnostic);
+        LOG.warn("Cloud authentication rejected [request_id={}, stage=code-exchange, http={}, reason={}]",
+                requestId(), status, diagnostic);
+    }
+
+    private static void logValidationFailure(String stage, String reason) {
+        markFailure(stage, reason);
+        LOG.warn("Cloud authentication rejected [request_id={}, stage={}, reason={}]", requestId(), stage, reason);
+    }
+
+    private static void markFailure(String stage, String reason) {
+        if (MDC.get(CloudHttpDiagnosticsFilter.REQUEST_ID_MDC) != null) {
+            MDC.put(CloudHttpDiagnosticsFilter.STAGE_MDC, stage);
+            MDC.put(CloudHttpDiagnosticsFilter.REASON_MDC, reason);
+        }
+    }
+
+    private static String requestId() {
+        String id = MDC.get(CloudHttpDiagnosticsFilter.REQUEST_ID_MDC);
+        return id == null ? "none" : id;
     }
 
     interface SdkRuntime {
@@ -202,7 +233,17 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
                 return new VerifiedClaims(
                         verified.userId(), verified.orgId(), verified.clusterId(), verified.jti(),
                         verified.expiresAt(), verified.issuer(), verified.audience(), verified.scope());
-            } catch (CloudControlPlaneException | JwtVerificationException failure) {
+            } catch (JwtVerificationException failure) {
+                String kind = failure.getKind();
+                String reason = switch (kind == null ? "" : kind) {
+                    case "missing-kid", "jwk-not-found", "signature-mismatch", "expired", "bad-issuer",
+                            "bad-audience", "bad-claim", "parse-error" -> kind;
+                    default -> "unclassified-jwt-rejection";
+                };
+                logValidationFailure("jwt-verification", reason);
+                throw new ProviderFailure();
+            } catch (CloudControlPlaneException failure) {
+                logValidationFailure("jwt-verification", "jwks-provider-unavailable");
                 throw new ProviderFailure();
             }
         }

@@ -23,13 +23,20 @@ public final class CloudSessionService {
     private final CloudSessionIdentity identity;
     private final TokenSecrets secrets;
     private final Clock clock;
+    private final CloudAuthenticationObserver observer;
 
     public CloudSessionService(
             CloudSessionStore sessions, CloudSessionIdentity identity, TokenSecrets secrets, Clock clock) {
+        this(sessions, identity, secrets, clock, CloudAuthenticationObserver.NONE);
+    }
+
+    public CloudSessionService(CloudSessionStore sessions, CloudSessionIdentity identity, TokenSecrets secrets,
+            Clock clock, CloudAuthenticationObserver observer) {
         this.sessions = Objects.requireNonNull(sessions, "sessions");
         this.identity = Objects.requireNonNull(identity, "identity");
         this.secrets = Objects.requireNonNull(secrets, "secrets");
         this.clock = Objects.requireNonNull(clock, "clock");
+        this.observer = Objects.requireNonNull(observer, "observer");
     }
 
     public CloudSessionIdentity identity() {
@@ -44,8 +51,16 @@ public final class CloudSessionService {
     public Optional<CreatedCloudSession> create(CloudLoginIdentity login) {
         Objects.requireNonNull(login, "login");
         var now = clock.instant();
-        if (!identity.equals(login.deployment()) || !login.jwtExpiresAt().isAfter(now)
-                || login.scope() == Scope.ADMIN) {
+        if (!identity.equals(login.deployment())) {
+            observer.sessionRejected(CloudAuthenticationObserver.SessionRejection.DEPLOYMENT_MISMATCH);
+            return Optional.empty();
+        }
+        if (!login.jwtExpiresAt().isAfter(now)) {
+            observer.sessionRejected(CloudAuthenticationObserver.SessionRejection.JWT_EXPIRED);
+            return Optional.empty();
+        }
+        if (login.scope() == Scope.ADMIN) {
+            observer.sessionRejected(CloudAuthenticationObserver.SessionRejection.ADMIN_SCOPE);
             return Optional.empty();
         }
         GeneratedSecret secret = secrets.generate();
@@ -53,6 +68,7 @@ public final class CloudSessionService {
         CloudSessionRecord record = new CloudSessionRecord(identity, login.jwtId(), secret.secretHash(),
                 login.userId(), login.scope().name(), false, now, now, expires);
         if (!sessions.create(record)) {
+            observer.sessionRejected(CloudAuthenticationObserver.SessionRejection.DUPLICATE_OR_REVOKED_JTI);
             return Optional.empty();
         }
         String id = Base64.getUrlEncoder().withoutPadding()

@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.control.core.CloudAuthenticationService;
+import io.tapstate.control.core.CloudAuthenticationObserver;
 import io.tapstate.control.core.CloudRuntimeStatusProvider;
 import io.tapstate.control.core.CloudSessionService;
 import io.tapstate.control.core.CloudStatusReporter;
@@ -12,15 +13,19 @@ import io.tapstate.spi.store.StorePort;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.env.Environment;
+import org.springframework.core.Ordered;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 
 import java.time.Clock;
 import java.time.Instant;
 import java.util.Map;
+import java.util.Locale;
 import java.util.UUID;
 
 /** Binds and validates the managed Cloud runtime's external startup contract. */
@@ -48,6 +53,16 @@ class CloudRuntimeConfiguration {
     }
 
     @Bean
+    FilterRegistrationBean<CloudHttpDiagnosticsFilter> cloudHttpDiagnostics(CloudRuntimeSettings settings) {
+        FilterRegistrationBean<CloudHttpDiagnosticsFilter> registration =
+                new FilterRegistrationBean<>(new CloudHttpDiagnosticsFilter());
+        registration.setName("cloudHttpDiagnostics");
+        registration.setOrder(Ordered.HIGHEST_PRECEDENCE + 10);
+        registration.setEnabled(settings.cloud());
+        return registration;
+    }
+
+    @Bean
     @ConditionalOnMissingBean(CloudAuthenticationService.class)
     CloudAuthenticationService cloudAuthenticationService(
             CloudRuntimeSettings settings, ObjectProvider<CloudSdkBridge> bridges,
@@ -65,8 +80,35 @@ class CloudRuntimeConfiguration {
         }
         CloudSessionIdentity identity = new CloudSessionIdentity(
                 settings.baseUrl().toString(), CloudSdkBridge.DEPLOYMENT_ORGANIZATION, settings.clusterId());
+        CloudAuthenticationObserver observer = new CloudAuthenticationObserver() {
+            @Override
+            public void entering(Stage stage) {
+                String label = stage.name().toLowerCase(Locale.ROOT).replace('_', '-');
+                if (MDC.get(CloudHttpDiagnosticsFilter.REQUEST_ID_MDC) != null) {
+                    MDC.put(CloudHttpDiagnosticsFilter.STAGE_MDC, label);
+                    MDC.remove(CloudHttpDiagnosticsFilter.REASON_MDC);
+                }
+                LOG.info("Cloud authentication step [request_id={}, stage={}]",
+                        requestId(), label);
+            }
+
+            @Override
+            public void sessionRejected(SessionRejection reason) {
+                String label = reason.name().toLowerCase(Locale.ROOT).replace('_', '-');
+                if (MDC.get(CloudHttpDiagnosticsFilter.REQUEST_ID_MDC) != null) {
+                    MDC.put(CloudHttpDiagnosticsFilter.REASON_MDC, label);
+                }
+                LOG.warn("Cloud authentication rejected [request_id={}, stage=session-create, reason={}]",
+                        requestId(), label);
+            }
+
+            private String requestId() {
+                String id = MDC.get(CloudHttpDiagnosticsFilter.REQUEST_ID_MDC);
+                return id == null ? "none" : id;
+            }
+        };
         return new CloudAuthenticationService(
-                bridge, bridge, new CloudSessionService(store, identity, tokenSecrets, clock));
+                bridge, bridge, new CloudSessionService(store, identity, tokenSecrets, clock, observer), observer);
     }
 
     @Bean
