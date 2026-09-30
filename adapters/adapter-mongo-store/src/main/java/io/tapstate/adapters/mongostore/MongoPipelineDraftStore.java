@@ -183,9 +183,9 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
             }
             Document filter = activeDraft(pipelineId).append(REVISION, expectedRevision);
             if (migrated != null) {
-                filter.append("baseArtifactHash", migrated.get("baseArtifactHash"))
-                        .append("publishedDraftRevision", migrated.get("publishedDraftRevision"))
-                        .append("publishedArtifactHash", migrated.get("publishedArtifactHash"));
+                filter.append("baseArtifactHash", replacement.baseArtifactHash())
+                        .append("publishedDraftRevision", replacement.publishedDraftRevision())
+                        .append("publishedArtifactHash", replacement.publishedArtifactHash());
             }
             if (drafts.replaceOne(filter,
                     toDocument(replacement)).getMatchedCount() == 1) {
