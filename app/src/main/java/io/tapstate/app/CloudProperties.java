@@ -13,7 +13,7 @@ public final class CloudProperties {
     /** Base URL of the Global Control Plane API used by the embedded Cloud client. */
     private String baseUrl;
 
-    /** Opaque credential passed to the SDK for outbound status reporting only. */
+    /** Opaque Cluster credential passed to the SDK for code exchange and outbound status reporting. */
     private String token;
 
     /** MongoDB Atlas connection string for this Cluster's own metadata store. */

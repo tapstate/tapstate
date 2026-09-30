@@ -180,7 +180,7 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
                     .baseUrl(settings.baseUrl().toString())
                     .issuer(settings.baseUrl().toString())
                     .clusterId(settings.clusterId())
-                    .clusterIdentitySecret(settings.token())
+                    .sdkStaticToken(settings.token())
                     .build();
             status = new C2StatusReportApi(new ApiClient().setBasePath(settings.baseUrl().toString()));
         }

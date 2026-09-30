@@ -54,9 +54,6 @@ on:
 permissions:
   contents: read
 
-env:
-  CLOUD_SDK_REVISION: d0e25b58096135f4da6b3e69df99876f49c8dc3b
-
 jobs:
   version:
     # The pin, and the whole of the freeze. Merging to the default branch stops when this is
@@ -396,18 +393,6 @@ jobs:
           distribution: temurin
           java-version: "21"
           cache: maven
-      # Temporary until this exact SDK coordinate is published to Tapdata Nexus.
-      - uses: actions/checkout@v4
-        with:
-          repository: tapstate/tapstate-cloud
-          ref: ${{ env.CLOUD_SDK_REVISION }}
-          token: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
-          path: tapstate-cloud-sdk
-          persist-credentials: false
-      - name: install the pinned Cloud SDK into the runner Maven repository
-        run: >-
-          mvn -B -f tapstate-cloud-sdk/pom.xml -pl client/java -am
-          -DskipSdkGeneration=true -DskipTests install
       - name: build the boot jar the image ships
         run: mvn -B -pl app -am -DskipTests package
       - name: read the staged Web provenance
@@ -516,18 +501,6 @@ jobs:
           distribution: temurin
           java-version: "21"
           cache: maven
-      # Temporary until this exact SDK coordinate is published to Tapdata Nexus.
-      - uses: actions/checkout@v4
-        with:
-          repository: tapstate/tapstate-cloud
-          ref: ${{ env.CLOUD_SDK_REVISION }}
-          token: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
-          path: tapstate-cloud-sdk
-          persist-credentials: false
-      - name: install the pinned Cloud SDK into the runner Maven repository
-        run: >-
-          mvn -B -f tapstate-cloud-sdk/pom.xml -pl client/java -am
-          -DskipSdkGeneration=true -DskipTests install
       - name: build the Cloud Web-bearing Boot JAR
         run: mvn -B -pl app -am -DskipTests package
       - name: read the staged Cloud Web provenance
