@@ -8,6 +8,7 @@ import com.tngtech.archunit.core.importer.ClassFileImporter;
 import com.tngtech.archunit.core.importer.ImportOption;
 import io.tapstate.spi.store.PipelineDraft;
 import io.tapstate.spi.store.PipelineDraftMutation;
+import io.tapstate.spi.store.PipelineDraftSummary;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -385,11 +386,12 @@ class RingDependencyRulesTest {
                         .or(resideInAPackage("com.fasterxml.jackson.annotation.."))
                         .or(resideInAPackage("tools.jackson.databind.."))
                         .or(resideInAPackage("jakarta.servlet.."))
-                        // These two framework-free SPI value types are the serialized authoring
-                        // document and mutation result, not ports. The HTTP adapter uses them only
-                        // to map the wire shape to/from the application service; it never calls a
-                        // storage interface.
+                        // These framework-free SPI value types are serialized authoring/list
+                        // projections and mutation results, not ports. The HTTP adapter uses them
+                        // only to map wire shapes to/from the application service; it never calls
+                        // a storage interface.
                         .or(equivalentTo(PipelineDraft.class))
+                        .or(equivalentTo(PipelineDraftSummary.class))
                         .or(DescribedPredicate.describe("PipelineDraft wire-model members",
                                 type -> type.getName().startsWith(PipelineDraft.class.getName() + "$")))
                         .or(equivalentTo(PipelineDraftMutation.class));

@@ -49,22 +49,24 @@ class ConnectorSupportDocumentationTest {
     }
 
     @Test
-    void certificationDirectionsAndSupportBoundaryAreExplicit() throws IOException {
+    void certificationDirectionsAndDeploymentBoundaryAreExplicit() throws IOException {
         for (Path document : DOCUMENTS) {
             String text = Files.readString(document);
             assertThat(text).as("support boundary in %s", document)
-                    // One kind is certified in both directions. A sync installs onto mongodb and
-                    // nothing else, so a row promising write on any other kind is the documentation
-                    // drifting ahead of what the server will accept. The boundary is a kind rather
-                    // than one id: a deployment on a managed variant registers that variant's id and
-                    // has to be able to install a sync through it.
                     .contains("| MySQL | `mysql` | Read |",
                             "| PostgreSQL | `postgres` | Read |",
                             "| MongoDB | `mongodb` | Read and write |",
                             "| Oracle | `oracle` | Read |",
                             "| SQL Server | `sqlserver` | Read |",
-                            "installs onto the `mongodb` kind and no other",
-                            "on any of its accepted ids",
+                            "cloud deployment profile installs only onto MongoDB Atlas",
+                            "On-prem deployments may write to any catalog connector marked sink-capable",
+                            "private connectors",
+                            "remain the operator's responsibility",
+                            "This deployment allowance is not a",
+                            "certification claim",
+                            "this preview certifies MongoDB write support only",
+                            "Applying a cloud pipeline",
+                            "whose sync names another connector is refused",
                             "Oracle Free 23", "SQL Server 2022", "DECIMAL(18,4)", "schema rediscovery",
                             "16 connector ids", "managed variants", "not been live-verified",
                             "on this server", "outside the supported configuration",
@@ -76,12 +78,11 @@ class ConnectorSupportDocumentationTest {
     }
 
     @Test
-    @DisplayName("the certified direction of every kind is the one the apply gate actually enforces")
-    void certifiedDirectionsAreDerivedFromTheKindTheServerInstallsOnto() throws IOException {
+    @DisplayName("certification remains narrower than the on-prem deployment allowance")
+    void certifiedDirectionsRemainNarrowerThanOnPremDeploymentAllowance() throws IOException {
         // The literal rows above are pinned so an edit to the documentation is seen. This reads the
-        // same rows from the other end: the write row is whichever kind the gate admits, so moving
-        // that kind in the code without moving the promise is red here even though every pinned
-        // literal still matches.
+        // certification policy from the other end. On-prem deployments may use any sink-capable
+        // connector, but that does not broaden the preview's certified write claim beyond MongoDB.
         for (Path document : DOCUMENTS) {
             String text = Files.readString(document);
             for (String kind : OfficialConnectors.IDS_BY_DATABASE_KIND.keySet()) {
