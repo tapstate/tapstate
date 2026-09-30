@@ -1,8 +1,12 @@
 package io.tapstate.app;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 
 import java.time.Duration;
@@ -466,6 +470,122 @@ class ClusterRebuildAdmissionTest {
                         + "alone, so nothing is ever missing from it - and what ended it is what the "
                         + "killed member left behind")
                 .isTrue();
+    }
+
+    /**
+     * A member that takes a pipeline back judges the run the claim carries now, not the one it submitted
+     * itself before it lost the claim.
+     *
+     * <p>What a three-machine run found: a member submitted a run while a third member was still joining,
+     * so that run was planned over two members. Its lease ran out while it was busy starting the run, and
+     * the member that picked the pipeline up replaced the run with one planned over all three. When that
+     * driver was killed, the first member took the claim back and still compared who is in sight against
+     * its own older run - which never included the killed member - so nothing it was planned over had
+     * gone, and the pipeline was left failed for a person with nothing in any log saying why.
+     */
+    @Test
+    void aTakeoverJudgesTheRunTheClaimCarriesRatherThanAnOlderOneThisMemberSubmitted() {
+        // node-c is committed but not in sight yet, so the run this member submits is planned over two.
+        membership.install(new ClusterMembership("cluster-a", 7, Set.of("node-a", "node-b", "node-c")));
+        membership.canCommit(Set.of("node-a", "node-b"));
+        assertThat(ownership.permit("orders").granted()).isTrue();
+        assertThat(ownership.beginExecution("orders").allowed()).isTrue();
+        membership.canCommit(Set.of("node-a", "node-b", "node-c"));
+
+        // This member's lease runs out while it is busy, and node-c replaces the run with one over all three.
+        claims.elapse(TTL.plusSeconds(1));
+        nanos.addAndGet(RENEW.toNanos());
+        PipelineActuationOwnership nodeC = new PipelineActuationOwnership(
+                "cluster-a", new WorkloadOwner("node-c", "boot-c"), membership,
+                new ClusterWorkloadClaims(claims, membership), TTL, RENEW, nanos::get);
+        assertThat(nodeC.permit("orders").granted()).isTrue();
+        assertThat(nodeC.beginExecution("orders").allowed()).isTrue();
+        assertThat(ownership.permit("orders").granted())
+                .as("this member no longer drives the pipeline").isFalse();
+
+        // node-c is killed: it goes out of sight, its lease runs out, and this member takes the pipeline back.
+        membership.canCommit(Set.of("node-a", "node-b"));
+        claims.elapse(TTL.plusSeconds(1));
+        nanos.addAndGet(RENEW.toNanos());
+        PipelineActuationOwnership.Permit taken = ownership.permit("orders");
+        assertThat(taken.granted()).isTrue();
+        assertThat(taken.claim().executionNodeIds())
+                .as("the run the claim carries is node-c's, planned over all three")
+                .containsExactlyInAnyOrder("node-a", "node-b", "node-c");
+
+        // That run died with node-c, and its failure is recorded under the claim this member holds now.
+        admission.recordFailure("orders");
+
+        assertThat(admission.admits("orders"))
+                .as("node-c carried part of the run this claim carries and is gone; the run this member "
+                        + "planned before node-c was in sight is not the run that died")
+                .isTrue();
+    }
+
+    /**
+     * The other half: taking the claim back is not by itself a sign the run is somebody else's. A member
+     * joining moves the committed revision, and every holder takes its claim once more under the new one -
+     * the same owner, so the same generation, still carrying the run it submitted. Forgetting what that run
+     * was planned over there would make its every death read as inherited, and a member starting up would
+     * restart a connector defect that happened to die around then.
+     */
+    @Test
+    void aRunThisMemberTakesBackUnderANewRevisionIsStillJudgedByWhatItWasPlannedOver() {
+        committed(7, "node-a", "node-b");
+        submitRunUnder(7);
+
+        committed(8, "node-a", "node-b", "node-c");
+        nanos.addAndGet(RENEW.toNanos() + 1);
+        assertThat(ownership.permit("orders").granted())
+                .as("the claim was granted under a cluster that has changed, so it has to be taken again")
+                .isFalse();
+        nanos.addAndGet(RENEW.toNanos() + 1);
+        PipelineActuationOwnership.Permit again = ownership.permit("orders");
+        assertThat(again.granted()).isTrue();
+        assertThat(again.claim().topologyRevision()).isEqualTo(8);
+        assertThat(again.claim().executionGeneration())
+                .as("still the run this member submitted")
+                .isEqualTo(1);
+
+        assertThat(admission.admits("orders"))
+                .as("every member this run was planned over is still here, and the one that joined takes "
+                        + "nothing away from it, so this death is the pipeline's own")
+                .isFalse();
+    }
+
+    /**
+     * A failed run that is not rebuilt says why, once for each reason rather than on every pass: a pipeline
+     * left failed with nothing saying why cannot be told apart from one this question was never asked about.
+     */
+    @Test
+    void aRefusalSaysWhyOnceForEachReason() {
+        Logger logger = (Logger) LoggerFactory.getLogger(ClusterRebuildAdmission.class);
+        ListAppender<ILoggingEvent> written = new ListAppender<>();
+        written.start();
+        logger.addAppender(written);
+        try {
+            committed(7, "node-a", "node-b");
+            submitRunUnder(7);
+
+            assertThat(admission.admits("orders")).isFalse();
+            assertThat(admission.admits("orders")).isFalse();
+            nanos.addAndGet(DETECTION.toNanos());
+            assertThat(admission.admits("orders")).isFalse();
+            membership.canCommit(Set.of("node-a", "node-b"));
+            assertThat(admission.admits("orders"))
+                    .as("the view published after the detection window records the failure as the run's own")
+                    .isFalse();
+            assertThat(admission.admits("orders")).isFalse();
+
+            assertThat(written.list).extracting(ILoggingEvent::getFormattedMessage).satisfiesExactly(
+                    first -> assertThat(first).contains("orders")
+                            .contains("every member its run was planned over is still in sight"),
+                    second -> assertThat(second).contains("orders")
+                            .contains("recorded as its own before any member it was planned over left"));
+        } finally {
+            logger.detachAppender(written);
+            written.stop();
+        }
     }
 
     @Test

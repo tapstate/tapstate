@@ -40,6 +40,9 @@ import org.slf4j.LoggerFactory;
  * intact membership view makes that answer durable. A sink failure recorded at its source needs no wait.
  * An unmarked failure whose driver leaves during the window can be rebuilt by its next holder.
  *
+ * <p>A refusal is logged with its reason, once for each reason, so a pipeline left failed says what kept
+ * it there.
+ *
  * <p>Not synchronized: one convergence pass at a time asks this, on a single scheduler thread with a
  * fixed delay, so passes never overlap.
  */
@@ -56,6 +59,8 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
     private final long detectionWindowNanos;
     private final LongSupplier nanoTime;
     private final Map<String, Attempts> attempts = new HashMap<>();
+    /** The reason each pipeline was last refused for, so a reason is logged when it changes. */
+    private final Map<String, PipelineActuationOwnership.Departure> refusals = new HashMap<>();
 
     /** What one pipeline has spent so far, and the earliest this member may spend the next of it. */
     private static final class Attempts {
@@ -115,8 +120,9 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
         // Only admission is asked for a FAILED checkpoint. Ownership's membership query is also used
         // before a run fails, so recording its answer there would manufacture an earlier failure.
         actuation.recordFailure(pipelineId, MAX_ATTEMPTS * backoffNanos, detectionWindowNanos);
-        if (!actuation.aMemberLeftUnderTheRun(pipelineId, MAX_ATTEMPTS * backoffNanos)
-                && !refusedForAChangedMembership.test(pipelineId)) {
+        PipelineActuationOwnership.Departure departure =
+                actuation.departure(pipelineId, MAX_ATTEMPTS * backoffNanos);
+        if (!departure.admits() && !refusedForAChangedMembership.test(pipelineId)) {
             // Either no member it was planned over is gone, and none went recently enough to still be
             // answering for this death -- so it is the pipeline's own and stays its own -- or this member
             // is not the one driving it. Both give the budget back.
@@ -126,8 +132,14 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
             // would be unreachable, longer and a departure would go on answering after its answer ran
             // out.
             attempts.remove(pipelineId);
+            // Said once for each reason rather than on every pass: this is asked every tick for as long as
+            // the pipeline stays failed, and the reason belongs in the log beside the failure it is about.
+            if (refusals.put(pipelineId, departure) != departure) {
+                LOG.info("Not rebuilding failed pipeline {}: {}", pipelineId, departure.refusal());
+            }
             return false;
         }
+        refusals.remove(pipelineId);
         Attempts spent = attempts.computeIfAbsent(pipelineId, id -> new Attempts());
         long now = nanoTime.getAsLong();
         if (spent.made >= MAX_ATTEMPTS) {
@@ -173,5 +185,6 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
     /** Releases what pipelines no longer desired have spent, so a deleted one leaks no counter. */
     void retain(java.util.Collection<String> pipelineIds) {
         attempts.keySet().retainAll(pipelineIds);
+        refusals.keySet().retainAll(pipelineIds);
     }
 }
