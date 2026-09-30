@@ -6,6 +6,7 @@ import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WriterProgress;
 import io.tapstate.spi.store.WriterRun;
 import java.time.Instant;
@@ -394,5 +395,42 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
             throw new IllegalStateException("mining chain not seeded: " + miningChainId);
         }
         return m;
+    }
+
+    // The fenced forms record what the unfenced ones do: this double keeps no claims to prove a fence against,
+    // and the store-side fence is witnessed against the real store.
+
+    @Override
+    public synchronized boolean beginWriterRun(String miningChainId, String pipelineId, String runId,
+            Map<String, List<String>> expectedWritersByTable, WorkloadClaimFence fence) {
+        beginWriterRun(miningChainId, pipelineId, runId, expectedWritersByTable);
+        return true;
+    }
+
+    @Override
+    public synchronized Optional<WriterRun> advanceWriter(String miningChainId, String pipelineId, String runId,
+            String writerId, String table, WriterProgress progress, WorkloadClaimFence fence) {
+        return advanceWriter(miningChainId, pipelineId, runId, writerId, table, progress);
+    }
+
+    @Override
+    public synchronized boolean advanceSinkAcked(String miningChainId, String pipelineId, String table,
+            ChainPosition position, WorkloadClaimFence fence) {
+        advanceSinkAcked(miningChainId, pipelineId, table, position);
+        return true;
+    }
+
+    @Override
+    public synchronized boolean advanceRingDone(String miningChainId, String pipelineId, String table, long seq,
+            WorkloadClaimFence fence) {
+        advanceRingDone(miningChainId, pipelineId, table, seq);
+        return true;
+    }
+
+    @Override
+    public synchronized boolean markSnapshotComplete(String miningChainId, String pipelineId, String table,
+            WorkloadClaimFence fence) {
+        markSnapshotComplete(miningChainId, pipelineId, table);
+        return true;
     }
 }

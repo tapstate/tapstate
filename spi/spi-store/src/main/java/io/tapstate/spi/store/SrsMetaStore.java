@@ -152,6 +152,23 @@ public interface SrsMetaStore {
     }
 
     /**
+     * The store-fenced form of {@link #advanceSinkAcked(String, String, String, ChainPosition)}. The consumer
+     * must already be bound to {@code fence}'s run by {@link #beginWriterRun(String, String, String, Map,
+     * WorkloadClaimFence)}, and {@code fence} must still be the live claim, proved in the same store operation
+     * as the write: a stale or differently bound advance is ignored, and answers false. Stores that cannot
+     * enforce that condition refuse the fenced operation rather than silently falling back to the unfenced
+     * contract.
+     */
+    default boolean advanceSinkAcked(
+            String miningChainId,
+            String pipelineId,
+            String table,
+            ChainPosition position,
+            WorkloadClaimFence fence) {
+        throw new UnsupportedOperationException("this SRS meta store does not support fenced sink acknowledgements");
+    }
+
+    /**
      * Starts {@code runId}'s writer accounting for {@code pipelineId} on the chain, replacing whatever run's
      * accounting was there: each table maps to the writers its changes are expected to reach in this run.
      *
@@ -164,6 +181,18 @@ public interface SrsMetaStore {
     default void beginWriterRun(String miningChainId, String pipelineId, String runId,
             Map<String, List<String>> expectedWritersByTable) {
         throw new UnsupportedOperationException("this store keeps no per-writer accounting");
+    }
+
+    /**
+     * Starts {@code runId}'s writer accounting as {@link #beginWriterRun(String, String, String, Map)} does, and
+     * binds every later durable sink effect of the pipeline on the chain to {@code fence}'s run. The binding and
+     * the proof that {@code fence} is still the live claim are one store operation, so a superseded run can
+     * neither start its accounting again nor take the binding back. False, with nothing written, where
+     * {@code fence} is not the live claim.
+     */
+    default boolean beginWriterRun(String miningChainId, String pipelineId, String runId,
+            Map<String, List<String>> expectedWritersByTable, WorkloadClaimFence fence) {
+        throw new UnsupportedOperationException("this SRS meta store does not support fenced sink acknowledgements");
     }
 
     /**
@@ -182,6 +211,16 @@ public interface SrsMetaStore {
     /** The pipeline's current writer accounting on the chain, or empty where no run has begun one. */
     default Optional<WriterRun> writerRun(String miningChainId, String pipelineId) {
         return Optional.empty();
+    }
+
+    /**
+     * The store-fenced form of {@link #advanceWriter}: also empty, with nothing written, where {@code fence} is
+     * no longer the live claim or the pipeline is bound to another run, proved in the same store operation as
+     * the write.
+     */
+    default Optional<WriterRun> advanceWriter(String miningChainId, String pipelineId, String runId,
+            String writerId, String table, WriterProgress progress, WorkloadClaimFence fence) {
+        throw new UnsupportedOperationException("this SRS meta store does not support fenced sink acknowledgements");
     }
 
     /**
@@ -227,6 +266,12 @@ public interface SrsMetaStore {
      * needed, nothing missed.
      */
     default void advanceRingDone(String miningChainId, String pipelineId, String table, long seq) {
+    }
+
+    /** The store-fenced form of {@link #advanceRingDone}, under the same condition as the fenced advance. */
+    default boolean advanceRingDone(String miningChainId, String pipelineId, String table, long seq,
+            WorkloadClaimFence fence) {
+        throw new UnsupportedOperationException("this SRS meta store does not support fenced sink acknowledgements");
     }
 
     /**
@@ -293,6 +338,12 @@ public interface SrsMetaStore {
      * mutate on an unseeded chain is a caller ordering error.
      */
     void markSnapshotComplete(String miningChainId, String pipelineId, String table);
+
+    /** The store-fenced form of a snapshot-completion mark, under the same condition as the fenced advance. */
+    default boolean markSnapshotComplete(
+            String miningChainId, String pipelineId, String table, WorkloadClaimFence fence) {
+        throw new UnsupportedOperationException("this SRS meta store does not support fenced sink acknowledgements");
+    }
 
     /**
      * Lists the id of every mining chain that carries a cursor for {@code pipelineId} — exactly the

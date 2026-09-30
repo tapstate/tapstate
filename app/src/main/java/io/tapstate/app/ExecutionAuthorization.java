@@ -4,6 +4,7 @@ import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.engine.EngineError;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimStore;
@@ -48,10 +49,10 @@ import org.slf4j.LoggerFactory;
  * and what the store says is left of the owner's lease, so this member stops no later than the moment the
  * claim becomes available to anyone else — the two never overlap, rather than merely being sized so that
  * they usually do not. That also covers the case where nobody takes over at all: an owner that died
- * leaves a record whose generations go on matching, and only the lease says it is nobody's. A call
+ * leaves a record whose generations go on matching, and only the lease says it is nobody's. A target call
  * already in flight when the deadline passes may still land; that is the delivery contract's business.
- * A durable position such a call would advance is not caught a second time either — the record it lands
- * in carries no generation of its own, unlike a capture append, which the store refuses on its own side.
+ * A durable acknowledgement carries the exact claim behind this answer to the store as a second fence,
+ * because unlike a replayable target write its position cannot safely land after this answer expires.
  *
  * <p>What it still assumes is that the two clocks run at comparable rates — a lease handed out in the
  * store's seconds is counted down in this member's. Offsets between them are not assumed, which is the
@@ -63,8 +64,8 @@ final class ExecutionAuthorization implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(ExecutionAuthorization.class);
 
-    /** What this member last read for one pipeline, and the monotonic point that reading expires at. */
-    private record Entry(long claimGeneration, long executionGeneration, long deadlineNanos) {
+    /** The exact claim this member last read for one pipeline, and when that reading expires locally. */
+    private record Entry(WorkloadClaimFence claim, long deadlineNanos) {
     }
 
     private final String clusterId;
@@ -150,12 +151,20 @@ final class ExecutionAuthorization implements AutoCloseable {
         return of(instances.iterator().next());
     }
 
-    /** Refuses, with a diagnosis, when this member may no longer act for {@code fence}'s run. */
-    void require(ExecutionFence fence) {
-        if (!authorized(fence)) {
+    /**
+     * The exact live claim behind this member's answer, or {@code null} on an unfenced single-node member.
+     * Refuses with a diagnosis when the member may no longer act for {@code fence}'s run.
+     */
+    WorkloadClaimFence require(ExecutionFence fence) {
+        if (!fenced) {
+            return null;
+        }
+        Entry authorized = authorizedEntry(fence);
+        if (authorized == null) {
             throw new TapstateException(
                     EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", fence.pipelineId()), null);
         }
+        return authorized.claim();
     }
 
     /** Whether {@code fence}'s run is still the current one, as far as this member can prove locally. */
@@ -163,6 +172,11 @@ final class ExecutionAuthorization implements AutoCloseable {
         if (!fenced) {
             return true;
         }
+        return authorizedEntry(fence) != null;
+    }
+
+    /** The current matching entry, refreshing it under the same rules as the boolean guard. */
+    private Entry authorizedEntry(ExecutionFence fence) {
         Objects.requireNonNull(fence, "fence");
         long now = nanoTime.getAsLong();
         Entry entry = entries.get(fence.pipelineId());
@@ -178,8 +192,10 @@ final class ExecutionAuthorization implements AutoCloseable {
             entry = read(fence.pipelineId(), false);
         }
         return entry != null
-                && entry.claimGeneration() == fence.claimGeneration()
-                && entry.executionGeneration() == fence.executionGeneration();
+                && entry.claim().claimGeneration() == fence.claimGeneration()
+                && entry.claim().executionGeneration() == fence.executionGeneration()
+                ? entry
+                : null;
     }
 
     /** Files a sink's known independent failure under the exact run while its claim is still live. */
@@ -211,9 +227,9 @@ final class ExecutionAuthorization implements AutoCloseable {
      * generation.
      */
     private static boolean precedes(Entry entry, ExecutionFence fence) {
-        return entry.claimGeneration() < fence.claimGeneration()
-                || (entry.claimGeneration() == fence.claimGeneration()
-                        && entry.executionGeneration() < fence.executionGeneration());
+        return entry.claim().claimGeneration() < fence.claimGeneration()
+                || (entry.claim().claimGeneration() == fence.claimGeneration()
+                        && entry.claim().executionGeneration() < fence.executionGeneration());
     }
 
     private void refreshAll() {
@@ -280,9 +296,7 @@ final class ExecutionAuthorization implements AutoCloseable {
             entries.remove(pipelineId);
             return null;
         }
-        Entry refreshed = new Entry(
-                current.get().claim().claimGeneration(), current.get().claim().executionGeneration(),
-                startedAt + held);
+        Entry refreshed = new Entry(WorkloadClaimFence.from(current.get().claim()), startedAt + held);
         entries.put(pipelineId, refreshed);
         return refreshed;
     }

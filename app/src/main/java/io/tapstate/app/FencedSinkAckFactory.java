@@ -21,12 +21,11 @@ import java.util.Objects;
  * superseded run starting its accounting again would take it over from the current run, whose writers would
  * then have nothing they say land.
  *
- * <p>On this path that guard is most of the fence, and the limit is worth stating where it is felt. A
- * writer's own progress is refused at the store once a later run has started its accounting, but what the
- * pipeline's record says is written after that, and that record carries no generation of its own, so nothing
- * on the far side turns a late write of it away. The capture side does carry one and is refused at the store.
- * Until the same holds here, a write that leaves a member after its guard last said yes -- one already in
- * flight, or one riding the slack between the two clocks -- is not caught a second time.
+ * <p>The local answer and the durable boundary are separate halves of the fence. The guard returns the
+ * exact live workload claim behind its answer, and the acknowledgement carries that claim to the store,
+ * which proves it in the same operation as the progress it records - the run's start, each writer's
+ * progress and the pipeline's record alike. An advance already in flight when ownership changes is
+ * therefore ignored there rather than moving the position after the run has been superseded.
  */
 final class FencedSinkAckFactory implements SinkAckFactory {
 
@@ -52,8 +51,7 @@ final class FencedSinkAckFactory implements SinkAckFactory {
 
     @Override
     public void beginRun(HazelcastInstance coordinator, Map<String, List<String>> writersByChain) {
-        ExecutionAuthorization.of(coordinator).require(fence);
-        delegate.beginRun(coordinator, writersByChain);
+        delegate.beginRun(coordinator, writersByChain, ExecutionAuthorization.of(coordinator).require(fence));
     }
 
     /**
@@ -89,14 +87,12 @@ final class FencedSinkAckFactory implements SinkAckFactory {
 
         @Override
         public void advance(String chain, ChainPosition position) {
-            authorization.require(fence);
-            ack.advance(chain, position);
+            ack.advance(chain, position, authorization.require(fence));
         }
 
         @Override
         public void bounded(String chain, SourceOrder through) {
-            authorization.require(fence);
-            ack.bounded(chain, through);
+            ack.bounded(chain, through, authorization.require(fence));
         }
 
         @Override

@@ -11,6 +11,10 @@ import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
+import io.tapstate.spi.store.WorkloadOwner;
 import org.bson.BsonDocument;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -238,6 +242,25 @@ class MongoSrsMetaStoreTest {
                 Map.entry("sinkAckedSeq", 99L));
         assertThat(update.get("$unset", Document.class))
                 .containsExactly(Map.entry("sinkAckedSrcpos", ""));
+    }
+
+    @Test
+    void sinkAckFenceHasOneStablePersistedShapeBesideTheConsumerProgress() {
+        WorkloadClaimFence fence = new WorkloadClaimFence(
+                new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "p1"),
+                new WorkloadOwner("node-a", "boot-a"), 3L, 7L, 11L);
+
+        Document stored = new Document(MongoSrsMetaStore.SINK_ACK_FENCE,
+                MongoSrsMetaStore.sinkAckFenceDocument("p1", fence));
+
+        assertThat(stored).isEqualTo(new Document("sinkAckFence", new Document("clusterId", "cluster-a")
+                .append("resourceType", "PIPELINE_ACTUATION")
+                .append("resourceId", "p1")
+                .append("ownerNodeId", "node-a")
+                .append("ownerBootId", "boot-a")
+                .append("claimGeneration", 3L)
+                .append("executionGeneration", 7L)
+                .append("topologyRevision", 11L)));
     }
 
     @Test

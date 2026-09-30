@@ -1,10 +1,12 @@
 package io.tapstate.app;
 
 import com.hazelcast.core.HazelcastInstance;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.AwaitedLoad;
 import io.tapstate.core.lifecycle.LoadLandings;
+import io.tapstate.runtime.engine.EngineError;
 import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.runtime.srs.CaptureRunUnit;
@@ -13,6 +15,7 @@ import io.tapstate.runtime.srs.SrsWriterFrontier;
 import io.tapstate.runtime.srs.SrsWriterFrontier.Landed;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SrsMetaStore;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WriterProgress;
 import io.tapstate.spi.store.WriterRun;
 import java.util.ArrayList;
@@ -41,6 +44,11 @@ import java.util.Set;
  * record any one of them could move by itself would say the pipeline had landed what only the fastest had -
  * a resume from there skips every change the slower ones still held, and nothing ever writes them again. So
  * the ack resolved here lands nothing of its own; only one bound to a writer does.
+ *
+ * <p>Where the run is fenced, each of those writes also carries the exact claim the member admitted it under,
+ * and the store proves that claim in the same operation as the write: a report that left the member before a
+ * takeover and arrives after it lands nothing. The run's start binds the pipeline's record to the run the same
+ * way.
  *
  * <p>The sink knows a chain only by the {@code src} stream name its events carry — a table at L1 — so this
  * maps that stream to the mining chain that keys its durable record. A member with no store bound resolves to
@@ -82,6 +90,17 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
      */
     @Override
     public void beginRun(HazelcastInstance coordinator, Map<String, List<String>> writersByChain) {
+        beginRun(coordinator, writersByChain, null);
+    }
+
+    /**
+     * As above, and where the run is fenced, binding every later durable effect of it to {@code fence} at the
+     * store in the same operation that proves the claim is still live. A claim that has moved on by then is a
+     * run that may not start: its writers would report into accounting it could never hold.
+     */
+    @Override
+    public void beginRun(HazelcastInstance coordinator, Map<String, List<String>> writersByChain,
+            WorkloadClaimFence fence) {
         SrsMetaStore meta = storeOn(coordinator);
         if (meta == null) {
             return;
@@ -90,8 +109,14 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
         writersByChain.forEach((table, writers) -> byMiningChain
                 .computeIfAbsent(miningChainOf(chainIdByTable, table), chain -> new LinkedHashMap<>())
                 .put(table, writers));
-        byMiningChain.forEach((miningChainId, byTable) ->
-                meta.beginWriterRun(miningChainId, pipelineId, runId, byTable));
+        byMiningChain.forEach((miningChainId, byTable) -> {
+            if (fence == null) {
+                meta.beginWriterRun(miningChainId, pipelineId, runId, byTable);
+            } else if (!meta.beginWriterRun(miningChainId, pipelineId, runId, byTable, fence)) {
+                throw new TapstateException(
+                        EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", pipelineId), null);
+            }
+        });
     }
 
     @Override
@@ -245,6 +270,11 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
 
         @Override
         public void advance(String chain, ChainPosition position) {
+            advance(chain, position, null);
+        }
+
+        @Override
+        public void advance(String chain, ChainPosition position, WorkloadClaimFence fence) {
             String miningChainId = miningChainOf(chainIdByTable, chain);
             WriterProgress was = progress.get(chain);
             SourceOrder durable = was == null || position.order().compareTo(was.durableThrough()) > 0
@@ -256,18 +286,23 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
             }
             WriterProgress next = new WriterProgress(durable, tokened);
             if (!next.equals(was)) {
-                report(chain, miningChainId, next);
+                report(chain, miningChainId, next, fence);
             }
         }
 
         @Override
         public void bounded(String chain, SourceOrder through) {
+            bounded(chain, through, null);
+        }
+
+        @Override
+        public void bounded(String chain, SourceOrder through, WorkloadClaimFence fence) {
             WriterProgress was = progress.get(chain);
             if (was != null && through.compareTo(was.durableThrough()) <= 0) {
                 return;
             }
             report(chain, miningChainOf(chainIdByTable, chain),
-                    new WriterProgress(through, was == null ? null : was.lastTokened()));
+                    new WriterProgress(through, was == null ? null : was.lastTokened()), fence);
         }
 
         /**
@@ -287,17 +322,27 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
             return new ChainPosition(position.order(), cdcStart);
         }
 
-        private void report(String chain, String miningChainId, WriterProgress next) {
-            progress.put(chain, next);
+        /**
+         * Records {@code next} as this writer's progress and lands what it moves - or, where the store turned it
+         * away while this run still holds the accounting, leaves it owed, so the next report carries it again.
+         */
+        private void report(String chain, String miningChainId, WriterProgress next, WorkloadClaimFence fence) {
             if (replaced) {
+                progress.put(chain, next);
                 return;
             }
-            Optional<WriterRun> run = meta.advanceWriter(miningChainId, pipelineId, runId, writerId, chain, next);
+            Optional<WriterRun> run = fence == null
+                    ? meta.advanceWriter(miningChainId, pipelineId, runId, writerId, chain, next)
+                    : meta.advanceWriter(miningChainId, pipelineId, runId, writerId, chain, next, fence);
             if (run.isEmpty()) {
                 refused(miningChainId);
+                if (replaced) {
+                    progress.put(chain, next);
+                }
                 return;
             }
-            land(chain, miningChainId, run.get());
+            progress.put(chain, next);
+            land(chain, miningChainId, run.get(), fence);
         }
 
         /**
@@ -306,14 +351,20 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
          * may land any more. No run at all is not: an execution starts its run before any of its writers
          * exists, so a writer reporting into none was wired to a run nothing started, and nothing would ever
          * wait on what it landed.
+         *
+         * <p>The accounting still being this run's is a third answer, which only a fenced report meets: the
+         * claim it carried was not the live one when it arrived - a lease re-taken under a new topology, or a
+         * report that left before a takeover and arrived after it. Nothing is written then and nothing is
+         * decided; the progress stays owed, and the member's own guard answers the next report.
          */
         private void refused(String miningChainId) {
-            if (meta.writerRun(miningChainId, pipelineId).isEmpty()) {
+            Optional<WriterRun> current = meta.writerRun(miningChainId, pipelineId);
+            if (current.isEmpty()) {
                 throw new IllegalStateException("writer '" + writerId + "' of pipeline '" + pipelineId
                         + "' reported into run '" + runId + "', which nothing started on mining chain '"
                         + miningChainId + "'");
             }
-            replaced = true;
+            replaced = !current.get().runId().equals(runId);
         }
 
         /**
@@ -328,7 +379,7 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
          * <p>A writer reporting a table the run does not route to it crashes bare: its progress would be left
          * out of the lowest one, so a resume could pass changes it still holds.
          */
-        private void land(String chain, String miningChainId, WriterRun run) {
+        private void land(String chain, String miningChainId, WriterRun run, WorkloadClaimFence fence) {
             if (!run.expectedFor(chain).contains(writerId)) {
                 throw new IllegalStateException("writer '" + writerId + "' landed changes of '" + chain
                         + "' that run '" + runId + "' of pipeline '" + pipelineId + "' does not route to it");
@@ -346,21 +397,54 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                 // run replacing this one carries on from it instead of from the head of the ring. And every
                 // writer reports on its own, so this may land after a later report of the table's - which the
                 // store, comparing the two, leaves standing.
-                meta.advanceSinkAcked(miningChainId, pipelineId, chain, resumable);
+                if (!advanceSinkAcked(miningChainId, chain, resumable, fence)) {
+                    return;
+                }
                 if (!isSnapshotOf(resumable)) {
                     recordHowFarTheSourceHasBeenRead(meta, miningChainId, resumable, recordedRead);
                 }
             }
             SourceOrder durable = now.durableThrough();
             if (durable.seq() >= 0 && (before == null || durable.compareTo(before.durableThrough()) > 0)
-                    && (resumable == null || durable.compareTo(resumable.order()) > 0)) {
-                meta.advanceRingDone(miningChainId, pipelineId, chain, durable.seq());
+                    && (resumable == null || durable.compareTo(resumable.order()) > 0)
+                    && !advanceRingDone(miningChainId, chain, durable.seq(), fence)) {
+                return;
             }
             if (!loaded.contains(chain) && SrsWriterFrontier.passedLoad(now, run.snapshotEpoch())) {
-                meta.markSnapshotComplete(miningChainId, pipelineId, chain);
+                if (!markSnapshotComplete(miningChainId, chain, fence)) {
+                    return;
+                }
                 loaded.add(chain);
             }
             landed.put(chain, now);
+        }
+
+        // Each write of the pipeline's record, fenced where the report was. A fenced write the store turned away
+        // answers false, and what it would have recorded is left for the next report, which lands it again.
+
+        private boolean advanceSinkAcked(String miningChainId, String chain, ChainPosition resumable,
+                WorkloadClaimFence fence) {
+            if (fence == null) {
+                meta.advanceSinkAcked(miningChainId, pipelineId, chain, resumable);
+                return true;
+            }
+            return meta.advanceSinkAcked(miningChainId, pipelineId, chain, resumable, fence);
+        }
+
+        private boolean advanceRingDone(String miningChainId, String chain, long seq, WorkloadClaimFence fence) {
+            if (fence == null) {
+                meta.advanceRingDone(miningChainId, pipelineId, chain, seq);
+                return true;
+            }
+            return meta.advanceRingDone(miningChainId, pipelineId, chain, seq, fence);
+        }
+
+        private boolean markSnapshotComplete(String miningChainId, String chain, WorkloadClaimFence fence) {
+            if (fence == null) {
+                meta.markSnapshotComplete(miningChainId, pipelineId, chain);
+                return true;
+            }
+            return meta.markSnapshotComplete(miningChainId, pipelineId, chain, fence);
         }
     }
 

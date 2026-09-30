@@ -2,6 +2,7 @@ package io.tapstate.runtime.engine;
 
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.lifecycle.LoadLandings;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import java.io.Serializable;
 import java.util.List;
 import java.util.Map;
@@ -38,6 +39,15 @@ public interface SinkAckFactory extends Serializable {
      * whose acks do not keep writers apart has nothing to start, which is the default.
      */
     default void beginRun(HazelcastInstance coordinator, Map<String, List<String>> writersByChain) {
+    }
+
+    /**
+     * {@link #beginRun(HazelcastInstance, Map)}, carrying the exact live workload claim the coordinating member
+     * admitted the run under, so a factory that records durably can bind the run to that claim at the store.
+     */
+    default void beginRun(HazelcastInstance coordinator, Map<String, List<String>> writersByChain,
+            WorkloadClaimFence fence) {
+        beginRun(coordinator, writersByChain);
     }
 
     /**
