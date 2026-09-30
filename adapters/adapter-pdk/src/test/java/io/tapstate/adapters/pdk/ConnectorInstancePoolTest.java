@@ -16,6 +16,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -452,6 +453,97 @@ class ConnectorInstancePoolTest {
                         + "one that gave back none is the leak this exists to stop")
                 .isZero();
         assertThat(pool.reserveOutsidePool()).isNotNull();
+    }
+
+    @Test
+    void aReplacementWaitsForAClosingReservationWithoutExceedingTheCeiling() throws Exception {
+        ConnectorInstancePool<FakeInstance> pool = pool(ConnectorInstancePool.DEFAULTS.withTotal(1));
+        ConnectorInstancePool.Reservation held = pool.reserveOutsidePool();
+        held.beginClose();
+        held.beginClose();
+        AtomicReference<ConnectorInstancePool.Reservation> replacement = new AtomicReference<>();
+        Thread waiting = run(() -> replacement.set(pool.reserveOutsidePool()));
+        try {
+            awaitParked(waiting);
+            assertThat(pool.liveInstances()).as("cleanup still holds its physical instance").isEqualTo(1);
+            assertThat(replacement.get()).as("the replacement cannot open before cleanup finishes").isNull();
+        } finally {
+            held.close();
+        }
+        joinAll();
+        assertThat(replacement.get()).as("the returned place admits the waiting follow").isNotNull();
+        assertThat(pool.liveInstances()).isEqualTo(1);
+        held.beginClose();
+        long refusing = System.nanoTime();
+        assertThatThrownBy(pool::reserveOutsidePool).isInstanceOf(TapstateException.class);
+        assertThat(Duration.ofNanos(System.nanoTime() - refusing))
+                .as("duplicate cleanup notifications cannot make an active ceiling wait")
+                .isLessThan(Duration.ofSeconds(2));
+        replacement.get().close();
+        assertThat(pool.liveInstances()).isZero();
+    }
+
+    @Test
+    void anUnfinishedCloseCannotMakeReservationAdmissionWaitWithoutABound() {
+        ConnectorInstancePool<FakeInstance> pool = pool(ConnectorInstancePool.DEFAULTS
+                .withTotal(1).withCall(Duration.ofMillis(100)));
+        try (ConnectorInstancePool.Reservation held = pool.reserveOutsidePool()) {
+            held.beginClose();
+            long started = System.nanoTime();
+            assertThatThrownBy(pool::reserveOutsidePool)
+                    .isInstanceOf(TapstateException.class)
+                    .satisfies(refused -> assertThat(((TapstateException) refused).code())
+                            .isEqualTo(ConnectorError.INSTANCE_LIMIT_REACHED));
+            assertThat(Duration.ofNanos(System.nanoTime() - started))
+                    .isGreaterThanOrEqualTo(Duration.ofMillis(100))
+                    .isLessThan(Duration.ofSeconds(5));
+            assertThat(pool.liveInstances()).as("a timeout never frees the unfinished instance").isEqualTo(1);
+        }
+    }
+
+    @Test
+    void returnedPooledCapacityWakesAReplacementWaitingForCleanup() throws Exception {
+        ConnectorInstancePool<FakeInstance> pool = pool(ConnectorInstancePool.DEFAULTS
+                .withTotal(2).withIdle(Duration.ZERO));
+        pool.call(config("pooled", "mongodb://one"), instance -> instance);
+        AtomicReference<ConnectorInstancePool.Reservation> replacement = new AtomicReference<>();
+        try (ConnectorInstancePool.Reservation held = pool.reserveOutsidePool()) {
+            held.beginClose();
+            Thread waiting = run(() -> replacement.set(pool.reserveOutsidePool()));
+            awaitParked(waiting);
+            pool.sweep();
+            waiting.join(TimeUnit.SECONDS.toMillis(1));
+            assertThat(waiting.isAlive()).as("returned pooled capacity must wake admission immediately").isFalse();
+            assertThat(replacement.get()).isNotNull();
+            assertThat(pool.liveInstances()).as("the unfinished close and its replacement are still counted")
+                    .isEqualTo(2);
+        }
+        joinAll();
+        replacement.get().close();
+        assertThat(pool.liveInstances()).isZero();
+    }
+
+    @Test
+    void closingThePoolWakesAReservationWaitingForCleanup() throws Exception {
+        ConnectorInstancePool<FakeInstance> pool = pool(ConnectorInstancePool.DEFAULTS.withTotal(1));
+        try (ConnectorInstancePool.Reservation held = pool.reserveOutsidePool()) {
+            held.beginClose();
+            AtomicReference<Throwable> refusal = new AtomicReference<>();
+            Thread waiting = run(() -> {
+                try {
+                    pool.reserveOutsidePool();
+                } catch (TapstateException closed) {
+                    refusal.set(closed);
+                }
+            });
+            awaitParked(waiting);
+            pool.close();
+            waiting.join(TimeUnit.SECONDS.toMillis(1));
+            assertThat(waiting.isAlive()).as("pool shutdown ends admission without waiting for cleanup").isFalse();
+            assertThat(refusal.get()).isInstanceOf(TapstateException.class);
+            assertThat(((TapstateException) refusal.get()).code()).isEqualTo(ConnectorError.INSTANCE_LIMIT_REACHED);
+            assertThat(pool.liveInstances()).isEqualTo(1);
+        }
     }
 
     @Test
