@@ -2,13 +2,14 @@
 <!--
   cli — the surface ring: Tapstate's offline CLI product front-end.
 
-  Dual-mode: bare `tapstate` opens an offline REPL; one-shot subcommands share the same verb
-  table for scripting / AI. Offline verbs are a whitelist (validate / new / add / explain); server
+  Dual-mode: bare `tapstate` opens the full-screen workbench; one-shot subcommands share the same verb
+  table for scripting / AI. Offline verbs are a whitelist (validate / new / explain); server
   verbs are registered too but report "requires a connection" rather than going missing.
 
   Ring rule R6: the CLI talks to services over HTTP only. Its dependency surface is allowlisted
   (bannedDependencies, the coarse twin of the arch-tests R6 rule): the named core-ring modules,
-  the framework-free control HTTP client, picocli (command framework), and jline (REPL line reader).
+  the framework-free control HTTP client, picocli (command framework), JLine (terminal backend), and
+  TamboUI (full-screen runner).
   Product control services and runtime implementations remain forbidden. Every allowed artifact is
   listed explicitly, so a new dependency fails the build until its boundary is deliberately reviewed.
 -->
@@ -69,13 +70,6 @@
       <artifactId>core-common</artifactId>
       <version>${revision}</version>
     </dependency>
-    <!-- The declarations of what state a pipeline holds, so the terminal's stop says what it is about
-         to clear, or keep, out of the same list the clearing itself works through. -->
-    <dependency>
-      <groupId>io.tapstate</groupId>
-      <artifactId>core-lifecycle</artifactId>
-      <version>${revision}</version>
-    </dependency>
     <!-- The shared error-code message catalog + renderer (presentation layer); the CLI renders
          coded diagnostics through it rather than carrying its own catalog. -->
     <dependency>
@@ -98,11 +92,29 @@
       <groupId>org.jline</groupId>
       <artifactId>jline</artifactId>
     </dependency>
+    <dependency>
+      <groupId>dev.tamboui</groupId>
+      <artifactId>tamboui-tui</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>dev.tamboui</groupId>
+      <artifactId>tamboui-css</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>dev.tamboui</groupId>
+      <artifactId>tamboui-jline3-backend</artifactId>
+    </dependency>
 
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter</artifactId>
       <scope>test</scope>
+    </dependency>
+    <!-- The lifecycle vocabulary keeps stop and restart descriptions aligned with the server state model. -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-lifecycle</artifactId>
+      <version>${revision}</version>
     </dependency>
     <dependency>
       <groupId>org.assertj</groupId>
@@ -201,12 +213,16 @@
                     <include>info.picocli:picocli</include>
                     <!-- jline aggregates its own modules under one version -->
                     <include>org.jline:*</include>
+                    <!-- the pinned full-screen runner and the only permitted terminal backend -->
+                    <include>dev.tamboui:tamboui-tui</include>
+                    <include>dev.tamboui:tamboui-css</include>
+                    <include>dev.tamboui:tamboui-jline3-backend</include>
                     <!-- test scope never ships -->
                     <include>*:*:*:*:test</include>
                   </includes>
                   <message>
-Dependency outside the cli surface-ring allowlist (rule R6). Only io.tapstate modules, picocli and
-jline are allowed; the CLI must reach services over HTTP, never via a compile dependency on
+Dependency outside the cli surface-ring allowlist (rule R6). Only io.tapstate modules, picocli, jline,
+and the pinned TamboUI runner/JLine backend are allowed; the CLI must reach services over HTTP, never via a compile dependency on
 control / runtime modules. Amend the recorded allowlist decision before adding an exception.
                   </message>
                 </bannedDependencies>
@@ -259,12 +275,11 @@ control / runtime modules. Amend the recorded allowlist decision before adding a
 
       The bundled resources read at runtime via getResourceAsStream are not reachable in a native
       image unless declared: the connector catalog (/catalog/*.json), the grammar JSON Schema
-      (/schema/*.json), the message catalog (/messages/*.yml) and the local development stack's
-      compose file (/local-stack/*.yml), demo recipes (/demo/*.tap.yml) and blank recipes
-      (/blank/*.tap.yml). They are declared here as IncludeResources globs.
-      Reflection config for the picocli command tree comes from the picocli-codegen processor
-      (see the compiler plugin above); JLine / CEL / snakeyaml config comes from the GraalVM
-      reachability-metadata repository.
+      (/schema/*.json), the message catalog (/messages/*.yml), and TamboUI's built-in key bindings
+      (/dev/tamboui/tui/bindings/*.properties). They are declared here as IncludeResources globs.
+      Reflection config for the picocli command tree comes from the
+      picocli-codegen processor (see the compiler plugin above); JLine / CEL / snakeyaml config
+      comes from the GraalVM reachability-metadata repository.
     -->
     <profile>
       <id>native</id>
@@ -288,19 +303,16 @@ control / runtime modules. Amend the recorded allowlist decision before adding a
               <mainClass>${mainClass}</mainClass>
               <buildArgs>
                 <buildArg>--no-fallback</buildArg>
-                <!-- The CPU this binary may assume. Left alone, native-image compiles for x86-64-v3 on
-                     AMD64, which requires AVX, AVX2, BMI1, BMI2 and FMA, and an image that needs them
-                     refuses to start on a CPU that does not have them. `compatibility` is the lowest
-                     common denominator on every architecture, so this one flag stays correct for the
-                     arm64 builds too; install-smoke.sh checks the native profile still names it. -->
+                <!-- The native image must run on AMD64 CPUs without AVX2/BMI2/FMA. The compatibility
+                     baseline is valid for every published architecture and is enforced by installer smoke. -->
                 <buildArg>-march=compatibility</buildArg>
+                <buildArg>--install-exit-handlers</buildArg>
                 <!-- bundled resources read via getResourceAsStream, declared so the image keeps them -->
                 <buildArg>-H:IncludeResources=catalog/.*\.json</buildArg>
                 <buildArg>-H:IncludeResources=schema/.*\.json</buildArg>
                 <buildArg>-H:IncludeResources=messages/.*\.yml</buildArg>
-                <buildArg>-H:IncludeResources=local-stack/.*\.yml</buildArg>
-                <buildArg>-H:IncludeResources=demo/.*\.tap\.yml</buildArg>
-                <buildArg>-H:IncludeResources=blank/.*\.tap\.yml</buildArg>
+                <buildArg>-H:IncludeResources=dev/tamboui/tui/bindings/.*\.properties</buildArg>
+                <buildArg>-H:IncludeResources=tui/themes/.*\.tcss</buildArg>
               </buildArgs>
               <metadataRepository>
                 <enabled>true</enabled>

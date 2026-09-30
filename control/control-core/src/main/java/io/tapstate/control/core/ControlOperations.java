@@ -233,6 +233,9 @@ public final class ControlOperations {
     public static final Operation PIPELINE_LOGS = mcp(
             "pipeline.logs", Scope.READ, false,
             "Read the bounded, secret-redacted log tail for a Pipeline.");
+    public static final Operation PIPELINE_LOG_LEVEL = new Operation(
+            "pipeline.log-level", Scope.WRITE, true, null,
+            "Set the minimum severity retained for one Pipeline's future node-local log lines.", CLI_ONLY);
     public static final Operation PIPELINE_METRICS_HISTORY = mcp(
             "pipeline.metrics.history", Scope.READ, false,
             "Read a bounded, reset-aware page of target-acknowledged output rates and selected table lag "
@@ -318,6 +321,7 @@ public final class ControlOperations {
             PIPELINE_METRICS,
             PIPELINE_SNAPSHOT,
             PIPELINE_LOGS,
+            PIPELINE_LOG_LEVEL,
             PIPELINE_METRICS_HISTORY,
             PIPELINE_EXPLAIN,
             PIPELINE_POSITION,

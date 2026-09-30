@@ -15,6 +15,7 @@ import io.tapstate.control.core.TokenSigner;
 import io.tapstate.control.core.VerifiedToken;
 import io.tapstate.core.logging.LogLine;
 import io.tapstate.core.logging.LogSink;
+import io.tapstate.core.logging.PipelineLogLevel;
 import io.tapstate.spi.store.TokenRecord;
 import io.tapstate.spi.store.TokenStore;
 import org.junit.jupiter.api.AfterAll;
@@ -29,6 +30,7 @@ import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.method.HandlerMethod;
 import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
@@ -120,6 +122,24 @@ class PipelineLogsApiTest {
     }
 
     @Test
+    void logsResumesStrictlyAfterTheProvidedCursor() {
+        PipelineLogs initial = client().get().uri("/api/pipelines/pl1/logs?limit=1")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(PipelineLogs.class).getBody();
+
+        FakeLogSink sink = context.getBean(FakeLogSink.class);
+        sink.append("pl1", new LogLine(1_700_000_000_200L, "INFO", "checkpoint complete"));
+
+        PipelineLogs resumed = client().get().uri("/api/pipelines/pl1/logs?after="
+                        + initial.nextCursor().token())
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(PipelineLogs.class).getBody();
+
+        assertThat(resumed.lines()).extracting(LogLine::message).containsExactly("checkpoint complete");
+        assertThat(resumed.truncated()).isFalse();
+    }
+
+    @Test
     void logsRejectsNonPositiveLimitsAsClientErrors() {
         for (String limit : List.of("0", "-1")) {
             ApiError body = client().get().uri("/api/pipelines/pl1/logs?limit=" + limit)
@@ -161,6 +181,19 @@ class PipelineLogsApiTest {
         assertThat(body.code()).isEqualTo("control.unauthenticated");
     }
 
+    @Test
+    void logLevelChangesTheMinimumSeverityForFuturePipelineLines() {
+        PipelineLogLevel level = client().post().uri("/api/pipelines/pl1:log-level")
+                .header("Authorization", "Bearer " + machineToken(Scope.WRITE))
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("level", "WARN"))
+                .retrieve().toEntity(PipelineLogLevel.class).getBody();
+
+        assertThat(level).isEqualTo(PipelineLogLevel.WARN);
+        assertThat(context.getBean(PipelineLogQueryService.class).level("pl1"))
+                .isEqualTo(PipelineLogLevel.WARN);
+    }
+
     // ---- the logs endpoint is a derivation of the registry ----
 
     @Test
@@ -185,7 +218,7 @@ class PipelineLogsApiTest {
 
         assertThat(projected)
                 .as("only the logs face projects onto this focused context")
-                .containsExactly("pipeline.logs");
+                .containsExactlyInAnyOrder("pipeline.logs", "pipeline.log-level", "pipeline.logs");
     }
 
     /**
@@ -247,9 +280,11 @@ class PipelineLogsApiTest {
     /** An in-memory, seedable node-local log sink: append-ordered lines per pipeline id. */
     static final class FakeLogSink implements LogSink {
         private final Map<String, List<LogLine>> byId = new LinkedHashMap<>();
+        private final Map<String, PipelineLogLevel> levels = new LinkedHashMap<>();
 
         void clear() {
             byId.clear();
+            levels.clear();
         }
 
         @Override
@@ -260,6 +295,16 @@ class PipelineLogsApiTest {
         @Override
         public List<LogLine> tail(String pipelineId) {
             return List.copyOf(byId.getOrDefault(pipelineId, List.of()));
+        }
+
+        @Override
+        public void level(String pipelineId, PipelineLogLevel level) {
+            levels.put(pipelineId, level);
+        }
+
+        @Override
+        public PipelineLogLevel level(String pipelineId) {
+            return levels.getOrDefault(pipelineId, PipelineLogLevel.INFO);
         }
     }
 

@@ -23,6 +23,7 @@
 # --- Punctuation used in English prose ---
 U+00A7  SECTION SIGN                             Cross-references to numbered sections of a spec.
 U+00B7  MIDDLE DOT                               Separator between fields on one line of CLI output.
+U+2161  ROMAN NUMERAL TWO                        Terminal navigation label.
 U+2013  EN DASH                                  Numeric and date ranges.
 U+2014  EM DASH                                  Parenthetical break in English prose.
 U+2026  HORIZONTAL ELLIPSIS                      Elision, and truncation markers in CLI output.
@@ -40,8 +41,12 @@ U+00FC  LATIN SMALL LETTER U WITH DIAERESIS      Malformed-token fixture exercis
 U+00D7  MULTIPLICATION SIGN                      Dimensions and matrix-shaped tables.
 U+00F7  DIVISION SIGN                            Ratios in prose, beside the multiplication sign.
 U+20AC  EURO SIGN                                Currency fixture in serialization tests.
+U+2190  LEFTWARDS ARROW                          Terminal navigation hint.
+U+2191  UPWARDS ARROW                            Terminal navigation hint.
 U+2192  RIGHTWARDS ARROW                         "maps to" in prose, tables and diagnostics.
+U+2193  DOWNWARDS ARROW                          Terminal navigation hint.
 U+2194  LEFT RIGHT ARROW                         Round-trip relation between two encodings.
+U+21BB  CLOCKWISE OPEN CIRCLE ARROW              Refresh hint in the terminal UI.
 U+2218  RING OPERATOR                            Function composition in a parser test's naming.
 U+222A  UNION                                    Set union in capability and workspace rules.
 U+2264  LESS-THAN OR EQUAL TO                    Bounds stated in scripts and diagnostics.
@@ -57,6 +62,34 @@ U+251C  BOX DRAWINGS LIGHT VERTICAL AND RIGHT
 U+2524  BOX DRAWINGS LIGHT VERTICAL AND LEFT
 U+2534  BOX DRAWINGS LIGHT UP AND HORIZONTAL
 U+253C  BOX DRAWINGS LIGHT VERTICAL AND HORIZONTAL
+U+256D  BOX DRAWINGS LIGHT ARC DOWN AND RIGHT     Terminal UI panel decoration.
+U+256E  BOX DRAWINGS LIGHT ARC DOWN AND LEFT      Terminal UI panel decoration.
+U+256F  BOX DRAWINGS LIGHT ARC UP AND LEFT        Terminal UI panel decoration.
+U+2570  BOX DRAWINGS LIGHT ARC UP AND RIGHT       Terminal UI panel decoration.
+U+25A0  BLACK SQUARE                             Terminal UI status marker.
+U+25B2  BLACK UP-POINTING TRIANGLE                Terminal UI menu marker.
+U+25B6  BLACK RIGHT-POINTING TRIANGLE             Terminal UI menu marker.
+U+25BC  BLACK DOWN-POINTING TRIANGLE              Terminal UI menu marker.
+U+25BE  BLACK DOWN-POINTING SMALL TRIANGLE        Terminal UI menu marker.
+U+25CB  WHITE CIRCLE                             Terminal UI status marker.
+U+25CF  BLACK CIRCLE                             Terminal UI status marker.
+U+2601  CLOUD                                    Terminal UI tab icon.
+U+26A1  HIGH VOLTAGE SIGN                         Terminal UI tab icon.
+U+270E  LOWER RIGHT PENCIL                        Terminal UI action icon.
+U+2728  SPARKLES                                 Terminal UI action icon.
+U+FE0F  VARIATION SELECTOR-16                    Emoji presentation selector.
 
 # --- Emoji ---
 U+1F916 ROBOT FACE                               Appears only inside the pattern that rejects agent footers; the check has to name the character it forbids.
+U+1F30A WATER WAVE                               Terminal UI overview tab icon.
+U+1F4A1 ELECTRIC LIGHT BULB                       Terminal UI onboarding icon.
+U+1F4BB PERSONAL COMPUTER                         Terminal UI workspace icon.
+U+1F4C2 OPEN FILE FOLDER                          Terminal UI tab icon.
+U+1F4C4 PAGE FACING UP                            Terminal UI tab icon.
+U+1F4DC SCROLL                                   Terminal UI log tab icon.
+U+1F500 TWISTED RIGHTWARDS ARROWS                 Terminal UI pipeline icon.
+U+1F50C ELECTRIC PLUG                             Terminal UI source icon.
+U+1F50E RIGHT-POINTING MAGNIFYING GLASS            Terminal UI inspect tab icon.
+U+1F510 LOCK                                     Terminal UI authentication icon.
+U+1F680 ROCKET                                    Terminal UI action icon.
+U+1F9ED COMPASS                                  Terminal UI context icon.

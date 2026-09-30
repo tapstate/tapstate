@@ -2,26 +2,27 @@ package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.PipelineLogQueryService;
 import io.tapstate.control.core.PipelineLogs;
-import io.tapstate.core.logging.LogLine;
+import io.tapstate.core.logging.LogCursor;
+import org.springframework.web.socket.CloseStatus;
 import org.springframework.scheduling.TaskScheduler;
 import org.springframework.web.socket.WebSocketSession;
 
+import java.io.IOException;
+import java.net.URI;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.List;
 import java.util.Objects;
 
 /**
- * The logs follow channel: streams a pipeline's node-local log tail, then only the lines appended since
- * the last frame ({@code tail -f}). It polls the same node-local sink the one-shot {@code GET} tails and
- * sends the delta {@link LogDelta#newLines computed} against what the follower has already been sent, so
- * an idle pipeline is quiet on the wire. Because the sink is a bounded ring, a burst may evict lines
- * before the follower polls; the delta then re-tails rather than dropping the gap, so a follower may see
- * a line twice, never lose one.
+ * The logs follow channel resumes from a server-owned cursor and sends only lines strictly after that
+ * cursor. A ring rollover is reported in the next frame as truncation instead of re-sending an ambiguous
+ * tail, so a reconnect can continue without heuristic de-duplication.
  */
 final class PipelineLogsFollowHandler extends PollingStreamHandler {
 
-    /** Session attribute holding the tail window last observed, so the next tick sends only what is new. */
-    private static final String LAST_TAIL = "tapstate.stream.lastTail";
+    /** Session attribute holding the last cursor the follower accepted. */
+    private static final String LAST_CURSOR = "tapstate.stream.lastLogCursor";
 
     private final PipelineLogQueryService logs;
 
@@ -31,14 +32,51 @@ final class PipelineLogsFollowHandler extends PollingStreamHandler {
     }
 
     @Override
-    @SuppressWarnings("unchecked")
-    protected void poll(WebSocketSession session, String pipelineId) {
-        List<LogLine> current = logs.logs(pipelineId).lines();
-        List<LogLine> previous = (List<LogLine>) session.getAttributes().getOrDefault(LAST_TAIL, List.of());
-        List<LogLine> fresh = LogDelta.newLines(previous, current);
-        if (!fresh.isEmpty()) {
-            send(session, StreamFrames.logs(new PipelineLogs(pipelineId, fresh)));
+    public void afterConnectionEstablished(WebSocketSession session) {
+        try {
+            LogCursor requested = requestedCursor(session);
+            if (requested != null) {
+                session.getAttributes().put(LAST_CURSOR, requested);
+            }
+            super.afterConnectionEstablished(session);
+        } catch (IllegalArgumentException malformedCursor) {
+            closeBadCursor(session);
         }
-        session.getAttributes().put(LAST_TAIL, current);
+    }
+
+    @Override
+    protected void poll(WebSocketSession session, String pipelineId) {
+        LogCursor after = (LogCursor) session.getAttributes().get(LAST_CURSOR);
+        PipelineLogs page = logs.logs(pipelineId, after, Integer.MAX_VALUE);
+        if (!page.lines().isEmpty() || page.truncated()) {
+            send(session, StreamFrames.logs(page));
+        }
+        if (page.nextCursor() != null) {
+            session.getAttributes().put(LAST_CURSOR, page.nextCursor());
+        }
+    }
+
+    private static LogCursor requestedCursor(WebSocketSession session) {
+        URI uri = session.getUri();
+        if (uri == null || uri.getRawQuery() == null) {
+            return null;
+        }
+        for (String parameter : uri.getRawQuery().split("&")) {
+            int equals = parameter.indexOf('=');
+            if (equals < 0 || !"after".equals(parameter.substring(0, equals))) {
+                continue;
+            }
+            String token = URLDecoder.decode(parameter.substring(equals + 1), StandardCharsets.UTF_8);
+            return LogCursor.parse(token);
+        }
+        return null;
+    }
+
+    private static void closeBadCursor(WebSocketSession session) {
+        try {
+            session.close(CloseStatus.BAD_DATA);
+        } catch (IOException ignored) {
+            // The malformed session is already unusable; there is no stream to recover here.
+        }
     }
 }

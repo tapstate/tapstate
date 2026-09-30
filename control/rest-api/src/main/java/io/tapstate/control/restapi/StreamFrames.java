@@ -4,6 +4,7 @@ import io.tapstate.control.core.PipelineLogs;
 import io.tapstate.control.core.PipelineStatus;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.lifecycle.ObservationFailure;
+import io.tapstate.core.logging.LogCursor;
 import io.tapstate.core.logging.LogLine;
 import io.tapstate.messages.MessageCatalog;
 
@@ -56,7 +57,7 @@ final class StreamFrames {
         return encoded;
     }
 
-    /** A logs frame: {@code {"pipelineId":..,"lines":[{timestampMillis,level,message},..]}}. */
+    /** A logs frame with a resumable cursor and any retention-truncation indication. */
     static String logs(PipelineLogs logs) {
         List<Object> lines = new ArrayList<>();
         for (LogLine line : logs.lines()) {
@@ -69,6 +70,14 @@ final class StreamFrames {
         Map<String, Object> frame = new LinkedHashMap<>();
         frame.put("pipelineId", logs.pipelineId());
         frame.put("lines", lines);
+        LogCursor nextCursor = logs.nextCursor();
+        if (nextCursor != null) {
+            Map<String, Object> cursor = new LinkedHashMap<>();
+            cursor.put("generation", nextCursor.generation());
+            cursor.put("sequence", nextCursor.sequence());
+            frame.put("nextCursor", cursor);
+        }
+        frame.put("truncated", logs.truncated());
         return JsonWriter.write(frame);
     }
 }

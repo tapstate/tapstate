@@ -14,6 +14,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.TreeSet;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -80,7 +81,7 @@ class CliTest {
     @Test
     void theCompositeVerbIsUpAndNoLongerAReservedRun() {
         // `run` was the placeholder for apply-then-start; the verb shipped as `up`, so the placeholder
-        // is gone rather than kept beside the real thing, and `up` is a real command on the table
+        // is gone rather than kept beside the real thing, and `up` is a real command on the table.
         assertThat(Cli.UNIMPLEMENTED_COMPOSITE_VERBS).doesNotContain("run", "up");
         assertThat(Cli.COMPOSITE_VERBS).contains("up");
         assertThat(Cli.newCommandLine().getSubcommands().keySet()).contains("up").doesNotContain("run");
@@ -228,6 +229,7 @@ class CliTest {
         // selected server. Keeping the choice at the process boundary ensures -c/-u is not silently
         // discarded before session setup (the regression covered by the E2E version check).
         assertThat(Cli.bypassesSessionResolution(LaunchOptions.parse("version"))).isTrue();
+        assertThat(Cli.bypassesSessionResolution(LaunchOptions.parse("up"))).isFalse();
         assertThat(Cli.bypassesSessionResolution(LaunchOptions.parse("-c", "http://node:8080",
                 "version"))).isFalse();
         assertThat(Cli.bypassesSessionResolution(LaunchOptions.parse("--context", "dev",
@@ -615,7 +617,7 @@ class CliTest {
         // -w was the sharp edge: it opens a session in a directory, but before a verb it is an error --
         // which is worth stating, since the obvious guess `tapstate -w DIR validate` is the wrong one
         Run r = run("help");
-        assertThat(r.out()).contains("open a session").contains("run one command and exit");
+        assertThat(r.out()).contains("open the full-screen workbench").contains("run one command and exit");
         assertThat(r.out()).contains("tapstate validate -w DIR");
         assertThat(r.out()).contains("$TAPSTATE_WORKDIR");
     }
@@ -894,7 +896,32 @@ class CliTest {
     }
 
     @Test
-    void workspaceOnlyArgsOpenASessionSeededWithThatWorkspace() {
+    void bareLaunchHandsTheSessionToTheWorkbenchSurface() {
+        AtomicReference<Repl> handedOff = new AtomicReference<>();
+
+        int code = Cli.runSession(LaunchOptions.parse(), new HttpControlPlaneClient(),
+                ScriptedPrompter::new, repl -> {
+                    handedOff.set(repl);
+                    return 41;
+                });
+
+        assertThat(code).isEqualTo(41);
+        assertThat(handedOff.get()).isNotNull();
+    }
+
+    @Test
+    void oneShotVerbNeverStartsTheWorkbenchSurface() {
+        int code = Cli.runSession(LaunchOptions.parse("version"), new HttpControlPlaneClient(),
+                ScriptedPrompter::new, repl -> {
+                    throw new AssertionError("one-shot verbs must not enter the workbench");
+                });
+
+        assertThat(code).isZero();
+        assertThat(Cli.newCommandLine().getSubcommands()).doesNotContainKey("tui");
+    }
+
+    @Test
+    void workspaceOnlyArgsOpenAWorkbenchSeededWithThatWorkspace() {
         assertThat(LaunchOptions.parse("-w", "foo").isOneShot()).isFalse();
         assertThat(LaunchOptions.parse("--workdir", "foo").isOneShot()).isFalse();
         assertThat(LaunchOptions.parse("--workdir=foo").isOneShot()).isFalse();

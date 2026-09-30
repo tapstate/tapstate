@@ -11,4 +11,9 @@ interface LogStream {
 
     /** A batch of newly appended log lines for the pipeline, oldest to newest. */
     void lines(String pipelineId, List<RemoteLogLine> lines);
+
+    /** Receives a cursor-aware page while preserving the legacy line-only callback. */
+    default void page(LogsOutcome.Found page) {
+        lines(page.pipelineId(), page.lines());
+    }
 }
