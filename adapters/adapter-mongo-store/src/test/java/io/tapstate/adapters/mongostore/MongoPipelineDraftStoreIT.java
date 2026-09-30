@@ -202,7 +202,8 @@ class MongoPipelineDraftStoreIT {
             MongoPipelineDraftStore store = new MongoPipelineDraftStore(client, drafts, artifacts);
             drafts.insertOne(new Document("_id", "legacy").append("revision", 1L)
                     .append("name", "Legacy").append("updatedBy", "migration"));
-            assertThat(store.replace("legacy", 1, draft("legacy", 2, PipelineDraft.Mode.DAG)))
+            assertThat(store.replace("legacy", 1, draft("legacy", 2, PipelineDraft.Mode.DAG,
+                    null, null, null)))
                     .isEqualTo(PipelineDraftMutation.REPLACED);
 
             drafts.insertOne(new Document("_id", "corrupt").append("schemaVersion", 99)
