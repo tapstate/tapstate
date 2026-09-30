@@ -14,6 +14,8 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Import;
 import tools.jackson.databind.DeserializationFeature;
 
+import java.util.List;
+
 /**
  * The public assembly entry point for the whole HTTP control face: the path-prefix configuration, Spring
  * Security chains, every verb controller, the pre-authentication entry points, the anonymous probe, and the
@@ -58,13 +60,20 @@ public class ControlHttpFace {
     JsonMapperBuilderCustomizer sourceJsonContract() {
         return builder -> builder
                 .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
-                .addMixIn(SourceView.class, NonNullSourceJson.class)
+                .addMixIn(SourceView.class, SourceScopeJson.class)
                 .addMixIn(SourceTableView.class, NonNullSourceJson.class)
                 .addMixIn(SourceDraft.SourceSrs.class, NonNullSourceJson.class);
     }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
     private abstract static class NonNullSourceJson {
+    }
+
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private abstract static class SourceScopeJson {
+        // Null leaves the connection scope open; an empty list explicitly selects no tables.
+        @JsonInclude(JsonInclude.Include.ALWAYS)
+        abstract List<SourceTableView> tables();
     }
 
 }

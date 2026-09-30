@@ -114,6 +114,42 @@ class SourceApiTest {
     }
 
     @Test
+    void sourceHttpPreservesUnboundedAndEmptyTableSelectionScopes() throws Exception {
+        for (boolean explicitlyEmpty : List.of(false, true)) {
+            String id = explicitlyEmpty ? "empty_scope" : "open_scope";
+            Map<String, Object> input = new LinkedHashMap<>(Map.of(
+                    "id", id, "connector", "mysql", "mode", "cdc",
+                    "config", Map.of("host", "localhost", "port", 3306,
+                            "database", "orders", "username", "app", "password", SECRET)));
+            if (explicitlyEmpty) input.put("tables", List.of());
+            ResponseEntity<String> created = request("writer").post().uri("/api/sources")
+                    .contentType(MediaType.APPLICATION_JSON).body(input).retrieve().toEntity(String.class);
+            SourceResource stored = (SourceResource) context.getBean(InMemoryArtifactStore.class)
+                    .get(id).orElseThrow();
+            if (explicitlyEmpty) assertThat(stored.tables()).isEmpty();
+            else assertThat(stored.tables()).isNull();
+
+            ResponseEntity<String> fetched = request("reader").get().uri("/api/sources/" + id)
+                    .retrieve().toEntity(String.class);
+            for (String response : List.of(created.getBody(), fetched.getBody())) {
+                JsonNode body = JSON.readTree(response);
+                assertThat(body.has("tables")).as("the declared table-scope discriminator stays present").isTrue();
+                if (explicitlyEmpty) assertThat(body.path("tables").isArray() && body.path("tables").isEmpty()).isTrue();
+                else assertThat(body.path("tables").isNull()).isTrue();
+                assertThat(response).doesNotContain(SECRET);
+            }
+            assertThat(fetched.getHeaders().getETag()).isEqualTo(created.getHeaders().getETag());
+        }
+        JsonNode listed = JSON.readTree(request("reader").get().uri("/api/sources")
+                .retrieve().body(String.class));
+        for (JsonNode source : listed.path("items")) {
+            assertThat(source.has("tables")).isTrue();
+            if ("open_scope".equals(source.path("id").asText())) assertThat(source.path("tables").isNull()).isTrue();
+            else assertThat(source.path("tables").isArray() && source.path("tables").isEmpty()).isTrue();
+        }
+    }
+
+    @Test
     void sourceSchemaContainsOnlyTablesTheSourceSelects() throws Exception {
         create("orders", "before");
         context.getBean(InMemorySchemaStore.class).save(new DiscoveredSourceModel(
