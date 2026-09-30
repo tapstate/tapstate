@@ -148,6 +148,11 @@ final class PdkSinkWriter implements SinkWriter {
                             ? tableModel(entry.getKey(), target)
                             : TargetTapTable.bare(rows.get(0).getTableId());
                     preparation.prepare(target, table);
+                    if (target != null) {
+                        // The connector receives both a table model and record events; its write path may
+                        // route by the event table id, so both must name the resolved target collection.
+                        rows.forEach(row -> row.setTableId(target.name()));
+                    }
                     // A connector may report the batch in several flushes, one callback each; accumulate.
                     write.writeRecord(connector.context(), rows, table,
                             result -> accepted[0] += accepted(result));

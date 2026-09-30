@@ -212,6 +212,7 @@ class ConnectorApiTest {
                 .filter(c -> c.id().equals("orders")).findFirst().orElseThrow();
         assertThat(orders.origin()).isEqualTo("registered");
         assertThat(orders.modes()).contains("snapshot");
+        assertThat(orders.writeModes()).isEmpty();
         assertThat(orders.icon()).isEqualTo("icons/orders.png");
     }
 

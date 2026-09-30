@@ -70,8 +70,8 @@ class CliFaceProjectionGatesTest {
      * The registered operations the CLI does not project, each a deliberate deferral rather than an
      * oversight. The security domain has no face anywhere — no command and no endpoint — so nothing
      * invokes those verbs today; the first administrator is created through the bootstrap entry point
-     * instead. The frontend-only source and connector detail and icon faces are HTTP contracts with no
-     * command shape yet.
+     * instead. Frontend-only source and connector details/icons, the unified Pipeline catalog, and
+     * Pipeline draft authoring/rebase endpoints are HTTP contracts with no command shape yet.
      *
      * <p>An entry here is a reviewed decision, not a running to-do list: an operation added to the
      * registry with no verb must turn this gate red, and deleting its entry is how it earns one.
@@ -82,6 +82,9 @@ class CliFaceProjectionGatesTest {
             "source.create", "source.delete", "source.draft", "source.get", "source.list", "source.schema",
             "source.update",
             "pipeline.get", "pipeline.list", "pipeline.layout.get", "pipeline.layout.update", "pipeline.create", "pipeline.update",
+            "pipeline.catalog",
+            "pipeline-draft.list", "pipeline-draft.get", "pipeline-draft.create", "pipeline-draft.replace",
+            "pipeline-draft.delete", "pipeline-draft.preview", "pipeline-draft.publish", "pipeline-draft.rebase",
             "user.create", "user.passwd", "user.list");
 
     @Test

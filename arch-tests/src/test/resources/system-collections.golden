@@ -19,6 +19,7 @@ connector_artifacts (gridfs) | store | MongoConnectorRegistry | immutable | 0 | 
 srs_meta | store | MongoSrsMetaStore | migrated | 0 | -
 system_meta | store | MongoConnection | migrated | 1 | -
 pipeline_layouts | store | MongoPipelineLayoutStore | migrated | 0 | -
+pipeline_drafts | store | MongoPipelineDraftStore | migrated | 0 | revision, updatedAt
 srs_log | store | MongoSrsLogStore | owned-elsewhere | 0 | -
 derived_schemas | store | MongoDerivedSchemaStore | migrated | 0 | -
 pipeline_rate_history | store | MongoRateHistoryStore | migrated | 9 | observedAt (ttl 1296000s), pipelineId+observedAt+_id
