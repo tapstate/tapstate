@@ -712,7 +712,9 @@ public final class PipelineDraftCompiler {
             if (!regex) {
                 return sourceId + "." + table;
             }
-            String pattern = isRegexReference(table) ? table.substring(1, table.length() - 1) : table;
+            String selectedTable = Objects.requireNonNull(table, "table");
+            String pattern = isRegexReference(selectedTable)
+                    ? selectedTable.substring(1, selectedTable.length() - 1) : selectedTable;
             if (pattern.startsWith("^")) {
                 pattern = pattern.substring(1);
             }

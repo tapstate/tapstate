@@ -13,6 +13,7 @@ import java.util.Map;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class PipelineDraftStoreContractTest {
 
@@ -75,6 +76,25 @@ class PipelineDraftStoreContractTest {
         assertThat(store.get("orders").orElseThrow().revision()).isEqualTo(2);
         assertThat(store.replace("orders", 1, draft(PipelineDraft.Mode.DAG, 2, graphWithNode("stale"), null)))
                 .isEqualTo(PipelineDraftMutation.REVISION_CONFLICT);
+    }
+
+    @Test
+    void defaultDraftPagesValidateBoundsAndReturnImmutableSlices() {
+        InMemoryDraftStore store = new InMemoryDraftStore();
+        store.create(draft(PipelineDraft.Mode.DAG, 1, graph(), null));
+
+        assertThat(store.listSummaries()).hasSize(1)
+                .extracting(PipelineDraftSummary::pipelineId).containsExactly("orders");
+        assertThat(store.listSummaries(0, 1)).hasSize(1);
+        assertThat(store.listSummaries(1, 1)).isEmpty();
+        assertThat(store.list(0, 1)).hasSize(1);
+        assertThat(store.list(1, 1)).isEmpty();
+        assertThatThrownBy(() -> store.listSummaries(-1, 1))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("draft page offset must be non-negative and limit must be positive");
+        assertThatThrownBy(() -> store.list(0, 0))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("draft page offset must be non-negative and limit must be positive");
     }
 
     private static PipelineDraft draft(PipelineDraft.Mode mode, long revision, PipelineDraft.Graph graph,

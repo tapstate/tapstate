@@ -399,6 +399,86 @@ class PipelineApiTest {
     }
 
     @Test
+    void draftReadPreviewAndSummaryRoutesExposeThePersistedAuthoringState() {
+        String token = machineToken(Scope.WRITE);
+        String draft = """
+                {"pipelineId":"preview-draft","mode":"wizard","name":"Preview orders",
+                 "wizard":{"root":{"id":"orders","sourceId":"crm","table":"orders",
+                   "key":["id"],"preTransforms":[]},"related":[],"transforms":[],
+                   "output":{"kind":"atlas","config":{"sourceId":"atlas","table":"orders_output"}}}}
+                """;
+        client().post().uri("/api/pipelines/preview-draft/draft")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(draft).retrieve().toBodilessEntity();
+
+        ResponseEntity<Map> fetched = client().get().uri("/api/pipelines/preview-draft/draft")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token).retrieve().toEntity(Map.class);
+        assertThat(fetched.getHeaders().getETag()).isEqualTo("\"1\"");
+        assertThat(fetched.getBody()).containsEntry("pipelineId", "preview-draft")
+                .containsEntry("mode", "wizard");
+
+        ResponseEntity<Map> preview = client().post().uri("/api/pipelines/preview-draft/draft:preview")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token).retrieve().toEntity(Map.class);
+        assertThat(preview.getBody()).containsEntry("pipelineId", "preview-draft")
+                .containsEntry("revision", 1).containsKey("artifact").containsKey("dsl");
+
+        ResponseEntity<Map> summaries = client().get().uri("/api/pipeline-drafts?limit=10&offset=0")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(Map.class);
+        List<?> items = (List<?>) summaries.getBody().get("items");
+        assertThat(items).singleElement().satisfies(item -> {
+            Map<?, ?> summary = (Map<?, ?>) item;
+            assertThat(summary.get("pipelineId")).isEqualTo("preview-draft");
+            assertThat(summary.get("name")).isEqualTo("Preview orders");
+            assertThat(summary.get("mode")).isEqualTo("wizard");
+            assertThat(summary.get("revision")).isEqualTo(1);
+        });
+
+        ResponseEntity<Map> artifacts = client().get().uri("/api/pipelines:artifacts?limit=10&offset=0")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(Map.class);
+        assertThat(artifacts.getBody()).containsKey("items");
+    }
+
+    @Test
+    void rebaseRequiresARevisionAndAnExplicitArtifactHashValue() {
+        String token = machineToken(Scope.WRITE);
+        String draft = """
+                {"pipelineId":"rebase-draft","mode":"dag","name":"Orders",
+                 "graph":{"nodes":[],"edges":[],"viewport":{"x":0,"y":0,"zoom":1}}}
+                """;
+        client().post().uri("/api/pipelines/rebase-draft/draft")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(draft).retrieve().toBodilessEntity();
+
+        ApiError missingEtag = client().put().uri("/api/pipelines/rebase-draft/draft")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(draft)
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.PRECONDITION_REQUIRED);
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(missingEtag.code()).isEqualTo("pipeline-draft.precondition-required");
+
+        ApiError invalidHash = client().post().uri("/api/pipelines/rebase-draft/draft:rebase")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body("{\"revision\":1,\"artifactHash\":7}")
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(invalidHash.code()).isEqualTo("control.malformed-request");
+
+        ResponseEntity<Map> rebased = client().post().uri("/api/pipelines/rebase-draft/draft:rebase")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body("{\"revision\":1,\"artifactHash\":null}")
+                .retrieve().toEntity(Map.class);
+        assertThat(rebased.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(rebased.getHeaders().getETag()).isEqualTo("\"2\"");
+        assertThat(rebased.getBody()).containsEntry("revision", 2);
+    }
+
+    @Test
     void wizardDraftRoundTripsLowerCaseRelationShapes() {
         String token = machineToken(Scope.WRITE);
         String draft = """
