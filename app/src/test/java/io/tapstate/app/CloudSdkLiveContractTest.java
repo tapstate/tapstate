@@ -4,10 +4,15 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import io.jsonwebtoken.Jwts;
 import io.tapstate.control.core.CloudRuntimeStatus;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CloudSessionIdentity;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -25,6 +30,7 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Runs the real Cloud SDK against the current C1, JWKS, callback, and C2 wire shapes. */
 class CloudSdkLiveContractTest {
@@ -33,6 +39,47 @@ class CloudSdkLiveContractTest {
     private static final String CLUSTER = "cluster-one";
     private static final String TOKEN = "shared-static-token-sentinel";
     private static final String KID = "test-key-one";
+
+    @Test
+    void exchangeFailuresLogTheirStatusAndCodeWithoutProviderPayloads() throws Exception {
+        AtomicReference<String> failureCode = new AtomicReference<>("exchange.code-expired");
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/api/auth/exchange", exchange -> respond(exchange, 401, Map.of(
+                "code", failureCode.get(), "msg", "provider-message-secret-sentinel",
+                "data", Map.of("jwt", "provider-jwt-secret-sentinel"))));
+        server.start();
+        Logger logger = (Logger) LoggerFactory.getLogger(CloudSdkBridge.class);
+        ListAppender<ILoggingEvent> captured = new ListAppender<>();
+        captured.start();
+        logger.addAppender(captured);
+        try {
+            CloudProperties properties = new CloudProperties();
+            properties.setBaseUrl("http://127.0.0.1:" + server.getAddress().getPort());
+            properties.setToken(TOKEN);
+            properties.setAtlasUri("mongodb://user:secret@atlas.example/cluster_meta");
+            properties.setClusterId(CLUSTER);
+            CloudSdkBridge bridge = new CloudSdkBridge(CloudRuntimeSettings.resolve(properties));
+            for (String suppliedCode : List.of("exchange.code-expired", "provider-code-secret-sentinel\nforged-log")) {
+                failureCode.set(suppliedCode);
+                assertThatThrownBy(() -> bridge.exchange("request-code-secret-sentinel", CLUSTER))
+                        .isInstanceOf(TapstateException.class).hasNoCause();
+            }
+            assertThat(captured.list).extracting(ILoggingEvent::getFormattedMessage)
+                    .containsExactly(
+                            "Cloud SDK code exchange failed [http=401, code=exchange.code-expired]",
+                            "Cloud SDK code exchange failed [http=401, code=unclassified]");
+            for (ILoggingEvent event : captured.list) {
+                assertThat(event.getFormattedMessage()).doesNotContain(
+                        TOKEN, "request-code-secret-sentinel", "provider-message-secret-sentinel",
+                        "provider-jwt-secret-sentinel", "provider-code-secret-sentinel", "atlas.example");
+                assertThat(event.getThrowableProxy()).isNull();
+            }
+        } finally {
+            logger.detachAppender(captured);
+            captured.stop();
+            server.stop(0);
+        }
+    }
 
     @Test
     void oneStaticTokenDrivesCodeExchangeAndStatusWhileTheSdkVerifiesJwtAndCallback() throws Exception {
@@ -156,9 +203,13 @@ class CloudSdkLiveContractTest {
     }
 
     private static void respond(HttpExchange exchange, Map<String, ?> body) throws IOException {
+        respond(exchange, 200, body);
+    }
+
+    private static void respond(HttpExchange exchange, int status, Map<String, ?> body) throws IOException {
         byte[] bytes = JSON.writeValueAsBytes(body);
         exchange.getResponseHeaders().set("Content-Type", "application/json");
-        exchange.sendResponseHeaders(200, bytes.length);
+        exchange.sendResponseHeaders(status, bytes.length);
         exchange.getResponseBody().write(bytes);
         exchange.close();
     }

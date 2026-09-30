@@ -17,6 +17,8 @@ import io.tapstate.control.core.CloudStatusSender;
 import io.tapstate.control.core.Scope;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CloudSessionIdentity;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
 import java.util.List;
@@ -29,6 +31,7 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
         CloudSessionCallbackVerifier, CloudStatusSender {
 
     static final String DEPLOYMENT_ORGANIZATION = "sdk-verified-cluster";
+    private static final Logger LOG = LoggerFactory.getLogger(CloudSdkBridge.class);
     private static final String AUDIENCE_SUFFIX = ".api.tapstate.io";
 
     private final CloudRuntimeSettings settings;
@@ -130,6 +133,17 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
         return new TapstateException(BootError.CLOUD_STATUS_SDK_REQUIRED, Map.of(), null);
     }
 
+    private static void logExchangeFailure(CloudControlPlaneException failure) {
+        String code = failure.getErrorCode();
+        String diagnostic = code != null && code.length() <= 128
+                && code.matches("(?:sdk|exchange|c2)\\.[a-z0-9]+(?:-[a-z0-9]+)*")
+                ? code : "unclassified";
+        int status = failure.getHttpStatus();
+        if (status < 0 || status > 599) status = 0;
+        // Provider messages, response bodies and exception causes can contain authentication inputs.
+        LOG.warn("Cloud SDK code exchange failed [http={}, code={}]", status, diagnostic);
+    }
+
     interface SdkRuntime {
         ExchangeResult exchange(String code);
         VerifiedClaims verify(String jwt);
@@ -176,6 +190,7 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
             try {
                 return new ExchangeResult(sdk.exchangeForJwt(code).jwt());
             } catch (CloudControlPlaneException failure) {
+                logExchangeFailure(failure);
                 throw new ProviderFailure();
             }
         }
