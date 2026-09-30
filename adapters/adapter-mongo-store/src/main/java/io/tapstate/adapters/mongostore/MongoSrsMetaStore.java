@@ -20,6 +20,8 @@ import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.WorkloadClaimType;
 import org.bson.Document;
 
 import java.time.Clock;
@@ -41,8 +43,9 @@ import java.util.function.Supplier;
  * document until its own source position can no longer move.
  *
  * <p>A consumer document holds everything belonging to one pipeline rather than to the chain: its read
- * cursor, each sink writer's progress and their derived acked position, the tables whose initial load all
- * expected writers have confirmed, and the seam and generation at which its load began. Records written
+ * cursor, each sink writer's progress and their derived acked position, the exact workload claim allowed
+ * to advance that progress, the tables whose initial load all expected writers have confirmed, and the
+ * seam and generation at which its load began. Records written
  * before that split carried those documents under the
  * chain's {@code consumerOffsets} field. The first consumer write migrates them; a chain write that finds
  * an old record already at the endpoint ceiling does the same and retries. The copy is insert-only and the
@@ -80,8 +83,15 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     /** Each sink writer's progress, kept apart until every writer has reached a position. */
     private static final String SINK_WRITER_PROGRESS = "sinkWriterProgress";
 
+    /** The exact pipeline run allowed to advance this consumer's irreversible sink progress. */
+    static final String SINK_ACK_FENCE = "sinkAckFence";
+
     private static final String WRITER_RING_DONE = "ringDone";
     private static final String WRITER_SNAPSHOT_COMPLETE = "snapshotComplete";
+
+    /** A real write, so a takeover and a fenced sink effect conflict on the same claim document. */
+    private static final Document PROVE_SINK_CLAIM =
+            new Document("$inc", new Document("fencedSinkEffects", 1L));
 
     /**
      * How much of a chain's schema history the record retains, in bytes of stored entries.
@@ -110,31 +120,60 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
 
     private final MongoCollection<Document> collection;
     private final MongoCollection<Document> consumers;
+    private final MongoCollection<Document> workloadClaims;
     private final MongoClient client;
     private final Clock clock;
 
     public MongoSrsMetaStore(MongoClient client, MongoCollection<Document> collection) {
-        this(client, collection, collection, Clock.systemUTC());
+        this(client, collection, collection, workloadClaims(client, collection), Clock.systemUTC());
     }
 
     /** The same store reading a given clock, for a caller that needs the recorded time to be decidable. */
     public MongoSrsMetaStore(MongoClient client, MongoCollection<Document> collection, Clock clock) {
-        this(client, collection, collection, clock);
+        this(client, collection, collection, workloadClaims(client, collection), clock);
     }
 
     /** A store whose chain roots and per-consumer cursors live in their declared collections. */
     public MongoSrsMetaStore(
             MongoClient client, MongoCollection<Document> collection, MongoCollection<Document> consumers) {
-        this(client, collection, consumers, Clock.systemUTC());
+        this(client, collection, consumers, workloadClaims(client, collection), Clock.systemUTC());
+    }
+
+    /** A store using the supplied coordination collection for atomic sink-claim proofs. */
+    public MongoSrsMetaStore(
+            MongoClient client,
+            MongoCollection<Document> collection,
+            MongoCollection<Document> consumers,
+            MongoCollection<Document> workloadClaims) {
+        this(client, collection, consumers, workloadClaims, Clock.systemUTC());
     }
 
     /** The same two-collection store reading a given clock. */
     MongoSrsMetaStore(MongoClient client, MongoCollection<Document> collection,
             MongoCollection<Document> consumers, Clock clock) {
+        this(client, collection, consumers, workloadClaims(client, collection), clock);
+    }
+
+    private MongoSrsMetaStore(
+            MongoClient client,
+            MongoCollection<Document> collection,
+            MongoCollection<Document> consumers,
+            MongoCollection<Document> workloadClaims,
+            Clock clock) {
         this.client = Objects.requireNonNull(client, "client");
         this.collection = Objects.requireNonNull(collection, "collection");
         this.consumers = Objects.requireNonNull(consumers, "consumers");
+        this.workloadClaims = Objects.requireNonNull(workloadClaims, "workloadClaims");
         this.clock = Objects.requireNonNull(clock, "clock");
+    }
+
+    /** The declared claim collection beside {@code collection}, used by convenience constructors. */
+    private static MongoCollection<Document> workloadClaims(
+            MongoClient client, MongoCollection<Document> collection) {
+        Objects.requireNonNull(client, "client");
+        Objects.requireNonNull(collection, "collection");
+        return SystemCollections.WORKLOAD_CLAIMS.on(
+                client.getDatabase(collection.getNamespace().getDatabaseName()));
     }
 
     @Override
@@ -300,16 +339,74 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
 
     @Override
     public void advanceSinkAcked(
+            String miningChainId,
+            String pipelineId,
+            ChainPosition position,
+            WorkloadClaimFence fence) {
+        Objects.requireNonNull(position, "position");
+        Objects.requireNonNull(position.order(), "position order");
+        mutateConsumer(miningChainId, pipelineId, fence, consumer -> {
+            if (!sinkAckFenceMatches(consumer, pipelineId, fence)) {
+                return false;
+            }
+            writePosition(consumer, position);
+            return true;
+        });
+    }
+
+    @Override
+    public void advanceSinkAcked(
             String miningChainId, String pipelineId, String table, ChainPosition position) {
         updateConsumer(miningChainId, pipelineId, sinkAckedUpdate(pipelineId, table, position));
+    }
+
+    @Override
+    public void advanceSinkAcked(
+            String miningChainId,
+            String pipelineId,
+            String table,
+            ChainPosition position,
+            WorkloadClaimFence fence) {
+        Objects.requireNonNull(table, "table");
+        Objects.requireNonNull(position, "position");
+        Objects.requireNonNull(position.order(), "position order");
+        mutateConsumer(miningChainId, pipelineId, fence, consumer -> {
+            if (!sinkAckFenceMatches(consumer, pipelineId, fence)) {
+                return false;
+            }
+            writePosition(consumer, position);
+            if (position.order().seq() >= 0) {
+                Document rings = nestedDocument(consumer, PER_TABLE_RING_DONE, pipelineId, true);
+                Object raw = rings.get(table);
+                long done = raw instanceof Number number ? number.longValue() : Long.MIN_VALUE;
+                rings.put(table, Math.max(done, position.order().seq()));
+            }
+            return true;
+        });
     }
 
     @Override
     public void configureSinkWriters(
             String miningChainId, String pipelineId, Map<String, List<String>> writerIdsByTable) {
         Objects.requireNonNull(writerIdsByTable, "writerIdsByTable");
-        mutateConsumer(miningChainId, pipelineId,
-                consumer -> configureSinkWriters(consumer, pipelineId, writerIdsByTable));
+        mutateConsumer(miningChainId, pipelineId, consumer -> {
+            configureSinkWriters(consumer, pipelineId, writerIdsByTable);
+            return true;
+        });
+    }
+
+    @Override
+    public void configureSinkWriters(
+            String miningChainId,
+            String pipelineId,
+            Map<String, List<String>> writerIdsByTable,
+            WorkloadClaimFence fence) {
+        Objects.requireNonNull(writerIdsByTable, "writerIdsByTable");
+        mutateConsumer(miningChainId, pipelineId, fence, consumer -> {
+            bindSinkAckFence(consumer, pipelineId, fence);
+            configureSinkWriters(consumer, pipelineId, writerIdsByTable);
+            return true;
+        });
     }
 
     @Override
@@ -321,8 +418,29 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             ChainPosition position) {
         Objects.requireNonNull(position, "position");
         Objects.requireNonNull(position.order(), "position order");
-        mutateConsumer(miningChainId, pipelineId,
-                consumer -> advanceSinkWriter(consumer, pipelineId, writerId, table, position));
+        mutateConsumer(miningChainId, pipelineId, consumer -> {
+            advanceSinkWriter(consumer, pipelineId, writerId, table, position);
+            return true;
+        });
+    }
+
+    @Override
+    public void advanceSinkWriterAcked(
+            String miningChainId,
+            String pipelineId,
+            String writerId,
+            String table,
+            ChainPosition position,
+            WorkloadClaimFence fence) {
+        Objects.requireNonNull(position, "position");
+        Objects.requireNonNull(position.order(), "position order");
+        mutateConsumer(miningChainId, pipelineId, fence, consumer -> {
+            if (!sinkAckFenceMatches(consumer, pipelineId, fence)) {
+                return false;
+            }
+            advanceSinkWriter(consumer, pipelineId, writerId, table, position);
+            return true;
+        });
     }
 
     @Override
@@ -340,7 +458,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         mutateConsumer(miningChainId, pipelineId, consumer -> {
             Document rings = nestedDocument(consumer, PER_TABLE_RING_DONE, pipelineId, true);
             if (rings.containsKey(table)) {
-                return;
+                return false;
             }
             rings.put(table, seq);
             Document perTable = nestedDocument(consumer, "perTableSeq", pipelineId, true);
@@ -356,6 +474,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                     writer.putIfAbsent(WRITER_RING_DONE, seq);
                 }
             }
+            return true;
         });
     }
 
@@ -560,6 +679,56 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                 completed.add(storedTable);
                 consumer.put("snapshotCompletedTables", completed);
             }
+        }
+    }
+
+    /** Adds one direct snapshot-completion mark, answering whether the consumer changed. */
+    private static boolean markSnapshotComplete(Document consumer, String table) {
+        Objects.requireNonNull(table, "table");
+        List<String> completed = new ArrayList<>(snapshotCompletedFrom(consumer));
+        if (completed.contains(table)) {
+            return false;
+        }
+        completed.add(table);
+        consumer.put("snapshotCompletedTables", completed);
+        return true;
+    }
+
+    /** The persisted run identity beside sink progress; kept exact as a document-shape contract. */
+    static Document sinkAckFenceDocument(String pipelineId, WorkloadClaimFence fence) {
+        requirePipelineFence(pipelineId, fence);
+        return WorkloadClaimDocuments.stored(fence);
+    }
+
+    /** Binds later sink progress in this consumer to the exact run that configured its writer plan. */
+    private static void bindSinkAckFence(
+            Document consumer, String pipelineId, WorkloadClaimFence fence) {
+        consumer.put(SINK_ACK_FENCE, sinkAckFenceDocument(pipelineId, fence));
+    }
+
+    /** Whether this consumer is still bound to the run carrying the acknowledgement. */
+    private static boolean sinkAckFenceMatches(
+            Document consumer, String pipelineId, WorkloadClaimFence fence) {
+        Document expected = sinkAckFenceDocument(pipelineId, fence);
+        Object stored = consumer.get(SINK_ACK_FENCE);
+        if (stored == null) {
+            return false;
+        }
+        if (!(stored instanceof Document document)) {
+            throw unreadableConsumer(pipelineId, SINK_ACK_FENCE);
+        }
+        return expected.equals(document);
+    }
+
+    /** A sink fence is a submitted execution of this exact pipeline, never another workload type. */
+    private static void requirePipelineFence(String pipelineId, WorkloadClaimFence fence) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(fence, "fence");
+        if (fence.key().type() != WorkloadClaimType.PIPELINE_ACTUATION
+                || !pipelineId.equals(fence.key().resourceId())
+                || fence.executionGeneration() < 1) {
+            throw new IllegalArgumentException(
+                    "a sink acknowledgement fence must name this pipeline's submitted execution");
         }
     }
 
@@ -831,10 +1000,39 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     @Override
+    public void markSnapshotComplete(
+            String miningChainId, String pipelineId, String table, WorkloadClaimFence fence) {
+        mutateConsumer(miningChainId, pipelineId, fence, consumer -> {
+            if (!sinkAckFenceMatches(consumer, pipelineId, fence)) {
+                return false;
+            }
+            return markSnapshotComplete(consumer, table);
+        });
+    }
+
+    @Override
     public void markSinkWriterSnapshotComplete(
             String miningChainId, String pipelineId, String writerId, String table) {
-        mutateConsumer(miningChainId, pipelineId,
-                consumer -> markSinkWriterSnapshotComplete(consumer, pipelineId, writerId, table));
+        mutateConsumer(miningChainId, pipelineId, consumer -> {
+            markSinkWriterSnapshotComplete(consumer, pipelineId, writerId, table);
+            return true;
+        });
+    }
+
+    @Override
+    public void markSinkWriterSnapshotComplete(
+            String miningChainId,
+            String pipelineId,
+            String writerId,
+            String table,
+            WorkloadClaimFence fence) {
+        mutateConsumer(miningChainId, pipelineId, fence, consumer -> {
+            if (!sinkAckFenceMatches(consumer, pipelineId, fence)) {
+                return false;
+            }
+            markSinkWriterSnapshotComplete(consumer, pipelineId, writerId, table);
+            return true;
+        });
     }
 
     /**
@@ -954,24 +1152,33 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      */
     private void mutateConsumer(
             String miningChainId, String pipelineId, ConsumerDocumentMutation mutation) {
+        mutateConsumer(miningChainId, pipelineId, null, mutation);
+    }
+
+    private void mutateConsumer(
+            String miningChainId,
+            String pipelineId,
+            WorkloadClaimFence fence,
+            ConsumerDocumentMutation mutation) {
         Objects.requireNonNull(miningChainId, "miningChainId");
         Objects.requireNonNull(pipelineId, "pipelineId");
         migrateLegacyConsumers(miningChainId, true);
-        writeConsumer(miningChainId, session -> {
+        writeConsumer(miningChainId, fence, session -> {
             Document key = consumerKey(miningChainId, pipelineId);
             Document consumer = consumers.find(session, key).first();
             if (consumer == null) {
                 consumer = new Document(key);
                 consumer.putAll(consumerIdentity(miningChainId, pipelineId));
             }
-            mutation.apply(consumer);
-            consumers.replaceOne(session, key, consumer, new ReplaceOptions().upsert(true));
+            if (mutation.apply(consumer)) {
+                consumers.replaceOne(session, key, consumer, new ReplaceOptions().upsert(true));
+            }
         });
     }
 
     @FunctionalInterface
     private interface ConsumerDocumentMutation {
-        void apply(Document consumer);
+        boolean apply(Document consumer);
     }
 
     /**
@@ -981,13 +1188,28 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * retry finds no root and refuses the mutation; if this write wins, the later drop removes its cursor.
      */
     private void writeConsumer(String miningChainId, ConsumerWrite write) {
+        writeConsumer(miningChainId, null, write);
+    }
+
+    /**
+     * The claim proof, root lifecycle fence and consumer write are one transaction. Proving the claim is a
+     * write, so a concurrent takeover conflicts with it; whichever commits first decides whether the sink
+     * effect belongs to the old run or is silently ignored as stale.
+     */
+    private void writeConsumer(
+            String miningChainId, WorkloadClaimFence fence, ConsumerWrite write) {
         StoreIo.run(miningChainId, () -> {
             try (ClientSession session = client.startSession()) {
                 session.withTransaction(() -> {
-                    UpdateResult fenced = collection.updateOne(session,
+                    if (fence != null && workloadClaims.updateOne(
+                            session, WorkloadClaimDocuments.live(fence), PROVE_SINK_CLAIM)
+                            .getMatchedCount() != 1) {
+                        return null;
+                    }
+                    UpdateResult rooted = collection.updateOne(session,
                             new Document("_id", miningChainId),
                             new Document("$inc", new Document(CONSUMER_WRITE_REVISION, 1L)));
-                    if (fenced.getMatchedCount() == 0) {
+                    if (rooted.getMatchedCount() == 0) {
                         throw unseededChain(miningChainId);
                     }
                     write.apply(session);

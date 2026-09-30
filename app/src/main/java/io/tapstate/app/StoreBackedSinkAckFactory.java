@@ -8,6 +8,7 @@ import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.SrsDurableFrontier;
 import io.tapstate.spi.store.SrsMetaStore;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -144,30 +145,50 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                 : new WriterBinding(writerId, writerStreams, writerIdsByStream);
         ConcurrentMap<String, Boolean> configuredMiningChains = new ConcurrentHashMap<>();
         Map<String, ChainPosition> recorded = new ConcurrentHashMap<>();
-        return (chain, position) -> {
-            String miningChainId = chainIdByTable.get(chain);
-            if (miningChainId == null) {
-                throw new IllegalStateException(
-                        "sink acked a chain the pipeline never sourced: '" + chain + "'");
+        return new SinkAck() {
+            @Override
+            public void advance(String chain, ChainPosition position) {
+                advance(chain, position, null);
             }
-            if (!writer.streams().contains(chain)) {
-                throw new IllegalStateException("sink writer '" + writer.id()
-                        + "' acked a chain it does not receive: '" + chain + "'");
-            }
-            ensureConfigured(meta, writer, miningChainId, configuredMiningChains);
-            String token = position.token() != null ? position.token()
-                    : isSnapshotOf(position) ? cdcStart(meta, miningChainId, pipelineId) : null;
-            ChainPosition acked = new ChainPosition(position.order(), token);
-            if (isSnapshotOf(position)) {
-                meta.advanceSinkWriterAcked(miningChainId, pipelineId, writer.id(), chain, acked);
-                meta.markSinkWriterSnapshotComplete(miningChainId, pipelineId, writer.id(), chain);
-            } else {
-                // A change is also recorded against its own table's ring, at the sequence it sat at there,
-                // so a run replacing this one carries on from it instead of from the head of the ring.
-                meta.advanceSinkWriterAcked(miningChainId, pipelineId, writer.id(), chain, acked);
-                recordHowFarTheSourceHasBeenRead(meta, miningChainId, acked, recorded);
+
+            @Override
+            public void advance(String chain, ChainPosition position, WorkloadClaimFence fence) {
+                acknowledge(meta, writer, configuredMiningChains, recorded, chain, position, fence);
             }
         };
+    }
+
+    /** Maps one engine acknowledgement to the durable consumer write under the claim that admitted it. */
+    private void acknowledge(
+            SrsMetaStore meta,
+            WriterBinding writer,
+            ConcurrentMap<String, Boolean> configuredMiningChains,
+            Map<String, ChainPosition> recorded,
+            String chain,
+            ChainPosition position,
+            WorkloadClaimFence fence) {
+        String miningChainId = chainIdByTable.get(chain);
+        if (miningChainId == null) {
+            throw new IllegalStateException(
+                    "sink acked a chain the pipeline never sourced: '" + chain + "'");
+        }
+        if (!writer.streams().contains(chain)) {
+            throw new IllegalStateException("sink writer '" + writer.id()
+                    + "' acked a chain it does not receive: '" + chain + "'");
+        }
+        ensureConfigured(meta, writer, miningChainId, configuredMiningChains, fence);
+        String token = position.token() != null ? position.token()
+                : isSnapshotOf(position) ? cdcStart(meta, miningChainId, pipelineId) : null;
+        ChainPosition acked = new ChainPosition(position.order(), token);
+        if (isSnapshotOf(position)) {
+            advanceWriterAck(meta, miningChainId, writer.id(), chain, acked, fence);
+            markWriterSnapshotComplete(meta, miningChainId, writer.id(), chain, fence);
+        } else {
+            // A change is also recorded against its own table's ring, at the sequence it sat at there,
+            // so a run replacing this one carries on from it instead of from the head of the ring.
+            advanceWriterAck(meta, miningChainId, writer.id(), chain, acked, fence);
+            recordHowFarTheSourceHasBeenRead(meta, miningChainId, acked, recorded);
+        }
     }
 
     /**
@@ -194,7 +215,8 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
             SrsMetaStore meta,
             WriterBinding writer,
             String miningChainId,
-            ConcurrentMap<String, Boolean> configuredMiningChains) {
+            ConcurrentMap<String, Boolean> configuredMiningChains,
+            WorkloadClaimFence fence) {
         configuredMiningChains.computeIfAbsent(miningChainId, ignored -> {
             Map<String, List<String>> plan = writer.plan();
             if (plan == null) {
@@ -202,7 +224,7 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                     plan = copyPlan(resolvedWriterIdsByStream);
                 }
             }
-            configure(meta, miningChainId, plan);
+            configure(meta, miningChainId, plan, fence);
             return Boolean.TRUE;
         });
     }
@@ -210,6 +232,14 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
     /** Registers the complete table-to-writer plan for {@code miningChainId} without touching another. */
     private void configure(
             SrsMetaStore meta, String miningChainId, Map<String, List<String>> plan) {
+        configure(meta, miningChainId, plan, null);
+    }
+
+    private void configure(
+            SrsMetaStore meta,
+            String miningChainId,
+            Map<String, List<String>> plan,
+            WorkloadClaimFence fence) {
         Map<String, List<String>> writersByTable = new LinkedHashMap<>();
         for (Map.Entry<String, List<String>> entry : plan.entrySet()) {
             String entryMiningChainId = chainIdByTable.get(entry.getKey());
@@ -225,7 +255,38 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
             throw new IllegalStateException(
                     "sink writer plan names no stream on mining chain '" + miningChainId + "'");
         }
-        meta.configureSinkWriters(miningChainId, pipelineId, writersByTable);
+        if (fence == null) {
+            meta.configureSinkWriters(miningChainId, pipelineId, writersByTable);
+        } else {
+            meta.configureSinkWriters(miningChainId, pipelineId, writersByTable, fence);
+        }
+    }
+
+    private void advanceWriterAck(
+            SrsMetaStore meta,
+            String miningChainId,
+            String writerId,
+            String table,
+            ChainPosition acked,
+            WorkloadClaimFence fence) {
+        if (fence == null) {
+            meta.advanceSinkWriterAcked(miningChainId, pipelineId, writerId, table, acked);
+        } else {
+            meta.advanceSinkWriterAcked(miningChainId, pipelineId, writerId, table, acked, fence);
+        }
+    }
+
+    private void markWriterSnapshotComplete(
+            SrsMetaStore meta,
+            String miningChainId,
+            String writerId,
+            String table,
+            WorkloadClaimFence fence) {
+        if (fence == null) {
+            meta.markSinkWriterSnapshotComplete(miningChainId, pipelineId, writerId, table);
+        } else {
+            meta.markSinkWriterSnapshotComplete(miningChainId, pipelineId, writerId, table, fence);
+        }
     }
 
     private static Map<String, List<String>> copyPlan(Map<String, List<String>> plan) {

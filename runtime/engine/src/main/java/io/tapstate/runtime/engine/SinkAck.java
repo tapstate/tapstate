@@ -1,6 +1,7 @@
 package io.tapstate.runtime.engine;
 
 import io.tapstate.core.event.ChainPosition;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import java.io.Serializable;
 
 /**
@@ -32,4 +33,13 @@ public interface SinkAck extends Serializable {
      * lowers, so the store persists what it is given.
      */
     void advance(String chain, ChainPosition position);
+
+    /**
+     * Advances with the exact live workload claim the member admitted this call under. Implementations that
+     * cross a durable boundary override this to prove the claim in the same operation as the watermark;
+     * other acknowledgements retain their ordinary two-coordinate contract.
+     */
+    default void advance(String chain, ChainPosition position, WorkloadClaimFence fence) {
+        advance(chain, position);
+    }
 }
