@@ -63,6 +63,14 @@ final class BenchmarkLiveReport {
         persist();
     }
 
+    void completeDiagnostic(Map<String, Object> summary) {
+        document.put("diagnosticSummary", summary);
+        document.put("acceptanceEvaluated", false);
+        document.put("status", "DIAGNOSTIC_COMPLETE");
+        document.put("finishedAt", Instant.now().toString());
+        persist();
+    }
+
     void fail(Throwable failure) {
         Map<String, Object> error = new LinkedHashMap<>();
         error.put("type", failure.getClass().getName());

@@ -212,7 +212,7 @@ class PipelineBenchmarkLiveRunIT {
         return inputs;
     }
 
-    private static Map<String, Object> artifact(Path path) {
+    static Map<String, Object> artifact(Path path) {
         Path absolute = path.toAbsolutePath().normalize();
         try {
             return object("path", absolute.toString(), "sizeBytes", Files.size(absolute),
@@ -278,7 +278,7 @@ class PipelineBenchmarkLiveRunIT {
                 "architecture", values[4]);
     }
 
-    private static List<Map<String, Object>> workloads() {
+    static List<Map<String, Object>> workloads() {
         List<Map<String, Object>> all = new ArrayList<>();
         for (BenchmarkWorkloadDefinitions.Workload workload : BenchmarkWorkloadDefinitions.all()) {
             List<Map<String, Object>> phases = new ArrayList<>();
@@ -306,7 +306,7 @@ class PipelineBenchmarkLiveRunIT {
         return List.copyOf(all);
     }
 
-    private static Map<String, Object> fork(RealBenchmarkForkDriver.Evidence evidence,
+    static Map<String, Object> fork(RealBenchmarkForkDriver.Evidence evidence,
             PipelineBenchmarkHarness.ForkResult result, Instant startedAt) {
         PipelineBenchmarkComparison.Fork performance = result.measurement();
         BenchmarkAckOracle.Fork correctness = result.correctness();

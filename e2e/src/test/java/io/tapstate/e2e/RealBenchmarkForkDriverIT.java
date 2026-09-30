@@ -1,6 +1,5 @@
 package io.tapstate.e2e;
 
-import com.mongodb.ConnectionString;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.testsupport.DockerGate;
 import org.junit.jupiter.api.Assumptions;
@@ -20,7 +19,6 @@ class RealBenchmarkForkDriverIT {
     private static final String ARM_PROPERTY = "tapstate.e2e.benchmark-smoke.arm";
     private static final String FORK_PROPERTY = "tapstate.e2e.benchmark-smoke.fork";
     private static final String MODE_PROPERTY = "tapstate.e2e.benchmark-smoke.capture-mode";
-    private enum Mode { PLAIN, PASSIVE_JDWP, ACTIVE_CAPTURE }
 
     @BeforeAll
     static void requireServices() {
@@ -50,20 +48,14 @@ class RealBenchmarkForkDriverIT {
     private static void run(String workloadId) throws Exception {
         PipelineBenchmarkComparison.Arm arm = PipelineBenchmarkComparison.Arm.valueOf(
                 System.getProperty(ARM_PROPERTY, "A"));
-        Mode mode = Mode.valueOf(System.getProperty(MODE_PROPERTY, "PLAIN"));
+        var mode = BenchmarkCaptureCalibrationLiveRunIT.Mode.valueOf(System.getProperty(MODE_PROPERTY, "PLAIN"));
         Path applicationJar = Path.of(System.getProperty(BOOT_JAR_PROPERTY));
-        BenchmarkJdiCostObserver.Artifact artifact = mode == Mode.PLAIN ? null : BenchmarkJdiCostObserver.Artifact.open(
+        BenchmarkJdiCostObserver.Artifact artifact = mode == BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN
+                ? null : BenchmarkJdiCostObserver.Artifact.open(
                 applicationJar, arm == PipelineBenchmarkComparison.Arm.A ? BenchmarkJdiCostObserver.Arm.REFERENCE
                         : BenchmarkJdiCostObserver.Arm.OBSERVABILITY);
         try (artifact) {
-            RealBenchmarkForkDriver driver = mode == Mode.PLAIN ? new RealBenchmarkForkDriver()
-                    : new RealBenchmarkForkDriver((storeUri, operatorDatabase, jar) -> {
-                        if (!jar.equals(applicationJar)) { throw new AssertionError("calibration artifact changed"); }
-                        var session = BenchmarkJdiTelemetrySession.launch(artifact, storeUri,
-                                new ConnectionString(storeUri).getDatabase(), operatorDatabase,
-                                BenchmarkJdiTelemetrySession.Mode.valueOf(mode.name()));
-                        return new BenchmarkForkEnvironment.OwnedBoot(session.server(), session);
-                    });
+            RealBenchmarkForkDriver driver = mode.driver(applicationJar, artifact);
             int forkNumber = Integer.parseInt(System.getProperty(FORK_PROPERTY, "1"));
             assertThat(forkNumber).as("the diagnostic fork number").isBetween(1, 5);
             PipelineBenchmarkHarness.ForkResult result = driver.run(
@@ -107,7 +99,8 @@ class RealBenchmarkForkDriverIT {
                                 RealBenchmarkForkDriver.MeasuredPhase::reportedRecordsOut).sum(),
                         evidence.resources().sampleCount(), evidence.mongoCommands().totalCommands(),
                         evidence.observedTargetCoverage().size(), evidence.checksum());
-                assertThat(evidence.telemetry().isPresent()).isEqualTo(mode != Mode.PLAIN);
+                assertThat(evidence.telemetry().isPresent())
+                        .isEqualTo(mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN);
                 System.out.println("benchmark-real-telemetry mode=" + mode + " evidence="
                         + JsonWriter.write(PipelineBenchmarkLiveRunIT.telemetryEvidence(evidence.telemetry())));
                 evidence.phases().forEach(phase -> {

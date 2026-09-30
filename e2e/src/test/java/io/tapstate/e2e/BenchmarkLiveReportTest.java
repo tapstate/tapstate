@@ -60,6 +60,23 @@ class BenchmarkLiveReportTest {
                 .hasMessageContaining("already exists");
     }
 
+    @Test
+    void completedCalibrationRemainsIneligibleForPerformanceAcceptance() throws Exception {
+        Path output = directory.resolve("calibration.json");
+        BenchmarkLiveReport report = new BenchmarkLiveReport(output);
+        report.begin(Map.of("purpose", "CAPTURE_CALIBRATION"), Map.of(), List.of());
+        report.addFork(Map.of("mode", "ACTIVE_CAPTURE", "id", "active-copy-B-1"));
+        report.completeDiagnostic(Map.of("completedForks", 1));
+
+        Map<?, ?> completed = read(output);
+        assertThat(completed.get("status")).isEqualTo("DIAGNOSTIC_COMPLETE");
+        assertThat(completed.get("acceptanceEvaluated")).isEqualTo(false);
+        assertThat(completed.containsKey("evaluation")).isFalse();
+        assertThat((List<?>) completed.get("forks")).hasSize(1);
+        assertThat(((Number) ((Map<?, ?>) completed.get("diagnosticSummary")).get("completedForks"))
+                .intValue()).isEqualTo(1);
+    }
+
     private static Map<?, ?> read(Path path) throws Exception {
         return (Map<?, ?>) JsonReader.parse(Files.readString(path));
     }
