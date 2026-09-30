@@ -10,6 +10,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -559,11 +560,7 @@ class ClusterRebuildAdmissionTest {
      */
     @Test
     void aRefusalSaysWhyOnceForEachReason() {
-        Logger logger = (Logger) LoggerFactory.getLogger(ClusterRebuildAdmission.class);
-        ListAppender<ILoggingEvent> written = new ListAppender<>();
-        written.start();
-        logger.addAppender(written);
-        try {
+        List<String> logged = loggedBy(() -> {
             committed(7, "node-a", "node-b");
             submitRunUnder(7);
 
@@ -576,16 +573,33 @@ class ClusterRebuildAdmissionTest {
                     .as("the view published after the detection window records the failure as the run's own")
                     .isFalse();
             assertThat(admission.admits("orders")).isFalse();
+        });
 
-            assertThat(written.list).extracting(ILoggingEvent::getFormattedMessage).satisfiesExactly(
-                    first -> assertThat(first).contains("orders")
-                            .contains("every member its run was planned over is still in sight"),
-                    second -> assertThat(second).contains("orders")
-                            .contains("recorded as its own before any member it was planned over left"));
-        } finally {
-            logger.detachAppender(written);
-            written.stop();
-        }
+        assertThat(logged).satisfiesExactly(
+                first -> assertThat(first).contains("orders")
+                        .contains("every member its run was planned over is still in sight"),
+                second -> assertThat(second).contains("orders")
+                        .contains("recorded as its own before any member it was planned over left"));
+    }
+
+    /** A later run of the same pipeline refused for the same reason is a new failure, and says so again. */
+    @Test
+    void aLaterRunRefusedForTheSameReasonSaysWhyAgain() {
+        List<String> logged = loggedBy(() -> {
+            committed(7, "node-a", "node-b");
+            submitRunUnder(7);
+            assertThat(admission.admits("orders")).isFalse();
+
+            // Somebody starts the pipeline again, and the run submitted for it fails the same way.
+            assertThat(ownership.beginExecution("orders").allowed()).isTrue();
+            assertThat(admission.admits("orders")).isFalse();
+        });
+
+        assertThat(logged)
+                .as("one line for each run, not one for the pipeline's whole life")
+                .hasSize(2)
+                .allSatisfy(line -> assertThat(line).contains("orders")
+                        .contains("every member its run was planned over is still in sight"));
     }
 
     @Test
@@ -607,6 +621,21 @@ class ClusterRebuildAdmissionTest {
                         + "trouble, and restarting it every backoff for ever is the restart loop this "
                         + "budget exists to stop")
                 .isFalse();
+    }
+
+    /** What the admission logged while {@code scenario} ran. */
+    private static List<String> loggedBy(Runnable scenario) {
+        Logger logger = (Logger) LoggerFactory.getLogger(ClusterRebuildAdmission.class);
+        ListAppender<ILoggingEvent> written = new ListAppender<>();
+        written.start();
+        logger.addAppender(written);
+        try {
+            scenario.run();
+        } finally {
+            logger.detachAppender(written);
+            written.stop();
+        }
+        return written.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
     }
 
     /** Installs a committed membership at {@code revision} and lets the gate see those nodes. */

@@ -59,8 +59,11 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
     private final long detectionWindowNanos;
     private final LongSupplier nanoTime;
     private final Map<String, Attempts> attempts = new HashMap<>();
-    /** The reason each pipeline was last refused for, so a reason is logged when it changes. */
-    private final Map<String, PipelineActuationOwnership.Departure> refusals = new HashMap<>();
+    /** The refusal last logged for each pipeline, so the same refusal of the same run is logged once. */
+    private final Map<String, Refusal> refusals = new HashMap<>();
+
+    /** Which run a refusal was about, and why it was refused. */
+    private record Refusal(long executionGeneration, PipelineActuationOwnership.Departure why) {}
 
     /** What one pipeline has spent so far, and the earliest this member may spend the next of it. */
     private static final class Attempts {
@@ -132,9 +135,11 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
             // would be unreachable, longer and a departure would go on answering after its answer ran
             // out.
             attempts.remove(pipelineId);
-            // Said once for each reason rather than on every pass: this is asked every tick for as long as
-            // the pipeline stays failed, and the reason belongs in the log beside the failure it is about.
-            if (refusals.put(pipelineId, departure) != departure) {
+            // Said once for each run and reason rather than on every pass: this is asked every tick for as
+            // long as the pipeline stays failed, and the reason belongs in the log beside the failure it is
+            // about - including when a later run of the same pipeline fails the same way.
+            Refusal refusal = new Refusal(actuation.heldExecutionGeneration(pipelineId), departure);
+            if (!refusal.equals(refusals.put(pipelineId, refusal))) {
                 LOG.info("Not rebuilding failed pipeline {}: {}", pipelineId, departure.refusal());
             }
             return false;

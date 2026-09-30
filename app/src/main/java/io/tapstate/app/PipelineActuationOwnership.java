@@ -361,6 +361,12 @@ final class PipelineActuationOwnership {
         return Departure.A_MEMBER_LEFT;
     }
 
+    /** The execution generation the claim this member holds for {@code pipelineId} carries, or zero. */
+    long heldExecutionGeneration(String pipelineId) {
+        Held state = fenced ? held.get(pipelineId) : null;
+        return state == null || state.claim == null ? 0 : state.claim.executionGeneration();
+    }
+
     /** Records FAILED once member loss is visible or a post-detection view confirms none. */
     synchronized void recordFailure(String pipelineId, long settlingNanos, long detectionWindowNanos) {
         if (!fenced || closing) {
