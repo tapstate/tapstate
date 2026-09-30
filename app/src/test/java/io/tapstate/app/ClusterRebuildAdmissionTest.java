@@ -602,6 +602,58 @@ class ClusterRebuildAdmissionTest {
                         .contains("every member its run was planned over is still in sight"));
     }
 
+    /**
+     * The budget is spent on one departure, not on a pipeline's whole life. A rebuilt run that goes on
+     * running long past the stretch a departure answers for has closed the episode it was submitted for,
+     * and a member lost after that starts another. Counted over the life of the process instead, every
+     * pipeline of a cluster that has lost members three times is left failed at the fourth - which is what
+     * a three-machine run showed: a rebuild after a healthy quarter of an hour counted as the second attempt.
+     */
+    @Test
+    void eachDepartureLongAfterTheLastRebuildRecoveredGetsABudgetOfItsOwn() {
+        committed(7, "node-a", "node-b", "node-c");
+        submitRunUnder(7);
+        long revision = 7;
+        for (int loss = 1; loss <= ClusterRebuildAdmission.MAX_ATTEMPTS + 1; loss++) {
+            String staying = loss % 2 == 1 ? "node-b" : "node-c";
+            committed(++revision, "node-a", staying);
+
+            assertThat(admission.admits("orders"))
+                    .as("departure %s, long after the run rebuilt for the one before it recovered", loss)
+                    .isTrue();
+
+            // The rebuild; then the member comes back, and the rebuilt run goes on running well.
+            submitRunUnder(revision);
+            committed(++revision, "node-a", "node-b", "node-c");
+            nanos.addAndGet(BACKOFF.multipliedBy(2L * ClusterRebuildAdmission.MAX_ATTEMPTS).toNanos());
+        }
+    }
+
+    /**
+     * The other half: replacements the cluster keeps killing while it has not settled are one departure's
+     * attempts, however many new runs they were. Resetting the budget for every new run would be the restart
+     * loop the budget exists to stop.
+     */
+    @Test
+    void replacementsTheClusterKeepsKillingWithinTheStretchShareOneBudget() {
+        committed(7, "node-a", "node-b", "node-c");
+        submitRunUnder(7);
+        long revision = 7;
+        for (int loss = 1; loss <= ClusterRebuildAdmission.MAX_ATTEMPTS; loss++) {
+            String staying = loss % 2 == 1 ? "node-b" : "node-c";
+            committed(++revision, "node-a", staying);
+            assertThat(admission.admits("orders")).as("attempt %s", loss).isTrue();
+            assertThat(ownership.beginExecution("orders").allowed()).as("replacement %s", loss).isTrue();
+            nanos.addAndGet(BACKOFF.toNanos());
+        }
+        // The last replacement is planned over node-a and node-b; node-b goes too.
+        committed(++revision, "node-a", "node-c");
+
+        assertThat(admission.admits("orders"))
+                .as("each replacement died within the stretch of the last rebuild, so the budget is spent")
+                .isFalse();
+    }
+
     @Test
     void onceTheSettlingIsOverADeathIsThePipelinesOwnAgain() {
         committed(7, "node-a", "node-b");

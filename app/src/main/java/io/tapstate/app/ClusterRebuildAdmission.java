@@ -34,7 +34,9 @@ import org.slf4j.LoggerFactory;
  * the count and the spacing below are spent.
  *
  * <p>The count resets by itself, once the stretch is over and nothing is missing: the departure has
- * stopped being the answer, and whatever ends a run after that is the pipeline's own. A failure already
+ * stopped being the answer, and whatever ends a run after that is the pipeline's own. It also resets
+ * when the run a rebuild put in place outlives that stretch: a member lost after that is another
+ * departure, with a budget of its own. A failure already
  * recorded as the pipeline's own keeps that answer across a claim handover.
  * A failure without a known cause waits through the configured heartbeat detection window before an
  * intact membership view makes that answer durable. A sink failure recorded at its source needs no wait.
@@ -70,6 +72,10 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
         private int made;
         private long nextAllowedNanos;
         private boolean started;
+        /** When the last rebuild was admitted. */
+        private long admittedAtNanos;
+        /** The execution generation of the run the last rebuild replaced. */
+        private long replacedExecution;
     }
 
     ClusterRebuildAdmission(PipelineActuationOwnership actuation, Duration backoff, Duration detectionWindow) {
@@ -147,6 +153,16 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
         refusals.remove(pipelineId);
         Attempts spent = attempts.computeIfAbsent(pipelineId, id -> new Attempts());
         long now = nanoTime.getAsLong();
+        long failedRun = actuation.heldExecutionGeneration(pipelineId);
+        if (spent.started && failedRun > spent.replacedExecution
+                && now - spent.admittedAtNanos >= MAX_ATTEMPTS * backoffNanos) {
+            // The run the last rebuild put in place went on running for longer than the whole stretch a
+            // departure answers for, and only then failed. The departure that budget was spent on is over;
+            // this is another one, with a budget of its own. Counted over the pipeline's life instead, a
+            // cluster that has lost members three times would leave every pipeline failed at the fourth.
+            spent.made = 0;
+            spent.started = false;
+        }
         if (spent.made >= MAX_ATTEMPTS) {
             if (!spent.started || now - spent.nextAllowedNanos >= 0) {
                 // Said once per backoff rather than once per tick: the pipeline stays failed from here on,
@@ -163,6 +179,8 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
         spent.made++;
         spent.started = true;
         spent.nextAllowedNanos = now + backoffNanos;
+        spent.admittedAtNanos = now;
+        spent.replacedExecution = failedRun;
         LOG.warn("Rebuilding pipeline {} after a member it was running on left (attempt {} of {})",
                 pipelineId, spent.made, MAX_ATTEMPTS);
         return true;
