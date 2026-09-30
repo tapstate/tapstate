@@ -6,6 +6,8 @@ import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.spi.store.PipelineDraft;
 import io.tapstate.spi.store.PipelineDraftMutation;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -163,6 +165,53 @@ class MongoPipelineDraftStoreIT {
             assertThat(store.publish(staleDependency)).isEqualTo(PipelineDraftMutation.ARTIFACT_CONFLICT);
             assertThat(artifacts.find(new Document("_id", "orders")).first()).isNull();
             assertThat(store.get("orders").orElseThrow().publishedDraftRevision()).isNull();
+        }
+    }
+
+    @Test
+    void refusesToReplaceAnArtifactOfAnotherKind() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            var database = client.getDatabase("tapstate_pipeline_draft_it");
+            var drafts = database.getCollection("pipeline_drafts");
+            var artifacts = database.getCollection("artifacts");
+            drafts.drop();
+            artifacts.drop();
+            MongoPipelineDraftStore store = new MongoPipelineDraftStore(client, drafts, artifacts);
+            assertThat(store.create(draft("mysql", 1, PipelineDraft.Mode.DAG)))
+                    .isEqualTo(PipelineDraftMutation.CREATED);
+            artifacts.insertOne(new Document("_id", "mysql").append("kind", "source")
+                    .append("contentHash", "source-hash"));
+            Resource pipeline = artifact("mysql");
+
+            assertThat(store.publish(new PipelineDraft.Publication("mysql", 1, null, pipeline,
+                    CanonicalHash.of(pipeline), Instant.parse("2026-09-21T01:00:00Z"), "publisher")))
+                    .isEqualTo(PipelineDraftMutation.ARTIFACT_CONFLICT);
+            assertThat(artifacts.find(new Document("_id", "mysql")).first().getString("kind"))
+                    .isEqualTo("source");
+        }
+    }
+
+    @Test
+    void replacesAStoredDraftAfterComparingItsMigratedModeAndSkipsUnreadableRowsInLists() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            var database = client.getDatabase("tapstate_pipeline_draft_it");
+            var drafts = database.getCollection("pipeline_drafts");
+            var artifacts = database.getCollection("artifacts");
+            drafts.drop();
+            artifacts.drop();
+            MongoPipelineDraftStore store = new MongoPipelineDraftStore(client, drafts, artifacts);
+            drafts.insertOne(new Document("_id", "legacy").append("revision", 1L)
+                    .append("name", "Legacy").append("updatedBy", "migration"));
+            assertThat(store.replace("legacy", 1, draft("legacy", 2, PipelineDraft.Mode.DAG)))
+                    .isEqualTo(PipelineDraftMutation.REPLACED);
+
+            drafts.insertOne(new Document("_id", "corrupt").append("schemaVersion", 99)
+                    .append("revision", 1L).append("mode", "unknown"));
+            assertThat(store.list()).extracting(PipelineDraft::pipelineId).containsExactly("legacy");
+            assertThat(store.listSummaries()).extracting(summary -> summary.pipelineId()).containsExactly("legacy");
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> store.get("corrupt"))
+                    .isInstanceOf(TapstateException.class)
+                    .extracting(error -> ((TapstateException) error).code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
         }
     }
 

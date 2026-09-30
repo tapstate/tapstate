@@ -30,6 +30,10 @@ final class PipelineDraftJson {
                 : json.convertValue(graph, PipelineDraft.Graph.class);
         PipelineDraft.Wizard wizardModel = wizard == null ? null
                 : json.convertValue(normalizeWizardForModel(wizard), PipelineDraft.Wizard.class);
+        Object baseHashValue = body.get("baseArtifactHash");
+        if (baseHashValue != null && !(baseHashValue instanceof String)) {
+            throw new IllegalArgumentException("baseArtifactHash must be a string or null");
+        }
         return new PipelineDraft(
                 id,
                 schemaVersion,
@@ -39,7 +43,7 @@ final class PipelineDraftJson {
                 textOrNull(body.get("description")),
                 graphModel,
                 wizardModel,
-                null,
+                (String) baseHashValue,
                 null,
                 null,
                 java.time.Instant.EPOCH,

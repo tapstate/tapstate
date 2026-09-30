@@ -294,7 +294,7 @@ class PipelineDraftCompilerTest {
         assertThat(serve.sync()).extracting(sync -> sync.source()).containsExactly("warehouse");
         assertThat(serve.sync().getFirst().writeMode().yaml()).isEqualTo("append");
         assertThat(serve.sync().getFirst().rename())
-                .isEqualTo(new RenameSpec(Map.of("active-orders", "orders_archive"), null, null, null));
+                .isEqualTo(new RenameSpec(Map.of("orders", "orders_archive"), null, null, null));
     }
 
     @Test
@@ -422,6 +422,87 @@ class PipelineDraftCompilerTest {
     }
 
     @Test
+    void removesWholeTableRegexAnchorsBeforeAddingTheSourcePrefix() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "mysql", "^orders_\\d+$",
+                        Map.of("tables", List.of(Map.of("table", "^orders_\\d+$", "tableKind", "regex"))),
+                        Map.of()),
+                new PipelineDraft.Node("target", "target", "mongo", null, Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("source-to-target", "source", "target")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiler.compile(dagDraft(graph)).serve();
+
+        assertThat(((FromClause.Flow) serve.from()).refs())
+                .containsExactly(FromRef.regex("\\Qmysql\\E\\.orders_\\d+"));
+    }
+
+    @Test
+    void targetRenameAfterATransformUsesTheUnderlyingSourceTableName() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source", "source", "mysql", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("map-node", "map", null, null,
+                        Map.of("fields", Map.of("id", "$order_id"),
+                                "experimental", Map.of("field-mode", "permissive")),
+                        Map.of("stepId", "normalized")),
+                new PipelineDraft.Node("target", "target", "mongo", "orders_archive", Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("source-map", "source", "map-node"),
+                        new PipelineDraft.Edge("map-target", "map-node", "target")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        PipelineResource compiled = compiler.compile(dagDraft(graph));
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiled.serve();
+        Step.Inline map = (Step.Inline) compiled.transforms().getFirst();
+
+        assertThat(serve.sync().getFirst().rename())
+                .isEqualTo(new RenameSpec(Map.of("orders", "orders_archive"), null, null, null));
+        assertThat(map.experimental()).containsEntry("field-mode", "permissive");
+    }
+
+    @Test
+    void targetRenameAfterANestUsesTheConfiguredRootTable() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("orders", "source", "mysql", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("items", "source", "mysql", "order_items", Map.of(), Map.of()),
+                new PipelineDraft.Node("nest", "nest", null, null, Map.of(
+                        "from", Map.of("orders", "mysql.orders", "items", "mysql.order_items"),
+                        "root", Map.of("from", "orders", "key", List.of("id"), "embed", List.of())),
+                        Map.of("stepId", "assembled")),
+                new PipelineDraft.Node("target", "target", "mongo", "orders_archive", Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("orders-nest", "orders", "nest"),
+                        new PipelineDraft.Edge("items-nest", "items", "nest"),
+                        new PipelineDraft.Edge("nest-target", "nest", "target")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiler.compile(dagDraft(graph)).serve();
+
+        assertThat(serve.sync().getFirst().rename())
+                .isEqualTo(new RenameSpec(Map.of("orders", "orders_archive"), null, null, null));
+    }
+
+    @Test
+    void targetRenameAfterAJoinUsesTheSqlFactTable() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("orders", "source", "mysql", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("customers", "source", "mysql", "customers", Map.of(), Map.of()),
+                new PipelineDraft.Node("join", "join", null, null, Map.of(
+                        "from", Map.of("o", "mysql.orders", "c", "mysql.customers"),
+                        "engine", "builtin",
+                        "sql", "SELECT o.id FROM o LEFT JOIN c ON o.customer_id = c.id"),
+                        Map.of("stepId", "joined-orders")),
+                new PipelineDraft.Node("target", "target", "mongo", "orders_archive", Map.of(), Map.of())),
+                List.of(new PipelineDraft.Edge("orders-join", "orders", "join"),
+                        new PipelineDraft.Edge("customers-join", "customers", "join"),
+                        new PipelineDraft.Edge("join-target", "join", "target")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        ServeBlock.Inline serve = (ServeBlock.Inline) compiler.compile(dagDraft(graph)).serve();
+
+        assertThat(serve.sync().getFirst().rename())
+                .isEqualTo(new RenameSpec(Map.of("orders", "orders_archive"), null, null, null));
+    }
+
+    @Test
     void compilesMultipleDagSourceTablesAndExplicitTargetMappings() {
         PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
                 new PipelineDraft.Node("source", "source", "mysql", "orders",
@@ -466,8 +547,7 @@ class PipelineDraftCompilerTest {
 
         ServeBlock.Inline serve = (ServeBlock.Inline) compiler.compile(dagDraft(graph)).serve();
         assertThat(serve.id()).isEqualTo("target__serve_");
-        assertThat(serve.sync().getFirst().rename())
-                .isEqualTo(new RenameSpec(Map.of("target__serve", "orders"), null, null, null));
+        assertThat(serve.sync().getFirst().rename()).isNull();
     }
 
     @Test
@@ -530,10 +610,12 @@ class PipelineDraftCompilerTest {
         assertCompileFails(withWizard(template, root, List.of(arrayWithoutKey), List.of(), template.wizard().output()),
                 "array relation requires an array key");
 
-        PipelineDraft.Related flatWithPath = related("child", "orders", PipelineDraft.Shape.FLAT,
+        PipelineDraft.Related flatWithoutPath = related("child", "orders", PipelineDraft.Shape.FLAT,
                 "", List.of("id"), List.of(new PipelineDraft.FieldPair("parent_id", "id")));
-        assertCompileFails(withWizard(template, root, List.of(flatWithPath), List.of(), template.wizard().output()),
-                "flat relation must not have a target path");
+        PipelineResource flatCompiled = compiler.compile(withWizard(template, root, List.of(flatWithoutPath),
+                List.of(), template.wizard().output()));
+        TransformBody.Nest flatNest = (TransformBody.Nest) ((Step.Inline) flatCompiled.transforms().getFirst()).body();
+        assertThat(flatNest.root().embed().getFirst().path()).isNull();
 
         PipelineDraft.Related missingPath = related("child", "orders", PipelineDraft.Shape.OBJECT,
                 null, List.of("id"), List.of(new PipelineDraft.FieldPair("parent_id", "id")));

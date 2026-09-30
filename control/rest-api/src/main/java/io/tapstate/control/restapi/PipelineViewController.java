@@ -24,12 +24,22 @@ class PipelineViewController {
         this.pipelines = Objects.requireNonNull(pipelines, "pipelines");
     }
 
-    @Verb("pipeline.list")
+    @Verb("pipeline.catalog")
     @GetMapping("/pipelines")
     PipelineList list(
             @RequestParam(name = "limit", required = false) Integer limit,
             @RequestParam(name = "offset", required = false) Integer offset) {
-        return new PipelineList(ListWindow.page(catalog.list(), limit, offset));
+        ListWindow.Window window = ListWindow.window(limit, offset);
+        return new PipelineList(catalog.list(window.offset(), window.limit()));
+    }
+
+    @Verb("pipeline.list")
+    @GetMapping("/pipelines:artifacts")
+    PipelineArtifactList listArtifacts(
+            @RequestParam(name = "limit", required = false) Integer limit,
+            @RequestParam(name = "offset", required = false) Integer offset) {
+        ListWindow.Window window = ListWindow.window(limit, offset);
+        return new PipelineArtifactList(pipelines.list(window.offset(), window.limit()));
     }
 
     @Verb("pipeline.get")

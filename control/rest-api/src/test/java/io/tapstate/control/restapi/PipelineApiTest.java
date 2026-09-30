@@ -241,9 +241,10 @@ class PipelineApiTest {
 
         String overlayDraft = """
                 {"pipelineId":"pl1","mode":"wizard","name":"Orders pipeline","description":"Updated definition",
+                 "baseArtifactHash":"%s",
                  "wizard":{"root":{"id":"root","sourceId":"src_x","table":"orders","key":[],
                    "preTransforms":[]},"related":[],"transforms":[]}}
-                """;
+                """.formatted(CanonicalHash.of(parse(PIPELINE_V1)));
         client().post().uri("/api/pipelines/pl1/draft")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
                 .contentType(MediaType.APPLICATION_JSON).body(overlayDraft).retrieve().toBodilessEntity();
@@ -895,7 +896,7 @@ class PipelineApiTest {
                 .as("the full pipeline surface — static reads, lifecycle writes, observation reads, position "
                         + "operations, and derived schemas — projects onto the authenticated /api surface")
                 .containsExactlyInAnyOrder(
-                        "pipeline.list", "pipeline.get", "pipeline.layout.get", "pipeline.layout.update", "pipeline.create",
+                        "pipeline.list", "pipeline.catalog", "pipeline.get", "pipeline.layout.get", "pipeline.layout.update", "pipeline.create",
                         "pipeline.update",
                         "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
                         "pipeline.status", "pipeline.metrics", "pipeline.snapshot", "pipeline.logs",
@@ -1521,8 +1522,7 @@ class PipelineApiTest {
             if (current.revision() != expectedRevision) {
                 return PipelineDraftMutation.REVISION_CONFLICT;
             }
-            if (!Objects.equals(current.baseArtifactHash(), replacement.baseArtifactHash())
-                    || !Objects.equals(current.publishedDraftRevision(), replacement.publishedDraftRevision())
+            if (!Objects.equals(current.publishedDraftRevision(), replacement.publishedDraftRevision())
                     || !Objects.equals(current.publishedArtifactHash(), replacement.publishedArtifactHash())) {
                 return PipelineDraftMutation.REVISION_CONFLICT;
             }

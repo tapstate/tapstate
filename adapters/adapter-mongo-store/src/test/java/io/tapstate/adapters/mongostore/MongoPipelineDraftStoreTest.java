@@ -76,6 +76,16 @@ class MongoPipelineDraftStoreTest {
     }
 
     @Test
+    void roundTripsAnIncompleteWizardWithoutARoot() {
+        PipelineDraft draft = new PipelineDraft("incomplete", 1, 1, PipelineDraft.Mode.WIZARD,
+                "Incomplete", "", null, new PipelineDraft.Wizard(null, List.of(), List.of(), null),
+                null, null, null, Instant.EPOCH, Instant.EPOCH, "author");
+
+        assertThat(MongoPipelineDraftStore.fromDocument(MongoPipelineDraftStore.toDocument(draft)))
+                .isEqualTo(draft);
+    }
+
+    @Test
     void readsDocumentMapsAndMissingLegacyFieldsWithoutLosingDefaults() {
         Document legacy = new Document("_id", "legacy-wizard")
                 .append("mode", "wizard")

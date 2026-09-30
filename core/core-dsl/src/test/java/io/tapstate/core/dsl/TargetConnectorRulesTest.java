@@ -92,6 +92,20 @@ class TargetConnectorRulesTest {
                 pipelineWritingTo("tgt_my"))).doesNotThrowAnyException();
     }
 
+    @Test
+    void onPremLeavesPrivateConnectorsForTheOperatorToValidate() {
+        assertThatCode(() -> validate(false, READ_SOURCE, target("private-sink", "acme-warehouse"),
+                pipelineWritingTo("private-sink"))).doesNotThrowAnyException();
+    }
+
+    @Test
+    void cloudRefusesConnectorsOutsideTheAtlasCatalogEntry() {
+        Throwable thrown = catchThrowable(() -> validate(true, READ_SOURCE,
+                target("private-sink", "acme-warehouse"), pipelineWritingTo("private-sink")));
+        assertThat(thrown).isInstanceOf(DslException.class);
+        assertThat(((DslException) thrown).args()).containsEntry("connector", "acme-warehouse");
+    }
+
     static Stream<String> sinkConnectors() {
         return CATALOG.all().stream().filter(entry -> entry.sink().capable()).map(entry -> entry.id());
     }

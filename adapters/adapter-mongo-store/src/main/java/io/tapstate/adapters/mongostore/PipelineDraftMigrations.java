@@ -21,6 +21,10 @@ final class PipelineDraftMigrations {
         if (document.getInteger("schemaVersion", 0) != PipelineDraft.CURRENT_SCHEMA_VERSION) {
             throw new IllegalArgumentException("unsupported pipeline draft schema version");
         }
+        Object mode = document.get("mode");
+        if (!("dag".equals(mode) || "wizard".equals(mode))) {
+            throw new IllegalArgumentException("unsupported pipeline draft mode");
+        }
         return document;
     }
 }

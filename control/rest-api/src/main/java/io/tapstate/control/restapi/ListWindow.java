@@ -11,9 +11,15 @@ final class ListWindow {
     }
 
     static <T> List<T> page(List<T> items, Integer limit, Integer offset) {
-        if (limit == null && offset == null) {
-            return items;
-        }
+        Window window = window(limit, offset);
+        int bound = window.limit();
+        int start = window.offset();
+        if (start >= items.size()) return List.of();
+        int end = (int) Math.min((long) items.size(), (long) start + bound);
+        return items.subList(start, end);
+    }
+
+    static Window window(Integer limit, Integer offset) {
         int bound = limit == null ? ListBounds.DEFAULT_LIMIT : limit;
         int start = offset == null ? 0 : offset;
         if (bound < 1 || bound > ListBounds.MAX_LIMIT) {
@@ -23,10 +29,9 @@ final class ListWindow {
         if (start < 0) {
             throw MalformedRequest.rejecting("offset must be non-negative", null);
         }
-        if (start >= items.size()) {
-            return List.of();
-        }
-        int end = (int) Math.min((long) items.size(), (long) start + bound);
-        return items.subList(start, end);
+        return new Window(start, bound);
+    }
+
+    record Window(int offset, int limit) {
     }
 }

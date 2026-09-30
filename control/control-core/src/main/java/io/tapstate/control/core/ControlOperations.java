@@ -176,8 +176,12 @@ public final class ControlOperations {
     // is stop then start composed at the surface.
     public static final Operation PIPELINE_LIST = new Operation(
             "pipeline.list", Scope.READ, false, ControlApiSchema.ref("pipeline.list"),
-            "List a bounded page of Pipeline artifacts with resolved Source summaries and live status. "
-                    + "Use limit (1-200) and offset to page; each item can include its DAG and transforms.", CLI_AND_MCP);
+            "List a bounded page of applied Pipeline artifacts with resolved Source summaries and live status. "
+                    + "Use limit (1-200) and offset to page. Use pipeline.get for a full definition.", CLI_AND_MCP);
+    public static final Operation PIPELINE_CATALOG = new Operation(
+            "pipeline.catalog", Scope.READ, false, null,
+            "List a bounded page of Pipelines from the unified artifact-and-draft catalog, including lifecycle status.",
+            CLI_AND_REST);
     public static final Operation PIPELINE_GET = new Operation(
             "pipeline.get", Scope.READ, false, null,
             "Get one static Pipeline artifact with resolved Source summaries.", CLI_ONLY);
@@ -219,6 +223,10 @@ public final class ControlOperations {
     public static final Operation PIPELINE_DRAFT_PUBLISH = new Operation(
             "pipeline-draft.publish", Scope.WRITE, true, null,
             "Compile and atomically publish one Pipeline draft after its revision and artifact checks.", CLI_AND_REST);
+    public static final Operation PIPELINE_DRAFT_REBASE = new Operation(
+            "pipeline-draft.rebase", Scope.WRITE, true, null,
+            "Explicitly rebase one Pipeline draft onto the artifact hash the caller has just read, preserving its content.",
+            CLI_AND_REST);
     public static final Operation PIPELINE_START = mcp(
             "pipeline.start", Scope.WRITE, true,
             "Set a Pipeline's desired state to running after its workspace has been applied.");
@@ -332,6 +340,7 @@ public final class ControlOperations {
             DATA_BROWSER_STATS,
             CLUSTER_MEMBERS,
             PIPELINE_LIST,
+            PIPELINE_CATALOG,
             PIPELINE_GET,
             PIPELINE_LAYOUT_GET,
             PIPELINE_LAYOUT_UPDATE,
@@ -344,6 +353,7 @@ public final class ControlOperations {
             PIPELINE_DRAFT_DELETE,
             PIPELINE_DRAFT_PREVIEW,
             PIPELINE_DRAFT_PUBLISH,
+            PIPELINE_DRAFT_REBASE,
             PIPELINE_START,
             PIPELINE_STOP,
             PIPELINE_PAUSE,

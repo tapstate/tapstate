@@ -17,6 +17,8 @@ import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.WriteMode;
+import io.tapstate.core.sql.JoinTree;
+import io.tapstate.core.sql.SqlFrontEnd;
 import io.tapstate.spi.store.PipelineDraft;
 
 import java.util.ArrayList;
@@ -32,6 +34,12 @@ import java.util.regex.Pattern;
 /** Deterministic compiler from the server-owned Pipeline authoring model to a runnable Artifact. */
 public final class PipelineDraftCompiler {
 
+    private static final int MAX_GRAPH_NODES = 512;
+    private static final int MAX_GRAPH_EDGES = 2048;
+    private static final int MAX_GRAPH_DEPTH = 128;
+    private static final int MAX_WIZARD_RELATIONS = 512;
+    private static final int MAX_WIZARD_RELATION_DEPTH = 128;
+
     /** Compiles one complete or incomplete draft without persisting or mutating it. */
     public PipelineResource compile(PipelineDraft draft) {
         Objects.requireNonNull(draft, "draft");
@@ -40,7 +48,10 @@ public final class PipelineDraftCompiler {
 
     private PipelineResource compileWizard(PipelineDraft draft) {
         PipelineDraft.Wizard wizard = Objects.requireNonNull(draft.wizard(), "wizard payload");
-        PipelineDraft.Root root = Objects.requireNonNull(wizard.root(), "wizard root");
+        PipelineDraft.Root root = wizard.root();
+        if (root == null) {
+            throw new IllegalArgumentException("wizard root is required for publication");
+        }
         requiredText(root.sourceId(), "wizard root source");
         requiredText(root.table(), "wizard root table");
         validateWizardIds(root, wizard.related());
@@ -141,7 +152,12 @@ public final class PipelineDraftCompiler {
     }
 
     private static void validateWizardIds(PipelineDraft.Root root, List<PipelineDraft.Related> related) {
+        if (related.size() > MAX_WIZARD_RELATIONS) {
+            throw new IllegalArgumentException("wizard exceeds the maximum related-table count of "
+                    + MAX_WIZARD_RELATIONS);
+        }
         Set<String> ids = new HashSet<>();
+        Map<String, PipelineDraft.Related> byId = new LinkedHashMap<>();
         if (!ids.add(root.id())) {
             throw new IllegalArgumentException("duplicate wizard id: " + root.id());
         }
@@ -149,6 +165,7 @@ public final class PipelineDraftCompiler {
             if (!ids.add(child.id())) {
                 throw new IllegalArgumentException("duplicate wizard id: " + child.id());
             }
+            byId.put(child.id(), child);
             if (child.id().equals(child.parentId())) {
                 throw new IllegalArgumentException("wizard relation cannot point to itself: " + child.id());
             }
@@ -160,9 +177,11 @@ public final class PipelineDraftCompiler {
                 if (!seen.add(parent)) {
                     throw new IllegalArgumentException("wizard related table cycle at: " + child.id());
                 }
-                String parentId = parent;
-                PipelineDraft.Related parentNode = related.stream()
-                        .filter(candidate -> candidate.id().equals(parentId)).findFirst().orElse(null);
+                if (seen.size() > MAX_WIZARD_RELATION_DEPTH) {
+                    throw new IllegalArgumentException("wizard relation depth exceeds "
+                            + MAX_WIZARD_RELATION_DEPTH + " at: " + child.id());
+                }
+                PipelineDraft.Related parentNode = byId.get(parent);
                 if (parentNode == null) {
                     throw new IllegalArgumentException("related table parent does not exist: " + parent);
                 }
@@ -192,7 +211,8 @@ public final class PipelineDraftCompiler {
             if (relation.shape() == PipelineDraft.Shape.ARRAY && relation.arrayKey().isEmpty()) {
                 throw new IllegalArgumentException("array relation requires an array key");
             }
-            if (relation.shape() == PipelineDraft.Shape.FLAT && relation.path() != null) {
+            if (relation.shape() == PipelineDraft.Shape.FLAT && relation.path() != null
+                    && !relation.path().isBlank()) {
                 throw new IllegalArgumentException("flat relation must not have a target path");
             }
             if (relation.shape() != PipelineDraft.Shape.FLAT && (relation.path() == null || relation.path().isBlank())) {
@@ -221,7 +241,8 @@ public final class PipelineDraftCompiler {
             };
             result.add(new Embed(related.id(), on,
                     shape,
-                    relation.path(), key, arrayKey, null, null,
+                    relation.shape() == PipelineDraft.Shape.FLAT ? null : relation.path(),
+                    key, arrayKey, null, null,
                     embedsFor(related.id(), children)));
         }
         return result;
@@ -238,23 +259,20 @@ public final class PipelineDraftCompiler {
     }
 
     private static Map<String, FieldRule> mapFields(Map<String, Object> fields) {
-        Map<String, FieldRule> result = new LinkedHashMap<>();
-        fields.forEach((name, value) -> {
-            if (value instanceof String string && string.startsWith("$")) {
-                result.put(name, FieldRule.rename(string.substring(1)));
-            } else if (value instanceof String string && string.startsWith("=")) {
-                String expression = string.substring(1);
-                if (expression.isBlank()) {
+        try {
+            Map<String, FieldRule> parsed = ((TransformBody.MapProjection) PipelineRepresentation.body(
+                    "map", Map.of("fields", fields), "wizard.transform.fields")).fields();
+            parsed.forEach((name, rule) -> {
+                if (rule instanceof FieldRule.Computed computed && computed.celExpr().isBlank()) {
                     throw new IllegalArgumentException("computed map expression must be non-blank: " + name);
                 }
-                result.put(name, FieldRule.computed(expression));
-            } else if (Boolean.FALSE.equals(value)) {
-                result.put(name, FieldRule.drop());
-            } else {
-                result.put(name, FieldRule.literal(value));
-            }
-        });
-        return result;
+            });
+            return parsed;
+        } catch (TapstateException error) {
+            Object reason = error.args().get("reason");
+            throw new IllegalArgumentException(reason instanceof String text
+                    ? text : "invalid wizard map transform", error);
+        }
     }
 
     private static String requiredText(Map<String, Object> fields, String name) {
@@ -274,6 +292,12 @@ public final class PipelineDraftCompiler {
 
     private PipelineResource compileGraph(PipelineDraft draft) {
         PipelineDraft.Graph graph = Objects.requireNonNull(draft.graph(), "graph payload");
+        if (graph.nodes().size() > MAX_GRAPH_NODES) {
+            throw new IllegalArgumentException("graph exceeds the maximum node count of " + MAX_GRAPH_NODES);
+        }
+        if (graph.edges().size() > MAX_GRAPH_EDGES) {
+            throw new IllegalArgumentException("graph exceeds the maximum edge count of " + MAX_GRAPH_EDGES);
+        }
         LinkedHashSet<String> sourceIds = new LinkedHashSet<>();
         Map<String, PipelineDraft.Node> nodes = new LinkedHashMap<>();
         for (PipelineDraft.Node node : graph.nodes()) {
@@ -426,8 +450,12 @@ public final class PipelineDraftCompiler {
             }
             return;
         }
-        if (isGraphTransform(node)) {
-            tables.add(graphStepId(node));
+        if ("nest".equals(node.type())) {
+            collectNestRootTable(node, nodes, inputs, visited, tables);
+            return;
+        }
+        if ("join".equals(node.type())) {
+            collectJoinFactTable(node, nodes, inputs, visited, tables);
             return;
         }
         for (String input : inputs.getOrDefault(nodeId, List.of())) {
@@ -435,11 +463,77 @@ public final class PipelineDraftCompiler {
         }
     }
 
+    private static void collectNestRootTable(PipelineDraft.Node nest, Map<String, PipelineDraft.Node> nodes,
+            Map<String, List<String>> inputs, Set<String> visited, Set<String> tables) {
+        Object rootValue = nest.config().get("root");
+        if (!(rootValue instanceof Map<?, ?> root)) {
+            throw new IllegalArgumentException("graph nest requires a root object: " + nest.id());
+        }
+        String rootAlias = mapText(root, "from");
+        Object aliasesValue = nest.config().get("from");
+        if (rootAlias == null || !(aliasesValue instanceof Map<?, ?> aliases)) {
+            throw new IllegalArgumentException("graph nest requires a root from alias: " + nest.id());
+        }
+        String rootRef = mapText(aliases, rootAlias);
+        if (rootRef == null) {
+            throw new IllegalArgumentException("graph nest root alias is not declared: " + nest.id());
+        }
+        for (PipelineDraft.Node candidate : nodes.values()) {
+            if ("source".equals(candidate.type()) && sourceTableSelections(candidate).stream()
+                    .anyMatch(selection -> selection.reference(candidate.sourceId()).equals(rootRef))) {
+                collectOutputTables(candidate.id(), nodes, inputs, visited, tables);
+                return;
+            }
+            if (rootRef.equals(candidate.id()) || rootRef.equals(graphStepId(candidate))) {
+                collectOutputTables(candidate.id(), nodes, inputs, visited, tables);
+                return;
+            }
+        }
+        throw new IllegalArgumentException("graph nest root does not resolve to an upstream table: " + rootRef);
+    }
+
+    private static void collectJoinFactTable(PipelineDraft.Node join, Map<String, PipelineDraft.Node> nodes,
+            Map<String, List<String>> inputs, Set<String> visited, Set<String> tables) {
+        Object aliasesValue = join.config().get("from");
+        Object sqlValue = join.config().get("sql");
+        if (!(aliasesValue instanceof Map<?, ?> aliases) || !(sqlValue instanceof String sql)) {
+            throw new IllegalArgumentException("graph join requires source aliases and SQL: " + join.id());
+        }
+        JoinTree.Source fact;
+        try {
+            fact = SqlFrontEnd.factSource(sql);
+        } catch (RuntimeException error) {
+            throw new IllegalArgumentException("graph join fact table cannot be resolved: " + join.id(), error);
+        }
+        String factRef = mapText(aliases, fact.name());
+        if (factRef == null) {
+            throw new IllegalArgumentException("graph join fact alias is not declared: " + fact.name());
+        }
+        for (String inputId : inputs.getOrDefault(join.id(), List.of())) {
+            PipelineDraft.Node input = nodes.get(inputId);
+            if (input == null || !"source".equals(input.type())) {
+                continue;
+            }
+            for (SourceTableSelection selection : sourceTableSelections(input)) {
+                if (selection.reference(input.sourceId()).equals(factRef)) {
+                    tables.add(selection.renameKey());
+                    return;
+                }
+            }
+        }
+        throw new IllegalArgumentException("graph join fact table does not resolve to an upstream source: "
+                + factRef);
+    }
+
     private static List<String> graphOutputs(String nodeId, Map<String, PipelineDraft.Node> nodes,
             Map<String, List<String>> inputs, Map<String, List<String>> outputs, Set<String> visiting, List<Step> steps) {
         List<String> existing = outputs.get(nodeId);
         if (existing != null) {
             return existing;
+        }
+        if (visiting.size() >= MAX_GRAPH_DEPTH) {
+            throw new IllegalArgumentException("graph depth exceeds the maximum of " + MAX_GRAPH_DEPTH
+                    + " at: " + nodeId);
         }
         if (!visiting.add(nodeId)) {
             throw new IllegalArgumentException("graph contains a cycle at: " + nodeId);
@@ -465,7 +559,7 @@ public final class PipelineDraftCompiler {
                 FromClause from = graphTransformFrom(node, refs);
                 TransformBody body = graphTransformBody(node);
                 String stepId = graphStepId(node);
-                steps.add(Step.inline(stepId, from, body, Map.of()));
+                steps.add(Step.inline(stepId, from, body, graphTransformExperimental(node)));
                 result = List.of(stepId);
             }
         }
@@ -560,6 +654,25 @@ public final class PipelineDraftCompiler {
         }
     }
 
+    private static Map<String, Object> graphTransformExperimental(PipelineDraft.Node node) {
+        Object configured = node.config().get("experimental");
+        if (configured == null) {
+            return Map.of();
+        }
+        if (!(configured instanceof Map<?, ?> values)) {
+            throw new IllegalArgumentException("graph transform experimental must be an object: " + node.id());
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        values.forEach((key, value) -> {
+            if (!(key instanceof String name) || name.isBlank()) {
+                throw new IllegalArgumentException("graph transform experimental keys must be non-blank strings: "
+                        + node.id());
+            }
+            result.put(name, value);
+        });
+        return result;
+    }
+
     private static List<SourceTableSelection> sourceTableSelections(PipelineDraft.Node node) {
         Object configured = node.config().get("tables");
         List<SourceTableSelection> selections = new ArrayList<>();
@@ -600,7 +713,24 @@ public final class PipelineDraftCompiler {
                 return sourceId + "." + table;
             }
             String pattern = isRegexReference(table) ? table.substring(1, table.length() - 1) : table;
+            if (pattern.startsWith("^")) {
+                pattern = pattern.substring(1);
+            }
+            if (hasUnescapedTrailingAnchor(pattern)) {
+                pattern = pattern.substring(0, pattern.length() - 1);
+            }
             return "/" + Pattern.quote(sourceId) + "\\." + pattern + "/";
+        }
+
+        private static boolean hasUnescapedTrailingAnchor(String pattern) {
+            if (!pattern.endsWith("$")) {
+                return false;
+            }
+            int escapes = 0;
+            for (int i = pattern.length() - 2; i >= 0 && pattern.charAt(i) == '\\'; i--) {
+                escapes++;
+            }
+            return escapes % 2 == 0;
         }
 
         private String renameKey() {

@@ -7,6 +7,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.PipelineDraft;
 import io.tapstate.spi.store.PipelineDraftMutation;
 import io.tapstate.spi.store.PipelineDraftStore;
+import io.tapstate.spi.store.PipelineDraftSummary;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -78,11 +79,30 @@ public final class PipelineDraftService {
         return store.list();
     }
 
+    public List<PipelineDraft> list(int offset, int limit) {
+        return store.list(offset, limit);
+    }
+
+    public List<PipelineDraftSummary> listSummaries() {
+        return store.listSummaries();
+    }
+
+    public List<PipelineDraftSummary> listSummaries(int offset, int limit) {
+        return store.listSummaries(offset, limit);
+    }
+
     public PipelineDraftMutation create(PipelineDraft draft) {
         Objects.requireNonNull(draft, "draft");
         Instant now = Instant.now(clock);
-        String baseArtifactHash = artifacts == null ? null
-                : artifacts.getResource(draft.pipelineId()).map(StoredResource::contentHash).orElse(null);
+        StoredResource existing = artifacts == null ? null
+                : artifacts.getResource(draft.pipelineId()).orElse(null);
+        if (existing != null && !(existing.resource() instanceof PipelineResource)) {
+            return PipelineDraftMutation.ARTIFACT_CONFLICT;
+        }
+        String baseArtifactHash = existing == null ? null : existing.contentHash();
+        if (!Objects.equals(draft.baseArtifactHash(), baseArtifactHash)) {
+            return PipelineDraftMutation.ARTIFACT_CONFLICT;
+        }
         return store.create(new PipelineDraft(draft.pipelineId(), draft.schemaVersion(), 1, draft.mode(),
                 draft.name(), draft.description(), draft.graph(), draft.wizard(), baseArtifactHash, null, null,
                 now, now, draft.updatedBy()));
@@ -125,6 +145,37 @@ public final class PipelineDraftService {
     public PipelineDraftMutation discard(String principal, String pipelineId, long expectedRevision) {
         return audited(ControlOperations.PIPELINE_DRAFT_DELETE, principal, pipelineId,
                 () -> store.delete(Objects.requireNonNull(pipelineId, "pipelineId"), expectedRevision));
+    }
+
+    /** Explicitly adopts the artifact version the caller has just read after a publish conflict. */
+    public PipelineDraftMutation rebase(String principal, String pipelineId, long expectedRevision,
+            String expectedArtifactHash) {
+        return audited(ControlOperations.PIPELINE_DRAFT_REBASE, principal, pipelineId,
+                () -> rebaseOwned(pipelineId, expectedRevision, expectedArtifactHash, principal));
+    }
+
+    private PipelineDraftMutation rebaseOwned(String pipelineId, long expectedRevision,
+            String expectedArtifactHash, String principal) {
+        PipelineDraft current = store.get(Objects.requireNonNull(pipelineId, "pipelineId")).orElse(null);
+        if (current == null) {
+            return PipelineDraftMutation.NOT_FOUND;
+        }
+        if (current.revision() != expectedRevision) {
+            return PipelineDraftMutation.REVISION_CONFLICT;
+        }
+        StoredResource artifact = artifacts == null ? null : artifacts.getResource(pipelineId).orElse(null);
+        if (artifact != null && !(artifact.resource() instanceof PipelineResource)) {
+            return PipelineDraftMutation.ARTIFACT_CONFLICT;
+        }
+        String actualHash = artifact == null ? null : artifact.contentHash();
+        if (!Objects.equals(expectedArtifactHash, actualHash)) {
+            return PipelineDraftMutation.ARTIFACT_CONFLICT;
+        }
+        PipelineDraft rebased = new PipelineDraft(current.pipelineId(), current.schemaVersion(),
+                expectedRevision + 1, current.mode(), current.name(), current.description(), current.graph(),
+                current.wizard(), actualHash, current.publishedDraftRevision(), current.publishedArtifactHash(),
+                current.createdAt(), Instant.now(clock), requirePrincipal(principal));
+        return store.replace(pipelineId, expectedRevision, rebased);
     }
 
     /** Compiles the requested revision without writing an Artifact or publication marker. */

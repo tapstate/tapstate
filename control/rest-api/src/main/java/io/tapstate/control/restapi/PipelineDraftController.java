@@ -8,6 +8,7 @@ import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.PipelineDraft;
 import io.tapstate.spi.store.PipelineDraftMutation;
+import io.tapstate.spi.store.PipelineDraftSummary;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.ResponseEntity;
@@ -18,6 +19,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.util.UriComponentsBuilder;
 import tools.jackson.databind.ObjectMapper;
@@ -25,6 +27,7 @@ import tools.jackson.databind.ObjectMapper;
 import java.math.BigDecimal;
 import java.net.URI;
 import java.util.Map;
+import java.util.List;
 import java.util.Objects;
 
 /** HTTP projection for durable Pipeline authoring drafts. */
@@ -40,9 +43,14 @@ class PipelineDraftController {
     }
 
     @Verb("pipeline-draft.list")
-    @GetMapping("/pipelines/drafts")
-    Map<String, Object> list() {
-        return Map.of("items", service().list().stream().map(draft -> PipelineDraftJson.write(json, draft)).toList());
+    @GetMapping("/pipeline-drafts")
+    Map<String, Object> list(
+            @RequestParam(name = "limit", required = false) Integer limit,
+            @RequestParam(name = "offset", required = false) Integer offset) {
+        ListWindow.Window window = ListWindow.window(limit, offset);
+        List<Map<String, Object>> items = service().listSummaries(window.offset(), window.limit()).stream()
+                .map(PipelineDraftController::summaryJson).toList();
+        return Map.of("items", items);
     }
 
     @Verb("pipeline-draft.get")
@@ -112,8 +120,45 @@ class PipelineDraftController {
                 "published", true, "warnings", result.warnings());
     }
 
+    @Verb("pipeline-draft.rebase")
+    @PostMapping("/pipelines/{id}/draft:rebase")
+    ResponseEntity<Map<String, Object>> rebase(@PathVariable("id") String id,
+            @RequestBody Map<String, Object> body) {
+        long expected = number(body.get("revision"), "revision");
+        if (!body.containsKey("artifactHash")) {
+            throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                    Map.of("reason", "artifactHash must be provided, as a string or null"), null);
+        }
+        Object hash = body.get("artifactHash");
+        if (hash != null && !(hash instanceof String)) {
+            throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                    Map.of("reason", "artifactHash must be a string or null"), null);
+        }
+        PipelineDraftMutation outcome = service().rebase(
+                AuthenticatedCaller.subject(), id, expected, (String) hash);
+        refuse(outcome, id);
+        PipelineDraft rebased = service().find(id).orElseThrow(() -> error(PipelineDraftError.NOT_FOUND, id));
+        return ResponseEntity.ok().eTag(etag(rebased.revision())).body(PipelineDraftJson.write(json, rebased));
+    }
+
     private ResponseEntity<Map<String, Object>> response(PipelineDraft draft) {
         return ResponseEntity.ok().eTag(etag(draft.revision())).body(PipelineDraftJson.write(json, draft));
+    }
+
+    private static Map<String, Object> summaryJson(PipelineDraftSummary draft) {
+        Map<String, Object> result = new java.util.LinkedHashMap<>();
+        result.put("pipelineId", draft.pipelineId());
+        result.put("mode", draft.mode().name().toLowerCase(java.util.Locale.ROOT));
+        result.put("name", draft.name());
+        result.put("description", draft.description());
+        result.put("revision", draft.revision());
+        result.put("baseArtifactHash", draft.baseArtifactHash());
+        result.put("publishedDraftRevision", draft.publishedDraftRevision());
+        result.put("publishedArtifactHash", draft.publishedArtifactHash());
+        result.put("createdAt", draft.createdAt());
+        result.put("updatedAt", draft.updatedAt());
+        result.put("updatedBy", draft.updatedBy());
+        return result;
     }
 
     private PipelineDraftService service() {

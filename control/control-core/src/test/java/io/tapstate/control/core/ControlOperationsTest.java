@@ -40,6 +40,7 @@ class ControlOperationsTest {
                         "data-browser.stats",
                         "cluster.members",
                         "pipeline.list",
+                        "pipeline.catalog",
                         "pipeline.get",
                         "pipeline.layout.get",
                         "pipeline.layout.update",
@@ -52,6 +53,7 @@ class ControlOperationsTest {
                         "pipeline-draft.delete",
                         "pipeline-draft.preview",
                         "pipeline-draft.publish",
+                        "pipeline-draft.rebase",
                         "pipeline.start",
                         "pipeline.stop",
                         "pipeline.pause",
@@ -124,7 +126,7 @@ class ControlOperationsTest {
         // The static Pipeline projection, layout read, and observation reads are all
         // read faces; read-scoped, unaudited.
         for (String id : List.of(
-                "pipeline.list", "pipeline.get", "pipeline.layout.get", "pipeline.status", "pipeline.metrics",
+                "pipeline.list", "pipeline.catalog", "pipeline.get", "pipeline.layout.get", "pipeline.status", "pipeline.metrics",
                 "pipeline.snapshot", "pipeline.logs", "pipeline.metrics.history", "pipeline.explain")) {
             assertThat(registry.resolve(id).scope()).as(id).isEqualTo(Scope.READ);
         }
@@ -145,6 +147,7 @@ class ControlOperationsTest {
                         "connection.test",
                         "connection.discover-schema",
                         "connector.register",
+                        "pipeline-draft.rebase",
                         "pipeline.start",
                         "pipeline.stop",
                         "pipeline.pause",
@@ -178,6 +181,7 @@ class ControlOperationsTest {
                 "user.list",
                 "token.list",
                 "pipeline.list",
+                "pipeline.catalog",
                 "pipeline.get",
                 "pipeline.layout.get",
                 "pipeline.layout.update",
@@ -196,7 +200,7 @@ class ControlOperationsTest {
         // A scope statement about the registry alone: the CLI face opens every registered operation and
         // clips none of them. Whether each one has a verb behind it is not knowable from here
         // — control-core cannot see the CLI — and is gated where both are visible, in arch-tests.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(58);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(60);
         assertThat(registry.all()).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
     }
@@ -237,7 +241,7 @@ class ControlOperationsTest {
                 .containsExactlyInAnyOrder(
                         "pipeline-draft.list", "pipeline-draft.get", "pipeline-draft.create",
                         "pipeline-draft.replace", "pipeline-draft.delete", "pipeline-draft.preview",
-                        "pipeline-draft.publish");
+                        "pipeline-draft.publish", "pipeline-draft.rebase", "pipeline.catalog");
     }
 
     /**

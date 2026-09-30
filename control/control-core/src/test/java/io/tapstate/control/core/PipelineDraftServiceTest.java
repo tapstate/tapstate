@@ -30,7 +30,7 @@ class PipelineDraftServiceTest {
 
     @Test
     void createAssignsInitialRevisionAndServerOwnedMetadata() {
-        PipelineDraft submitted = draft(9, "client", "forged-base", 8L, "forged-published",
+        PipelineDraft submitted = draft(9, "client", null, 8L, "forged-published",
                 Instant.EPOCH, Instant.EPOCH);
 
         assertThat(service.create("alice", submitted)).isEqualTo(PipelineDraftMutation.CREATED);
@@ -43,6 +43,29 @@ class PipelineDraftServiceTest {
         assertThat(saved.createdAt()).isEqualTo(NOW);
         assertThat(saved.updatedAt()).isEqualTo(NOW);
         assertThat(saved.updatedBy()).isEqualTo("alice");
+    }
+
+    @Test
+    void rebaseRequiresTheCurrentArtifactHashAndAdvancesTheDraftRevision() {
+        store.seed(draft(5, "alice", "old-hash", 4L, "published-hash", NOW, NOW));
+
+        assertThat(service.rebase("bob", "orders", 5, "new-hash"))
+                .isEqualTo(PipelineDraftMutation.ARTIFACT_CONFLICT);
+        assertThat(service.rebase("bob", "orders", 5, null)).isEqualTo(PipelineDraftMutation.REPLACED);
+
+        PipelineDraft rebased = store.get("orders").orElseThrow();
+        assertThat(rebased.revision()).isEqualTo(6);
+        assertThat(rebased.baseArtifactHash()).isNull();
+        assertThat(rebased.publishedDraftRevision()).isEqualTo(4L);
+        assertThat(rebased.publishedArtifactHash()).isEqualTo("published-hash");
+        assertThat(rebased.updatedBy()).isEqualTo("bob");
+    }
+
+    @Test
+    void createRejectsAnUnverifiedClientArtifactHash() {
+        assertThat(service.create(draft(1, "alice", "unverified", null, null, NOW, NOW)))
+                .isEqualTo(PipelineDraftMutation.ARTIFACT_CONFLICT);
+        assertThat(store.get("orders")).isEmpty();
     }
 
     @Test
@@ -238,8 +261,7 @@ class PipelineDraftServiceTest {
             if (current == null) return PipelineDraftMutation.NOT_FOUND;
             if (current.revision() != expectedRevision) return PipelineDraftMutation.REVISION_CONFLICT;
             if (current.mode() != replacement.mode()) return PipelineDraftMutation.MODE_CONFLICT;
-            if (!Objects.equals(current.baseArtifactHash(), replacement.baseArtifactHash())
-                    || !Objects.equals(current.publishedDraftRevision(), replacement.publishedDraftRevision())
+            if (!Objects.equals(current.publishedDraftRevision(), replacement.publishedDraftRevision())
                     || !Objects.equals(current.publishedArtifactHash(), replacement.publishedArtifactHash())) {
                 return PipelineDraftMutation.REVISION_CONFLICT;
             }

@@ -1,6 +1,7 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
@@ -10,6 +11,7 @@ import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.DesiredStore;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.PipelineDraft;
 import io.tapstate.spi.store.PipelineDraftMutation;
@@ -32,7 +34,7 @@ class PipelineCatalogServiceTest {
         List<Resource> resources = new ArrayList<>();
         for (String id : List.of("artifact-stop", "failed", "resuming", "starting", "pausing", "running",
                 "paused", "desired-running", "desired-paused", "desired-stopped", "desired-failed",
-                "desired-new", "desired-completed", "new")) {
+                "desired-new", "desired-completed", "completed-running-intent", "corrupt-intent", "new")) {
             resources.add(pipeline(id, id.equals("artifact-stop") ? "artifact description" : null));
         }
         resources.add(new DslParser().parse("""
@@ -59,6 +61,8 @@ class PipelineCatalogServiceTest {
         desired.save(intent("desired-failed", PipelineState.FAILED));
         desired.save(intent("desired-new", PipelineState.NEW));
         desired.save(intent("desired-completed", PipelineState.COMPLETED));
+        desired.save(intent("completed-running-intent", PipelineState.RUNNING));
+        desired.corrupt("corrupt-intent");
         MemoryObservationStore observations = new MemoryObservationStore();
         observations.save(observation("artifact-stop", PipelineState.RUNNING));
         observations.save(observation("failed", PipelineState.FAILED));
@@ -67,6 +71,7 @@ class PipelineCatalogServiceTest {
         observations.save(observation("pausing", PipelineState.RUNNING));
         observations.save(observation("running", PipelineState.RUNNING));
         observations.save(observation("paused", PipelineState.PAUSED));
+        observations.save(observation("completed-running-intent", PipelineState.COMPLETED));
 
         PipelineCatalogService service = new PipelineCatalogService(
                 new ArtifactQueryService(artifactStore(resources)),
@@ -80,7 +85,8 @@ class PipelineCatalogServiceTest {
         assertThat(items).extracting(PipelineCatalogItem::id).isSorted().doesNotContain("unrelated");
         assertThat(byId).containsOnlyKeys("artifact-stop", "failed", "resuming", "starting", "pausing", "running",
                 "paused", "desired-running", "desired-paused", "desired-stopped", "desired-failed",
-                "desired-new", "desired-completed", "new", "draft-only");
+                "desired-new", "desired-completed", "completed-running-intent", "corrupt-intent", "new",
+                "draft-only");
         assertThat(byId.get("failed").name()).isEqualTo("failed");
         assertThat(byId.get("failed").description()).isEqualTo("draft description");
         assertThat(byId.get("failed").mode()).isEqualTo("wizard");
@@ -103,7 +109,12 @@ class PipelineCatalogServiceTest {
         assertThat(byId.get("desired-failed").status().state()).isEqualTo(PipelineCatalogItem.DisplayState.FAILED);
         assertThat(byId.get("desired-new").status().state()).isEqualTo(PipelineCatalogItem.DisplayState.NEW);
         assertThat(byId.get("desired-completed").status().state()).isEqualTo(PipelineCatalogItem.DisplayState.COMPLETED);
+        assertThat(byId.get("completed-running-intent").status().state())
+                .isEqualTo(PipelineCatalogItem.DisplayState.COMPLETED);
+        assertThat(byId.get("corrupt-intent").status().state()).isEqualTo(PipelineCatalogItem.DisplayState.NEW);
         assertThat(byId.get("new").status().state()).isEqualTo(PipelineCatalogItem.DisplayState.NEW);
+        assertThat(service.list(0, 2)).extracting(PipelineCatalogItem::id)
+                .containsExactly("artifact-stop", "completed-running-intent");
     }
 
     private static Resource pipeline(String id, String description) {
@@ -186,6 +197,11 @@ class PipelineCatalogServiceTest {
 
     private static final class MemoryDesiredStore implements DesiredStore {
         private final Map<String, DesiredState> desired = new HashMap<>();
+        private final java.util.Set<String> unreadable = new java.util.HashSet<>();
+
+        void corrupt(String pipelineId) {
+            unreadable.add(pipelineId);
+        }
 
         @Override
         public void save(DesiredState state) {
@@ -194,6 +210,10 @@ class PipelineCatalogServiceTest {
 
         @Override
         public Optional<DesiredState> read(String pipelineId) {
+            if (unreadable.contains(pipelineId)) {
+                throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                        Map.of("id", pipelineId, "field", "targetState"), null);
+            }
             return Optional.ofNullable(desired.get(pipelineId));
         }
 

@@ -84,6 +84,17 @@ class SqlFrontEndTest {
     }
 
     @Test
+    @DisplayName("the fact source follows SQL join semantics without requiring discovered columns")
+    void resolvesFactSourceForLeftAndRightJoinsWithoutSchemas() {
+        assertThat(SqlFrontEnd.factSource(
+                "SELECT o.o_id FROM orders o LEFT JOIN customers c ON o.o_cust_id = c.c_id"))
+                .isEqualTo(new JoinTree.Source("o", "orders"));
+        assertThat(SqlFrontEnd.factSource(
+                "SELECT c.c_name FROM customers c RIGHT JOIN orders o ON o.o_cust_id = c.c_id"))
+                .isEqualTo(new JoinTree.Source("o", "orders"));
+    }
+
+    @Test
     @DisplayName("a LEFT JOIN keeps the sides it was written with")
     void leftJoinKeepsItsSides() {
         // Control for the rewrite above: an implementation that always swaps, or never swaps,
