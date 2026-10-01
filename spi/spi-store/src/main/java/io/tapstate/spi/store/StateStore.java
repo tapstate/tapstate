@@ -22,7 +22,7 @@ import java.util.Optional;
  * write. The state carrier is the opaque {@code stateJson}; the fencing decision is made on the
  * epoch alone, never on the state, so a lagging clock or a stale state view can never corrupt it.
  */
-public interface StateStore {
+public interface StateStore extends StopReservationStore {
 
     /** Returns the current checkpoint for a pipeline, or empty if none exists. */
     Optional<CheckpointDoc> read(String pipelineId);

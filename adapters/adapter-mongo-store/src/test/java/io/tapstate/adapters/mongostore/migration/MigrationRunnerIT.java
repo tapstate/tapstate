@@ -307,7 +307,7 @@ class MigrationRunnerIT {
                         "V7RepairBlankPipelines", "V8DiscardViewSchemaPolicies", "V9RateHistoryIndexes",
                         "V10SrsConsumerOffsetIndexes", "V11RateHistoryKeysetIndex",
                         "V12PipelineEventIndexes", "V13HistoryRollupIndexes",
-                        "V14LatestObservationChunkIndexes");
+                        "V14LatestObservationChunkIndexes", "V15StopReservationShape");
 
         MigrationRunner.migrate(database);
 
@@ -331,6 +331,32 @@ class MigrationRunnerIT {
         assertThat(refusal).isNotNull();
         assertThat(refusal.code().code()).isEqualTo("migration.data-newer-than-binary");
         assertThat(refusal.args()).containsEntry("installed", "14").containsEntry("supported", "13");
+    }
+
+    @Test
+    void stopReservationVersionLeavesOldCheckpointsUntouchedAndRefusesAnOlderBinary() {
+        MongoDatabase database = freshDatabase("runner_stop_reservation_shape");
+        seedSchemaDocument(database, 14, null);
+        Document original = new Document("_id", "orders")
+                .append("stateJson", "{\"state\":\"RUNNING\"}")
+                .append("epoch", 7L)
+                .append("touchMillis", 1_780_000_000_000L);
+        SystemCollections.PIPELINE_STATE.on(database).insertOne(original);
+
+        MigrationRunner.migrate(database);
+        MigrationRunner.migrate(database);
+
+        assertThat(installedVersion(database)).isEqualTo(15);
+        assertThat(SystemCollections.PIPELINE_STATE.on(database).find(new Document("_id", "orders")).first())
+                .as("an old checkpoint is not backfilled with an invented stop")
+                .isEqualTo(original);
+        List<ChangeSet> oldBinary = MigrationRunner.changeSets().stream()
+                .filter(change -> change.version() <= 14).toList();
+        TapstateException refusal = catchThrowableOfType(() -> MigrationRunner.migrate(
+                database, oldBinary, LOCK_TTL, PATIENT, CLOCK), TapstateException.class);
+        assertThat(refusal).isNotNull();
+        assertThat(refusal.code().code()).isEqualTo("migration.data-newer-than-binary");
+        assertThat(refusal.args()).containsEntry("installed", "15").containsEntry("supported", "14");
     }
 
     @Test

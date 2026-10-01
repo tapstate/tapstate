@@ -3,6 +3,7 @@ package io.tapstate.adapters.mongostore;
 import com.mongodb.ErrorCategory;
 import com.mongodb.MongoException;
 import com.mongodb.MongoWriteException;
+import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.model.FindOneAndUpdateOptions;
 import com.mongodb.client.model.ReturnDocument;
@@ -11,6 +12,8 @@ import io.tapstate.core.lifecycle.CasOutcome;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.StateStore;
+import io.tapstate.spi.store.StopAuthority;
+import io.tapstate.spi.store.StopReservation;
 import org.bson.Document;
 
 import java.time.Instant;
@@ -39,9 +42,18 @@ public final class MongoStateStore implements StateStore {
             new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER);
 
     private final MongoCollection<Document> collection;
+    private final MongoStopReservationWrites stops;
 
     public MongoStateStore(MongoCollection<Document> collection) {
         this.collection = Objects.requireNonNull(collection, "collection");
+        this.stops = null;
+    }
+
+    /** Production binding for short authority-guarded reservation transactions. */
+    public MongoStateStore(MongoClient client, MongoCollection<Document> collection,
+            MongoCollection<Document> desired, MongoCollection<Document> workloadClaims) {
+        this.collection = Objects.requireNonNull(collection, "collection");
+        this.stops = new MongoStopReservationWrites(client, collection, desired, workloadClaims);
     }
 
     @Override
@@ -83,7 +95,8 @@ public final class MongoStateStore implements StateStore {
         Objects.requireNonNull(touchTime, "touchTime");
         // The atomic fence: swap the state and bump the epoch only where the stored epoch still equals
         // the writer's expectation. This is the sole legal transition write.
-        Document filter = new Document("_id", pipelineId).append("epoch", expectedEpoch);
+        Document filter = new Document("_id", pipelineId).append("epoch", expectedEpoch)
+                .append(StopReservationDocument.FIELD, new Document("$exists", false));
         Document update = new Document("$set",
                 new Document("stateJson", nextStateJson).append("touchMillis", touchTime.toEpochMilli()))
                 .append("$inc", new Document("epoch", 1L));
@@ -112,6 +125,56 @@ public final class MongoStateStore implements StateStore {
         StoreIo.run(() -> collection.deleteOne(new Document("_id", pipelineId)));
     }
 
+    @Override
+    public boolean supportsStopReservations() {
+        return stops != null;
+    }
+
+    @Override
+    public Optional<StopReservation> readStopReservation(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Document document = StoreIo.call(() -> collection.find(new Document("_id", pipelineId)).first());
+        if (document == null || !document.containsKey(StopReservationDocument.FIELD)) {
+            return Optional.empty();
+        }
+        if (!(document.get(StopReservationDocument.FIELD) instanceof Document marker)) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", pipelineId, "field", StopReservationDocument.FIELD), null);
+        }
+        return Optional.of(StopReservationDocument.read(pipelineId, toCheckpoint(document).epoch(), marker));
+    }
+
+    @Override
+    public Optional<StopReservation> reserveStop(
+            CheckpointDoc expected, StopReservation proposal, Instant touchTime) {
+        return requireStops().reserve(expected, proposal, touchTime);
+    }
+
+    @Override
+    public Optional<StopReservation> rebindStop(
+            StopReservation expected, StopAuthority successor, Instant touchTime) {
+        return requireStops().rebind(expected, successor, touchTime);
+    }
+
+    @Override
+    public Optional<CheckpointDoc> completeStop(StopReservation expected, Instant touchTime) {
+        return requireStops().complete(expected, touchTime);
+    }
+
+    @Override
+    public Optional<CheckpointDoc> retireStop(
+            StopReservation expected, io.tapstate.core.lifecycle.DesiredState successor,
+            StopAuthority authority, Instant touchTime) {
+        return requireStops().retire(expected, successor, authority, touchTime);
+    }
+
+    private MongoStopReservationWrites requireStops() {
+        if (stops == null) {
+            throw new UnsupportedOperationException("authority-guarded stop reservations require a verified client");
+        }
+        return stops;
+    }
+
     /** Maps a checkpoint to its stored document: the pipeline id as {@code _id}, the rest as fields. */
     static Document toDocument(CheckpointDoc checkpoint) {
         return new Document("_id", checkpoint.pipelineId())
@@ -122,17 +185,30 @@ public final class MongoStateStore implements StateStore {
 
     /** Reconstructs a checkpoint from its stored document. */
     static CheckpointDoc toCheckpoint(Document document) {
-        String id = document.getString("_id");
-        String stateJson = document.getString("stateJson");
-        Long epoch = document.getLong("epoch");
-        Long touchMillis = document.getLong("touchMillis");
-        if (stateJson == null || epoch == null || touchMillis == null) {
-            // A stored checkpoint missing a field this version requires is store corruption, surfaced
-            // as a coded io diagnostic rather than a bare unboxing crash while reconstructing.
-            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
-                    Map.of("id", String.valueOf(id),
-                            "field", stateJson == null ? "stateJson" : epoch == null ? "epoch" : "touchMillis"), null);
+        Object rawId = document.get("_id");
+        String id = rawId instanceof String value ? value : String.valueOf(rawId);
+        if (!(rawId instanceof String) || id.isBlank()) { throw unreadable(id, "_id"); }
+        if (!(document.get("stateJson") instanceof String stateJson)) { throw unreadable(id, "stateJson"); }
+        long epoch = integer(document.get("epoch"), id, "epoch");
+        long touchMillis = integer(document.get("touchMillis"), id, "touchMillis");
+        if (epoch < 0) { throw unreadable(id, "epoch"); }
+        CheckpointDoc checkpoint = new CheckpointDoc(id, stateJson, epoch, Instant.ofEpochMilli(touchMillis));
+        if (document.containsKey(StopReservationDocument.FIELD)) {
+            if (!(document.get(StopReservationDocument.FIELD) instanceof Document marker)) {
+                throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                        Map.of("id", String.valueOf(id), "field", StopReservationDocument.FIELD), null);
+            }
+            StopReservationDocument.read(id, epoch, marker);
         }
-        return new CheckpointDoc(id, stateJson, epoch, Instant.ofEpochMilli(touchMillis));
+        return checkpoint;
+    }
+
+    private static long integer(Object value, String id, String field) {
+        if (!(value instanceof Long || value instanceof Integer)) { throw unreadable(id, field); }
+        return ((Number) value).longValue();
+    }
+
+    private static TapstateException unreadable(String id, String field) {
+        return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", id, "field", field), null);
     }
 }
