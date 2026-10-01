@@ -66,6 +66,7 @@ class BoundedPipelinePreviewIT {
                     PIPELINE_ID, OUTPUT_ID, 2, SAMPLE_ID, drafts);
 
             assertThat(events).extracting(event -> event.get("kind"))
+                    .as("preview events including terminal failure payload: %s", events)
                     .startsWith("run.accepted", "compile.completed", "sample.completed")
                     .endsWith("result.completed", "run.completed");
             List<Long> sequences = events.stream()
