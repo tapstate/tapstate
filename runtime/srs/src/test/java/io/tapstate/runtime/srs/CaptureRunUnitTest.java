@@ -916,6 +916,31 @@ class CaptureRunUnitTest {
     }
 
     /**
+     * A direct tail leaves a position the chain already holds where it is. A pipeline stopped with its state
+     * kept holds the chain where it stopped; a direct tail reads for its own pipeline alone, so where it began
+     * says nothing about where the chain stands for anyone else -- written down as the chain's start, it would
+     * become where the held pipeline resumes, past the changes it still owes.
+     */
+    @Test
+    void aDirectTailLeavesTheChainWhereAHeldPipelineStopped() {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chainId = MiningChainId.resolve(config(), "chain-direct-held").value();
+        meta.create(chainId, null);
+        long heldUnder = meta.openEpoch(chainId);
+        meta.selectConsumerTables(chainId, "holder", List.of("orders"), heldUnder);
+        assertThat(meta.establishPhysicalAnchor(chainId,
+                new ChainPosition(new SourceOrder(heldUnder, -1L), "where-the-holder-stopped"))).isTrue();
+
+        FakeSource port = new FakeSource(List.of(row(1)), List.of(), "seam-the-direct-load-began-at");
+        runUnit(port, meta).start(spec(ReadMode.SNAPSHOT_AND_CDC, false, "chain-direct-held"), e -> { });
+
+        assertThat(port.cdcStart)
+                .isEqualTo(CaptureStart.resume(new SourcePosition("seam-the-direct-load-began-at")));
+        assertThat(meta.resumeOffset(chainId)).as("the held pipeline still resumes where it stopped")
+                .contains("where-the-holder-stopped");
+    }
+
+    /**
      * A direct tail -- {@code srs.enabled:false} -- begins where the durable record says, exactly as a
      * shared-ring tail does.
      *

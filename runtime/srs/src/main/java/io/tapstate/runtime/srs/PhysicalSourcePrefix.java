@@ -188,6 +188,11 @@ final class PhysicalSourcePrefix implements AutoCloseable {
      * from. Where it holds none, carrying on would leave nothing to resume from at all -- a process stopping
      * before the first release would come back at the present, with every change it had been handed gone --
      * so the shared reader refuses. A direct tail carries on as it always has.
+     *
+     * <p>A direct tail writes where it began down only on a chain that holds no offset yet. It reads for its
+     * own pipeline alone and begins where that pipeline's own load did, so its start says nothing about where
+     * the chain stands for anybody else: written over a position a pipeline stopped with its state kept still
+     * holds, it would become where that pipeline resumes, past the changes it is owed.
      */
     synchronized void start(Optional<SourcePosition> position) {
         checkOpen();
@@ -201,6 +206,9 @@ final class PhysicalSourcePrefix implements AutoCloseable {
             if (!resumable && directPipeline == null) {
                 throw new TapstateException(CaptureError.RESUME_ANCHOR_UNAVAILABLE, Map.of("chain", chainId), null);
             }
+            return;
+        }
+        if (directPipeline != null && meta.read(chainId).map(SrsMeta::sourceReadOffset).isPresent()) {
             return;
         }
         boolean anchored = meta.establishPhysicalAnchor(chainId, new ChainPosition(new SourceOrder(epoch, -1L), token));
