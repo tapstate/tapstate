@@ -739,7 +739,7 @@ public final class CaptureRunUnit {
         if (events.isEmpty() && token == null) {
             return;
         }
-        prefix.awaitRoom();
+        prefix.checkStillRecording();
         int last = events.size() - 1;
         Map<String, Long> lastSeqByTable = new LinkedHashMap<>();
         for (int i = 0; i < events.size(); i++) {

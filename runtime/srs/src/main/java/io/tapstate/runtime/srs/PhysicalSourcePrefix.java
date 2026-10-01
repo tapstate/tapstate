@@ -22,7 +22,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.LockSupport;
 import java.util.function.BiConsumer;
 
 /**
@@ -52,9 +51,16 @@ import java.util.function.BiConsumer;
  * stops with a code instead of carrying on.
  *
  * <p>The account is held in memory and bounded. A process that stops loses it, and the next reader resumes
- * from the last position released -- which only ever means reading again what had already been read. When
- * the account is full the source is held back rather than let run ahead: a run that cannot be recorded
- * cannot be released later either. One daemon thread, shared by every account in the process, re-checks the
+ * from the last position released -- which only ever means reading again what had already been read. It never
+ * holds the source back. A run nobody confirms for a long while is an ordinary state -- a paused pipeline
+ * still owes the changes on its tables, and a table whose last change a transform dropped has nothing coming
+ * that would confirm it -- and holding the source back on it would stop every other pipeline reading the
+ * source, until a change that can never be read arrives. So quiet runs recorded behind a run still owed are
+ * folded into one, and once the account is full each new run is folded into the last one recorded. A fold
+ * releases only when everything folded into it is confirmed, and writes down what releasing its runs one by
+ * one would have written: how far the source was read, where the last change was, and for each consumer where
+ * its own last change was. Nothing is released past an owed run either way; folding only makes what is
+ * released afterwards coarser. One daemon thread, shared by every account in the process, re-checks the
  * confirmations while a source is quiet, so a run whose sinks confirm it after the source stopped talking is
  * still released.
  *
@@ -64,13 +70,12 @@ import java.util.function.BiConsumer;
  */
 final class PhysicalSourcePrefix implements AutoCloseable {
 
-    /** How many runs one reader may have recorded and not yet released before its source is held back. */
+    /** How many entries one reader's account holds before each new run is folded into the last one. */
     static final int MAX_PENDING_BATCHES = 256;
 
     /** How often the shared thread re-checks the confirmations of every open account. */
     static final long TICK_MILLIS = 100;
 
-    private static final long ROOM_POLL_NANOS = TimeUnit.MILLISECONDS.toNanos(1);
     private static final Set<PhysicalSourcePrefix> ACTIVE = ConcurrentHashMap.newKeySet();
     private static final ScheduledExecutorService TICKER = Executors.newSingleThreadScheduledExecutor(task -> {
         Thread thread = new Thread(task, "tapstate-physical-prefix");
@@ -204,23 +209,12 @@ final class PhysicalSourcePrefix implements AutoCloseable {
     }
 
     /**
-     * Holds the source back while the account is full. Called on the thread the source hands its runs over
-     * on, before the run is written anywhere, so a full account pauses the read itself.
+     * Throws what stopped the account, if anything did. Called on the thread the source hands its runs over
+     * on, before a run is written anywhere: a reader that can no longer write its positions down writes no
+     * more changes either.
      */
-    void awaitRoom() {
-        while (true) {
-            synchronized (this) {
-                checkOpen();
-                if (pending.size() < MAX_PENDING_BATCHES) {
-                    return;
-                }
-            }
-            tick();
-            LockSupport.parkNanos(ROOM_POLL_NANOS);
-            if (Thread.currentThread().isInterrupted()) {
-                throw new CancellationException("the reader stopped while its source was held back");
-            }
-        }
+    synchronized void checkStillRecording() {
+        checkOpen();
     }
 
     /**
@@ -232,9 +226,6 @@ final class PhysicalSourcePrefix implements AutoCloseable {
         checkOpen();
         if (!started) {
             start(Optional.empty());
-        }
-        if (pending.size() >= MAX_PENDING_BATCHES) {
-            throw new IllegalStateException("a run was recorded without room for it");
         }
         Collection<ConsumerOffset> consumers = meta.consumerOffsets(chainId);
         Map<String, Map<String, Long>> owed = new LinkedHashMap<>();
@@ -257,8 +248,14 @@ final class PhysicalSourcePrefix implements AutoCloseable {
         if (directPipeline != null && !owed.containsKey(directPipeline)) {
             owed.put(directPipeline, Map.copyOf(lastSeqByTable));
         }
-        ChainPosition position = new ChainPosition(new SourceOrder(epoch, nextBatch++), token);
-        pending.addLast(new Batch(position, Map.copyOf(lastSeqByTable), owed));
+        Batch run = Batch.of(new ChainPosition(new SourceOrder(epoch, nextBatch++), token), lastSeqByTable, owed);
+        Batch last = pending.peekLast();
+        if (last != null && (pending.size() >= MAX_PENDING_BATCHES || run.quiet() && last.quiet())) {
+            pending.removeLast();
+            pending.addLast(last.fold(run));
+        } else {
+            pending.addLast(run);
+        }
         releaseOrStop(consumers);
     }
 
@@ -349,36 +346,50 @@ final class PhysicalSourcePrefix implements AutoCloseable {
     }
 
     /**
-     * Writes a released run down. Its position becomes how far the source may be told to release its log;
-     * it becomes where a restart resumes, and where a consumer's target stands, only when the run carried a
-     * change -- for the consumer, one of its own -- because a run carrying none can name a point that,
-     * resumed from, passes over the change that follows it, and that no target ever confirmed.
+     * Writes a released entry down. Its position becomes how far the source may be told to release its log;
+     * a position becomes where a restart resumes, and where a consumer's target stands, only when its run
+     * carried a change -- for the consumer, one of its own -- because a run carrying none can name a point
+     * that, resumed from, passes over the change that follows it, and that no target ever confirmed. An entry
+     * that folded a change and then quiet runs writes the change down as the resume point first, and then
+     * the quiet position as how far the source was read: what releasing them one by one would have written.
      */
     private void write(Batch batch, Map<String, ConsumerOffset> current) {
         ChainPosition position = batch.position();
-        boolean carriedAChange = !batch.lastSeqByTable().isEmpty();
+        ChainPosition resumeAt = batch.resumeAt();
         if (directPipeline != null) {
-            if (carriedAChange) {
-                meta.advanceSinkAcked(chainId, directPipeline, position);
+            ChainPosition landed = batch.landedAt().get(directPipeline);
+            if (landed != null) {
+                meta.advanceSinkAcked(chainId, directPipeline, landed);
             }
             ConsumerOffset own = current.get(directPipeline);
-            List<ConsumerOffset> landed = current.values().stream()
+            List<ConsumerOffset> withThisEntry = current.values().stream()
                     .map(consumer -> consumer == own ? consumer.withSinkAcked(position) : consumer)
                     .toList();
             // A position held back to another consumer's is that consumer's run, not this one: nothing says it
             // carried a change, so it is not made a resume point.
-            SrsDurableFrontier.safeAdvance(position, own == null ? List.of() : landed)
-                    .ifPresent(safe -> meta.advanceSourceReadOffset(
-                            chainId, safe, carriedAChange && safe.equals(position)));
+            SrsDurableFrontier.safeAdvance(position, own == null ? List.of() : withThisEntry).ifPresent(safe -> {
+                if (!safe.equals(position) || resumeAt == null) {
+                    meta.advanceSourceReadOffset(chainId, safe, false);
+                    return;
+                }
+                if (!resumeAt.equals(position)) {
+                    meta.advanceSourceReadOffset(chainId, resumeAt, true);
+                }
+                meta.advanceSourceReadOffset(chainId, position, resumeAt.equals(position));
+            });
             return;
         }
-        for (Map.Entry<String, Map<String, Long>> debt : batch.owed().entrySet()) {
-            if (!debt.getValue().isEmpty() && current.containsKey(debt.getKey())
-                    && !meta.advancePhysicalSinkAcked(chainId, debt.getKey(), epoch, position)) {
+        for (Map.Entry<String, ChainPosition> landed : batch.landedAt().entrySet()) {
+            if (current.containsKey(landed.getKey())
+                    && !meta.advancePhysicalSinkAcked(chainId, landed.getKey(), epoch, landed.getValue())) {
                 throw lostOrUnverified();
             }
         }
-        if (!meta.advancePhysicalSourceReadOffset(chainId, epoch, position, carriedAChange)) {
+        if (resumeAt != null && !resumeAt.equals(position)
+                && !meta.advancePhysicalSourceReadOffset(chainId, epoch, resumeAt, true)) {
+            throw lostOrUnverified();
+        }
+        if (!meta.advancePhysicalSourceReadOffset(chainId, epoch, position, position.equals(resumeAt))) {
             throw lostOrUnverified();
         }
         batch.lastSeqByTable().forEach(trimThrough);
@@ -414,9 +425,55 @@ final class PhysicalSourcePrefix implements AutoCloseable {
     }
 
     /**
-     * One recorded run: the position it closes at, the last sequence it reached in each table, and what each
-     * consumer present when it was recorded owed it then.
+     * One entry of the account: a run, or adjacent runs folded together. {@code position} is the last position
+     * they named -- how far the source has been read once all of them are released -- and {@code resumeAt} the
+     * last one named by a run that carried a change, or null where none did. {@code lastSeqByTable} is the last
+     * sequence they reached in each table, {@code owed} what each consumer present when a run was recorded owed
+     * it then, and {@code landedAt} for each consumer the last position named by a run that carried one of its
+     * changes.
      */
-    private record Batch(ChainPosition position, Map<String, Long> lastSeqByTable, Map<String, Map<String, Long>> owed) {
+    private record Batch(ChainPosition position, ChainPosition resumeAt, Map<String, Long> lastSeqByTable,
+            Map<String, Map<String, Long>> owed, Map<String, ChainPosition> landedAt) {
+
+        static Batch of(ChainPosition position, Map<String, Long> lastSeqByTable,
+                Map<String, Map<String, Long>> owed) {
+            boolean named = position.token() != null;
+            Map<String, ChainPosition> landedAt = new LinkedHashMap<>();
+            if (named) {
+                owed.forEach((pipeline, tables) -> {
+                    if (!tables.isEmpty()) {
+                        landedAt.put(pipeline, position);
+                    }
+                });
+            }
+            return new Batch(position, named && !lastSeqByTable.isEmpty() ? position : null,
+                    Map.copyOf(lastSeqByTable), owed, landedAt);
+        }
+
+        /** Whether nothing in it carried a change, so nobody owes it anything. */
+        boolean quiet() {
+            return lastSeqByTable.isEmpty();
+        }
+
+        /**
+         * This entry with the run recorded after it folded in. It is confirmed only once both are, by the same
+         * test either alone would have had to pass: per consumer and table the higher of the two sequences, which
+         * belong to one ring, read in order.
+         */
+        Batch fold(Batch later) {
+            Map<String, Long> seqs = new LinkedHashMap<>(lastSeqByTable);
+            later.lastSeqByTable.forEach((table, seq) -> seqs.merge(table, seq, Math::max));
+            Map<String, Map<String, Long>> debts = new LinkedHashMap<>();
+            owed.forEach((pipeline, tables) -> debts.put(pipeline, new LinkedHashMap<>(tables)));
+            later.owed.forEach((pipeline, tables) -> {
+                Map<String, Long> debt = debts.computeIfAbsent(pipeline, ignored -> new LinkedHashMap<>());
+                tables.forEach((table, seq) -> debt.merge(table, seq, Math::max));
+            });
+            debts.replaceAll((pipeline, tables) -> Map.copyOf(tables));
+            Map<String, ChainPosition> landed = new LinkedHashMap<>(landedAt);
+            landed.putAll(later.landedAt);
+            return new Batch(later.position.token() != null ? later.position : position,
+                    later.resumeAt != null ? later.resumeAt : resumeAt, Map.copyOf(seqs), debts, landed);
+        }
     }
 }

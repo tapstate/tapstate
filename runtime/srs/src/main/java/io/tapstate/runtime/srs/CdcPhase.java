@@ -191,10 +191,10 @@ public final class CdcPhase {
         if (events.isEmpty() && token == null) {
             return;
         }
-        // Routed before the account is asked for room: a change naming a table this reader does not carry
-        // fails the run whole, before any of it is written or recorded.
+        // Routed before anything is written: a change naming a table this reader does not carry fails the
+        // run whole, before any of it is written or recorded.
         Map<String, List<SrsItem>> byTable = events.isEmpty() ? Map.of() : byTable(events, position, routes);
-        prefix.awaitRoom();
+        prefix.checkStillRecording();
         Map<String, Long> lastSeqByTable = new LinkedHashMap<>();
         for (Map.Entry<String, List<SrsItem>> entry : byTable.entrySet()) {
             lastSeqByTable.put(entry.getKey(),

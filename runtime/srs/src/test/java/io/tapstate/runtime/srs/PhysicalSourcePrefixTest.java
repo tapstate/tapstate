@@ -146,25 +146,88 @@ class PhysicalSourcePrefixTest {
     }
 
     /**
-     * A full account holds the source back instead of letting it run ahead: a run that cannot be recorded
-     * cannot be released later either. The wait ends as soon as a run is released.
+     * A run nobody confirms -- one owed to a paused pipeline, or the last change of a table a transform
+     * dropped -- does not hold the source back for everyone else on it. Runs go on being recorded behind it,
+     * the newest folded into the last once the account is full, and nothing is released past it until it
+     * lands. What is then released says what the runs said one by one: how far the source was read, where
+     * the last change was, and for each pipeline where its own last change was.
      */
     @Test
-    void aFullAccountHoldsItsSourceBackUntilARunIsReleased() throws Exception {
+    void aRunNobodyConfirmsDoesNotHoldTheSourceBack() {
+        select("paused", "orders");
+        select("busy", "customers");
+        PhysicalSourcePrefix prefix = shared("customers", "orders");
+        prefix.start(at("t0"));
+        prefix.admitted(Map.of("orders", 0L), "t1");
+        int runs = 2 * PhysicalSourcePrefix.MAX_PENDING_BATCHES;
+        for (int run = 0; run < runs; run++) {
+            prefix.admitted(Map.of("customers", (long) run), "c" + run);
+            prefix.admitted(Map.of(), "h" + run);
+        }
+        assertThat(prefix.pendingBatches()).isLessThanOrEqualTo(PhysicalSourcePrefix.MAX_PENDING_BATCHES);
+
+        // The busy pipeline confirms as far as the first run folded into the account's last entry.
+        int firstFolded = (PhysicalSourcePrefix.MAX_PENDING_BATCHES - 2) / 2;
+        ack("busy", "customers", firstFolded);
+        prefix.tick();
+        assertThat(sourceRead()).as("nothing passes the run the paused pipeline still owes").isEqualTo("t0");
+
+        ack("paused", "orders", 0);
+        prefix.tick();
+        assertThat(sourceRead()).as("the last entry waits for every run folded into it")
+                .isEqualTo("h" + (firstFolded - 1));
+
+        ack("busy", "customers", runs - 1);
+        prefix.tick();
+        assertThat(sourceRead()).isEqualTo("h" + (runs - 1));
+        assertThat(meta.resumeOffset(CHAIN)).as("a restart begins at the last change, not the quiet run after it")
+                .contains("c" + (runs - 1));
+        assertThat(consumer("busy").sinkAcked().token()).isEqualTo("c" + (runs - 1));
+        assertThat(consumer("paused").sinkAcked().token()).as("its own last change, not anybody else's")
+                .isEqualTo("t1");
+        assertThat(prefix.pendingBatches()).isZero();
+    }
+
+    /** Quiet runs recorded behind a run still owed are folded into one: there is nothing in them to owe. */
+    @Test
+    void quietRunsBehindARunStillOwedAreFoldedIntoOne() {
         select("pipe", "orders");
         PhysicalSourcePrefix prefix = shared("orders");
         prefix.start(at("t0"));
-        for (int seq = 0; seq < PhysicalSourcePrefix.MAX_PENDING_BATCHES; seq++) {
-            prefix.admitted(Map.of("orders", (long) seq), "t" + seq);
+        prefix.admitted(Map.of("orders", 0L), "t1");
+        for (int beat = 0; beat < 10; beat++) {
+            prefix.admitted(Map.of(), "h" + beat);
         }
-        CompletableFuture<Void> room = CompletableFuture.runAsync(prefix::awaitRoom);
-        assertThat(room).as("held back while every recorded run is still owed").isNotDone();
-        Thread.sleep(3 * PhysicalSourcePrefix.TICK_MILLIS);
-        assertThat(room).isNotDone();
+        assertThat(prefix.pendingBatches()).isEqualTo(2);
 
         ack("pipe", "orders", 0);
-        room.get(5, TimeUnit.SECONDS);
-        assertThat(prefix.pendingBatches()).isEqualTo(PhysicalSourcePrefix.MAX_PENDING_BATCHES - 1);
+        prefix.tick();
+        assertThat(sourceRead()).isEqualTo("h9");
+        assertThat(meta.resumeOffset(CHAIN)).contains("t1");
+    }
+
+    /**
+     * A direct tail folds the same way, and a fold that ends in a quiet run still resumes from the change
+     * before it.
+     */
+    @Test
+    void aDirectTailFoldsWhatItCannotKeepApartAndResumesFromItsLastChange() {
+        meta.selectConsumerTables(CHAIN, "direct", List.of(), epoch);
+        PhysicalSourcePrefix prefix = PhysicalSourcePrefix.direct(meta, CHAIN, epoch, "direct", health);
+        opened.add(prefix);
+        prefix.start(at("t0"));
+        int runs = 2 * PhysicalSourcePrefix.MAX_PENDING_BATCHES;
+        for (int run = 0; run < runs; run++) {
+            prefix.admitted(Map.of("orders", (long) run), "c" + run);
+            prefix.admitted(Map.of(), "h" + run);
+        }
+        assertThat(prefix.pendingBatches()).isLessThanOrEqualTo(PhysicalSourcePrefix.MAX_PENDING_BATCHES);
+
+        ack("direct", "orders", runs - 1);
+        prefix.tick();
+        assertThat(sourceRead()).isEqualTo("h" + (runs - 1));
+        assertThat(meta.resumeOffset(CHAIN)).contains("c" + (runs - 1));
+        assertThat(consumer("direct").sinkAcked().token()).isEqualTo("c" + (runs - 1));
     }
 
     /** Confirmations that land while the source is quiet are still acted on, by the shared re-check. */
