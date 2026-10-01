@@ -4,6 +4,8 @@ import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.engine.SinkAckFactory;
 
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -12,11 +14,10 @@ import java.util.Objects;
  * run resumes from. So the member's own guard is asked before each advance, on the member where the sink
  * actually runs, exactly as it is asked before the batch that earned the position.
  *
- * <p>On this path that guard is the whole of the fence, and the limit is worth stating where it is felt:
- * the durable record an advance lands in carries no generation of its own, so nothing on the far side
- * turns a late advance away. The capture side does carry one and is refused at the store. Until the same
- * holds here, an advance that leaves a member after its guard last said yes -- one already in flight, or
- * one riding the slack between the two clocks -- is not caught a second time.
+ * <p>The local answer and the durable boundary are separate halves of the fence. The guard returns the
+ * exact live workload claim behind its answer, and the acknowledgement carries that claim to the store;
+ * an advance already in flight when ownership changes is therefore conditionally ignored there rather
+ * than moving the position after the run has been superseded.
  */
 final class FencedSinkAckFactory implements SinkAckFactory {
 
@@ -40,11 +41,21 @@ final class FencedSinkAckFactory implements SinkAckFactory {
         return guarded(delegate.resolve(member), fence, ExecutionAuthorization.of(member));
     }
 
+    @Override
+    public void prepareWriterPlan(Map<String, List<String>> writerIdsByStream) {
+        delegate.prepareWriterPlan(writerIdsByStream);
+    }
+
+    @Override
+    public SinkAckFactory forWriter(
+            String writerId, List<String> streams, Map<String, List<String>> writerIdsByStream) {
+        return new FencedSinkAckFactory(delegate.forWriter(writerId, streams, writerIdsByStream), fence);
+    }
+
     /** {@code ack}, asking {@code authorization} for {@code fence}'s run before each advance. */
     static SinkAck guarded(SinkAck ack, ExecutionFence fence, ExecutionAuthorization authorization) {
         return (chain, position) -> {
-            authorization.require(fence);
-            ack.advance(chain, position);
+            ack.advance(chain, position, authorization.require(fence));
         };
     }
 }

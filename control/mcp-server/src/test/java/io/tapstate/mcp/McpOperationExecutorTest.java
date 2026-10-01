@@ -41,7 +41,7 @@ class McpOperationExecutorTest {
                          "spec":{"contentHash":"abc123","text":"{}","unavailable":null}}
                         """);
             } else if (exchange.getRequestURI().toString().equals("/api/sources?limit=50&offset=0")
-                    || exchange.getRequestURI().toString().equals("/api/pipelines?limit=50&offset=0")) {
+                    || exchange.getRequestURI().toString().equals("/api/pipelines:artifacts?limit=50&offset=0")) {
                 answer(exchange, 200, "{\"items\":[]}");
             } else {
                 answer(exchange, 200, "{}");
@@ -122,7 +122,7 @@ class McpOperationExecutorTest {
                     "/api/sources:draft",
                     "/api/connections/orders/test-result", "/api/connections:discover-schema",
                     "/api/connections/orders/schema", "/api/artifacts:validate", "/api/artifacts:apply",
-                    "/api/artifacts/orders", "/api/pipelines?limit=50&offset=0",
+                    "/api/artifacts/orders", "/api/pipelines:artifacts?limit=50&offset=0",
                     "/api/pipelines/orders:start", "/api/pipelines/orders:stop",
                     "/api/pipelines/orders:pause", "/api/pipelines/orders:resume",
                     "/api/pipelines/orders/status", "/api/pipelines/orders/metrics",
@@ -252,7 +252,7 @@ class McpOperationExecutorTest {
                     Map.of("limit", 999, "offset", 3)).error()).isFalse();
 
             assertThat(paths).containsExactly(
-                    "/api/sources?limit=50&offset=0", "/api/pipelines?limit=200&offset=3");
+                    "/api/sources?limit=50&offset=0", "/api/pipelines:artifacts?limit=200&offset=3");
         } finally {
             server.stop(0);
         }
@@ -320,7 +320,7 @@ class McpOperationExecutorTest {
                     Map.of("offset", (long) Integer.MAX_VALUE + 1));
 
             assertThat(floatingPoint.error()).isFalse();
-            assertThat(paths).containsExactly("/api/pipelines?limit=2&offset=1");
+            assertThat(paths).containsExactly("/api/pipelines:artifacts?limit=2&offset=1");
             assertThat(fractional.body()).containsEntry("code", "control.malformed-request");
             assertThat(text.body()).containsEntry("code", "control.malformed-request");
             assertThat(negativeOffset.body()).containsEntry("code", "control.malformed-request");

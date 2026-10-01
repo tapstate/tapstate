@@ -209,6 +209,7 @@ io.document-too-large
 io.document-unreadable
 io.schema-read-contention
 io.schema-write-contention
+io.sink-writer-progress-ambiguous
 io.store-unauthorized
 io.store-unavailable
 io.workload-claim-fenced
@@ -257,6 +258,13 @@ nest.state-far-exceeds-memory-budget
 nest.state-paths-changed
 nest.state-served-from-cold-layer
 nest.tombstone-limit-exceeded
+pipeline-draft.already-exists
+pipeline-draft.artifact-conflict
+pipeline-draft.invalid
+pipeline-draft.mode-conflict
+pipeline-draft.not-found
+pipeline-draft.precondition-required
+pipeline-draft.revision-conflict
 pipeline.already-exists
 pipeline.id-mismatch
 pipeline.not-found

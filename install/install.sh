@@ -19,6 +19,8 @@
 #   TAPSTATE_TELEMETRY     "off" disables the install event entirely: nothing is sent AND no id file is
 #                          written. Checked before either happens, never after.
 #   TAPSTATE_TELEMETRY_URL where the install event goes; default https://install.tapstate.dev/e.
+#                          Scheduled GitHub Actions runs skip the default POST; an explicit endpoint
+#                          still receives it, and the installation id is kept in either case.
 #   TAPSTATE_ENTRYPOINT    which entry point ran this: "cli" (default) or "quickstart".
 #   TAPSTATE_TELEMETRY_CHANNEL
 #                          "internal" marks the event as one of ours -- a test harness, not a person.
@@ -415,12 +417,22 @@ telemetry_enabled() {
     esac
 }
 
+telemetry_post_suppressed() {
+    [ "${GITHUB_ACTIONS:-}" = true ] && [ "${GITHUB_EVENT_NAME:-}" = schedule ] \
+        && [ -z "${TAPSTATE_TELEMETRY_URL:-}" ]
+}
+
 # Said before anything is written or sent, and on stderr: the quickstart runs this script with stdout
 # dropped, so a disclosure on stdout would be invisible on the path most first-time users take.
 telemetry_disclose() {
     telemetry_enabled || return 0
-    printf 'tapstate reports one anonymous install event (version, OS/arch, entry point, channel, and\n' >&2
-    printf 'a random installation id kept in %s). No IP address is stored.\n' "$install_dir" >&2
+    if telemetry_post_suppressed; then
+        printf 'tapstate keeps a random installation id in %s; scheduled GitHub Actions installs\n' "$install_dir" >&2
+        printf 'skip the default telemetry POST.\n' >&2
+    else
+        printf 'tapstate reports one anonymous install event (version, OS/arch, entry point, channel, and\n' >&2
+        printf 'a random installation id kept in %s). No IP address is stored.\n' "$install_dir" >&2
+    fi
     printf 'Turn it off with TAPSTATE_TELEMETRY=off; deleting %s forgets this installation.\n\n' "$install_dir/$ID_FILE" >&2
 }
 
@@ -446,6 +458,11 @@ send_install_event() {
         ( umask 077; printf '%s\n' "$installation_id" > "$id_path" ) 2>/dev/null || return 0
     fi
     [ -n "$installation_id" ] || return 0
+
+    # Forks can keep running an older unfenced workflow while fetching this published installer.
+    # Suppress their scheduled default POST here, after preserving the id and before either transport.
+    # Explicit endpoints remain authoritative, including an explicit production endpoint.
+    telemetry_post_suppressed && return 0
 
     event_os="${platform%%-*}"
     event_arch="${platform#*-}"

@@ -27,6 +27,8 @@ public final class ControlOperations {
     private static final Map<Frontend, Maturity> CLI_ONLY = Map.of(Frontend.CLI, Maturity.CURRENT);
     private static final Map<Frontend, Maturity> CLI_AND_MCP =
             Map.of(Frontend.CLI, Maturity.CURRENT, Frontend.MCP, Maturity.CURRENT);
+    private static final Map<Frontend, Maturity> CLI_AND_REST =
+            Map.of(Frontend.CLI, Maturity.CURRENT, Frontend.REST, Maturity.CURRENT);
 
     // system domain
     public static final Operation SYSTEM_VERSION = new Operation(
@@ -174,8 +176,12 @@ public final class ControlOperations {
     // is stop then start composed at the surface.
     public static final Operation PIPELINE_LIST = new Operation(
             "pipeline.list", Scope.READ, false, ControlApiSchema.ref("pipeline.list"),
-            "List a bounded page of Pipeline artifacts with resolved Source summaries and live status. "
-                    + "Use limit (1-200) and offset to page; each item can include its DAG and transforms.", CLI_AND_MCP);
+            "List a bounded page of applied Pipeline artifacts with resolved Source summaries and live status. "
+                    + "Use limit (1-200) and offset to page. Use pipeline.get for a full definition.", CLI_AND_MCP);
+    public static final Operation PIPELINE_CATALOG = new Operation(
+            "pipeline.catalog", Scope.READ, false, null,
+            "List a bounded page of Pipelines from the unified artifact-and-draft catalog, including lifecycle status.",
+            CLI_AND_REST);
     public static final Operation PIPELINE_GET = new Operation(
             "pipeline.get", Scope.READ, false, null,
             "Get one static Pipeline artifact with resolved Source summaries.", CLI_ONLY);
@@ -192,6 +198,35 @@ public final class ControlOperations {
     public static final Operation PIPELINE_UPDATE = new Operation(
             "pipeline.update", Scope.WRITE, true, null,
             "Replace one Pipeline definition while its content hash precondition still matches.", CLI_ONLY);
+
+    // Draft operations are the web authoring contract. They are also registered on the CLI face so the
+    // operation catalog remains complete across the command surface; REST is the currently implemented
+    // protocol adapter for these verbs.
+    public static final Operation PIPELINE_DRAFT_LIST = new Operation(
+            "pipeline-draft.list", Scope.READ, false, null,
+            "List editable Pipeline drafts with their revisions and publication state.", CLI_AND_REST);
+    public static final Operation PIPELINE_DRAFT_GET = new Operation(
+            "pipeline-draft.get", Scope.READ, false, null,
+            "Get one editable Pipeline draft and its revision.", CLI_AND_REST);
+    public static final Operation PIPELINE_DRAFT_CREATE = new Operation(
+            "pipeline-draft.create", Scope.WRITE, true, null,
+            "Create one editable Pipeline draft.", CLI_AND_REST);
+    public static final Operation PIPELINE_DRAFT_REPLACE = new Operation(
+            "pipeline-draft.replace", Scope.WRITE, true, null,
+            "Replace one Pipeline draft using its current revision.", CLI_AND_REST);
+    public static final Operation PIPELINE_DRAFT_DELETE = new Operation(
+            "pipeline-draft.delete", Scope.WRITE, true, null,
+            "Discard one Pipeline draft using its current revision.", CLI_AND_REST);
+    public static final Operation PIPELINE_DRAFT_PREVIEW = new Operation(
+            "pipeline-draft.preview", Scope.READ, false, null,
+            "Compile one Pipeline draft without publishing or changing the applied artifact.", CLI_AND_REST);
+    public static final Operation PIPELINE_DRAFT_PUBLISH = new Operation(
+            "pipeline-draft.publish", Scope.WRITE, true, null,
+            "Compile and atomically publish one Pipeline draft after its revision and artifact checks.", CLI_AND_REST);
+    public static final Operation PIPELINE_DRAFT_REBASE = new Operation(
+            "pipeline-draft.rebase", Scope.WRITE, true, null,
+            "Explicitly rebase one Pipeline draft onto the artifact hash the caller has just read, preserving its content.",
+            CLI_AND_REST);
     public static final Operation PIPELINE_START = mcp(
             "pipeline.start", Scope.WRITE, true,
             "Set a Pipeline's desired state to running after its workspace has been applied.");
@@ -305,11 +340,20 @@ public final class ControlOperations {
             DATA_BROWSER_STATS,
             CLUSTER_MEMBERS,
             PIPELINE_LIST,
+            PIPELINE_CATALOG,
             PIPELINE_GET,
             PIPELINE_LAYOUT_GET,
             PIPELINE_LAYOUT_UPDATE,
             PIPELINE_CREATE,
             PIPELINE_UPDATE,
+            PIPELINE_DRAFT_LIST,
+            PIPELINE_DRAFT_GET,
+            PIPELINE_DRAFT_CREATE,
+            PIPELINE_DRAFT_REPLACE,
+            PIPELINE_DRAFT_DELETE,
+            PIPELINE_DRAFT_PREVIEW,
+            PIPELINE_DRAFT_PUBLISH,
+            PIPELINE_DRAFT_REBASE,
             PIPELINE_START,
             PIPELINE_STOP,
             PIPELINE_PAUSE,

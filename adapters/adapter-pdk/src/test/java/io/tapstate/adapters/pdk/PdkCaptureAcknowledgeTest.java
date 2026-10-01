@@ -282,15 +282,20 @@ class PdkCaptureAcknowledgeTest {
         Recorder recorder = new Recorder();
         Subscription sub = open(Synthetic.acknowledgingSource(dir, channel.key), "AcknowledgingSource", recorder);
         SourcePosition durable;
+        int deliveredBeforeClose;
         try {
             durable = deliver(recorder, "rows").position().orElseThrow();
             sub.acknowledge(durable);
+            deliveredBeforeClose = channel.deliveredOn.size();
         } finally {
             sub.close();
         }
 
-        Delivery onTheWayDown = recorder.next();
-        assertThat(onTheWayDown.events()).as("the source's last delivery, made while it stopped").isEmpty();
+        // Counted at the source, because a closed subscription hands the listener nothing either: the delivery
+        // is made, and stops at the subscription.
+        assertThat(channel.deliveredOn).as("the source's last delivery, made while it stopped")
+                .hasSizeGreaterThan(deliveredBeforeClose);
+        assertThat(recorder.deliveries).as("and it reaches no listener").isEmpty();
         assertThat(channel.flushes).as("a delivery made after close hands nothing over").isEmpty();
         assertThat(recorder.acknowledged).isEmpty();
         assertThatCode(() -> sub.acknowledge(durable))

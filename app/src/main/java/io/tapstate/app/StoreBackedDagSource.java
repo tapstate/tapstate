@@ -1274,7 +1274,7 @@ final class StoreBackedDagSource implements DagSource {
         if (readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY) {
             return SinkAckFactory.NONE;
         }
-        return new StoreBackedSinkAckFactory(chainIdByTable(pipeline), pipelineId);
+        return new StoreBackedSinkAckFactory(chainIdByTable(pipeline), pipelineId, storePort.meta());
     }
 
     /**
@@ -1325,7 +1325,7 @@ final class StoreBackedDagSource implements DagSource {
                 key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch, freshStart),
                 step -> transformBinding(step, stepsById, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds),
                 element -> FencedSinkWriterFactory.heldTo(
-                        sinkWriter(pipeline, element, targets, serveStreams, freshFullLoad), fence),
+                        sinkWriter(pipeline, element, targets, serveStreams, sourceIdByTable, freshFullLoad), fence),
                 ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
                 sourceKeysById::get,
                 view -> FencedSinkWriterFactory.heldTo(
@@ -2420,11 +2420,11 @@ final class StoreBackedDagSource implements DagSource {
      */
     private SupplierEx<? extends SinkWriter> sinkWriter(
             PipelineResource pipeline, SyncElement element, Map<String, TargetTable> targets,
-            Set<String> serveStreams, boolean freshFullLoad) {
+            Set<String> serveStreams, Map<String, String> sourceIdByTable, boolean freshFullLoad) {
         SourceResource sink = StoredArtifacts.requireSource(artifacts(), element.source());
         return sinkWriterBinder.bind(
                 sink.connector(), sink.config(), writeMode(element.writeMode()), ddl(element.ddl()),
-                TargetModelResolver.renameAll(targets, serveStreams, element.rename()),
+                TargetModelResolver.renameAll(targets, serveStreams, element.rename(), sourceIdByTable),
                 new PipelineNode(pipeline.id(), syncNodeId(element)),
                 element.onFullLoad() == null ? OnFullLoad.APPEND : OnFullLoad.valueOf(element.onFullLoad().name()),
                 freshFullLoad);

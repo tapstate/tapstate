@@ -37,17 +37,18 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
 
@@ -77,6 +78,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
     private static final int BATCH_SIZE = 1000;
     private static final int SAMPLE_SIZE = 10;
     private static final long SHUTDOWN_JOIN_MILLIS = 2000;
+    private static final long CDC_SHUTDOWN_GRACE_MILLIS = 5000;
 
     /** The longest an Oracle LogMiner start waits for connector initialization and schema discovery. */
     public static final Duration DEFAULT_PREFLIGHT_TIMEOUT = Duration.ofSeconds(30);
@@ -294,16 +296,16 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
         // refuses the start instead of letting the pipeline report RUNNING before its tail fails.
         CompletableFuture<Void> preflight = OracleLogMinerIdentifiers.appliesTo(config)
                 ? new CompletableFuture<>() : null;
-        AtomicBoolean closed = new AtomicBoolean();
+        CdcDelivery delivery = new CdcDelivery();
         Acknowledgements acknowledgements = new Acknowledgements(connector, listener,
                 connector.functions().getFlushOffsetFunction(), acknowledgeIntervalNanos, nanoClock);
         Thread thread = new Thread(
                 () -> streamLoop(connector, config, resumeAt, startAt, listener, stream, preflight,
-                        acknowledgements, closed),
+                        acknowledgements, delivery),
                 "tapstate-cdc-" + connector.connectorId());
         thread.setDaemon(true);
         thread.start();
-        awaitPreflight(preflight, connector, thread);
+        awaitPreflight(preflight, connector, thread, delivery);
         return new Subscription() {
             @Override
             public void acknowledge(SourcePosition durable) {
@@ -312,41 +314,41 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
 
             @Override
             public void close() {
-                if (!closed.compareAndSet(false, true)) {
+                // Before anything else: a source may still deliver on its way down, and a delivery made
+                // after close must hand it nothing.
+                acknowledgements.close();
+                if (!delivery.cancel()) {
                     return;
                 }
-                // Before the connector is told to stop: a source may still deliver on its way down, and a
-                // delivery made after close must hand it nothing.
-                acknowledgements.close();
-                thread.interrupt();
-                connector.stopQuietly();
-                joinQuietly(thread);
-                connector.close();
+                shutDown(connector, thread, CDC_SHUTDOWN_GRACE_MILLIS);
             }
         };
     }
 
     /** Waits until LogMiner's worker has accepted its discovered identifiers, cleaning up a refusal. */
     private void awaitPreflight(
-            CompletableFuture<Void> preflight, PdkConnector connector, Thread thread) {
+            CompletableFuture<Void> preflight, PdkConnector connector, Thread thread, CdcDelivery delivery) {
         if (preflight == null) {
             return;
         }
         try {
             preflight.get(preflightTimeout.toNanos(), TimeUnit.NANOSECONDS);
         } catch (TimeoutException failure) {
-            shutDown(connector, thread);
+            delivery.cancel();
+            shutDown(connector, thread, 0);
             throw new TapstateException(ConnectorError.LOGMINER_PREFLIGHT_TIMEOUT,
                     Map.of("connector", connector.connectorId(),
                             "timeout", preflightTimeout.toMillis() + "ms"), failure);
         } catch (InterruptedException failure) {
-            shutDown(connector, thread);
+            delivery.cancel();
+            shutDown(connector, thread, 0);
             Thread.currentThread().interrupt();
             throw new TapstateException(ConnectorError.CAPTURE_FAILED,
                     Map.of("connector", connector.connectorId(),
                             "detail", "change-capture preflight was interrupted"), failure);
         } catch (ExecutionException failure) {
-            shutDown(connector, thread);
+            delivery.cancel();
+            shutDown(connector, thread, 0);
             Throwable cause = failure.getCause();
             if (cause instanceof RuntimeException runtime) {
                 throw runtime;
@@ -358,12 +360,57 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
         }
     }
 
-    /** Ends a worker whose preflight cannot be returned, then discards its connector handle. */
-    private static void shutDown(PdkConnector connector, Thread thread) {
-        thread.interrupt();
+    /** Lets a cancelled read release its cursor before stopping the client; aborts remain bounded. */
+    private static void shutDown(PdkConnector connector, Thread thread, long graceMillis) {
+        if (graceMillis > 0) {
+            joinQuietly(thread, graceMillis);
+        }
+        if (thread.isAlive()) {
+            thread.interrupt();
+        }
         connector.stopQuietly();
-        joinQuietly(thread);
+        joinQuietly(thread, SHUTDOWN_JOIN_MILLIS);
         connector.close();
+    }
+
+    /** Cancels at the consumer boundary without interrupting the source cursor's cleanup. */
+    private static final class CdcDelivery {
+        private final Set<Thread> active = new HashSet<>();
+        private volatile boolean closed;
+
+        synchronized boolean cancel() {
+            if (closed) {
+                return false;
+            }
+            closed = true;
+            // Wake a listener blocked on downstream capacity, including connector-owned delivery threads.
+            active.forEach(Thread::interrupt);
+            return true;
+        }
+
+        void accept(Runnable batch) {
+            Thread current = Thread.currentThread();
+            synchronized (this) {
+                if (closed) {
+                    throw new CancellationException("the change capture was closed");
+                }
+                active.add(current);
+            }
+            try {
+                batch.run();
+                if (closed) {
+                    throw new CancellationException("the change capture was closed");
+                }
+            } finally {
+                synchronized (this) {
+                    active.remove(current);
+                    if (closed) {
+                        // Our listener wake-up must not prevent a connector's finally block doing I/O.
+                        Thread.interrupted();
+                    }
+                }
+            }
+        }
     }
 
     @Override
@@ -687,7 +734,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
 
     private void streamLoop(PdkConnector connector, CaptureConfig config, Object resumeAt, Long startAt,
             CaptureListener listener, StreamReadFunction stream, CompletableFuture<Void> preflight,
-            Acknowledgements acknowledgements, AtomicBoolean closed) {
+            Acknowledgements acknowledgements, CdcDelivery delivery) {
         try {
             connector.underLoader(() -> {
                 // streamRead is handed only stream names, so the connector reads each changed table's
@@ -715,28 +762,32 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
                     // told on. A delivery of heartbeats alone counts too, which keeps a quiet stream
                     // releasing.
                     // Before the batch rather than after it, because handing a batch over can hold this
-                    // thread for as long as the recipient needs room, and the release is due regardless.
+                    // thread for as long as the recipient needs room, and the release is due regardless --
+                    // and outside the delivery a close cancels, so a close wakes the hand-over and never the
+                    // source's own call.
                     acknowledgements.applyIfDue();
-                    // A change stream also carries control events (heartbeats and the like) that signal
-                    // the tail is alive but carry no row; they are not decodable changes, so skip them.
-                    List<TapEvent> changes = new ArrayList<>(events.size());
-                    for (TapEvent event : events) {
-                        if (!(event instanceof ControlEvent)) {
-                            changes.add(event);
+                    delivery.accept(() -> {
+                        // A change stream also carries control events (heartbeats and the like) that signal
+                        // the tail is alive but carry no row; they are not decodable changes, so skip them.
+                        List<TapEvent> changes = new ArrayList<>(events.size());
+                        for (TapEvent event : events) {
+                            if (!(event instanceof ControlEvent)) {
+                                changes.add(event);
+                            }
                         }
-                    }
-                    // The batch goes over whole, with the one offset the source named for it. The offset
-                    // means the source had read to here once this entire batch was handed over, so it
-                    // belongs to the batch and not to any change inside it; and the batch itself is worth
-                    // keeping, because everything downstream that costs per act rather than per change --
-                    // writing the changes down above all -- costs one act per batch only while the batch
-                    // still exists.
-                    List<Envelope> decoded = new ArrayList<>(changes.size());
-                    for (TapEvent change : changes) {
-                        decoded.add(TapEventCodec.decodeChange(
-                                change, connector.codecs(), declaredTypes(declared, change)));
-                    }
-                    listener.onBatch(decoded, position(connector, offset));
+                        // The batch goes over whole, with the one offset the source named for it. The offset
+                        // means the source had read to here once this entire batch was handed over, so it
+                        // belongs to the batch and not to any change inside it; and the batch itself is worth
+                        // keeping, because everything downstream that costs per act rather than per change --
+                        // writing the changes down above all -- costs one act per batch only while the batch
+                        // still exists.
+                        List<Envelope> decoded = new ArrayList<>(changes.size());
+                        for (TapEvent change : changes) {
+                            decoded.add(TapEventCodec.decodeChange(
+                                    change, connector.codecs(), declaredTypes(declared, change)));
+                        }
+                        listener.onBatch(decoded, position(connector, offset));
+                    });
                 });
                 Object readerOffset = MysqlResumeOffset.forReader(connector.connectorId(), startOffset,
                         connector.context().getStateMap(), () -> InstanceFactory.instance(JsonParser.class));
@@ -744,10 +795,8 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
                 return null;
             });
         } catch (Throwable t) {
-            if (t instanceof CancellationException && closed.get()) {
-                // Closing a subscription interrupts this worker before it stops the connector. A listener
-                // waiting on downstream capacity reports that interruption as cancellation; it is the
-                // requested stop, not a connector failure to publish through the listener's error channel.
+            if (t instanceof CancellationException && delivery.closed) {
+                // Consumer cancellation is the requested stop, not a connector failure to publish.
                 return;
             }
             // The cdc stream runs on this daemon thread; its failure cannot be returned to the caller, so it
@@ -1066,9 +1115,9 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
     }
 
     /** Waits a bounded time for the stream thread to exit before its loader is closed. */
-    private static void joinQuietly(Thread thread) {
+    private static void joinQuietly(Thread thread, long millis) {
         try {
-            thread.join(SHUTDOWN_JOIN_MILLIS);
+            thread.join(millis);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }

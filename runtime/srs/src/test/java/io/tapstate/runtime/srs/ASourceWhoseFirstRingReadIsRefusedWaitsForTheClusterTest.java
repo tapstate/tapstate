@@ -1,6 +1,7 @@
 package io.tapstate.runtime.srs;
 
 import static com.hazelcast.jet.core.Edge.between;
+import static io.tapstate.runtime.srs.SplitBrainProtectionTestSupport.awaitMinimumSize;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.hazelcast.config.Config;
@@ -26,6 +27,7 @@ import io.tapstate.spi.capture.SourcePosition;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import java.net.ServerSocket;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -60,7 +62,7 @@ class ASourceWhoseFirstRingReadIsRefusedWaitsForTheClusterTest {
 
     @AfterEach
     void stopMembers() {
-        for (HazelcastInstance member : List.of(first, second)) {
+        for (HazelcastInstance member : new HazelcastInstance[] {first, second}) {
             if (member != null && member.getLifecycleService().isRunning()) {
                 member.shutdown();
             }
@@ -68,9 +70,13 @@ class ASourceWhoseFirstRingReadIsRefusedWaitsForTheClusterTest {
     }
 
     @Test
-    void aSourceRefusedItsFirstReadWaitsForTheClusterInsteadOfEndingTheRun() throws InterruptedException {
-        first = Hazelcast.newHazelcastInstance(member());
-        second = Hazelcast.newHazelcastInstance(member());
+    void aSourceRefusedItsFirstReadWaitsForTheClusterInsteadOfEndingTheRun() throws Exception {
+        int[] ports = twoFreePorts();
+        first = Hazelcast.newHazelcastInstance(member(ports[0], ports));
+        second = Hazelcast.newHazelcastInstance(member(ports[1], ports));
+        awaitMembers(first, 2, Duration.ofSeconds(10));
+        awaitMinimumSize(PROTECTION, first, second);
+        awaitClusterSafe(first, Duration.ofSeconds(10));
         // Written while the protection is satisfied, so what the source later cannot reach is a ring that
         // demonstrably holds these changes rather than one that was never filled.
         fill(first, CHANGES);
@@ -78,6 +84,8 @@ class ASourceWhoseFirstRingReadIsRefusedWaitsForTheClusterTest {
         // The cluster no longer qualifies, so every operation on the ring is refused -- the state a member
         // is in between joining and its own verdict agreeing, held still for as long as the case needs.
         second.shutdown();
+        awaitMembers(first, 1, Duration.ofSeconds(10));
+        awaitProtection(first, false, Duration.ofSeconds(10));
         Job job = first.getJet().newJob(sourceToList(), new JobConfig()
                 .setName(PIPELINE)
                 // The production configuration: the engine decides what replaces a run whose cluster
@@ -100,7 +108,8 @@ class ASourceWhoseFirstRingReadIsRefusedWaitsForTheClusterTest {
                 .as("and it really was refused -- nothing was read while the cluster said no")
                 .isEmpty();
 
-        second = Hazelcast.newHazelcastInstance(member());
+        second = Hazelcast.newHazelcastInstance(member(ports[1], ports));
+        awaitMinimumSize(PROTECTION, first, second);
 
         awaitSize(first, CHANGES);
         assertThat(first.<String>getList(SINK))
@@ -111,15 +120,17 @@ class ASourceWhoseFirstRingReadIsRefusedWaitsForTheClusterTest {
     }
 
     /** A member of a cluster whose change rings are only readable while both members are present. */
-    private Config member() {
+    private Config member(int port, int[] ports) {
         Config config = new Config();
         config.setClusterName(cluster);
         config.setProperty("hazelcast.phone.home.enabled", "false");
         config.setProperty("hazelcast.shutdownhook.enabled", "false");
+        config.getNetworkConfig().setPort(port).setPortAutoIncrement(false);
         config.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");
         config.getNetworkConfig().getJoin().getAutoDetectionConfig().setEnabled(false);
         config.getNetworkConfig().getJoin().getMulticastConfig().setEnabled(false);
-        config.getNetworkConfig().getJoin().getTcpIpConfig().setEnabled(true).addMember("127.0.0.1");
+        config.getNetworkConfig().getJoin().getTcpIpConfig().setEnabled(true).setMembers(List.of(
+                "127.0.0.1:" + ports[0], "127.0.0.1:" + ports[1]));
         config.getJetConfig().setEnabled(true).setCooperativeThreadCount(2);
         config.addSplitBrainProtectionConfig(new SplitBrainProtectionConfig(PROTECTION, true)
                 .setProtectOn(SplitBrainProtectionOn.READ_WRITE)
@@ -135,6 +146,12 @@ class ASourceWhoseFirstRingReadIsRefusedWaitsForTheClusterTest {
         config.getSerializationConfig().addSerializerConfig(
                 new SerializerConfig().setImplementation(new SrsItemSerializer()).setTypeClass(SrsItem.class));
         return config;
+    }
+
+    private static int[] twoFreePorts() throws Exception {
+        try (ServerSocket first = new ServerSocket(0); ServerSocket second = new ServerSocket(0)) {
+            return new int[] {first.getLocalPort(), second.getLocalPort()};
+        }
     }
 
     /**
@@ -159,6 +176,42 @@ class ASourceWhoseFirstRingReadIsRefusedWaitsForTheClusterTest {
         for (int i = 0; i < count; i++) {
             ring.append(new SrsItem(new SourcePosition("w" + i), Op.INSERT, 1L, null, Map.of("id", i), 0L));
         }
+    }
+
+    private static void awaitMembers(HazelcastInstance member, int expected, Duration timeout)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + timeout.toNanos();
+        while (System.nanoTime() < deadline) {
+            if (member.getCluster().getMembers().size() == expected) {
+                return;
+            }
+            Thread.sleep(25);
+        }
+        assertThat(member.getCluster().getMembers()).hasSize(expected);
+    }
+
+    private static void awaitProtection(HazelcastInstance member, boolean expected, Duration timeout)
+            throws InterruptedException {
+        var protection = member.getSplitBrainProtectionService().getSplitBrainProtection(PROTECTION);
+        long deadline = System.nanoTime() + timeout.toNanos();
+        while (System.nanoTime() < deadline) {
+            if (protection.hasMinimumSize() == expected) {
+                return;
+            }
+            Thread.sleep(25);
+        }
+        assertThat(protection.hasMinimumSize()).isEqualTo(expected);
+    }
+
+    private static void awaitClusterSafe(HazelcastInstance member, Duration timeout) throws InterruptedException {
+        long deadline = System.nanoTime() + timeout.toNanos();
+        while (System.nanoTime() < deadline) {
+            if (member.getPartitionService().isClusterSafe()) {
+                return;
+            }
+            Thread.sleep(25);
+        }
+        assertThat(member.getPartitionService().isClusterSafe()).isTrue();
     }
 
     /**
