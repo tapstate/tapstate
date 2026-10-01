@@ -226,13 +226,21 @@ public interface SrsMetaStore {
     }
 
     /**
-     * Where a restart of the chain's reader resumes: the position of the last released run that carried a
-     * change, where the stream began, or a position put there by hand -- whichever was recorded last. Empty
-     * for a chain with no offset or no record. The default answers the source read offset itself, which is
-     * what a store that does not keep the two apart, and every record written before they were, means.
+     * Where a restart of the chain's reader resumes, and when that was written down: the position of the last
+     * released run that carried a change, where the stream began, or a position put there by hand --
+     * whichever was recorded last. Empty for a chain with no offset or no record. The default answers the
+     * source read offset itself, which is what a store that does not keep the two apart, and every record
+     * written before they were, means.
      */
+    default Optional<ResumePoint> resumePoint(String miningChainId) {
+        return read(miningChainId)
+                .filter(meta -> meta.sourceReadOffset() != null)
+                .map(meta -> new ResumePoint(meta.sourceRead(), meta.sourceReadAt()));
+    }
+
+    /** The token of {@link #resumePoint}: what a restart hands its source to resume from. */
     default Optional<String> resumeOffset(String miningChainId) {
-        return read(miningChainId).map(SrsMeta::sourceReadOffset);
+        return resumePoint(miningChainId).map(point -> point.position().token());
     }
 
     /**

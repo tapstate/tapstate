@@ -25,6 +25,7 @@ import io.tapstate.spi.capture.SharedNotes;
 import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.ResumePoint;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
@@ -1972,7 +1973,7 @@ class CaptureRunUnitTest {
         /** Per chain and pipeline, how far each table's ring is done with -- kept once, never raised here. */
         final Map<String, Map<String, Long>> ringDone = new LinkedHashMap<>();
         /** Per chain, where a restart resumes when that is not the read offset itself. */
-        private final Map<String, String> resumeFrom = new LinkedHashMap<>();
+        private final Map<String, ResumePoint> resumeFrom = new LinkedHashMap<>();
         private volatile String pausedPipeline;
         private volatile CountDownLatch registrationReached;
         private volatile CountDownLatch allowRegistration;
@@ -2079,15 +2080,14 @@ class CaptureRunUnitTest {
                     m.miningChainId(), position, m.consumerOffsets(),
                     m.schemaHistory(), m.retention(), m.epoch()));
             if (resumable && position.token() != null) {
-                resumeFrom.put(miningChainId, position.token());
+                resumeFrom.put(miningChainId, new ResumePoint(position, null));
             }
         }
 
         @Override
-        public synchronized java.util.Optional<String> resumeOffset(String miningChainId) {
-            String resume = resumeFrom.get(miningChainId);
-            return resume != null ? java.util.Optional.of(resume)
-                    : read(miningChainId).map(SrsMeta::sourceReadOffset);
+        public synchronized java.util.Optional<ResumePoint> resumePoint(String miningChainId) {
+            ResumePoint resume = resumeFrom.get(miningChainId);
+            return resume != null ? java.util.Optional.of(resume) : SrsMetaStore.super.resumePoint(miningChainId);
         }
 
         @Override
@@ -2395,7 +2395,7 @@ class CaptureRunUnitTest {
                 records.put(miningChainId, new SrsMeta(m.miningChainId(), position, m.consumerOffsets(),
                         m.schemaHistory(), m.retention(), m.epoch()));
                 if (resumable && position.token() != null) {
-                    resumeFrom.put(miningChainId, position.token());
+                    resumeFrom.put(miningChainId, new ResumePoint(position, null));
                 }
             }
             return true;
@@ -2419,7 +2419,7 @@ class CaptureRunUnitTest {
                     || trustedNow && (stored.order() == null || stored.order().epoch() < epoch)) {
                 records.put(miningChainId, new SrsMeta(m.miningChainId(), position, m.consumerOffsets(),
                         m.schemaHistory(), m.retention(), m.epoch()));
-                resumeFrom.put(miningChainId, position.token());
+                resumeFrom.put(miningChainId, new ResumePoint(position, null));
                 trusted.add(miningChainId);
                 return true;
             }

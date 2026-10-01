@@ -13,6 +13,7 @@ import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.ResumePoint;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
@@ -25,7 +26,9 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -312,6 +315,47 @@ class MongoSrsMetaStoreIT {
             collection.updateOne(new Document("_id", CHAIN), new Document("$unset",
                     new Document(MongoSrsMetaStore.SOURCE_RESUME_OFFSET, "")));
             assertThat(store.resumeOffset(CHAIN)).as("it resumes from its read offset").contains("by-hand");
+        });
+    }
+
+    /**
+     * The resume point keeps the order it was reached at and when it was written, apart from the read
+     * offset's: a quiet release stamps the read offset and leaves the resume point's stamp alone, so the age
+     * it reports is that of where a restart would begin. A point put there by hand has no order to keep.
+     */
+    @Test
+    void theResumePointKeepsItsOwnOrderAndTimeAcrossAQuietRelease() {
+        SteppedClock clock = new SteppedClock(WRITTEN_AT);
+        withCollection(clock, (store, collection) -> {
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            ChainPosition change = new ChainPosition(new SourceOrder(epoch, 0), "change-0");
+            store.advancePhysicalSourceReadOffset(CHAIN, epoch, change, true);
+            clock.advance(Duration.ofHours(1));
+            store.advancePhysicalSourceReadOffset(CHAIN, epoch,
+                    new ChainPosition(new SourceOrder(epoch, 1), "quiet-1"), false);
+
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadAt())
+                    .isEqualTo(WRITTEN_AT.plus(Duration.ofHours(1)));
+            assertThat(store.resumePoint(CHAIN)).contains(new ResumePoint(change, WRITTEN_AT));
+
+            clock.advance(Duration.ofHours(1));
+            store.rewindSourceReadOffset(CHAIN, "by-hand");
+            assertThat(store.resumePoint(CHAIN)).as("put there by hand: no order, stamped when it was put")
+                    .contains(new ResumePoint(
+                            new ChainPosition(null, "by-hand"), WRITTEN_AT.plus(Duration.ofHours(2))));
+
+            // A record from before the resume point was kept apart: its read offset, with its order and stamp.
+            clock.advance(Duration.ofHours(1));
+            ChainPosition later = new ChainPosition(new SourceOrder(epoch, 5), "change-5");
+            store.advanceSourceReadOffset(CHAIN, later, true);
+            collection.updateOne(new Document("_id", CHAIN), new Document("$unset",
+                    new Document(MongoSrsMetaStore.SOURCE_RESUME_OFFSET, "")
+                            .append(MongoSrsMetaStore.SOURCE_RESUME_EPOCH, "")
+                            .append(MongoSrsMetaStore.SOURCE_RESUME_SEQ, "")
+                            .append(MongoSrsMetaStore.SOURCE_RESUME_AT, "")));
+            assertThat(store.resumePoint(CHAIN))
+                    .contains(new ResumePoint(later, WRITTEN_AT.plus(Duration.ofHours(3))));
         });
     }
 
@@ -1668,6 +1712,34 @@ class MongoSrsMetaStoreIT {
     /** The same again, handing over the collection too, for a case that has to write a raw document. */
     private static void withCollection(CollectionTest test) {
         withCollection(Clock.systemUTC(), test);
+    }
+
+    /** A clock a case moves on by hand, so the writes it stamps can be told apart. */
+    private static final class SteppedClock extends Clock {
+        private Instant now;
+
+        SteppedClock(Instant start) {
+            this.now = start;
+        }
+
+        void advance(Duration by) {
+            now = now.plus(by);
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return this;
+        }
+
+        @Override
+        public Instant instant() {
+            return now;
+        }
     }
 
     private static void withCollection(Clock clock, CollectionTest test) {

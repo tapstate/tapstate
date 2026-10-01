@@ -18,6 +18,7 @@ import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.ResumePoint;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
@@ -110,6 +111,14 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * written before the two were kept apart, which resumes from the read offset as it always did.
      */
     static final String SOURCE_RESUME_OFFSET = "sourceResumeOffset";
+
+    /**
+     * The order the resume point was reached at -- absent for one put there by hand, which was never observed
+     * here -- and when it was written. Laid down in the same write as {@link #SOURCE_RESUME_OFFSET}.
+     */
+    static final String SOURCE_RESUME_EPOCH = "sourceResumeEpoch";
+    static final String SOURCE_RESUME_SEQ = "sourceResumeSeq";
+    static final String SOURCE_RESUME_AT = "sourceResumeAt";
 
     /** The generation, revision and tables of the one subscription the chain's reader holds on its source. */
     static final String PHYSICAL_CAPTURE_EPOCH = "physicalCaptureEpoch";
@@ -308,14 +317,18 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         // token says where the engine observed that token in the ring, and this token was not observed
         // here at all -- leaving the old one in place would have the record claim the new position sits
         // exactly where the old one did, in the comparison that decides what is safe to forget.
+        long now = Instant.now(clock).toEpochMilli();
         long matched = writeChainWithConsumerMigration(miningChainId, () -> collection.updateOne(
                         new Document("_id", miningChainId),
                         new Document("$set", new Document("sourceReadOffset", token)
                                 .append(SOURCE_RESUME_OFFSET, token)
-                                .append("sourceReadAt", Instant.now(clock).toEpochMilli())
+                                .append("sourceReadAt", now)
+                                .append(SOURCE_RESUME_AT, now)
                                 .append(PHYSICAL_PREFIX_TRUSTED, true))
                                 .append("$unset", new Document("sourceReadEpoch", "")
-                                        .append("sourceReadSeq", "")))
+                                        .append("sourceReadSeq", "")
+                                        .append(SOURCE_RESUME_EPOCH, "")
+                                        .append(SOURCE_RESUME_SEQ, "")))
                 .getMatchedCount());
         if (matched == 0) {
             // The filter names the chain and nothing else, so nothing matching can only mean no record.
@@ -353,21 +366,32 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     @Override
-    public Optional<String> resumeOffset(String miningChainId) {
+    public Optional<ResumePoint> resumePoint(String miningChainId) {
         Objects.requireNonNull(miningChainId, "miningChainId");
         Document root = StoreIo.call(() -> collection.find(new Document("_id", miningChainId))
-                .projection(Projections.include(SOURCE_RESUME_OFFSET, "sourceReadOffset"))
+                .projection(Projections.include(SOURCE_RESUME_OFFSET, SOURCE_RESUME_EPOCH, SOURCE_RESUME_SEQ,
+                        SOURCE_RESUME_AT, "sourceReadOffset", "sourceReadEpoch", "sourceReadSeq", "sourceReadAt"))
                 .first());
         if (root == null) {
             return Optional.empty();
         }
-        Object resume = root.get(SOURCE_RESUME_OFFSET);
-        Object read = resume != null ? resume : root.get("sourceReadOffset");
-        if (read != null && !(read instanceof String)) {
-            throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", miningChainId,
-                    "field", resume != null ? SOURCE_RESUME_OFFSET : "sourceReadOffset"), null);
+        // A record written before the two were kept apart resumes from its read offset, which only a change
+        // ever moved then.
+        boolean kept = root.get(SOURCE_RESUME_OFFSET) != null;
+        String tokenField = kept ? SOURCE_RESUME_OFFSET : "sourceReadOffset";
+        Object token = root.get(tokenField);
+        if (token == null) {
+            return Optional.empty();
         }
-        return Optional.ofNullable((String) read);
+        if (!(token instanceof String)) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", miningChainId, "field", tokenField), null);
+        }
+        ChainPosition position = kept
+                ? positionFrom(root, SOURCE_RESUME_OFFSET, SOURCE_RESUME_EPOCH, SOURCE_RESUME_SEQ)
+                : sourceReadFrom(root);
+        return Optional.of(new ResumePoint(position,
+                instantFrom(root, kept ? SOURCE_RESUME_AT : "sourceReadAt")));
     }
 
     @Override
@@ -573,7 +597,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * The fields a write to the read offset lays down: the order it reached, the token, and when it was
      * written. An advance carries both halves of the position — a token stored without its order can no
      * longer be ranked, and an order without its token is nothing a read can resume from — so each part
-     * is written only when it is there, and after a rewind the order is the part that is not.
+     * is written only when it is there, and after a rewind the order is the part that is not. A position a
+     * restart may resume from is laid down a second time, the same three parts, as the resume point.
      */
     private static Document sourceReadFields(ChainPosition position, Instant at, boolean resumable) {
         Document fields = new Document();
@@ -583,12 +608,19 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         }
         if (position.token() != null) {
             fields.append("sourceReadOffset", position.token());
-            if (resumable) {
-                fields.append(SOURCE_RESUME_OFFSET, position.token());
-            }
         }
         if (at != null) {
             fields.append("sourceReadAt", at.toEpochMilli());
+        }
+        if (resumable && position.token() != null) {
+            fields.append(SOURCE_RESUME_OFFSET, position.token());
+            if (position.order() != null) {
+                fields.append(SOURCE_RESUME_EPOCH, position.order().epoch())
+                        .append(SOURCE_RESUME_SEQ, position.order().seq());
+            }
+            if (at != null) {
+                fields.append(SOURCE_RESUME_AT, at.toEpochMilli());
+            }
         }
         return fields;
     }
@@ -2037,9 +2069,15 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * the tail to the snapshot seam instead, re-mining every change since.
      */
     private static ChainPosition sourceReadFrom(Document document) {
-        String token = document.getString("sourceReadOffset");
-        Object epoch = document.get("sourceReadEpoch");
-        Object seq = document.get("sourceReadSeq");
+        return positionFrom(document, "sourceReadOffset", "sourceReadEpoch", "sourceReadSeq");
+    }
+
+    /** A token and the order beside it, read the way {@link #sourceReadFrom} reads the read offset. */
+    private static ChainPosition positionFrom(Document document, String tokenField, String epochField,
+            String seqField) {
+        String token = document.getString(tokenField);
+        Object epoch = document.get(epochField);
+        Object seq = document.get(seqField);
         if (!(epoch instanceof Number) || !(seq instanceof Number)) {
             return token == null ? null : new ChainPosition(null, token);
         }
@@ -2049,7 +2087,11 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
 
     /** When the read offset was last written, or null on a record whose offset predates the stamp. */
     private static Instant sourceReadAtFrom(Document document) {
-        Object at = document.get("sourceReadAt");
+        return instantFrom(document, "sourceReadAt");
+    }
+
+    private static Instant instantFrom(Document document, String field) {
+        Object at = document.get(field);
         return at instanceof Number millis ? Instant.ofEpochMilli(millis.longValue()) : null;
     }
 

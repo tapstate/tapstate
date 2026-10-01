@@ -7,6 +7,7 @@ import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.ResumePoint;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
 
@@ -24,9 +25,11 @@ import java.util.TreeSet;
 /**
  * Reads where a pipeline picks up from, and moves it.
  *
- * <p>What it moves is the chain's own read offset, because that is what a run actually starts from. The
- * per-pipeline acked position is reported beside it and never written: it records what a sink confirmed,
- * and no request can make that true.
+ * <p>What it reports and moves is the chain's resume point, because that is what a run actually starts from.
+ * The chain's read offset can stand past it -- a read carries on through runs that carried no change -- and
+ * how far that got is how far the source may release its log, not where the next run begins; a write-back
+ * moves the two together. The per-pipeline acked position is reported beside it and never written: it
+ * records what a sink confirmed, and no request can make that true.
  *
  * <p>Everything the request could be refused for is decided before anything is written. A write-back that
  * names two chains and is going to be refused for the second must not have moved the first — half of one
@@ -236,6 +239,7 @@ public final class PipelinePositionService {
     /** One chain's reading: where it resumes, when that was written, this pipeline's ack, and who shares it. */
     private PipelinePosition.Chain report(String pipelineId, PipelineChains.Chain chain) {
         Optional<SrsMeta> record = meta.read(chain.chainId());
+        Optional<ResumePoint> resume = meta.resumePoint(chain.chainId());
         Optional<ConsumerOffset> mine = record.stream()
                 .flatMap(found -> found.consumerOffsets().stream())
                 .filter(offset -> offset.pipelineId().equals(pipelineId))
@@ -250,8 +254,8 @@ public final class PipelinePositionService {
                 chain.chainId(),
                 chain.sourceId(),
                 chain.tables(),
-                pointOf(record.map(SrsMeta::sourceRead).orElse(null)),
-                record.map(SrsMeta::sourceReadAt).map(Instant::toString).orElse(null),
+                pointOf(resume.map(ResumePoint::position).orElse(null)),
+                resume.map(ResumePoint::recordedAt).map(Instant::toString).orElse(null),
                 pointOf(mine.map(ConsumerOffset::sinkAcked).orElse(null)),
                 List.copyOf(shared));
     }

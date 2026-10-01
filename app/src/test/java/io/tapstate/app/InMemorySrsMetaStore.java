@@ -5,6 +5,7 @@ import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.ResumePoint;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
@@ -34,7 +35,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     /** The chains whose source read offset every table they carry can resume from. */
     private final Set<String> trusted = new HashSet<>();
     /** Per chain, where a restart resumes when that is not the read offset itself. */
-    private final Map<String, String> resumeFrom = new LinkedHashMap<>();
+    private final Map<String, ResumePoint> resumeFrom = new LinkedHashMap<>();
     /** What each chain's reader subscribed to, as its record would carry it. */
     private final Map<String, PhysicalSelection> selections = new LinkedHashMap<>();
     /** Tables asked for by pipelines arriving on each chain, until a subscription serves them. */
@@ -129,19 +130,20 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
             return false;
         }
         if (ranksAfter(position, m.sourceRead())) {
+            Instant at = Instant.now();
             records.put(miningChainId, new SrsMeta(m.miningChainId(), position, m.consumerOffsets(),
-                    m.schemaHistory(), m.retention(), m.epoch(), Instant.now()));
+                    m.schemaHistory(), m.retention(), m.epoch(), at));
             if (resumable && position.token() != null) {
-                resumeFrom.put(miningChainId, position.token());
+                resumeFrom.put(miningChainId, new ResumePoint(position, at));
             }
         }
         return true;
     }
 
     @Override
-    public synchronized Optional<String> resumeOffset(String miningChainId) {
-        String resume = resumeFrom.get(miningChainId);
-        return resume != null ? Optional.of(resume) : read(miningChainId).map(SrsMeta::sourceReadOffset);
+    public synchronized Optional<ResumePoint> resumePoint(String miningChainId) {
+        ResumePoint resume = resumeFrom.get(miningChainId);
+        return resume != null ? Optional.of(resume) : SrsMetaStore.super.resumePoint(miningChainId);
     }
 
     @Override
@@ -160,9 +162,10 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         boolean trustedNow = trusted.contains(miningChainId);
         if (stored == null || stored.token() == null
                 || trustedNow && (stored.order() == null || stored.order().epoch() < epoch)) {
+            Instant at = Instant.now();
             records.put(miningChainId, new SrsMeta(m.miningChainId(), position, m.consumerOffsets(),
-                    m.schemaHistory(), m.retention(), m.epoch(), Instant.now()));
-            resumeFrom.put(miningChainId, position.token());
+                    m.schemaHistory(), m.retention(), m.epoch(), at));
+            resumeFrom.put(miningChainId, new ResumePoint(position, at));
             trusted.add(miningChainId);
             return true;
         }
@@ -208,10 +211,11 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     @Override
     public synchronized void rewindSourceReadOffset(String miningChainId, String token) {
         SrsMeta m = require(miningChainId);
+        Instant at = Instant.now();
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), new ChainPosition(null, token), m.consumerOffsets(),
-                m.schemaHistory(), m.retention(), m.epoch(), Instant.now()));
-        resumeFrom.put(miningChainId, token);
+                m.schemaHistory(), m.retention(), m.epoch(), at));
+        resumeFrom.put(miningChainId, new ResumePoint(new ChainPosition(null, token), at));
         trusted.add(miningChainId);
     }
 
@@ -228,7 +232,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
                 m.miningChainId(), position, m.consumerOffsets(),
                 m.schemaHistory(), m.retention(), m.epoch()));
         if (resumable && position.token() != null) {
-            resumeFrom.put(miningChainId, position.token());
+            resumeFrom.put(miningChainId, new ResumePoint(position, null));
         }
     }
 

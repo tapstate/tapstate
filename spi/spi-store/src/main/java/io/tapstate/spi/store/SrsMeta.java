@@ -24,9 +24,11 @@ import java.util.Optional;
  * predates the stamp).
  *
  * <p>{@code sourceReadAt} is here for the reader, not for the run: nothing branches on it. What it answers
- * is how old the recorded position is, which is the one thing that decides whether resuming from it is
- * still possible at all -- a source retains its change log for a window, and a position older than that
- * window is one no read can start from. An opaque token cannot be looked at and dated; this can.
+ * is how old the recorded position is -- a source retains its change log for a window, and a position older
+ * than that window is one no read can start from. An opaque token cannot be looked at and dated; this can.
+ * Where a restart begins can sit behind this offset, at the last change before runs that carried none, and
+ * its own age is the one that decides whether resuming is still possible:
+ * {@link SrsMetaStore#resumePoint} answers both.
  *
  * <p><strong>What is here is the chain's, and only the chain's.</strong> The line is which of the two
  * things a quantity answers for: the chain is one read of one source's change log, shared by everyone on

@@ -13,6 +13,7 @@ import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.ResumePoint;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
@@ -102,6 +103,27 @@ class PipelinePositionServiceTest {
 
         assertThat(service.read("orders_sync").chains().getFirst().resumeFrom())
                 .isEqualTo(new PipelinePosition.Point("mysql-bin.000001:4", null, null));
+    }
+
+    /**
+     * A read carries on past the last change, through runs that carried none, and how far it got is how far
+     * the source may release its log -- not where the next run begins. The reading is where it begins, and
+     * when that was written: dated by the quiet runs instead, a point the source's log no longer reaches
+     * back to would read as one recorded a moment ago.
+     */
+    @Test
+    void reportsWhereTheNextRunBeginsNotHowFarAQuietReadGotPastIt() {
+        onOneChain("orders_sync");
+        meta.put(new SrsMeta(CHAIN, new ChainPosition(new SourceOrder(3L, 91240L), "mysql-bin.000004:900"),
+                List.of(), List.of(), null, 3L, WRITTEN_AT.plusSeconds(3600)));
+        meta.resumesAt(CHAIN, new ResumePoint(
+                new ChainPosition(new SourceOrder(3L, 91201L), "mysql-bin.000004:154"), WRITTEN_AT));
+
+        PipelinePosition.Chain chain = service.read("orders_sync").chains().getFirst();
+
+        assertThat(chain.resumeFrom())
+                .isEqualTo(new PipelinePosition.Point("mysql-bin.000004:154", 3L, 91201L));
+        assertThat(chain.recordedAt()).isEqualTo("2026-09-03T10:12:44Z");
     }
 
     // ------------------------------------------------------------ writing back
@@ -367,11 +389,23 @@ class PipelinePositionServiceTest {
      */
     private static final class FakeSrsMetaStore implements SrsMetaStore {
         private final Map<String, SrsMeta> records = new HashMap<>();
+        /** Where a chain resumes, where a case put it apart from the read offset. */
+        private final Map<String, ResumePoint> resumePoints = new HashMap<>();
         final List<Map.Entry<String, String>> rewinds = new ArrayList<>();
         final List<Map.Entry<String, ChainPosition>> advances = new ArrayList<>();
 
         void put(SrsMeta record) {
             records.put(record.miningChainId(), record);
+        }
+
+        void resumesAt(String miningChainId, ResumePoint point) {
+            resumePoints.put(miningChainId, point);
+        }
+
+        @Override
+        public Optional<ResumePoint> resumePoint(String miningChainId) {
+            ResumePoint point = resumePoints.get(miningChainId);
+            return point != null ? Optional.of(point) : SrsMetaStore.super.resumePoint(miningChainId);
         }
 
         @Override
@@ -382,6 +416,7 @@ class PipelinePositionServiceTest {
         @Override
         public void rewindSourceReadOffset(String miningChainId, String token) {
             rewinds.add(Map.entry(miningChainId, token));
+            resumePoints.remove(miningChainId);
             SrsMeta held = records.get(miningChainId);
             records.put(miningChainId, new SrsMeta(miningChainId, new ChainPosition(null, token),
                     held.consumerOffsets(), held.schemaHistory(),
