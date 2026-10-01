@@ -38,6 +38,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -48,6 +49,7 @@ import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
+import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
 
 /**
@@ -416,6 +418,12 @@ public final class ObservationPublisher {
     private final NestColdLayerWatch coldLayer;
     private final Clock clock;
     private final CardinalityBudget.Folder cardinality = CardinalityBudget.folder();
+    private final Object accountLock = new Object();
+    private final Map<String, Object> accountTokens = new ConcurrentHashMap<>();
+
+    private record PreparationTicket(String pipelineId, ObservationStore.Scope scope, Object token) { }
+    private record FailureReading(ObservationFailure carried, boolean inheritStored,
+            Map<String, Long> counts, Instant countingSince) { }
     private final Map<String, ObservationFailure> currentFailures = new ConcurrentHashMap<>();
     private final Map<String, ObservationStore.Scope> currentScopes = new ConcurrentHashMap<>();
     private final Map<String, Instant> failureCountingSinceByPipeline = new ConcurrentHashMap<>();
@@ -868,31 +876,14 @@ public final class ObservationPublisher {
     /** Takes one frame and resets local run accounts when an execution identity changes. */
     public Optional<Prepared> prepareScoped(String pipelineId, ObservationFailure failure,
             ObservationStore.Scope scope) {
+        return prepareScoped(pipelineId, failure, scope, () -> true);
+    }
+
+    /** The ownership predicate may access a store and is never called under the account lock. */
+    public Optional<Prepared> prepareScoped(String pipelineId, ObservationFailure failure,
+            ObservationStore.Scope scope, BooleanSupplier current) {
         Objects.requireNonNull(scope, "scope");
-        ObservationStore.Scope previous;
-        while (true) {
-            previous = currentScopes.get(pipelineId);
-            if (previous != null && !scope.equals(previous)
-                    && scope.executionGeneration() <= previous.executionGeneration()) {
-                return Optional.empty();
-            }
-            if (scope.equals(previous)
-                    || (previous == null ? currentScopes.putIfAbsent(pipelineId, scope) == null
-                            : currentScopes.replace(pipelineId, previous, scope))) {
-                break;
-            }
-        }
-        if (!scope.equals(previous)) {
-            currentFailures.remove(pipelineId);
-            failuresByPipelineAndCode.remove(pipelineId);
-            boolean continuing = rebuildingResumes.remove(pipelineId);
-            if (previous == null || !previous.pipelineIncarnationId().equals(scope.pipelineIncarnationId())
-                    || !continuing) {
-                cardinality.forgetPipeline(pipelineId);
-            }
-            failureCountingSinceByPipeline.put(pipelineId, observedNow());
-        }
-        return prepare(pipelineId, failure, scope);
+        return prepare(pipelineId, failure, scope, Objects.requireNonNull(current, "current"));
     }
 
     /** Keeps named series stable while a paused execution is replaced with the same resource. */
@@ -907,7 +898,12 @@ public final class ObservationPublisher {
 
     /** A single immutable measurement and its local alert inputs, before any telemetry store call. */
     public record Prepared(Observation observation, boolean inheritStoredFailure,
-            Map<String, NestStateReading> nestReadings, Map<String, Long> pinned, Map<String, Long> gaps) {
+            Map<String, NestStateReading> nestReadings, Map<String, Long> pinned, Map<String, Long> gaps,
+            Object accountToken) {
+        public Prepared(Observation observation, boolean inheritStoredFailure,
+                Map<String, NestStateReading> nestReadings, Map<String, Long> pinned, Map<String, Long> gaps) {
+            this(observation, inheritStoredFailure, nestReadings, pinned, gaps, null);
+        }
         public Prepared {
             Objects.requireNonNull(observation, "observation");
             nestReadings = Map.copyOf(nestReadings);
@@ -920,90 +916,144 @@ public final class ObservationPublisher {
             Observation changed = new Observation(observation.pipelineId(), observation.state(),
                     FlatMetricProjection.of(facts, FLAT_REDUCTIONS).metrics(), observation.snapshot(),
                     observation.positions(), observation.failure(), observation.observedAt(), facts);
-            return new Prepared(changed, inheritStoredFailure, nestReadings, pinned, gaps);
+            return new Prepared(changed, inheritStoredFailure, nestReadings, pinned, gaps, accountToken);
         }
     }
 
     /** Takes the pipeline's current measurements without reading or writing any observation store. */
     public Optional<Prepared> prepare(String pipelineId, ObservationFailure failure) {
-        return prepare(pipelineId, failure, null);
+        return prepare(pipelineId, failure, () -> true);
     }
 
-    private Optional<Prepared> prepare(String pipelineId, ObservationFailure failure, ObservationStore.Scope scope) {
+    public Optional<Prepared> prepare(String pipelineId, ObservationFailure failure, BooleanSupplier current) {
+        return prepare(pipelineId, failure, null, Objects.requireNonNull(current, "current"));
+    }
+
+    private Optional<Prepared> prepare(String pipelineId, ObservationFailure failure, ObservationStore.Scope scope,
+            BooleanSupplier current) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        return state.read(pipelineId).map(checkpoint -> {
-            PipelineState actual = StateJson.parse(checkpoint.stateJson());
+        if (!current.getAsBoolean()) { return Optional.empty(); }
+        PreparationTicket ticket;
+        synchronized (accountLock) {
+            ObservationStore.Scope previous = currentScopes.get(pipelineId);
+            if (scope != null && previous != null && !scope.equals(previous)
+                    && scope.executionGeneration() <= previous.executionGeneration()) { return Optional.empty(); }
+            if (scope != null && !scope.equals(previous)) {
+                currentScopes.put(pipelineId, scope);
+                accountTokens.put(pipelineId, new Object());
+                currentFailures.remove(pipelineId);
+                failuresByPipelineAndCode.remove(pipelineId);
+                boolean continuing = rebuildingResumes.remove(pipelineId);
+                if (previous == null || !previous.pipelineIncarnationId().equals(scope.pipelineIncarnationId())
+                        || !continuing) { cardinality.forgetPipeline(pipelineId); }
+                failureCountingSinceByPipeline.put(pipelineId, observedNow());
+            }
+            Object token = accountTokens.computeIfAbsent(pipelineId, ignored -> new Object());
+            ticket = new PreparationTicket(pipelineId, scope, token);
+            // Keep a witnessed cause even when the following collection fails. A null retry adds nothing.
             if (failure != null) {
                 currentFailures.put(pipelineId, failure);
-            } else if (actual != PipelineState.FAILED) {
-                currentFailures.remove(pipelineId);
-            }
-            ObservationFailure carried = failure == null ? currentFailures.get(pipelineId) : failure;
-            boolean inheritStoredFailure = carried == null && actual == PipelineState.FAILED;
-            // Counted on the pass that witnesses it, which is the only pass handed a cause. A later pass
-            // over a pipeline still FAILED is handed null and adds nothing, so one death is one count.
-            if (failure != null) {
-                failuresByPipelineAndCode
-                        .computeIfAbsent(pipelineId, id -> new ConcurrentHashMap<>())
+                failuresByPipelineAndCode.computeIfAbsent(pipelineId, ignored -> new ConcurrentHashMap<>())
                         .merge(failure.code(), 1L, Long::sum);
             }
-            Map<String, NestStateReading> readings = nestStateReadings.apply(pipelineId);
-            // Both frontier readings are taken once and used twice - published as metrics and judged by
-            // the watch. Asking each source again for the watch would pay for a second collection of the
-            // run's statistics per pass, and would let the two answers disagree: what an operator reads
-            // and what raised the alarm they are reading would then be different passes of the same run.
-            Map<String, Long> gaps = frontierGaps.apply(pipelineId);
-            Map<String, Long> pinned = frontierStalls.apply(pipelineId);
-            // One instant for the whole pass, shared by the observation and by every point in it. Asking
-            // the clock again per metric would stamp one pass with a spread of times, and a consumer
-            // computing a rate across two passes would divide by a difference that is partly this
-            // publisher's own loop.
-            Instant at = observedNow();
-            // The stored document carries these facts twice, from this one measurement: whole, as the
-            // facts themselves, and as the flat numeric view of them. The flat view is a projection and it
-            // drops what it cannot hold; what it drops is still on the document as a fact, so a reader who
-            // finds a metric missing from the flat view finds it whole next to it rather than nowhere. What
-            // the flat view drops today is pinned by this publisher's own test, so that the first metric it
-            // cannot carry is a decision somebody makes rather than a metric that quietly fails to appear.
-            // Taken once and used twice, like the frontier readings above: the load is published as two
-            // metrics and as the observation's own snapshot dataset, and asking its source again for the
-            // second use would let the two faces of one load describe different passes of it.
-            SnapshotReading loaded = snapshots.apply(pipelineId);
-            List<MetricFact> measured = facts(pipelineId, actual, at, readings, gaps, pinned,
-                    nestDeadLetters.apply(pipelineId), joinRecomputeDone.apply(pipelineId),
-                    joinRecomputeExpected.apply(pipelineId), loaded, scope)
-                    .stream().map(cardinality::fold).toList();
+        }
+        // State and every native source may wait. None runs under the shared account/folder lock.
+        var checkpoint = state.read(pipelineId);
+        if (checkpoint.isEmpty() || !current.getAsBoolean()) { return Optional.empty(); }
+        PipelineState actual = StateJson.parse(checkpoint.orElseThrow().stateJson());
+        FailureReading failureReading;
+        synchronized (accountLock) {
+            if (!ticketCurrent(ticket)) { return Optional.empty(); }
+            if (failure == null && actual != PipelineState.FAILED) { currentFailures.remove(pipelineId); }
+            ObservationFailure carried = currentFailures.get(pipelineId);
+            failureReading = failureReading(pipelineId, carried, carried == null && actual == PipelineState.FAILED);
+        }
+        Map<String, NestStateReading> readings = orderedSnapshot(nestStateReadings.apply(pipelineId));
+        Map<String, Long> gaps = orderedSnapshot(frontierGaps.apply(pipelineId));
+        Map<String, Long> pinned = orderedSnapshot(frontierStalls.apply(pipelineId));
+        Instant at = observedNow();
+        SnapshotReading loaded = snapshots.apply(pipelineId);
+        List<MetricFact> raw = facts(pipelineId, actual, at, readings, gaps, pinned,
+                nestDeadLetters.apply(pipelineId), joinRecomputeDone.apply(pipelineId),
+                joinRecomputeExpected.apply(pipelineId), loaded, scope, failureReading);
+        Map<String, String> sourcePositions = orderedSnapshot(positions.apply(pipelineId));
+        // A wait before the frame clock must not attach a newer time to an obsolete checkpoint.
+        // This read is part of bounded preparation on a telemetry worker, never a hot-path CAS.
+        var afterCollection = state.read(pipelineId);
+        if (afterCollection.isEmpty() || afterCollection.orElseThrow().epoch() != checkpoint.orElseThrow().epoch()
+                || !afterCollection.orElseThrow().stateJson().equals(checkpoint.orElseThrow().stateJson())
+                || !current.getAsBoolean()) { return Optional.empty(); }
+        synchronized (accountLock) {
+            if (!ticketCurrent(ticket)) { return Optional.empty(); }
+            List<MetricFact> measured = raw.stream().map(cardinality::fold).toList();
             Observation published = new Observation(pipelineId, actual,
-                    FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
-                    loaded.byTable(), positions.apply(pipelineId), carried, at, measured);
-            return new Prepared(published, inheritStoredFailure, readings, pinned, gaps);
-        });
+                    FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(), loaded.byTable(),
+                    sourcePositions, failureReading.carried(), at, measured);
+            return Optional.of(new Prepared(published, failureReading.inheritStored(), readings, pinned, gaps,
+                    ticket.token()));
+        }
+    }
+
+    private static <K, V> Map<K, V> orderedSnapshot(Map<K, V> input) {
+        Map<K, V> copy = new LinkedHashMap<>();
+        input.forEach((key, value) -> copy.put(Objects.requireNonNull(key), Objects.requireNonNull(value)));
+        return Collections.unmodifiableMap(copy);
+    }
+
+    /** Called only while the short account lock is held; it performs no external work. */
+    private boolean ticketCurrent(PreparationTicket ticket) {
+        return accountTokens.get(ticket.pipelineId()) == ticket.token()
+                && (ticket.scope() == null || ticket.scope().equals(currentScopes.get(ticket.pipelineId())));
+    }
+
+    private FailureReading failureReading(String pipelineId, ObservationFailure carried, boolean inheritStored) {
+        Map<String, Long> counts = failuresByPipelineAndCode.get(pipelineId);
+        return new FailureReading(carried, inheritStored, counts == null ? Map.of() : Map.copyOf(counts),
+                failureCountingSinceByPipeline.getOrDefault(pipelineId, countingFailuresSince));
+    }
+
+    private boolean accountCurrent(Prepared prepared, ObservationStore.Scope scope, BooleanSupplier current) {
+        if (!current.getAsBoolean()) { return false; }
+        synchronized (accountLock) {
+            return prepared.accountToken() == null || ticketCurrent(new PreparationTicket(
+                    prepared.observation().pipelineId(), scope, prepared.accountToken()));
+        }
     }
 
     /** Persists one previously measured frame; a stale scoped write produces no published frame. */
     public Optional<Observation> commit(Prepared prepared, ObservationStore.Scope scope) {
+        return commit(prepared, scope, () -> true);
+    }
+
+    public Optional<Observation> commit(Prepared prepared, ObservationStore.Scope scope, BooleanSupplier current) {
         Objects.requireNonNull(prepared, "prepared");
+        Objects.requireNonNull(current, "current");
+        if (!accountCurrent(prepared, scope, current)) { return Optional.empty(); }
         Observation published = prepared.observation();
         if (prepared.inheritStoredFailure()) {
-            ObservationFailure carried = previous(published.pipelineId(), scope)
-                    .map(Observation::failure).orElse(null);
+            ObservationFailure carried = previous(published.pipelineId(), scope).map(Observation::failure).orElse(null);
             if (carried != null) {
                 published = new Observation(published.pipelineId(), published.state(), published.metrics(),
-                        published.snapshot(), published.positions(), carried, published.observedAt(),
-                        published.facts());
+                        published.snapshot(), published.positions(), carried, published.observedAt(), published.facts());
             }
         }
-        if (!save(published, scope)) {
-            return Optional.empty();
+        if (!accountCurrent(prepared, scope, current) || !save(published, scope)) { return Optional.empty(); }
+        // The physical conditional write owns its own fence. Losing this guard suppresses local effects;
+        // it cannot undo an already accepted write.
+        if (!accountCurrent(prepared, scope, current)) { return Optional.empty(); }
+        coldLayer.saw(published.pipelineId(), scope, prepared.nestReadings(),
+                () -> localAccountCurrent(prepared, scope));
+        if (!accountCurrent(prepared, scope, current)) { return Optional.empty(); }
+        frontierStall.saw(published.pipelineId(), scope, prepared.pinned(), prepared.gaps(),
+                () -> localAccountCurrent(prepared, scope));
+        return accountCurrent(prepared, scope, current) ? Optional.of(published) : Optional.empty();
+    }
+
+    private boolean localAccountCurrent(Prepared prepared, ObservationStore.Scope scope) {
+        synchronized (accountLock) {
+            return prepared.accountToken() == null || ticketCurrent(new PreparationTicket(
+                    prepared.observation().pipelineId(), scope, prepared.accountToken()));
         }
-            // Fed after the observation is written and never before. The observation is the contract and
-            // the alert is a courtesy on top of it, so a fault in the alerting path must not be able to
-            // cost a pipeline the read face that says it is alive at all.
-            coldLayer.saw(published.pipelineId(), scope, prepared.nestReadings());
-            frontierStall.saw(published.pipelineId(), prepared.pinned(), prepared.gaps());
-            // Handed back so that whoever runs the pass can take a sample off exactly what was published,
-            // at the time it was published, rather than reading it back or measuring it again.
-            return Optional.of(published);
     }
 
     private Optional<Observation> previous(String pipelineId, ObservationStore.Scope scope) {
@@ -1139,8 +1189,18 @@ public final class ObservationPublisher {
             Map<String, NestStateReading> nestReadings, Map<String, Long> gaps, Map<String, Long> pinned,
             Map<String, Long> discarded, Map<String, Long> rebuildDone, Map<String, Long> rebuildExpected,
             SnapshotReading loaded, ObservationStore.Scope scope) {
+        FailureReading captured;
+        synchronized (accountLock) { captured = failureReading(pipelineId, null, false); }
+        return facts(pipelineId, actual, at, nestReadings, gaps, pinned, discarded, rebuildDone,
+                rebuildExpected, loaded, scope, captured);
+    }
+
+    private List<MetricFact> facts(String pipelineId, PipelineState actual, Instant at,
+            Map<String, NestStateReading> nestReadings, Map<String, Long> gaps, Map<String, Long> pinned,
+            Map<String, Long> discarded, Map<String, Long> rebuildDone, Map<String, Long> rebuildExpected,
+            SnapshotReading loaded, ObservationStore.Scope scope, FailureReading failureReading) {
         List<MetricFact> facts = new ArrayList<>();
-        failures(pipelineId, at).ifPresent(facts::add);
+        failures(pipelineId, at, failureReading).ifPresent(facts::add);
         recordCounts.apply(pipelineId)
                 .ifPresent(count -> facts.add(readAt(pipelineId, RECORDS_DRIVEN_METRIC, "{record}", at, count)));
         // One point per chain that reported a reading, so a chain keeping up and a chain that has stalled
@@ -1415,16 +1475,12 @@ public final class ObservationPublisher {
      * code nothing has produced is a row per code per pipeline, and the set of codes a connector can
      * contribute is open.
      */
-    private Optional<MetricFact> failures(String pipelineId, Instant at) {
-        Map<String, Long> byCode = failuresByPipelineAndCode.get(pipelineId);
-        if (byCode == null || byCode.isEmpty()) {
-            return Optional.empty();
-        }
+    private Optional<MetricFact> failures(String pipelineId, Instant at, FailureReading reading) {
+        if (reading.counts().isEmpty()) { return Optional.empty(); }
         List<MetricPoint> counted = new ArrayList<>();
-        Instant since = failureCountingSinceByPipeline.getOrDefault(pipelineId, countingFailuresSince);
-        byCode.forEach((code, count) -> counted.add(MetricPoint.accumulated(
+        reading.counts().forEach((code, count) -> counted.add(MetricPoint.accumulated(
                 Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, CODE_ATTRIBUTE, code),
-                since, at, count)));
+                reading.countingSince(), at, count)));
         return Optional.of(new MetricFact(ERRORS_METRIC, MetricType.COUNTER, "{error}", counted));
     }
 
@@ -1443,14 +1499,22 @@ public final class ObservationPublisher {
      * carries the same answer.
      */
     public void forgetPipelinesOutside(Collection<String> live) {
-        Objects.requireNonNull(live, "live");
-        failuresByPipelineAndCode.keySet().retainAll(Set.copyOf(live));
-        currentFailures.keySet().retainAll(Set.copyOf(live));
-        currentScopes.keySet().retainAll(Set.copyOf(live));
-        rebuildingResumes.retainAll(Set.copyOf(live));
-        failureCountingSinceByPipeline.keySet().retainAll(Set.copyOf(live));
-        cardinality.forgetPipelinesOutside(live);
-        coldLayer.forgetPipelinesOutside(live);
+        Set<String> kept = Set.copyOf(Objects.requireNonNull(live, "live"));
+        Runnable forgetCold;
+        Runnable forgetFrontier;
+        synchronized (accountLock) {
+            failuresByPipelineAndCode.keySet().retainAll(kept);
+            currentFailures.keySet().retainAll(kept);
+            currentScopes.keySet().retainAll(kept);
+            rebuildingResumes.retainAll(kept);
+            failureCountingSinceByPipeline.keySet().retainAll(kept);
+            accountTokens.keySet().retainAll(kept);
+            cardinality.forgetPipelinesOutside(kept);
+            forgetCold = coldLayer.captureForgetPipelinesOutside(kept);
+            forgetFrontier = frontierStall.captureForgetPipelinesOutside(kept);
+        }
+        forgetCold.run();
+        forgetFrontier.run();
     }
 
     /**

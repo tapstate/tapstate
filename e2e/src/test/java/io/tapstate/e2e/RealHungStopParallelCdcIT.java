@@ -237,7 +237,40 @@ class RealHungStopParallelCdcIT {
                     throw bAssertion;
                 }
                 if (aAssertion != null) { throw aAssertion; }
+                if (!nativeWait.execution().isEmpty()) {
+                    Document pending = coordination.getCollection(MongoStorePort.PIPELINE_STATE)
+                            .find(new Document("_id", A)).first();
+                    assertThat(pending).as("A keeps its durable stop while the native close is held").isNotNull();
+                    Document marker = pending.get("stopReservation", Document.class);
+                    assertThat(marker).isNotNull();
+                    Document subject = marker.get("subject", Document.class);
+                    assertThat(subject.getString("kind")).isEqualTo("EXISTING_JOB");
+                    Document oldJob = subject.get("oldJob", Document.class);
+                    Map<String, Object> pinned = Map.of("jobId", ((Number) oldJob.get("jobId")).longValue(),
+                            "clusterId", oldJob.getString("clusterId"), "bootId", oldJob.getString("bootId"),
+                            "pipelineIncarnationId", subject.getString("pipelineIncarnationId"),
+                            "executionGeneration", ((Number) subject.get("executionGeneration")).longValue());
+                    assertThat(nativeWait.execution()).as("the real wait uses exactly the durable old native job")
+                            .isEqualTo(pinned);
+                    report.addFork(Map.of("action", "durable-stop-still-pending", "execution", pinned,
+                            "sourceEpoch", marker.get("sourceEpoch"), "reservedEpoch", marker.get("reservedEpoch")));
+                }
                 observed.releaseClose();
+                Await.until("A to finish its actual stop after releasing the native close",
+                        SETUP_WAIT, () -> actual.read(A).map(value -> StateJson.parse(value.stateJson()))
+                                .filter(PipelineState.STOPPED::equals).isPresent()
+                                && control.state(A).filter(PipelineState.STOPPED::equals).isPresent(),
+                        () -> "actual=" + actual.read(A).map(value -> StateJson.parse(value.stateJson()))
+                                + ", reported=" + control.state(A));
+                Document completed = coordination.getCollection(MongoStorePort.PIPELINE_STATE)
+                        .find(new Document("_id", A)).first();
+                assertThat(completed.containsKey("stopReservation"))
+                        .as("the completed stop clears its durable reservation").isFalse();
+                Progress afterStop = advanceB(control, actual, sourceB, targetDatabase,
+                        bReadings.getLast(), Duration.ofSeconds(12));
+                report.addFork(Map.of("action", "native-close-released-and-stop-completed",
+                        "actual", PipelineState.STOPPED.name(), "reported", PipelineState.STOPPED.name(),
+                        "bProgress", afterStop.evidence()));
             }
             assertThat(PipelineBenchmarkLiveRunIT.artifact(jar)).isEqualTo(application);
             assertThat(PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor("mysql")))

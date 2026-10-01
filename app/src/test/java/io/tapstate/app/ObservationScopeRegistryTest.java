@@ -20,10 +20,187 @@ import java.util.ArrayList;
 import java.util.Map;
 import java.util.Optional;
 import java.util.function.Consumer;
+import java.util.function.BiConsumer;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 class ObservationScopeRegistryTest {
+
+    @Test
+    void aColdRebuildKeepsItsQualifiedStoredFloorWithoutInstallingAnObservationScope() {
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        ObservationStore.Scope existingJob = new ObservationStore.Scope("inc-a", 41);
+        ObservationStore.Stored saved = new ObservationStore.Stored(
+                frame(START, START.minusSeconds(60), 7).observation(), Optional.of(existingJob));
+
+        assertThat(scopes.current(PIPELINE)).isEmpty();
+        var ticket = scopes.beginColdRebuild(PIPELINE, existingJob, () -> true).orElseThrow();
+        assertThat(scopes.prepareColdRebuildingResume(ticket, Optional.of(saved))).isTrue();
+        assertThat(scopes.current(PIPELINE)).isEmpty();
+        var unknownNative = scopes.continueFrame(gaugeFrame(START.plusMillis(500), 22), existingJob);
+        assertThat(unknownNative.observation().facts()).allMatch(fact -> fact.type() == MetricType.GAUGE);
+
+        ObservationStore.Scope next = scopes.begin(PIPELINE, "inc-a", 42);
+        ObservationPublisher.Prepared continued = scopes.continueFrame(
+                frame(START.plusSeconds(1), START.plusSeconds(1), 2), next);
+        assertThat(counter(continued)).isEqualTo(9);
+        assertThat(start(continued)).isEqualTo(START.minusSeconds(60));
+    }
+
+    @Test
+    void unqualifiedOrUnavailableColdTelemetryIsUnknownAndDoesNotBlockAValidRebuild() {
+        var existing = new ObservationStore.Scope("inc-a", 41);
+        Observation known = frame(START, START.minusSeconds(60), 7).observation();
+        Observation legacy = new Observation(PIPELINE, PipelineState.RUNNING,
+                Map.of("records.out", 7L), Map.of(), Map.of(), null, START, List.of());
+        Observation other = new Observation("other", known.state(), known.metrics(), known.snapshot(),
+                known.positions(), null, START, known.facts());
+        List<Optional<ObservationStore.Stored>> unavailable = List.of(Optional.empty(),
+                Optional.of(new ObservationStore.Stored(known, Optional.empty())),
+                Optional.of(new ObservationStore.Stored(known, Optional.of(new ObservationStore.Scope("inc-a", 40)))),
+                Optional.of(new ObservationStore.Stored(known, Optional.of(new ObservationStore.Scope("inc-b", 41)))),
+                Optional.of(new ObservationStore.Stored(other, Optional.of(existing))),
+                Optional.of(new ObservationStore.Stored(legacy, Optional.of(existing))),
+                Optional.of(new ObservationStore.Stored(gaugeFrame(START, 22).observation(), Optional.of(existing))));
+        for (var stored : unavailable) {
+            ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+            var ticket = scopes.beginColdRebuild(PIPELINE, existing, () -> true).orElseThrow();
+            assertThat(scopes.prepareColdRebuildingResume(ticket, stored)).isTrue();
+            assertThat(scopes.current(PIPELINE)).isEmpty();
+            var next = scopes.begin(PIPELINE, "inc-a", 42);
+            var fresh = scopes.continueFrame(frame(START.plusSeconds(1), START.plusSeconds(1), 2), next);
+            assertThat(counter(fresh)).isEqualTo(2);
+            assertThat(start(fresh)).isEqualTo(START.plusSeconds(1));
+        }
+    }
+
+    @Test
+    void aFailedStartAndAnUnavailableRetryKeepTheAlreadyQualifiedColdFloor() {
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        var existing = new ObservationStore.Scope("inc-a", 41);
+        var saved = new ObservationStore.Stored(frame(START, START.minusSeconds(60), 7).observation(),
+                Optional.of(existing));
+        var first = scopes.beginColdRebuild(PIPELINE, existing, () -> true).orElseThrow();
+        assertThat(scopes.prepareColdRebuildingResume(first, Optional.of(saved))).isTrue();
+        var rejected = scopes.begin(PIPELINE, "inc-a", 42);
+        scopes.discard(PIPELINE, rejected);
+
+        assertThat(scopes.prepareColdRebuildingResume(first, Optional.of(saved))).isFalse();
+        scopes.cancelColdRebuild(first);
+        var retry = scopes.beginColdRebuild(PIPELINE, existing, () -> true).orElseThrow();
+        assertThat(scopes.prepareColdRebuildingResume(retry, Optional.empty())).isTrue();
+        assertThat(scopes.prepareColdRebuildingResume(retry, Optional.of(new ObservationStore.Stored(
+                frame(START, START, 999).observation(), Optional.of(new ObservationStore.Scope("inc-other", 99))))))
+                .isTrue();
+        var admitted = scopes.begin(PIPELINE, "inc-a", 43);
+        var continued = scopes.continueFrame(frame(START.plusSeconds(2), START.plusSeconds(2), 2), admitted);
+        assertThat(counter(continued)).isEqualTo(9);
+        assertThat(start(continued)).isEqualTo(START.minusSeconds(60));
+    }
+
+    @Test
+    void coldFloorsBelongOnlyToAHigherGenerationOfTheSameIncarnation() {
+        for (var next : List.of(new ObservationStore.Scope("inc-b", 42), new ObservationStore.Scope("inc-a", 41))) {
+            ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+            var existing = new ObservationStore.Scope("inc-a", 41);
+            var ticket = scopes.beginColdRebuild(PIPELINE, existing, () -> true).orElseThrow();
+            assertThat(scopes.prepareColdRebuildingResume(ticket, Optional.of(new ObservationStore.Stored(
+                    frame(START, START, 7).observation(), Optional.of(existing))))).isTrue();
+            var begun = scopes.begin(PIPELINE, next.pipelineIncarnationId(), next.executionGeneration());
+            assertThat(scopes.prepareColdRebuildingResume(ticket, Optional.empty())).isFalse();
+            scopes.cancelColdRebuild(ticket);
+            assertThat(counter(scopes.continueFrame(frame(START.plusSeconds(1), START.plusSeconds(1), 2), begun)))
+                    .isEqualTo(2);
+        }
+    }
+
+    @Test
+    void aColdStoredReadCannotCrossBeginDeleteDiscardRetainOrCancellation() {
+        List<BiConsumer<ObservationScopeRegistry, ObservationScopeRegistry.ColdRebuildTicket>> changes = List.of(
+                (scopes, ticket) -> scopes.begin(PIPELINE, "inc-a", 42),
+                (scopes, ticket) -> scopes.discard(PIPELINE, scopes.begin(PIPELINE, "inc-a", 42)),
+                (scopes, ticket) -> scopes.forgetIncarnation(PIPELINE, "inc-a"),
+                (scopes, ticket) -> scopes.discard(PIPELINE, new ObservationStore.Scope("inc-a", 41)),
+                (scopes, ticket) -> scopes.retain(List.of()),
+                (scopes, ticket) -> scopes.clearContinuation(PIPELINE),
+                (scopes, ticket) -> scopes.cancelColdRebuild(ticket),
+                (scopes, ticket) -> scopes.cancelRestoration(PIPELINE));
+        var existing = new ObservationStore.Scope("inc-a", 41);
+        var saved = new ObservationStore.Stored(frame(START, START, 7).observation(), Optional.of(existing));
+        for (var change : changes) {
+            ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+            var ticket = scopes.beginColdRebuild(PIPELINE, existing, () -> true).orElseThrow();
+            // The caller's stored read completes only after this registry transition.
+            change.accept(scopes, ticket);
+            assertThat(scopes.prepareColdRebuildingResume(ticket, Optional.of(saved))).isFalse();
+            var next = scopes.begin(PIPELINE, "inc-a", 43);
+            assertThat(counter(scopes.continueFrame(frame(START.plusSeconds(1), START.plusSeconds(1), 2), next)))
+                    .isEqualTo(2);
+        }
+    }
+
+    @Test
+    void ownerLossCancelsAStagedFloorWhileAnOldDeletionCannotEraseANewIncarnationTicket() {
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        var existing = new ObservationStore.Scope("inc-b", 42);
+        var saved = new ObservationStore.Stored(frame(START, START, 7).observation(), Optional.of(existing));
+        AtomicBoolean current = new AtomicBoolean(true);
+        var ticket = scopes.beginColdRebuild(PIPELINE, existing, current::get).orElseThrow();
+        scopes.forgetIncarnation(PIPELINE, "inc-a");
+        assertThat(scopes.prepareColdRebuildingResume(ticket, Optional.of(saved))).isTrue();
+        current.set(false);
+        assertThat(scopes.prepareColdRebuildingResume(ticket, Optional.empty())).isFalse();
+        var next = scopes.begin(PIPELINE, "inc-b", 43);
+        assertThat(counter(scopes.continueFrame(frame(START.plusSeconds(1), START.plusSeconds(1), 2), next)))
+                .isEqualTo(2);
+        assertThat(scopes.beginColdRebuild(PIPELINE, existing, () -> true)).isEmpty();
+    }
+
+    @Test
+    void coldAuthorityChecksRunOutsideTheEntryLockAndObserveRegistryChangesDuringBothChecks() throws Exception {
+        var existing = new ObservationStore.Scope("inc-a", 41);
+        try (var executor = Executors.newSingleThreadExecutor()) {
+            ObservationScopeRegistry before = new ObservationScopeRegistry();
+            assertThat(before.beginColdRebuild(PIPELINE, existing, () -> {
+                try { executor.submit(() -> before.clearContinuation(PIPELINE)).get(5, TimeUnit.SECONDS); }
+                catch (Exception failed) { throw new AssertionError(failed); }
+                return true;
+            })).isEmpty();
+
+            ObservationScopeRegistry after = new ObservationScopeRegistry();
+            AtomicInteger checks = new AtomicInteger();
+            var ticket = after.beginColdRebuild(PIPELINE, existing, () -> {
+                if (checks.incrementAndGet() == 2) {
+                    try { executor.submit(() -> after.clearContinuation(PIPELINE)).get(5, TimeUnit.SECONDS); }
+                    catch (Exception failed) { throw new AssertionError(failed); }
+                }
+                return true;
+            }).orElseThrow();
+            assertThat(after.prepareColdRebuildingResume(ticket, Optional.of(new ObservationStore.Stored(
+                    frame(START, START, 7).observation(), Optional.of(existing))))).isFalse();
+            assertThat(checks.get()).isEqualTo(2);
+        }
+    }
+
+    @Test
+    void theQualifiedTicketReusesWarmFramesAndNativeEpochContinuation() {
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        var existing = scopes.begin(PIPELINE, "inc-a", 41);
+        scopes.continueFrame(frame(START.plusSeconds(1), START, 7), existing);
+        var restartedNative = scopes.continueFrame(frame(START.plusSeconds(2), START.plusSeconds(2), 2), existing);
+        assertThat(counter(restartedNative)).isEqualTo(9);
+        var ticket = scopes.beginColdRebuild(PIPELINE, existing, () -> true).orElseThrow();
+        assertThat(scopes.prepareColdRebuildingResume(ticket, Optional.empty())).isTrue();
+        assertThat(scopes.current(PIPELINE)).contains(existing);
+        var next = scopes.begin(PIPELINE, "inc-a", 42);
+        var continued = scopes.continueFrame(frame(START.plusSeconds(3), START.plusSeconds(3), 3), next);
+        assertThat(counter(continued)).isEqualTo(12);
+        assertThat(start(continued)).isEqualTo(START);
+    }
 
     @Test
     void aFactsAbsentFrameRetainsItsLegacyMetricsWithoutInventingMeasurements() {

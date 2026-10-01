@@ -20,6 +20,19 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class FrontierStallWatchTest {
 
+    @Test
+    void aDelayedForgetCannotDeleteTheReplacementsWindow() {
+        RecordingAlert alert = new RecordingAlert();
+        FrontierStallWatch watch = new FrontierStallWatch(ONE_MINUTE, alert);
+        watch.saw("orders", Map.of("old", 90_000L), Map.of());
+        Runnable cleanup = watch.captureForgetPipelinesOutside(List.of());
+        watch.saw("orders", Map.of("new", 90_000L), Map.of());
+        cleanup.run();
+        watch.saw("orders", Map.of("new", 90_000L), Map.of());
+        assertThat(watch.watching()).containsExactly("orders/new");
+        assertThat(alert.crossed).containsExactly("orders/old", "orders/new");
+    }
+
     private static final FrontierStallPressure ONE_MINUTE =
             new FrontierStallPressure(Duration.ofMinutes(1));
 

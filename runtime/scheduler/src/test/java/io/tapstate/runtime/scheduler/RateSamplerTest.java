@@ -36,6 +36,7 @@ class RateSamplerTest {
         private final List<ObservationStore.Scope> scopes = new ArrayList<>();
         private final List<Instant> gapStarts = new ArrayList<>();
         private int failuresRemaining;
+        private java.util.function.Consumer<RateSample> beforeAppend = sample -> { };
 
         @Override
         public void append(RateSample sample) {
@@ -48,6 +49,7 @@ class RateSamplerTest {
                 failuresRemaining--;
                 throw new IllegalStateException("injected append failure");
             }
+            beforeAppend.accept(sample);
             appended.add(sample);
             gapStarts.add(gapFrom);
         }
@@ -322,5 +324,178 @@ class RateSamplerTest {
         assertThat(sampler.gapHealth().opened()).isEqualTo(2);
         assertThat(sampler.gapHealth().closed()).isEqualTo(1);
         assertThat(history.gapStarts).containsExactly(T0.plusSeconds(1));
+    }
+
+    @Test
+    void preparationLossWithoutAnObservationKeepsItsRealTimeUntilALineBearingSampleSucceeds() {
+        RecordingHistory history = new RecordingHistory();
+        RateSampler sampler = new RateSampler(history, Duration.ofSeconds(60));
+        ObservationStore.Scope run = new ObservationStore.Scope("inc-a", 41);
+        Instant lostAt = T0.plusMillis(37);
+
+        sampler.markPreparationDropped("orders", run, lostAt);
+        sampler.markPreparationDropped("orders", run, T0.plusMillis(38));
+        assertThat(history.appended).isEmpty();
+        assertThat(history.gapStarts).isEmpty();
+        assertThat(sampler.hasOpenGap("orders", run)).isTrue();
+        assertThat(sampler.gapHealth().opened()).isEqualTo(1);
+        assertThat(sampler.gapHealth().closed()).isZero();
+
+        Observation empty = new Observation("orders", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(),
+                null, T0.plusMillis(39));
+        assertThat(sampler.appendIfDue(empty, run)).isFalse();
+        assertThat(sampler.hasOpenGap("orders", run)).isTrue();
+        history.failuresRemaining = 1;
+        org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+                sampler.appendIfDue(moving(T0.plusSeconds(1), 2), run)).hasMessage("injected append failure");
+        assertThat(history.appended).isEmpty();
+        assertThat(sampler.hasOpenGap("orders", run)).isTrue();
+        assertThat(sampler.gapHealth().closed()).isZero();
+        assertThat(sampler.appendIfDue(moving(T0.plusSeconds(2), 3), run)).isTrue();
+        assertThat(history.gapStarts).containsExactly(lostAt);
+        assertThat(history.scopes).containsExactly(run);
+        assertThat(history.appended).singleElement().satisfies(sample -> {
+            assertThat(sample.pipelineId()).isEqualTo("orders");
+            assertThat(sample.observedAt()).isEqualTo(T0.plusSeconds(2));
+            assertThat(sample.counters()).containsEntry("records.out", 3L);
+            assertThat(sample.countingSince()).isEqualTo(STARTED);
+        });
+        assertThat(sampler.gapHealth().open()).isZero();
+        assertThat(sampler.gapHealth().closed()).isEqualTo(1);
+    }
+
+    @Test
+    void preparationLossUsesTheExistingIntervalAndDoesNotAdvanceTheSamplingCadence() {
+        RecordingHistory history = new RecordingHistory();
+        RateSampler sampler = new RateSampler(history, Duration.ofSeconds(60));
+        ObservationStore.Scope run = new ObservationStore.Scope("inc-a", 41);
+        sampler.appendIfDue(moving(T0, 1), run);
+
+        sampler.markPreparationDropped("orders", run, T0.plusMillis(59_999));
+        assertThat(sampler.hasOpenGap("orders", run)).isFalse();
+        sampler.markPreparationDropped("orders", run, T0.plusSeconds(60));
+        assertThat(sampler.appendIfDue(moving(T0.plusMillis(59_999), 2), run)).isFalse();
+        assertThat(sampler.hasOpenGap("orders", run)).isTrue();
+        assertThat(history.appended).hasSize(1);
+        assertThat(sampler.appendIfDue(moving(T0.plusSeconds(61), 3), run)).isTrue();
+        assertThat(history.gapStarts).containsExactly(null, T0.plusSeconds(60));
+        assertThat(history.appended).extracting(RateSample::observedAt).containsExactly(T0, T0.plusSeconds(61));
+    }
+
+    @Test
+    void latePreparationLossFromAnOldEqualGenerationOrLegacyOwnerCannotPoisonTheCurrentGap() {
+        RecordingHistory history = new RecordingHistory();
+        RateSampler sampler = new RateSampler(history, Duration.ofSeconds(60));
+        ObservationStore.Scope current = new ObservationStore.Scope("inc-new", 42);
+        sampler.appendIfDue(moving(T0, 1), current);
+
+        sampler.markPreparationDropped("orders", new ObservationStore.Scope("inc-old", 41), T0.plusSeconds(120));
+        sampler.markPreparationDropped("orders", new ObservationStore.Scope("inc-other", 42), T0.plusSeconds(121));
+        sampler.markPreparationDropped("orders", null, T0.plusSeconds(122));
+        assertThat(sampler.gapHealth().open()).isZero();
+        assertThat(sampler.gapHealth().opened()).isZero();
+
+        sampler.markPreparationDropped("orders", current, T0.plusSeconds(60));
+        sampler.markPreparationDropped("orders", new ObservationStore.Scope("inc-old", 41), T0.plusSeconds(10));
+        assertThat(sampler.appendIfDue(moving(T0.plusSeconds(61), 3), current)).isTrue();
+        assertThat(history.scopes).containsExactly(current, current);
+        assertThat(history.gapStarts).containsExactly(null, T0.plusSeconds(60));
+    }
+
+    @Test
+    void replacingAPreparationGapDoesNotRecoverItOrTransferItToANewExecution() {
+        RecordingHistory history = new RecordingHistory();
+        RateSampler sampler = new RateSampler(history, Duration.ofSeconds(60));
+        ObservationStore.Scope old = new ObservationStore.Scope("inc-a", 41);
+        ObservationStore.Scope next = new ObservationStore.Scope("inc-b", 42);
+        sampler.markPreparationDropped("orders", old, T0);
+
+        assertThat(sampler.appendIfDue(moving(T0.plusSeconds(1), 2), next)).isTrue();
+        sampler.markPreparationDropped("orders", old, T0.plusSeconds(120));
+        assertThat(history.gapStarts).containsExactly((Instant) null);
+        assertThat(history.scopes).containsExactly(next);
+        assertThat(sampler.gapHealth().open()).isZero();
+        assertThat(sampler.gapHealth().opened()).isEqualTo(1);
+        assertThat(sampler.gapHealth().closed()).isZero();
+    }
+
+    @Test
+    void aNewExecutionPreparationLossStartsItsOwnCadenceAndGap() {
+        RecordingHistory history = new RecordingHistory();
+        RateSampler sampler = new RateSampler(history, Duration.ofSeconds(60));
+        ObservationStore.Scope old = new ObservationStore.Scope("inc-a", 41);
+        ObservationStore.Scope next = new ObservationStore.Scope("inc-a", 42);
+        sampler.appendIfDue(moving(T0, 1), old);
+        sampler.markPreparationDropped("orders", next, T0.plusSeconds(1));
+
+        assertThat(sampler.appendIfDue(moving(T0.plusSeconds(2), 3), next)).isTrue();
+        assertThat(history.scopes).containsExactly(old, next);
+        assertThat(history.gapStarts).containsExactly(null, T0.plusSeconds(1));
+        assertThat(sampler.gapHealth().opened()).isEqualTo(1);
+        assertThat(sampler.gapHealth().closed()).isEqualTo(1);
+    }
+
+    @Test
+    void legacyPreparationLossKeepsTheOriginalCadenceWithoutWritingAFrame() {
+        RecordingHistory history = new RecordingHistory();
+        RateSampler sampler = new RateSampler(history, Duration.ofSeconds(60));
+        sampler.appendIfDue(moving(T0, 1));
+        sampler.markPreparationDropped("orders", null, T0.plusSeconds(59));
+        assertThat(sampler.gapHealth().open()).isZero();
+        sampler.markPreparationDropped("orders", null, T0.plusSeconds(60));
+        assertThat(history.appended).hasSize(1);
+
+        assertThat(sampler.appendIfDue(moving(T0.plusSeconds(61), 3))).isTrue();
+        assertThat(history.scopes).isEmpty();
+        assertThat(history.gapStarts).containsExactly(null, T0.plusSeconds(60));
+        assertThat(sampler.gapHealth().closed()).isEqualTo(1);
+    }
+
+    @Test
+    void aLegacyPreparationGapCannotAttachToAScopedSampleOrBeReopenedByALateLegacySignal() {
+        RecordingHistory history = new RecordingHistory();
+        RateSampler sampler = new RateSampler(history, Duration.ofSeconds(60));
+        sampler.markPreparationDropped("orders", null, T0);
+        ObservationStore.Scope current = new ObservationStore.Scope("inc-a", 41);
+
+        assertThat(sampler.appendIfDue(moving(T0.plusSeconds(1), 2), current)).isTrue();
+        sampler.markPreparationDropped("orders", null, T0.plusSeconds(120));
+        assertThat(history.gapStarts).containsExactly((Instant) null);
+        assertThat(sampler.gapHealth().open()).isZero();
+        assertThat(sampler.gapHealth().closed()).isZero();
+    }
+
+    @Test
+    void anOlderSuccessfulAppendCannotEraseAPreparationLossObservedDuringItsStoreCall() {
+        RecordingHistory history = new RecordingHistory();
+        RateSampler sampler = new RateSampler(history, Duration.ofSeconds(60));
+        ObservationStore.Scope run = new ObservationStore.Scope("inc-a", 41);
+        sampler.appendIfDue(moving(T0, 1), run);
+        history.beforeAppend = sample -> sampler.markPreparationDropped("orders", run, T0.plusSeconds(65));
+
+        assertThat(sampler.appendIfDue(moving(T0.plusSeconds(60), 2), run)).isTrue();
+        assertThat(sampler.hasOpenGap("orders", run)).isTrue();
+        history.beforeAppend = sample -> { };
+        assertThat(sampler.appendIfDue(moving(T0.plusSeconds(120), 3), run)).isTrue();
+        assertThat(history.gapStarts).containsExactly(null, null, T0.plusSeconds(65));
+        assertThat(sampler.gapHealth().closed()).isEqualTo(1);
+    }
+
+    @Test
+    void aLateOldPreparationSignalDuringANewScopeAppendCannotUndoTheNewCadence() {
+        RecordingHistory history = new RecordingHistory();
+        RateSampler sampler = new RateSampler(history, Duration.ofSeconds(60));
+        ObservationStore.Scope old = new ObservationStore.Scope("inc-a", 41);
+        ObservationStore.Scope next = new ObservationStore.Scope("inc-a", 42);
+        sampler.appendIfDue(moving(T0, 1), old);
+        history.beforeAppend = sample -> sampler.markPreparationDropped("orders", old, T0.plusSeconds(60));
+
+        assertThat(sampler.appendIfDue(moving(T0.plusSeconds(1), 2), next)).isTrue();
+        history.beforeAppend = sample -> { };
+        assertThat(sampler.appendIfDue(moving(T0.plusSeconds(2), 3), next)).isFalse();
+        assertThat(history.scopes).containsExactly(old, next);
+        assertThat(history.gapStarts).containsExactly(null, null);
+        assertThat(sampler.gapHealth().open()).isZero();
+        assertThat(sampler.gapHealth().opened()).isZero();
     }
 }

@@ -52,6 +52,7 @@ final class RecordingActuator implements LifecycleActuator {
     @Override
     public void stop(String pipelineId, boolean purgeState) {
         calls.add("stop:" + pipelineId + (purgeState ? ":purge" : ":keep"));
+        carryingAJob = false;
     }
 
     @Override

@@ -242,7 +242,8 @@ final class ConvergenceDriver {
                 // A completed clean reconciliation, rather than an idle tick while work is pending,
                 // ends the failure streak. Pending work has not yet shown it can succeed.
                 if (result != null && result.status() != ConvergeStatus.START_CAPACITY
-                        && result.status() != ConvergeStatus.START_PENDING) {
+                        && result.status() != ConvergeStatus.START_PENDING
+                        && result.status() != ConvergeStatus.STOP_PENDING) {
                     reconcileFailures.remove(pipelineId);
                 }
             } catch (RuntimeException e) {
@@ -358,6 +359,8 @@ final class ConvergenceDriver {
             pendingWork.put(pipelineId, PendingReason.START_CAPACITY);
         } else if (result != null && result.status() == ConvergeStatus.START_PENDING) {
             pendingWork.put(pipelineId, PendingReason.START_PENDING);
+        } else if (result != null && result.status() == ConvergeStatus.STOP_PENDING) {
+            pendingWork.put(pipelineId, PendingReason.STOP_PENDING);
         } else {
             pendingWork.clear(pipelineId);
         }
@@ -380,10 +383,9 @@ final class ConvergenceDriver {
                 }
                 return Optional.empty();
             }
-            (scope.isPresent()
-                    ? publisher.prepareScoped(pipelineId, failure, scope.get())
-                    : publisher.prepare(pipelineId, failure))
-                    .ifPresent(prepared -> telemetryWork.offer(prepared, scope.orElse(null)));
+            var capturedScope = scope.orElse(null);
+            telemetryWork.offerPreparation(pipelineId, failure, capturedScope,
+                    () -> publicationOwner(pipelineId, capturedScope, permit));
             return Optional.empty();
         }
         if (observationScopes == null) {
@@ -391,6 +393,20 @@ final class ConvergenceDriver {
         }
         return observationScopes.current(pipelineId)
                 .flatMap(scope -> publisher.publishScoped(pipelineId, failure, scope));
+    }
+
+    private boolean publicationOwner(String pipelineId, io.tapstate.spi.store.ObservationStore.Scope scope,
+            PipelineActuationOwnership.Permit expected) {
+        if (!businessEligible.getAsBoolean()) {
+            return false;
+        }
+        PipelineActuationOwnership.Permit owner = expected != null && expected.granted()
+                ? expected : actuation.permit(pipelineId);
+        if (!owner.granted() || !stillOwner(pipelineId, owner)) {
+            return false;
+        }
+        return owner.claim() == null || (scope != null
+                && owner.claim().executionGeneration() == scope.executionGeneration());
     }
 
     /** Lease renewal time may move; the actual owner and both fencing generations must not. */

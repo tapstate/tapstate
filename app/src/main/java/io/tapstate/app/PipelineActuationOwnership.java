@@ -9,6 +9,8 @@ import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
+import io.tapstate.spi.store.StopAuthority;
+import io.tapstate.spi.store.WorkloadClaimFence;
 
 import java.time.Duration;
 import java.util.Collection;
@@ -295,6 +297,22 @@ final class PipelineActuationOwnership {
         } finally {
             state.lock.unlock();
         }
+    }
+
+    String clusterId() { return clusterId; }
+
+    /** Current stop authority is a read; stopping never allocates a new execution or a standalone lease. */
+    Optional<StopAuthority> stopAuthority(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        if (fenced) {
+            Permit permit = permit(pipelineId);
+            return permit.granted() ? Optional.of(StopAuthority.claimed(WorkloadClaimFence.from(permit.claim())))
+                    : Optional.empty();
+        }
+        if (generations == null) { return Optional.empty(); }
+        OptionalLong generation = generations.currentGeneration(clusterId, pipelineId);
+        return generation.isPresent() && generation.getAsLong() > 0
+                ? Optional.of(StopAuthority.standalone(clusterId, generation.getAsLong())) : Optional.empty();
     }
 
     private Execution beginUnderClaim(String pipelineId, Held state) {

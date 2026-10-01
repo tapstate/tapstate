@@ -96,7 +96,7 @@ class PipelineConvergerTest {
 
         CheckpointDoc actual = state.read("p1").orElseThrow();
         assertThat(actual.stateJson()).isEqualTo(StateJson.of(STOPPED));
-        assertThat(actual.epoch()).isEqualTo(4); // seed 0 -> RUNNING 1 -> PAUSED 2 -> RUNNING 3 -> STOPPED 4
+        assertThat(actual.epoch()).isEqualTo(5); // stop reserves epoch 4 before its completion advances to 5
     }
 
     @Test

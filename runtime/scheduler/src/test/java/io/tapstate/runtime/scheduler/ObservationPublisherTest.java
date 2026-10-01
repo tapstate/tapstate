@@ -8,6 +8,7 @@ import io.tapstate.core.lifecycle.NestStateWindow;
 import io.tapstate.core.lifecycle.MetricAttributes;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
+import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.SnapshotReading;
@@ -29,6 +30,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 
@@ -45,6 +50,122 @@ import static org.assertj.core.api.Assertions.entry;
  * left unobserved rather than published as an empty doc.
  */
 class ObservationPublisherTest {
+
+    @Test
+    void aBlockedCollectionCannotGiveAnOldCheckpointANewTimestamp() throws Exception {
+        state.seed("orders", PipelineState.FAILED);
+        MutableClock clock = new MutableClock(T0);
+        AtomicBoolean first = new AtomicBoolean(true);
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        ObservationPublisher writer = new ObservationPublisher(state, observations,
+                id -> OptionalLong.of(1), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(), id -> {
+                    if (first.compareAndSet(true, false)) { entered.countDown(); awaitRelease(release); }
+                    return Map.of();
+                }, new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
+                id -> Map.of(), new FrontierStallWatch(FrontierStallPressure.DEFAULT, FrontierStallAlert.NONE),
+                id -> Map.of(), id -> Map.of(), id -> Map.of(), clock);
+        var scope = new ObservationStore.Scope("inc-a", 1);
+        var failure = new ObservationFailure(LifecycleError.PAUSED_JOB_MISSING.code(), Map.of("pipeline", "orders"));
+        try (var executor = Executors.newSingleThreadExecutor()) {
+            var old = executor.submit(() -> writer.prepareScoped("orders", failure, scope));
+            try {
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                state.seed("orders", PipelineState.STOPPED);
+                clock.advanceSeconds(1);
+                var stopped = writer.prepareScoped("orders", null, scope).orElseThrow();
+                observations.save(stopped.observation());
+                clock.advanceSeconds(1);
+            } finally { release.countDown(); }
+            assertThat(old.get(5, TimeUnit.SECONDS)).as("old state cannot be stamped after the later checkpoint")
+                    .isEmpty();
+        }
+        assertThat(observations.read("orders").orElseThrow().state()).isEqualTo(PipelineState.STOPPED);
+        assertThat(observations.read("orders").orElseThrow().observedAt()).isEqualTo(T0.plusSeconds(1));
+    }
+
+    @Test
+    void aLateCollectionCannotConsumeTheNextScopesCardinalityBudget() throws Exception {
+        state.seed("orders", PipelineState.FAILED);
+        Map<String, Long> oldNames = new LinkedHashMap<>();
+        for (int index = 0; index < 1_000; index++) { oldNames.put("old-%04d".formatted(index), 1L); }
+        AtomicReference<Map<String, Long>> names = new AtomicReference<>(oldNames);
+        AtomicBoolean first = new AtomicBoolean(true);
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        ObservationPublisher writer = new ObservationPublisher(state, observations, id -> {
+            if (first.compareAndSet(true, false)) {
+                entered.countDown();
+                awaitRelease(release);
+            }
+            return OptionalLong.of(1);
+        }, id -> Map.of(), id -> SnapshotReading.NONE, id -> names.get());
+        try (var executor = Executors.newSingleThreadExecutor()) {
+            var old = executor.submit(() -> writer.prepareScoped("orders", null,
+                    new ObservationStore.Scope("inc-a", 1)));
+            try {
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                names.set(Map.of("new-first", 1L));
+                writer.prepareScoped("orders", null, new ObservationStore.Scope("inc-a", 2)).orElseThrow();
+            } finally { release.countDown(); }
+            assertThat(old.get(5, TimeUnit.SECONDS)).as("the old collector lost its scope while measuring").isEmpty();
+        }
+        names.set(Map.of("new-after", 7L));
+        Observation current = writer.prepareScoped("orders", null,
+                new ObservationStore.Scope("inc-a", 2)).orElseThrow().observation();
+        assertThat(current.facts()).filteredOn(fact -> fact.name().equals("tapstate.pipeline.frontier.gap"))
+                .singleElement().satisfies(fact -> assertThat(fact.points()).singleElement().satisfies(point -> {
+                    assertThat(point.attributes()).containsEntry(MetricAttributes.CHAIN_ID, "new-after")
+                            .doesNotContainKey(MetricAttributes.OVERFLOW);
+                    assertThat(point.value()).isEqualTo(7);
+                }));
+    }
+
+    @Test
+    void forgettingAPipelineInvalidatesItsInFlightCollection() throws Exception {
+        state.seed("orders", PipelineState.RUNNING);
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        ObservationPublisher writer = new ObservationPublisher(state, observations, id -> {
+            entered.countDown();
+            awaitRelease(release);
+            return OptionalLong.of(1);
+        }, id -> Map.of());
+        try (var executor = Executors.newSingleThreadExecutor()) {
+            var pending = executor.submit(() -> writer.prepareScoped("orders", null,
+                    new ObservationStore.Scope("inc-a", 1)));
+            try {
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                writer.forgetPipelinesOutside(List.of());
+            } finally { release.countDown(); }
+            assertThat(pending.get(5, TimeUnit.SECONDS)).as("deleted accounts cannot be revived by a collector")
+                    .isEmpty();
+        }
+    }
+
+    @Test
+    void aFailedNativeCollectionKeepsItsFirstCauseWithoutCountingItAgain() {
+        state.seed("orders", PipelineState.FAILED);
+        AtomicBoolean refuse = new AtomicBoolean(true);
+        ObservationPublisher writer = new ObservationPublisher(state, observations, id -> {
+            if (refuse.compareAndSet(true, false)) { throw new IllegalStateException("native collector unavailable"); }
+            return OptionalLong.of(1);
+        }, id -> Map.of());
+        var failure = new ObservationFailure(LifecycleError.PAUSED_JOB_MISSING.code(), Map.of("pipeline", "orders"));
+        var scope = new ObservationStore.Scope("inc-a", 1);
+        assertThatThrownBy(() -> writer.prepareScoped("orders", failure, scope))
+                .isInstanceOf(IllegalStateException.class).hasMessage("native collector unavailable");
+        Observation recovered = writer.prepareScoped("orders", null, scope).orElseThrow().observation();
+        assertThat(recovered.failure()).isEqualTo(failure);
+        assertThat(recovered.facts()).filteredOn(fact -> fact.name().equals("tapstate.pipeline.errors"))
+                .singleElement().satisfies(fact -> assertThat(fact.points()).singleElement()
+                        .satisfies(point -> assertThat(point.value()).isEqualTo(1)));
+    }
+
+    private static void awaitRelease(CountDownLatch release) {
+        try { assertThat(release.await(5, TimeUnit.SECONDS)).isTrue(); }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+    }
 
     @Test
     void rebuildingResumeRetainsNamedMetricSeriesWhileFreshStartOpensANewBudget() {
@@ -906,7 +1027,7 @@ class ObservationPublisherTest {
         }
 
 
-        private final Map<String, CheckpointDoc> docs = new HashMap<>();
+        private final Map<String, CheckpointDoc> docs = new java.util.concurrent.ConcurrentHashMap<>();
 
         void seed(String pipelineId, PipelineState state) {
             docs.put(pipelineId, CheckpointDoc.initial(pipelineId, StateJson.of(state), T0));

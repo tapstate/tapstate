@@ -112,6 +112,18 @@ final class InMemoryWorkloadClaimStore implements WorkloadClaimStore {
     }
 
     @Override
+    public synchronized OptionalLong currentGeneration(String clusterId, String pipelineId) {
+        WorkloadClaimKey key = new WorkloadClaimKey(
+                clusterId, WorkloadClaimType.PIPELINE_ACTUATION, pipelineId);
+        WorkloadClaim current = claims.get(key);
+        if (current != null) {
+            return OptionalLong.of(current.executionGeneration());
+        }
+        Long generation = unclaimedGenerations.get(key);
+        return generation == null ? OptionalLong.empty() : OptionalLong.of(generation);
+    }
+
+    @Override
     public synchronized OptionalLong advanceStandalone(String clusterId, String pipelineId) {
         WorkloadClaimKey key = new WorkloadClaimKey(
                 clusterId, WorkloadClaimType.PIPELINE_ACTUATION, pipelineId);

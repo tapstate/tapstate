@@ -16,6 +16,18 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class NestColdLayerWatchTest {
 
+    @Test
+    void aDelayedForgetCannotDeleteTheReplacementsWindow() {
+        NestColdLayerWatch watch = new NestColdLayerWatch(PRESSURE, alert);
+        watch.saw("p1", Map.of("old", reading(1_000, 900)));
+        Runnable cleanup = watch.captureForgetPipelinesOutside(List.of());
+        watch.saw("p1", Map.of("new", reading(1_000, 900)));
+        cleanup.run();
+        watch.saw("p1", Map.of("new", reading(2_000, 1_800)));
+        assertThat(watch.watching()).containsExactly("p1/new");
+        assertThat(alert.crossed).containsExactly("p1/old", "p1/new");
+    }
+
     private static final NestColdLayerPressure PRESSURE = new NestColdLayerPressure(0.5, 100);
 
     private final RecordingAlert alert = new RecordingAlert();

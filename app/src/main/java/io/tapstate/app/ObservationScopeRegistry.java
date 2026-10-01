@@ -16,6 +16,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BooleanSupplier;
 
 /** The execution identity and bounded cumulative continuation retained for local telemetry publishes. */
 final class ObservationScopeRegistry {
@@ -29,6 +30,7 @@ final class ObservationScopeRegistry {
         private MetricContinuation restored;
         private long revision;
         private RestoreTicket restore;
+        private ColdRebuildTicket coldRebuild;
         private MetricProducerEpochs epochs = new MetricProducerEpochs();
         private CardinalityBudget.Folder folder = CardinalityBudget.folder();
     }
@@ -38,6 +40,104 @@ final class ObservationScopeRegistry {
     record RecoverySignal(ConvergeResult result, ObservationFailure failure) { }
     record FailureAttempt(ObservationFailure failure, boolean first) { }
     record RestoreTelemetryFailure(ObservationStore.Scope scope, Instant occurredAt, long lastFailureNanos) { }
+
+    /** A real old execution's continuation permission, fenced across caller-owned stored reads. */
+    static final class ColdRebuildTicket {
+        private final String pipelineId;
+        private final Entry entry;
+        private final long revision;
+        private final ObservationStore.Scope existingScope;
+        private final ObservationStore.Scope currentAtStart;
+        private final BooleanSupplier current;
+        private MetricContinuation staged;
+
+        private ColdRebuildTicket(String pipelineId, Entry entry, ObservationStore.Scope existingScope,
+                BooleanSupplier current) {
+            this.pipelineId = pipelineId; this.entry = entry; this.revision = entry.revision;
+            this.existingScope = existingScope; this.currentAtStart = entry.current; this.current = current;
+        }
+    }
+
+    /** Captures the registry before the ownership/intent check; the predicate may perform IO outside its lock. */
+    Optional<ColdRebuildTicket> beginColdRebuild(String pipelineId, ObservationStore.Scope existingScope,
+            BooleanSupplier current) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(existingScope, "existingScope"); Objects.requireNonNull(current, "current");
+        Entry entry = entries.computeIfAbsent(pipelineId, ignored -> new Entry());
+        ColdRebuildTicket ticket;
+        ColdRebuildTicket previous;
+        synchronized (entry) {
+            if (entry.current != null && !existingScope.equals(entry.current)
+                    || entry.pendingFrom != null && (!entry.pendingFrom.pipelineIncarnationId()
+                            .equals(existingScope.pipelineIncarnationId())
+                            || entry.pendingFrom.executionGeneration() > existingScope.executionGeneration())) {
+                return Optional.empty();
+            }
+            ticket = new ColdRebuildTicket(pipelineId, entry, existingScope, current);
+            previous = entry.coldRebuild;
+        }
+        if (!current.getAsBoolean()) { return Optional.empty(); }
+        synchronized (entry) {
+            if (entries.get(pipelineId) != entry || entry.revision != ticket.revision
+                    || !Objects.equals(entry.current, ticket.currentAtStart) || entry.coldRebuild != previous) {
+                return Optional.empty();
+            }
+            entry.coldRebuild = ticket;
+            return Optional.of(ticket);
+        }
+    }
+
+    /**
+     * Processes a still-current rebuild ticket. Missing, empty or differently scoped telemetry adds no
+     * facts and does not block the rebuild; an already matching floor remains known. False means only
+     * that the ticket, registry, ownership or intent is no longer current. No scope or native epoch is
+     * installed, and every stored read belongs to the caller outside the registry lock.
+     */
+    boolean prepareColdRebuildingResume(ColdRebuildTicket ticket, Optional<ObservationStore.Stored> stored) {
+        Objects.requireNonNull(ticket, "ticket"); Objects.requireNonNull(stored, "stored");
+        if (!ticket.current.getAsBoolean()) { cancelColdRebuild(ticket); return false; }
+        synchronized (ticket.entry) {
+            if (!valid(ticket)) { return false; }
+            Entry entry = ticket.entry;
+            Optional<ObservationStore.Stored> qualified = stored.filter(saved ->
+                    ticket.pipelineId.equals(saved.observation().pipelineId())
+                            && saved.scope().filter(ticket.existingScope::equals).isPresent());
+            if (ticket.currentAtStart != null) {
+                prepareRebuildingResume(entry, ticket.existingScope, qualified);
+            } else {
+                Observation source = qualified.map(ObservationStore.Stored::observation).orElse(null);
+                MetricContinuation known = MetricContinuation.capture(source);
+                if (ticket.existingScope.equals(entry.pendingFrom) && entry.pending != null) {
+                    known = MetricContinuation.captureFacts(entry.pending.atLeast(
+                            source == null ? List.of() : source.facts(), source == null ? null : source.observedAt()));
+                }
+                if (!known.isEmpty()) {
+                    entry.pending = known.boundedBy(entry.folder);
+                    entry.pendingFrom = ticket.existingScope;
+                }
+            }
+            ticket.staged = ticket.existingScope.equals(entry.pendingFrom) ? entry.pending : null;
+            return true;
+        }
+    }
+
+    private boolean valid(ColdRebuildTicket ticket) {
+        return entries.get(ticket.pipelineId) == ticket.entry && ticket.entry.revision == ticket.revision
+                && ticket.entry.coldRebuild == ticket && Objects.equals(ticket.entry.current, ticket.currentAtStart);
+    }
+
+    /** Cancels only this still-current ticket, never the floor already inherited by a newer begin. */
+    void cancelColdRebuild(ColdRebuildTicket ticket) {
+        Objects.requireNonNull(ticket, "ticket");
+        synchronized (ticket.entry) {
+            if (!valid(ticket)) { return; }
+            if (ticket.staged != null && ticket.entry.pending == ticket.staged
+                    && ticket.existingScope.equals(ticket.entry.pendingFrom)) {
+                ticket.entry.pending = null; ticket.entry.pendingFrom = null;
+            }
+            ticket.entry.coldRebuild = null;
+        }
+    }
 
     /** The entry object and revision fence begin/delete/recreate, including an absent current scope. */
     static final class RestoreTicket {
@@ -76,6 +176,7 @@ final class ObservationScopeRegistry {
                 return Optional.empty();
             }
             if (entry.restore != null && !Objects.equals(owner, entry.restore.owner)) {
+                clearStagedColdRebuild(entry);
                 entry.revision++;
                 entry.restore = null;
             }
@@ -212,6 +313,9 @@ final class ObservationScopeRegistry {
                 return false;
             }
             Entry entry = ticket.entry;
+            if (entry.coldRebuild != null && !entry.coldRebuild.existingScope.equals(stored.scope().orElseThrow())) {
+                clearStagedColdRebuild(entry);
+            }
             entry.current = stored.scope().orElseThrow();
             entry.restored = ticket.baseline == null
                     ? MetricContinuation.capture(stored.observation()).boundedBy(entry.folder) : ticket.baseline;
@@ -233,7 +337,8 @@ final class ObservationScopeRegistry {
         Entry entry = entries.get(pipelineId);
         if (entry != null) {
             synchronized (entry) {
-                if (entry.restore != null) {
+                if (entry.restore != null || entry.coldRebuild != null) {
+                    clearStagedColdRebuild(entry);
                     entry.revision++;
                     entry.restore = null;
                 }
@@ -245,6 +350,15 @@ final class ObservationScopeRegistry {
         entries.keySet().forEach(this::cancelRestoration);
     }
 
+    private static void clearStagedColdRebuild(Entry entry) {
+        ColdRebuildTicket ticket = entry.coldRebuild;
+        if (ticket != null && ticket.staged != null && entry.pending == ticket.staged
+                && ticket.existingScope.equals(entry.pendingFrom)) {
+            entry.pending = null; entry.pendingFrom = null;
+        }
+        entry.coldRebuild = null;
+    }
+
     ObservationStore.Scope begin(String pipelineId, String incarnation, long generation) {
         ObservationStore.Scope scope = new ObservationStore.Scope(incarnation, generation);
         Entry entry = entries.computeIfAbsent(Objects.requireNonNull(pipelineId, "pipelineId"), id -> new Entry());
@@ -254,6 +368,7 @@ final class ObservationScopeRegistry {
             }
             entry.revision++;
             entry.restore = null;
+            entry.coldRebuild = null;
             entry.restored = null;
             if (entry.pending != null && entry.pendingFrom != null
                     && entry.pendingFrom.pipelineIncarnationId().equals(incarnation)
@@ -289,8 +404,13 @@ final class ObservationScopeRegistry {
             if (current != null && !Objects.equals(current.pipelineIncarnationId(), incarnationId)) {
                 return;
             }
+            if (current == null && entry.coldRebuild != null
+                    && !entry.coldRebuild.existingScope.pipelineIncarnationId().equals(incarnationId)) {
+                return;
+            }
             entry.revision++;
             entry.restore = null;
+            entry.coldRebuild = null;
             entry.restored = null;
             // Keep the entry object: a concurrent begin may already hold it after computeIfAbsent.
             entry.current = null;
@@ -336,23 +456,25 @@ final class ObservationScopeRegistry {
             if (owner == null) {
                 return;
             }
-            Observation source = entry.last;
-            if (MetricContinuation.capture(source).isEmpty()) {
-                source = stored.filter(saved -> saved.scope().filter(owner::equals).isPresent())
-                        .map(ObservationStore.Stored::observation).orElse(source);
-            }
-            List<MetricFact> known = source == null ? List.of() : source.facts();
-            java.time.Instant at = source == null ? null : source.observedAt();
-            if (entry.active != null) {
-                known = entry.active.atLeast(known, at);
-            }
-            if (entry.restored != null) {
-                known = entry.restored.atLeast(known, at);
-            }
-            known = MetricContinuation.captureFacts(entry.epochs.knownFacts(at)).atLeast(known, at);
-            entry.pending = MetricContinuation.captureFacts(known).boundedBy(entry.folder);
-            entry.pendingFrom = owner;
+            prepareRebuildingResume(entry, owner, stored);
         }
+    }
+
+    private static void prepareRebuildingResume(Entry entry, ObservationStore.Scope owner,
+            Optional<ObservationStore.Stored> stored) {
+        Observation source = entry.last;
+        if (MetricContinuation.capture(source).isEmpty()) {
+            source = stored.filter(saved -> saved.scope().filter(owner::equals).isPresent())
+                    .map(ObservationStore.Stored::observation).orElse(source);
+        }
+        List<MetricFact> known = source == null ? List.of() : source.facts();
+        Instant at = source == null ? null : source.observedAt();
+        if (entry.active != null) { known = entry.active.atLeast(known, at); }
+        if (entry.restored != null) { known = entry.restored.atLeast(known, at); }
+        known = MetricContinuation.captureFacts(entry.epochs.knownFacts(at)).atLeast(known, at);
+        if (owner.equals(entry.pendingFrom) && entry.pending != null) { known = entry.pending.atLeast(known, at); }
+        entry.pending = MetricContinuation.captureFacts(known).boundedBy(entry.folder);
+        entry.pendingFrom = owner;
     }
 
     /** An ordinary stop ends pending carry; the current scope keeps its final known totals. */
@@ -362,6 +484,9 @@ final class ObservationScopeRegistry {
             return;
         }
         synchronized (entry) {
+            entry.revision++;
+            entry.restore = null;
+            entry.coldRebuild = null;
             entry.pending = null;
             entry.pendingFrom = null;
         }
@@ -432,10 +557,12 @@ final class ObservationScopeRegistry {
             if (entry.current == null) {
                 entry.revision++;
                 entry.restore = null;
+                entry.coldRebuild = null;
             }
             if (scope.equals(entry.current)) {
                 entry.revision++;
                 entry.restore = null;
+                entry.coldRebuild = null;
                 entry.restored = null;
                 entry.current = null;
                 entry.last = null;

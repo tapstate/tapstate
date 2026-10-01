@@ -14,6 +14,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BooleanSupplier;
 
 /**
  * Watches each nest namespace's readings go by and says when one stops being served from memory.
@@ -65,11 +66,18 @@ public final class NestColdLayerWatch {
 
     /** Records a successful observation under its internal execution owner. */
     public void saw(String pipelineId, ObservationStore.Scope scope, Map<String, NestStateReading> readings) {
+        saw(pipelineId, scope, readings, () -> true);
+    }
+
+    /** The predicate is a local account check; callbacks remain outside the per-pipeline map update. */
+    public void saw(String pipelineId, ObservationStore.Scope scope, Map<String, NestStateReading> readings,
+            BooleanSupplier current) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(readings, "readings");
+        Objects.requireNonNull(current, "current");
         List<Alert> alerts = new ArrayList<>();
         byPipeline.compute(pipelineId, (id, previous) -> {
-            if (stale(scope, previous)) {
+            if (!current.getAsBoolean() || stale(scope, previous)) {
                 return previous;
             }
             Map<String, Seen> held = new HashMap<>(matching(scope, previous));
@@ -78,6 +86,7 @@ public final class NestColdLayerWatch {
             return held.isEmpty() ? null : new ScopedSeen(scope, Map.copyOf(held));
         });
         alerts.forEach(change -> {
+            if (!current.getAsBoolean()) { return; }
             if (change.over()) {
                 alert.crossed(pipelineId, change.namespace(), change.window());
             } else {
@@ -117,6 +126,15 @@ public final class NestColdLayerWatch {
     /** Releases windows for resources that have left the live artifact set. */
     public void forgetPipelinesOutside(Collection<String> live) {
         byPipeline.keySet().retainAll(Set.copyOf(Objects.requireNonNull(live, "live")));
+    }
+
+    /** Captures exact old windows; executing later cannot remove a replacement window. */
+    public Runnable captureForgetPipelinesOutside(Collection<String> live) {
+        Set<String> kept = Set.copyOf(Objects.requireNonNull(live, "live"));
+        Map<String, ScopedSeen> captured = new HashMap<>();
+        byPipeline.forEach((id, seen) -> { if (!kept.contains(id)) { captured.put(id, seen); } });
+        return () -> captured.forEach((id, expected) ->
+                byPipeline.computeIfPresent(id, (key, current) -> current == expected ? null : current));
     }
 
     private void judge(Map<String, Seen> held, String namespace, NestStateReading reading, List<Alert> alerts) {

@@ -54,6 +54,10 @@ public record ConvergeResult(
                 Optional.of(checkpoint), Optional.empty());
     }
 
+    static ConvergeResult stopPending(CheckpointDoc checkpoint) {
+        return new ConvergeResult(ConvergeStatus.STOP_PENDING, Optional.of(checkpoint), Optional.empty());
+    }
+
     static ConvergeResult failed(CheckpointDoc checkpoint, Throwable cause,
             Optional<PipelineState> transitionFrom) {
         return new ConvergeResult(ConvergeStatus.FAILED, Optional.of(checkpoint),

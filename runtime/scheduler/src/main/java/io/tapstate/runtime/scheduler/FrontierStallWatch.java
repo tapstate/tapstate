@@ -2,13 +2,19 @@ package io.tapstate.runtime.scheduler;
 
 import io.tapstate.core.lifecycle.FrontierStall;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
+import io.tapstate.spi.store.ObservationStore;
 
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Objects;
 import java.util.OptionalLong;
 import java.util.Set;
+import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BooleanSupplier;
 
 /**
  * Watches each chain's pinned-for reading go by and says when one has been pinned too long, and when it
@@ -37,14 +43,16 @@ import java.util.Set;
  * other's readings — and a joined name would answer that with a separator that has to be absent from every
  * pipeline id there will ever be.
  *
- * <p>Not thread-safe, and does not need to be: it is fed from the pass that publishes observations, which
- * is one caller at a time.
+ * <p>Each successful publication replaces an immutable scoped snapshot. Alert callbacks run after
+ * the per-pipeline update, so one slow alert cannot hold another pipeline's measurement account.
  */
 public final class FrontierStallWatch {
 
     private final FrontierStallPressure pressure;
     private final FrontierStallAlert alert;
-    private final Map<String, Map<String, Boolean>> byPipeline = new HashMap<>();
+    private record Seen(ObservationStore.Scope scope, Map<String, Boolean> chains) { }
+    private record Alert(FrontierStall stall, boolean over) { }
+    private final Map<String, Seen> byPipeline = new ConcurrentHashMap<>();
 
     public FrontierStallWatch(FrontierStallPressure pressure, FrontierStallAlert alert) {
         this.pressure = Objects.requireNonNull(pressure, "pressure");
@@ -61,37 +69,61 @@ public final class FrontierStallWatch {
      * the pinned ones are judged here, each carrying whatever distance it has.
      */
     public void saw(String pipelineId, Map<String, Long> stalls, Map<String, Long> gaps) {
+        saw(pipelineId, null, stalls, gaps, () -> true);
+    }
+
+    public void saw(String pipelineId, ObservationStore.Scope scope, Map<String, Long> stalls, Map<String, Long> gaps,
+            BooleanSupplier current) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(stalls, "stalls");
         Objects.requireNonNull(gaps, "gaps");
-        Map<String, Boolean> held = byPipeline.computeIfAbsent(pipelineId, ignored -> new HashMap<>());
-        held.keySet().retainAll(stalls.keySet());
-        stalls.forEach((chain, pinnedMillis) -> {
-            Long gap = gaps.get(chain);
-            judge(pipelineId, held, new FrontierStall(chain, pinnedMillis,
-                    gap == null ? OptionalLong.empty() : OptionalLong.of(gap)));
+        Objects.requireNonNull(current, "current");
+        List<Alert> alerts = new ArrayList<>();
+        byPipeline.compute(pipelineId, (id, previous) -> {
+            if (!current.getAsBoolean() || stale(scope, previous)) { return previous; }
+            Map<String, Boolean> held = new HashMap<>(previous != null
+                    && Objects.equals(scope, previous.scope()) ? previous.chains() : Map.of());
+            held.keySet().retainAll(stalls.keySet());
+            stalls.forEach((chain, pinnedMillis) -> {
+                Long gap = gaps.get(chain);
+                FrontierStall stall = new FrontierStall(chain, pinnedMillis,
+                        gap == null ? OptionalLong.empty() : OptionalLong.of(gap));
+                boolean nowOver = pressure.isOver(stall);
+                boolean wasOver = Boolean.TRUE.equals(held.put(chain, nowOver));
+                if (nowOver != wasOver) { alerts.add(new Alert(stall, nowOver)); }
+            });
+            return held.isEmpty() ? null : new Seen(scope, Map.copyOf(held));
         });
-        if (held.isEmpty()) {
-            byPipeline.remove(pipelineId);
-        }
+        alerts.forEach(change -> {
+            if (!current.getAsBoolean()) { return; }
+            if (change.over()) { alert.crossed(pipelineId, change.stall()); }
+            else { alert.cleared(pipelineId, change.stall()); }
+        });
     }
 
     /** Which chains are currently held, as pipeline and chain together — what a caller asserts on. */
     Set<String> watching() {
         Set<String> held = new HashSet<>();
-        byPipeline.forEach((pipelineId, chains) ->
-                chains.keySet().forEach(chain -> held.add(pipelineId + "/" + chain)));
+        byPipeline.forEach((pipelineId, seen) ->
+                seen.chains().keySet().forEach(chain -> held.add(pipelineId + "/" + chain)));
         return held;
     }
 
-    private void judge(String pipelineId, Map<String, Boolean> held, FrontierStall stall) {
-        boolean nowOver = pressure.isOver(stall);
-        boolean wasOver = Boolean.TRUE.equals(held.get(stall.chain()));
-        held.put(stall.chain(), nowOver);
-        if (nowOver && !wasOver) {
-            alert.crossed(pipelineId, stall);
-        } else if (!nowOver && wasOver) {
-            alert.cleared(pipelineId, stall);
-        }
+    public void forgetPipelinesOutside(Collection<String> live) {
+        byPipeline.keySet().retainAll(Set.copyOf(Objects.requireNonNull(live, "live")));
+    }
+
+    /** A delayed cleanup matches the captured window object rather than only its pipeline id. */
+    public Runnable captureForgetPipelinesOutside(Collection<String> live) {
+        Set<String> kept = Set.copyOf(Objects.requireNonNull(live, "live"));
+        Map<String, Seen> captured = new HashMap<>();
+        byPipeline.forEach((id, seen) -> { if (!kept.contains(id)) { captured.put(id, seen); } });
+        return () -> captured.forEach((id, expected) ->
+                byPipeline.computeIfPresent(id, (key, current) -> current == expected ? null : current));
+    }
+
+    private static boolean stale(ObservationStore.Scope scope, Seen previous) {
+        return previous != null && previous.scope() != null && (scope == null
+                || !scope.equals(previous.scope()) && scope.executionGeneration() <= previous.scope().executionGeneration());
     }
 }

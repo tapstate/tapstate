@@ -1,6 +1,9 @@
 package io.tapstate.runtime.scheduler;
 
 import java.util.Optional;
+import java.util.function.BooleanSupplier;
+import io.tapstate.spi.store.StopAuthority;
+import io.tapstate.spi.store.StopReservation;
 
 /**
  * Turns a converged lifecycle transition into the matching data-plane job operation. The converge
@@ -70,6 +73,25 @@ public interface LifecycleActuator {
     /** Stops a paused job that must be rebuilt while retaining its known cumulative observations. */
     default void stopForRebuildingResume(String pipelineId, boolean purgeState) {
         stop(pipelineId, purgeState);
+    }
+
+    /** A native binding supplies a factual absent job or the exact admitted old job before reservation. */
+    default Optional<StopReservation.Subject> stopSubject(String pipelineId) {
+        return Optional.empty();
+    }
+
+    /** Reads current authority without advancing the execution sequence. */
+    default Optional<StopAuthority> stopAuthority(String pipelineId) {
+        return Optional.empty();
+    }
+
+    /**
+     * Finishes only the pinned old job and its capture. False is unfinished work; a retired intent cannot
+     * authorize its old purge. Metrics are captured on first admission, independently of later retries.
+     */
+    default boolean finishStop(StopReservation reservation, boolean continuing, boolean firstAttempt,
+            boolean retiring, BooleanSupplier current) {
+        throw new UnsupportedOperationException("durable stop actuation is unavailable");
     }
 
     /**

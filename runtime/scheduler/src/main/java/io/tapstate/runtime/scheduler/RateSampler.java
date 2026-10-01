@@ -98,14 +98,18 @@ public final class RateSampler {
         if (sample == null) {
             return false;
         }
-        Cadence seen = cadence.get(observation.pipelineId());
-        Cadence prior = seen;
-        if (prior != null && !Objects.equals(prior.scope(), scope)) {
-            if (olderThan(scope, prior.scope())) {
-                return false;
+        // Claim the accepted identity before store IO. A late drop from the preceding execution
+        // cannot then prevent this execution's successful append from establishing its cadence.
+        Cadence seen = cadence.compute(observation.pipelineId(), (id, current) -> {
+            if (current != null && (Objects.equals(current.scope(), scope) || olderThan(scope, current.scope()))) {
+                return current;
             }
-            prior = null;
+            return trackGapChange(current, new Cadence(scope, null, null), false);
+        });
+        if (!Objects.equals(seen.scope(), scope)) {
+            return false;
         }
+        Cadence prior = seen;
         if (prior != null && prior.lastWrittenAt() != null
                 && observation.observedAt().isBefore(prior.lastWrittenAt().plus(interval))) {
             return false;
@@ -155,7 +159,14 @@ public final class RateSampler {
         if (observation.observedAt() == null || sampleOf(observation) == null) {
             return;
         }
-        cadence.compute(observation.pipelineId(), (id, current) -> {
+        markPreparationDropped(observation.pipelineId(), scope, observation.observedAt());
+    }
+
+    /** Remembers a due lost preparation by its real time and owner, without inventing a measured frame. */
+    public void markPreparationDropped(String pipelineId, ObservationStore.Scope scope, Instant at) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(at, "at");
+        cadence.compute(pipelineId, (id, current) -> {
             Cadence original = current;
             if (current != null && !Objects.equals(current.scope(), scope)) {
                 if (olderThan(scope, current.scope())) {
@@ -164,11 +175,11 @@ public final class RateSampler {
                 current = null;
             }
             if (current != null && current.lastWrittenAt() != null
-                    && observation.observedAt().isBefore(current.lastWrittenAt().plus(interval))) {
+                    && at.isBefore(current.lastWrittenAt().plus(interval))) {
                 return current;
             }
             Instant first = current == null || current.firstFailedAt() == null
-                    ? observation.observedAt() : min(current.firstFailedAt(), observation.observedAt());
+                    ? at : min(current.firstFailedAt(), at);
             return trackGapChange(original,
                     new Cadence(scope, current == null ? null : current.lastWrittenAt(), first), false);
         });

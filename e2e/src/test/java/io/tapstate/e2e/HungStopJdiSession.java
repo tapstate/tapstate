@@ -44,11 +44,17 @@ final class HungStopJdiSession implements AutoCloseable {
         }
     }
     record WaitEntry(long atNanos, long threadIdentity, String pipelineId,
-            long budgetSeconds, int budgetNanos, BoundMethod method, String caller) {
+            long budgetSeconds, int budgetNanos, BoundMethod method, String caller,
+            Map<String, Object> execution, Map<String, Object> timeoutCatcher) {
+        WaitEntry {
+            execution = Map.copyOf(execution);
+            timeoutCatcher = Map.copyOf(timeoutCatcher);
+        }
         Map<String, Object> evidence() {
             return Map.of("atNanos", atNanos, "threadIdentity", threadIdentity,
                     "pipelineId", pipelineId, "budgetSeconds", budgetSeconds,
-                    "budgetNanos", budgetNanos, "method", method.evidence(), "caller", caller);
+                    "budgetNanos", budgetNanos, "method", method.evidence(), "caller", caller,
+                    "execution", execution, "timeoutCatcher", timeoutCatcher);
         }
     }
     record WaitExit(WaitEntry entry, long atNanos, long elapsedNanos,
@@ -69,7 +75,12 @@ final class HungStopJdiSession implements AutoCloseable {
             this.type = type; this.name = name; this.signature = signature;
         }
     }
-    private record Image(String origin, byte[] code) { }
+    private record Image(String origin, String name, String signature, byte[] code, byte[] timeoutCode) { }
+    private static final String EXACT_WAIT = "awaitTerminalExact";
+    private static final String EXACT_WAIT_SIGNATURE =
+            "(Ljava/lang/String;Lio/tapstate/runtime/engine/Engine$ExecutionJob;Ljava/time/Duration;)Z";
+    private static final String TIMEOUT_SIGNATURE =
+            "(Ljava/util/concurrent/CompletableFuture;Ljava/time/Duration;)Z";
     private static final String APP_LOADER = "org.springframework.boot.loader.launch.LaunchedClassLoader";
     private static final String SOURCE = "io.tapstate.runtime.srs.SrsSourceProcessor";
     private static final String WRAPPER = "com.hazelcast.jet.impl.processor.ProcessorWrapper";
@@ -107,6 +118,8 @@ final class HungStopJdiSession implements AutoCloseable {
     private int waitDepth;
     private List<Method> waitCallers = List.of();
     private WaitEntry entered;
+    private Method timeoutMethod;
+    private BoundMethod timeoutBinding;
     private boolean sawNativeTimeout;
     private long events;
 
@@ -413,7 +426,8 @@ final class HungStopJdiSession implements AutoCloseable {
         if (!bindings.isEmpty() && bindings.values().iterator().next().loaderIdentity() != loader.uniqueID()) {
             throw invalid("the two target methods used different application loaders");
         }
-        List<Method> selected = type.methodsByName(target.name, target.signature);
+        Image pinned = images.get(target);
+        List<Method> selected = type.methodsByName(pinned.name(), pinned.signature());
         if (selected.size() != 1) { throw invalid("exact target method missing or ambiguous"); }
         Method method = selected.getFirst();
         if (!method.declaringType().equals(type) || method.isStatic() || method.isNative()
@@ -425,8 +439,23 @@ final class HungStopJdiSession implements AutoCloseable {
         if (returns.isEmpty()) { throw invalid("target method has no normal return instruction"); }
         Location entry = method.locationOfCodeIndex(0);
         if (entry == null || entry.codeIndex() != 0) { throw invalid("exact method entry unavailable"); }
-        BoundMethod bound = new BoundMethod(target.type, target.name, target.signature,
+        BoundMethod bound = new BoundMethod(target.type, pinned.name(), pinned.signature(),
                 images.get(target).origin(), sha256(images.get(target).code()), loader.uniqueID(), returns);
+        if (target == Target.JET_WAIT && EXACT_WAIT.equals(pinned.name())) {
+            List<Method> helpers = type.methodsByName("awaitTerminal", TIMEOUT_SIGNATURE);
+            if (helpers.size() != 1) { throw invalid("exact wait timeout catcher missing or ambiguous"); }
+            Method helper = helpers.getFirst();
+            if (!helper.declaringType().equals(type) || helper.isStatic() || helper.isNative()
+                    || helper.isAbstract() || helper.isBridge() || helper.isObsolete()
+                    || !Arrays.equals(pinned.timeoutCode(), helper.bytecodes())) {
+                throw invalid("live timeout catcher differs from immutable artifact Code");
+            }
+            List<Integer> helperReturns = BenchmarkJdiCostObserver.returnOffsets(pinned.timeoutCode());
+            if (helperReturns.isEmpty()) { throw invalid("timeout catcher had no normal return instruction"); }
+            timeoutMethod = helper;
+            timeoutBinding = new BoundMethod(target.type, helper.name(), helper.signature(), pinned.origin(),
+                    sha256(pinned.timeoutCode()), loader.uniqueID(), helperReturns);
+        }
         methods.put(target, method); bindings.put(target, bound);
         BreakpointRequest request = vm.eventRequestManager().createBreakpointRequest(entry);
         request.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD); request.enable(); requests.add(request);
@@ -497,8 +526,10 @@ final class HungStopJdiSession implements AutoCloseable {
         }
         StackFrame frame = firstFrame(event.thread());
         List<Value> arguments = frame.getArgumentValues();
-        if (arguments.size() != 2 || !(arguments.getFirst() instanceof StringReference name)
-                || !(arguments.get(1) instanceof ObjectReference budget)) {
+        boolean exact = EXACT_WAIT.equals(bindings.get(Target.JET_WAIT).name());
+        int budgetIndex = exact ? 2 : 1;
+        if (arguments.size() != budgetIndex + 1 || !(arguments.getFirst() instanceof StringReference name)
+                || !(arguments.get(budgetIndex) instanceof ObjectReference budget)) {
             throw invalid("Jet wait arguments unavailable");
         }
         if (!pipelineId.equals(name.value())) { return; }
@@ -514,8 +545,9 @@ final class HungStopJdiSession implements AutoCloseable {
             throw invalid("real terminal wait did not receive the thirty-second budget");
         }
         List<StackFrame> frames = frames(event.thread());
+        String caller = exact ? "finishStop" : "stopInternal";
         if (frames.size() < 2 || !ACTUATOR.equals(frames.get(1).location().declaringType().name())
-                || !"stopInternal".equals(frames.get(1).location().method().name())) {
+                || !caller.equals(frames.get(1).location().method().name())) {
             throw invalid("terminal wait was not called by actual lifecycle teardown");
         }
         ObjectReference receiver = frame.thisObject();
@@ -523,7 +555,9 @@ final class HungStopJdiSession implements AutoCloseable {
         waitThread = event.thread(); waitReceiver = receiver; waitDepth = frames.size();
         waitCallers = frames.subList(1, frames.size()).stream().map(candidate -> candidate.location().method()).toList();
         entered = new WaitEntry(System.nanoTime(), waitThread.uniqueID(), pipelineId, 30, 0,
-                bindings.get(Target.JET_WAIT), ACTUATOR + "#stopInternal");
+                bindings.get(Target.JET_WAIT), ACTUATOR + "#" + caller,
+                exact ? execution(arguments.get(1)) : Map.of(),
+                exact ? timeoutBinding.evidence() : bindings.get(Target.JET_WAIT).evidence());
         waitRequest.disable();
         waitExitRequest = vm.eventRequestManager().createMethodExitRequest();
         waitExitRequest.addClassFilter(methods.get(Target.JET_WAIT).declaringType());
@@ -539,6 +573,32 @@ final class HungStopJdiSession implements AutoCloseable {
         waitThreadDeath.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
         waitThreadDeath.enable(); requests.add(waitThreadDeath);
         waitEntered.complete(entered);
+    }
+
+    private static Map<String, Object> execution(Value value) {
+        if (!(value instanceof ObjectReference expected)
+                || !"io.tapstate.runtime.engine.Engine$ExecutionJob".equals(expected.referenceType().name())) {
+            throw invalid("exact terminal wait lacked its native execution identity");
+        }
+        Value jobValue = expected.getValue(exactField(expected.referenceType(), "job",
+                "Lio/tapstate/spi/store/StopReservation$JobIdentity;"));
+        Value scopeValue = expected.getValue(exactField(expected.referenceType(), "scope",
+                "Lio/tapstate/spi/store/ObservationStore$Scope;"));
+        if (!(jobValue instanceof ObjectReference job) || !(scopeValue instanceof ObjectReference scope)) {
+            throw invalid("exact terminal wait identity fields unavailable");
+        }
+        Value jobId = job.getValue(exactField(job.referenceType(), "jobId", "J"));
+        Value generation = scope.getValue(exactField(scope.referenceType(), "executionGeneration", "J"));
+        if (!(jobId instanceof LongValue nativeId) || !(generation instanceof LongValue durableGeneration)
+                || durableGeneration.value() < 1) {
+            throw invalid("exact terminal wait identity had invalid numeric fields");
+        }
+        return Map.of("jobId", nativeId.value(),
+                "clusterId", string(job.getValue(exactField(job.referenceType(), "clusterId", "Ljava/lang/String;"))),
+                "bootId", string(job.getValue(exactField(job.referenceType(), "bootId", "Ljava/lang/String;"))),
+                "pipelineIncarnationId", string(scope.getValue(exactField(scope.referenceType(),
+                        "pipelineIncarnationId", "Ljava/lang/String;"))),
+                "executionGeneration", durableGeneration.value());
     }
 
     private void waitException(ExceptionEvent event) throws Exception {
@@ -561,9 +621,18 @@ final class HungStopJdiSession implements AutoCloseable {
         if (candidates.isEmpty() || candidates.stream().anyMatch(index -> index > waitIndex)) {
             throw invalid("an exception escaped the actual Jet wait");
         }
-        if ("java.util.concurrent.TimeoutException".equals(event.exception().referenceType().name())
-                && caught.method().equals(methods.get(Target.JET_WAIT))) {
-            sawNativeTimeout = true;
+        if ("java.util.concurrent.TimeoutException".equals(event.exception().referenceType().name())) {
+            Method expectedCatch = timeoutMethod == null ? methods.get(Target.JET_WAIT) : timeoutMethod;
+            if (caught.method().equals(expectedCatch)) {
+                if (timeoutMethod != null && (timeoutMethod.isObsolete()
+                        || !Arrays.equals(images.get(Target.JET_WAIT).timeoutCode(), timeoutMethod.bytecodes())
+                        || waitIndex < 1 || !frames.get(waitIndex - 1).location().method().equals(timeoutMethod)
+                        || frames.get(waitIndex - 1).thisObject() == null
+                        || frames.get(waitIndex - 1).thisObject().uniqueID() != waitReceiver.uniqueID())) {
+                    throw invalid("native timeout lost its pinned catcher and exact wait caller");
+                }
+                sawNativeTimeout = true;
+            }
         }
     }
 
@@ -713,8 +782,19 @@ final class HungStopJdiSession implements AutoCloseable {
     private static void add(Map<Target, Image> found, Target target, String origin, InputStream input) throws Exception {
         byte[] bytes = input.readNBytes(MAX_CLASS_BYTES + 1);
         if (bytes.length > MAX_CLASS_BYTES) { throw invalid("target class exceeded its bound"); }
-        byte[] code = methodCode(bytes, target.name + target.signature);
-        if (code == null || found.putIfAbsent(target, new Image(origin, code)) != null) {
+        String name = target.name;
+        String signature = target.signature;
+        byte[] timeoutCode = null;
+        byte[] code = target == Target.JET_WAIT ? methodCode(bytes, EXACT_WAIT + EXACT_WAIT_SIGNATURE) : null;
+        if (code != null) {
+            name = EXACT_WAIT;
+            signature = EXACT_WAIT_SIGNATURE;
+            timeoutCode = methodCode(bytes, "awaitTerminal" + TIMEOUT_SIGNATURE);
+            if (timeoutCode == null) { throw invalid("immutable exact wait timeout catcher missing"); }
+        } else {
+            code = methodCode(bytes, name + signature);
+        }
+        if (code == null || found.putIfAbsent(target, new Image(origin, name, signature, code, timeoutCode)) != null) {
             throw invalid("immutable target method missing or duplicated");
         }
     }

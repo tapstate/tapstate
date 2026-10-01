@@ -4,6 +4,9 @@ import io.tapstate.runtime.scheduler.LifecycleActuator;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
+import io.tapstate.spi.store.StopAuthority;
+import io.tapstate.spi.store.StopReservation;
 
 /** Measures real engine/capture operations at the assembly seam, including failures and cleanup. */
 final class MeasuredLifecycleActuator implements LifecycleActuator {
@@ -118,5 +121,26 @@ final class MeasuredLifecycleActuator implements LifecycleActuator {
     @Override
     public boolean isCarryingAJob(String pipelineId) {
         return delegate.isCarryingAJob(pipelineId);
+    }
+
+    @Override
+    public Optional<StopReservation.Subject> stopSubject(String pipelineId) {
+        return delegate.stopSubject(pipelineId);
+    }
+
+    @Override
+    public Optional<StopAuthority> stopAuthority(String pipelineId) {
+        return delegate.stopAuthority(pipelineId);
+    }
+
+    @Override
+    public boolean finishStop(StopReservation reservation, boolean continuing, boolean firstAttempt,
+            boolean retiring, BooleanSupplier current) {
+        long began = System.nanoTime();
+        try {
+            return delegate.finishStop(reservation, continuing, firstAttempt, retiring, current);
+        } finally {
+            facts.recordVerb(LifecycleWorkDispatcher.Verb.STOP, System.nanoTime() - began);
+        }
     }
 }

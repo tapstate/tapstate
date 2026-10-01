@@ -47,6 +47,8 @@ import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.ExecutionGenerationStore;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.StopAuthority;
+import io.tapstate.spi.store.StopReservation;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
@@ -208,6 +210,145 @@ class EngineLifecycleActuatorTest {
             assertThat(duration.startTime()).isEqualTo(started);
             assertThat(point(continued, "tapstate.pipeline.lag").value()).isEqualTo(22);
         }
+    }
+
+    @Test
+    void aTerminalOldJobKeepsColdRebuildCountersWithoutInstallingItsScope() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        var generations = new InMemoryWorkloadClaimStore();
+        var ownership = PipelineActuationOwnership.single("single", generations);
+        var incarnations = coldStopIncarnations();
+        var coordinator = new RecordingCaptureCoordinator(events);
+        var dags = new RecordingDagSource(events);
+        var warmEngine = new Engine(member);
+        var warmScopes = new ObservationScopeRegistry();
+        var warm = new EngineLifecycleActuator(warmEngine, dags, coordinator, teardown(),
+                ownership, incarnations, warmScopes);
+        warm.start(PIPE);
+        Job held = member.getJet().getJob(PIPE);
+        awaitStatus(held, JobStatus.RUNNING);
+        warm.pause(PIPE);
+        awaitStatus(held, JobStatus.SUSPENDED);
+        coordinator.loadDelivered = false;
+        Engine.ExecutionJob old = warmEngine.executionJob(PIPE).orElseThrow();
+        Instant started = Instant.parse("2026-09-27T00:00:00Z");
+        var stored = new ObservationStore.Stored(metricFrame(started.plusSeconds(10), started,
+                7, 3, 11).observation(), Optional.of(old.scope()));
+        warmEngine.cancelExact(PIPE, old);
+        assertThat(warmEngine.awaitTerminalExact(PIPE, old, Duration.ofSeconds(15))).isTrue();
+
+        var recoveredEngine = new Engine(member);
+        var coldScopes = new ObservationScopeRegistry();
+        var cold = new EngineLifecycleActuator(recoveredEngine, dags, coordinator, teardown(),
+                ownership, incarnations, coldScopes, null, retainedObservation(stored));
+        assertThat(recoveredEngine.awaitTerminalExact(PIPE, old, Duration.ofSeconds(15))).isTrue();
+        assertThat(recoveredEngine.noUnfinishedJob(PIPE)).isTrue();
+        assertThat(recoveredEngine.executionJob(PIPE)).contains(old);
+        assertThat(coldScopes.current(PIPE)).isEmpty();
+        assertThat(cold.needsRebuildOnResume(PIPE)).isTrue();
+        StopAuthority authority = cold.stopAuthority(PIPE).orElseThrow();
+        assertThat(authority.executionGeneration()).isEqualTo(old.scope().executionGeneration());
+        assertThat(incarnations.current(PIPE)).contains(old.scope().pipelineIncarnationId());
+        StopReservation.Subject subject = cold.stopSubject(PIPE).orElseThrow();
+        var reservation = new StopReservation(PIPE, "terminal-cold-rebuild", 10, 11,
+                new DesiredState(PIPE, PipelineState.RUNNING, "rev-1"), subject);
+
+        assertThat(cold.finishStop(reservation, true, true, false,
+                () -> cold.stopAuthority(PIPE).filter(authority::equals).isPresent())).isTrue();
+        assertThat(coldScopes.current(PIPE))
+                .as("a stored cumulative floor must not install the old observation scope").isEmpty();
+        assertThat(coordinator.hasActiveCapture(PIPE)).isFalse();
+        assertThat(generations.executionGeneration(standaloneKey())).isEqualTo(1);
+
+        cold.start(PIPE);
+        awaitStatus(member.getJet().getJob(PIPE), JobStatus.RUNNING);
+        ObservationStore.Scope next = coldScopes.current(PIPE).orElseThrow();
+        assertThat(next.pipelineIncarnationId()).isEqualTo(old.scope().pipelineIncarnationId());
+        assertThat(next.executionGeneration()).isEqualTo(old.scope().executionGeneration() + 1);
+        Instant rebuiltAt = started.plusSeconds(30);
+        Observation continued = coldScopes.continueFrame(
+                metricFrame(rebuiltAt, rebuiltAt, 2, 1, 22), next).observation();
+
+        assertThat(point(continued, "tapstate.pipeline.records").value())
+                .as("the terminal predecessor's retained seven records continue with two new records")
+                .isEqualTo(9);
+        assertThat(point(continued, "tapstate.pipeline.records").startTime()).isEqualTo(started);
+        assertThat(continued.metrics()).containsEntry("records.out", 9L);
+        assertThat(subject).isEqualTo(new StopReservation.ExistingJob(
+                old.scope().pipelineIncarnationId(), old.scope().executionGeneration(), old.job(), authority));
+        assertThat(dags.fences).extracting(ExecutionFence::executionGeneration).containsExactly(1L, 2L);
+    }
+
+    @Test
+    void aCancelledAdmittedStartCanStopWhileItsTerminalPredecessorHasTheOlderGeneration() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        var generations = new InMemoryWorkloadClaimStore();
+        var ownership = PipelineActuationOwnership.single("single", generations);
+        var coordinator = new RecordingCaptureCoordinator(events);
+        var dags = new RecordingDagSource(events);
+        var engine = new Engine(member);
+        var scopes = new ObservationScopeRegistry();
+        var actuator = new EngineLifecycleActuator(engine, dags, coordinator, teardown(),
+                ownership, coldStopIncarnations(), scopes);
+        actuator.start(PIPE);
+        awaitStatus(member.getJet().getJob(PIPE), JobStatus.RUNNING);
+        Engine.ExecutionJob old = engine.executionJob(PIPE).orElseThrow();
+        engine.cancelExact(PIPE, old);
+        assertThat(engine.awaitTerminalExact(PIPE, old, Duration.ofSeconds(15))).isTrue();
+
+        // The second admission advances the durable authority, then loses its submission permission.
+        try (LifecycleActuator.PreparedStart abandoned = actuator.prepareStart(PIPE)) {
+            assertThat(generations.executionGeneration(standaloneKey())).isEqualTo(2);
+            assertThat(scopes.current(PIPE)).contains(new ObservationStore.Scope(
+                    old.scope().pipelineIncarnationId(), 2));
+            assertThat(coordinator.hasActiveCapture(PIPE)).isTrue();
+        }
+        assertThat(scopes.current(PIPE)).isEmpty();
+        assertThat(coordinator.hasActiveCapture(PIPE)).isFalse();
+        assertThat(engine.executionJob(PIPE)).contains(old);
+        assertThat(engine.noUnfinishedJob(PIPE)).isTrue();
+        StopAuthority authority = actuator.stopAuthority(PIPE).orElseThrow();
+        assertThat(authority.executionGeneration()).isEqualTo(2);
+        StopReservation.Subject subject = actuator.stopSubject(PIPE).orElseThrow();
+        assertThat(subject).isEqualTo(new StopReservation.NoJob("single", authority));
+        var reservation = new StopReservation(PIPE, "cancelled-admission-stop", 10, 11,
+                new DesiredState(PIPE, PipelineState.STOPPED, "rev-2"), subject);
+
+        assertThat(actuator.finishStop(reservation, false, true, false,
+                () -> actuator.stopAuthority(PIPE).filter(authority::equals).isPresent())).isTrue();
+        assertThat(generations.executionGeneration(standaloneKey())).isEqualTo(2);
+        assertThat(coordinator.hasActiveCapture(PIPE)).isFalse();
+        assertThat(engine.executionJob(PIPE)).contains(old);
+        assertThat(dags.fences).extracting(ExecutionFence::executionGeneration).containsExactly(1L, 2L);
+    }
+
+    private static PipelineIncarnationService coldStopIncarnations() {
+        return new PipelineIncarnationService(new ArtifactStore() {
+            @Override public void saveAll(List<io.tapstate.core.model.Resource> resources) {
+                throw new UnsupportedOperationException();
+            }
+            @Override public Optional<io.tapstate.core.model.Resource> get(String id) { return Optional.empty(); }
+            @Override public List<io.tapstate.core.model.Resource> list() { return List.of(); }
+            @Override public Optional<String> pipelineIncarnationId(String id) {
+                return PIPE.equals(id) ? Optional.of("inc-a") : Optional.empty();
+            }
+            @Override public Optional<String> ensurePipelineIncarnationId(String id, String candidate) {
+                return pipelineIncarnationId(id);
+            }
+        });
+    }
+
+    private static ObservationStore retainedObservation(ObservationStore.Stored stored) {
+        return new ObservationStore() {
+            @Override public void save(Observation observation) { throw new AssertionError("unexpected write"); }
+            @Override public Optional<Observation> read(String id) {
+                return readStored(id).map(Stored::observation);
+            }
+            @Override public Optional<Stored> readStored(String id) {
+                return stored.observation().pipelineId().equals(id) ? Optional.of(stored) : Optional.empty();
+            }
+            @Override public void delete(String id) { throw new AssertionError("unexpected delete"); }
+        };
     }
 
     private static ObservationPublisher.Prepared metricFrame(Instant at, Instant since,

@@ -13,6 +13,7 @@ import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.PipelineEventStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -38,7 +39,7 @@ import java.util.Map;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
-/** Fixed worker budgets keep slow telemetry stores away from convergence and data-plane calls. */
+/** Fixed worker budgets keep telemetry collection and stores away from convergence and data-plane calls. */
 final class TelemetryDispatcher implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(TelemetryDispatcher.class);
@@ -127,13 +128,15 @@ final class TelemetryDispatcher implements AutoCloseable {
             private final String pipelineId;
             private volatile ObservationStore.Scope scope;
             private volatile ObservationScopeRegistry.RestoreTicket restoreTicket;
+            private final PreparationFrame preparation;
             private volatile FailureTime failureTime;
             /** 0 running, 1 timed out while running, 2 finished. */
             private final AtomicInteger state = new AtomicInteger();
 
-            private Operation(String pipelineId, ObservationStore.Scope scope) {
+            private Operation(String pipelineId, ObservationStore.Scope scope, PreparationFrame preparation) {
                 this.pipelineId = pipelineId;
                 this.scope = scope;
+                this.preparation = preparation;
             }
         }
 
@@ -201,7 +204,11 @@ final class TelemetryDispatcher implements AutoCloseable {
         }
 
         private Operation begin(String pipelineId, ObservationStore.Scope scope) {
-            Operation operation = new Operation(pipelineId, scope);
+            return begin(pipelineId, scope, null);
+        }
+
+        private Operation begin(String pipelineId, ObservationStore.Scope scope, PreparationFrame preparation) {
+            Operation operation = new Operation(pipelineId, scope, preparation);
             inFlight.put(Thread.currentThread(), operation);
             return operation;
         }
@@ -279,12 +286,27 @@ final class TelemetryDispatcher implements AutoCloseable {
         }
     }
 
-    private sealed interface Frame permits ObservationFrame, ReconcileFailureFrame, RecoveryFrame {
+    private sealed interface Frame permits ObservationFrame, PreparationFrame, ReconcileFailureFrame, RecoveryFrame {
         ObservationStore.Scope scope();
     }
 
     private record ObservationFrame(ObservationPublisher.Prepared prepared, ObservationStore.Scope scope)
             implements Frame {
+    }
+
+    /** Captures publication authority and the one observed cause without collecting native metrics. */
+    private record PreparationFrame(String pipelineId, ObservationFailure failure, ObservationStore.Scope scope,
+            BooleanSupplier owner, Instant requestedAt) implements Frame {
+        private PreparationFrame {
+            Objects.requireNonNull(pipelineId, "pipelineId");
+            Objects.requireNonNull(owner, "owner");
+            Objects.requireNonNull(requestedAt, "requestedAt");
+        }
+
+        private PreparationFrame replacing(PreparationFrame previous) {
+            return previous.failure() != null && Objects.equals(scope, previous.scope())
+                    ? new PreparationFrame(pipelineId, previous.failure(), scope, owner, requestedAt) : this;
+        }
     }
 
     private record ReconcileFailureFrame(String pipelineId, long failures, ObservationStore.Scope scope)
@@ -665,6 +687,59 @@ final class TelemetryDispatcher implements AutoCloseable {
         offerProjections(frame, scope);
     }
 
+    /** The scheduler offers only immutable inputs; collection and folding share the latest worker budget. */
+    void offerPreparation(String pipelineId, ObservationFailure failure, ObservationStore.Scope scope,
+            BooleanSupplier owner) {
+        PreparationFrame request = new PreparationFrame(pipelineId, failure, scope, owner, Instant.now());
+        if (!closed.get() && eligible(request)) {
+            offerLatest(pipelineId, request);
+        }
+    }
+
+    private boolean eligible(PreparationFrame request) {
+        return !abort.get() && stillCurrent(request.pipelineId(), request.scope()) && request.owner().getAsBoolean();
+    }
+
+    private boolean prepareAndCommit(PreparationFrame request) {
+        PipelineLogContext previous = PipelineLogContext.capture();
+        MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, request.pipelineId());
+        PipelineLogContext.bindScope(request.scope());
+        try {
+            return prepareAndCommitOwned(request);
+        } finally {
+            previous.restore();
+        }
+    }
+
+    private boolean prepareAndCommitOwned(PreparationFrame request) {
+        if (!eligible(request)) {
+            return false;
+        }
+        var prepared = request.scope() == null
+                ? publisher.prepare(request.pipelineId(), request.failure(), () -> eligible(request))
+                : publisher.prepareScoped(request.pipelineId(), request.failure(), request.scope(),
+                        () -> eligible(request));
+        if (prepared.isEmpty() || !eligible(request)) {
+            return false;
+        }
+        ObservationPublisher.Prepared frame = scopes == null ? prepared.orElseThrow()
+                : scopes.continueFrame(prepared.orElseThrow(), request.scope());
+        if (!eligible(request)) {
+            return false;
+        }
+        var published = publisher.commit(frame, request.scope(), () -> eligible(request));
+        if (published.isEmpty() || !eligible(request)) {
+            return false;
+        }
+        // commit may carry a stored failure; all successful projections still use these same measured facts.
+        if (published.orElseThrow() != frame.observation()) {
+            frame = new ObservationPublisher.Prepared(published.orElseThrow(), false,
+                    frame.nestReadings(), frame.pinned(), frame.gaps());
+        }
+        offerProjections(frame, request.scope());
+        return true;
+    }
+
     private void offerProjections(ObservationPublisher.Prepared frame, ObservationStore.Scope scope) {
         Observation observation = frame.observation();
         if (sampler != null) {
@@ -725,6 +800,9 @@ final class TelemetryDispatcher implements AutoCloseable {
     }
 
     private void latestFailure(Stats.Operation operation) {
+        if (operation.preparation != null) {
+            preparationDropped(operation.preparation);
+        }
         rememberColdFailure(operation);
         if (operation.restoreTicket != null && scopes != null && boundaryEvents != null) {
             var retained = scopes.restorationTelemetryFailure(operation.restoreTicket, operation.scope)
@@ -738,6 +816,12 @@ final class TelemetryDispatcher implements AutoCloseable {
             return;
         }
         boundaryFailed(operation.pipelineId, operation.scope, Sink.LATEST);
+    }
+
+    private void preparationDropped(PreparationFrame request) {
+        if (sampler != null && stillCurrent(request.pipelineId(), request.scope())) {
+            sampler.markPreparationDropped(request.pipelineId(), request.scope(), request.requestedAt());
+        }
     }
 
     private void successfulCompletion(Stats stats, Stats.Operation operation, Sink sink) {
@@ -871,6 +955,11 @@ final class TelemetryDispatcher implements AutoCloseable {
                     }
                     if (existing.pending != null) {
                         latestStats.coalesced.incrementAndGet();
+                        if (frame instanceof PreparationFrame incoming
+                                && existing.pending instanceof PreparationFrame previous) {
+                            preparationDropped(previous);
+                            frame = incoming.replacing(previous);
+                        }
                     } else if (existing.started) {
                         existing.pendingCounted = true;
                         latestPending.incrementAndGet();
@@ -882,6 +971,9 @@ final class TelemetryDispatcher implements AutoCloseable {
             }
             if (!latestCapacity.tryAcquire()) {
                 latestStats.dropped();
+                if (frame instanceof PreparationFrame preparation) {
+                    preparationDropped(preparation);
+                }
                 boundaryFailed(pipelineId, frame.scope(), Sink.LATEST);
                 LOG.warn("Latest observation for pipeline {} was dropped: telemetry queue is full", pipelineId);
                 return;
@@ -902,6 +994,9 @@ final class TelemetryDispatcher implements AutoCloseable {
                 }
                 latestCapacity.release();
                 latestStats.dropped();
+                if (frame instanceof PreparationFrame preparation) {
+                    preparationDropped(preparation);
+                }
                 boundaryFailed(pipelineId, frame.scope(), Sink.LATEST);
                 LOG.warn("Latest observation for pipeline {} was dropped: telemetry workers stopped", pipelineId);
             }
@@ -1082,16 +1177,26 @@ final class TelemetryDispatcher implements AutoCloseable {
                 }
                 if (!latestStats.allow()) {
                     latestStats.dropped();
+                    if (frame instanceof PreparationFrame preparation) {
+                        preparationDropped(preparation);
+                    }
                     boundaryFailed(pipelineId, frame.scope(), Sink.LATEST);
                     continue;
                 }
-                Stats.Operation operation = latestStats.begin(pipelineId, frame.scope());
+                Stats.Operation operation = latestStats.begin(pipelineId, frame.scope(),
+                        frame instanceof PreparationFrame preparation ? preparation : null);
                 if (frame instanceof RecoveryFrame recovery) {
                     operation.restoreTicket = recovery.ticket();
                 }
                 try {
                     if (frame instanceof ObservationFrame observation) {
                         if (publisher.commit(observation.prepared(), observation.scope()).isPresent()) {
+                            successfulCompletion(latestStats, operation, Sink.LATEST);
+                        } else {
+                            latestStats.skipped(operation);
+                        }
+                    } else if (frame instanceof PreparationFrame preparation) {
+                        if (prepareAndCommit(preparation)) {
                             successfulCompletion(latestStats, operation, Sink.LATEST);
                         } else {
                             latestStats.skipped(operation);

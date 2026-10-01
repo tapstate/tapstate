@@ -6,6 +6,10 @@ import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.runtime.scheduler.StartDeferred;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.StopAuthority;
+import io.tapstate.spi.store.StopReservation;
+import io.tapstate.runtime.engine.EngineError;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.srs.SnapshotCapacityUnavailable;
 import io.tapstate.runtime.srs.PhysicalRingNotReady;
 import org.slf4j.Logger;
@@ -14,6 +18,8 @@ import org.slf4j.LoggerFactory;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Map;
+import java.util.function.BooleanSupplier;
 
 /**
  * Binds the converge loop's lifecycle actuator seam to the Jet execution engine and the source-side capture
@@ -215,7 +221,12 @@ final class EngineLifecycleActuator implements LifecycleActuator {
                 PipelineLogContext submitLogContext = PipelineLogContext.capture();
                 try {
                     PipelineLogContext.bindScope(observationScope);
-                    engine.submit(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings());
+                    if (observationScope == null) {
+                        engine.submit(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings());
+                    } else {
+                        engine.submit(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings(),
+                                actuation.clusterId(), observationScope);
+                    }
                     captureCoordinator.activateSnapshot(pipelineId);
                 } catch (RuntimeException | Error failure) {
                     // A submitted job or reserved snapshot may already exist. Give both back before
@@ -332,6 +343,113 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         stopInternal(pipelineId, purgeState);
     }
 
+    @Override
+    public Optional<StopAuthority> stopAuthority(String pipelineId) {
+        return actuation.stopAuthority(pipelineId);
+    }
+
+    @Override
+    public Optional<StopReservation.Subject> stopSubject(String pipelineId) {
+        Optional<Engine.ExecutionJob> nativeJob = engine.executionJob(pipelineId);
+        StopAuthority authority = stopAuthority(pipelineId).orElse(null);
+        if (nativeJob.isEmpty()) {
+            return Optional.of(new StopReservation.NoJob(actuation.clusterId(), authority));
+        }
+        Engine.ExecutionJob old = nativeJob.orElseThrow();
+        boolean sameExecution = authority != null && authority.clusterId().equals(old.job().clusterId())
+                && authority.executionGeneration() == old.scope().executionGeneration()
+                && (incarnations == null || incarnations.current(pipelineId)
+                        .filter(old.scope().pipelineIncarnationId()::equals).isPresent());
+        if (sameExecution) {
+            // A qualified terminal job still supplies the cumulative floor for a rebuilding resume.
+            return Optional.of(new StopReservation.ExistingJob(old.scope().pipelineIncarnationId(),
+                    old.scope().executionGeneration(), old.job(), authority));
+        }
+        if (engine.noUnfinishedJob(pipelineId)) {
+            return Optional.of(new StopReservation.NoJob(actuation.clusterId(), authority));
+        }
+        throw new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", pipelineId), null);
+    }
+
+    @Override
+    public boolean finishStop(StopReservation reservation, boolean continuing, boolean firstAttempt,
+            boolean retiring, BooleanSupplier current) {
+        String id = reservation.pipelineId();
+        if (!current.getAsBoolean()) { return false; }
+        Engine.ExecutionJob old = reservation.subject() instanceof StopReservation.ExistingJob existing
+                ? new Engine.ExecutionJob(existing.oldJob(), new ObservationStore.Scope(
+                        existing.pipelineIncarnationId(), existing.executionGeneration())) : null;
+        if (old == null) {
+            if (!engine.noUnfinishedJob(id)) { return false; }
+        } else {
+            if (continuing && !prepareStopContinuation(id, old, firstAttempt, current)) {
+                return false;
+            }
+            if (firstAttempt && !continuing && engine.isCurrentOrAbsent(id, old)) {
+                captureCurrentMetrics(id);
+            }
+            if (!current.getAsBoolean()) { return false; }
+            engine.cancelExact(id, old);
+            if (!engine.awaitTerminalExact(id, old, JOB_TEARDOWN_BUDGET)) { return false; }
+            if (!engine.isCurrentOrAbsent(id, old)) {
+                // A newer native job owns pipeline-local capture. Retiring old work may only close its old job.
+                return retiring && current.getAsBoolean();
+            }
+        }
+        if (!current.getAsBoolean()) { return false; }
+        if (old == null && !engine.noUnfinishedJob(id) || old != null && !engine.isCurrentOrAbsent(id, old)) {
+            return false;
+        }
+        boolean purge = !retiring && reservation.originalDesired().purgeState();
+        if (!continuing) {
+            if (observationScopes != null) { observationScopes.clearContinuation(id); }
+            if (observationPublisher != null) { observationPublisher.clearRebuildingResume(id); }
+        }
+        captureCoordinator.stopCapture(id, purge);
+        if (captureCoordinator.hasActiveCapture(id) || !current.getAsBoolean()) { return false; }
+        if (purge) {
+            stateTeardown.noteLocations(id, dagSource.stateLocations(id, stateTeardown.defaultDatabase()));
+            if (!current.getAsBoolean()) { return false; }
+            stateTeardown.finishPending(id);
+        }
+        return current.getAsBoolean();
+    }
+
+    private boolean prepareStopContinuation(String id, Engine.ExecutionJob old, boolean firstAttempt,
+            BooleanSupplier current) {
+        if (observationScopes == null) { return current.getAsBoolean(); }
+        Optional<ObservationStore.Scope> scope = observationScopes.current(id);
+        if (scope.isPresent()) {
+            if (!scope.orElseThrow().equals(old.scope()) || !current.getAsBoolean()) { return false; }
+            if (firstAttempt) { captureMetricsForResume(id); }
+            return current.getAsBoolean();
+        }
+        BooleanSupplier qualified = () -> current.getAsBoolean() && engine.isCurrentOrAbsent(id, old)
+                && (incarnations == null || incarnations.current(id)
+                        .filter(old.scope().pipelineIncarnationId()::equals).isPresent());
+        var ticket = observationScopes.beginColdRebuild(id, old.scope(), qualified).orElse(null);
+        if (ticket == null) { return false; }
+        try {
+            Optional<ObservationStore.Stored> stored = Optional.empty();
+            if (observations != null) {
+                try {
+                    stored = observations.readStored(id);
+                } catch (RuntimeException unavailable) {
+                    LOG.warn("Could not read the known cumulative metrics for pipeline {}", id, unavailable);
+                }
+            }
+            if (!observationScopes.prepareColdRebuildingResume(ticket, stored) || !qualified.getAsBoolean()) {
+                observationScopes.cancelColdRebuild(ticket);
+                return false;
+            }
+            if (observationPublisher != null) { observationPublisher.prepareRebuildingResume(id); }
+            return true;
+        } catch (RuntimeException | Error failure) {
+            observationScopes.cancelColdRebuild(ticket);
+            throw failure;
+        }
+    }
+
     private void captureMetricsForResume(String pipelineId) {
         if (observationScopes == null) {
             return;
@@ -366,7 +484,8 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     private void captureCurrentMetrics(String pipelineId, ObservationStore.Scope owner) {
         if (observationPublisher != null) {
             try {
-                observationPublisher.prepareScoped(pipelineId, null, owner)
+                observationPublisher.prepareScoped(pipelineId, null, owner,
+                        () -> observationScopes.current(pipelineId).filter(owner::equals).isPresent())
                         .ifPresent(frame -> observationScopes.continueFrame(frame, owner));
             } catch (RuntimeException unavailable) {
                 LOG.warn("Could not measure the final cumulative metrics for pipeline {}", pipelineId,
@@ -377,6 +496,10 @@ final class EngineLifecycleActuator implements LifecycleActuator {
 
     private void stopInternal(String pipelineId, boolean purgeState) {
         engine.cancel(pipelineId);
+        boolean jobOver = engine.awaitTerminal(pipelineId, JOB_TEARDOWN_BUDGET);
+        if (!jobOver) {
+            throw new StartDeferred(StartDeferred.Reason.DEPENDENCY);
+        }
         if (purgeState) {
             // Noted before the job is even known to be over, and before the drop: a stop is driven once, on
             // the transition, so a process that dies anywhere after this point leaves a note the next start
@@ -386,9 +509,8 @@ final class EngineLifecycleActuator implements LifecycleActuator {
             stateTeardown.noteLocations(
                     pipelineId, dagSource.stateLocations(pipelineId, stateTeardown.defaultDatabase()));
         }
-        boolean jobOver = engine.awaitTerminal(pipelineId, JOB_TEARDOWN_BUDGET);
         captureCoordinator.stopCapture(pipelineId, purgeState);
-        if (purgeState && jobOver) {
+        if (purgeState) {
             // Only once nothing is left to write into it. A processor still winding down writes state as it
             // closes, and a drop racing that leaves entries behind with the note already gone.
             stateTeardown.finishPending(pipelineId);

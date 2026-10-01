@@ -34,6 +34,8 @@ import io.tapstate.runtime.engine.nest.NestStatePlacement;
 import io.tapstate.runtime.engine.nest.NestStateMetricNames;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.OperatorStateStores;
+import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.StopReservation;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -46,7 +48,9 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -80,6 +84,22 @@ public final class Engine {
             JetStageGauge.EXPECTED, JetStageGauge.MEMBERS);
 
     private final HazelcastInstance member;
+    private static final String STOP_CLUSTER = "tapstate.stop.cluster";
+    private static final String STOP_INCARNATION = "tapstate.stop.incarnation";
+    private static final String STOP_GENERATION = "tapstate.stop.generation";
+    private static final String STOP_BOOT = "tapstate.stop.boot";
+    private record SubmissionIdentity(String clusterId, ObservationStore.Scope scope) { }
+    private final ThreadLocal<SubmissionIdentity> submissionIdentity = new ThreadLocal<>();
+    private final String bootId = UUID.randomUUID().toString();
+    private final Map<ExecutionJob, CompletableFuture<Void>> stopFutures = new LinkedHashMap<>(16, 0.75f, true);
+
+    /** Identity read from one actual Jet job, independent of a later job under the same name. */
+    public record ExecutionJob(StopReservation.JobIdentity job, ObservationStore.Scope scope) {
+        public ExecutionJob {
+            Objects.requireNonNull(job, "job");
+            Objects.requireNonNull(scope, "scope");
+        }
+    }
 
     /**
      * The layer behind the nest state maps, asked how much a namespace holds altogether. Absent on a run
@@ -152,6 +172,22 @@ public final class Engine {
         submitJob(pipelineId, dag);
     }
 
+    /** Carries the already admitted resource and execution into the actual native submission. */
+    public void submit(String pipelineId, DAG dag, Map<String, String> stateDatabases,
+            NestSettings settings, String clusterId, ObservationStore.Scope scope) {
+        Objects.requireNonNull(clusterId, "clusterId");
+        Objects.requireNonNull(scope, "scope");
+        if (clusterId.isBlank() || submissionIdentity.get() != null) {
+            throw new IllegalStateException("native submission identity is blank or nested");
+        }
+        submissionIdentity.set(new SubmissionIdentity(clusterId, scope));
+        try {
+            submit(pipelineId, dag, stateDatabases, settings);
+        } finally {
+            submissionIdentity.remove();
+        }
+    }
+
     /** Validates and pins placement before capture or graph construction performs a side effect. */
     public void configureNestState(Map<String, String> stateDatabases, NestSettings settings) {
         NestStatePlacement.applyTo(member, stateDatabases, settings);
@@ -179,7 +215,104 @@ public final class Engine {
                 // members changed ends, and what starts in its place is submitted deliberately, once, by
                 // whoever holds the pipeline.
                 .setAutoScaling(false);
+        SubmissionIdentity identity = submissionIdentity.get();
+        if (identity != null) {
+            config.setArgument(STOP_CLUSTER, identity.clusterId())
+                    .setArgument(STOP_INCARNATION, identity.scope().pipelineIncarnationId())
+                    .setArgument(STOP_GENERATION, identity.scope().executionGeneration())
+                    .setArgument(STOP_BOOT, bootId);
+        }
         member.getJet().newJobIfAbsent(dag, config);
+    }
+
+    /** Empty means Jet has no job under this name; an existing job with incomplete identity is refused. */
+    public Optional<ExecutionJob> executionJob(String pipelineId) {
+        Job job = member.getJet().getJob(pipelineId);
+        return job == null ? Optional.empty() : Optional.of(executionJob(pipelineId, job));
+    }
+
+    /** Terminal history is not an unfinished job; missing metadata is still a refusal, never absence. */
+    public boolean noUnfinishedJob(String pipelineId) {
+        Job observed = member.getJet().getJob(pipelineId);
+        if (observed == null) { return true; }
+        ExecutionJob identity = executionJob(pipelineId, observed);
+        return awaitTerminal(stopFuture(observed, identity), Duration.ZERO);
+    }
+
+    private CompletableFuture<Void> stopFuture(Job observed, ExecutionJob identity) {
+        synchronized (stopFutures) {
+            CompletableFuture<Void> known = stopFutures.get(identity);
+            if (known != null) { return known; }
+        }
+        // A fresh native proxy joins asynchronously. Retain that real future across zero-budget probes.
+        CompletableFuture<Void> nativeFuture = observed.getFuture();
+        synchronized (stopFutures) {
+            CompletableFuture<Void> known = stopFutures.get(identity);
+            if (known != null) { return known; }
+            stopFutures.put(identity, nativeFuture);
+            if (stopFutures.size() > MAX_QUEUE_ACCOUNTS) {
+                stopFutures.remove(stopFutures.keySet().iterator().next());
+            }
+            return nativeFuture;
+        }
+    }
+
+    private ExecutionJob executionJob(String pipelineId, Job job) {
+        JobConfig config = job.getConfig();
+        Object cluster = config.getArgument(STOP_CLUSTER);
+        Object incarnation = config.getArgument(STOP_INCARNATION);
+        Object generation = config.getArgument(STOP_GENERATION);
+        Object boot = config.getArgument(STOP_BOOT);
+        if (!pipelineId.equals(config.getName()) || !(cluster instanceof String clusterId)
+                || clusterId.isBlank() || !(incarnation instanceof String incarnationId) || incarnationId.isBlank()
+                || !(generation instanceof Long executionGeneration) || executionGeneration < 1
+                || !(boot instanceof String submittedBoot) || submittedBoot.isBlank()) {
+            throw new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", pipelineId), null);
+        }
+        return new ExecutionJob(new StopReservation.JobIdentity(clusterId, job.getId(), submittedBoot),
+                new ObservationStore.Scope(incarnationId, executionGeneration));
+    }
+
+    private Job exactJob(String pipelineId, ExecutionJob expected) {
+        Objects.requireNonNull(expected, "expected");
+        Job job = member.getJet().getJob(expected.job().jobId());
+        if (job != null && !expected.equals(executionJob(pipelineId, job))) {
+            throw new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", pipelineId), null);
+        }
+        return job;
+    }
+
+    /** Cancels only the pinned old job; lookup by pipeline name cannot select a replacement here. */
+    public void cancelExact(String pipelineId, ExecutionJob expected) {
+        Job job = exactJob(pipelineId, expected);
+        if (job != null && job.getStatus() != JobStatus.FAILED && job.getStatus() != JobStatus.COMPLETED) {
+            job.cancel();
+        }
+        synchronized (queueAccounts) {
+            QueueAccount prior = queueAccounts.get(pipelineId);
+            if (prior != null && prior.jobId() == expected.job().jobId()) {
+                queueAccounts.put(pipelineId,
+                        new QueueAccount(expected.job().jobId(), "", 0, Long.MAX_VALUE, true));
+            }
+        }
+        stageQueueAccounts.cancel(pipelineId, expected.job().jobId());
+        if (isCurrentOrAbsent(pipelineId, expected)) {
+            JobFailureRegistry.of(member).clear(pipelineId);
+            if (storedCountSampler != null) { storedCountSampler.forget(pipelineId); }
+        }
+    }
+
+    /** Whether releasing pipeline-local capture can still belong to this old job. */
+    public boolean isCurrentOrAbsent(String pipelineId, ExecutionJob expected) {
+        Job current = member.getJet().getJob(pipelineId);
+        return current == null || current.getId() == expected.job().jobId()
+                && expected.equals(executionJob(pipelineId, current));
+    }
+
+    /** Waits only for the pinned native job, returning false while its actual terminal future is unfinished. */
+    public boolean awaitTerminalExact(String pipelineId, ExecutionJob expected, Duration budget) {
+        Job job = exactJob(pipelineId, expected);
+        return job == null || awaitTerminal(stopFuture(job, expected), budget);
     }
 
     /**
@@ -296,8 +429,16 @@ public final class Engine {
         if (job == null) {
             return true;
         }
+        return awaitTerminal(job, budget);
+    }
+
+    private boolean awaitTerminal(Job job, Duration budget) {
+        return awaitTerminal(job.getFuture(), budget);
+    }
+
+    private boolean awaitTerminal(CompletableFuture<Void> future, Duration budget) {
         try {
-            job.getFuture().toCompletableFuture().get(budget.toMillis(), TimeUnit.MILLISECONDS);
+            future.get(budget.toMillis(), TimeUnit.MILLISECONDS);
             return true;
         } catch (CancellationException | ExecutionException over) {
             return true;

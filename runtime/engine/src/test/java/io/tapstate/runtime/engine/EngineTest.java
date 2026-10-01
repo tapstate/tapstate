@@ -23,6 +23,8 @@ import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.lifecycle.DeliveryReading;
+import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 import java.time.Duration;
@@ -141,6 +143,63 @@ class EngineTest {
         // Nothing was ever submitted, so there is nothing still writing: a caller waiting to clear up after
         // this pipeline may go ahead rather than sit out its whole budget for a job that does not exist.
         assertThat(new Engine(member).awaitTerminal("never-ran", Duration.ofSeconds(15))).isTrue();
+    }
+
+    @Test
+    void admittedJobIdentityComesFromTheNativeJobAndSurvivesANewEngineBinding() {
+        Engine engine = new Engine(member);
+        ObservationStore.Scope admitted = new ObservationStore.Scope("inc-orders", 41);
+        engine.submit("orders-pipe", foreverDag(), Map.of(), NestSettings.defaults(), "cluster-a", admitted);
+        Job job = member.getJet().getJob("orders-pipe");
+        awaitStatus(job, JobStatus.RUNNING);
+
+        Engine.ExecutionJob identity = engine.executionJob("orders-pipe").orElseThrow();
+
+        assertThat(identity.job().jobId()).isEqualTo(job.getId());
+        assertThat(identity.job().clusterId()).isEqualTo("cluster-a");
+        assertThat(identity.job().bootId()).isNotBlank();
+        assertThat(identity.scope()).isEqualTo(admitted);
+        assertThat(new Engine(member).executionJob("orders-pipe")).contains(identity);
+        assertThat(engine.executionJob("never-ran")).isEmpty();
+        assertThat(engine.awaitTerminalExact("orders-pipe", identity, Duration.ofMillis(80))).isFalse();
+        engine.cancelExact("orders-pipe", identity);
+        assertThat(engine.awaitTerminalExact("orders-pipe", identity, Duration.ofSeconds(15))).isTrue();
+    }
+
+    @Test
+    void anOldExactCancelAndWaitCannotSelectTheReplacementUnderTheSameName() {
+        Engine engine = new Engine(member);
+        engine.submit("orders-pipe", foreverDag(), Map.of(), NestSettings.defaults(), "cluster-a",
+                new ObservationStore.Scope("inc-orders", 41));
+        awaitStatus(member.getJet().getJob("orders-pipe"), JobStatus.RUNNING);
+        Engine.ExecutionJob old = engine.executionJob("orders-pipe").orElseThrow();
+        engine.cancelExact("orders-pipe", old);
+        assertThat(engine.awaitTerminalExact("orders-pipe", old, Duration.ofSeconds(15))).isTrue();
+        engine.submit("orders-pipe", foreverDag(), Map.of(), NestSettings.defaults(), "cluster-a",
+                new ObservationStore.Scope("inc-orders", 42));
+        Job successor = member.getJet().getJob("orders-pipe");
+        awaitStatus(successor, JobStatus.RUNNING);
+
+        engine.cancelExact("orders-pipe", old);
+
+        assertThat(engine.awaitTerminalExact("orders-pipe", old, Duration.ofMillis(80))).isTrue();
+        assertThat(engine.isCurrentOrAbsent("orders-pipe", old)).isFalse();
+        assertThat(successor.getId()).isNotEqualTo(old.job().jobId());
+        assertThat(successor.getStatus()).isEqualTo(JobStatus.RUNNING);
+        assertThat(engine.executionJob("orders-pipe").orElseThrow().scope().executionGeneration()).isEqualTo(42);
+    }
+
+    @Test
+    void anExistingNativeJobWithoutAdmittedIdentityIsRefusedWithoutCancellation() {
+        Engine engine = new Engine(member);
+        engine.submit("orders-pipe", foreverDag());
+        Job job = member.getJet().getJob("orders-pipe");
+        awaitStatus(job, JobStatus.RUNNING);
+
+        assertThatThrownBy(() -> engine.executionJob("orders-pipe"))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
+        assertThat(job.getStatus()).isEqualTo(JobStatus.RUNNING);
     }
 
     @Test
