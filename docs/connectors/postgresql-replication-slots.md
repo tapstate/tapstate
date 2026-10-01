@@ -46,22 +46,24 @@ was created, as it did in earlier versions. Other source databases are not affec
 ## A paused pipeline holds the log
 
 A pipeline that is paused, or stopped with its state kept (`stop <pipeline> --keep-state`), still owes
-every change after its position, so the slot waits for it. The other pipelines reading the source keep
-reading and landing their changes meanwhile; it is only the slot that cannot move past what one of them
-has not landed. PostgreSQL keeps WAL for as long as that lasts.
+every change after its position, so the slot waits for it. The other pipelines reading the source go on
+reading and landing their changes, until the changes the held pipeline has not read pile up past what
+Tapstate buffers for it - about a thousand on any one of its tables. From then on the whole source waits
+for it, and so does every pipeline reading the source. PostgreSQL keeps WAL for as long as either lasts.
 
 Bound it on the source with `max_slot_wal_keep_size`. Past that limit PostgreSQL invalidates the slot;
 the pipelines reading through it cannot resume from where they were, and have to be rerun with
 `restart <pipeline> --rerun`.
 
-A pipeline started on the same source meanwhile reads from where the slot is held, too: the source has
-one reader and one position. So a pipeline that starts while another pipeline is paused or stopped with
-its state kept is also sent the changes to its own tables made since that pipeline stopped. For a
-`cdc_only` pipeline those include changes made before it started; for one that loads its tables first
-they include changes its load already holds, which are written again in the order they were made. Once
-nothing holds the source - the held pipeline is resumed and catches up, or is cleared - a `cdc_only`
-pipeline starting there begins at the present, and one that loads its tables first begins where its load
-did.
+A pipeline started on the same source meanwhile can be sent changes made before it started. When it
+starts the source's reader itself - the held pipeline is stopped with its state kept and nothing else reads
+the source - or asks the running reader for tables it does not read yet, the reader goes back to where the
+source is held, and the new pipeline is sent the changes to its own tables since then: for a `cdc_only`
+pipeline those include changes made before it started; for one that loads its tables first, changes its
+load already holds, written again in the order they were made. A pipeline whose tables the running reader
+already reads begins where the reader is. Once nothing holds the source - the held pipeline is resumed and
+catches up, or is cleared - a `cdc_only` pipeline starting there begins at the present, and one that loads
+its tables first begins where its load did.
 
 ## Rewinding a pipeline, and `keepWalHours`
 
