@@ -8,6 +8,8 @@ import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.migration.MigrationRunner;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.model.SourceResource;
+import io.tapstate.spi.store.IoError;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -66,10 +68,29 @@ public final class MongoConnection implements AutoCloseable {
         try {
             MigrationRunner.migrate(database());
             sourceConfigKeyring = new SourceConfigKeyringHandle(new SourceConfigKeyringStore(database()));
+            verifySourceConfigStorage();
         } catch (RuntimeException e) {
             close();
             throw e;
         }
+    }
+
+    /** Verifies existing Source envelopes and logical identity before handing out the store connection. */
+    private void verifySourceConfigStorage() {
+        EncryptedArtifactCodec codec = new EncryptedArtifactCodec(sourceConfigKeyring);
+        StoreIo.run(() -> {
+            Document sources = new Document("$or", List.of(
+                    new Document("kind", "source"), new Document("body.kind", "source")));
+            try (var cursor = SystemCollections.ARTIFACTS.on(database()).find(sources).iterator()) {
+                while (cursor.hasNext()) {
+                    Document document = cursor.next();
+                    if (!(codec.decode(document) instanceof SourceResource)) {
+                        throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                                Map.of("id", String.valueOf(document.get("_id")), "field", "body"), null);
+                    }
+                }
+            }
+        });
     }
 
     /**

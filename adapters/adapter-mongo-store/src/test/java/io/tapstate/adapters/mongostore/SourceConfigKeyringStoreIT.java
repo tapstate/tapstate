@@ -16,6 +16,9 @@ import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
@@ -26,8 +29,10 @@ import java.security.SecureRandom;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Date;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -140,6 +145,47 @@ class SourceConfigKeyringStoreIT {
                     error.printStackTrace(new PrintWriter(printed));
                     assertThat(printed.toString()).doesNotContain(material, "not-base64@");
                 });
+    }
+
+    @ParameterizedTest(name = "malformed persisted {0} is rejected safely")
+    @MethodSource("malformedKeyringValues")
+    void malformedPersistedKeyringTypesAreCodedRatherThanTruncatedOrBareThrown(String field, Object value) {
+        MongoDatabase database = freshDatabase("keyring_invalid_shape");
+        MongoCollection<Document> systemMeta = SystemCollections.SYSTEM_META.on(database);
+        SourceConfigKeyringStore store = new SourceConfigKeyringStore(database);
+        store.loadOrCreateCipher();
+        Document original = systemMeta.find(new Document("_id", "source-config-keyring")).first();
+        String material = original.getList("keys", Document.class).getFirst().getString("material");
+        systemMeta.updateOne(new Document("_id", "source-config-keyring"),
+                new Document("$set", new Document(field, value)));
+
+        assertThatThrownBy(store::loadExistingCipher).isInstanceOfSatisfying(TapstateException.class, error -> {
+            assertThat(error.code()).isEqualTo(StoreError.SOURCE_CONFIG_KEYRING_INVALID);
+            assertThat(error.getCause()).isNull();
+            StringWriter printed = new StringWriter();
+            error.printStackTrace(new PrintWriter(printed));
+            assertThat(printed.toString()).doesNotContain(material, "malformed-keyring-input-sentinel");
+        });
+        assertThat(systemMeta.countDocuments(new Document("_id", "source-config-keyring"))).isEqualTo(1);
+    }
+
+    private static Stream<Arguments> malformedKeyringValues() {
+        String sentinel = "malformed-keyring-input-sentinel";
+        return Stream.of(
+                Arguments.of("formatVersion", sentinel),
+                Arguments.of("formatVersion", 1.5d),
+                Arguments.of("formatVersion", 4_294_967_297L),
+                Arguments.of("epoch", sentinel),
+                Arguments.of("epoch", 1.5d),
+                Arguments.of("activeKeyId", new Document("value", sentinel)),
+                Arguments.of("preparedKeyId", 17),
+                Arguments.of("preparedKeyId", (Object) null),
+                Arguments.of("keys", new Document("value", sentinel)),
+                Arguments.of("keys", List.of(sentinel)),
+                Arguments.of("keys.0", (Object) null),
+                Arguments.of("keys.0.id", 17),
+                Arguments.of("keys.0.state", new Document("value", sentinel)),
+                Arguments.of("keys.0.material", List.of(sentinel)));
     }
 
     @Test

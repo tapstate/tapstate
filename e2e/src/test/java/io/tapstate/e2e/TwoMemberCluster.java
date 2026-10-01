@@ -85,20 +85,41 @@ final class TwoMemberCluster implements AutoCloseable {
      * @param nodeSessionTtl the lease each member's node session is taken under, or null for the default
      */
     static TwoMemberCluster start(String storeUri, String name, Duration nodeSessionTtl) {
-        String clusterId = name + "-" + UUID.randomUUID();
+        return start(storeUri, name + "-" + UUID.randomUUID(), nodeSessionTtl, false, false);
+    }
+
+    /** Starts both JVMs before waiting, so first-boot coordination executes concurrently. */
+    static TwoMemberCluster startConcurrently(String storeUri, String name, Duration nodeSessionTtl) {
+        return start(storeUri, name + "-" + UUID.randomUUID(), nodeSessionTtl, true, false);
+    }
+
+    /** Restarts the entire stopped cluster with its original durable identity and existing administrator. */
+    TwoMemberCluster restarted() {
+        if (first.isAlive() || second.isAlive()) {
+            throw new IllegalStateException("both original processes must stop before a cluster restart");
+        }
+        return start(storeUri, clusterId, nodeSessionTtl, true, true);
+    }
+
+    private static TwoMemberCluster start(String storeUri, String clusterId, Duration nodeSessionTtl,
+            boolean concurrent, boolean existingAdministrator) {
         String bindAddress = RoutableAddress.ofThisMachine();
         int memberPortA = RealProcessServer.reservePort();
         int memberPortB = RealProcessServer.reservePort();
         String seeds = bindAddress + ":" + memberPortA + "," + bindAddress + ":" + memberPortB;
 
-        RealProcessServer first = RealProcessServer.start(storeUri, "0.0.0.0",
-                httpPort -> arguments(
-                        clusterId, NODE_A, memberPortA, seeds, httpPort, bindAddress, nodeSessionTtl));
+        java.util.function.IntFunction<List<String>> firstArguments = httpPort -> arguments(
+                clusterId, NODE_A, memberPortA, seeds, httpPort, bindAddress, nodeSessionTtl);
+        RealProcessServer first = concurrent
+                ? RealProcessServer.launching(storeUri, "0.0.0.0", firstArguments)
+                : RealProcessServer.start(storeUri, "0.0.0.0", firstArguments);
         RealProcessServer second;
         try {
-            second = RealProcessServer.start(storeUri, "0.0.0.0",
-                    httpPort -> arguments(
-                            clusterId, NODE_B, memberPortB, seeds, httpPort, bindAddress, nodeSessionTtl));
+            java.util.function.IntFunction<List<String>> secondArguments = httpPort -> arguments(
+                    clusterId, NODE_B, memberPortB, seeds, httpPort, bindAddress, nodeSessionTtl);
+            second = concurrent
+                    ? RealProcessServer.launching(storeUri, "0.0.0.0", secondArguments)
+                    : RealProcessServer.start(storeUri, "0.0.0.0", secondArguments);
         } catch (RuntimeException | Error failure) {
             first.close();
             throw failure;
@@ -106,7 +127,12 @@ final class TwoMemberCluster implements AutoCloseable {
         TwoMemberCluster cluster = new TwoMemberCluster(
                 first, second, storeUri, clusterId, bindAddress, seeds, nodeSessionTtl);
         try {
-            cluster.a.bootstrapAndLogin(ADMIN, PASSWORD);
+            if (concurrent) {
+                first.awaitReady();
+                second.awaitReady();
+            }
+            if (existingAdministrator) cluster.a.login(ADMIN, PASSWORD);
+            else cluster.a.bootstrapAndLogin(ADMIN, PASSWORD);
             // The administrator lives in the store both of them share, so the second does not create one.
             cluster.b.login(ADMIN, PASSWORD);
         } catch (RuntimeException | Error failure) {

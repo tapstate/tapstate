@@ -255,6 +255,22 @@ final class RealProcessServer implements ServerHandle {
         return process.isAlive();
     }
 
+    /** Waits for all startup runners, not merely the earlier Tomcat health response. */
+    void awaitReady() {
+        ControlPlane control = new ControlPlane(baseUrl);
+        Await.until("the process to complete application startup", STARTUP_BUDGET, () -> {
+            if (!process.isAlive()) {
+                throw new AssertionError("the server exited with status " + process.exitValue()
+                        + " before application readiness; its output was:\n" + tail());
+            }
+            try {
+                return Files.readString(output).contains("Tapstate application is ready") && control.healthy();
+            } catch (IOException failure) {
+                throw new UncheckedIOException("could not read application readiness", failure);
+            }
+        }, this::tail);
+    }
+
     /**
      * What it exited with, for a witness whose subject is the server declining to start.
      *

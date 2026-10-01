@@ -45,6 +45,9 @@ final class EncryptedArtifactCodec {
     Resource decode(Document document) {
         String id = String.valueOf(document.get("_id"));
         if (!(document.get("body") instanceof Document stored)) throw unreadable(id, "body");
+        boolean indexedSource = "source".equals(document.get("kind"));
+        boolean bodySource = "source".equals(stored.get("kind"));
+        if (indexedSource != bodySource) throw unreadable(id, "kind");
         Map<String, Object> tree = new LinkedHashMap<>(stored);
         if ("source".equals(tree.get("kind"))) {
             if (!(tree.get("config") instanceof String envelope)

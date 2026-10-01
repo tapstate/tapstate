@@ -97,25 +97,27 @@ public final class SourceConfigKeyringStore {
     }
 
     private static Loaded decodeStored(Document stored) {
-        Number format = stored.get("formatVersion", Number.class);
-        Number epoch = stored.get("epoch", Number.class);
-        String active = stored.getString("activeKeyId");
-        String prepared = stored.getString("preparedKeyId");
-        List<Document> entries = stored.getList("keys", Document.class);
-        if (format == null || format.intValue() != FORMAT_VERSION || epoch == null || epoch.longValue() < 1
-                || active == null || active.isBlank() || entries == null || entries.isEmpty()) {
+        Object format = stored.get("formatVersion");
+        Object epoch = stored.get("epoch");
+        Object preparedValue = stored.get("preparedKeyId");
+        if (!storedInteger(format) || ((Number) format).longValue() != FORMAT_VERSION
+                || !storedInteger(epoch) || ((Number) epoch).longValue() < 1
+                || !(stored.get("activeKeyId") instanceof String active) || active.isBlank()
+                || !(stored.get("keys") instanceof List<?> entries) || entries.isEmpty()
+                || (stored.containsKey("preparedKeyId") && !(preparedValue instanceof String))) {
             throw invalid();
         }
+        String prepared = (String) preparedValue;
 
         Map<String, byte[]> decoded = new LinkedHashMap<>();
         int activeEntries = 0;
         int preparedEntries = 0;
         try {
-            for (Document entry : entries) {
-                String id = entry.getString("id");
-                String state = entry.getString("state");
-                String material = entry.getString("material");
-                if (id == null || material == null
+            for (Object value : entries) {
+                if (!(value instanceof Document entry)
+                        || !(entry.get("id") instanceof String id)
+                        || !(entry.get("state") instanceof String state)
+                        || !(entry.get("material") instanceof String material)
                         || !("active".equals(state) || "read-only".equals(state) || "prepared".equals(state))
                         || decoded.containsKey(id)
                         || id.equals(active) != "active".equals(state)
@@ -141,10 +143,14 @@ public final class SourceConfigKeyringStore {
                     || (prepared != null && (preparedEntries != 1 || !decoded.containsKey(prepared)))) {
                 throw invalid();
             }
-            return new Loaded(epoch.longValue(), active, prepared, new SourceConfigCipher(active, decoded));
+            return new Loaded(((Number) epoch).longValue(), active, prepared, new SourceConfigCipher(active, decoded));
         } finally {
             decoded.values().forEach(bytes -> Arrays.fill(bytes, (byte) 0));
         }
+    }
+
+    private static boolean storedInteger(Object value) {
+        return value instanceof Integer || value instanceof Long;
     }
 
     Loaded prepareRotation() {

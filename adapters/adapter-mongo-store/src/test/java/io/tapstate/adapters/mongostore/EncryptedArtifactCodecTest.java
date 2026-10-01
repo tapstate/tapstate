@@ -68,6 +68,24 @@ class EncryptedArtifactCodecTest {
         refuses(swapped);
     }
 
+    @Test
+    void aSourceCannotMasqueradeAsAnotherIndexedKindAndBypassProtectedBrowseProjection() {
+        for (Object wrongKind : Arrays.asList(null, "pipeline", new Document("kind", "untrusted-kind-input"))) {
+            Document stored = codec.encode(source("unknown"));
+            stored.put("kind", wrongKind);
+            refuses(stored);
+        }
+    }
+
+    @Test
+    void aMalformedSourceHashIsAStorageDiagnosticRatherThanABareTypeError() {
+        for (Object invalidHash : Arrays.asList(null, 123, new Document("input", "config-secret"))) {
+            Document stored = codec.encode(source("unknown"));
+            stored.put("contentHash", invalidHash);
+            refuses(stored);
+        }
+    }
+
     private void refuses(Document document) {
         assertThatThrownBy(() -> codec.decode(document)).isInstanceOfSatisfying(TapstateException.class, error -> {
             assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
