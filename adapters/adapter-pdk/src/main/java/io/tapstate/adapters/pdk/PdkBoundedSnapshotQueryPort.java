@@ -116,7 +116,7 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
             }
             ensureBeforeDeadline(request);
             cancellation.throwIfCancelled();
-            boolean complete = request.selection() instanceof BoundedSnapshotQueryRequest.AllRows || !hasMore[0];
+            boolean complete = !hasMore[0];
             return new BoundedSnapshotQueryResult(rows, complete, hasMore[0],
                     !request.stableOrder().isEmpty(), queryCount[0], clock.instant());
         } finally {

@@ -459,7 +459,7 @@ final class PreviewSelectionPlanner {
             }
             queryCount += result.queryCount();
             repeatable &= result.repeatable();
-            if (!result.complete() || (!root && result.hasMore())) {
+            if (!root && !result.complete()) {
                 refuse("an exact relation query was truncated and cannot produce a complete preview");
             }
             if (root && result.hasMore()) {

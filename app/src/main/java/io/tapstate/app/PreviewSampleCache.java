@@ -49,12 +49,16 @@ final class PreviewSampleCache {
         if (entry == null) {
             return null;
         }
-        return new BoundedSnapshotQueryResult(entry.rows(), true, entry.hasMore(), true, 0, entry.sampledAt());
+        return new BoundedSnapshotQueryResult(
+                entry.rows(), !entry.hasMore(), entry.hasMore(), true, 0, entry.sampledAt());
     }
 
     void put(String principal, String pipelineId, String sampleId,
             String connectorIdentity, BoundedSnapshotQueryRequest request, BoundedSnapshotQueryResult result) {
-        if (!result.complete() || !result.repeatable()) {
+        boolean truncatedRootSample = request.selection() instanceof BoundedSnapshotQueryRequest.AllRows
+                && result.hasMore();
+        if ((!result.complete() && !truncatedRootSample)
+                || !result.repeatable()) {
             return;
         }
         long encodedBytes = 0;
