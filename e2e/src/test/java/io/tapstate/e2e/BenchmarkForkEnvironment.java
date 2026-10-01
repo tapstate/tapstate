@@ -35,25 +35,42 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
         OwnedBoot launch(String storeUri, String operatorStateDatabase, Path applicationJar) throws Exception;
     }
 
-    record OwnedBoot(RealProcessServer server, BenchmarkJdiTelemetrySession telemetry) implements AutoCloseable {
+    record OwnedBoot(RealProcessServer server, BenchmarkJdiTelemetrySession telemetry,
+            ExecutionAdmissionJdiSession admission) implements AutoCloseable {
+        OwnedBoot(RealProcessServer server, BenchmarkJdiTelemetrySession telemetry) {
+            this(server, telemetry, null);
+        }
         OwnedBoot {
             Objects.requireNonNull(server, "owned server");
             if (telemetry != null && telemetry.server() != server) {
                 throw new IllegalArgumentException("telemetry must own this exact server");
             }
+            if (admission != null && (admission.server() != server || telemetry != null)) {
+                throw new IllegalArgumentException("admission must exclusively own this exact server");
+            }
         }
         static OwnedBoot plain(String storeUri, String operatorStateDatabase, Path applicationJar) {
             return new OwnedBoot(RealProcessServer.start(storeUri, operatorStateDatabase, applicationJar), null);
         }
-        void check() { if (telemetry != null) { telemetry.checkCapture(); } }
+        void check() {
+            if (telemetry != null) { telemetry.checkCapture(); }
+            if (admission != null) { admission.checkCapture(); }
+        }
         void begin() throws Exception { if (telemetry != null) { telemetry.begin(); } }
         void cutoff() throws Exception { if (telemetry != null) { telemetry.cutoff(); } }
         Optional<BenchmarkJdiTelemetrySession.Evidence> finish() throws Exception {
             return telemetry == null ? Optional.empty() : Optional.of(telemetry.shutdownAndFinish());
         }
-        @Override public void close() {
-            if (telemetry != null) { telemetry.close(); } else { server.close(); }
+        @Override public void close() throws Exception {
+            if (admission != null) { admission.close(); }
+            else if (telemetry != null) { telemetry.close(); }
+            else { server.close(); }
         }
+    }
+
+    @FunctionalInterface
+    interface BeforeStart {
+        void accept(OwnedBoot boot) throws Exception;
     }
 
     @FunctionalInterface
@@ -162,6 +179,12 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
 
     static BenchmarkForkEnvironment open(BenchmarkWorkloadDefinitions.Workload workload,
             Path applicationJar, String forkId, BootLauncher launcher) throws Exception {
+        return open(workload, applicationJar, forkId, launcher, boot -> { });
+    }
+
+    /** Allows a diagnostic baseline after setup while the real first START is still pending. */
+    static BenchmarkForkEnvironment open(BenchmarkWorkloadDefinitions.Workload workload,
+            Path applicationJar, String forkId, BootLauncher launcher, BeforeStart beforeStart) throws Exception {
         Objects.requireNonNull(workload, "workload");
         Objects.requireNonNull(applicationJar, "applicationJar");
         if (!Files.isRegularFile(applicationJar) || forkId == null || forkId.isBlank()) {
@@ -217,6 +240,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
             // Apply validates references within the submitted workspace, so the discovered sources
             // travel with their dependents again even though their content is unchanged.
             control.apply(resources);
+            Objects.requireNonNull(beforeStart, "beforeStart").accept(boot);
             for (String pipeline : workload.pipelineIds()) {
                 control.lifecycle(pipeline, LifecycleVerb.START);
             }
@@ -227,15 +251,24 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
             return new BenchmarkForkEnvironment(workload, forkId, sourceSettings, storeUri,
                     externalTargetUri, managedViewsUri, operatorStateUri, boot, control, source, mongo);
         } catch (Exception | Error failure) {
-            if (boot != null) {
-                boot.close();
-            }
-            if (mongo != null) {
-                mongo.close();
-            }
-            source.close();
+            closeAfterFailure(boot, failure);
+            closeAfterFailure(mongo, failure);
+            closeAfterFailure(source, failure);
             throw failure;
         }
+    }
+
+    private static void closeAfterFailure(AutoCloseable resource, Throwable failure) {
+        if (resource == null) { return; }
+        try { resource.close(); }
+        catch (Exception | Error cleanupFailure) {
+            if (cleanupFailure != failure) { failure.addSuppressed(cleanupFailure); }
+        }
+    }
+
+    /** Ends only the owned application, retaining this fork's live SQL and Mongo fixtures. */
+    void closeBoot() throws Exception {
+        boot.close();
     }
 
     private static void awaitRunning(ControlPlane control, String pipeline) {
