@@ -14,6 +14,9 @@ cluster.membership-unreadable:
 actuation.pipeline-not-found:
   message: "No pipeline artifact `{pipeline}` is stored to run."
   solution: "Apply the pipeline before starting it, and check the id for typos."
+actuation.preview-refused:
+  message: "The Pipeline preview was refused: {reason}."
+  solution: "Keep the preview within its bounded sampling and execution guarantees, then try again."
 actuation.not-a-pipeline:
   message: "Resource `{pipeline}` is a `{kind}`, not a pipeline, so it cannot be run."
   solution: "Start a pipeline resource; check the id names a pipeline and not another kind of resource."

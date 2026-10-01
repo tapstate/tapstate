@@ -220,6 +220,10 @@ public final class ControlOperations {
     public static final Operation PIPELINE_DRAFT_PREVIEW = new Operation(
             "pipeline-draft.preview", Scope.READ, false, null,
             "Compile one Pipeline draft without publishing or changing the applied artifact.", CLI_AND_REST);
+    public static final Operation PIPELINE_PREVIEW = new Operation(
+            "pipeline.preview", Scope.READ, false, null,
+            "Run a bounded preview of an uncommitted Pipeline candidate without writing a target or artifact.",
+            CLI_AND_REST);
     public static final Operation PIPELINE_DRAFT_PUBLISH = new Operation(
             "pipeline-draft.publish", Scope.WRITE, true, null,
             "Compile and atomically publish one Pipeline draft after its revision and artifact checks.", CLI_AND_REST);
@@ -352,6 +356,7 @@ public final class ControlOperations {
             PIPELINE_DRAFT_REPLACE,
             PIPELINE_DRAFT_DELETE,
             PIPELINE_DRAFT_PREVIEW,
+            PIPELINE_PREVIEW,
             PIPELINE_DRAFT_PUBLISH,
             PIPELINE_DRAFT_REBASE,
             PIPELINE_START,

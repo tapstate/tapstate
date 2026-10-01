@@ -1,9 +1,13 @@
 package io.tapstate.app;
 
 import com.hazelcast.config.Config;
+import com.hazelcast.config.EvictionConfig;
+import com.hazelcast.config.EvictionPolicy;
 import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.JoinConfig;
 import com.hazelcast.config.MapConfig;
+import com.hazelcast.config.MapStoreConfig;
+import com.hazelcast.config.MaxSizePolicy;
 import com.hazelcast.config.RingbufferConfig;
 import com.hazelcast.config.RingbufferStoreConfig;
 import com.hazelcast.config.SerializerConfig;
@@ -517,6 +521,9 @@ class HazelcastConfiguration {
         config.getSerializationConfig().addSerializerConfig(new SerializerConfig()
                 .setTypeClass(Envelope.class)
                 .setImplementation(new EnvelopeSerializer()));
+        config.getSerializationConfig().addSerializerConfig(new SerializerConfig()
+                .setTypeClass(PreviewSampleCache.Entry.class)
+                .setImplementation(new PreviewSampleCache.EntrySerializer()));
         RingbufferConfig rings = new RingbufferConfig("srs.*")
                 .setCapacity(SRS_RING_CAPACITY)
                 .setInMemoryFormat(InMemoryFormat.OBJECT)
@@ -539,6 +546,12 @@ class HazelcastConfiguration {
                     .setFactoryImplementation(new SrsLogRingbufferStoreFactory(srsLogStore)));
         }
         config.addRingBufferConfig(rings);
+        // Preview maps are request-scoped scratch only. These more specific patterns override the
+        // durable nest/join patterns installed after member startup and deliberately carry no MapStore.
+        config.addMapConfig(previewMapConfig("__preview.*", 300));
+        config.addMapConfig(previewSampleMapConfig());
+        config.addMapConfig(previewMapConfig("nest.preview_*.*", 300));
+        config.addMapConfig(previewMapConfig("join.preview_*.*", 300));
         // What a nest state map is is NOT declared here, and the omission is load-bearing: it is declared
         // once the member is running, by makeNestCapable. A pattern placed in this static configuration
         // answers for every namespace and shadows the per-pipeline budget added later, which the substrate
@@ -549,6 +562,25 @@ class HazelcastConfiguration {
         // there is nothing behind the pattern being shadowed yet - which is exactly the state the nest
         // maps were in until the day one was added.
         return config;
+    }
+
+    private static MapConfig previewMapConfig(String pattern, int ttlSeconds) {
+        return new MapConfig(pattern)
+                .setBackupCount(0)
+                .setAsyncBackupCount(0)
+                .setInMemoryFormat(InMemoryFormat.OBJECT)
+                .setTimeToLiveSeconds(ttlSeconds)
+                .setMaxIdleSeconds(ttlSeconds)
+                .setMapStoreConfig(new MapStoreConfig().setEnabled(false));
+    }
+
+    private static MapConfig previewSampleMapConfig() {
+        return previewMapConfig(PreviewSampleCache.MAP_NAME, (int) PreviewSampleCache.TTL.toSeconds())
+                .setInMemoryFormat(InMemoryFormat.BINARY)
+                .setEvictionConfig(new EvictionConfig()
+                        .setSize(8)
+                        .setMaxSizePolicy(MaxSizePolicy.PER_NODE)
+                        .setEvictionPolicy(EvictionPolicy.LRU));
     }
 
     /**

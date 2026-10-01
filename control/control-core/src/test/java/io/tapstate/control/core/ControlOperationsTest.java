@@ -52,6 +52,7 @@ class ControlOperationsTest {
                         "pipeline-draft.replace",
                         "pipeline-draft.delete",
                         "pipeline-draft.preview",
+                        "pipeline.preview",
                         "pipeline-draft.publish",
                         "pipeline-draft.rebase",
                         "pipeline.start",
@@ -80,6 +81,7 @@ class ControlOperationsTest {
     void scopesMatchTheOperationInventory() {
         assertThat(registry.resolve("artifact.apply").scope()).isEqualTo(Scope.WRITE);
         assertThat(registry.resolve("artifact.validate").scope()).isEqualTo(Scope.READ);
+        assertThat(registry.resolve("pipeline.preview").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("artifact.get").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("artifact.list").scope()).isEqualTo(Scope.READ);
         // artifact.delete removes a stored resource for good, so it is the most consequential write in
@@ -165,6 +167,7 @@ class ControlOperationsTest {
                 "artifact.get",
                 "artifact.list",
                 "artifact.validate",
+                "pipeline.preview",
                 "source.draft",
                 "source.list",
                 "source.get",
@@ -200,7 +203,7 @@ class ControlOperationsTest {
         // A scope statement about the registry alone: the CLI face opens every registered operation and
         // clips none of them. Whether each one has a verb behind it is not knowable from here
         // — control-core cannot see the CLI — and is gated where both are visible, in arch-tests.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(60);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(61);
         assertThat(registry.all()).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
     }
@@ -241,6 +244,7 @@ class ControlOperationsTest {
                 .containsExactlyInAnyOrder(
                         "pipeline-draft.list", "pipeline-draft.get", "pipeline-draft.create",
                         "pipeline-draft.replace", "pipeline-draft.delete", "pipeline-draft.preview",
+                        "pipeline.preview",
                         "pipeline-draft.publish", "pipeline-draft.rebase", "pipeline.catalog");
     }
 

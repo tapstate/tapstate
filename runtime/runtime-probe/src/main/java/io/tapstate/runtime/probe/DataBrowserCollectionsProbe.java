@@ -14,8 +14,8 @@ import java.util.List;
  * now, which is what a user browsing their data is asking about — a source may be referenced purely
  * as a connection supplier, declaring no tables at all, and still have collections to list.
  *
- * <p>The whitelist of such calls is a closed set of six — the connection probe, the discovery probe,
- * and the four the data browser needs. Any further synchronous control-to-runtime call is a
+ * <p>The whitelist of such calls is a closed set of seven — the connection probe, the discovery probe,
+ * the four data-browser calls, and the Pipeline preview probe. Any further synchronous control-to-runtime call is a
  * deliberate widening of the seam that must change the gate and the sync-whitelist decision, not slip
  * in beside them.
  */
