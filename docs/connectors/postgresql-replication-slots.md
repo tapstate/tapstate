@@ -54,6 +54,12 @@ Bound it on the source with `max_slot_wal_keep_size`. Past that limit PostgreSQL
 the pipelines reading through it cannot resume from where they were, and have to be rerun with
 `restart <pipeline> --rerun`.
 
+A pipeline started on the same source meanwhile reads from where the slot is held, too: the source has
+one reader and one position. So a `cdc_only` pipeline that starts while another pipeline is paused or
+stopped with its state kept is also sent the changes to its own tables made since that pipeline stopped,
+not only those made after it started. Once nothing holds the source - the held pipeline is resumed and
+catches up, or is cleared - a pipeline starting there begins at the present.
+
 ## Rewinding a pipeline, and `keepWalHours`
 
 Once a position is confirmed, PostgreSQL will not send the changes before it again. A request to start
