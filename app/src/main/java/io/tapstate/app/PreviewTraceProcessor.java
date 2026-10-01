@@ -72,7 +72,7 @@ final class PreviewTraceProcessor extends AbstractProcessor {
             if (inputAlias == null && samplesWritten < MAX_ROWS) {
                 Map<String, Object> sample = sample(event, nodeId);
                 long remainingBytes = MAX_BYTES - sampleBytes;
-                long size = EventJsonValues.encodedSize(sample, remainingBytes);
+                long size = EventJsonValues.encodedSize(PreviewJsonValues.normalize(sample), remainingBytes);
                 if (size <= remainingBytes) {
                     String key = "sample:" + nodeId + ":" + String.format("%02d", samplesWritten);
                     memberMap().put(key, JsonWriter.write(PreviewJsonValues.normalize(sample)));

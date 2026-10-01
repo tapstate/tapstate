@@ -1288,6 +1288,16 @@ final class Synthetic {
                 Map.of());
     }
 
+    /** A MongoDB target connector that restores portable string keys through its registered codec. */
+    static Path mongoPreviewTarget(Path dir) {
+        String register = "codecs.registerFromTapValue(io.tapdata.entity.schema.value.TapStringValue.class, "
+                + "value -> new org.bson.types.ObjectId(value.getValue()));"
+                + "codecs.registerFromTapValue(io.tapdata.entity.schema.value.TapDateTimeValue.class, "
+                + "value -> java.util.Date.from(value.getValue().toInstant()));";
+        return SyntheticJar.compileToJar(dir, "synthetic.MongoPreviewTarget",
+                source("MongoPreviewTarget", "", register));
+    }
+
     /** A second registrable connector under a distinct id, whose manifest declares no PDK API version. */
     static Path seedablePaymentsConnector(Path dir) {
         String src = SELF_SCAN_IMPORTS

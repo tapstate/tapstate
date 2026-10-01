@@ -5,16 +5,18 @@ import io.tapstate.control.core.PipelinePreviewEvent;
 import io.tapstate.control.core.PipelinePreviewCommand;
 import io.tapstate.control.core.PipelinePreviewSession;
 import io.tapstate.control.core.PipelinePreviewService;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
+import tools.jackson.core.JacksonException;
 import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.math.BigDecimal;
 import java.util.ArrayList;
@@ -29,6 +31,7 @@ class PipelinePreviewController {
     private static final Set<String> REQUEST_FIELDS =
             Set.of("pipelineId", "outputId", "rootLimit", "sampleId", "drafts");
     private static final Set<String> DRAFT_FIELDS = Set.of("source", "content", "expectedContentHash");
+    static final int MAX_REQUEST_BYTES = 4 * 1024 * 1024;
 
     private final PipelinePreviewService previews;
     private final ObjectMapper json;
@@ -39,8 +42,26 @@ class PipelinePreviewController {
     }
 
     @Verb("pipeline.preview")
-    @PostMapping(value = "/artifacts:preview", produces = "application/x-ndjson")
-    ResponseEntity<StreamingResponseBody> preview(@RequestBody Map<String, Object> body) {
+    @PostMapping(value = "/artifacts:preview", consumes = "application/json", produces = "application/x-ndjson")
+    ResponseEntity<StreamingResponseBody> preview(HttpServletRequest request) throws IOException {
+        if (request.getContentLengthLong() > MAX_REQUEST_BYTES) {
+            throw MalformedRequest.rejecting("preview request exceeds the 4 MiB limit", null);
+        }
+        byte[] bytes = readBounded(request.getInputStream(), MAX_REQUEST_BYTES);
+        Object decoded;
+        try {
+            decoded = json.readValue(bytes, Object.class);
+        } catch (JacksonException malformedJson) {
+            throw MalformedRequest.rejecting("request body is not valid JSON", malformedJson);
+        }
+        Map<?, ?> body;
+        if (decoded instanceof Map<?, ?> object) {
+            body = object;
+        } else if (decoded == null) {
+            body = null;
+        } else {
+            throw MalformedRequest.rejecting("preview request body must be a JSON object", null);
+        }
         PipelinePreviewCommand command = parse(body);
         PipelinePreviewSession stream = previews.open(AuthenticatedCaller.subject(), command);
         StreamingResponseBody response = output -> writeEvents(output, stream);
@@ -50,7 +71,15 @@ class PipelinePreviewController {
                 .body(response);
     }
 
-    private PipelinePreviewCommand parse(Map<String, Object> body) {
+    static byte[] readBounded(InputStream input, int maxBytes) throws IOException {
+        byte[] bytes = input.readNBytes(maxBytes + 1);
+        if (bytes.length > maxBytes) {
+            throw MalformedRequest.rejecting("preview request exceeds the 4 MiB limit", null);
+        }
+        return bytes;
+    }
+
+    private PipelinePreviewCommand parse(Map<?, ?> body) {
         if (body == null) {
             throw MalformedRequest.rejecting("request body is required", null);
         }
@@ -62,6 +91,10 @@ class PipelinePreviewController {
         Object rawDrafts = MalformedRequest.require(body.get("drafts"), "drafts must be an array");
         if (!(rawDrafts instanceof java.util.List<?> list)) {
             throw MalformedRequest.rejecting("drafts must be an array", null);
+        }
+        if (list.size() > PipelinePreviewService.MAX_DRAFTS) {
+            throw MalformedRequest.rejecting(
+                    "drafts exceed the " + PipelinePreviewService.MAX_DRAFTS + " resource limit", null);
         }
         ArrayList<ArtifactDraft> drafts = new ArrayList<>(list.size());
         for (Object raw : list) {

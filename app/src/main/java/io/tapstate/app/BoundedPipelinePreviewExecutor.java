@@ -8,12 +8,15 @@ import com.hazelcast.jet.core.DAG;
 import com.hazelcast.map.IMap;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.adapters.pdk.PdkBoundedSnapshotQueryPort;
+import io.tapstate.adapters.pdk.PdkTargetPreviewRenderer;
 import io.tapstate.adapters.transform.StatelessTransforms;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.EventJsonValues;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.ViewBlock;
@@ -64,6 +67,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
     private static final int MAX_EVENTS = 32;
     private static final Duration LEASE_TTL = Duration.ofMinutes(5);
     private static final Duration CANCEL_JOIN = Duration.ofSeconds(2);
+    private static final long MAX_RESULT_BYTES = 8L * 1024L * 1024L;
 
     private final StorePort storePort;
     private final ConnectorProvisioner connectors;
@@ -71,6 +75,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
     private final NestSettings nestSettings;
     private final Clock clock;
     private final PreviewSelectionPlanner planner;
+    private final PdkTargetPreviewRenderer targetPreviewRenderer;
     private final ThreadPoolExecutor workers;
 
     BoundedPipelinePreviewExecutor(StorePort storePort, ConnectorProvisioner connectors,
@@ -82,6 +87,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
         this.clock = Objects.requireNonNull(clock, "clock");
         this.planner = new PreviewSelectionPlanner(new PdkBoundedSnapshotQueryPort(connectors),
                 new PreviewSampleCache(member), clock);
+        this.targetPreviewRenderer = new PdkTargetPreviewRenderer(connectors);
         ThreadFactory threads = task -> {
             Thread thread = new Thread(task, "tapstate-preview-" + UUID.randomUUID());
             thread.setDaemon(true);
@@ -209,6 +215,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
             Throwable failure = null;
             List<Map<String, Object>> documents = List.of();
             List<Map<String, Object>> trace = List.of();
+            String resultFormat = PdkTargetPreviewRenderer.LOGICAL_JSON;
             PreviewSelectionPlanner.Sample sample = null;
             Set<String> stateMaps = Set.of();
             boolean jobJoined = true;
@@ -262,6 +269,13 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                 job.set(submitted);
                 waitForJob(submitted);
                 documents = readDocuments();
+                PdkTargetPreviewRenderer.Result rendered = targetPreviewRenderer.render(
+                        selectedTarget(executionPipeline, snapshot), documents, this::checkActive);
+                documents = rendered.documents();
+                resultFormat = rendered.format();
+                if (EventJsonValues.encodedSize(documents, MAX_RESULT_BYTES) > MAX_RESULT_BYTES) {
+                    throw refused("the final preview result exceeds the 8 MiB response limit");
+                }
                 trace = readTrace(executionPipeline);
             } catch (Exception problem) {
                 if (!(problem instanceof InterruptedException) || !cancelled.get()) {
@@ -314,7 +328,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                     emit("step.completed", node);
                 }
                 emit("result.completed", Map.of(
-                        "format", "logical-json",
+                        "format", resultFormat,
                         "documents", documents,
                         "complete", true,
                         "rowCount", documents.size(),
@@ -450,15 +464,19 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                 if (json == null) {
                     continue;
                 }
-                Object parsed = JsonReader.parse(json);
-                if (!(parsed instanceof Map<?, ?> map)) {
-                    throw refused("the preview sink produced a non-document result");
-                }
-                Map<String, Object> doc = new LinkedHashMap<>();
-                map.forEach((key, value) -> doc.put((String) key, value));
-                docs.add(Collections.unmodifiableMap(doc));
+                docs.add(Collections.unmodifiableMap(PreviewDocumentStorage.decode(json)));
             }
             return List.copyOf(docs);
+        }
+
+        private SourceResource selectedTarget(
+                PipelineResource pipeline, ReadOnlyArtifactSnapshot snapshot) {
+            if (!(pipeline.serve() instanceof ServeBlock.Inline serve)
+                    || serve.sync() == null || serve.sync().isEmpty()) {
+                return null;
+            }
+            Resource target = snapshot.get(serve.sync().getFirst().source()).orElse(null);
+            return target instanceof SourceResource source ? source : null;
         }
 
         private List<Map<String, Object>> readTrace(PipelineResource pipeline) {

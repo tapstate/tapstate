@@ -24,6 +24,9 @@ public enum ControlError implements TapstateErrorCode {
      */
     MALFORMED_REQUEST("control.malformed-request", Set.of("reason")),
 
+    /** A valid preview request could not enter the bounded candidate-compilation pool. */
+    PREVIEW_OVERLOADED("control.preview-overloaded", Set.of()),
+
     /**
      * An audited operation was refused because its mandatory audit record could not be written first;
      * {@code op} is the operation id. No audit, no execute — the operation never ran.

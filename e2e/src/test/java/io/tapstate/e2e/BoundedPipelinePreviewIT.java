@@ -14,7 +14,7 @@ import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** The bounded preview reads a candidate, executes its Map step, and leaves the workspace untouched. */
+/** Bounded previews execute candidate transforms on both server tiers without changing the workspace. */
 class BoundedPipelinePreviewIT {
 
     private static final String SOURCE_ID = "preview_source";
@@ -38,10 +38,24 @@ class BoundedPipelinePreviewIT {
                     Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
 
             Path source = Files.createDirectories(directory.resolve("source"));
-            Files.writeString(source.resolve("orders.csv"), "id,company_name,amount\n"
-                    + "order-1,Northwind,12\n"
-                    + "order-2,Contoso,7\n"
-                    + "order-3,Fabrikam,9\n");
+            Files.writeString(source.resolve("orders.csv"), "id,customer_id,company_name,amount\n"
+                    + "order-1,customer-1,Northwind,12\n"
+                    + "order-2,customer-2,Contoso,7\n"
+                    + "order-3,customer-3,Fabrikam,9\n");
+            Files.writeString(source.resolve("customers.csv"), "id,name\n"
+                    + "customer-1,Northwind Ltd\n"
+                    + "customer-2,Contoso Ltd\n"
+                    + "customer-3,Fabrikam Ltd\n");
+            Files.writeString(source.resolve("orders_archive.csv"), "id,customer_id,company_name,amount\n"
+                    + "order-4,customer-3,Fabrikam,5\n");
+            Files.writeString(source.resolve("order_items.csv"), "id,order_id,sku\n"
+                    + "item-1,order-1,sku-a\n"
+                    + "item-2,order-1,sku-b\n"
+                    + "item-3,order-2,sku-c\n");
+            Files.writeString(source.resolve("item_labels.csv"), "id,item_id,label\n"
+                    + "label-1,item-1,fragile\n"
+                    + "label-2,item-1,gift\n"
+                    + "label-3,item-3,priority\n");
             Map<String, Object> settings = Map.of("uri", source.toString());
             control.discoverSchema(SOURCE_ID, E2eConnectorJar.CONNECTOR_ID, settings);
 
@@ -95,9 +109,57 @@ class BoundedPipelinePreviewIT {
             assertDocument(javascriptDocuments.get(0), "order-1", "Northwind", 24);
             assertDocument(javascriptDocuments.get(1), "order-2", "Contoso", 14);
 
+            Map<String, Object> filtered = result(control, source, "filterPipelineYaml()", OUTPUT_ID,
+                    SAMPLE_ID + "-filter", false);
+            assertThat(filtered).containsEntry("complete", true).containsEntry("rowCount", 1);
+            assertThat(values(documents(filtered), "id"))
+                    .containsExactly("order-1");
+
+            Map<String, Object> allFiltered = result(control, source, "emptyFilterPipelineYaml()", OUTPUT_ID,
+                    SAMPLE_ID + "-filter-empty", false);
+            assertThat(allFiltered).containsEntry("complete", true).containsEntry("rowCount", 0);
+            assertThat(documents(allFiltered)).isEmpty();
+
+            Map<String, Object> union = result(control, source, "unionPipelineYaml()", OUTPUT_ID,
+                    SAMPLE_ID + "-union", false);
+            assertThat(union).containsEntry("complete", true).containsEntry("rowCount", 4);
+            assertThat(values(documents(union), "id"))
+                    .containsExactlyInAnyOrder("order-1", "order-2", "order-3", "order-4");
+
+            Map<String, Object> joined = result(control, source, "joinPipelineYaml()", OUTPUT_ID,
+                    SAMPLE_ID + "-join", false);
+            assertThat(joined).containsEntry("complete", true).containsEntry("rowCount", 3);
+            Map<?, ?> joinedOrder = documentBy(documents(joined), "order_id", "order-1");
+            assertThat(joinedOrder.get("customer_name")).isEqualTo("Northwind Ltd");
+
+            Map<String, Object> nested = result(control, source, "nestedPipelineYaml()", OUTPUT_ID,
+                    SAMPLE_ID + "-nest", false);
+            assertThat(nested).containsEntry("complete", true).containsEntry("rowCount", 3);
+            Map<?, ?> firstOrder = documentBy(documents(nested), "id", "order-1");
+            List<?> items = (List<?>) firstOrder.get("items");
+            assertThat(items).hasSize(2);
+            Map<?, ?> firstItem = documentBy(items, "id", "item-1");
+            assertThat(values((List<?>) firstItem.get("labels"), "label"))
+                    .containsExactlyInAnyOrder("fragile", "gift");
+            Map<?, ?> secondItem = documentBy(items, "id", "item-2");
+            assertThat((List<?>) secondItem.get("labels")).isEmpty();
+            assertThat((List<?>) documentBy(documents(nested), "id", "order-3").get("items")).isEmpty();
+
+            Map<String, Object> unwound = result(control, source, "unwindPipelineYaml()", "preview_sync",
+                    SAMPLE_ID + "-unwind", true);
+            assertThat(unwound).containsEntry("format", "logical-json").containsEntry("complete", true)
+                    .containsEntry("rowCount", 6);
+            assertThat(values(documents(unwound), "item_index"))
+                    .contains(0, 1);
+            assertThat(values(documents(unwound), "items"))
+                    .contains("northwind-a", "northwind-b", "contoso-a", "contoso-b", "fabrikam-a", "fabrikam-b");
+
             assertThat(control.artifactIds())
                     .as("preview compiles drafts without applying them to the artifact store")
                     .doesNotContain(SOURCE_ID, PIPELINE_ID);
+            assertThat(Files.exists(source.resolve("preview-target")))
+                    .as("preview replaces the target sink and never creates a target directory")
+                    .isFalse();
         }
     }
 
@@ -123,6 +185,43 @@ class BoundedPipelinePreviewIT {
                 entry -> String.valueOf(entry.getKey()), Map.Entry::getValue));
     }
 
+    private static Map<String, Object> result(
+            ControlPlane control, Path directory, String pipelineYaml, String outputId, String sampleId,
+            boolean includeTarget) {
+        List<ControlPlane.PreviewDraft> drafts = new java.util.ArrayList<>();
+        drafts.add(new ControlPlane.PreviewDraft("preview_source.tap.yml", sourceYaml(directory)));
+        drafts.add(new ControlPlane.PreviewDraft("preview_pipeline.tap.yml", pipelineYaml));
+        if (includeTarget) {
+            drafts.add(new ControlPlane.PreviewDraft(
+                    "preview_target.tap.yml", targetYaml(directory.resolve("preview-target"))));
+        }
+        List<Map<String, Object>> events = control.preview(PIPELINE_ID, outputId, 100, sampleId, drafts);
+        assertThat(events).extracting(event -> event.get("kind"))
+                .startsWith("run.accepted", "compile.completed", "sample.completed")
+                .endsWith("result.completed", "run.completed");
+        return payload(events, "result.completed");
+    }
+
+    private static List<?> documents(Map<String, Object> result) {
+        assertThat(result.get("documents")).isInstanceOf(List.class);
+        return (List<?>) result.get("documents");
+    }
+
+    private static Map<?, ?> documentBy(List<?> documents, String key, Object value) {
+        return documents.stream()
+                .map(Map.class::cast)
+                .filter(document -> value.equals(document.get(key)))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("no preview document matched " + key + "=" + value));
+    }
+
+    private static List<Object> values(List<?> documents, String key) {
+        return documents.stream()
+                .map(Map.class::cast)
+                .map(document -> document.get(key))
+                .toList();
+    }
+
     private static String sourceYaml(Path directory) {
         return """
                 version: tapstate/v1
@@ -131,7 +230,17 @@ class BoundedPipelinePreviewIT {
                 connector: e2e_file
                 config: { uri: "%s" }
                 mode: cdc
-                tables: [ orders ]
+                tables: [ orders, customers, orders_archive, order_items, item_labels ]
+                """.formatted(directory);
+    }
+
+    private static String targetYaml(Path directory) {
+        return """
+                version: tapstate/v1
+                kind: source
+                id: preview_target
+                connector: e2e_file
+                config: { uri: "%s" }
                 """.formatted(directory);
     }
 
@@ -181,6 +290,133 @@ class BoundedPipelinePreviewIT {
                   id: preview_view
                   from: scripted_orders
                   primary_key: id
+                """;
+    }
+
+    private static String filterPipelineYaml() {
+        return """
+                version: tapstate/v1
+                kind: pipeline
+                id: preview_pipeline
+                source: preview_source
+                settings: { read_mode: snapshot_and_cdc }
+                transforms:
+                  - { id: large_orders, from: [orders], type: filter, expr: "int(after.amount) >= 10" }
+                view:
+                  id: preview_view
+                  from: large_orders
+                  primary_key: id
+                """;
+    }
+
+    private static String emptyFilterPipelineYaml() {
+        return """
+                version: tapstate/v1
+                kind: pipeline
+                id: preview_pipeline
+                source: preview_source
+                settings: { read_mode: snapshot_and_cdc }
+                transforms:
+                  - { id: no_orders, from: [orders], type: filter, expr: "false" }
+                view:
+                  id: preview_view
+                  from: no_orders
+                  primary_key: id
+                """;
+    }
+
+    private static String unionPipelineYaml() {
+        return """
+                version: tapstate/v1
+                kind: pipeline
+                id: preview_pipeline
+                source: preview_source
+                settings: { read_mode: snapshot_and_cdc }
+                transforms:
+                  - { id: all_orders, from: [orders, orders_archive], type: union }
+                view:
+                  id: preview_view
+                  from: all_orders
+                  primary_key: id
+                """;
+    }
+
+    private static String joinPipelineYaml() {
+        return """
+                version: tapstate/v1
+                kind: pipeline
+                id: preview_pipeline
+                source: preview_source
+                settings: { read_mode: snapshot_and_cdc }
+                transforms:
+                  - id: joined_orders
+                    type: join
+                    from: { o: orders, c: customers }
+                    engine: builtin
+                    sql: |
+                      SELECT o.id AS order_id, o.amount AS amount, c.name AS customer_name
+                      FROM o JOIN c ON o.customer_id = c.id
+                view:
+                  id: preview_view
+                  from: joined_orders
+                  primary_key: order_id
+                """;
+    }
+
+    private static String nestedPipelineYaml() {
+        return """
+                version: tapstate/v1
+                kind: pipeline
+                id: preview_pipeline
+                source: preview_source
+                settings: { read_mode: snapshot_and_cdc }
+                transforms:
+                  - id: order_tree
+                    type: nest
+                    from: { o: orders, i: order_items, l: item_labels }
+                    root:
+                      from: o
+                      key: [ id ]
+                      embed:
+                        - from: i
+                          on: { order_id: id }
+                          as: array
+                          path: items
+                          arrayKey: [ id ]
+                          embed:
+                            - { from: l, on: { item_id: id }, as: array, path: labels, arrayKey: [ id ] }
+                view:
+                  id: preview_view
+                  from: order_tree
+                  primary_key: id
+                """;
+    }
+
+    private static String unwindPipelineYaml() {
+        return """
+                version: tapstate/v1
+                kind: pipeline
+                id: preview_pipeline
+                source: preview_source
+                settings: { read_mode: snapshot_and_cdc }
+                transforms:
+                  - id: decorated_orders
+                    from: [orders]
+                    type: js
+                    script: |
+                      function process(record, ctx) {
+                        const label = record.after.company_name.toLowerCase();
+                        record.after.items = [label + "-a", label + "-b"];
+                        return record;
+                      }
+                  - { id: expanded_orders, from: [decorated_orders], type: unwind, path: items,
+                      include_array_index: item_index }
+                serve:
+                  from: expanded_orders
+                  sync:
+                    - id: preview_sync
+                      source: preview_target
+                      write_mode: append
                 """;
     }
 

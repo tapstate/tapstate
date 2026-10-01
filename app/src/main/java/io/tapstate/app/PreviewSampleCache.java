@@ -67,7 +67,7 @@ final class PreviewSampleCache {
                 return;
             }
             long remaining = MAX_ENTRY_BYTES - encodedBytes;
-            long rowBytes = EventJsonValues.encodedSize(row.after(), remaining);
+            long rowBytes = EventJsonValues.encodedSize(PreviewJsonValues.normalize(row.after()), remaining);
             if (rowBytes > remaining) {
                 return;
             }

@@ -6,7 +6,6 @@ import com.hazelcast.core.HazelcastInstanceNotActiveException;
 import com.hazelcast.map.IMap;
 import com.hazelcast.function.SupplierEx;
 import io.tapstate.core.event.Envelope;
-import io.tapstate.core.event.EventJsonValues;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.common.TapstateException;
@@ -94,12 +93,12 @@ final class PreviewMaterializerSinkWriterFactory implements SupplierEx<SinkWrite
                             continue;
                         }
                         String key = String.format("append:%020d", appendSequence++);
+                        String document = PreviewDocumentStorage.encode(payload);
+                        long newBytes = PreviewDocumentStorage.encodedSize(document);
                         long remaining = MAX_BYTES - encodedBytes;
-                        long newBytes = EventJsonValues.encodedSize(payload, remaining);
                         if (newBytes > remaining) {
                             throw refused("the final preview result exceeds the 8 MiB response limit");
                         }
-                        String document = JsonWriter.write(PreviewJsonValues.normalize(payload));
                         putBounded(key, document, 0L, newBytes);
                         written++;
                         continue;
@@ -133,21 +132,18 @@ final class PreviewMaterializerSinkWriterFactory implements SupplierEx<SinkWrite
                     String prior = rows.get(nextKey);
                     Map<String, Object> merged = new LinkedHashMap<>();
                     if (prior != null) {
-                        Object decoded = io.tapstate.core.common.JsonReader.parse(prior);
-                        if (!(decoded instanceof Map<?, ?> existing)) {
-                            throw new IllegalStateException("preview materializer stored a non-document value");
-                        }
+                        Map<String, Object> existing = PreviewDocumentStorage.decode(prior);
                         existing.forEach((key, value) -> merged.put((String) key, value));
                     }
                     merged.putAll(after);
                     event.removed().forEach(merged::remove);
                     long oldBytes = jsonBytes(prior);
+                    String document = PreviewDocumentStorage.encode(merged);
+                    long newBytes = PreviewDocumentStorage.encodedSize(document);
                     long remaining = MAX_BYTES - (encodedBytes - oldBytes);
-                    long newBytes = EventJsonValues.encodedSize(merged, remaining);
                     if (newBytes > remaining) {
                         throw refused("the final preview result exceeds the 8 MiB response limit");
                     }
-                    String document = JsonWriter.write(PreviewJsonValues.normalize(merged));
                     putBounded(nextKey, document, oldBytes, newBytes);
                     written++;
                 }

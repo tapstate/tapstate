@@ -34,17 +34,22 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.Semaphore;
 
 /** Compiles unsaved candidates before opening a bounded, read-only Pipeline preview session. */
 public final class PipelinePreviewService {
 
     public static final int DEFAULT_ROOT_LIMIT = 100;
     public static final Duration DEADLINE = Duration.ofSeconds(15);
+    public static final int MAX_DRAFTS = 256;
+    public static final long MAX_DRAFT_BYTES = 4L * 1024L * 1024L;
+    private static final int MAX_CONCURRENT_COMPILATIONS = 8;
 
     private final ApplyService compiler;
     private final PipelinePreviewProbe probe;
     private final CanonicalWriter writer = new CanonicalWriter();
     private final Clock clock;
+    private final Semaphore compileSlots = new Semaphore(MAX_CONCURRENT_COMPILATIONS);
 
     public PipelinePreviewService(ApplyService compiler, PipelinePreviewProbe probe, Clock clock) {
         this.compiler = Objects.requireNonNull(compiler, "compiler");
@@ -69,40 +74,59 @@ public final class PipelinePreviewService {
             throw malformed("sampleId exceeds the 128 character limit");
         }
 
-        CandidateWorkspacePlan candidate = compiler.planCandidateWorkspace(drafts);
-        Map<String, Resource> resources = new LinkedHashMap<>();
-        candidate.resources().forEach(resource -> resources.put(resource.id(), resource));
-        Resource requested = resources.get(pipelineId);
-        if (!(requested instanceof PipelineResource pipeline)) {
-            throw malformed("pipelineId must identify a Pipeline in the candidate workspace");
-        }
-
-        Output output = selectOutput(pipeline, resources, command.outputId());
-        List<Resource> closure = executionClosure(pipeline, output, resources);
-        String candidateHash = candidateHash(closure);
         Instant deadline = clock.instant().plus(DEADLINE);
-        String runId = UUID.randomUUID().toString();
-        List<String> canonical = closure.stream()
-                .sorted(Comparator.comparing(Resource::id))
-                .map(writer::write)
-                .toList();
-        PipelinePreviewRequest request = new PipelinePreviewRequest(
-                runId, principal, pipelineId, output.id(), rootLimit, sampleId, candidateHash,
-                canonical, deadline);
-        PipelinePreviewExecutionSpec spec = new PipelinePreviewExecutionSpec(
-                pipelineId, candidateHash, publicPipeline(pipeline, output), output.id(), output.kind(),
-                rootLimit, "best-effort", contexts(pipeline, resources));
+        if (!compileSlots.tryAcquire()) {
+            throw new TapstateException(ControlError.PREVIEW_OVERLOADED, Map.of(), null);
+        }
+        PipelinePreviewRequest request;
+        PipelinePreviewExecutionSpec spec;
+        String candidateHash;
+        String runId;
+        try {
+            CandidateWorkspacePlan candidate = compiler.planCandidateWorkspace(drafts);
+            Map<String, Resource> resources = new LinkedHashMap<>();
+            candidate.resources().forEach(resource -> resources.put(resource.id(), resource));
+            Resource requested = resources.get(pipelineId);
+            if (!(requested instanceof PipelineResource pipeline)) {
+                throw malformed("pipelineId must identify a Pipeline in the candidate workspace");
+            }
+
+            Output output = selectOutput(pipeline, resources, command.outputId());
+            List<Resource> closure = executionClosure(pipeline, output, resources);
+            candidateHash = candidateHash(closure);
+            runId = UUID.randomUUID().toString();
+            List<String> canonical = closure.stream()
+                    .sorted(Comparator.comparing(Resource::id))
+                    .map(writer::write)
+                    .toList();
+            request = new PipelinePreviewRequest(
+                    runId, principal, pipelineId, output.id(), rootLimit, sampleId, candidateHash,
+                    canonical, deadline);
+            spec = new PipelinePreviewExecutionSpec(
+                    pipelineId, candidateHash, publicPipeline(pipeline, output), output.id(), output.kind(),
+                    rootLimit, "best-effort", contexts(pipeline, resources));
+        } finally {
+            compileSlots.release();
+        }
         PipelinePreviewStream execution = probe.preview(request);
         return new SequencedStream(runId, candidateHash, spec, pipelineId, rootLimit, execution, clock);
     }
 
-    private static List<ArtifactDraft> requireDrafts(List<ArtifactDraft> drafts) {
+    static List<ArtifactDraft> requireDrafts(List<ArtifactDraft> drafts) {
         if (drafts == null || drafts.isEmpty()) {
             throw malformed("drafts must contain the candidate workspace resources");
         }
+        if (drafts.size() > MAX_DRAFTS) {
+            throw malformed("drafts exceed the " + MAX_DRAFTS + " resource limit");
+        }
+        long contentBytes = 0;
         for (ArtifactDraft draft : drafts) {
             if (draft == null || draft.content() == null || draft.content().isBlank()) {
                 throw malformed("each draft must carry non-blank content");
+            }
+            contentBytes += draft.content().getBytes(StandardCharsets.UTF_8).length;
+            if (contentBytes > MAX_DRAFT_BYTES) {
+                throw malformed("draft content exceeds the 4 MiB limit");
             }
         }
         return List.copyOf(drafts);

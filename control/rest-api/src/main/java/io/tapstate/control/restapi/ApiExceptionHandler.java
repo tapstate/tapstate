@@ -118,6 +118,7 @@ class ApiExceptionHandler {
             case "pipeline-draft.invalid" -> HttpStatus.BAD_REQUEST;
             // A request refused at the HTTP boundary as structurally malformed is a client input error, like dsl.*.
             case "control.malformed-request" -> HttpStatus.BAD_REQUEST;
+            case "control.preview-overloaded" -> HttpStatus.SERVICE_UNAVAILABLE;
             // A lifecycle verb on a pipeline that was never applied is a 404; a verb the state machine forbids
             // from the current state, or a start/resume at a stale revision, is a 409 state conflict.
             case "lifecycle.unknown-pipeline" -> HttpStatus.NOT_FOUND;

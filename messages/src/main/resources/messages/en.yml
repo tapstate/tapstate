@@ -576,6 +576,9 @@ control.forbidden:
 control.malformed-request:
   message: "The request is malformed: {reason}."
   solution: "Correct the request body, then send it again."
+control.preview-overloaded:
+  message: "Pipeline preview is at capacity."
+  solution: "Wait for an active preview to finish, then retry."
 control.unauthenticated:
   message: "This operation requires authentication."
   solution: "Sign in with `login` to obtain a session token, or present a machine token with `--token`."
