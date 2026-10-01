@@ -371,7 +371,7 @@ public final class Engine {
      * frontier-lag alarm's blind spot rather than its quiet state.
      */
     public Map<String, Long> frontierGaps(String pipelineId) {
-        return byChain(pipelineId, JetFrontierGauge::chainOf);
+        return byChain(pipelineId, FrontierMetricNames::chainOf);
     }
 
     /**
@@ -389,7 +389,7 @@ public final class Engine {
      * distance is kept at its widest: the pipeline is only as unpinned as its most stuck sink.
      */
     public Map<String, Long> frontierStalls(String pipelineId) {
-        return byChain(pipelineId, JetFrontierGauge::stalledChainOf);
+        return byChain(pipelineId, FrontierMetricNames::stalledChainOf);
     }
 
     /**

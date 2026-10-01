@@ -381,9 +381,81 @@ public final class ControlApiSchema {
         properties.put("cannotSay", array(string("A fact this observation cannot establish")));
         properties.put("next", nullable(next));
         properties.put("pending", pending);
+        properties.put("plan", executionPlan());
+        properties.put("awaitingRebalance", array(string(
+                "Stable id of a member that joined after the run was planned and is given no part of it until a "
+                        + "rebalance")));
         return object(List.of(
                 "pipelineId", "state", "kind", "message", "freshness", "evidence", "cannotSay", "next"),
                 properties, false);
+    }
+
+    /**
+     * The plan a pipeline's current run was submitted on: why each node runs as wide as it does. Absent when no
+     * run has one recorded, and so are the values a run does not have - a run on a single member is fenced by
+     * nothing and names no generations, and a node run as one processor for the cluster has no per-member count.
+     */
+    private static Map<String, Object> executionPlan() {
+        Map<String, Object> batch = new LinkedHashMap<>();
+        batch.put("maxRecords", positiveInteger("The most records the node takes its input in at once"));
+        batch.put("maxWaitMillis", withDescription(nonNegativeInteger(),
+                "The longest the node waits for a batch to fill, in milliseconds"));
+        Map<String, Object> node = new LinkedHashMap<>();
+        node.put("node", string("Pipeline node id"));
+        node.put("requested", positiveInteger("Target total number of processors the node was given"));
+        node.put("requestedOrigin", withDescription(enumString("explicit", "node-default"),
+                "Whether the pipeline's author wrote the target, or it is the default for the node's kind"));
+        node.put("scope", withDescription(enumString("total-one", "native"),
+                "One processor for the whole cluster, or the same number of processors on every member"));
+        node.put("memberCount", positiveInteger("Members the width was worked out for"));
+        node.put("computedLocal", positiveInteger(
+                "Processors per member; absent for a node run as one processor for the cluster"));
+        node.put("effective", positiveInteger("Processors the node runs in total"));
+        node.put("reasons", array(string("Why the width is what it is: requested-one, source-reads-not-split, "
+                + "single-target-keyless, key-not-derivable, rounded-up, rounded-down, or budget:<name>")));
+        node.put("batch", object(List.of("maxRecords", "maxWaitMillis"), batch, false));
+        Map<String, Object> resources = new LinkedHashMap<>();
+        resources.put("writers", positiveInteger("Processors writing the sink's rows, across the run"));
+        resources.put("connectorMode", withDescription(enumString("isolated", "shared"),
+                "Whether each writer opens a connector of its own, or the writers on one member share one"));
+        resources.put("connectorInstances", positiveInteger("Connectors the writers open, across the run"));
+        resources.put("bufferedRecords", withDescription(nonNegativeInteger(),
+                "Most records the writers hold between them: two batches each, one forming and one being written"));
+        resources.put("edgeQueueRecords", withDescription(nonNegativeInteger(),
+                "Most records the queues of the edges into the sink hold: one full queue from every processor "
+                        + "sending into it to every processor it takes its input on"));
+        Map<String, Object> change = new LinkedHashMap<>();
+        change.put("previousEffective", positiveInteger("Processors the node ran in total in the run before"));
+        change.put("causes", array(withDescription(enumString(
+                "members-changed", "target-changed", "capability-changed"),
+                "An input of the working-out that moved: the member count, the node's target, or what bounds it")));
+        node.put("change", withDescription(object(List.of("previousEffective", "causes"), change, false),
+                "How the node's width moved from the run before; absent where it did not move or there was none"));
+        node.put("resources", withDescription(object(List.of(
+                "writers", "connectorMode", "connectorInstances", "bufferedRecords", "edgeQueueRecords"),
+                resources, false), "What a sink holds open and buffers at its width, as upper bounds; absent for "
+                + "any node but a sink. A connector's own connection pool is sized inside the connector and is "
+                + "not counted"));
+        Map<String, Object> properties = new LinkedHashMap<>();
+        properties.put("claimGeneration", withDescription(nonNegativeInteger(),
+                "Generation of the claim the run was submitted under; absent where nothing fences the run"));
+        properties.put("executionGeneration", withDescription(nonNegativeInteger(),
+                "The run's own generation, moved by every submission; absent where nothing fences the run"));
+        properties.put("topologyRevision", withDescription(nonNegativeInteger(),
+                "Committed topology the claim was held under; absent where nothing fences the run"));
+        properties.put("members", array(string("Stable id of a member the widths were worked out for")));
+        properties.put("nodes", array(object(List.of(
+                "node", "requested", "requestedOrigin", "scope", "memberCount", "effective", "reasons", "batch"),
+                node, false)));
+        properties.put("plannedAt", instant("When the run was planned"));
+        Map<String, Object> replaced = new LinkedHashMap<>();
+        replaced.put("executionGeneration", withDescription(nonNegativeInteger(),
+                "The replaced run's generation; absent where nothing fenced it"));
+        replaced.put("members", array(string("Stable id of a member its widths were worked out for")));
+        replaced.put("plannedAt", instant("When the replaced run was planned"));
+        properties.put("replaces", withDescription(object(List.of("members", "plannedAt"), replaced, false),
+                "The run this plan replaced, after a lost member, a stop or a restart; absent where there was none"));
+        return object(List.of("members", "nodes", "plannedAt"), properties, false);
     }
 
     /**
@@ -498,6 +570,16 @@ public final class ControlApiSchema {
 
     private static Map<String, Object> nonNegativeInteger() {
         return Map.of("type", "integer", "minimum", 0);
+    }
+
+    private static Map<String, Object> positiveInteger(String description) {
+        return Map.of("type", "integer", "minimum", 1, "description", description);
+    }
+
+    private static Map<String, Object> withDescription(Map<String, Object> schema, String description) {
+        Map<String, Object> described = new LinkedHashMap<>(schema);
+        described.put("description", description);
+        return immutableMap(described);
     }
 
     private static Map<String, Object> nullable(Map<String, Object> value) {

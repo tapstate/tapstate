@@ -172,13 +172,13 @@ class PipelineActuationOwnershipTest {
     void theRunAKilledMemberLeftBehindIsAdmittedForRebuildingByTheOneThatInheritsIt() {
         PipelineActuationOwnership nodeA = ownership(NODE_A);
         assertThat(nodeA.permit("orders").granted()).isTrue();
-        assertThat(nodeA.aMemberLeftUnderTheRun("orders", SETTLING))
+        assertThat(nodeA.departure("orders", SETTLING))
                 .as("a pipeline nobody has run yet is not a run anybody left behind")
-                .isFalse();
+                .isEqualTo(PipelineActuationOwnership.Departure.NO_RUN);
         assertThat(nodeA.beginExecution("orders").allowed()).isTrue();
-        assertThat(nodeA.aMemberLeftUnderTheRun("orders", SETTLING))
+        assertThat(nodeA.departure("orders", SETTLING))
                 .as("and nothing has moved under the member that submitted it")
-                .isFalse();
+                .isEqualTo(PipelineActuationOwnership.Departure.NOBODY_LEFT);
 
         // That member is killed: it stops renewing, and the lease it never released runs out.
         claims.elapse(TTL.plusSeconds(1));
@@ -188,10 +188,10 @@ class PipelineActuationOwnershipTest {
         assertThat(nodeB.permit("orders").granted())
                 .as("the pipeline changes hands once the dead holder's lease expires")
                 .isTrue();
-        assertThat(nodeB.aMemberLeftUnderTheRun("orders", SETTLING))
+        assertThat(nodeB.departure("orders", SETTLING))
                 .as("the member that inherits a claim already carrying an execution is holding a run "
                         + "nobody is driving, and that is the whole of what it needs to know to replace it")
-                .isTrue();
+                .isEqualTo(PipelineActuationOwnership.Departure.INHERITED);
     }
 
     private PipelineActuationOwnership ownership(WorkloadOwner owner) {

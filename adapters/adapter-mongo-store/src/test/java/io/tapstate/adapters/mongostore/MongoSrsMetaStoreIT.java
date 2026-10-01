@@ -15,6 +15,8 @@ import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
+import io.tapstate.spi.store.WriterProgress;
+import io.tapstate.spi.store.WriterRun;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -29,12 +31,14 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static io.tapstate.adapters.mongostore.StoredBytes.DOCUMENT_CEILING;
@@ -86,6 +90,9 @@ class MongoSrsMetaStoreIT {
 
     /** What the size case leaves between the record it seeds and the ceiling. */
     private static final int UNDER_THE_CEILING = 4_096;
+
+    /** The commands that change something at the endpoint, as a command listener names them. */
+    private static final Set<String> WRITE_COMMANDS = Set.of("insert", "update", "delete", "findAndModify");
 
     @Container
     private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
@@ -342,103 +349,58 @@ class MongoSrsMetaStoreIT {
             assertThat(store.ringDoneThrough(CHAIN, "p1"))
                     .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 9L, "items", 4L));
             assertThat(onlyConsumer(store).sinkAckedSrcpos())
-                    .as("the chain's acked position is written in the same update, as it always was")
-                    .isEqualTo("s");
+                    .as("and the chain's acked position is the last one written that moved its own table on: "
+                            + "the older reports of orders moved nothing, and the tables' sequences are not ranked "
+                            + "against one another")
+                    .isEqualTo("t4");
         });
     }
 
     @Test
-    void writerAwareProgressExposesOnlyTheSlowestSinkAgainstTheRealStore() {
+    void aTablesReportThatLandsAfterALaterOneLeavesTheAckedPositionWhereItIs() {
         withStore(store -> {
             store.create(CHAIN, null);
-            store.configureSinkWriters(CHAIN, "p1", Map.of("orders", List.of("sink-0", "sink-1")));
 
-            store.advanceSinkWriterAcked(
-                    CHAIN, "p1", "sink-0", "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
+            store.advanceSinkAcked(CHAIN, "p1", "orders", new ChainPosition(new SourceOrder(1, 5), "t5"));
+            // Each writer of a sink works the acked position out from what it read back and reports on its own,
+            // so a report worked out before a later one can land after it, carrying the older answer.
+            store.advanceSinkAcked(CHAIN, "p1", "orders", new ChainPosition(new SourceOrder(1, 3), "t3"));
+            store.advanceSinkAcked(CHAIN, "p1", "orders", new ChainPosition(SourceOrder.snapshotRow(1), "s"));
+            assertThat(onlyConsumer(store).sinkAcked())
+                    .as("never moved back by a report of what the table had already passed")
+                    .isEqualTo(new ChainPosition(new SourceOrder(1, 5), "t5"));
 
-            assertThat(store.ringDoneThrough(CHAIN, "p1")).isEmpty();
-            assertThat(onlyConsumer(store).sinkAcked()).isNull();
+            store.advanceSinkAcked(CHAIN, "p1", "orders", new ChainPosition(new SourceOrder(2, 0), "n0"));
+            assertThat(onlyConsumer(store).sinkAcked())
+                    .as("and moved on by the first one past it, a new generation of the ring included")
+                    .isEqualTo(new ChainPosition(new SourceOrder(2, 0), "n0"));
 
-            store.advanceSinkWriterAcked(
-                    CHAIN, "p1", "sink-1", "orders", new ChainPosition(new SourceOrder(1, 50), "t50"));
+            store.advanceSinkAcked(CHAIN, "p1", "items", new ChainPosition(new SourceOrder(1, 2), "i2"));
+            assertThat(onlyConsumer(store).sinkAcked())
+                    .as("another table's report is not ranked against it: each table's ring numbers its changes "
+                            + "on its own")
+                    .isEqualTo(new ChainPosition(new SourceOrder(1, 2), "i2"));
 
-            assertThat(store.ringDoneThrough(CHAIN, "p1")).containsEntry("orders", 50L);
-            assertThat(onlyConsumer(store).sinkAckedSrcpos()).isEqualTo("t50");
-
-            store.markSinkWriterSnapshotComplete(CHAIN, "p1", "sink-0", "orders");
-            assertThat(store.read(CHAIN).orElseThrow().snapshotCompletedTables("p1")).isEmpty();
-
-            store.markSinkWriterSnapshotComplete(CHAIN, "p1", "sink-1", "orders");
-            assertThat(store.read(CHAIN).orElseThrow().snapshotCompletedTables("p1"))
-                    .containsExactly("orders");
+            store.advanceSinkAcked(CHAIN, "p1", "orders", new ChainPosition(new SourceOrder(1, 7), "t7"));
+            assertThat(onlyConsumer(store).sinkAcked())
+                    .as("while a report of orders is still compared with the last one of orders")
+                    .isEqualTo(new ChainPosition(new SourceOrder(1, 2), "i2"));
         });
     }
 
     @Test
-    void legacyAggregateProgressCannotStandForTwoDivergentSinkWriters() {
+    void aRewrittenConsumerRecordLetsATableMoveOnFromWhereItNowStands() {
         withStore(store -> {
             store.create(CHAIN, null);
-            // This is the complete shape released before writer-aware progress: the fast target reached
-            // 100, the slow target reached 50, and only the aggregate 100 could be recorded.
-            store.advanceSinkAcked(
-                    CHAIN, "p1", "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
+            store.advanceSinkAcked(CHAIN, "p1", "orders", new ChainPosition(new SourceOrder(1, 5), "t5"));
 
-            assertThatThrownBy(() -> store.configureSinkWriters(
-                    CHAIN, "p1", Map.of("orders", List.of("fast", "slow"))))
-                    .isInstanceOf(TapstateException.class)
-                    .satisfies(thrown -> {
-                        TapstateException refusal = (TapstateException) thrown;
-                        assertThat(refusal.code()).isEqualTo(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS);
-                        assertThat(refusal.args()).containsEntry("pipeline", "p1");
-                    });
+            // A write-back moving the pipeline to an earlier position: the run after it confirms from there.
+            store.upsertConsumerOffset(CHAIN, new ConsumerOffset("p1", Map.of(), null));
+            store.advanceSinkAcked(CHAIN, "p1", "orders", new ChainPosition(new SourceOrder(1, 3), "t3"));
 
-            // Refusal is atomic: it leaves the aggregate intact but does not promote it into writer
-            // evidence. Clearing this consumer is the control-store half of the required full resync.
-            assertThat(store.ringDoneThrough(CHAIN, "p1")).containsEntry("orders", 100L);
-            assertThat(onlyConsumer(store).sinkAckedSrcpos()).isEqualTo("t100");
-            store.detachConsumer(CHAIN, "p1");
-
-            store.configureSinkWriters(CHAIN, "p1", Map.of("orders", List.of("fast", "slow")));
-            store.advanceSinkWriterAcked(
-                    CHAIN, "p1", "fast", "orders", new ChainPosition(new SourceOrder(2, 100), "t2-100"));
-            store.advanceSinkWriterAcked(
-                    CHAIN, "p1", "slow", "orders", new ChainPosition(new SourceOrder(2, 50), "t2-50"));
-
-            assertThat(store.ringDoneThrough(CHAIN, "p1")).containsEntry("orders", 50L);
-            assertThat(onlyConsumer(store).sinkAckedSrcpos()).isEqualTo("t2-50");
-        });
-    }
-
-    @Test
-    void initialRingCursorSeedsEveryWriterWithoutClaimingSinkProgress() {
-        withStore(store -> {
-            store.create(CHAIN, null);
-            store.startRingAfter(CHAIN, "p1", "orders", 40);
-
-            store.configureSinkWriters(CHAIN, "p1", Map.of("orders", List.of("fast", "slow")));
-            store.advanceSinkWriterAcked(
-                    CHAIN, "p1", "fast", "orders", new ChainPosition(new SourceOrder(1, 41), "t41"));
-
-            assertThat(store.ringDoneThrough(CHAIN, "p1"))
-                    .as("the initial cursor belongs to both writers until the slower writer advances")
-                    .containsEntry("orders", 40L);
-            assertThat(onlyConsumer(store).sinkAcked()).isNull();
-        });
-    }
-
-    @Test
-    void legacyAggregateProgressCanSeedItsOnlySinkWriter() {
-        withStore(store -> {
-            store.create(CHAIN, null);
-            store.advanceSinkAcked(
-                    CHAIN, "p1", "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
-
-            store.configureSinkWriters(CHAIN, "p1", Map.of("orders", List.of("only")));
-            store.advanceSinkWriterAcked(
-                    CHAIN, "p1", "only", "orders", new ChainPosition(new SourceOrder(1, 101), "t101"));
-
-            assertThat(store.ringDoneThrough(CHAIN, "p1")).containsEntry("orders", 101L);
-            assertThat(onlyConsumer(store).sinkAckedSrcpos()).isEqualTo("t101");
+            assertThat(onlyConsumer(store).sinkAcked())
+                    .as("compared with nothing the rewritten record no longer holds")
+                    .isEqualTo(new ChainPosition(new SourceOrder(1, 3), "t3"));
         });
     }
 
@@ -473,6 +435,93 @@ class MongoSrsMetaStoreIT {
             store.upsertConsumerOffset(CHAIN, new ConsumerOffset("p1", Map.of(), null));
 
             assertThat(store.ringDoneThrough(CHAIN, "p1")).isEmpty();
+        });
+    }
+
+    /**
+     * A run's writers each keep their own progress per table, and the run answers back all of it - every
+     * writer's, under the name it reported with, even a name holding the dot a field path would read as a
+     * step into a nested document - together with the generation the pipeline's load was read under.
+     */
+    @Test
+    void aWriterRunKeepsEachWritersProgressAndAnswersItBack() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.setCdcStart(CHAIN, "p1", "seam-0", 3L);
+            store.beginWriterRun(CHAIN, "p1", "g7", Map.of(
+                    "orders", List.of("serve.a#0", "view.v#0"),
+                    "items", List.of("serve.a#0")));
+
+            store.advanceWriter(CHAIN, "p1", "g7", "serve.a#0", "orders", new WriterProgress(
+                    new SourceOrder(3, 9), new ChainPosition(new SourceOrder(3, 8), "t8")));
+            WriterRun run = store.advanceWriter(CHAIN, "p1", "g7", "view.v#0", "orders",
+                    new WriterProgress(new SourceOrder(3, 5), null)).orElseThrow();
+
+            assertThat(run.runId()).isEqualTo("g7");
+            assertThat(run.expectedFor("orders")).containsExactly("serve.a#0", "view.v#0");
+            assertThat(run.expectedFor("items")).containsExactly("serve.a#0");
+            assertThat(run.progressFor("orders")).containsOnly(
+                    Map.entry("serve.a#0", new WriterProgress(
+                            new SourceOrder(3, 9), new ChainPosition(new SourceOrder(3, 8), "t8"))),
+                    Map.entry("view.v#0", new WriterProgress(new SourceOrder(3, 5), null)));
+            assertThat(run.snapshotEpoch()).isEqualTo(3L);
+            assertThat(store.writerRun(CHAIN, "p1")).contains(run);
+        });
+    }
+
+    /**
+     * Starting a run replaces the one before it whole: its accounting starts empty, and a writer of the
+     * replaced run is turned away at the store - what it says lands nowhere, however far it got.
+     */
+    @Test
+    void aReplacedRunTurnsItsWritersAwayAndTheNewOneStartsEmpty() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.beginWriterRun(CHAIN, "p1", "g7", Map.of("orders", List.of("serve.a#0")));
+            store.advanceWriter(CHAIN, "p1", "g7", "serve.a#0", "orders",
+                    new WriterProgress(new SourceOrder(1, 9), null));
+
+            store.beginWriterRun(CHAIN, "p1", "g8", Map.of("orders", List.of("serve.a#0")));
+
+            assertThat(store.advanceWriter(CHAIN, "p1", "g7", "serve.a#0", "orders",
+                    new WriterProgress(new SourceOrder(1, 12), null))).isEmpty();
+            WriterRun current = store.writerRun(CHAIN, "p1").orElseThrow();
+            assertThat(current.runId()).isEqualTo("g8");
+            assertThat(current.progressFor("orders")).isEmpty();
+            assertThat(store.advanceWriter(CHAIN, "p1", "g8", "serve.a#0", "orders",
+                    new WriterProgress(new SourceOrder(1, 4), null))).isPresent();
+        });
+    }
+
+    @Test
+    void aRewrittenConsumerRecordCarriesNoWriterRun() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.beginWriterRun(CHAIN, "p1", "g7", Map.of("orders", List.of("serve.a#0")));
+
+            store.upsertConsumerOffset(CHAIN, new ConsumerOffset("p1", Map.of(), null));
+
+            assertThat(store.writerRun(CHAIN, "p1")).isEmpty();
+        });
+    }
+
+    /**
+     * Landed progress with no token behind it raises the table's ring place alone: the acked position is a
+     * token and the order it sat at, and there is no token to pair a new order with.
+     */
+    @Test
+    void aRingPlaceRaisedWithoutAnAckLeavesTheAckedPositionAsItWas() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.advanceSinkAcked(CHAIN, "p1", "orders", new ChainPosition(new SourceOrder(1, 5), "t5"));
+
+            store.advanceRingDone(CHAIN, "p1", "orders", 9);
+            store.advanceRingDone(CHAIN, "p1", "orders", 7);
+            store.advanceRingDone(CHAIN, "p1", "orders", SourceOrder.SNAPSHOT_SEQ);
+
+            assertThat(store.ringDoneThrough(CHAIN, "p1")).containsExactlyEntriesOf(Map.of("orders", 9L));
+            assertThat(onlyConsumer(store).sinkAcked())
+                    .isEqualTo(new ChainPosition(new SourceOrder(1, 5), "t5"));
         });
     }
 
@@ -776,6 +825,13 @@ class MongoSrsMetaStoreIT {
             assertThatThrownBy(() -> store.markSnapshotComplete("nope", "p1", "orders"))
                     .isInstanceOf(IllegalStateException.class);
             assertThatThrownBy(() -> store.openEpoch("nope"))
+                    .isInstanceOf(IllegalStateException.class);
+            assertThatThrownBy(() -> store.beginWriterRun("nope", "p", "g1", Map.of("orders", List.of("w#0"))))
+                    .isInstanceOf(IllegalStateException.class);
+            assertThatThrownBy(() -> store.advanceWriter("nope", "p", "g1", "w#0", "orders",
+                    new WriterProgress(new SourceOrder(1, 1), null)))
+                    .isInstanceOf(IllegalStateException.class);
+            assertThatThrownBy(() -> store.advanceRingDone("nope", "p", "orders", 1L))
                     .isInstanceOf(IllegalStateException.class);
         });
     }
@@ -1140,6 +1196,105 @@ class MongoSrsMetaStoreIT {
         } finally {
             resumeCursorCleanup.countDown();
             dropCommitted.countDown();
+            executor.shutdownNow();
+            assertThat(executor.awaitTermination(30, TimeUnit.SECONDS)).isTrue();
+        }
+    }
+
+    /**
+     * A writer that stops for good halfway through one of its chain's writes holds up no other writer of that
+     * chain - which is what a member killed while its sinks were reporting leaves behind.
+     *
+     * <p>Whatever such a writer had open, the endpoint keeps open until a lifetime of its own runs out, a minute
+     * by default, and a write that has to wait for it waits that long. Here the writer on the member that goes
+     * stops right after its first write reaches the endpoint, and every write the writers left on the chain make
+     * afterwards - to the same pipeline's record, to another pipeline's, and to the chain's own - has to land
+     * well inside that minute.
+     */
+    @Test
+    void aWriterThatStopsHalfwayThroughAWriteHoldsUpNoOtherWriterOfItsChain() throws Exception {
+        CountDownLatch stopped = new CountDownLatch(1);
+        CountDownLatch released = new CountDownLatch(1);
+        AtomicBoolean armed = new AtomicBoolean();
+        CommandListener stopsAfterItsFirstWrite = new CommandListener() {
+            @Override
+            public void commandSucceeded(CommandSucceededEvent event) {
+                if (!WRITE_COMMANDS.contains(event.getCommandName()) || !armed.compareAndSet(true, false)) {
+                    return;
+                }
+                stopped.countDown();
+                try {
+                    // Let go only once the case is over, so its clients can close. Until then this writer is gone
+                    // as far as the endpoint and every other writer can tell.
+                    released.await(120, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        };
+        MongoClientSettings stoppingSettings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl()))
+                .addCommandListener(stopsAfterItsFirstWrite)
+                .build();
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try (MongoClient stoppingClient = MongoClients.create(stoppingSettings);
+                MongoClient survivingClient = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            MongoCollection<Document> roots = survivingClient.getDatabase("tapstate").getCollection("srs_meta");
+            MongoCollection<Document> consumers =
+                    survivingClient.getDatabase("tapstate").getCollection("srs_consumer_offsets");
+            roots.drop();
+            consumers.drop();
+            MongoSrsMetaStore stopping = new MongoSrsMetaStore(stoppingClient,
+                    stoppingClient.getDatabase("tapstate").getCollection("srs_meta"),
+                    stoppingClient.getDatabase("tapstate").getCollection("srs_consumer_offsets"));
+            MongoSrsMetaStore surviving = new MongoSrsMetaStore(survivingClient, roots, consumers);
+            surviving.create(CHAIN, null);
+            // Two pipelines on the chain, each with a record already: one whose writers are on both members, and
+            // one whose only writer is on the member that stays.
+            surviving.beginWriterRun(CHAIN, "orders-pipe", "run-1",
+                    Map.of("orders", List.of("sink#0", "sink#1")));
+            surviving.beginWriterRun(CHAIN, "audit-pipe", "run-1", Map.of("orders", List.of("sink#0")));
+
+            armed.set(true);
+            Future<?> stoppingWrite = executor.submit(() -> stopping.advanceWriter(CHAIN, "orders-pipe", "run-1",
+                    "sink#1", "orders", new WriterProgress(new SourceOrder(1L, 40L), null)));
+            assertThat(stopped.await(10, TimeUnit.SECONDS))
+                    .as("the writer on the member that goes has stopped halfway through its write")
+                    .isTrue();
+
+            ChainPosition landed = new ChainPosition(new SourceOrder(1L, 41L), "binlog:41");
+            WriterProgress progress = new WriterProgress(new SourceOrder(1L, 41L), landed);
+            Future<?> survivingWrites = executor.submit(() -> {
+                surviving.advanceWriter(CHAIN, "orders-pipe", "run-1", "sink#0", "orders", progress);
+                surviving.advanceSinkAcked(CHAIN, "orders-pipe", "orders", landed);
+                surviving.advanceRingDone(CHAIN, "orders-pipe", "orders", 42L);
+                surviving.advanceConsumerReadSeq(CHAIN, "audit-pipe", "orders", 41L);
+                surviving.markSnapshotComplete(CHAIN, "audit-pipe", "orders");
+                surviving.advanceSourceReadOffset(CHAIN, landed);
+            });
+            try {
+                survivingWrites.get(15, TimeUnit.SECONDS);
+            } catch (TimeoutException waiting) {
+                throw new AssertionError("the writers left on the chain were still waiting 15 s after another writer "
+                        + "stopped halfway through a write - on what that writer left open, which the endpoint "
+                        + "goes on holding for a minute by default", waiting);
+            }
+
+            SrsMeta record = surviving.read(CHAIN).orElseThrow();
+            assertThat(surviving.writerRun(CHAIN, "orders-pipe").orElseThrow().progress().get("orders"))
+                    .as("and what they wrote landed")
+                    .containsEntry("sink#0", progress);
+            assertThat(record.consumerOffset("orders-pipe").orElseThrow().sinkAcked()).isEqualTo(landed);
+            assertThat(surviving.ringDoneThrough(CHAIN, "orders-pipe")).containsEntry("orders", 42L);
+            ConsumerOffset audit = record.consumerOffset("audit-pipe").orElseThrow();
+            assertThat(audit.perTableSeq()).containsEntry("orders", 41L);
+            assertThat(audit.snapshotCompletedTables()).containsExactly("orders");
+            assertThat(record.sourceRead()).isEqualTo(landed);
+            assertThat(stoppingWrite.isDone())
+                    .as("while the writer that stopped is still stopped: nothing here waited for it to go on")
+                    .isFalse();
+        } finally {
+            released.countDown();
             executor.shutdownNow();
             assertThat(executor.awaitTermination(30, TimeUnit.SECONDS)).isTrue();
         }

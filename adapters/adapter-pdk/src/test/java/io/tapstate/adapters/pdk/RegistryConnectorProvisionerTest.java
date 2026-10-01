@@ -43,6 +43,32 @@ class RegistryConnectorProvisionerTest {
         assertThat(Files.readAllBytes(staged)).isEqualTo(artifact);
     }
 
+    /**
+     * An artifact certified for one instance to serve several writers resolves to a ref that says so and names
+     * its bytes; an artifact with no certification, or another's, runs one instance per writer.
+     */
+    @Test
+    void resolvesAnArtifactCertifiedForSharingToARefThatSharesIt(@TempDir Path dir) throws IOException {
+        Path cacheDir = dir.resolve("plugins");
+        byte[] artifact = Files.readAllBytes(Synthetic.annotatedConnector(dir));
+        InMemoryConnectorRegistry registry = new InMemoryConnectorRegistry();
+        String hash = registry.register("orders", "1.3.5", RegistrationSource.SEED, artifact)
+                .registration().contentHash();
+        RegistryConnectorProvisioner provisioner =
+                new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), cacheDir);
+
+        ConnectorRef uncertified = provisioner.resolve("orders");
+        registry.shareSafe.put("some-other-bytes", "v1");
+        ConnectorRef certifiedForOthers = provisioner.resolve("orders");
+        registry.shareSafe.put(hash, "v1");
+        ConnectorRef certified = provisioner.resolve("orders");
+
+        assertThat(uncertified.shareSafe()).isFalse();
+        assertThat(certifiedForOthers.shareSafe()).isFalse();
+        assertThat(certified.shareSafe()).isTrue();
+        assertThat(certified.contentHash()).isEqualTo(hash);
+    }
+
     @Test
     void reusesTheStagedArtifactOnASecondResolveInsteadOfFetchingBytesAgain(@TempDir Path dir) throws IOException {
         Path cacheDir = dir.resolve("plugins");

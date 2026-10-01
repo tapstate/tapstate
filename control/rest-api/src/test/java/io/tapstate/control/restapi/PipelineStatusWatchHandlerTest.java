@@ -2,6 +2,7 @@ package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.ArtifactQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
+import io.tapstate.core.lifecycle.ExecutionPlans;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.Resource;
@@ -40,6 +41,11 @@ class PipelineStatusWatchHandlerTest {
     private static final MessageCatalog CATALOG = MessageCatalog.bundled();
 
     private static PipelineObservationQueryService serviceWith(ObservationStore observations, String... pipelineIds) {
+        return serviceWith(observations, ExecutionPlans.NONE, pipelineIds);
+    }
+
+    private static PipelineObservationQueryService serviceWith(ObservationStore observations, ExecutionPlans plans,
+            String... pipelineIds) {
         Map<String, Resource> byId = new HashMap<>();
         for (String id : pipelineIds) {
             byId.put(id, new io.tapstate.core.dsl.DslParser().parse("""
@@ -72,7 +78,7 @@ class PipelineStatusWatchHandlerTest {
                 return List.copyOf(byId.values());
             }
         });
-        return new PipelineObservationQueryService(artifacts, observations);
+        return new PipelineObservationQueryService(artifacts, observations, plans);
     }
 
     private static ObservationStore emptyObservations() {
@@ -191,6 +197,42 @@ class PipelineStatusWatchHandlerTest {
 
         assertThat(session.sent).hasSize(1);
         assertThat(session.closeStatus).isNull();
+    }
+
+    @Test
+    void aWatchFollowsTheStateWithoutReadingThePlanOnEveryPoll() {
+        // A frame does not carry the plan, and the plan changes only when a new run is submitted: read on every
+        // poll, it would be read once a second for every open watch and thrown away each time.
+        Observation running = new Observation("orders", PipelineState.RUNNING, Map.of(), Map.of());
+        ObservationStore store = new ObservationStore() {
+            @Override
+            public void delete(String pipelineId) {
+                throw new UnsupportedOperationException("removal is not exercised by this double");
+            }
+
+            @Override
+            public void save(Observation observation) {
+            }
+
+            @Override
+            public Optional<Observation> read(String pipelineId) {
+                return Optional.of(running);
+            }
+        };
+        List<List<String>> planReads = new ArrayList<>();
+        ExecutionPlans plans = pipelineIds -> {
+            planReads.add(List.copyOf(pipelineIds));
+            return Map.of();
+        };
+        PipelineStatusWatchHandler handler = new PipelineStatusWatchHandler(serviceWith(store, plans, "orders"),
+                CATALOG, new NoOpTaskScheduler(), Duration.ofSeconds(1));
+        FakeWebSocketSession session = new FakeWebSocketSession();
+
+        handler.poll(session, "orders");
+        handler.poll(session, "orders");
+
+        assertThat(session.sent).hasSize(1);
+        assertThat(planReads).isEmpty();
     }
 
     @Test

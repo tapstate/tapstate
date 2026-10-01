@@ -167,10 +167,13 @@ class SnapshotBeforeCdcDataFlowTest {
             actuator.stop(PIPELINE, true);
         }
 
-        // The load-bearing assertion: the three snapshot reads (op r) arrive first, in buffered order, then the
-        // two cdc inserts (op i), in change order. Exact order proves all snapshot precedes all cdc AND that the
-        // content is snapshot union cdc, all through the one transform-to-sink chain.
-        assertThat(arrived).containsExactly("r|100", "r|101", "r|102", "i|0", "i|1");
+        // The load-bearing assertion: the three snapshot reads (op r) arrive first, then the two cdc inserts
+        // (op i) - all snapshot before any cdc, and the content snapshot union cdc, through the one
+        // transform-to-sink chain. The sink runs several writers, so neither group arrives in any order of its
+        // own: a table's snapshot rows are spread over every writer, and the two changes are of different keys.
+        assertThat(arrived).hasSize(5);
+        assertThat(arrived.subList(0, 3)).containsExactlyInAnyOrder("r|100", "r|101", "r|102");
+        assertThat(arrived.subList(3, 5)).containsExactlyInAnyOrder("i|0", "i|1");
     }
 
     private static Envelope snapshot(int id) {

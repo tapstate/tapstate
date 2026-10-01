@@ -12,6 +12,7 @@ import com.mongodb.client.model.ReplaceOptions;
 import com.mongodb.client.model.ReturnDocument;
 import com.mongodb.client.model.UpdateOptions;
 import com.mongodb.client.result.UpdateResult;
+
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
@@ -22,7 +23,8 @@ import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimType;
-import org.bson.Document;
+import io.tapstate.spi.store.WriterProgress;
+import io.tapstate.spi.store.WriterRun;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -35,6 +37,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Supplier;
 
+import org.bson.Document;
+
 /**
  * The MongoDB SRS meta store: one durable coordination document per mining chain — the offset and schema
  * truth that outlive the in-memory change ring — plus one cursor document per consumer pipeline. The chain
@@ -43,10 +47,8 @@ import java.util.function.Supplier;
  * document until its own source position can no longer move.
  *
  * <p>A consumer document holds everything belonging to one pipeline rather than to the chain: its read
- * cursor, each sink writer's progress and their derived acked position, the exact workload claim allowed
- * to advance that progress, the tables whose initial load all expected writers have confirmed, and the
- * seam and generation at which its load began. Records written
- * before that split carried those documents under the
+ * cursor, its acked position, the tables whose initial load its sink has confirmed, and the seam and
+ * generation at which its load began. Records written before that split carried those documents under the
  * chain's {@code consumerOffsets} field. The first consumer write migrates them; a chain write that finds
  * an old record already at the endpoint ceiling does the same and retries. The copy is insert-only and the
  * embedded map is cleared only after every cursor has landed, so an interrupted migration loses nothing.
@@ -54,6 +56,13 @@ import java.util.function.Supplier;
  * cursor, so a copier holding an older snapshot cannot restore the departed consumer. The schema history
  * remains an append-only array on the chain document, advanced by an update that keeps the newest entries
  * inside a fixed byte budget. Nullable positions are stored only when present, never as explicit nulls.
+ *
+ * <p>A write to a consumer document that is already there is one write of its own, and holds nothing once
+ * it has returned. Only a write that finds no document takes a transaction, which writes the chain document
+ * too, because creating a cursor has to be set against a drop of the chain it would belong to. What a
+ * transaction has written stays held until it ends, and one whose writer stopped halfway through it - a
+ * member killed mid-write - ends only when the endpoint gives up on it, a minute later by default. Taken on
+ * every consumer write, that put every writer of a chain behind any member that died while it was writing.
  *
  * <p>Driver IO failures are translated into coded io diagnostics, so no driver type escapes the module
  * (rule R3). A re-seed of an existing chain (which would discard its accumulated truth) and a mutate of
@@ -63,15 +72,9 @@ import java.util.function.Supplier;
  */
 public final class MongoSrsMetaStore implements SrsMetaStore {
 
-    private static final String POSITION = "position";
-    private static final String POSITION_ORDER = "position order";
-    private static final String TABLE = "table";
-    private static final String PIPELINE_ID = "pipelineId";
-    private static final String SNAPSHOT_COMPLETED_TABLES = "snapshotCompletedTables";
-
     /**
-     * A root-local fence advanced with every split-cursor write. It has no model meaning: its write is
-     * what makes the root-existence check conflict with a concurrent lifecycle delete.
+     * A root-local fence advanced by every split-cursor write that may create the cursor. It has no model
+     * meaning: its write is what makes the root-existence check conflict with a concurrent lifecycle delete.
      */
     private static final String CONSUMER_WRITE_REVISION = "consumerWriteRevision";
 
@@ -83,21 +86,13 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      */
     static final String PER_TABLE_RING_DONE = "perTableRingDone";
 
-    /** The complete table-to-writer plan used to derive this consumer's public progress fields. */
-    private static final String EXPECTED_SINK_WRITERS = "expectedSinkWriters";
-
-    /** Each sink writer's progress, kept apart until every writer has reached a position. */
-    private static final String SINK_WRITER_PROGRESS = "sinkWriterProgress";
-
-    /** The exact pipeline run allowed to advance this consumer's irreversible sink progress. */
-    static final String SINK_ACK_FENCE = "sinkAckFence";
-
-    private static final String WRITER_RING_DONE = "ringDone";
-    private static final String WRITER_SNAPSHOT_COMPLETE = "snapshotComplete";
-
-    /** A real write, so a takeover and a fenced sink effect conflict on the same claim document. */
-    private static final Document PROVE_SINK_CLAIM =
-            new Document("$inc", new Document("fencedSinkEffects", 1L));
+    /**
+     * Per table, the last acked position written for it - its generation, its sequence in the table's ring and
+     * its token: what an ack of that table is compared with before it moves the chain's acked position. Dropped
+     * with the rest of the consumer when its record is rewritten, so a position written back is moved on from
+     * wherever it now stands.
+     */
+    static final String SINK_ACKED_BY_TABLE = "sinkAckedByTable";
 
     /**
      * How much of a chain's schema history the record retains, in bytes of stored entries.
@@ -123,6 +118,13 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * retained stays inside the budget rather than touching it.
      */
     private static final int HISTORY_ENTRY_OVERHEAD_BYTES = 12;
+
+    /** The exact pipeline run a consumer's durable sink effects are bound to, beside the progress they make. */
+    static final String SINK_ACK_FENCE = "sinkAckFence";
+
+    /** A real write, so a takeover and a fenced sink effect conflict on the same claim document. */
+    private static final Document PROVE_SINK_CLAIM =
+            new Document("$inc", new Document("fencedSinkEffects", 1L));
 
     private final MongoCollection<Document> collection;
     private final MongoCollection<Document> consumers;
@@ -241,8 +243,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     @Override
     public void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
         Objects.requireNonNull(miningChainId, "miningChainId");
-        Objects.requireNonNull(position, POSITION);
-        Objects.requireNonNull(position.order(), POSITION_ORDER);
+        Objects.requireNonNull(position, "position");
+        Objects.requireNonNull(position.order(), "position order");
         // Two updates, and the split is the guard. The first carries the ordering condition in its own
         // filter, so the comparison and the write are one atomic act: a read-then-write would let a second
         // member land its advance in between and be overwritten by this one, which is the rewind this
@@ -343,115 +345,264 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         updateConsumer(miningChainId, pipelineId, sinkAckedUpdate(pipelineId, position));
     }
 
-    @Override
-    public void advanceSinkAcked(
-            String miningChainId,
-            String pipelineId,
-            ChainPosition position,
-            WorkloadClaimFence fence) {
-        Objects.requireNonNull(position, POSITION);
-        Objects.requireNonNull(position.order(), POSITION_ORDER);
-        mutateConsumer(miningChainId, pipelineId, fence, consumer -> {
-            if (!sinkAckFenceMatches(consumer, pipelineId, fence)) {
-                return false;
-            }
-            writePosition(consumer, position);
-            return true;
-        });
-    }
-
+    /**
+     * Writes the whole update while {@code position} is later than the last one written for {@code table}, and
+     * otherwise only the part of it that only ever rises: the table's place in its ring.
+     *
+     * <p>Every writer of a sink reports on its own, working the table's position out from what it read back, so
+     * a report worked out before a later one can land after it, carrying the older answer; written, it would
+     * move the position back, and a run replacing this one would start from there. So the write carries the
+     * comparison in its own filter, and lands only where the table's last position is earlier than this one or
+     * there is none: the comparison and the write are one act, which no report landing in between can split.
+     * Where that finds nothing, the ring place alone is raised, where the last position is this one or later.
+     * Only the table's own: each table's ring numbers its changes on its own, so one table's position says
+     * nothing about how far another's has got.
+     *
+     * <p>Where neither finds anything there is no document to compare with - or its table's position went with
+     * a rewrite in between - and the fenced path decides again, in a transaction that may create the document.
+     */
     @Override
     public void advanceSinkAcked(
             String miningChainId, String pipelineId, String table, ChainPosition position) {
-        updateConsumer(miningChainId, pipelineId, sinkAckedUpdate(pipelineId, table, position));
-    }
-
-    @Override
-    public void advanceSinkAcked(
-            String miningChainId,
-            String pipelineId,
-            String table,
-            ChainPosition position,
-            WorkloadClaimFence fence) {
-        Objects.requireNonNull(table, TABLE);
-        Objects.requireNonNull(position, POSITION);
-        Objects.requireNonNull(position.order(), POSITION_ORDER);
-        mutateConsumer(miningChainId, pipelineId, fence, consumer -> {
-            if (!sinkAckFenceMatches(consumer, pipelineId, fence)) {
-                return false;
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(table, "table");
+        Objects.requireNonNull(position, "position");
+        Objects.requireNonNull(position.order(), "position order");
+        migrateLegacyConsumers(miningChainId, true);
+        Document key = consumerKey(miningChainId, pipelineId);
+        SourceOrder order = position.order();
+        if (updateExistingConsumer(miningChainId, tableAckedBefore(key, table, order),
+                sinkAckedUpdate(pipelineId, table, position))) {
+            return;
+        }
+        Document atOrAfter = tableAckedAtOrAfter(key, table, order);
+        boolean settled = order.seq() >= 0
+                ? updateExistingConsumer(miningChainId, atOrAfter,
+                        new Document("$max", new Document(PER_TABLE_RING_DONE + "." + table, order.seq())))
+                : StoreIo.call(miningChainId, () -> consumers.find(atOrAfter)
+                        .projection(Projections.include("_id")).first()) != null;
+        if (settled) {
+            return;
+        }
+        writeConsumer(miningChainId, session -> {
+            Document held = consumers.find(session, key)
+                    .projection(Projections.include(SINK_ACKED_BY_TABLE + "." + table)).first();
+            SourceOrder last = held == null ? null : tableAckedFrom(held, table);
+            Document write;
+            if (last == null || position.order().compareTo(last) > 0) {
+                write = sinkAckedUpdate(pipelineId, table, position);
+            } else if (position.order().seq() >= 0) {
+                write = new Document("$max",
+                        new Document(PER_TABLE_RING_DONE + "." + table, position.order().seq()));
+            } else {
+                return;
             }
-            writePosition(consumer, position);
-            if (position.order().seq() >= 0) {
-                Document rings = nestedDocument(consumer, PER_TABLE_RING_DONE, pipelineId, true);
-                Object raw = rings.get(table);
-                long done = raw instanceof Number number ? number.longValue() : Long.MIN_VALUE;
-                rings.put(table, Math.max(done, position.order().seq()));
-            }
-            return true;
+            write.append("$setOnInsert", consumerIdentity(miningChainId, pipelineId));
+            consumers.updateOne(session, key, write, new UpdateOptions().upsert(true));
         });
     }
 
+    /**
+     * The fenced form of the table-aware advance: the same two conditional writes, made only while {@code fence}
+     * is the live claim and the pipeline's cursor is bound to its run. The cursor is there by now - the run's
+     * start created it - so there is nothing to create and nothing of the chain's own to hold.
+     */
     @Override
-    public void configureSinkWriters(
-            String miningChainId, String pipelineId, Map<String, List<String>> writerIdsByTable) {
-        Objects.requireNonNull(writerIdsByTable, "writerIdsByTable");
-        mutateConsumer(miningChainId, pipelineId, consumer -> {
-            configureSinkWriters(consumer, pipelineId, writerIdsByTable);
-            return true;
-        });
-    }
-
-    @Override
-    public void configureSinkWriters(
-            String miningChainId,
-            String pipelineId,
-            Map<String, List<String>> writerIdsByTable,
+    public boolean advanceSinkAcked(String miningChainId, String pipelineId, String table, ChainPosition position,
             WorkloadClaimFence fence) {
-        Objects.requireNonNull(writerIdsByTable, "writerIdsByTable");
-        mutateConsumer(miningChainId, pipelineId, fence, consumer -> {
-            bindSinkAckFence(consumer, pipelineId, fence);
-            configureSinkWriters(consumer, pipelineId, writerIdsByTable);
-            return true;
-        });
-    }
-
-    @Override
-    public void advanceSinkWriterAcked(
-            String miningChainId,
-            String pipelineId,
-            String writerId,
-            String table,
-            ChainPosition position) {
-        Objects.requireNonNull(position, POSITION);
-        Objects.requireNonNull(position.order(), POSITION_ORDER);
-        mutateConsumer(miningChainId, pipelineId, consumer -> {
-            advanceSinkWriter(consumer, pipelineId, writerId, table, position);
-            return true;
-        });
-    }
-
-    @Override
-    public void advanceSinkWriterAcked(
-            String miningChainId,
-            String pipelineId,
-            String writerId,
-            String table,
-            ChainPosition position,
-            WorkloadClaimFence fence) {
-        Objects.requireNonNull(position, POSITION);
-        Objects.requireNonNull(position.order(), POSITION_ORDER);
-        mutateConsumer(miningChainId, pipelineId, fence, consumer -> {
-            if (!sinkAckFenceMatches(consumer, pipelineId, fence)) {
-                return false;
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(table, "table");
+        Objects.requireNonNull(position, "position");
+        Objects.requireNonNull(position.order(), "position order");
+        migrateLegacyConsumers(miningChainId, true);
+        Document key = consumerKey(miningChainId, pipelineId);
+        SourceOrder order = position.order();
+        return fencedConsumerWrite(miningChainId, pipelineId, fence, session -> {
+            if (consumers.updateOne(session, tableAckedBefore(key, table, order),
+                    sinkAckedUpdate(pipelineId, table, position)).getMatchedCount() == 0 && order.seq() >= 0) {
+                consumers.updateOne(session, tableAckedAtOrAfter(key, table, order),
+                        new Document("$max", new Document(PER_TABLE_RING_DONE + "." + table, order.seq())));
             }
-            advanceSinkWriter(consumer, pipelineId, writerId, table, position);
-            return true;
+            return Boolean.TRUE;
+        }).isPresent();
+    }
+
+    /** The consumer-document field holding the current run's per-writer accounting. */
+    static final String WRITER_RUN = "writerRun";
+
+    @Override
+    public void beginWriterRun(String miningChainId, String pipelineId, String runId,
+            Map<String, List<String>> expectedWritersByTable) {
+        Objects.requireNonNull(runId, "runId");
+        Document expected = new Document();
+        expectedWritersByTable.forEach((table, writers) -> expected.append(table, List.copyOf(writers)));
+        updateConsumer(miningChainId, pipelineId, new Document("$set", new Document(WRITER_RUN,
+                new Document("id", runId).append("expected", expected).append("progress", new Document()))));
+    }
+
+    /**
+     * Starts the run's accounting as the unfenced start does, and binds the pipeline's later durable sink effects
+     * on the chain to {@code fence}'s run - in one transaction with the proof that {@code fence} is the live claim,
+     * and with the chain's lifecycle fence, because this is the write that may create the pipeline's cursor. Once
+     * a run a claim no longer names can prove nothing, it can neither start its accounting again nor take the
+     * binding back from the run that holds it.
+     */
+    @Override
+    public boolean beginWriterRun(String miningChainId, String pipelineId, String runId,
+            Map<String, List<String>> expectedWritersByTable, WorkloadClaimFence fence) {
+        Objects.requireNonNull(runId, "runId");
+        Document bound = sinkAckFenceDocument(pipelineId, fence);
+        Document expected = new Document();
+        expectedWritersByTable.forEach((table, writers) -> expected.append(table, List.copyOf(writers)));
+        Document update = new Document("$set", new Document(WRITER_RUN,
+                new Document("id", runId).append("expected", expected).append("progress", new Document()))
+                .append(SINK_ACK_FENCE, bound))
+                .append("$setOnInsert", consumerIdentity(miningChainId, pipelineId));
+        Document key = consumerKey(miningChainId, pipelineId);
+        migrateLegacyConsumers(miningChainId, true);
+        return StoreIo.call(miningChainId, () -> {
+            try (ClientSession session = client.startSession()) {
+                return session.withTransaction(() -> {
+                    if (!provesClaim(session, fence)) {
+                        return false;
+                    }
+                    UpdateResult rooted = collection.updateOne(session, new Document("_id", miningChainId),
+                            new Document("$inc", new Document(CONSUMER_WRITE_REVISION, 1L)));
+                    if (rooted.getMatchedCount() == 0) {
+                        throw unseededChain(miningChainId);
+                    }
+                    consumers.updateOne(session, key, update, new UpdateOptions().upsert(true));
+                    return true;
+                });
+            }
         });
+    }
+
+    @Override
+    public Optional<WriterRun> advanceWriter(String miningChainId, String pipelineId, String runId,
+            String writerId, String table, WriterProgress progress) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(runId, "runId");
+        Objects.requireNonNull(writerId, "writerId");
+        Objects.requireNonNull(table, "table");
+        Objects.requireNonNull(progress, "progress");
+        migrateLegacyConsumers(miningChainId, true);
+        Document filter = writerRunFilter(miningChainId, pipelineId, runId);
+        Document update = writerProgressUpdate(writerId, table, progress);
+        // One write of its own, like every write to a document that is already there: a run's accounting is
+        // only ever advanced here, never created, so a document that is not there, or carries another run, is
+        // left as it is and answers nothing.
+        Document after = StoreIo.call(miningChainId,
+                () -> consumers.findOneAndUpdate(filter, update, WRITER_RUN_AFTER));
+        return after == null ? Optional.empty() : writerRunOf(after);
+    }
+
+    /** The fenced form of the writer's report: the same write, while {@code fence} proves the run current. */
+    @Override
+    public Optional<WriterRun> advanceWriter(String miningChainId, String pipelineId, String runId,
+            String writerId, String table, WriterProgress progress, WorkloadClaimFence fence) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(runId, "runId");
+        Objects.requireNonNull(writerId, "writerId");
+        Objects.requireNonNull(table, "table");
+        Objects.requireNonNull(progress, "progress");
+        migrateLegacyConsumers(miningChainId, true);
+        Document filter = writerRunFilter(miningChainId, pipelineId, runId);
+        Document update = writerProgressUpdate(writerId, table, progress);
+        return fencedConsumerWrite(miningChainId, pipelineId, fence,
+                session -> consumers.findOneAndUpdate(session, filter, update, WRITER_RUN_AFTER))
+                .flatMap(MongoSrsMetaStore::writerRunOf);
+    }
+
+    /** What a writer's report answers with: its run's accounting as it stands after the write. */
+    private static final FindOneAndUpdateOptions WRITER_RUN_AFTER = new FindOneAndUpdateOptions()
+            .returnDocument(ReturnDocument.AFTER)
+            .projection(Projections.include(WRITER_RUN, "snapshotEpoch", "cdcStartPosition"));
+
+    /** The pipeline's cursor on the chain, while it carries {@code runId}'s accounting. */
+    private static Document writerRunFilter(String miningChainId, String pipelineId, String runId) {
+        return new Document(consumerKey(miningChainId, pipelineId)).append(WRITER_RUN + ".id", runId);
+    }
+
+    /**
+     * The replacement of one writer's entry in its run's accounting. The writer's key is encoded because a writer
+     * id names its vertex, and a vertex name may hold the dot a field path reads as a step into a nested
+     * document; the id itself travels inside the entry.
+     */
+    private static Document writerProgressUpdate(String writerId, String table, WriterProgress progress) {
+        String path = WRITER_RUN + ".progress." + table + "." + writerKey(writerId);
+        Document entry = new Document("writer", writerId)
+                .append("durableEpoch", progress.durableThrough().epoch())
+                .append("durableSeq", progress.durableThrough().seq());
+        if (progress.lastTokened() != null) {
+            entry.append("tokenEpoch", progress.lastTokened().order().epoch())
+                    .append("tokenSeq", progress.lastTokened().order().seq())
+                    .append("token", progress.lastTokened().token());
+        }
+        return new Document("$set", new Document(path, entry));
+    }
+
+    @Override
+    public Optional<WriterRun> writerRun(String miningChainId, String pipelineId) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Document consumer = StoreIo.call(() -> consumers.find(consumerKey(miningChainId, pipelineId))
+                .projection(Projections.include(WRITER_RUN, "snapshotEpoch", "cdcStartPosition")).first());
+        return consumer == null ? Optional.empty() : writerRunOf(consumer);
+    }
+
+    /** A writer id as a field name: its UTF-8 bytes in URL-safe base64, which holds no dot or dollar. */
+    static String writerKey(String writerId) {
+        return java.util.Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(writerId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
+    /** The run accounting a consumer document carries, or empty where it carries none. */
+    private static Optional<WriterRun> writerRunOf(Document consumer) {
+        if (!(consumer.get(WRITER_RUN) instanceof Document run)) {
+            return Optional.empty();
+        }
+        Map<String, List<String>> expected = new LinkedHashMap<>();
+        if (run.get("expected") instanceof Document byTable) {
+            for (Map.Entry<String, Object> table : byTable.entrySet()) {
+                List<String> writers = new ArrayList<>();
+                if (table.getValue() instanceof List<?> listed) {
+                    listed.forEach(writer -> writers.add(String.valueOf(writer)));
+                }
+                expected.put(table.getKey(), writers);
+            }
+        }
+        Map<String, Map<String, WriterProgress>> progress = new LinkedHashMap<>();
+        if (run.get("progress") instanceof Document byTable) {
+            for (Map.Entry<String, Object> table : byTable.entrySet()) {
+                Map<String, WriterProgress> byWriter = new LinkedHashMap<>();
+                if (table.getValue() instanceof Document entries) {
+                    for (Object value : entries.values()) {
+                        if (value instanceof Document entry) {
+                            ChainPosition tokened = entry.getString("token") == null ? null : new ChainPosition(
+                                    new SourceOrder(entry.getLong("tokenEpoch"), entry.getLong("tokenSeq")),
+                                    entry.getString("token"));
+                            byWriter.put(entry.getString("writer"), new WriterProgress(
+                                    new SourceOrder(entry.getLong("durableEpoch"), entry.getLong("durableSeq")),
+                                    tokened));
+                        }
+                    }
+                }
+                progress.put(table.getKey(), byWriter);
+            }
+        }
+        Long snapshotEpoch = consumer.getString("cdcStartPosition") == null ? null
+                : readEpoch(consumer, "snapshotEpoch");
+        return Optional.of(new WriterRun(run.getString("id"), expected, progress, snapshotEpoch));
     }
 
     @Override
     public void startRingAfter(String miningChainId, String pipelineId, String table, long seq) {
-        Objects.requireNonNull(table, TABLE);
+        Objects.requireNonNull(table, "table");
         // Read, then write only when there is no arrival yet: a pipeline arrives on a ring from one member
         // at a time, so nothing races this, and a raise over a place the pipeline already has would carry it
         // past changes it has not received.
@@ -461,40 +612,49 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         // The completed place and the read cursor are one arrival fact. Publishing only the former leaves
         // the consumer absent from the write-side headroom minimum until a later registration write lands;
         // enough concurrent changes can then overwrite the first changes written after this arrival.
-        mutateConsumer(miningChainId, pipelineId, consumer -> {
-            Document rings = nestedDocument(consumer, PER_TABLE_RING_DONE, pipelineId, true);
-            if (rings.containsKey(table)) {
-                return false;
-            }
-            rings.put(table, seq);
-            Document perTable = nestedDocument(consumer, "perTableSeq", pipelineId, true);
-            Object rawRead = perTable.get(table);
-            long read = rawRead instanceof Number number ? number.longValue() : Long.MIN_VALUE;
-            perTable.put(table, Math.max(read, seq));
-
-            Document expected = nestedDocument(consumer, EXPECTED_SINK_WRITERS, pipelineId, false);
-            if (expected != null) {
-                Document progress = nestedDocument(consumer, SINK_WRITER_PROGRESS, pipelineId, true);
-                for (String writerId : writerIds(expected.get(table), pipelineId, table)) {
-                    Document writer = writerProgress(progress, pipelineId, writerId, table, true);
-                    writer.putIfAbsent(WRITER_RING_DONE, seq);
-                }
-            }
-            return true;
-        });
+        updateConsumer(miningChainId, pipelineId, consumerArrivalUpdate(table, seq));
     }
 
     /** The one update that publishes both halves of a consumer's first arrival on a table ring. */
     static Document consumerArrivalUpdate(String table, long seq) {
-        Objects.requireNonNull(table, TABLE);
+        Objects.requireNonNull(table, "table");
         return new Document("$max", new Document(PER_TABLE_RING_DONE + "." + table, seq)
                 .append("perTableSeq." + table, seq));
+    }
+
+    /**
+     * A {@code $max}, as the raise that comes with an acked change is: writers of one run landing at once
+     * each write, and the record only ever moves forward. A snapshot row sits at a reserved sequence below
+     * every change and is no place in any ring, so it raises nothing.
+     */
+    @Override
+    public void advanceRingDone(String miningChainId, String pipelineId, String table, long seq) {
+        Objects.requireNonNull(table, "table");
+        if (seq < 0) {
+            return;
+        }
+        updateConsumer(miningChainId, pipelineId,
+                new Document("$max", new Document(PER_TABLE_RING_DONE + "." + table, seq)));
+    }
+
+    /** The fenced form of the ring raise, under the same condition as the fenced advance. */
+    @Override
+    public boolean advanceRingDone(String miningChainId, String pipelineId, String table, long seq,
+            WorkloadClaimFence fence) {
+        Objects.requireNonNull(table, "table");
+        if (seq < 0) {
+            return true;
+        }
+        migrateLegacyConsumers(miningChainId, true);
+        Document key = consumerKey(miningChainId, pipelineId);
+        return fencedConsumerWrite(miningChainId, pipelineId, fence, session -> consumers.updateOne(session, key,
+                new Document("$max", new Document(PER_TABLE_RING_DONE + "." + table, seq)))).isPresent();
     }
 
     @Override
     public Map<String, Long> ringDoneThrough(String miningChainId, String pipelineId) {
         Objects.requireNonNull(miningChainId, "miningChainId");
-        Objects.requireNonNull(pipelineId, PIPELINE_ID);
+        Objects.requireNonNull(pipelineId, "pipelineId");
         Document consumer = StoreIo.call(() -> consumers.find(consumerKey(miningChainId, pipelineId))
                 .projection(Projections.include(PER_TABLE_RING_DONE)).first());
         Map<String, Long> seqs = new LinkedHashMap<>();
@@ -515,8 +675,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * addresses exactly one field. A deep {@code $max} creates the cursor map when none exists yet.
      */
     static Document consumerReadSeqUpdate(String pipelineId, String table, long lastReadSeq) {
-        Objects.requireNonNull(pipelineId, PIPELINE_ID);
-        Objects.requireNonNull(table, TABLE);
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(table, "table");
         return new Document("$max", new Document("perTableSeq." + table, lastReadSeq));
     }
 
@@ -540,9 +700,9 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * already declines to write down, leaving the offset where it stands.
      */
     static Document sinkAckedUpdate(String pipelineId, ChainPosition position) {
-        Objects.requireNonNull(pipelineId, PIPELINE_ID);
-        Objects.requireNonNull(position, POSITION);
-        Objects.requireNonNull(position.order(), POSITION_ORDER);
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(position, "position");
+        Objects.requireNonNull(position.order(), "position order");
         Document fields = new Document("sinkAckedEpoch", position.order().epoch())
                 .append("sinkAckedSeq", position.order().seq());
         Document update = new Document("$set", fields);
@@ -559,11 +719,17 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * the same write, so the per-table record can never run ahead of the chain position it came with. A
      * {@code $max} rather than a set: two members confirming at once both write, and the record only ever
      * moves forward. A snapshot row sits at a reserved sequence below every change and is no place in any
-     * ring, so it raises nothing.
+     * ring, so it raises nothing. The order is also kept as the table's last acked one, which the next ack of
+     * the table is compared with.
      */
     static Document sinkAckedUpdate(String pipelineId, String table, ChainPosition position) {
-        Objects.requireNonNull(table, TABLE);
+        Objects.requireNonNull(table, "table");
         Document update = sinkAckedUpdate(pipelineId, position);
+        Document last = new Document("epoch", position.order().epoch()).append("ringSeq", position.order().seq());
+        if (position.token() != null) {
+            last.append("token", position.token());
+        }
+        update.get("$set", Document.class).append(SINK_ACKED_BY_TABLE + "." + table, last);
         if (position.order().seq() >= 0) {
             update.append("$max", new Document(PER_TABLE_RING_DONE + "." + table, position.order().seq()));
         }
@@ -571,305 +737,46 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     /**
-     * Installs the complete writer plan and seeds newly named writers from a compatible public cursor.
-     * A cursor from before writer-aware progress is compatible with one writer only: with several, the
-     * aggregate may name the fastest writer and there is no stored evidence for the rest.
+     * The consumer at {@code key}, where the last acked position written for {@code table} is earlier than
+     * {@code order}, or where there is none it can be compared with - read as {@link #tableAckedFrom} reads
+     * one: a generation and a ring sequence, both numbers. Ranked by generation first, as an order is.
      */
-    private static void configureSinkWriters(
-            Document consumer, String pipelineId, Map<String, List<String>> writerIdsByTable) {
-        Document expected = new Document();
-        LinkedHashSet<String> allWriterIds = new LinkedHashSet<>();
-        Map<String, List<String>> normalizedPlan = new LinkedHashMap<>();
-        for (Map.Entry<String, List<String>> entry : writerIdsByTable.entrySet()) {
-            String table = storedKey(entry.getKey(), TABLE);
-            if (entry.getValue().isEmpty()) {
-                throw new IllegalArgumentException(
-                        "sink writer plan for table '" + table + "' must name at least one writer");
-            }
-            List<String> writerIds = entry.getValue().stream()
-                    .map(writerId -> storedKey(writerId, "sink writer id"))
-                    .distinct()
-                    .toList();
-            normalizedPlan.put(table, writerIds);
-            allWriterIds.addAll(writerIds);
-        }
-
-        Document priorPlan = nestedDocument(consumer, EXPECTED_SINK_WRITERS, pipelineId, false);
-        Document ringDone = nestedDocument(consumer, PER_TABLE_RING_DONE, pipelineId, false);
-        ChainPosition aggregateAck = sinkAckedFrom(consumer);
-        List<String> completed = snapshotCompletedFrom(consumer);
-        // startRingAfter publishes a table's initial ring cursor before the DAG is assembled. That cursor
-        // is a common baseline for every writer, not evidence that any sink has written a change. Actual
-        // legacy sink progress always carries an aggregate acknowledgement or snapshot completion too.
-        boolean hasAggregateProgress = aggregateAck != null || !completed.isEmpty();
-        if (priorPlan == null && allWriterIds.size() > 1 && hasAggregateProgress) {
-            throw new TapstateException(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS,
-                    Map.of("pipeline", pipelineId), null);
-        }
-
-        Document progress = nestedDocument(consumer, SINK_WRITER_PROGRESS, pipelineId, true);
-        for (Map.Entry<String, List<String>> entry : normalizedPlan.entrySet()) {
-            String table = entry.getKey();
-            List<String> writerIds = entry.getValue();
-            expected.append(table, writerIds);
-            for (String writerId : writerIds) {
-                Document writer = writerProgress(progress, pipelineId, writerId, table, true);
-                if (aggregateAck != null && sinkAckedFrom(writer) == null) {
-                    writePosition(writer, aggregateAck);
-                }
-                if (!writer.containsKey(WRITER_RING_DONE)
-                        && ringDone != null && ringDone.get(table) instanceof Number seq) {
-                    writer.put(WRITER_RING_DONE, seq.longValue());
-                }
-                if (completed.contains(table)) {
-                    writer.put(WRITER_SNAPSHOT_COMPLETE, true);
-                }
-            }
-        }
-        consumer.put(EXPECTED_SINK_WRITERS, expected);
+    static Document tableAckedBefore(Document key, String table, SourceOrder order) {
+        String epoch = SINK_ACKED_BY_TABLE + "." + table + ".epoch";
+        String seq = SINK_ACKED_BY_TABLE + "." + table + ".ringSeq";
+        return new Document(key).append("$or", List.of(
+                new Document(epoch, new Document("$not", new Document("$type", "number"))),
+                new Document(seq, new Document("$not", new Document("$type", "number"))),
+                new Document(epoch, new Document("$lt", order.epoch())),
+                new Document(epoch, order.epoch()).append(seq, new Document("$lt", order.seq()))));
     }
 
-    /** Advances one writer, then raises only the minimum every expected writer has reached. */
-    private static void advanceSinkWriter(
-            Document consumer,
-            String pipelineId,
-            String writerId,
-            String table,
-            ChainPosition position) {
-        writerId = storedKey(writerId, "sink writer id");
-        table = storedKey(table, TABLE);
-        requireExpectedWriter(consumer, pipelineId, writerId, table);
-        Document progress = nestedDocument(consumer, SINK_WRITER_PROGRESS, pipelineId, true);
-        Document writer = writerProgress(progress, pipelineId, writerId, table, true);
-        ChainPosition recorded = sinkAckedFrom(writer);
-        if (recorded == null || position.order().compareTo(recorded.order()) > 0) {
-            writePosition(writer, position);
-        }
-        if (position.order().seq() >= 0) {
-            Object raw = writer.get(WRITER_RING_DONE);
-            long done = raw instanceof Number number ? number.longValue() : Long.MIN_VALUE;
-            writer.put(WRITER_RING_DONE, Math.max(done, position.order().seq()));
-        }
-
-        ChainPosition derived = derivedSinkAck(consumer, pipelineId);
-        ChainPosition aggregate = sinkAckedFrom(consumer);
-        if (derived != null && (aggregate == null
-                || derived.order().compareTo(aggregate.order()) > 0)) {
-            writePosition(consumer, derived);
-        }
-        Long derivedRing = derivedRingDone(consumer, pipelineId, table);
-        if (derivedRing != null) {
-            Document aggregateRings = nestedDocument(consumer, PER_TABLE_RING_DONE, pipelineId, true);
-            Object raw = aggregateRings.get(table);
-            long done = raw instanceof Number number ? number.longValue() : Long.MIN_VALUE;
-            aggregateRings.put(table, Math.max(done, derivedRing));
-        }
+    /** The rest of the consumer at {@code key}: a last acked position for {@code table} at or after {@code order}. */
+    static Document tableAckedAtOrAfter(Document key, String table, SourceOrder order) {
+        String epoch = SINK_ACKED_BY_TABLE + "." + table + ".epoch";
+        String seq = SINK_ACKED_BY_TABLE + "." + table + ".ringSeq";
+        return new Document(key)
+                .append(seq, new Document("$type", "number"))
+                .append("$or", List.of(
+                        new Document(epoch, new Document("$gt", order.epoch())),
+                        new Document(epoch, order.epoch()).append(seq, new Document("$gte", order.seq()))));
     }
 
-    /** Records one snapshot confirmation and publishes completion only once all expected writers agree. */
-    private static void markSinkWriterSnapshotComplete(
-            Document consumer, String pipelineId, String writerId, String table) {
-        String storedWriterId = storedKey(writerId, "sink writer id");
-        String storedTable = storedKey(table, TABLE);
-        List<String> expected = requireExpectedWriter(consumer, pipelineId, storedWriterId, storedTable);
-        Document progress = nestedDocument(consumer, SINK_WRITER_PROGRESS, pipelineId, true);
-        writerProgress(progress, pipelineId, storedWriterId, storedTable, true)
-                .put(WRITER_SNAPSHOT_COMPLETE, true);
-        boolean complete = expected.stream().allMatch(expectedWriter -> {
-            Document writer = writerProgress(progress, pipelineId, expectedWriter, storedTable, false);
-            return writer != null && Boolean.TRUE.equals(writer.getBoolean(WRITER_SNAPSHOT_COMPLETE));
-        });
-        if (complete) {
-            List<String> completed = new ArrayList<>(snapshotCompletedFrom(consumer));
-            if (!completed.contains(storedTable)) {
-                completed.add(storedTable);
-                consumer.put(SNAPSHOT_COMPLETED_TABLES, completed);
-            }
-        }
-    }
-
-    /** Adds one direct snapshot-completion mark, answering whether the consumer changed. */
-    private static boolean markSnapshotComplete(Document consumer, String table) {
-        Objects.requireNonNull(table, TABLE);
-        List<String> completed = new ArrayList<>(snapshotCompletedFrom(consumer));
-        if (completed.contains(table)) {
-            return false;
-        }
-        completed.add(table);
-        consumer.put(SNAPSHOT_COMPLETED_TABLES, completed);
-        return true;
-    }
-
-    /** The persisted run identity beside sink progress; kept exact as a document-shape contract. */
-    static Document sinkAckFenceDocument(String pipelineId, WorkloadClaimFence fence) {
-        requirePipelineFence(pipelineId, fence);
-        return WorkloadClaimDocuments.stored(fence);
-    }
-
-    /** Binds later sink progress in this consumer to the exact run that configured its writer plan. */
-    private static void bindSinkAckFence(
-            Document consumer, String pipelineId, WorkloadClaimFence fence) {
-        consumer.put(SINK_ACK_FENCE, sinkAckFenceDocument(pipelineId, fence));
-    }
-
-    /** Whether this consumer is still bound to the run carrying the acknowledgement. */
-    private static boolean sinkAckFenceMatches(
-            Document consumer, String pipelineId, WorkloadClaimFence fence) {
-        Document expected = sinkAckFenceDocument(pipelineId, fence);
-        Object stored = consumer.get(SINK_ACK_FENCE);
-        if (stored == null) {
-            return false;
-        }
-        if (!(stored instanceof Document document)) {
-            throw unreadableConsumer(pipelineId, SINK_ACK_FENCE);
-        }
-        return expected.equals(document);
-    }
-
-    /** A sink fence is a submitted execution of this exact pipeline, never another workload type. */
-    private static void requirePipelineFence(String pipelineId, WorkloadClaimFence fence) {
-        Objects.requireNonNull(pipelineId, PIPELINE_ID);
-        Objects.requireNonNull(fence, "fence");
-        if (fence.key().type() != WorkloadClaimType.PIPELINE_ACTUATION
-                || !pipelineId.equals(fence.key().resourceId())
-                || fence.executionGeneration() < 1) {
-            throw new IllegalArgumentException(
-                    "a sink acknowledgement fence must name this pipeline's submitted execution");
-        }
-    }
-
-    /** The minimum ack across every writer-table subscription, or null while any has not acknowledged. */
-    private static ChainPosition derivedSinkAck(Document consumer, String pipelineId) {
-        Document expected = nestedDocument(consumer, EXPECTED_SINK_WRITERS, pipelineId, false);
-        Document progress = nestedDocument(consumer, SINK_WRITER_PROGRESS, pipelineId, false);
-        if (expected == null || expected.isEmpty() || progress == null) {
+    /** The order of the last acked position written for {@code table}, or null while none has been. */
+    private static SourceOrder tableAckedFrom(Document document, String table) {
+        Document byTable = document.get(SINK_ACKED_BY_TABLE, Document.class);
+        Document last = byTable == null ? null : byTable.get(table, Document.class);
+        if (last == null || !(last.get("epoch") instanceof Number epoch)
+                || !(last.get("ringSeq") instanceof Number seq)) {
             return null;
         }
-        ChainPosition lowest = null;
-        for (Map.Entry<String, Object> entry : expected.entrySet()) {
-            for (String writerId : writerIds(entry.getValue(), pipelineId, entry.getKey())) {
-                Document writer = writerProgress(progress, pipelineId, writerId, entry.getKey(), false);
-                ChainPosition acked = writer == null ? null : sinkAckedFrom(writer);
-                if (acked == null) {
-                    return null;
-                }
-                if (lowest == null || acked.order().compareTo(lowest.order()) < 0) {
-                    lowest = acked;
-                }
-            }
-        }
-        return lowest;
-    }
-
-    /** The minimum ring sequence for one table, or null while any expected writer has not reached it. */
-    private static Long derivedRingDone(Document consumer, String pipelineId, String table) {
-        Document expected = nestedDocument(consumer, EXPECTED_SINK_WRITERS, pipelineId, false);
-        Document progress = nestedDocument(consumer, SINK_WRITER_PROGRESS, pipelineId, false);
-        if (expected == null || progress == null) {
-            return null;
-        }
-        Long lowest = null;
-        for (String writerId : writerIds(expected.get(table), pipelineId, table)) {
-            Document writer = writerProgress(progress, pipelineId, writerId, table, false);
-            Object raw = writer == null ? null : writer.get(WRITER_RING_DONE);
-            if (!(raw instanceof Number seq)) {
-                return null;
-            }
-            lowest = lowest == null ? seq.longValue() : Math.min(lowest, seq.longValue());
-        }
-        return lowest;
-    }
-
-    /** Verifies that the writer plan names {@code writerId} for {@code table}. */
-    private static List<String> requireExpectedWriter(
-            Document consumer, String pipelineId, String writerId, String table) {
-        Document expected = nestedDocument(consumer, EXPECTED_SINK_WRITERS, pipelineId, false);
-        List<String> writers = expected == null
-                ? List.of()
-                : writerIds(expected.get(table), pipelineId, table);
-        if (!writers.contains(writerId)) {
-            throw new IllegalStateException("sink writer '" + writerId
-                    + "' is not configured to receive table '" + table + "'");
-        }
-        return writers;
-    }
-
-    /** Reads one expected-writer list, treating absence as no configured writers. */
-    private static List<String> writerIds(Object raw, String pipelineId, String table) {
-        if (raw == null) {
-            return List.of();
-        }
-        if (!(raw instanceof List<?> entries)) {
-            throw unreadableConsumer(pipelineId, EXPECTED_SINK_WRITERS + "." + table);
-        }
-        List<String> writers = new ArrayList<>();
-        for (Object entry : entries) {
-            if (!(entry instanceof String writerId)) {
-                throw unreadableConsumer(pipelineId, EXPECTED_SINK_WRITERS + "." + table);
-            }
-            writers.add(writerId);
-        }
-        return List.copyOf(writers);
-    }
-
-    /** Returns a nested document, creating it when requested and rejecting a malformed stored value. */
-    private static Document nestedDocument(
-            Document parent, String field, String pipelineId, boolean create) {
-        Object raw = parent.get(field);
-        if (raw instanceof Document document) {
-            return document;
-        }
-        if (raw != null) {
-            throw unreadableConsumer(pipelineId, field);
-        }
-        if (!create) {
-            return null;
-        }
-        Document document = new Document();
-        parent.put(field, document);
-        return document;
-    }
-
-    /** One writer's progress for one table inside the writer progress document. */
-    private static Document writerProgress(
-            Document progress,
-            String pipelineId,
-            String writerId,
-            String table,
-            boolean create) {
-        Document byTable = nestedDocument(progress, writerId, pipelineId, create);
-        return byTable == null ? null : nestedDocument(byTable, table, pipelineId, create);
-    }
-
-    /** Writes both ordered and resumable halves of a position into one document. */
-    private static void writePosition(Document document, ChainPosition position) {
-        document.put("sinkAckedEpoch", position.order().epoch());
-        document.put("sinkAckedSeq", position.order().seq());
-        if (position.token() == null) {
-            document.remove("sinkAckedSrcpos");
-        } else {
-            document.put("sinkAckedSrcpos", position.token());
-        }
-    }
-
-    /** A dynamic Mongo document key must remain one field rather than becoming a dotted path. */
-    private static String storedKey(String value, String what) {
-        Objects.requireNonNull(value, what);
-        if (value.isBlank() || value.indexOf('.') >= 0 || value.startsWith("$")) {
-            throw new IllegalArgumentException(what + " must be a non-blank Mongo field name, got '" + value + "'");
-        }
-        return value;
-    }
-
-    private static TapstateException unreadableConsumer(String pipelineId, String field) {
-        return new TapstateException(IoError.DOCUMENT_UNREADABLE,
-                Map.of("id", pipelineId, "field", field), null);
+        return new SourceOrder(epoch.longValue(), seq.longValue());
     }
 
     @Override
     public void setCdcStart(
             String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch) {
-        Objects.requireNonNull(pipelineId, PIPELINE_ID);
+        Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(cdcStartPosition, "cdcStartPosition");
         if (snapshotEpoch < 0) {
             throw new IllegalArgumentException("snapshotEpoch must not be negative, got " + snapshotEpoch);
@@ -1005,40 +912,15 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         updateConsumer(miningChainId, pipelineId, snapshotCompleteUpdate(pipelineId, table));
     }
 
+    /** The fenced form of the snapshot mark, under the same condition as the fenced advance. */
     @Override
-    public void markSnapshotComplete(
-            String miningChainId, String pipelineId, String table, WorkloadClaimFence fence) {
-        mutateConsumer(miningChainId, pipelineId, fence, consumer -> {
-            if (!sinkAckFenceMatches(consumer, pipelineId, fence)) {
-                return false;
-            }
-            return markSnapshotComplete(consumer, table);
-        });
-    }
-
-    @Override
-    public void markSinkWriterSnapshotComplete(
-            String miningChainId, String pipelineId, String writerId, String table) {
-        mutateConsumer(miningChainId, pipelineId, consumer -> {
-            markSinkWriterSnapshotComplete(consumer, pipelineId, writerId, table);
-            return true;
-        });
-    }
-
-    @Override
-    public void markSinkWriterSnapshotComplete(
-            String miningChainId,
-            String pipelineId,
-            String writerId,
-            String table,
+    public boolean markSnapshotComplete(String miningChainId, String pipelineId, String table,
             WorkloadClaimFence fence) {
-        mutateConsumer(miningChainId, pipelineId, fence, consumer -> {
-            if (!sinkAckFenceMatches(consumer, pipelineId, fence)) {
-                return false;
-            }
-            markSinkWriterSnapshotComplete(consumer, pipelineId, writerId, table);
-            return true;
-        });
+        Document update = snapshotCompleteUpdate(pipelineId, table);
+        migrateLegacyConsumers(miningChainId, true);
+        Document key = consumerKey(miningChainId, pipelineId);
+        return fencedConsumerWrite(miningChainId, pipelineId, fence,
+                session -> consumers.updateOne(session, key, update)).isPresent();
     }
 
     /**
@@ -1051,14 +933,14 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * never done. An upsert creates the consumer entry when the pipeline has none and touches nothing else.
      */
     static Document snapshotCompleteUpdate(String pipelineId, String table) {
-        Objects.requireNonNull(pipelineId, PIPELINE_ID);
-        Objects.requireNonNull(table, TABLE);
-        return new Document("$addToSet", new Document(SNAPSHOT_COMPLETED_TABLES, table));
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(table, "table");
+        return new Document("$addToSet", new Document("snapshotCompletedTables", table));
     }
 
     @Override
     public List<String> miningChainIdsWithConsumer(String pipelineId) {
-        Objects.requireNonNull(pipelineId, PIPELINE_ID);
+        Objects.requireNonNull(pipelineId, "pipelineId");
         // Include both shapes during the lazy migration window. Only ids are read, so enumeration never
         // reconstructs a cursor and a corrupt cursor cannot prevent a departing pipeline from detaching.
         LinkedHashSet<String> chains = new LinkedHashSet<>();
@@ -1066,7 +948,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                 .projection(Projections.include("_id"))
                 .map(document -> document.getString("_id"))
                 .into(chains));
-        StoreIo.call(() -> consumers.find(new Document(PIPELINE_ID, pipelineId))
+        StoreIo.call(() -> consumers.find(new Document("pipelineId", pipelineId))
                 .projection(Projections.include("miningChainId"))
                 .map(document -> document.getString("miningChainId"))
                 .into(chains));
@@ -1094,7 +976,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     @Override
     public void detachConsumer(String miningChainId, String pipelineId) {
         Objects.requireNonNull(miningChainId, "miningChainId");
-        Objects.requireNonNull(pipelineId, PIPELINE_ID);
+        Objects.requireNonNull(pipelineId, "pipelineId");
         // A detach is idempotent, so an absent chain is already the requested end state. Migration still
         // runs when the chain exists, preserving every other legacy cursor before this one is removed.
         // Its transaction also serializes any older migration snapshot before the delete, so no durable
@@ -1109,7 +991,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * so the dotted path addresses exactly one field and cannot reach into a neighbouring consumer's.
      */
     static Document consumerPresenceFilter(String pipelineId) {
-        Objects.requireNonNull(pipelineId, PIPELINE_ID);
+        Objects.requireNonNull(pipelineId, "pipelineId");
         return new Document("consumerOffsets." + pipelineId, new Document("$exists", true));
     }
 
@@ -1137,85 +1019,50 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     /**
-     * Writes one split consumer document after moving any embedded predecessors out of the chain record.
-     * The identity fields are insert-only so a partial update can create the cursor without replacing a
-     * different facet written concurrently by the same pipeline.
+     * Writes one split consumer document after moving any embedded predecessors out of the chain record: where
+     * it stands, in one write of its own, when it is already there, and otherwise on the fenced path, which may
+     * create it. The identity fields are insert-only so a partial update can create the cursor without replacing
+     * a different facet written concurrently by the same pipeline.
      */
     private void updateConsumer(String miningChainId, String pipelineId, Document update) {
         Objects.requireNonNull(miningChainId, "miningChainId");
-        Objects.requireNonNull(pipelineId, PIPELINE_ID);
+        Objects.requireNonNull(pipelineId, "pipelineId");
         migrateLegacyConsumers(miningChainId, true);
+        Document key = consumerKey(miningChainId, pipelineId);
+        if (updateExistingConsumer(miningChainId, key, update)) {
+            return;
+        }
         update.append("$setOnInsert", consumerIdentity(miningChainId, pipelineId));
         writeConsumer(miningChainId, session -> consumers.updateOne(session,
-                consumerKey(miningChainId, pipelineId), update, new UpdateOptions().upsert(true)));
+                key, update, new UpdateOptions().upsert(true)));
     }
 
     /**
-     * Mutates one complete split consumer document in the same fenced transaction as every other cursor
-     * write. Writer progress is a function of several nested values, so a path update cannot derive it;
-     * replacing the document inside the transaction lets concurrent writers conflict and retry from the
-     * latest complete state instead of losing one another's acknowledgement.
+     * Applies {@code update} to the consumer document {@code filter} finds, in one write that holds nothing once
+     * it has returned, and answers whether it found one. It never creates one, and that is why it needs no fence
+     * against a drop of the chain: a drop before it leaves it nothing to find, a drop after it takes what it
+     * wrote, and a drop under way when it arrives is waited for and leaves it nothing either - so nothing it does
+     * can bring back a cursor a drop took away.
      */
-    private void mutateConsumer(
-            String miningChainId, String pipelineId, ConsumerDocumentMutation mutation) {
-        mutateConsumer(miningChainId, pipelineId, null, mutation);
-    }
-
-    private void mutateConsumer(
-            String miningChainId,
-            String pipelineId,
-            WorkloadClaimFence fence,
-            ConsumerDocumentMutation mutation) {
-        Objects.requireNonNull(miningChainId, "miningChainId");
-        Objects.requireNonNull(pipelineId, PIPELINE_ID);
-        migrateLegacyConsumers(miningChainId, true);
-        writeConsumer(miningChainId, fence, session -> {
-            Document key = consumerKey(miningChainId, pipelineId);
-            Document consumer = consumers.find(session, key).first();
-            if (consumer == null) {
-                consumer = new Document(key);
-                consumer.putAll(consumerIdentity(miningChainId, pipelineId));
-            }
-            if (mutation.apply(consumer)) {
-                consumers.replaceOne(session, key, consumer, new ReplaceOptions().upsert(true));
-            }
-        });
-    }
-
-    @FunctionalInterface
-    private interface ConsumerDocumentMutation {
-        boolean apply(Document consumer);
+    private boolean updateExistingConsumer(String miningChainId, Document filter, Document update) {
+        return StoreIo.call(miningChainId, () -> consumers.updateOne(filter, update)).getMatchedCount() > 0;
     }
 
     /**
-     * Checks the root and writes one split cursor as a single lifecycle operation. The revision increment
-     * deliberately writes the root rather than merely reading it: a concurrent {@link #dropChain(String)}
-     * then conflicts on that document, so MongoDB serializes the two transactions. If the drop wins, a
-     * retry finds no root and refuses the mutation; if this write wins, the later drop removes its cursor.
+     * Checks the root and writes one split cursor - one the write may create - as a single lifecycle operation.
+     * The revision increment deliberately writes the root rather than merely reading it: a concurrent
+     * {@link #dropChain(String)} then conflicts on that document, so MongoDB serializes the two transactions.
+     * If the drop wins, a retry finds no root and refuses the mutation; if this write wins, the later drop
+     * removes its cursor.
      */
     private void writeConsumer(String miningChainId, ConsumerWrite write) {
-        writeConsumer(miningChainId, null, write);
-    }
-
-    /**
-     * The claim proof, root lifecycle fence and consumer write are one transaction. Proving the claim is a
-     * write, so a concurrent takeover conflicts with it; whichever commits first decides whether the sink
-     * effect belongs to the old run or is silently ignored as stale.
-     */
-    private void writeConsumer(
-            String miningChainId, WorkloadClaimFence fence, ConsumerWrite write) {
         StoreIo.run(miningChainId, () -> {
             try (ClientSession session = client.startSession()) {
                 session.withTransaction(() -> {
-                    if (fence != null && workloadClaims.updateOne(
-                            session, WorkloadClaimDocuments.live(fence), PROVE_SINK_CLAIM)
-                            .getMatchedCount() != 1) {
-                        return null;
-                    }
-                    UpdateResult rooted = collection.updateOne(session,
+                    UpdateResult fenced = collection.updateOne(session,
                             new Document("_id", miningChainId),
                             new Document("$inc", new Document(CONSUMER_WRITE_REVISION, 1L)));
-                    if (rooted.getMatchedCount() == 0) {
+                    if (fenced.getMatchedCount() == 0) {
                         throw unseededChain(miningChainId);
                     }
                     write.apply(session);
@@ -1228,6 +1075,94 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     @FunctionalInterface
     private interface ConsumerWrite {
         void apply(ClientSession session);
+    }
+
+    /**
+     * Makes {@code write} only while {@code fence} is the live claim and the pipeline's cursor on the chain is
+     * bound to {@code fence}'s run, in one transaction, and answers what the write answered - empty where the
+     * fence did not hold, and where the write itself answered nothing.
+     *
+     * <p>Proving the claim is a write to it, so a takeover that commits first leaves this nothing to prove, and
+     * one that commits after it waits for this to finish: an acknowledgement already in flight when ownership
+     * changes lands before the change or not at all. It holds nothing of the chain's own, only this pipeline's
+     * claim and cursor, so a member killed halfway through one leaves nothing another pipeline waits on, and
+     * what it left open is ended with the rest of what that member left.
+     *
+     * <p>A binding that is not a document is a damaged record: reported, and never replaced by an
+     * acknowledgement.
+     */
+    private <T> Optional<T> fencedConsumerWrite(String miningChainId, String pipelineId, WorkloadClaimFence fence,
+            java.util.function.Function<ClientSession, T> write) {
+        Document bound = sinkAckFenceDocument(pipelineId, fence);
+        Document key = consumerKey(miningChainId, pipelineId);
+        return StoreIo.call(miningChainId, () -> {
+            try (ClientSession session = client.startSession()) {
+                return session.withTransaction(() -> {
+                    if (!provesClaim(session, fence)) {
+                        return Optional.<T>empty();
+                    }
+                    Document cursor = consumers.find(session, key)
+                            .projection(Projections.include(SINK_ACK_FENCE)).first();
+                    if (cursor == null || !boundTo(cursor, bound)) {
+                        return Optional.<T>empty();
+                    }
+                    if (!bound.equals(cursor.get(SINK_ACK_FENCE))) {
+                        // The same run, proved under the topology its holder has taken the claim again under
+                        // since the run was bound: the binding records the claim as it now stands.
+                        consumers.updateOne(session, key, new Document("$set", new Document(SINK_ACK_FENCE, bound)));
+                    }
+                    return Optional.ofNullable(write.apply(session));
+                });
+            }
+        });
+    }
+
+    /** Whether {@code fence} is the live claim, by a write to it, inside {@code session}'s transaction. */
+    private boolean provesClaim(ClientSession session, WorkloadClaimFence fence) {
+        return workloadClaims.updateOne(session, WorkloadClaimDocuments.live(fence), PROVE_SINK_CLAIM)
+                .getMatchedCount() == 1;
+    }
+
+    /**
+     * Whether {@code cursor} is bound to the run {@code bound} names. The topology the claim was last taken under
+     * is not part of the run: a member joining has the holder take the same claim again, with the same
+     * generations, under the new revision, and the run it carries goes on.
+     */
+    private static boolean boundTo(Document cursor, Document bound) {
+        Object stored = cursor.get(SINK_ACK_FENCE);
+        if (stored == null) {
+            return false;
+        }
+        if (!(stored instanceof Document binding)) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", String.valueOf(cursor.get("_id")), "field", SINK_ACK_FENCE), null);
+        }
+        Document storedRun = new Document(binding);
+        Document boundRun = new Document(bound);
+        storedRun.remove(TOPOLOGY_REVISION);
+        boundRun.remove(TOPOLOGY_REVISION);
+        return boundRun.equals(storedRun);
+    }
+
+    /** The field of a stored claim the run's identity leaves out. */
+    private static final String TOPOLOGY_REVISION = "topologyRevision";
+
+    /** The persisted run identity beside sink progress; kept exact as a document-shape contract. */
+    static Document sinkAckFenceDocument(String pipelineId, WorkloadClaimFence fence) {
+        requirePipelineFence(pipelineId, fence);
+        return WorkloadClaimDocuments.stored(fence);
+    }
+
+    /** A sink fence is a submitted execution of this exact pipeline, never another workload type. */
+    private static void requirePipelineFence(String pipelineId, WorkloadClaimFence fence) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(fence, "fence");
+        if (fence.key().type() != WorkloadClaimType.PIPELINE_ACTUATION
+                || !pipelineId.equals(fence.key().resourceId())
+                || fence.executionGeneration() < 1) {
+            throw new IllegalArgumentException(
+                    "a sink acknowledgement fence must name this pipeline's submitted execution");
+        }
     }
 
     /**
@@ -1345,10 +1280,10 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         List<Document> split = StoreIo.call(() -> consumers.find(consumersOfChain(miningChainId))
                 .into(new ArrayList<>()));
         for (Document document : split) {
-            String pipelineId = document.getString(PIPELINE_ID);
+            String pipelineId = document.getString("pipelineId");
             if (pipelineId == null) {
                 throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
-                        Map.of("id", String.valueOf(document.get("_id")), "field", PIPELINE_ID), null);
+                        Map.of("id", String.valueOf(document.get("_id")), "field", "pipelineId"), null);
             }
             merged.put(pipelineId, consumerFromDocument(pipelineId, document));
         }
@@ -1358,14 +1293,14 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     /** The collision-free id of one cursor document; chain roots keep scalar string ids. */
     private static Document consumerKey(String miningChainId, String pipelineId) {
         Objects.requireNonNull(miningChainId, "miningChainId");
-        Objects.requireNonNull(pipelineId, PIPELINE_ID);
+        Objects.requireNonNull(pipelineId, "pipelineId");
         return new Document("_id", new Document("chain", miningChainId).append("pipeline", pipelineId));
     }
 
     /** Fields every split cursor carries so both lookup directions can use declared indexes. */
     private static Document consumerIdentity(String miningChainId, String pipelineId) {
         return new Document("miningChainId", miningChainId)
-                .append(PIPELINE_ID, pipelineId);
+                .append("pipelineId", pipelineId);
     }
 
     /** One full split cursor document, used by replacement writes. */
@@ -1516,7 +1451,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * two position writers create it without this field.
      */
     private static List<String> snapshotCompletedFrom(Document document) {
-        Object raw = document.get(SNAPSHOT_COMPLETED_TABLES);
+        Object raw = document.get("snapshotCompletedTables");
         List<String> completed = new ArrayList<>();
         if (raw instanceof List<?> entries) {
             for (Object entry : entries) {
@@ -1603,7 +1538,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         }
         Document document = new Document("perTableSeq", perTable);
         if (!offset.snapshotCompletedTables().isEmpty()) {
-            document.append(SNAPSHOT_COMPLETED_TABLES, List.copyOf(offset.snapshotCompletedTables()));
+            document.append("snapshotCompletedTables", List.copyOf(offset.snapshotCompletedTables()));
         }
         if (offset.cdcStartPosition() != null) {
             document.append("cdcStartPosition", offset.cdcStartPosition());

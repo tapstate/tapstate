@@ -2887,7 +2887,7 @@ final class Repl {
                     out.println();
                     out.println(pipelineHeadline(pipeline, listed.members().size()));
                     for (RemoteVertex vertex : pipeline.vertices()) {
-                        out.println("  " + cell(vertex.name()) + "  " + where(vertex));
+                        out.println("  " + cell(vertex.name()) + "  " + where(vertex) + backlogOf(vertex));
                     }
                 }
             }
@@ -2968,6 +2968,18 @@ final class Repl {
         return line.toString();
     }
 
+    /**
+     * The rows queued into one vertex's processors between them, where any are: what a vertex that has fallen
+     * behind shows first. Nothing is printed where none are queued or nothing was read, so a line that says
+     * nothing about a backlog is a vertex keeping up or one not yet measured, as the headline's measured-from
+     * count says.
+     */
+    private static String backlogOf(RemoteVertex vertex) {
+        long queued = vertex.processors().stream()
+                .map(RemoteProcessor::backlog).filter(java.util.Objects::nonNull).mapToLong(Long::longValue).sum();
+        return queued > 0 ? "  backlog " + queued : "";
+    }
+
     /** Where one vertex's work is, by the node names a reader can act on; the count when it has none. */
     private static String where(RemoteVertex vertex) {
         List<String> nodes = new ArrayList<>();
@@ -3009,8 +3021,22 @@ final class Repl {
             for (RemoteProcessor processor : vertex.processors()) {
                 Map<String, Object> one = new LinkedHashMap<>();
                 putIfPresent(one, "index", processor.index());
+                putIfPresent(one, "localIndex", processor.localIndex());
                 putIfPresent(one, "memberUuid", processor.memberUuid());
                 putIfPresent(one, "nodeId", processor.nodeId());
+                putIfPresent(one, "backlog", processor.backlog());
+                if (!processor.frontierGaps().isEmpty()) {
+                    one.put("frontierGaps", new java.util.TreeMap<>(processor.frontierGaps()));
+                }
+                if (!processor.frontierStalledMillis().isEmpty()) {
+                    one.put("frontierStalledMillis", new java.util.TreeMap<>(processor.frontierStalledMillis()));
+                }
+                if (!processor.queuedByStream().isEmpty()) {
+                    one.put("queuedByStream", new java.util.TreeMap<>(processor.queuedByStream()));
+                }
+                if (!processor.inFlightByTable().isEmpty()) {
+                    one.put("inFlightByTable", new java.util.TreeMap<>(processor.inFlightByTable()));
+                }
                 processors.add(one);
             }
             entry.put("processors", processors);
@@ -3843,9 +3869,9 @@ final class Repl {
 
     /**
      * {@code snapshot <pipeline-id>} — reads the pipeline's per-table initial-load progress and prints one
-     * {@code <table>  <rowsDone>/<rowsTotal> (<pct>%)} line per table in name order (a table with no total
-     * shows {@code <rowsDone>/?} — honest partial data), or a benign {@code no snapshot} line when there is
-     * none. A coded refusal renders its code and message.
+     * {@code <table>  <rowsDone>/<rowsTotal> (<pct>%)  landed|landing} line per table in name order (a table with
+     * no total shows {@code <rowsDone>/?} — honest partial data), or a benign {@code no snapshot} line when there
+     * is none. A coded refusal renders its code and message.
      */
     private int snapshotOnline(List<String> words) {
         String id = readTargetId(words);
@@ -4209,13 +4235,18 @@ final class Repl {
 
     /**
      * One table's snapshot progress: {@code rowsDone/rowsTotal (donePct%)} when the total is known, or
-     * {@code rowsDone/?} when it is unavailable — honest partial data, never faked as a percentage.
+     * {@code rowsDone/?} when it is unavailable — honest partial data, never faked as a percentage. Then
+     * {@code landed} once the target has durably confirmed the whole load, or {@code landing} while it has not;
+     * neither from a server that does not say.
      */
     private static String renderProgress(RemoteTableSnapshot progress) {
-        if (progress.rowsTotal() != null && progress.donePct() != null) {
-            return progress.rowsDone() + "/" + progress.rowsTotal() + " (" + progress.donePct() + "%)";
+        String counted = progress.rowsTotal() != null && progress.donePct() != null
+                ? progress.rowsDone() + "/" + progress.rowsTotal() + " (" + progress.donePct() + "%)"
+                : progress.rowsDone() + "/?";
+        if (progress.landed() == null) {
+            return counted;
         }
-        return progress.rowsDone() + "/?";
+        return counted + (progress.landed() ? "  landed" : "  landing");
     }
 
     /**
@@ -5117,6 +5148,71 @@ final class Repl {
             out.println("  pending    " + answer.pending().reason());
         }
         answer.cannotSay().forEach(unanswerable -> out.println("  cannot say " + unanswerable));
+        if (answer.plan() != null) {
+            renderPlan(out, answer.plan());
+        }
+        if (!answer.awaitingRebalance().isEmpty()) {
+            out.println("  awaiting   " + String.join(", ", answer.awaitingRebalance())
+                    + " -- joined after this run was planned; given no part of it until a rebalance");
+        }
+    }
+
+    /**
+     * How wide the pipeline's current run was planned to run, node by node, and why, as the server sent it: the
+     * run the plan belongs to, then per node the width it runs at and how that is spread, the target it was given
+     * and where that came from, why the width is not the target where it is not, and the batch it takes its
+     * input in. Nothing is worked out here; a generation the run does not have is left out rather than shown as 0.
+     */
+    private static void renderPlan(PrintWriter out, ExplainOutcome.Plan plan) {
+        List<String> run = new ArrayList<>();
+        if (plan.executionGeneration() != null) {
+            run.add("execution " + plan.executionGeneration());
+        }
+        if (plan.claimGeneration() != null) {
+            run.add("claim " + plan.claimGeneration());
+        }
+        if (plan.topologyRevision() != null) {
+            run.add("topology " + plan.topologyRevision());
+        }
+        out.println("  planned    " + plan.plannedAt() + " on " + String.join(", ", plan.members())
+                + (run.isEmpty() ? "" : " (" + String.join(", ", run) + ")"));
+        if (plan.replaces() != null) {
+            out.println("  replaced   " + (plan.replaces().executionGeneration() == null ? "the run"
+                    : "execution " + plan.replaces().executionGeneration()) + " planned " + plan.replaces().plannedAt()
+                    + " on " + String.join(", ", plan.replaces().members()));
+        }
+        plan.nodes().forEach(node -> {
+            out.println("  width      " + node.node() + "  " + width(node));
+            if (node.resources() != null) {
+                out.println("  resources  " + node.node() + "  " + resources(node.resources()));
+            }
+        });
+    }
+
+    private static String resources(ExplainOutcome.PlanResources resources) {
+        return resources.writers() + (resources.writers() == 1 ? " writer, " : " writers, ")
+                + resources.connectorInstances() + " " + resources.connectorMode()
+                + (resources.connectorInstances() == 1 ? " connector" : " connectors")
+                + "; at most " + resources.bufferedRecords() + " records buffered and "
+                + resources.edgeQueueRecords() + " queued";
+    }
+
+    private static String width(ExplainOutcome.PlanNode node) {
+        String spread = node.computedLocal() == null
+                ? "one processor for the cluster"
+                : node.computedLocal() + " per member on " + node.memberCount()
+                        + (node.memberCount() == 1 ? " member" : " members");
+        return node.effective() + " in all (" + spread + "), requested " + node.requested()
+                + " (" + node.requestedOrigin() + ")"
+                + (node.reasons().isEmpty() ? "" : " -- " + String.join(", ", node.reasons()))
+                + "; batch " + node.maxRecords() + " records, " + node.maxWaitMillis() + "ms wait"
+                + (node.change() == null ? "" : "; " + changed(node.change()));
+    }
+
+    /** How a node's width moved from the run before, and what moved it where the server could say. */
+    private static String changed(ExplainOutcome.PlanChange change) {
+        return "was " + change.previousEffective()
+                + (change.causes().isEmpty() ? "" : " (" + String.join(", ", change.causes()) + ")");
     }
 
     private static String evidenceValue(Object value) {

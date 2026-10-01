@@ -1,11 +1,16 @@
 package io.tapstate.app;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -241,6 +246,124 @@ class ClusterRebuildAdmissionTest {
     }
 
     /**
+     * A run refused before it started because a member joined between its plan and its start ran nothing,
+     * so its death is not the pipeline's own - and a joining member is exactly what the departure reading
+     * above rightly ignores. Without its own answer such a run stays failed for a person over the moment it
+     * happened to be submitted in; with it, the run is rebuilt against the members present, and only within
+     * the same budget every rebuild is held to.
+     */
+    @Test
+    void aRunRefusedForAChangedMembershipBeforeItStartedIsRebuiltWithinTheBudget() {
+        ClusterRebuildAdmission afterARefusedStart = new ClusterRebuildAdmission(
+                ownership, pipelineId -> true, BACKOFF, DETECTION, nanos::get);
+        committed(7, "node-a", "node-b");
+        submitRunUnder(7);
+        committed(8, "node-a", "node-b", "node-c");
+
+        assertThat(afterARefusedStart.admits("orders")).isTrue();
+        for (int attempt = 1; attempt < ClusterRebuildAdmission.MAX_ATTEMPTS; attempt++) {
+            nanos.addAndGet(BACKOFF.toNanos());
+            assertThat(afterARefusedStart.admits("orders")).as("attempt %s", attempt + 1).isTrue();
+        }
+        nanos.addAndGet(BACKOFF.toNanos());
+        assertThat(afterARefusedStart.admits("orders"))
+                .as("the budget is spent: a start refused over and over is left for a person")
+                .isFalse();
+    }
+
+    /**
+     * The second half of what this class was reported for. A member that restarted took over a run another boot
+     * of it had submitted, and every start it made was refused with a code before it took a run of its own.
+     * Judged by the run the claim still named - inherited, so admitted - each refusal spent a rebuild, and the
+     * pipeline was started into the same refusal until the budget ran out.
+     */
+    @Test
+    void aStartRefusedBeforeItTookARunIsNotRebuiltAsTheRunItTookOver() {
+        committed(7, "node-a", "node-b");
+        submitRunUnder(7);
+        claims.elapse(TTL.plusSeconds(1));
+        nanos.addAndGet(RENEW.toNanos());
+        PipelineActuationOwnership restarted = new PipelineActuationOwnership(
+                "cluster-a", new WorkloadOwner("node-a", "boot-a-restarted"), membership,
+                new ClusterWorkloadClaims(claims, membership), TTL, RENEW, nanos::get);
+        assertThat(restarted.permit("orders").granted()).isTrue();
+        ClusterRebuildAdmission afterRestart = new ClusterRebuildAdmission(restarted, BACKOFF, DETECTION, nanos::get);
+
+        List<String> logged = loggedBy(() -> {
+            restarted.startRefusedBeforeItsRun("orders");
+            for (int pass = 0; pass <= ClusterRebuildAdmission.MAX_ATTEMPTS; pass++) {
+                assertThat(afterRestart.admits("orders"))
+                        .as("pass %s: the start was refused, and no member leaving answers for that", pass)
+                        .isFalse();
+                nanos.addAndGet(BACKOFF.toNanos());
+            }
+        });
+
+        assertThat(logged).hasSize(1).allSatisfy(line -> assertThat(line).contains("orders")
+                .contains("its last start was refused before it took a run"));
+    }
+
+    /**
+     * A departure's rebuilds are for the runs it ends. A replacement refused before it took a run was ended by
+     * its refusal alone, so it spends none of them, and the next run that does start and is then cut short by a
+     * member leaving has the whole budget.
+     */
+    @Test
+    void aReplacementRefusedBeforeItTookARunDoesNotSpendTheDeparturesRebuilds() {
+        committed(7, "node-a", "node-b");
+        submitRunUnder(7);
+        committed(8, "node-a");
+        assertThat(admission.admits("orders")).as("node-b left under the run").isTrue();
+
+        ownership.startRefusedBeforeItsRun("orders");
+        nanos.addAndGet(BACKOFF.toNanos());
+        assertThat(admission.admits("orders"))
+                .as("the replacement was refused before it took a run, with node-b still gone")
+                .isFalse();
+
+        // Somebody clears what refused it and starts the pipeline, and that run is cut short by a member leaving.
+        committed(9, "node-a", "node-c");
+        submitRunUnder(9);
+        committed(10, "node-a");
+        List<String> logged = loggedBy(() -> assertThat(admission.admits("orders")).isTrue());
+        assertThat(logged).hasSize(1).allSatisfy(line -> assertThat(line).contains("attempt 1 of 3"));
+    }
+
+    /**
+     * The engine keeps the failure of the run it last refused. A start refused before it took a run leaves that
+     * record where it is, about the run before - which says nothing of this refusal and must not admit it.
+     */
+    @Test
+    void aStartRefusedBeforeItTookARunIsNotTakenForTheRunAChangedMembershipRefused() {
+        ClusterRebuildAdmission afterARefusedStart = new ClusterRebuildAdmission(
+                ownership, pipelineId -> true, BACKOFF, DETECTION, nanos::get);
+        committed(7, "node-a", "node-b");
+        submitRunUnder(7);
+        committed(8, "node-a", "node-b", "node-c");
+        assertThat(afterARefusedStart.admits("orders")).as("the engine refused the run for its members").isTrue();
+
+        ownership.startRefusedBeforeItsRun("orders");
+        nanos.addAndGet(BACKOFF.toNanos());
+
+        assertThat(afterARefusedStart.admits("orders"))
+                .as("what failed now is the replacement's own refusal, not the run the engine refused")
+                .isFalse();
+    }
+
+    @Test
+    void theRefusalIsReadOffItsCodeWhetherTheCauseOrOnlyItsRenderingSurvived() {
+        io.tapstate.core.common.TapstateException refused = new io.tapstate.core.common.TapstateException(
+                io.tapstate.runtime.engine.EngineError.MEMBERSHIP_CHANGED_BEFORE_START,
+                java.util.Map.of("pipeline", "orders", "planned", 2, "actual", 3), null);
+
+        assertThat(ClusterRebuildAdmission.isMembershipChangedBeforeStart(refused)).isTrue();
+        assertThat(ClusterRebuildAdmission.isMembershipChangedBeforeStart(
+                new RuntimeException("com.hazelcast.jet.JetException: " + refused))).isTrue();
+        assertThat(ClusterRebuildAdmission.isMembershipChangedBeforeStart(
+                new RuntimeException("connector refused the write"))).isFalse();
+    }
+
+    /**
      * How a member actually leaves a running cluster: the committed set keeps naming it, because that
      * set only ever grows, and what changes is who this member can see. Asked of the committed set, the
      * departure never shows -- and a run whose driver survived the loss of another member it was running
@@ -328,6 +451,25 @@ class ClusterRebuildAdmissionTest {
                 .isFalse();
         nanos.addAndGet(BACKOFF.multipliedBy(10).toNanos());
         assertThat(admission.admits("orders")).isFalse();
+    }
+
+    @Test
+    void aPipelineCreatedUnderTheIdOfOneThatSpentItsBudgetGetsABudgetOfItsOwn() {
+        committed(7, "node-a", "node-b");
+        submitRunUnder(7);
+        committed(8, "node-a");
+        for (int attempt = 0; attempt < ClusterRebuildAdmission.MAX_ATTEMPTS; attempt++) {
+            assertThat(admission.admits("orders")).as("attempt " + attempt).isTrue();
+            nanos.addAndGet(BACKOFF.toNanos());
+        }
+        assertThat(admission.admits("orders")).isFalse();
+
+        // Deleted, and created again under the same id before the departure that spent the budget is over.
+        admission.retain(List.of());
+
+        assertThat(admission.admits("orders"))
+                .as("what a deleted pipeline spent is not the budget of the one created under its id")
+                .isTrue();
     }
 
     /**
@@ -429,6 +571,187 @@ class ClusterRebuildAdmissionTest {
                 .isTrue();
     }
 
+    /**
+     * A member that takes a pipeline back judges the run the claim carries now, not the one it submitted
+     * itself before it lost the claim.
+     *
+     * <p>What a three-machine run found: a member submitted a run while a third member was still joining,
+     * so that run was planned over two members. Its lease ran out while it was busy starting the run, and
+     * the member that picked the pipeline up replaced the run with one planned over all three. When that
+     * driver was killed, the first member took the claim back and still compared who is in sight against
+     * its own older run - which never included the killed member - so nothing it was planned over had
+     * gone, and the pipeline was left failed for a person with nothing in any log saying why.
+     */
+    @Test
+    void aTakeoverJudgesTheRunTheClaimCarriesRatherThanAnOlderOneThisMemberSubmitted() {
+        // node-c is committed but not in sight yet, so the run this member submits is planned over two.
+        membership.install(new ClusterMembership("cluster-a", 7, Set.of("node-a", "node-b", "node-c")));
+        membership.canCommit(Set.of("node-a", "node-b"));
+        assertThat(ownership.permit("orders").granted()).isTrue();
+        assertThat(ownership.beginExecution("orders").allowed()).isTrue();
+        membership.canCommit(Set.of("node-a", "node-b", "node-c"));
+
+        // This member's lease runs out while it is busy, and node-c replaces the run with one over all three.
+        claims.elapse(TTL.plusSeconds(1));
+        nanos.addAndGet(RENEW.toNanos());
+        PipelineActuationOwnership nodeC = new PipelineActuationOwnership(
+                "cluster-a", new WorkloadOwner("node-c", "boot-c"), membership,
+                new ClusterWorkloadClaims(claims, membership), TTL, RENEW, nanos::get);
+        assertThat(nodeC.permit("orders").granted()).isTrue();
+        assertThat(nodeC.beginExecution("orders").allowed()).isTrue();
+        assertThat(ownership.permit("orders").granted())
+                .as("this member no longer drives the pipeline").isFalse();
+
+        // node-c is killed: it goes out of sight, its lease runs out, and this member takes the pipeline back.
+        membership.canCommit(Set.of("node-a", "node-b"));
+        claims.elapse(TTL.plusSeconds(1));
+        nanos.addAndGet(RENEW.toNanos());
+        PipelineActuationOwnership.Permit taken = ownership.permit("orders");
+        assertThat(taken.granted()).isTrue();
+        assertThat(taken.claim().executionNodeIds())
+                .as("the run the claim carries is node-c's, planned over all three")
+                .containsExactlyInAnyOrder("node-a", "node-b", "node-c");
+
+        // That run died with node-c, and its failure is recorded under the claim this member holds now.
+        admission.recordFailure("orders");
+
+        assertThat(admission.admits("orders"))
+                .as("node-c carried part of the run this claim carries and is gone; the run this member "
+                        + "planned before node-c was in sight is not the run that died")
+                .isTrue();
+    }
+
+    /**
+     * The other half: taking the claim back is not by itself a sign the run is somebody else's. A member
+     * joining moves the committed revision, and every holder takes its claim once more under the new one -
+     * the same owner, so the same generation, still carrying the run it submitted. Forgetting what that run
+     * was planned over there would make its every death read as inherited, and a member starting up would
+     * restart a connector defect that happened to die around then.
+     */
+    @Test
+    void aRunThisMemberTakesBackUnderANewRevisionIsStillJudgedByWhatItWasPlannedOver() {
+        committed(7, "node-a", "node-b");
+        submitRunUnder(7);
+
+        committed(8, "node-a", "node-b", "node-c");
+        nanos.addAndGet(RENEW.toNanos() + 1);
+        assertThat(ownership.permit("orders").granted())
+                .as("the claim was granted under a cluster that has changed, so it has to be taken again")
+                .isFalse();
+        nanos.addAndGet(RENEW.toNanos() + 1);
+        PipelineActuationOwnership.Permit again = ownership.permit("orders");
+        assertThat(again.granted()).isTrue();
+        assertThat(again.claim().topologyRevision()).isEqualTo(8);
+        assertThat(again.claim().executionGeneration())
+                .as("still the run this member submitted")
+                .isEqualTo(1);
+
+        assertThat(admission.admits("orders"))
+                .as("every member this run was planned over is still here, and the one that joined takes "
+                        + "nothing away from it, so this death is the pipeline's own")
+                .isFalse();
+    }
+
+    /**
+     * A failed run that is not rebuilt says why, once for each reason rather than on every pass: a pipeline
+     * left failed with nothing saying why cannot be told apart from one this question was never asked about.
+     */
+    @Test
+    void aRefusalSaysWhyOnceForEachReason() {
+        List<String> logged = loggedBy(() -> {
+            committed(7, "node-a", "node-b");
+            submitRunUnder(7);
+
+            assertThat(admission.admits("orders")).isFalse();
+            assertThat(admission.admits("orders")).isFalse();
+            nanos.addAndGet(DETECTION.toNanos());
+            assertThat(admission.admits("orders")).isFalse();
+            membership.canCommit(Set.of("node-a", "node-b"));
+            assertThat(admission.admits("orders"))
+                    .as("the view published after the detection window records the failure as the run's own")
+                    .isFalse();
+            assertThat(admission.admits("orders")).isFalse();
+        });
+
+        assertThat(logged).satisfiesExactly(
+                first -> assertThat(first).contains("orders")
+                        .contains("every member its run was planned over is still in sight"),
+                second -> assertThat(second).contains("orders")
+                        .contains("recorded as its own before any member it was planned over left"));
+    }
+
+    /** A later run of the same pipeline refused for the same reason is a new failure, and says so again. */
+    @Test
+    void aLaterRunRefusedForTheSameReasonSaysWhyAgain() {
+        List<String> logged = loggedBy(() -> {
+            committed(7, "node-a", "node-b");
+            submitRunUnder(7);
+            assertThat(admission.admits("orders")).isFalse();
+
+            // Somebody starts the pipeline again, and the run submitted for it fails the same way.
+            assertThat(ownership.beginExecution("orders").allowed()).isTrue();
+            assertThat(admission.admits("orders")).isFalse();
+        });
+
+        assertThat(logged)
+                .as("one line for each run, not one for the pipeline's whole life")
+                .hasSize(2)
+                .allSatisfy(line -> assertThat(line).contains("orders")
+                        .contains("every member its run was planned over is still in sight"));
+    }
+
+    /**
+     * The budget is spent on one departure, not on a pipeline's whole life. A rebuilt run that goes on
+     * running long past the stretch a departure answers for has closed the episode it was submitted for,
+     * and a member lost after that starts another. Counted over the life of the process instead, every
+     * pipeline of a cluster that has lost members three times is left failed at the fourth - which is what
+     * a three-machine run showed: a rebuild after a healthy quarter of an hour counted as the second attempt.
+     */
+    @Test
+    void eachDepartureLongAfterTheLastRebuildRecoveredGetsABudgetOfItsOwn() {
+        committed(7, "node-a", "node-b", "node-c");
+        submitRunUnder(7);
+        long revision = 7;
+        for (int loss = 1; loss <= ClusterRebuildAdmission.MAX_ATTEMPTS + 1; loss++) {
+            String staying = loss % 2 == 1 ? "node-b" : "node-c";
+            committed(++revision, "node-a", staying);
+
+            assertThat(admission.admits("orders"))
+                    .as("departure %s, long after the run rebuilt for the one before it recovered", loss)
+                    .isTrue();
+
+            // The rebuild; then the member comes back, and the rebuilt run goes on running well.
+            submitRunUnder(revision);
+            committed(++revision, "node-a", "node-b", "node-c");
+            nanos.addAndGet(BACKOFF.multipliedBy(2L * ClusterRebuildAdmission.MAX_ATTEMPTS).toNanos());
+        }
+    }
+
+    /**
+     * The other half: replacements the cluster keeps killing while it has not settled are one departure's
+     * attempts, however many new runs they were. Resetting the budget for every new run would be the restart
+     * loop the budget exists to stop.
+     */
+    @Test
+    void replacementsTheClusterKeepsKillingWithinTheStretchShareOneBudget() {
+        committed(7, "node-a", "node-b", "node-c");
+        submitRunUnder(7);
+        long revision = 7;
+        for (int loss = 1; loss <= ClusterRebuildAdmission.MAX_ATTEMPTS; loss++) {
+            String staying = loss % 2 == 1 ? "node-b" : "node-c";
+            committed(++revision, "node-a", staying);
+            assertThat(admission.admits("orders")).as("attempt %s", loss).isTrue();
+            assertThat(ownership.beginExecution("orders").allowed()).as("replacement %s", loss).isTrue();
+            nanos.addAndGet(BACKOFF.toNanos());
+        }
+        // The last replacement is planned over node-a and node-b; node-b goes too.
+        committed(++revision, "node-a", "node-c");
+
+        assertThat(admission.admits("orders"))
+                .as("each replacement died within the stretch of the last rebuild, so the budget is spent")
+                .isFalse();
+    }
+
     @Test
     void onceTheSettlingIsOverADeathIsThePipelinesOwnAgain() {
         committed(7, "node-a", "node-b");
@@ -448,6 +771,21 @@ class ClusterRebuildAdmissionTest {
                         + "trouble, and restarting it every backoff for ever is the restart loop this "
                         + "budget exists to stop")
                 .isFalse();
+    }
+
+    /** What the admission logged while {@code scenario} ran. */
+    private static List<String> loggedBy(Runnable scenario) {
+        Logger logger = (Logger) LoggerFactory.getLogger(ClusterRebuildAdmission.class);
+        ListAppender<ILoggingEvent> written = new ListAppender<>();
+        written.start();
+        logger.addAppender(written);
+        try {
+            scenario.run();
+        } finally {
+            logger.detachAppender(written);
+            written.stop();
+        }
+        return written.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
     }
 
     /** Installs a committed membership at {@code revision} and lets the gate see those nodes. */

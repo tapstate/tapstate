@@ -71,7 +71,24 @@ public final class PassthroughProcessor extends AbstractProcessor {
                 // is exactly the lowest of what its edges promised.
                 : () -> new PassthroughProcessor(
                         new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING));
-        return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier), vertexName);
+        // Its stand-ins on the other members pass its bounds on as it does; see TotalOne.
+        return TotalOne.passingBounds(ProcessorSupplier.of(supplier), vertexName, axes, chainsByOrdinal);
+    }
+
+    /**
+     * A meta-supplier for a gathering that runs the same number of processors on every member. Every edge
+     * into it routes by the key of the rows it carries, so each row's changes still meet on one processor in
+     * the order they were read; the per-member count is set on the vertex. Held to {@code plannedMembers}:
+     * see {@link PlannedMembersGuard}.
+     */
+    public static ProcessorMetaSupplier nativeMetaSupplier(String vertexName, ChainAxes axes,
+            Map<Integer, List<String>> chainsByOrdinal, int plannedMembers) {
+        Objects.requireNonNull(vertexName, "vertexName");
+        SupplierEx<Processor> supplier = axes == null
+                ? PassthroughProcessor::new
+                : () -> new PassthroughProcessor(
+                        new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING));
+        return PlannedMembersGuard.of(ProcessorMetaSupplier.of(ProcessorSupplier.of(supplier)), plannedMembers);
     }
 
     @Override

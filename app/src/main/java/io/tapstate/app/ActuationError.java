@@ -182,7 +182,45 @@ enum ActuationError implements TapstateErrorCode {
      * A paused run also retains its assembly, which a resume with an unchanged artifact may reuse.
      */
     SCHEMA_SYNC_WHILE_RUNNING("actuation.schema-sync-while-running",
-            Set.of("pipeline", "state", "desired"));
+            Set.of("pipeline", "state", "desired")),
+
+    /**
+     * A node's cluster-wide target has no width the members of this run can take within every budget:
+     * {@code node} is the node, {@code requested} the target, {@code members} the members taking part and
+     * {@code candidates} each per-member count tried with the first budget it broke. Refused before anything
+     * starts, because running over a budget and running at a width nobody asked for are both worse than not
+     * running.
+     */
+    NO_SAFE_PARALLELISM("actuation.no-safe-parallelism",
+            Set.of("pipeline", "node", "requested", "members", "candidates")),
+
+    /**
+     * A node was explicitly asked to run wider than one processor, and it can only run as one: {@code node}
+     * is the node, {@code requested} the target and {@code reason} why - a stream reaching it carries no key
+     * to route it by, or every row it writes lands in one target table that has none. With no key, two
+     * processors would apply one row's changes in an order nobody decides.
+     */
+    PARALLELISM_NEEDS_A_KEY("actuation.parallelism-needs-a-key",
+            Set.of("pipeline", "node", "requested", "reason")),
+
+    /**
+     * A member a run would take part on cannot load a connector the pipeline's sinks open: {@code pipeline} is
+     * the pipeline, {@code member} the member by stable id, {@code connector} the connector id and {@code reason}
+     * what the member answered - its own coded refusal, the failure it hit, or that it did not answer in time.
+     * Every member is asked before the run starts anything, because a member that finds out only as its sink
+     * opens fails a run that is already reading, and the reason stays on that member.
+     */
+    CONNECTOR_UNAVAILABLE_ON_MEMBER("actuation.connector-unavailable-on-member",
+            Set.of("pipeline", "member", "connector", "reason")),
+
+    /**
+     * The members a run would take part on load different artifacts for one connector: {@code pipeline} is the
+     * pipeline, {@code connector} the connector id and {@code artifacts} the content hash each member loaded. The
+     * writers of one sink would run different code - members reading different registries, or a registration
+     * replaced while the run was starting.
+     */
+    CONNECTOR_DIFFERS_ACROSS_MEMBERS("actuation.connector-differs-across-members",
+            Set.of("pipeline", "connector", "artifacts"));
 
     private final String code;
     private final Set<String> placeholders;

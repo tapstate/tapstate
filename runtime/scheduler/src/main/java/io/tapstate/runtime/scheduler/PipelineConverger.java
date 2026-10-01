@@ -10,6 +10,7 @@ import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.StateStore;
 
 import java.time.Clock;
+import java.util.Collection;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -46,6 +47,11 @@ public final class PipelineConverger {
         this.actuator = Objects.requireNonNull(actuator, "actuator");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.rebuilds = Objects.requireNonNull(rebuilds, "rebuilds");
+    }
+
+    /** Tells the rebuild admission which pipelines are still desired, so it forgets the rest. */
+    public void retain(Collection<String> pipelineIds) {
+        rebuilds.retain(pipelineIds);
     }
 
     /** Drives the pipeline's actual state toward its current desired target, seeding it if new. */
