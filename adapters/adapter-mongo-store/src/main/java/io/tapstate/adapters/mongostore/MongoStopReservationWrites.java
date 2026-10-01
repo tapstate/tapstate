@@ -104,6 +104,41 @@ final class MongoStopReservationWrites {
         });
     }
 
+    Optional<StopReservation> replace(StopReservation expected, StopReservation successor, Instant at) {
+        Objects.requireNonNull(expected, "expected");
+        Objects.requireNonNull(successor, "successor");
+        Objects.requireNonNull(at, "at");
+        String previousCluster = switch (expected.subject()) {
+            case StopReservation.NoJob absent -> absent.clusterId();
+            case StopReservation.ExistingJob old -> old.oldJob().clusterId();
+        };
+        String successorCluster = switch (successor.subject()) {
+            case StopReservation.NoJob absent -> absent.clusterId();
+            case StopReservation.ExistingJob old -> old.oldJob().clusterId();
+        };
+        if (!expected.pipelineId().equals(successor.pipelineId())
+                || expected.token().equals(successor.token())
+                || successor.sourceEpoch() != expected.reservedEpoch()
+                || successor.reservedEpoch() != Math.addExact(expected.reservedEpoch(), 1)
+                || expected.originalDesired().equals(successor.originalDesired())
+                || !previousCluster.equals(successorCluster)) {
+            throw new IllegalArgumentException("a successor stop must replace the exact epoch with a fresh intent and token");
+        }
+        Document marker = StopReservationDocument.write(successor);
+        return transact(expected.pipelineId(), session -> {
+            requireCurrent(session, expected);
+            guardDesired(session, expected.pipelineId(), successor.originalDesired());
+            guardAuthority(session, expected.pipelineId(), successor.subject(), successor.authorityOrNull());
+            Document next = states.findOneAndUpdate(session, exactMarker(expected),
+                    new Document("$set", new Document(StopReservationDocument.FIELD, marker)
+                            .append("touchMillis", at.toEpochMilli()))
+                            .append("$inc", new Document("epoch", 1L)), RETURN_AFTER);
+            if (next == null) { throw FENCED; }
+            return StopReservationDocument.read(expected.pipelineId(), MongoStateStore.toCheckpoint(next).epoch(),
+                    requireMarker(next, expected.pipelineId()));
+        });
+    }
+
     Optional<CheckpointDoc> complete(StopReservation expected, Instant at) {
         Objects.requireNonNull(expected, "expected");
         Objects.requireNonNull(at, "at");

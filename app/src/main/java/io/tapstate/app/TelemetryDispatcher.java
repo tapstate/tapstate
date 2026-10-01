@@ -37,6 +37,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.OptionalLong;
 import java.util.Map;
 import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 import java.util.function.Consumer;
 
 /** Fixed worker budgets keep telemetry collection and stores away from convergence and data-plane calls. */
@@ -52,6 +53,14 @@ final class TelemetryDispatcher implements AutoCloseable {
 
     enum Sink {
         LATEST, HISTORY, EXPORT, EVENT
+    }
+
+    enum PublicationQualification {
+        CURRENT, RETRY, STALE
+    }
+
+    private enum PreparationOutcome {
+        PUBLISHED, RETRY, SKIPPED
     }
 
     enum BreakerState {
@@ -129,6 +138,8 @@ final class TelemetryDispatcher implements AutoCloseable {
             private volatile ObservationStore.Scope scope;
             private volatile ObservationScopeRegistry.RestoreTicket restoreTicket;
             private final PreparationFrame preparation;
+            /** Set synchronously only after the publisher registered this request's non-null cause. */
+            private boolean failureCaptured;
             private volatile FailureTime failureTime;
             /** 0 running, 1 timed out while running, 2 finished. */
             private final AtomicInteger state = new AtomicInteger();
@@ -296,7 +307,7 @@ final class TelemetryDispatcher implements AutoCloseable {
 
     /** Captures publication authority and the one observed cause without collecting native metrics. */
     private record PreparationFrame(String pipelineId, ObservationFailure failure, ObservationStore.Scope scope,
-            BooleanSupplier owner, Instant requestedAt) implements Frame {
+            Supplier<PublicationQualification> owner, Instant requestedAt) implements Frame {
         private PreparationFrame {
             Objects.requireNonNull(pipelineId, "pipelineId");
             Objects.requireNonNull(owner, "owner");
@@ -690,46 +701,74 @@ final class TelemetryDispatcher implements AutoCloseable {
     /** The scheduler offers only immutable inputs; collection and folding share the latest worker budget. */
     void offerPreparation(String pipelineId, ObservationFailure failure, ObservationStore.Scope scope,
             BooleanSupplier owner) {
+        Objects.requireNonNull(owner, "owner");
+        offerQualifiedPreparation(pipelineId, failure, scope,
+                () -> owner.getAsBoolean() ? PublicationQualification.CURRENT : PublicationQualification.STALE);
+    }
+
+    void offerQualifiedPreparation(String pipelineId, ObservationFailure failure, ObservationStore.Scope scope,
+            Supplier<PublicationQualification> owner) {
         PreparationFrame request = new PreparationFrame(pipelineId, failure, scope, owner, Instant.now());
-        if (!closed.get() && eligible(request)) {
-            offerLatest(pipelineId, request);
+        if (closed.get()) {
+            return;
         }
+        if (qualification(request) == PublicationQualification.STALE) {
+            discardStalePreparation(pipelineId);
+            return;
+        }
+        offerLatest(pipelineId, request);
+    }
+
+    private PublicationQualification qualification(PreparationFrame request) {
+        return abort.get() || !stillCurrent(request.pipelineId(), request.scope())
+                ? PublicationQualification.STALE : Objects.requireNonNull(request.owner().get(), "qualification");
     }
 
     private boolean eligible(PreparationFrame request) {
-        return !abort.get() && stillCurrent(request.pipelineId(), request.scope()) && request.owner().getAsBoolean();
+        return qualification(request) == PublicationQualification.CURRENT;
     }
 
-    private boolean prepareAndCommit(PreparationFrame request) {
+    private PreparationOutcome prepareAndCommit(PreparationFrame request, Stats.Operation operation) {
         PipelineLogContext previous = PipelineLogContext.capture();
         MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, request.pipelineId());
         PipelineLogContext.bindScope(request.scope());
         try {
-            return prepareAndCommitOwned(request);
+            return prepareAndCommitOwned(request, operation);
         } finally {
             previous.restore();
         }
     }
 
-    private boolean prepareAndCommitOwned(PreparationFrame request) {
-        if (!eligible(request)) {
-            return false;
+    private PreparationOutcome prepareAndCommitOwned(PreparationFrame request, Stats.Operation operation) {
+        PublicationQualification before = qualification(request);
+        if (before != PublicationQualification.CURRENT) {
+            if (before == PublicationQualification.STALE) {
+                discardStalePreparation(request.pipelineId());
+            }
+            return before == PublicationQualification.RETRY ? PreparationOutcome.RETRY : PreparationOutcome.SKIPPED;
         }
+        BooleanSupplier current = () -> eligible(request);
+        Runnable captured = () -> operation.failureCaptured = true;
         var prepared = request.scope() == null
-                ? publisher.prepare(request.pipelineId(), request.failure(), () -> eligible(request))
-                : publisher.prepareScoped(request.pipelineId(), request.failure(), request.scope(),
-                        () -> eligible(request));
-        if (prepared.isEmpty() || !eligible(request)) {
-            return false;
+                ? publisher.prepare(request.pipelineId(), request.failure(), current, captured)
+                : publisher.prepareScoped(request.pipelineId(), request.failure(), request.scope(), current, captured);
+        if (prepared.isEmpty()) {
+            // The publisher acknowledges its actual account update, independently of guard success.
+            // Retrying an already captured non-null cause would count the same death twice.
+            return !operation.failureCaptured && qualification(request) == PublicationQualification.RETRY
+                    ? PreparationOutcome.RETRY : PreparationOutcome.SKIPPED;
+        }
+        if (!eligible(request)) {
+            return PreparationOutcome.SKIPPED;
         }
         ObservationPublisher.Prepared frame = scopes == null ? prepared.orElseThrow()
                 : scopes.continueFrame(prepared.orElseThrow(), request.scope());
         if (!eligible(request)) {
-            return false;
+            return PreparationOutcome.SKIPPED;
         }
         var published = publisher.commit(frame, request.scope(), () -> eligible(request));
         if (published.isEmpty() || !eligible(request)) {
-            return false;
+            return PreparationOutcome.SKIPPED;
         }
         // commit may carry a stored failure; all successful projections still use these same measured facts.
         if (published.orElseThrow() != frame.observation()) {
@@ -737,7 +776,40 @@ final class TelemetryDispatcher implements AutoCloseable {
                     frame.nestReadings(), frame.pinned(), frame.gaps());
         }
         offerProjections(frame, request.scope());
-        return true;
+        return PreparationOutcome.PUBLISHED;
+    }
+
+    void discardStalePreparations() {
+        latestByPipeline.keySet().forEach(this::discardStalePreparation);
+    }
+
+    void discardStalePreparation(String pipelineId) {
+        LatestSlot slot = latestByPipeline.get(pipelineId);
+        if (slot == null) {
+            return;
+        }
+        Frame pending;
+        synchronized (slot) {
+            pending = slot.pending;
+        }
+        // The external predicate stays outside the monitor. Cleanup matches this exact input snapshot.
+        if (!(pending instanceof PreparationFrame preparation)
+                || qualification(preparation) != PublicationQualification.STALE) {
+            return;
+        }
+        synchronized (slot) {
+            if (latestByPipeline.get(pipelineId) != slot || slot.pending != pending) {
+                return;
+            }
+            slot.pending = null;
+            if (slot.pendingCounted) {
+                latestPending.decrementAndGet();
+                slot.pendingCounted = false;
+            }
+            if (!slot.scheduled) {
+                slot.retire();
+            }
+        }
     }
 
     private void offerProjections(ObservationPublisher.Prepared frame, ObservationStore.Scope scope) {
@@ -886,18 +958,23 @@ final class TelemetryDispatcher implements AutoCloseable {
                 || !scopeRecovery.unchanged(pipelineId, qualified)) {
             return false;
         }
+        BooleanSupplier current = () -> scopes.awaiting(ticket) && frame.owner().getAsBoolean()
+                && scopeRecovery.matchesOwner(pipelineId, qualified, ticket.owner())
+                && scopeRecovery.unchanged(pipelineId, qualified);
         operation.scope = qualified.scope();
         var prepared = scopes.restorationPrepared(ticket, qualified).orElse(null);
         if (prepared == null) {
             var attempt = scopes.restorationFailure(ticket, qualified.checkpoint());
             prepared = publisher.prepareScoped(pipelineId,
-                    attempt != null && attempt.first() ? attempt.failure() : null, qualified.scope()).orElse(null);
+                    attempt != null && attempt.first() ? attempt.failure() : null, qualified.scope(), current)
+                    .orElse(null);
             // Preparation can fail before or after its local failure account is updated. A neutral
             // retry reads that account; only a still unrecorded cause is handed back for counting.
             if (prepared != null && attempt != null && !attempt.first()
                     && prepared.observation().state() == StateJson.parse(qualified.checkpoint().stateJson())
                     && !recordedFailure(prepared, attempt.failure())) {
-                prepared = publisher.prepareScoped(pipelineId, attempt.failure(), qualified.scope()).orElse(null);
+                prepared = publisher.prepareScoped(pipelineId, attempt.failure(), qualified.scope(), current)
+                        .orElse(null);
             }
             if (prepared == null || !scopes.rememberRestoration(ticket, qualified, prepared)) {
                 return false;
@@ -909,7 +986,7 @@ final class TelemetryDispatcher implements AutoCloseable {
             return false;
         }
         ObservationStore.Scope scope = qualified.scope();
-        var persisted = publisher.commit(scopes.restorationFrame(ticket, qualified.stored(), prepared), scope);
+        var persisted = publisher.commit(scopes.restorationFrame(ticket, qualified.stored(), prepared), scope, current);
         if (persisted.isEmpty()) {
             scopes.retryRestoration(ticket);
             return false;
@@ -947,8 +1024,12 @@ final class TelemetryDispatcher implements AutoCloseable {
 
     private void offerLatest(String pipelineId, Frame frame) {
         while (true) {
+            if (closed.get()) {
+                return;
+            }
             LatestSlot existing = latestByPipeline.get(pipelineId);
             if (existing != null) {
+                Frame rejected = null;
                 synchronized (existing) {
                     if (existing.retired) {
                         continue;
@@ -965,9 +1046,32 @@ final class TelemetryDispatcher implements AutoCloseable {
                         latestPending.incrementAndGet();
                     }
                     existing.pending = frame;
+                    if (!existing.scheduled) {
+                        // A parked request consumes its original capacity permit and waits for this offer.
+                        // Resubmission is non-blocking and never creates another slot for this pipeline.
+                        existing.scheduled = true;
+                        try {
+                            latestWorkers.execute(existing);
+                            if (existing.pendingCounted) {
+                                latestPending.decrementAndGet();
+                                existing.pendingCounted = false;
+                            }
+                        } catch (java.util.concurrent.RejectedExecutionException saturated) {
+                            existing.scheduled = false;
+                            rejected = existing.pending;
+                        }
+                    }
                     latestStats.queueDepth(latestWorkers.getQueue().size() + latestPending.get());
-                    return;
                 }
+                if (rejected != null) {
+                    latestStats.dropped();
+                    if (rejected instanceof PreparationFrame preparation) {
+                        preparationDropped(preparation);
+                    }
+                    boundaryFailed(pipelineId, rejected.scope(), Sink.LATEST);
+                    LOG.warn("Latest observation for pipeline {} is waiting for telemetry worker capacity", pipelineId);
+                }
+                return;
             }
             if (!latestCapacity.tryAcquire()) {
                 latestStats.dropped();
@@ -1068,6 +1172,9 @@ final class TelemetryDispatcher implements AutoCloseable {
                             slot.pendingCounted = false;
                         }
                         slot.pending = null;
+                        if (!slot.scheduled) {
+                            slot.retire();
+                        }
                     }
                 }
             }
@@ -1080,6 +1187,13 @@ final class TelemetryDispatcher implements AutoCloseable {
             return;
         }
         watchdog.shutdownNow();
+        latestByPipeline.values().forEach(slot -> {
+            synchronized (slot) {
+                if (!slot.scheduled) {
+                    slot.retire();
+                }
+            }
+        });
         latestWorkers.shutdown();
         historyWorker.shutdown();
         exportWorker.shutdown();
@@ -1139,6 +1253,7 @@ final class TelemetryDispatcher implements AutoCloseable {
         private boolean retired;
         private boolean started;
         private boolean pendingCounted;
+        private boolean scheduled = true;
 
         private LatestSlot(String pipelineId, Frame first) {
             this.pipelineId = pipelineId;
@@ -1146,10 +1261,42 @@ final class TelemetryDispatcher implements AutoCloseable {
         }
 
         private synchronized void cancel() {
+            retire();
+        }
+
+        /** Called with the slot monitor; the capacity permit is released exactly once. */
+        private void retire() {
+            if (retired) {
+                return;
+            }
             retired = true;
+            scheduled = false;
             pending = null;
+            if (pendingCounted) {
+                latestPending.decrementAndGet();
+                pendingCounted = false;
+            }
             latestByPipeline.remove(pipelineId, this);
             latestCapacity.release();
+        }
+
+        private void park(PreparationFrame request) {
+            synchronized (this) {
+                if (retired) {
+                    return;
+                }
+                if (pending instanceof PreparationFrame incoming) {
+                    pending = incoming.replacing(request);
+                } else if (pending == null || Objects.equals(request.scope(), pending.scope())) {
+                    pending = request;
+                }
+                scheduled = false;
+                started = false;
+                if (pending != null && !pendingCounted) {
+                    latestPending.incrementAndGet();
+                    pendingCounted = true;
+                }
+            }
         }
 
         @Override
@@ -1169,9 +1316,7 @@ final class TelemetryDispatcher implements AutoCloseable {
                     frame = aborting ? null : pending;
                     pending = null;
                     if (frame == null) {
-                        retired = true;
-                        latestByPipeline.remove(pipelineId, this);
-                        latestCapacity.release();
+                        retire();
                         return;
                     }
                 }
@@ -1196,10 +1341,15 @@ final class TelemetryDispatcher implements AutoCloseable {
                             latestStats.skipped(operation);
                         }
                     } else if (frame instanceof PreparationFrame preparation) {
-                        if (prepareAndCommit(preparation)) {
+                        PreparationOutcome outcome = prepareAndCommit(preparation, operation);
+                        if (outcome == PreparationOutcome.PUBLISHED) {
                             successfulCompletion(latestStats, operation, Sink.LATEST);
                         } else {
                             latestStats.skipped(operation);
+                            if (outcome == PreparationOutcome.RETRY) {
+                                park(preparation);
+                                return;
+                            }
                         }
                     } else if (frame instanceof ReconcileFailureFrame failure) {
                         if (publisher.commitReconcileFailure(failure.pipelineId(), failure.failures(),
@@ -1219,6 +1369,12 @@ final class TelemetryDispatcher implements AutoCloseable {
                     latestFailure(operation);
                     latestStats.completed(operation, false);
                     LOG.warn("Could not write latest observation for pipeline {}", pipelineId, failed);
+                    if (frame instanceof PreparationFrame preparation && preparation.failure() != null
+                            && !operation.failureCaptured
+                            && qualification(preparation) != PublicationQualification.STALE) {
+                        park(preparation);
+                        return;
+                    }
                 } catch (Error defect) {
                     latestStats.completed(operation, false);
                     throw defect;

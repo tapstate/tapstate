@@ -20,6 +20,12 @@ import io.tapstate.runtime.scheduler.PipelineConverger;
 import io.tapstate.runtime.scheduler.RateSampler;
 import io.tapstate.spi.metrics.MetricsExport;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.ClusterMembership;
+import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
+import io.tapstate.spi.store.WorkloadOwner;
+import io.tapstate.runtime.scheduler.LifecycleActuator;
 import org.junit.jupiter.api.Test;
 
 import java.time.Clock;
@@ -28,6 +34,7 @@ import java.time.Instant;
 import java.util.Map;
 import java.util.List;
 import java.util.Collection;
+import java.util.Set;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.concurrent.ConcurrentHashMap;
@@ -38,6 +45,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.Future;
 import java.util.function.BooleanSupplier;
 
 import static io.tapstate.core.lifecycle.PipelineState.RUNNING;
@@ -419,6 +429,156 @@ class TelemetryPreparationTest {
             } finally {
                 release.countDown();
             }
+        }
+    }
+
+    @Test
+    void aTemporarilyBusyClaimCannotDiscardTheOnlyObservedFailureCause() throws Exception {
+        String id = "orders";
+        Duration lease = Duration.ofSeconds(30);
+        Duration renew = Duration.ofSeconds(10);
+        AtomicLong nanos = new AtomicLong();
+        ClusterProperties properties = new ClusterProperties();
+        properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
+        ClusterMembershipGate membership = new ClusterMembershipGate(properties);
+        membership.install(new ClusterMembership("cluster-a", 7, Set.of("node-a", "node-b", "node-c")));
+        membership.canCommit(Set.of("node-a", "node-b"));
+        var claims = org.mockito.Mockito.spy(new InMemoryWorkloadClaimStore());
+        PipelineActuationOwnership actuation = new PipelineActuationOwnership("cluster-a",
+                new WorkloadOwner("node-a", "boot-a"), membership,
+                new ClusterWorkloadClaims(claims, membership), lease, renew, nanos::get);
+        assertThat(actuation.permit(id).granted()).isTrue();
+        assertThat(actuation.beginExecution(id).allowed()).isTrue();
+        WorkloadClaim originalClaim = actuation.permit(id).claim();
+        assertThat(originalClaim.executionGeneration()).isEqualTo(1);
+
+        CountDownLatch renewEntered = new CountDownLatch(1);
+        CountDownLatch releaseRenew = new CountDownLatch(1);
+        org.mockito.Mockito.doAnswer(invocation -> {
+            renewEntered.countDown();
+            awaitRelease(releaseRenew);
+            return invocation.callRealMethod();
+        }).when(claims).renew(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.eq(lease));
+        ExecutorService renewer = Executors.newSingleThreadExecutor();
+        AtomicReference<Future<PipelineActuationOwnership.Permit>> renewed = new AtomicReference<>();
+        AtomicInteger failureChecks = new AtomicInteger();
+        IllegalStateException cause = new IllegalStateException("native job failed");
+        LifecycleActuator actuator = new LifecycleActuator() {
+            @Override public void start(String pipelineId) { }
+            @Override public void pause(String pipelineId) { }
+            @Override public void resume(String pipelineId) { }
+            @Override public void stop(String pipelineId, boolean purgeState) { }
+            @Override public boolean isCarryingAJob(String pipelineId) { return true; }
+            @Override public Optional<Throwable> failure(String pipelineId) {
+                if (failureChecks.incrementAndGet() == 1) {
+                    // The driver already captured its grant. A real renewal now holds the local claim lock.
+                    nanos.set(renew.toNanos());
+                    renewed.set(renewer.submit(() -> actuation.permit(id)));
+                    awaitRelease(renewEntered);
+                    assertThat(actuation.permit(id).retry()).isTrue();
+                    return Optional.of(cause);
+                }
+                return Optional.empty();
+            }
+        };
+        InMemoryDesiredStore desired = new InMemoryDesiredStore();
+        InMemoryStateStore state = new InMemoryStateStore();
+        Instant since = Instant.now().minusSeconds(1);
+        desired.save(new DesiredState(id, RUNNING, "rev-1"));
+        state.create(id, StateJson.of(RUNNING), since);
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        var scope = scopes.begin(id, "inc-a", originalClaim.executionGeneration());
+        Map<String, Observation> latest = new ConcurrentHashMap<>();
+        AtomicInteger collections = new AtomicInteger();
+        ObservationPublisher publisher = new ObservationPublisher(state, accepting(latest), pipelineId -> {
+            collections.incrementAndGet();
+            return OptionalLong.empty();
+        }, pipelineId -> Map.of());
+        try (TelemetryDispatcher telemetry = new TelemetryDispatcher(
+                publisher, null, MetricsExport.none(), scopes, 1, 2)) {
+            ConvergenceDriver driver = new ConvergenceDriver(
+                    new PipelineConverger(desired, state, actuator, Clock.systemUTC()),
+                    desired, publisher, null, MetricsExport.none(), membership::businessEligible,
+                    actuation, LifecycleWorkDispatcher.inline(), scopes, telemetry);
+            driver.reconcile();
+            assertThat(failureChecks.get()).isEqualTo(1);
+            assertThat(StateJson.parse(state.read(id).orElseThrow().stateJson())).isEqualTo(FAILED);
+            assertThat(actuation.permit(id).retry()).isTrue();
+            assertThat(scopes.current(id)).contains(scope);
+            assertThat(latest).isEmpty();
+            assertThat(collections.get()).as("an unknown grant must not permit native collection").isZero();
+
+            releaseRenew.countDown();
+            WorkloadClaim afterRenew = renewed.get().get(5, TimeUnit.SECONDS).claim();
+            assertThat(afterRenew.owner()).isEqualTo(originalClaim.owner());
+            assertThat(afterRenew.claimGeneration()).isEqualTo(originalClaim.claimGeneration());
+            assertThat(afterRenew.executionGeneration()).isEqualTo(originalClaim.executionGeneration());
+            assertThat(claims.read(new WorkloadClaimKey("cluster-a",
+                    WorkloadClaimType.PIPELINE_ACTUATION, id)).orElseThrow().claim()).isEqualTo(afterRenew);
+            driver.reconcile();
+            await(() -> latest.containsKey(id));
+            assertThat(failureChecks.get()).as("the later FAILED tick does not rediscover the death").isEqualTo(1);
+            assertThat(latest.get(id).failure()).isEqualTo(PipelineFailures.of(id, cause));
+            assertThat(latest.get(id).metrics()).containsEntry("errors.engine.job-failed", 1L);
+            long successes = telemetry.health().get(TelemetryDispatcher.Sink.LATEST).successes();
+            driver.reconcile();
+            await(() -> telemetry.health().get(TelemetryDispatcher.Sink.LATEST).successes() > successes);
+            assertThat(latest.get(id).metrics()).containsEntry("errors.engine.job-failed", 1L);
+        } finally {
+            releaseRenew.countDown();
+            renewer.shutdownNow();
+            assertThat(renewer.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+        }
+    }
+
+    @Test
+    void aFailureBeforeAccountRegistrationKeepsItsCauseUntilALaterOffer() throws Exception {
+        InMemoryStateStore state = new InMemoryStateStore();
+        state.create("orders", StateJson.of(FAILED), Instant.now());
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        var scope = scopes.begin("orders", "inc-a", 41);
+        AtomicBoolean failClock = new AtomicBoolean();
+        Clock delegate = Clock.systemUTC();
+        Clock clock = new Clock() {
+            @Override public java.time.ZoneId getZone() { return delegate.getZone(); }
+            @Override public Clock withZone(java.time.ZoneId zone) { return delegate.withZone(zone); }
+            @Override public Instant instant() {
+                if (failClock.compareAndSet(true, false)) {
+                    throw new IllegalStateException("frame clock unavailable");
+                }
+                return delegate.instant();
+            }
+        };
+        Map<String, Observation> latest = new ConcurrentHashMap<>();
+        AtomicInteger collections = new AtomicInteger();
+        ObservationPublisher publisher = new ObservationPublisher(state, accepting(latest), id -> {
+            collections.incrementAndGet();
+            return OptionalLong.empty();
+        }, id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(), id -> Map.of(),
+                new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
+                id -> Map.of(), new FrontierStallWatch(FrontierStallPressure.DEFAULT, FrontierStallAlert.NONE),
+                id -> Map.of(), id -> Map.of(), id -> Map.of(), id -> CaptureReading.NONE,
+                id -> DeliveryReading.NONE, clock);
+        var failure = PipelineFailures.of("orders", new IllegalStateException("native job failed"));
+        try (TelemetryDispatcher telemetry = new TelemetryDispatcher(
+                publisher, null, MetricsExport.none(), scopes, 1, 2)) {
+            // The first scope reset fails before the publisher records the witnessed cause.
+            failClock.set(true);
+            telemetry.offerPreparation("orders", failure, scope, () -> true);
+            await(() -> telemetry.health().get(TelemetryDispatcher.Sink.LATEST).failures() == 1
+                    && telemetry.health().get(TelemetryDispatcher.Sink.LATEST).inFlight() == 0
+                    && telemetry.health().get(TelemetryDispatcher.Sink.LATEST).queueDepth() == 1);
+            assertThat(latest).isEmpty();
+            assertThat(collections.get()).isZero();
+            telemetry.offerPreparation("orders", null, scope, () -> true);
+            await(() -> latest.containsKey("orders"));
+            assertThat(latest.get("orders").failure()).isEqualTo(failure);
+            assertThat(latest.get("orders").metrics()).containsEntry("errors.engine.job-failed", 1L);
+            long successes = telemetry.health().get(TelemetryDispatcher.Sink.LATEST).successes();
+            telemetry.offerPreparation("orders", null, scope, () -> true);
+            await(() -> telemetry.health().get(TelemetryDispatcher.Sink.LATEST).successes() > successes);
+            assertThat(latest.get("orders").metrics()).containsEntry("errors.engine.job-failed", 1L);
+            assertThat(telemetry.health().get(TelemetryDispatcher.Sink.LATEST).highWater()).isLessThanOrEqualTo(3);
         }
     }
 

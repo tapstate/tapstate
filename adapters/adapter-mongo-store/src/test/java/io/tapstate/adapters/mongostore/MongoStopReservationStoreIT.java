@@ -126,6 +126,78 @@ class MongoStopReservationStoreIT {
     }
 
     @Test
+    void aFreshSuccessorMarkerPreservesStampedPurgeAndFencesTheOldWorkAcrossRestart() {
+        try (Fixture fixture = fresh()) {
+            fixture.seed(PipelineState.FAILED);
+            DesiredState original = desired(PipelineState.STOPPED, "rev-a");
+            fixture.desired.save(original);
+            fixture.claims.advanceStandalone(CLUSTER, PIPELINE);
+            CheckpointDoc before = fixture.state.read(PIPELINE).orElseThrow();
+            StopAuthority authority = StopAuthority.standalone(CLUSTER, 1);
+            StopReservation old = existing(before, original, authority);
+            fixture.state.reserveStop(before, old, T0.plusSeconds(1)).orElseThrow();
+            DesiredState restart = new DesiredState(PIPELINE, PipelineState.RUNNING, "rev-b",
+                    true, "assembly-b", true, old.reservedEpoch());
+            fixture.desired.save(restart);
+            StopReservation successor = new StopReservation(PIPELINE, "fresh-restart-token",
+                    old.reservedEpoch(), old.reservedEpoch() + 1, restart, old.subject());
+
+            assertThat(fixture.state.replaceStop(old, successor, T0.plusSeconds(2))).contains(successor);
+            assertThat(fixture.state.read(PIPELINE).orElseThrow().stateJson())
+                    .isEqualTo(StateJson.of(PipelineState.FAILED));
+            assertThat(fixture.state.read(PIPELINE).orElseThrow().epoch()).isEqualTo(2);
+            assertThat(fixture.state.completeStop(old, T0.plusSeconds(3))).isEmpty();
+            assertThat(fixture.state.retireStop(old, restart, authority, T0.plusSeconds(3))).isEmpty();
+            assertThat(fixture.state.compareAndSwap(PIPELINE, old.reservedEpoch(),
+                    StateJson.of(PipelineState.STOPPED), T0.plusSeconds(3)))
+                    .isEqualTo(new CasOutcome.Fenced(successor.reservedEpoch()));
+            try (MongoClient client = MongoClients.create(MONGO.getReplicaSetUrl())) {
+                MongoStateStore recovered = fixture.stateOn(client);
+                assertThat(recovered.readStopReservation(PIPELINE)).contains(successor);
+                assertThat(recovered.readStopReservation(PIPELINE).orElseThrow().originalDesired())
+                        .isEqualTo(restart);
+                assertThat(recovered.completeStop(successor, T0.plusSeconds(4)).orElseThrow().stateJson())
+                        .isEqualTo(StateJson.of(PipelineState.STOPPED));
+            }
+            assertThat(fixture.state.readStopReservation(PIPELINE)).isEmpty();
+            assertThat(fixture.desired.read(PIPELINE)).contains(restart);
+            assertThat(fixture.claims.currentGeneration(CLUSTER, PIPELINE)).hasValue(1);
+        }
+    }
+
+    @Test
+    void aSuccessorMarkerRequiresTheExactCurrentIntentAuthorityAndOldToken() {
+        try (Fixture fixture = fresh()) {
+            fixture.seed(PipelineState.COMPLETED);
+            DesiredState original = desired(PipelineState.STOPPED, "rev-a");
+            fixture.desired.save(original);
+            fixture.claims.advanceStandalone(CLUSTER, PIPELINE);
+            StopReservation old = existing(fixture.state.read(PIPELINE).orElseThrow(), original,
+                    StopAuthority.standalone(CLUSTER, 1));
+            fixture.state.reserveStop(fixture.state.read(PIPELINE).orElseThrow(), old,
+                    T0.plusSeconds(1)).orElseThrow();
+            DesiredState restart = new DesiredState(PIPELINE, PipelineState.RUNNING, "rev-b",
+                    true, "assembly-b", true, old.reservedEpoch());
+            StopReservation successor = new StopReservation(PIPELINE, "fresh-restart-token",
+                    old.reservedEpoch(), old.reservedEpoch() + 1, restart, old.subject());
+            assertThat(fixture.state.replaceStop(old, successor, T0.plusSeconds(2))).isEmpty();
+            fixture.desired.save(restart);
+            StopReservation wrongToken = new StopReservation(PIPELINE, "wrong-old-token", old.sourceEpoch(),
+                    old.reservedEpoch(), original, old.subject());
+            assertThat(fixture.state.replaceStop(wrongToken, successor, T0.plusSeconds(2))).isEmpty();
+            StopReservation wrongAuthority = new StopReservation(PIPELINE, "wrong-authority-token",
+                    old.reservedEpoch(), old.reservedEpoch() + 1, restart,
+                    new StopReservation.NoJob(CLUSTER, StopAuthority.standalone(CLUSTER, 2)));
+            assertThat(fixture.state.replaceStop(old, wrongAuthority, T0.plusSeconds(2))).isEmpty();
+            assertThat(fixture.state.readStopReservation(PIPELINE)).contains(old);
+            assertThat(fixture.state.read(PIPELINE).orElseThrow().epoch()).isEqualTo(old.reservedEpoch());
+            assertThat(fixture.state.read(PIPELINE).orElseThrow().stateJson())
+                    .isEqualTo(StateJson.of(PipelineState.COMPLETED));
+            assertThat(fixture.claims.currentGeneration(CLUSTER, PIPELINE)).hasValue(1);
+        }
+    }
+
+    @Test
     void takeoverFencesOldCompletionAndTheNewClaimCanRebindIt() {
         try (Fixture fixture = fresh()) {
             fixture.seed(PipelineState.RUNNING);

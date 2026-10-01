@@ -311,7 +311,33 @@ public final class PipelineConverger {
     private ConvergeResult resumeStop(StopReservation marker, DesiredState intent, boolean firstAttempt) {
         String id = marker.pipelineId();
         StopAuthority authority = actuator.stopAuthority(id).orElse(null);
+        if (marker.authorityOrNull() != null && authority == null) {
+            return ConvergeResult.superseded();
+        }
         boolean retiring = !marker.originalDesired().equals(intent);
+        if (retiring && intent.targetState() == PipelineState.RUNNING && intent.reassemble()
+                && Objects.equals(intent.rebuiltAtStateEpoch(), marker.reservedEpoch())) {
+            StopReservation expectedOld = marker;
+            java.util.function.BooleanSupplier currentOld = () -> !Thread.currentThread().isInterrupted()
+                    && desired.read(id).filter(intent::equals).isPresent()
+                    && state.readStopReservation(id).filter(expectedOld::equals).isPresent()
+                    && Objects.equals(authority, actuator.stopAuthority(id).orElse(null));
+            if (!currentOld.getAsBoolean()) { return ConvergeResult.superseded(); }
+            CheckpointDoc before = requireCheckpoint(id);
+            boolean continuing = continuesCounters(before, intent);
+            if (!actuator.finishStop(expectedOld, continuing, firstAttempt, true, currentOld)) {
+                return currentOld.getAsBoolean() ? ConvergeResult.stopPending(requireCheckpoint(id))
+                        : ConvergeResult.superseded();
+            }
+            if (!currentOld.getAsBoolean()) { return ConvergeResult.superseded(); }
+            StopReservation.Subject subject = actuator.stopSubject(id)
+                    .orElseThrow(() -> new IllegalStateException("durable stop binding supplied no factual subject"));
+            if (!currentOld.getAsBoolean()) { return ConvergeResult.superseded(); }
+            StopReservation replacement = new StopReservation(id, UUID.randomUUID().toString(),
+                    marker.reservedEpoch(), Math.incrementExact(marker.reservedEpoch()), intent, subject);
+            return state.replaceStop(marker, replacement, clock.instant())
+                    .map(accepted -> resumeStop(accepted, intent, true)).orElseGet(ConvergeResult::superseded);
+        }
         if (!retiring && !Objects.equals(marker.authorityOrNull(), authority)) {
             if (authority == null || marker.subject() instanceof StopReservation.ExistingJob old
                     && old.executionGeneration() != authority.executionGeneration()) {
@@ -327,8 +353,7 @@ public final class PipelineConverger {
                 && Objects.equals(authority, actuator.stopAuthority(id).orElse(null));
         if (!current.getAsBoolean()) { return ConvergeResult.superseded(); }
         CheckpointDoc before = requireCheckpoint(id);
-        boolean continuing = StateJson.parse(before.stateJson()) == PipelineState.PAUSED
-                && intent.targetState() == PipelineState.RUNNING;
+        boolean continuing = continuesCounters(before, intent);
         if (!actuator.finishStop(expected, continuing, firstAttempt, retiring, current)) {
             return current.getAsBoolean() ? ConvergeResult.stopPending(requireCheckpoint(id))
                     : ConvergeResult.superseded();
@@ -348,12 +373,19 @@ public final class PipelineConverger {
         return ConvergeResult.converged(stopped, StateJson.parse(before.stateJson()));
     }
 
+    /** A genuine resume carries known totals; a stamped restart or purge starts fresh counters. */
+    private static boolean continuesCounters(CheckpointDoc before, DesiredState intent) {
+        return StateJson.parse(before.stateJson()) == PipelineState.PAUSED
+                && intent.targetState() == PipelineState.RUNNING
+                && intent.rebuiltAtStateEpoch() == null && !intent.purgeState();
+    }
+
     /** Compatibility for a binding that explicitly has no durable reservation capability. */
     private ConvergeResult legacyStop(CheckpointDoc before, DesiredState intent, boolean replacement) {
         String id = before.pipelineId();
         CasOutcome reserved = state.compareAndSwap(id, before.epoch(), before.stateJson(), clock.instant());
         if (!(reserved instanceof CasOutcome.Applied admitted)) { return ConvergeResult.superseded(); }
-        boolean continuing = replacement && StateJson.parse(before.stateJson()) == PipelineState.PAUSED;
+        boolean continuing = replacement && continuesCounters(before, intent);
         if (continuing) {
             actuator.stopForRebuildingResume(id, intent.purgeState());
         } else {

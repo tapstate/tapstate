@@ -39,6 +39,7 @@ final class InMemoryStateStore implements StateStore {
     private DesiredStore stopIntents;
     private Function<String, StopAuthority> authorities;
     private Runnable beforeComplete = () -> { };
+    private Runnable afterStopSupersession = () -> { };
     private int reservations;
 
     @Override
@@ -110,6 +111,23 @@ final class InMemoryStateStore implements StateStore {
         return Optional.of(proposal);
     }
 
+    @Override public synchronized Optional<StopReservation> replaceStop(
+            StopReservation expected, StopReservation proposal, Instant at) {
+        if (!exact(expected) || !expected.pipelineId().equals(proposal.pipelineId())
+                || expected.token().equals(proposal.token())
+                || expected.originalDesired().equals(proposal.originalDesired())
+                || proposal.sourceEpoch() != expected.reservedEpoch()
+                || proposal.reservedEpoch() != Math.incrementExact(expected.reservedEpoch())
+                || !intent(proposal.originalDesired()) || !authority(proposal.pipelineId(), proposal.authorityOrNull())) {
+            return Optional.empty();
+        }
+        advance(expected, docs.get(expected.pipelineId()).stateJson(), at);
+        stops.put(expected.pipelineId(), proposal);
+        reservations++;
+        afterStopSupersession.run();
+        return Optional.of(proposal);
+    }
+
     @Override public synchronized Optional<StopReservation> rebindStop(
             StopReservation expected, StopAuthority successor, Instant at) {
         if (!exact(expected) || !intent(expected.originalDesired()) || !authority(expected.pipelineId(), successor)) {
@@ -140,6 +158,7 @@ final class InMemoryStateStore implements StateStore {
         }
         CheckpointDoc retired = advance(expected, docs.get(expected.pipelineId()).stateJson(), at);
         stops.remove(expected.pipelineId());
+        afterStopSupersession.run();
         return Optional.of(retired);
     }
 
@@ -164,5 +183,7 @@ final class InMemoryStateStore implements StateStore {
     }
 
     void onBeforeComplete(Runnable action) { beforeComplete = action; }
+    /** Models process loss immediately after the superseding marker write has committed. */
+    void onAfterStopSupersession(Runnable action) { afterStopSupersession = action; }
     int stopReservations() { return reservations; }
 }

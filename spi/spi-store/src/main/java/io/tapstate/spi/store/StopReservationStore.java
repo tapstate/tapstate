@@ -31,6 +31,12 @@ public interface StopReservationStore {
         throw new UnsupportedOperationException("durable stop reservations are unavailable");
     }
 
+    /** Replaces the exact old marker with a fresh intent while preserving actual state and fencing old work. */
+    default Optional<StopReservation> replaceStop(
+            StopReservation expected, StopReservation successor, Instant touchTime) {
+        throw new UnsupportedOperationException("durable stop reservations are unavailable");
+    }
+
     /** Completes only the exact pending stop while its original intent and current authority still hold. */
     default Optional<CheckpointDoc> completeStop(StopReservation expected, Instant touchTime) {
         throw new UnsupportedOperationException("durable stop reservations are unavailable");

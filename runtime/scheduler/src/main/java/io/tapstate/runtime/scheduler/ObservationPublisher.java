@@ -882,8 +882,15 @@ public final class ObservationPublisher {
     /** The ownership predicate may access a store and is never called under the account lock. */
     public Optional<Prepared> prepareScoped(String pipelineId, ObservationFailure failure,
             ObservationStore.Scope scope, BooleanSupplier current) {
+        return prepareScoped(pipelineId, failure, scope, current, () -> { });
+    }
+
+    /** Acknowledges a witnessed cause only after its matching local account captured it. */
+    public Optional<Prepared> prepareScoped(String pipelineId, ObservationFailure failure,
+            ObservationStore.Scope scope, BooleanSupplier current, Runnable failureCaptured) {
         Objects.requireNonNull(scope, "scope");
-        return prepare(pipelineId, failure, scope, Objects.requireNonNull(current, "current"));
+        return prepare(pipelineId, failure, scope, Objects.requireNonNull(current, "current"),
+                Objects.requireNonNull(failureCaptured, "failureCaptured"));
     }
 
     /** Keeps named series stable while a paused execution is replaced with the same resource. */
@@ -926,11 +933,17 @@ public final class ObservationPublisher {
     }
 
     public Optional<Prepared> prepare(String pipelineId, ObservationFailure failure, BooleanSupplier current) {
-        return prepare(pipelineId, failure, null, Objects.requireNonNull(current, "current"));
+        return prepare(pipelineId, failure, current, () -> { });
+    }
+
+    public Optional<Prepared> prepare(String pipelineId, ObservationFailure failure, BooleanSupplier current,
+            Runnable failureCaptured) {
+        return prepare(pipelineId, failure, null, Objects.requireNonNull(current, "current"),
+                Objects.requireNonNull(failureCaptured, "failureCaptured"));
     }
 
     private Optional<Prepared> prepare(String pipelineId, ObservationFailure failure, ObservationStore.Scope scope,
-            BooleanSupplier current) {
+            BooleanSupplier current, Runnable failureCaptured) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         if (!current.getAsBoolean()) { return Optional.empty(); }
         PreparationTicket ticket;
@@ -957,6 +970,8 @@ public final class ObservationPublisher {
                         .merge(failure.code(), 1L, Long::sum);
             }
         }
+        // The callback stays outside the account lock and acknowledges the completed update above.
+        if (failure != null) { failureCaptured.run(); }
         // State and every native source may wait. None runs under the shared account/folder lock.
         var checkpoint = state.read(pipelineId);
         if (checkpoint.isEmpty() || !current.getAsBoolean()) { return Optional.empty(); }

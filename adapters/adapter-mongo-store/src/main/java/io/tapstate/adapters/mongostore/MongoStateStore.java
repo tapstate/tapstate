@@ -157,6 +157,12 @@ public final class MongoStateStore implements StateStore {
     }
 
     @Override
+    public Optional<StopReservation> replaceStop(
+            StopReservation expected, StopReservation successor, Instant touchTime) {
+        return requireStops().replace(expected, successor, touchTime);
+    }
+
+    @Override
     public Optional<CheckpointDoc> completeStop(StopReservation expected, Instant touchTime) {
         return requireStops().complete(expected, touchTime);
     }

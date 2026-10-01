@@ -14,10 +14,20 @@ import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.PipelineEvent;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
+import io.tapstate.core.lifecycle.CaptureReading;
+import io.tapstate.core.lifecycle.DeliveryReading;
+import io.tapstate.core.lifecycle.SnapshotReading;
+import io.tapstate.core.lifecycle.FrontierStall;
+import io.tapstate.core.lifecycle.FrontierStallPressure;
+import io.tapstate.core.lifecycle.NestColdLayerPressure;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
+import io.tapstate.runtime.scheduler.FrontierStallAlert;
+import io.tapstate.runtime.scheduler.FrontierStallWatch;
+import io.tapstate.runtime.scheduler.NestColdLayerAlert;
+import io.tapstate.runtime.scheduler.NestColdLayerWatch;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.runtime.scheduler.PipelineConverger;
 import io.tapstate.spi.metrics.MetricsExport;
@@ -444,6 +454,56 @@ class ObservationScopeRecoveryTest {
         }
     }
 
+    @Test
+    void anInvalidatedColdInheritedFailureReadCannotSaveOrUpdateWatches() throws Exception {
+        for (boolean loseOwner : new boolean[] {true, false}) {
+            Fixture fixture = new Fixture(PipelineState.FAILED);
+            Observation before = saved(PipelineState.FAILED, FAILURE);
+            fixture.latest.put(before, Optional.of(OWNER));
+            fixture.latest.blockInheritedFailure = true;
+            AtomicBoolean owner = new AtomicBoolean(true);
+            AtomicInteger watched = new AtomicInteger();
+            FrontierStallAlert alert = new FrontierStallAlert() {
+                @Override public void crossed(String id, FrontierStall stall) { watched.incrementAndGet(); }
+                @Override public void cleared(String id, FrontierStall stall) { watched.incrementAndGet(); }
+            };
+            ObservationPublisher publisher = new ObservationPublisher(fixture.state, fixture.latest,
+                    id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE,
+                    id -> Map.of(), id -> Map.of(),
+                    new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
+                    id -> Map.of("chain", 90_000L),
+                    new FrontierStallWatch(new FrontierStallPressure(java.time.Duration.ofMinutes(1)), alert),
+                    id -> Map.of(), id -> Map.of(), id -> Map.of(), id -> CaptureReading.NONE,
+                    id -> DeliveryReading.NONE, Clock.systemUTC());
+            try (TelemetryDispatcher dispatcher = new TelemetryDispatcher(publisher, null,
+                    MetricsExport.none(), fixture.scopes, TelemetryBoundaryDispatchTest.eventStore(fixture.events),
+                    fixture.recovery, 1, 2)) {
+                dispatcher.offerScopeRecovery(PIPELINE, null, null, owner::get);
+                assertThat(fixture.latest.inheritedEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(fixture.latest.reads.get()).as("resolve read, then the inherited FAILED cause read")
+                        .isEqualTo(2);
+                assertThat(fixture.latest.writes.get()).isZero();
+                assertThat(watched.get()).isZero();
+                assertThat(fixture.scopes.current(PIPELINE)).isEmpty();
+                if (loseOwner) {
+                    owner.set(false);
+                } else {
+                    fixture.scopes.cancelRestoration(PIPELINE);
+                }
+                fixture.latest.inheritedRelease.countDown();
+                await(() -> dispatcher.health().get(TelemetryDispatcher.Sink.LATEST).inFlight() == 0);
+                assertThat(fixture.latest.writes.get())
+                        .as("qualification was lost before the physical save was called").isZero();
+                assertThat(fixture.latest.read(PIPELINE).orElseThrow()).isSameAs(before);
+                assertThat(watched.get()).as("an invalidated recovery cannot update local alert windows").isZero();
+                assertThat(fixture.scopes.current(PIPELINE)).isEmpty();
+                assertThat(fixture.events).isEmpty();
+            } finally {
+                fixture.latest.inheritedRelease.countDown();
+            }
+        }
+    }
+
     private static long errorCount(Observation observation) {
         return observation.facts().stream().filter(fact -> fact.name().equals("tapstate.pipeline.errors"))
                 .flatMap(fact -> fact.points().stream()).mapToLong(MetricPoint::value).sum();
@@ -586,6 +646,9 @@ class ObservationScopeRecoveryTest {
         private final CountDownLatch release = new CountDownLatch(1);
         private final CountDownLatch writeEntered = new CountDownLatch(1);
         private final CountDownLatch writeRelease = new CountDownLatch(1);
+        private final CountDownLatch inheritedEntered = new CountDownLatch(1);
+        private final CountDownLatch inheritedRelease = new CountDownLatch(1);
+        private volatile boolean blockInheritedFailure;
         private final AtomicBoolean failWrite = new AtomicBoolean();
         private volatile boolean blocked;
         private volatile boolean blockWrite;
@@ -626,8 +689,19 @@ class ObservationScopeRecoveryTest {
             return Optional.ofNullable(rows.get(id)).map(Stored::observation);
         }
         @Override public Optional<Stored> readStored(String id) {
-            reads.incrementAndGet();
+            int read = reads.incrementAndGet();
             readerThread = Thread.currentThread().getName();
+            if (blockInheritedFailure && PIPELINE.equals(id) && read == 2) {
+                inheritedEntered.countDown();
+                try {
+                    if (!inheritedRelease.await(5, TimeUnit.SECONDS)) {
+                        throw new AssertionError("inherited failure read was not released");
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError(interrupted);
+                }
+            }
             if (blocked && PIPELINE.equals(id)) {
                 entered.countDown();
                 try {

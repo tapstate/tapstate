@@ -149,6 +149,9 @@ final class ConvergenceDriver {
             if (pendingWork != null) {
                 pendingWork.clearAll();
             }
+            if (telemetryWork != null) {
+                telemetryWork.discardStalePreparations();
+            }
             return;
         }
         List<String> pipelineIds = desired.pipelineIds();
@@ -185,6 +188,9 @@ final class ConvergenceDriver {
                     }
                     if (pendingWork != null) {
                         pendingWork.clear(pipelineId);
+                    }
+                    if (telemetryWork != null) {
+                        telemetryWork.discardStalePreparation(pipelineId);
                     }
                     continue;
                 }
@@ -384,8 +390,8 @@ final class ConvergenceDriver {
                 return Optional.empty();
             }
             var capturedScope = scope.orElse(null);
-            telemetryWork.offerPreparation(pipelineId, failure, capturedScope,
-                    () -> publicationOwner(pipelineId, capturedScope, permit));
+            telemetryWork.offerQualifiedPreparation(pipelineId, failure, capturedScope,
+                    () -> publicationQualification(pipelineId, capturedScope, permit));
             return Optional.empty();
         }
         if (observationScopes == null) {
@@ -395,18 +401,34 @@ final class ConvergenceDriver {
                 .flatMap(scope -> publisher.publishScoped(pipelineId, failure, scope));
     }
 
-    private boolean publicationOwner(String pipelineId, io.tapstate.spi.store.ObservationStore.Scope scope,
-            PipelineActuationOwnership.Permit expected) {
+    private TelemetryDispatcher.PublicationQualification publicationQualification(String pipelineId,
+            io.tapstate.spi.store.ObservationStore.Scope scope, PipelineActuationOwnership.Permit expected) {
         if (!businessEligible.getAsBoolean()) {
-            return false;
+            return TelemetryDispatcher.PublicationQualification.STALE;
         }
-        PipelineActuationOwnership.Permit owner = expected != null && expected.granted()
-                ? expected : actuation.permit(pipelineId);
-        if (!owner.granted() || !stillOwner(pipelineId, owner)) {
-            return false;
+        PipelineActuationOwnership.Permit current = actuation.permit(pipelineId);
+        if (current.retry()) {
+            return TelemetryDispatcher.PublicationQualification.RETRY;
         }
-        return owner.claim() == null || (scope != null
-                && owner.claim().executionGeneration() == scope.executionGeneration());
+        if (!current.granted()) {
+            return TelemetryDispatcher.PublicationQualification.STALE;
+        }
+        if (expected != null && expected.granted()) {
+            var before = expected.claim();
+            var now = current.claim();
+            boolean unchanged = before == null || now == null ? before == now
+                    : before.key().equals(now.key()) && before.owner().equals(now.owner())
+                            && before.claimGeneration() == now.claimGeneration()
+                            && before.executionGeneration() == now.executionGeneration()
+                            && before.topologyRevision() == now.topologyRevision();
+            if (!unchanged) {
+                return TelemetryDispatcher.PublicationQualification.STALE;
+            }
+        }
+        return current.claim() == null || (scope != null
+                && current.claim().executionGeneration() == scope.executionGeneration())
+                ? TelemetryDispatcher.PublicationQualification.CURRENT
+                : TelemetryDispatcher.PublicationQualification.STALE;
     }
 
     /** Lease renewal time may move; the actual owner and both fencing generations must not. */
