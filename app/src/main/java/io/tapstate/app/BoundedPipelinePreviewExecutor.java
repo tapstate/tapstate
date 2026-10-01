@@ -451,8 +451,21 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                 if (cause instanceof TapstateException coded) {
                     throw coded;
                 }
+                LOG.warn("Preview job {} failed unexpectedly (exception types: {})",
+                        request.runId(), exceptionTypes(cause));
                 throw refused("the isolated preview pipeline failed during execution");
             }
+        }
+
+        private String exceptionTypes(Throwable failureCause) {
+            List<String> types = new ArrayList<>();
+            Set<Throwable> seen = Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+            for (Throwable current = failureCause;
+                    current != null && types.size() < 8 && seen.add(current);
+                    current = current.getCause()) {
+                types.add(current.getClass().getName());
+            }
+            return String.join(" <- ", types);
         }
 
         private List<Map<String, Object>> readDocuments() {
