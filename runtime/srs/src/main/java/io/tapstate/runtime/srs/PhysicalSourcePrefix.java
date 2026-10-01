@@ -5,6 +5,7 @@ import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
 
@@ -259,11 +260,26 @@ final class PhysicalSourcePrefix implements AutoCloseable {
         releaseOrStop(consumers);
     }
 
-    /** Re-checks the confirmations, releasing what they now allow. The shared thread calls it while a source is quiet. */
+    /**
+     * Re-checks the confirmations, releasing what they now allow. The shared thread calls it while a source is
+     * quiet. A store that cannot be read this turn is asked again on the next: nothing can be released on
+     * confirmations nobody could read, so skipping a turn is the safe direction, and stopping every pipeline on
+     * the source over one failed read is not.
+     */
     synchronized void tick() {
-        if (!closed && failure == null && !pending.isEmpty()) {
-            releaseOrStop(meta.consumerOffsets(chainId));
+        if (closed || failure != null || pending.isEmpty()) {
+            return;
         }
+        Collection<ConsumerOffset> consumers;
+        try {
+            consumers = meta.consumerOffsets(chainId);
+        } catch (TapstateException unread) {
+            if (unread.code() == IoError.STORE_UNAVAILABLE) {
+                return;
+            }
+            throw unread;
+        }
+        releaseOrStop(consumers);
     }
 
     private void tickSafely() {
@@ -334,7 +350,15 @@ final class PhysicalSourcePrefix implements AutoCloseable {
                     return false;
                 }
                 if (ringDone == null) {
-                    ringDone = meta.ringDoneThrough(chainId, consumer.pipelineId());
+                    try {
+                        ringDone = meta.ringDoneThrough(chainId, consumer.pipelineId());
+                    } catch (TapstateException unread) {
+                        // Not confirmed while it cannot be read; a later turn reads it again.
+                        if (unread.code() == IoError.STORE_UNAVAILABLE) {
+                            return false;
+                        }
+                        throw unread;
+                    }
                 }
                 Long done = ringDone.get(table.getKey());
                 if (done == null || done < table.getValue()) {

@@ -247,6 +247,43 @@ class PhysicalSourcePrefixTest {
         assertThat(sourceRead()).isEqualTo("t1");
     }
 
+    /**
+     * A store that cannot be read for a moment does not stop the reader: the re-check skips that turn and a
+     * later one releases what the confirmations allow. Nothing can be released on confirmations nobody could
+     * read, so skipping is the safe direction.
+     */
+    @Test
+    void aStoreThatCannotBeReadForAMomentDoesNotStopTheReader() {
+        java.util.concurrent.atomic.AtomicBoolean unreadable = new java.util.concurrent.atomic.AtomicBoolean();
+        meta = new CaptureRunUnitTest.InMemoryMeta() {
+            @Override
+            public synchronized List<ConsumerOffset> consumerOffsets(String miningChainId) {
+                if (unreadable.get()) {
+                    throw new TapstateException(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE,
+                            Map.of("detail", "the primary is being elected"), null);
+                }
+                return super.consumerOffsets(miningChainId);
+            }
+        };
+        meta.create(CHAIN, null);
+        epoch = meta.openEpoch(CHAIN);
+        select("pipe", "orders");
+        PhysicalSourcePrefix prefix = shared("orders");
+        prefix.start(at("t0"));
+        prefix.admitted(Map.of("orders", 0L), "t1");
+
+        unreadable.set(true);
+        ack("pipe", "orders", 0);
+        prefix.tick();
+        assertThat(health.failure()).as("the reader goes on").isEmpty();
+        assertThat(sourceRead()).isEqualTo("t0");
+
+        unreadable.set(false);
+        prefix.tick();
+        assertThat(sourceRead()).isEqualTo("t1");
+        assertThat(health.failure()).isEmpty();
+    }
+
     /** A reader whose generation another reader has taken stops with a code, and writes nothing down. */
     @Test
     void aReaderThatLostItsGenerationStopsWithACode() {
