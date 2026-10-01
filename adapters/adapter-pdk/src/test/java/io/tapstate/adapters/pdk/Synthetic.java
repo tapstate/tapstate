@@ -577,6 +577,23 @@ final class Synthetic {
     }
 
     /**
+     * Streams one insert the way a connector built on a change-data engine hands its changes over: whatever
+     * the hand-over throws comes back out of the stream wrapped in an exception of the connector's own.
+     */
+    static Path wrappingStreamSource(Path dir) {
+        String register = "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "  consumer.streamReadStarted();"
+                + row("a", 1)
+                + "  List<TapEvent> ins = new ArrayList<>();"
+                + "  ins.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(1L).after(a));"
+                + "  try { consumer.accept(ins, null); }"
+                + "  catch (Throwable t) { throw new RuntimeException(t); }"
+                + "  consumer.streamReadEnded();"
+                + "});";
+        return SyntheticJar.compileToJar(dir, "synthetic.WrappingStream", source("WrappingStream", "", register));
+    }
+
+    /**
      * A source that reads on a thread of its own and delivers from it, the way a polling connector does, but
      * only when it is told to; its flush function records every call it gets.
      *

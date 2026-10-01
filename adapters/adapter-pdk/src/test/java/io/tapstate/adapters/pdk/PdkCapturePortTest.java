@@ -30,6 +30,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -840,8 +841,31 @@ class PdkCapturePortTest {
 
     @Test
     void closingACdcSubscriptionDoesNotReportItsInterruptedBatchAsAFailure(@TempDir Path dir) throws Exception {
-        Path jar = Synthetic.emittingSource(dir);
-        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.EmittingSource", null));
+        assertACloseIsNotReported(Synthetic.emittingSource(dir), "synthetic.EmittingSource",
+                () -> new CancellationException("the cdc batch was interrupted while it waited for room"));
+    }
+
+    /**
+     * A connector built on a change-data engine hands the cancellation back wrapped in an exception of its own.
+     * It is still the stop that was asked for: reported, it fails a run whose old stream was only being
+     * replaced -- which is what a reader widened over another table does.
+     */
+    @Test
+    void closingACdcSubscriptionDoesNotReportTheCancellationAConnectorWrapped(@TempDir Path dir) throws Exception {
+        assertACloseIsNotReported(Synthetic.wrappingStreamSource(dir), "synthetic.WrappingStream",
+                () -> new CancellationException("the cdc batch was interrupted while it waited for room"));
+    }
+
+    /** Whatever else a stream throws once its close was asked for is that close too, and nobody's failure. */
+    @Test
+    void closingACdcSubscriptionDoesNotReportWhatTheStopCutOff(@TempDir Path dir) throws Exception {
+        assertACloseIsNotReported(Synthetic.emittingSource(dir), "synthetic.EmittingSource",
+                () -> new IllegalStateException("the hand-over was cut off by the stop"));
+    }
+
+    private void assertACloseIsNotReported(Path jar, String connectorClass, Supplier<RuntimeException> woken)
+            throws Exception {
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, connectorClass, null));
         CountDownLatch batchEntered = new CountDownLatch(1);
         CountDownLatch keepBatchParked = new CountDownLatch(1);
         AtomicReference<Throwable> failure = new AtomicReference<>();
@@ -853,7 +877,7 @@ class PdkCapturePortTest {
                     keepBatchParked.await();
                 } catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
-                    throw new CancellationException("the cdc batch was interrupted while it waited for room");
+                    throw woken.get();
                 }
             }
 
