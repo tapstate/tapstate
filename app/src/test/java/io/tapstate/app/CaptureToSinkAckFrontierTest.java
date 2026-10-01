@@ -61,6 +61,7 @@ import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.SrsMetaStore;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -71,6 +72,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.UnaryOperator;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -555,16 +557,33 @@ class CaptureToSinkAckFrontierTest {
     /**
      * A fake connector whose cdc stream is driven on demand: {@code cdc} starts a daemon that emits each fed
      * change to the listener, so the test can release changes one at a time while the pipeline runs live.
+     *
+     * <p>Its change log is whatever the case feeds it. Each subscription reads all of it on its own -- every
+     * change fed before it opened, then every one fed while it is open -- and is stopped by its own close alone,
+     * as two readers of one source each read its whole log. A queue and a running flag shared by every
+     * subscription instead handed each change to whichever reader polled first, and let one reader's close stop
+     * the other's delivery for good: a pipeline reading the source directly, opened before the buffered
+     * pipeline's reader was closed and opened again, then never saw another change.
      */
     private static final class GatedSource implements CapturePort {
 
-        private final LinkedBlockingQueue<Envelope> pending = new LinkedBlockingQueue<>();
-        private volatile boolean running;
+        private final List<Envelope> fed = new ArrayList<>();
+        private final List<LinkedBlockingQueue<Envelope>> open = new ArrayList<>();
         private volatile boolean cdcClosed;
-        private Thread daemon;
 
-        void feed(Envelope change) {
-            pending.add(change);
+        synchronized void feed(Envelope change) {
+            fed.add(change);
+            open.forEach(subscription -> subscription.add(change));
+        }
+
+        private synchronized LinkedBlockingQueue<Envelope> subscribe() {
+            LinkedBlockingQueue<Envelope> pending = new LinkedBlockingQueue<>(fed);
+            open.add(pending);
+            return pending;
+        }
+
+        private synchronized void unsubscribe(LinkedBlockingQueue<Envelope> pending) {
+            open.remove(pending);
         }
 
         @Override
@@ -577,9 +596,10 @@ class CaptureToSinkAckFrontierTest {
             // Where the stream begins, said before anything else, as a connector's stream says it.
             listener.onStart(java.util.Optional.of(start instanceof CaptureStart.Resume resume
                     ? resume.position() : new SourcePosition("start")));
-            running = true;
-            daemon = new Thread(() -> {
-                while (running) {
+            LinkedBlockingQueue<Envelope> pending = subscribe();
+            AtomicBoolean running = new AtomicBoolean(true);
+            Thread daemon = new Thread(() -> {
+                while (running.get()) {
                     try {
                         Envelope change = pending.poll(25, TimeUnit.MILLISECONDS);
                         if (change != null) {
@@ -594,7 +614,8 @@ class CaptureToSinkAckFrontierTest {
             daemon.setDaemon(true);
             daemon.start();
             return () -> {
-                running = false;
+                running.set(false);
+                unsubscribe(pending);
                 cdcClosed = true;
                 daemon.interrupt();
             };
