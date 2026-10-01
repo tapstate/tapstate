@@ -534,7 +534,11 @@ public final class CaptureRunUnit {
                     meta.clearPhysicalRequests(chainId, tables);
                     return false;
                 }
-                stream.getAndSet(null).close();
+                // Stopped on the first attempt; a retry after a refused publication finds nothing left to stop.
+                Subscription running = stream.getAndSet(null);
+                if (running != null) {
+                    running.close();
+                }
                 PhysicalSourcePrefix prefix = prefixOver(tables);
                 SrsMetaStore.PhysicalSelection wider =
                         new SrsMetaStore.PhysicalSelection(epoch, published.revision() + 1, tables);

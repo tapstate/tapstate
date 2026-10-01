@@ -1508,6 +1508,37 @@ class CaptureRunUnitTest {
     }
 
     /**
+     * A table asked for while the reader is being widened leaves the wider selection out of date before it is
+     * published, and the publication is refused. The reader takes the newer request on in the same widening:
+     * its stream is already stopped by then, so the retry has none to stop again.
+     */
+    @Test
+    void aTableAskedForWhileTheReaderIsWideningIsTakenOnInTheSameWidening() {
+        java.util.concurrent.atomic.AtomicBoolean raced = new java.util.concurrent.atomic.AtomicBoolean();
+        InMemoryMeta meta = new InMemoryMeta() {
+            @Override
+            public synchronized boolean replacePhysicalSelection(
+                    String miningChainId, PhysicalSelection current, PhysicalSelection wider) {
+                if (raced.compareAndSet(false, true)) {
+                    requestPhysicalTables(miningChainId, wider.epoch(), List.of("payments"));
+                }
+                return super.replacePhysicalSelection(miningChainId, current, wider);
+            }
+        };
+        FakeSource source = new FakeSource(List.of(), List.of());
+        CaptureRunUnit unit = runUnit(source, meta);
+        CaptureRun owner = unit.start(specOver("pipe-1", "k-widen-race", "orders"), e -> { });
+        String chainId = owner.chainId().orElseThrow().value();
+        meta.requestPhysicalTables(chainId, meta.read(chainId).orElseThrow().epoch(), List.of("customers"));
+
+        assertThat(unit.widen(owner)).isTrue();
+        assertThat(source.cdcStreams)
+                .containsExactly(List.of("orders"), List.of("customers", "orders", "payments"));
+        assertThat(meta.requestedPhysicalTables(chainId)).isEmpty();
+        owner.close();
+    }
+
+    /**
      * A reader that starts again reads its chain from where it was released to, so a pipeline already on the
      * chain is owed what the new reader mines again before that pipeline's own run comes back -- written into
      * the ring above the place the pipeline had. Coming back, the pipeline keeps that place rather than
