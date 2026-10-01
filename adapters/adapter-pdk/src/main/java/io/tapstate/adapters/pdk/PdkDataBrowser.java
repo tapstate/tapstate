@@ -235,6 +235,7 @@ public final class PdkDataBrowser implements DataBrowser {
                 if (!closed.compareAndSet(false, true)) {
                     return;
                 }
+                slot.beginClose();
                 // The place in the ceiling is given back after the stream is stopped, and in a finally:
                 // a close that threw on the way out would otherwise leak the count rather than the
                 // connector, which is the half nothing would ever report.

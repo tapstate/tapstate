@@ -701,6 +701,19 @@ final class ControlPlane {
                 string(map, "contentHash", response.body())));
     }
 
+    /** Creates and reads back an authoring draft through the public HTTP contract. */
+    Map<String, Object> createPipelineDraft(String id, Map<String, Object> draft) {
+        HttpResponse<String> created = send(authed("/api/pipelines/" + urlSegment(id) + "/draft",
+                JsonWriter.write(draft)));
+        expect(created, 201, "create pipeline draft " + id);
+        HttpResponse<String> read = send(authedGet("/api/pipelines/" + urlSegment(id) + "/draft"));
+        expect(read, 200, "read pipeline draft " + id);
+        if (!(JsonReader.parse(read.body()) instanceof Map<?, ?> map)) {
+            throw new AssertionError("the pipeline draft read was not an object: " + read.body());
+        }
+        return asObject(map);
+    }
+
     /** A stored Source as the API projects it, including its secret-free configuration. */
     Map<String, Object> source(String sourceId) {
         HttpResponse<String> response = send(authedGet("/api/sources/" + urlSegment(sourceId)));

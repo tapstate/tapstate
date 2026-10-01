@@ -154,7 +154,7 @@ class AColumnNamedWithADotIsReportedWhenItIsAppliedTest {
                 new InMemoryArtifactStore(), catalog,
                 new AuditGate(record -> { }, FIXED_CLOCK), schemas, NestSettings.defaults(),
                 SchemaDerivation.none(),
-                new LivePipelines(new InMemoryDesiredStore(), new InMemoryStateStore()));
+                new LivePipelines(new InMemoryDesiredStore(), new InMemoryStateStore()), "on-prem");
     }
 
     /** A catalog store with nothing registered, so the merged view is the bundled snapshot alone. */

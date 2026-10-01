@@ -191,7 +191,7 @@ public final class PipelineRepresentation {
         throw malformed(path + ".type is required");
     }
 
-    private static TransformBody body(String type, Map<String, Object> payload, String path) {
+    static TransformBody body(String type, Map<String, Object> payload, String path) {
         return switch (type) {
             case "js" -> new TransformBody.Js(requiredText(payload, "script", path));
             case "map" -> new TransformBody.MapProjection(
@@ -245,6 +245,9 @@ public final class PipelineRepresentation {
                     result.put(entry.getKey(), FieldRule.computed(
                             requiredString(typed.get("celExpr"), path + "." + entry.getKey())));
                 } else if (typed.size() == 1 && typed.containsKey("value")) {
+                    if (typed.get("value") == null) {
+                        throw malformed(path + "." + entry.getKey() + ".value cannot be null");
+                    }
                     result.put(entry.getKey(), FieldRule.literal(copyJsonValue(typed.get("value"))));
                 } else {
                     result.put(entry.getKey(), FieldRule.literal(copyJsonValue(value)));
