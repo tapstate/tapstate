@@ -99,7 +99,7 @@ final class PreviewSelectionPlanner {
             refuse("the selected output has no bounded source anchor");
         }
 
-        List<String> orderedRoots = List.copyOf(roots);
+        List<String> orderedRoots = roots.stream().sorted().toList();
         if (orderedRoots.size() > rootLimit) {
             refuse("rootLimit must allow at least one row from every required root source");
         }

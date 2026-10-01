@@ -126,6 +126,17 @@ class BoundedPipelinePreviewIT {
             assertThat(union).containsEntry("complete", true).containsEntry("rowCount", 4);
             assertThat(values(documents(union), "id"))
                     .containsExactlyInAnyOrder("order-1", "order-2", "order-3", "order-4");
+            List<Map<String, Object>> boundedUnion = control.preview(PIPELINE_ID, OUTPUT_ID, 2,
+                    SAMPLE_ID + "-union-bounded", List.of(
+                            new ControlPlane.PreviewDraft("preview_source.tap.yml", sourceYaml(source)),
+                            new ControlPlane.PreviewDraft("preview_pipeline.tap.yml", unionPipelineYaml())));
+            Map<String, Object> unionSample = payload(boundedUnion, "sample.completed");
+            assertThat(unionSample).containsEntry("rootRows", 2).containsEntry("rootTruncated", true);
+            List<String> unionRootKeys = ((List<?>) unionSample.get("rootSourceKeys")).stream()
+                    .map(String::valueOf)
+                    .toList();
+            assertThat(unionRootKeys).hasSize(2)
+                    .containsExactlyElementsOf(unionRootKeys.stream().sorted().toList());
 
             Map<String, Object> joined = result(control, source, "joinPipelineYaml()", OUTPUT_ID,
                     SAMPLE_ID + "-join", false);
