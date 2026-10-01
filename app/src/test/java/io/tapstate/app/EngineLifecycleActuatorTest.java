@@ -189,6 +189,52 @@ class EngineLifecycleActuatorTest {
         assertThat(member.getJet().getJob(PIPE)).isNull();
     }
 
+    /**
+     * A start refused while its prerequisites are checked has taken no run of its own, so the claim still names the
+     * run before it. The member driving the pipeline is told, so the failure the refusal records is judged as that
+     * refusal - not by the earlier run, which after a member left would read as the departure ending it again.
+     */
+    @Test
+    void aStartRefusedBeforeItTakesARunIsJudgedAsThatRefusal() {
+        RecordingDagSource dagSource = new RecordingDagSource(new CopyOnWriteArrayList<>());
+        TapstateException refused = new TapstateException(ActuationError.SOURCE_TABLE_NOT_DISCOVERED,
+                Map.of("source", "orders_src", "table", "orders"), null);
+        dagSource.validation = () -> {
+            throw refused;
+        };
+        PipelineActuationOwnership ownership = clusteredOwnership();
+        assertThat(ownership.permit(PIPE).granted()).isTrue();
+        assertThat(ownership.beginExecution(PIPE).allowed()).as("the run before this start").isTrue();
+        LifecycleActuator actuator = new EngineLifecycleActuator(new Engine(member), dagSource,
+                new RecordingCaptureCoordinator(new CopyOnWriteArrayList<>()), teardown(), ownership);
+
+        assertThatThrownBy(() -> actuator.start(PIPE)).isSameAs(refused);
+
+        assertThat(ownership.departure(PIPE, Duration.ofSeconds(90).toNanos()))
+                .isEqualTo(PipelineActuationOwnership.Departure.START_REFUSED);
+    }
+
+    /** A start refused once it took a run is that run's failure, judged like any other death of a run. */
+    @Test
+    void aStartRefusedOnceItTookARunIsJudgedByThatRun() {
+        RecordingDagSource dagSource = new RecordingDagSource(new CopyOnWriteArrayList<>());
+        dagSource.planning = () -> {
+            throw new TapstateException(ActuationError.NO_SAFE_PARALLELISM, Map.of(
+                    "pipeline", PIPE, "node", "w", "requested", 1000, "members", 1,
+                    "candidates", "1000 per member breaks max-local-parallelism"), null);
+        };
+        PipelineActuationOwnership ownership = clusteredOwnership();
+        assertThat(ownership.permit(PIPE).granted()).isTrue();
+        LifecycleActuator actuator = new EngineLifecycleActuator(new Engine(member), dagSource,
+                new RecordingCaptureCoordinator(new CopyOnWriteArrayList<>()), teardown(), ownership);
+
+        assertThatThrownBy(() -> actuator.start(PIPE)).isInstanceOf(TapstateException.class);
+
+        assertThat(ownership.heldExecutionGeneration(PIPE)).as("the start took a run first").isEqualTo(1);
+        assertThat(ownership.departure(PIPE, Duration.ofSeconds(90).toNanos()))
+                .isNotEqualTo(PipelineActuationOwnership.Departure.START_REFUSED);
+    }
+
     /** A start that plans its run does so before it opens the capture its topology is then built over. */
     @Test
     void aStartPlansItsRunBeforeItOpensTheCapture() {

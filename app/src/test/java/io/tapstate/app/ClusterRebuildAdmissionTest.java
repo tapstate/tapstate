@@ -271,6 +271,85 @@ class ClusterRebuildAdmissionTest {
                 .isFalse();
     }
 
+    /**
+     * The second half of what this class was reported for. A member that restarted took over a run another boot
+     * of it had submitted, and every start it made was refused with a code before it took a run of its own.
+     * Judged by the run the claim still named - inherited, so admitted - each refusal spent a rebuild, and the
+     * pipeline was started into the same refusal until the budget ran out.
+     */
+    @Test
+    void aStartRefusedBeforeItTookARunIsNotRebuiltAsTheRunItTookOver() {
+        committed(7, "node-a", "node-b");
+        submitRunUnder(7);
+        claims.elapse(TTL.plusSeconds(1));
+        nanos.addAndGet(RENEW.toNanos());
+        PipelineActuationOwnership restarted = new PipelineActuationOwnership(
+                "cluster-a", new WorkloadOwner("node-a", "boot-a-restarted"), membership,
+                new ClusterWorkloadClaims(claims, membership), TTL, RENEW, nanos::get);
+        assertThat(restarted.permit("orders").granted()).isTrue();
+        ClusterRebuildAdmission afterRestart = new ClusterRebuildAdmission(restarted, BACKOFF, DETECTION, nanos::get);
+
+        List<String> logged = loggedBy(() -> {
+            restarted.startRefusedBeforeItsRun("orders");
+            for (int pass = 0; pass <= ClusterRebuildAdmission.MAX_ATTEMPTS; pass++) {
+                assertThat(afterRestart.admits("orders"))
+                        .as("pass %s: the start was refused, and no member leaving answers for that", pass)
+                        .isFalse();
+                nanos.addAndGet(BACKOFF.toNanos());
+            }
+        });
+
+        assertThat(logged).hasSize(1).allSatisfy(line -> assertThat(line).contains("orders")
+                .contains("its last start was refused before it took a run"));
+    }
+
+    /**
+     * A departure's rebuilds are for the runs it ends. A replacement refused before it took a run was ended by
+     * its refusal alone, so it spends none of them, and the next run that does start and is then cut short by a
+     * member leaving has the whole budget.
+     */
+    @Test
+    void aReplacementRefusedBeforeItTookARunDoesNotSpendTheDeparturesRebuilds() {
+        committed(7, "node-a", "node-b");
+        submitRunUnder(7);
+        committed(8, "node-a");
+        assertThat(admission.admits("orders")).as("node-b left under the run").isTrue();
+
+        ownership.startRefusedBeforeItsRun("orders");
+        nanos.addAndGet(BACKOFF.toNanos());
+        assertThat(admission.admits("orders"))
+                .as("the replacement was refused before it took a run, with node-b still gone")
+                .isFalse();
+
+        // Somebody clears what refused it and starts the pipeline, and that run is cut short by a member leaving.
+        committed(9, "node-a", "node-c");
+        submitRunUnder(9);
+        committed(10, "node-a");
+        List<String> logged = loggedBy(() -> assertThat(admission.admits("orders")).isTrue());
+        assertThat(logged).hasSize(1).allSatisfy(line -> assertThat(line).contains("attempt 1 of 3"));
+    }
+
+    /**
+     * The engine keeps the failure of the run it last refused. A start refused before it took a run leaves that
+     * record where it is, about the run before - which says nothing of this refusal and must not admit it.
+     */
+    @Test
+    void aStartRefusedBeforeItTookARunIsNotTakenForTheRunAChangedMembershipRefused() {
+        ClusterRebuildAdmission afterARefusedStart = new ClusterRebuildAdmission(
+                ownership, pipelineId -> true, BACKOFF, DETECTION, nanos::get);
+        committed(7, "node-a", "node-b");
+        submitRunUnder(7);
+        committed(8, "node-a", "node-b", "node-c");
+        assertThat(afterARefusedStart.admits("orders")).as("the engine refused the run for its members").isTrue();
+
+        ownership.startRefusedBeforeItsRun("orders");
+        nanos.addAndGet(BACKOFF.toNanos());
+
+        assertThat(afterARefusedStart.admits("orders"))
+                .as("what failed now is the replacement's own refusal, not the run the engine refused")
+                .isFalse();
+    }
+
     @Test
     void theRefusalIsReadOffItsCodeWhetherTheCauseOrOnlyItsRenderingSurvived() {
         io.tapstate.core.common.TapstateException refused = new io.tapstate.core.common.TapstateException(

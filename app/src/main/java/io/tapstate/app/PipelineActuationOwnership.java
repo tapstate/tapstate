@@ -85,6 +85,12 @@ final class PipelineActuationOwnership {
         /** The execution generation of the run {@link #runMembers} describes; zero while there is none. */
         private long runExecutionGeneration;
         /**
+         * The execution generation the claim carried when a start on this member was refused before it took
+         * a run of its own, or {@link #NEVER}. While the claim still carries it, what failed is that start,
+         * not the run the generation names.
+         */
+        private long startRefusedAtGeneration = NEVER;
+        /**
          * The last moment any of those members was out of sight while this member looked, or
          * {@link #NEVER}. Remembered rather than recomputed, because a member that leaves and
          * comes back is a member that left: the run it was carrying pieces of died either way, and by
@@ -208,6 +214,18 @@ final class PipelineActuationOwnership {
      * does. The caller submits nothing in that case: a run that cannot be fenced is a run nothing could
      * later stop from writing.
      */
+    /**
+     * Notes that a start of {@code pipelineId} on this member was refused before it took a run, by one of the
+     * checks a start makes ahead of everything a run opens. Until a run takes a generation of its own, the
+     * failure that refusal records is the refusal's, which no member leaving answers for.
+     */
+    void startRefusedBeforeItsRun(String pipelineId) {
+        Held state = held.get(Objects.requireNonNull(pipelineId, "pipelineId"));
+        if (state != null && state.claim != null) {
+            state.startRefusedAtGeneration = state.claim.executionGeneration();
+        }
+    }
+
     Execution beginExecution(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         if (closing) {
@@ -264,6 +282,7 @@ final class PipelineActuationOwnership {
         SHUTTING_DOWN("this member is shutting down"),
         NOT_DRIVING("this member does not hold the pipeline's actuation claim"),
         NO_RUN("no run has been submitted under the pipeline's actuation claim"),
+        START_REFUSED("its last start was refused before it took a run, which no member leaving answers for"),
         ITS_OWN_FAILURE("its run's failure was recorded as its own before any member it was planned over left"),
         NOBODY_LEFT("every member its run was planned over is still in sight,"
                 + " and none left within the settling stretch");
@@ -324,6 +343,10 @@ final class PipelineActuationOwnership {
      * with no recorded failure is admitted: its driver may have gone away before it could record why
      * the run ended. That includes a run somebody else submitted while this member did not hold the
      * pipeline, whatever this member once planned a run of its own over.
+     *
+     * <p>A start refused before it took a run is judged as that refusal. The claim still names the run
+     * before it, and judged by that run - inherited, or planned over a member that has gone - every
+     * refused start would read as the same death again and spend a rebuild meant for a departure.
      */
     Departure departure(String pipelineId, long settlingNanos) {
         Objects.requireNonNull(pipelineId, "pipelineId");
@@ -339,6 +362,9 @@ final class PipelineActuationOwnership {
         }
         if (state.claim.executionGeneration() == 0) {
             return Departure.NO_RUN;
+        }
+        if (state.startRefusedAtGeneration == state.claim.executionGeneration()) {
+            return Departure.START_REFUSED;
         }
         // A failure the submitting holder saw before any member loss remains that same failure when
         // the claim changes hands. A later departure cannot turn it into a cluster-caused death.

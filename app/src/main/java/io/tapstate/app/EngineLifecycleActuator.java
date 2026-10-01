@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.ExecutionPlan;
 import io.tapstate.core.lifecycle.NodeParallelism;
 import io.tapstate.core.model.BatchSpec;
@@ -105,14 +106,23 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // An engine whose member was shut down for want of memory is the first such refusal. Everything
         // below would otherwise run up to the member and be thrown back uncoded, a capture left reading for
         // a job that cannot exist.
-        engine.refuseIfLost(pipelineId);
-        DagSource.StartPreparation prepared = dagSource.prepareStart(
-                pipelineId, stateTeardown.defaultDatabase());
-        // Every member the run would take part on loads the connectors its sinks open, asked before the run is
-        // fenced or anything is opened: a member that finds out only as its sink opens fails a run that is
-        // already reading, and its reason stays on that member.
-        Set<String> sharedConnectors = connectors.requireEveryMemberCanLoad(
-                pipelineId, Set.copyOf(prepared.sinkConnectors().values()));
+        DagSource.StartPreparation prepared;
+        Set<String> sharedConnectors;
+        try {
+            engine.refuseIfLost(pipelineId);
+            prepared = dagSource.prepareStart(pipelineId, stateTeardown.defaultDatabase());
+            // Every member the run would take part on loads the connectors its sinks open, asked before the run
+            // is fenced or anything is opened: a member that finds out only as its sink opens fails a run that
+            // is already reading, and its reason stays on that member.
+            sharedConnectors = connectors.requireEveryMemberCanLoad(
+                    pipelineId, Set.copyOf(prepared.sinkConnectors().values()));
+        } catch (TapstateException refused) {
+            // Refused before this start took a run, so the claim still names the run before it. Judged by that
+            // run, the failure this refusal records would read as its death - and right after a member left,
+            // as the departure again, spending the rebuilds meant for it on a refusal nobody leaving caused.
+            actuation.startRefusedBeforeItsRun(pipelineId);
+            throw refused;
+        }
         // The run's own generation, taken before the first side effect for the same reason: a run this
         // member cannot fence is one nothing could later stop from writing, so it must not be half built.
         // Nothing is recorded as failed here -- the pipeline is fine, this member is not its driver any

@@ -131,7 +131,11 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
         actuation.recordFailure(pipelineId, MAX_ATTEMPTS * backoffNanos, detectionWindowNanos);
         PipelineActuationOwnership.Departure departure =
                 actuation.departure(pipelineId, MAX_ATTEMPTS * backoffNanos);
-        if (!departure.admits() && !refusedForAChangedMembership.test(pipelineId)) {
+        // A start refused before it took a run is not a run the engine refused: whatever the engine still
+        // holds is about the run before it, so it cannot speak for this failure.
+        boolean membershipRefusedTheRun = departure != PipelineActuationOwnership.Departure.START_REFUSED
+                && refusedForAChangedMembership.test(pipelineId);
+        if (!departure.admits() && !membershipRefusedTheRun) {
             // Either no member it was planned over is gone, and none went recently enough to still be
             // answering for this death -- so it is the pipeline's own and stays its own -- or this member
             // is not the one driving it. Both give the budget back.
