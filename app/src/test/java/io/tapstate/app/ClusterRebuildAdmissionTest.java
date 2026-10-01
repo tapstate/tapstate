@@ -374,6 +374,25 @@ class ClusterRebuildAdmissionTest {
         assertThat(admission.admits("orders")).isFalse();
     }
 
+    @Test
+    void aPipelineCreatedUnderTheIdOfOneThatSpentItsBudgetGetsABudgetOfItsOwn() {
+        committed(7, "node-a", "node-b");
+        submitRunUnder(7);
+        committed(8, "node-a");
+        for (int attempt = 0; attempt < ClusterRebuildAdmission.MAX_ATTEMPTS; attempt++) {
+            assertThat(admission.admits("orders")).as("attempt " + attempt).isTrue();
+            nanos.addAndGet(BACKOFF.toNanos());
+        }
+        assertThat(admission.admits("orders")).isFalse();
+
+        // Deleted, and created again under the same id before the departure that spent the budget is over.
+        admission.retain(List.of());
+
+        assertThat(admission.admits("orders"))
+                .as("what a deleted pipeline spent is not the budget of the one created under its id")
+                .isTrue();
+    }
+
     /**
      * The failure this class was reported for: a pipeline left failed for a person over a member that
      * went away, with the budget meant to bring it back never reaching it.

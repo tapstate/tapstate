@@ -206,7 +206,8 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
     }
 
     /** Releases what pipelines no longer desired have spent, so a deleted one leaks no counter. */
-    void retain(java.util.Collection<String> pipelineIds) {
+    @Override
+    public void retain(java.util.Collection<String> pipelineIds) {
         attempts.keySet().retainAll(pipelineIds);
         refusals.keySet().retainAll(pipelineIds);
     }
