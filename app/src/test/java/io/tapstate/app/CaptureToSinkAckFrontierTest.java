@@ -388,10 +388,10 @@ class CaptureToSinkAckFrontierTest {
         actuator.start(DIRECT_PIPELINE);
         try {
             // Fed until the chain knows both of them, rather than until two changes have arrived
-            // somewhere. A start returns before the pipeline it started is reading, and the directly-read
-            // one reads the source live -- so a change made before it attached is not late for it, it is
-            // before its beginning and it never sees one. Nothing else says when that attach finished,
-            // which is why this keeps making changes rather than waiting for one.
+            // somewhere. A start returns before the pipeline it started is reading, and nothing says when
+            // that attach finished. A real source read live never hands a reader a change made before it
+            // attached, so this keeps making changes rather than waiting for one; the fake source here
+            // replays its whole log to each subscription, and the wait does not lean on that.
             awaitBothConsumersAcked(gatedSource, meta, chainId);
 
             assertThat(meta.consumerOffsets(chainId))
