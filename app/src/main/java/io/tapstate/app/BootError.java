@@ -30,6 +30,15 @@ enum BootError implements TapstateErrorCode {
     /** The managed metadata connection is not a MongoDB or MongoDB SRV connection string. */
     CLOUD_ATLAS_URI_INVALID("boot.cloud-atlas-uri-invalid", Set.of()),
 
+    /** A Web-bearing distribution has missing, unsupported, malformed, or conflicting metadata. */
+    WEB_PROFILE_INVALID("boot.web-profile-invalid", Set.of("reason")),
+
+    /** The packaged Web profile does not match the mode selected by the external Cloud settings. */
+    WEB_PROFILE_MODE_MISMATCH("boot.web-profile-mode-mismatch", Set.of("profile", "mode")),
+
+    /** Cloud Web metadata requires a safe HTTPS Console URL; on-prem must carry no Console URL. */
+    WEB_CONSOLE_URL_INVALID("boot.web-console-url-invalid", Set.of()),
+
     /** The optional on-prem store switch cannot disable managed Cloud metadata persistence. */
     CLOUD_STORE_REQUIRED("boot.cloud-store-required", Set.of()),
 

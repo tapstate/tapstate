@@ -36,7 +36,7 @@ RUN set -eu; \
 FROM eclipse-temurin:21-jre AS runtime-base
 
 # Common OCI self-description. Only the public server target associates its package with the
-# public source repository; the Cloud package has independent, private access permissions.
+# public source repository; the Cloud target retains independent package metadata.
 LABEL org.opencontainers.image.title="Tapstate server" \
       org.opencontainers.image.description="Preview runtime: single-node, in-memory; a restart replays from the source rather than resuming a persisted offset. Not for production." \
       org.opencontainers.image.url="https://tapstate.com" \
@@ -69,10 +69,14 @@ ARG TAPSTATE_RELEASE_VERSION=development
 ARG TAPSTATE_REVISION=unknown
 ARG TAPSTATE_WEB_REVISION=unknown
 ARG TAPSTATE_WEB_FILES_SHA256=unknown
+ARG TAPSTATE_WEB_PROFILE=unknown
+ARG TAPSTATE_WEB_CLOUD_CONSOLE_URL=""
 LABEL org.opencontainers.image.version="$TAPSTATE_RELEASE_VERSION" \
       org.opencontainers.image.revision="$TAPSTATE_REVISION" \
       io.tapstate.web.revision="$TAPSTATE_WEB_REVISION" \
-      io.tapstate.web.files.sha256="$TAPSTATE_WEB_FILES_SHA256"
+      io.tapstate.web.files.sha256="$TAPSTATE_WEB_FILES_SHA256" \
+      io.tapstate.web.profile="$TAPSTATE_WEB_PROFILE" \
+      io.tapstate.web.cloud-console-url="$TAPSTATE_WEB_CLOUD_CONSOLE_URL"
 
 USER tapstate
 
@@ -94,7 +98,7 @@ ENTRYPOINT ["java", "-jar", "/opt/tapstate/tapstate.jar"]
 # Overridable: replacing it is how an operator passes a different role or extra Spring arguments.
 CMD ["--role=all"]
 
-# Cloud release builds reuse the exact Boot JAR and runtime layers above. The connector context is
+# Each profile supplies its own Boot JAR while sharing the runtime layers above. The connector context is
 # supplied only to this target, so ordinary server builds neither fetch nor bundle connector jars.
 # The connector seed has separate distribution terms, so this target does not inherit the server label's
 # Apache-2.0 assertion. Publication still requires a reviewed license inventory and permission.

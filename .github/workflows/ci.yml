@@ -382,9 +382,11 @@ jobs:
           shellcheck deploy/docker/dockerfile-smoke.sh
           shellcheck deploy/docker/dockerfile-smoke-test.sh
           shellcheck scripts/prepare-web-assets.sh
+          shellcheck scripts/build-web-assets.sh
           shellcheck scripts/prepare-web-assets-smoke.sh
           shellcheck deploy/cloud/ghcr-publish.sh deploy/cloud/ghcr-publish-smoke.sh
           python3 -m py_compile .github/scripts/web-provenance.py .github/scripts/web-provenance-smoke.py
+          python3 -m py_compile scripts/web-assets-profile.py scripts/web-assets-profile-smoke.py
           shellcheck -s sh deploy/install-site/assemble.sh
           shellcheck -s sh deploy/install-site/verify-published.sh
           shellcheck deploy/install-site/verify-smoke.sh
@@ -410,7 +412,7 @@ jobs:
         run: python3 .github/scripts/web-provenance-smoke.py
       - name: Cloud connector input and test-preparation cases
         run: python3 deploy/cloud/stage-connectors-test.py
-      - name: Private Cloud GHCR publisher cases
+      - name: Public Cloud GHCR publisher cases
         run: bash deploy/cloud/ghcr-publish-smoke.sh
       - name: Authenticated Cloud artifact cases
         run: node --test scripts/seal-cloud-artifact.test.mjs

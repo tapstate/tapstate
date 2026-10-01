@@ -7,6 +7,8 @@ import hashlib
 import importlib.util
 import io
 import json
+import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -30,6 +32,7 @@ PREPARE_SPEC = importlib.util.spec_from_file_location("prepare_test_inputs", Pat
 assert PREPARE_SPEC is not None and PREPARE_SPEC.loader is not None
 PREPARE = importlib.util.module_from_spec(PREPARE_SPEC)
 PREPARE_SPEC.loader.exec_module(PREPARE)
+CLOUD_URL = "https://console.example.test/"
 
 
 class StageConnectorsTest(unittest.TestCase):
@@ -41,6 +44,7 @@ class StageConnectorsTest(unittest.TestCase):
         self.jars.mkdir()
         self.lock = self.root / "connectors.lock.json"
         self.staged = self.root / "staged"
+        self.boot_jar = self.make_boot_jar()
         self.entries = []
         for connector_id in MODULE.REQUIRED_IDS:
             self.make_jar(connector_id)
@@ -54,6 +58,34 @@ class StageConnectorsTest(unittest.TestCase):
                 "sha256": hashlib.sha256(content).hexdigest(),
             })
         self.write_lock()
+
+    def make_boot_jar(self, *, profile: str = "cloud", console_url: str | None = CLOUD_URL,
+                      extra_bytes: bytes = b"") -> bytes:
+        html = b"<!doctype html><title>Cloud image input</title>\n"
+        manifest = f"{hashlib.sha256(html).hexdigest()}  ./index.html\n".encode("ascii")
+        properties = (
+            "repository=tapstate/tapstate-web\n"
+            f"revision={'b' * 40}\n"
+            f"files.sha256={hashlib.sha256(manifest).hexdigest()}\n"
+            f"tapstate.revision={'a' * 40}\n"
+            "release.version=1.2.3\n"
+            f"web.profile={profile}\n"
+        )
+        if console_url is not None:
+            properties += f"cloud.console.url={console_url}\n"
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
+            archive.writestr("META-INF/tapstate-web.properties", properties)
+            archive.writestr("META-INF/tapstate-web.files.sha256", manifest)
+            archive.writestr("BOOT-INF/classes/static/index.html", html)
+            if extra_bytes:
+                archive.writestr("BOOT-INF/classes/Other.class", extra_bytes)
+        return output.getvalue()
+
+    def verify_image(self, layout: Path, boot_jar: Path | None = None, *,
+                     profile: str = "cloud", console_url: str = CLOUD_URL) -> str:
+        return IMAGE.verify(layout, self.lock, boot_jar,
+                            web_profile=profile, cloud_console_url=console_url)
 
     def make_jar(self, connector_id: str, *, spec_id: str | None = None,
                  pdk_version: str = "2.0.5-SNAPSHOT", spec_path: str | None = None,
@@ -138,7 +170,9 @@ class StageConnectorsTest(unittest.TestCase):
     def make_oci(self, *, architectures: tuple[str, ...] = ("amd64", "arm64"),
                  tamper: str | None = None, license_label: str | None = "NOASSERTION",
                  boot_jars: dict[str, bytes] | None = None,
-                 omit_path: str | None = None, add_license_directory: bool = False) -> Path:
+                 omit_path: str | None = None, add_license_directory: bool = False,
+                 label_overrides: dict[str, str | None] | None = None,
+                 duplicate_profile_label: bool = False) -> Path:
         MODULE.stage(self.lock, self.jars, self.staged)
         layout = self.root / "oci"
         (layout / "blobs/sha256").mkdir(parents=True)
@@ -159,7 +193,7 @@ class StageConnectorsTest(unittest.TestCase):
                     directory = tarfile.TarInfo("opt/tapstate/release/licenses")
                     directory.type = tarfile.DIRTYPE
                     archive.addfile(directory)
-                boot_jar = (boot_jars or {}).get(architecture, b"synthetic-boot-jar")
+                boot_jar = (boot_jars or {}).get(architecture, self.boot_jar)
                 files = {"opt/tapstate/tapstate.jar": boot_jar}
                 for path in self.staged.rglob("*"):
                     if path.is_file():
@@ -174,15 +208,31 @@ class StageConnectorsTest(unittest.TestCase):
                     member.size = len(data)
                     archive.addfile(member, io.BytesIO(data))
             layer_digest = add_blob(layer_stream.getvalue())
+            with zipfile.ZipFile(io.BytesIO(boot_jar)) as jar:
+                files_digest = hashlib.sha256(jar.read("META-INF/tapstate-web.files.sha256")).hexdigest()
             labels = {
                 "org.opencontainers.image.version": "1.2.3",
                 "org.opencontainers.image.revision": "a" * 40,
                 "io.tapstate.web.revision": "b" * 40,
-                "io.tapstate.web.files.sha256": "c" * 64,
+                "io.tapstate.web.files.sha256": files_digest,
+                "io.tapstate.distribution": "cloud",
+                "io.tapstate.web.profile": "cloud",
+                "io.tapstate.web.cloud-console-url": CLOUD_URL,
             }
             if license_label is not None:
                 labels["org.opencontainers.image.licenses"] = license_label
-            config_digest = add_json({"config": {"Labels": labels}})
+            for key, value in (label_overrides or {}).items():
+                if value is None:
+                    labels.pop(key, None)
+                else:
+                    labels[key] = value
+            config_bytes = json.dumps({"config": {"Labels": labels}}, sort_keys=True).encode("utf-8")
+            if duplicate_profile_label:
+                config_bytes = config_bytes.replace(
+                    b'"io.tapstate.web.profile": "cloud"',
+                    b'"io.tapstate.web.profile": "onprem", "io.tapstate.web.profile": "cloud"',
+                )
+            config_digest = add_blob(config_bytes)
             manifest_digest = add_json({
                 "config": {"digest": config_digest},
                 "layers": [{"digest": layer_digest}],
@@ -292,55 +342,117 @@ class StageConnectorsTest(unittest.TestCase):
 
     def test_oci_requires_both_platforms_with_same_locked_jars(self) -> None:
         layout = self.make_oci()
-        self.assertTrue(IMAGE.verify(layout, self.lock).startswith("sha256:"))
+        self.assertTrue(self.verify_image(layout).startswith("sha256:"))
 
     def test_oci_rejects_different_boot_jars_across_platforms(self) -> None:
-        layout = self.make_oci(boot_jars={"arm64": b"other-boot-jar"})
+        layout = self.make_oci(boot_jars={"arm64": self.make_boot_jar(extra_bytes=b"other-bytecode")})
         with self.assertRaisesRegex(IMAGE.ImageError, "different Boot JAR bytes"):
-            IMAGE.verify(layout, self.lock)
+            self.verify_image(layout)
 
     def test_oci_boot_jar_matches_the_verified_build_input(self) -> None:
         layout = self.make_oci()
         boot_jar = self.root / "app-boot.jar"
-        boot_jar.write_bytes(b"synthetic-boot-jar")
-        self.assertTrue(IMAGE.verify(layout, self.lock, boot_jar).startswith("sha256:"))
+        boot_jar.write_bytes(self.boot_jar)
+        self.assertTrue(self.verify_image(layout, boot_jar).startswith("sha256:"))
         boot_jar.write_bytes(b"different-build-input")
         with self.assertRaisesRegex(IMAGE.ImageError, "differs from the verified build input"):
-            IMAGE.verify(layout, self.lock, boot_jar)
+            self.verify_image(layout, boot_jar)
 
     def test_oci_rejects_tampered_jar(self) -> None:
         layout = self.make_oci(tamper="opt/tapstate/connectors/mysql-connector.jar")
         with self.assertRaisesRegex(IMAGE.ImageError, "JAR differs from the release lock"):
-            IMAGE.verify(layout, self.lock)
+            self.verify_image(layout)
 
     def test_oci_rejects_unlocked_release_content(self) -> None:
         layout = self.make_oci(tamper="opt/tapstate/release/secret.txt")
         with self.assertRaisesRegex(IMAGE.ImageError, "unexpected files"):
-            IMAGE.verify(layout, self.lock)
+            self.verify_image(layout)
 
     def test_oci_requires_companion_license_file(self) -> None:
         layout = self.make_oci(omit_path="opt/tapstate/release/licenses/ORACLE-FREE-USE-TERMS.txt")
         with self.assertRaisesRegex(IMAGE.ImageError, "release metadata has missing or unexpected files"):
-            IMAGE.verify(layout, self.lock)
+            self.verify_image(layout)
 
     def test_oci_accepts_companion_license_directory_entry(self) -> None:
         layout = self.make_oci(add_license_directory=True)
-        self.assertTrue(IMAGE.verify(layout, self.lock).startswith("sha256:"))
+        self.assertTrue(self.verify_image(layout).startswith("sha256:"))
 
     def test_oci_rejects_changed_companion_license_file(self) -> None:
         layout = self.make_oci(tamper="opt/tapstate/release/licenses/MICROSOFT-MIT-LICENSE.txt")
         with self.assertRaisesRegex(IMAGE.ImageError, "companion license differs"):
-            IMAGE.verify(layout, self.lock)
+            self.verify_image(layout)
 
     def test_oci_rejects_missing_architecture(self) -> None:
         layout = self.make_oci(architectures=("amd64",))
         with self.assertRaisesRegex(IMAGE.ImageError, "expected amd64 and arm64"):
-            IMAGE.verify(layout, self.lock)
+            self.verify_image(layout)
 
     def test_oci_requires_license_label(self) -> None:
         layout = self.make_oci(license_label=None)
         with self.assertRaisesRegex(IMAGE.ImageError, "missing image label org.opencontainers.image.licenses"):
-            IMAGE.verify(layout, self.lock)
+            self.verify_image(layout)
+
+    def test_oci_cannot_wrap_an_onprem_jar_with_cloud_labels(self) -> None:
+        onprem = self.make_boot_jar(profile="onprem", console_url=None)
+        layout = self.make_oci(boot_jars={"amd64": onprem, "arm64": onprem})
+        with self.assertRaisesRegex(IMAGE.ImageError, "disagrees with Boot JAR metadata"):
+            self.verify_image(layout)
+
+    def test_oci_requires_explicit_cloud_profile_labels(self) -> None:
+        layout = self.make_oci(label_overrides={"io.tapstate.web.profile": None})
+        with self.assertRaisesRegex(IMAGE.ImageError, "missing image label io.tapstate.web.profile"):
+            self.verify_image(layout)
+
+    def test_oci_duplicate_profile_label_cannot_shadow_a_crossed_profile(self) -> None:
+        layout = self.make_oci(duplicate_profile_label=True)
+        with self.assertRaisesRegex(IMAGE.ImageError, "duplicate JSON field"):
+            self.verify_image(layout)
+
+    def test_oci_cannot_wrap_cloud_jar_as_onprem_distribution(self) -> None:
+        layout = self.make_oci(label_overrides={"io.tapstate.distribution": "onprem"})
+        with self.assertRaisesRegex(IMAGE.ImageError, "distribution disagrees"):
+            self.verify_image(layout)
+
+    def test_oci_cloud_console_label_must_match_jar_metadata(self) -> None:
+        layout = self.make_oci(label_overrides={"io.tapstate.web.cloud-console-url": "https://other.example.test/"})
+        with self.assertRaisesRegex(IMAGE.ImageError, "URL label disagrees"):
+            self.verify_image(layout)
+
+    def test_oci_console_metadata_cannot_override_declared_build_input(self) -> None:
+        layout = self.make_oci()
+        with self.assertRaisesRegex(IMAGE.ImageError, "URL disagrees with the declared build input"):
+            self.verify_image(layout, console_url="https://other.example.test/")
+
+    def test_oci_cloud_gate_rejects_declared_onprem_profile(self) -> None:
+        layout = self.make_oci()
+        with self.assertRaisesRegex(IMAGE.ImageError, "on-prem profile must not contain"):
+            self.verify_image(layout, profile="onprem")
+
+    def test_oci_cli_verifies_actual_cloud_zip_against_declared_normalized_url(self) -> None:
+        layout = self.make_oci()
+        boot_jar = self.root / "verified-boot.jar"
+        boot_jar.write_bytes(self.boot_jar)
+        result = subprocess.run([
+            sys.executable, str(IMAGE_SCRIPT), "--oci-layout", str(layout),
+            "--lock", str(self.lock), "--boot-jar", str(boot_jar),
+            "--web-profile", "cloud", "--cloud-console-url", "HTTPS://CONSOLE.EXAMPLE.TEST:443",
+        ], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("verified linux/amd64 and linux/arm64", result.stdout)
+
+    def test_oci_cli_requires_both_explicit_profile_inputs(self) -> None:
+        layout = self.make_oci()
+        boot_jar = self.root / "verified-boot.jar"
+        boot_jar.write_bytes(self.boot_jar)
+        base = [sys.executable, str(IMAGE_SCRIPT), "--oci-layout", str(layout),
+                "--lock", str(self.lock), "--boot-jar", str(boot_jar)]
+        for missing, supplied in (("--web-profile", ["--cloud-console-url", CLOUD_URL]),
+                                  ("--cloud-console-url", ["--web-profile", "cloud"])):
+            with self.subTest(missing=missing):
+                result = subprocess.run(base + supplied, capture_output=True, text=True, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(missing, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
 
 
 if __name__ == "__main__":

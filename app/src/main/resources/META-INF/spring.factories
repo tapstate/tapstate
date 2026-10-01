@@ -2,3 +2,7 @@
 # aborts startup (e.g. the store is unreachable) as a clean diagnostic instead of a raw stack trace.
 org.springframework.boot.diagnostics.FailureAnalyzer=\
 io.tapstate.app.CodedFailureAnalyzer
+
+# Validate deployment profile after external configuration is loaded and before context creation.
+org.springframework.boot.EnvironmentPostProcessor=\
+io.tapstate.app.WebDistributionEnvironmentPostProcessor

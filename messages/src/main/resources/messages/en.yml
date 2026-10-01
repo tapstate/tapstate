@@ -99,6 +99,15 @@ boot.cloud-config-incomplete:
 boot.cloud-connectors-invalid:
   message: "Cloud connector `{connector}` failed its required startup check: {reason}."
   solution: "Restore the matching release, lock, and licenses; repair the stored artifact or plugin cache if mismatched, then confirm every connector can register and load."
+boot.web-profile-invalid:
+  message: "The packaged Web deployment metadata is invalid: {reason}."
+  solution: "Rebuild the distribution with one supported Web deployment profile and its matching complete Web payload."
+boot.web-profile-mode-mismatch:
+  message: "The packaged Web profile `{profile}` does not match the configured runtime mode `{mode}`."
+  solution: "Use the Cloud distribution with all four Cloud settings, or the on-prem distribution with every Cloud setting and CLUSTER_ID alias removed."
+boot.web-console-url-invalid:
+  message: "The packaged Web Cloud Console URL is invalid."
+  solution: "Rebuild Cloud Web metadata with an absolute ASCII HTTPS Console URL without credentials, a fragment, or control characters; omit this URL from on-prem metadata."
 boot.cloud-store-required:
   message: "Managed Cloud mode requires its metadata store."
   solution: "Remove tapstate.store.mongo.enabled=false and supply the assigned Cloud Atlas metadata URI."

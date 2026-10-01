@@ -79,6 +79,7 @@ jobs:
       tag: ${{ steps.next.outputs.tag }}
       is_latest: ${{ steps.next.outputs.is_latest }}
       sha: ${{ steps.sha.outputs.sha }}
+      web_sha: ${{ steps.web-pin.outputs.sha }}
       # The tag the version was counted up from. Two jobs downstream need the same range -- the
       # documentation gate and the notes -- and working it out a second time is a second chance to
       # take the newest tag in the repository rather than the newest one on this commit's ancestry.
@@ -192,6 +193,16 @@ jobs:
           set -euo pipefail
           bash .github/scripts/satellites.sh branch "${{ steps.next.outputs.version }}" \
             | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: record the frozen Web commit shared by both image profiles
+        id: web-pin
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+        run: |
+          set -euo pipefail
+          sha="$(gh api 'repos/tapstate/tapstate-web/git/ref/heads/ws/release-${{ steps.next.outputs.version }}' --jq .object.sha)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       # The documentation site is not pinned and gets no branch: Netlify builds it from `next` as the
       # preview and `main` as what the public sees, so a third branch across that pair would publish
@@ -342,6 +353,7 @@ jobs:
     outputs:
       web_revision: ${{ steps.web-provenance.outputs.revision }}
       web_files_sha256: ${{ steps.web-provenance.outputs.files-sha256 }}
+      boot_jar_sha256: ${{ steps.web-provenance.outputs.boot-jar-sha256 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -356,7 +368,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: tapstate/tapstate-web
-          ref: ws/release-${{ needs.version.outputs.version }}
+          ref: ${{ needs.version.outputs.web_sha }}
           token: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
           path: tapstate-web
           persist-credentials: false
@@ -378,13 +390,15 @@ jobs:
           pnpm lint
           pnpm --filter web i18n:check
           pnpm --filter web test
-          pnpm --filter web build --mode onprem
+          bash ../scripts/build-web-assets.sh --web-root . \
+            --web-revision '${{ needs.version.outputs.web_sha }}' --web-profile onprem
       - name: stage the pinned Web bundle for the Boot JAR
         run: |
           web_revision="$(git -C tapstate-web rev-parse HEAD)"
           bash scripts/prepare-web-assets.sh \
             --web-root tapstate-web \
             --web-revision "$web_revision" \
+            --web-profile onprem \
             --tapstate-revision "${{ needs.version.outputs.sha }}" \
             --release-version "${{ needs.version.outputs.version }}" \
             --output app/target/generated-resources/tapstate-web
@@ -404,8 +418,14 @@ jobs:
           files_sha256="$(sed -n 's/^files.sha256=//p' "$properties")"
           [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
           [[ "$files_sha256" =~ ^[0-9a-f]{64}$ ]]
+          test "$revision" = '${{ needs.version.outputs.web_sha }}'
+          grep -Fxq 'web.profile=onprem' "$properties"
+          mapfile -t boot_jars < <(find app/target -maxdepth 1 -type f -name 'app-*-boot.jar')
+          test "${#boot_jars[@]}" -eq 1
+          boot_sha256="$(sha256sum "${boot_jars[0]}" | awk '{print $1}')"
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
           echo "files-sha256=$files_sha256" >> "$GITHUB_OUTPUT"
+          echo "boot-jar-sha256=$boot_sha256" >> "$GITHUB_OUTPUT"
       # The ordinary image consumes this on-prem Web-bearing Boot JAR. Cloud builds a separate
       # Boot JAR because Vite deployment profiles are compile-time inputs.
       - uses: actions/upload-artifact@v4
@@ -430,6 +450,7 @@ jobs:
             TAPSTATE_REVISION=${{ needs.version.outputs.sha }}
             TAPSTATE_WEB_REVISION=${{ steps.web-provenance.outputs.revision }}
             TAPSTATE_WEB_FILES_SHA256=${{ steps.web-provenance.outputs.files-sha256 }}
+            TAPSTATE_WEB_PROFILE=onprem
           outputs: type=oci,dest=${{ runner.temp }}/server-image.tar
       - uses: actions/upload-artifact@v4
         with:
@@ -447,6 +468,8 @@ jobs:
     outputs:
       web_revision: ${{ steps.web-provenance.outputs.revision }}
       web_files_sha256: ${{ steps.web-provenance.outputs.files-sha256 }}
+      cloud_console_url: ${{ steps.web-provenance.outputs.cloud-console-url }}
+      boot_jar_sha256: ${{ steps.web-provenance.outputs.boot-jar-sha256 }}
       sealed_context: ${{ steps.seal.outputs.context }}
     steps:
       - uses: actions/checkout@v4
@@ -458,7 +481,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: tapstate/tapstate-web
-          ref: ws/release-${{ needs.version.outputs.version }}
+          ref: ${{ needs.version.outputs.web_sha }}
           token: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
           path: tapstate-web
           persist-credentials: false
@@ -479,20 +502,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          node <<'NODE'
-          const value = process.env.VITE_CLOUD_CONSOLE_URL?.trim()
-          const url = new URL(value)
-          if (url.protocol !== 'https:' || url.username || url.password || url.hash) process.exit(1)
-          NODE
           pnpm install --frozen-lockfile
-          pnpm --filter web build --mode cloud
+          bash ../scripts/build-web-assets.sh --web-root . \
+            --web-revision '${{ needs.version.outputs.web_sha }}' --web-profile cloud \
+            --cloud-console-url "$VITE_CLOUD_CONSOLE_URL"
       - name: stage the pinned Cloud Web bundle for the Boot JAR
+        env:
+          VITE_CLOUD_CONSOLE_URL: ${{ vars.VITE_CLOUD_CONSOLE_URL }}
         shell: bash
         run: |
           web_revision="$(git -C tapstate-web rev-parse HEAD)"
           bash scripts/prepare-web-assets.sh \
             --web-root tapstate-web \
             --web-revision "$web_revision" \
+            --web-profile cloud --cloud-console-url "$VITE_CLOUD_CONSOLE_URL" \
             --tapstate-revision "${{ needs.version.outputs.sha }}" \
             --release-version "${{ needs.version.outputs.version }}" \
             --output app/target/generated-resources/tapstate-web
@@ -510,10 +533,19 @@ jobs:
           properties=app/target/classes/META-INF/tapstate-web.properties
           revision="$(sed -n 's/^revision=//p' "$properties")"
           files_sha256="$(sed -n 's/^files.sha256=//p' "$properties")"
+          console_url="$(sed -n 's/^cloud.console.url=//p' "$properties")"
           [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
           [[ "$files_sha256" =~ ^[0-9a-f]{64}$ ]]
+          test "$revision" = '${{ needs.version.outputs.web_sha }}'
+          grep -Fxq 'web.profile=cloud' "$properties"
+          test -n "$console_url"
+          mapfile -t boot_jars < <(find app/target -maxdepth 1 -type f -name 'app-*-boot.jar')
+          test "${#boot_jars[@]}" -eq 1
+          boot_sha256="$(sha256sum "${boot_jars[0]}" | awk '{print $1}')"
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
           echo "files-sha256=$files_sha256" >> "$GITHUB_OUTPUT"
+          echo "cloud-console-url=$console_url" >> "$GITHUB_OUTPUT"
+          echo "boot-jar-sha256=$boot_sha256" >> "$GITHUB_OUTPUT"
       - name: seal the Cloud Boot JAR before public artifact storage
         id: seal
         env:
@@ -587,6 +619,8 @@ jobs:
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - name: build the Cloud OCI archive from the verified server Boot JAR
+        env:
+          CLOUD_CONSOLE_URL: ${{ needs.cloud-server-jar.outputs.cloud_console_url }}
         shell: bash
         run: |
           set -euo pipefail
@@ -598,9 +632,13 @@ jobs:
             --build-arg "TAPSTATE_REVISION=${{ needs.version.outputs.sha }}" \
             --build-arg "TAPSTATE_WEB_REVISION=${{ needs.cloud-server-jar.outputs.web_revision }}" \
             --build-arg "TAPSTATE_WEB_FILES_SHA256=${{ needs.cloud-server-jar.outputs.web_files_sha256 }}" \
+            --build-arg "TAPSTATE_WEB_PROFILE=cloud" \
+            --build-arg "TAPSTATE_WEB_CLOUD_CONSOLE_URL=$CLOUD_CONSOLE_URL" \
             --output "type=oci,dest=$RUNNER_TEMP/cloud-image.tar" .
       - name: verify both platforms, Web provenance, and locked inputs
         id: verify
+        env:
+          CLOUD_CONSOLE_URL: ${{ needs.cloud-server-jar.outputs.cloud_console_url }}
         shell: bash
         run: |
           set -euo pipefail
@@ -614,13 +652,16 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/verify-image.py \
             --oci-layout "$RUNNER_TEMP/cloud-layout" \
             --lock deploy/cloud/connectors.lock.json \
-            --boot-jar "${boot_jars[0]}"
+            --boot-jar "${boot_jars[0]}" \
+            --web-profile cloud --cloud-console-url "$CLOUD_CONSOLE_URL"
           PYTHONDONTWRITEBYTECODE=1 python3 .github/scripts/web-provenance.py create \
             --oci-layout "$RUNNER_TEMP/cloud-layout" \
             --output "$RUNNER_TEMP/cloud-web-provenance-check.json" \
             --version '${{ needs.version.outputs.version }}' \
             --tapstate-revision '${{ needs.version.outputs.sha }}' \
-            --web-revision '${{ needs.cloud-server-jar.outputs.web_revision }}'
+            --web-revision '${{ needs.cloud-server-jar.outputs.web_revision }}' \
+            --web-profile cloud --cloud-console-url "$CLOUD_CONSOLE_URL" \
+            --boot-jar-sha256 '${{ needs.cloud-server-jar.outputs.boot_jar_sha256 }}'
           digest="$(jq -er '.manifests | if length == 1 then .[0].digest else error("root count") end' \
             "$RUNNER_TEMP/cloud-layout/index.json")"
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
@@ -959,9 +1000,11 @@ jobs:
             --output "$provenance" \
             --version '${{ needs.version.outputs.version }}' \
             --tapstate-revision '${{ needs.version.outputs.sha }}' \
-            --web-revision '${{ needs.server-image.outputs.web_revision }}'
+            --web-revision '${{ needs.server-image.outputs.web_revision }}' --web-profile onprem \
+            --boot-jar-sha256 '${{ needs.server-image.outputs.boot_jar_sha256 }}'
           python3 .github/scripts/web-provenance.py verify \
-            --oci-layout image/layout --provenance "$provenance"
+            --oci-layout image/layout --provenance "$provenance" --web-profile onprem \
+            --boot-jar-sha256 '${{ needs.server-image.outputs.boot_jar_sha256 }}'
           .github/scripts/release-manifest.sh "${{ needs.version.outputs.version }}" staging image/layout
       - name: assemble the draft release
         id: create

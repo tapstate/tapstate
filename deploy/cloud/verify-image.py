@@ -22,6 +22,11 @@ SPEC = spec_from_file_location("stage_connectors", STAGING_SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 STAGING = module_from_spec(SPEC)
 SPEC.loader.exec_module(STAGING)
+PROVENANCE_SCRIPT = Path(__file__).resolve().parents[2] / ".github" / "scripts" / "web-provenance.py"
+PROVENANCE_SPEC = spec_from_file_location("web_provenance", PROVENANCE_SCRIPT)
+assert PROVENANCE_SPEC is not None and PROVENANCE_SPEC.loader is not None
+PROVENANCE = module_from_spec(PROVENANCE_SPEC)
+PROVENANCE_SPEC.loader.exec_module(PROVENANCE)
 
 
 class ImageError(Exception):
@@ -43,7 +48,9 @@ def blob(layout: Path, digest: str) -> bytes:
 
 def object_from_bytes(data: bytes, description: str) -> dict[str, Any]:
     try:
-        value = json.loads(data)
+        value = json.loads(data, object_pairs_hook=PROVENANCE.unique_json_object)
+    except PROVENANCE.ProvenanceError as exc:
+        raise ImageError(f"{description} contains a duplicate JSON field") from exc
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise ImageError(f"{description} is not JSON") from exc
     if not isinstance(value, dict):
@@ -68,6 +75,13 @@ def selected_files(layout: Path, layers: list[Any], platform: str) -> dict[str, 
             with tarfile.open(fileobj=io.BytesIO(layer), mode="r:*") as archive:
                 for member in archive:
                     path = normalized(member.name)
+                    if path in {"opt", "opt/tapstate"} and not member.isdir():
+                        raise ImageError(f"{platform} has a linked or non-directory image input parent")
+                    if files and path in {".wh.opt", "opt/.wh.tapstate", ".wh..wh..opq",
+                                          "opt/.wh..wh..opq", "opt/tapstate/.wh..wh..opq",
+                                          "opt/tapstate/.wh.tapstate.jar", "opt/tapstate/.wh.connectors",
+                                          "opt/tapstate/.wh.release"}:
+                        raise ImageError(f"{platform} deletes a verified image input")
                     wanted = path == "opt/tapstate/tapstate.jar" or path.startswith(
                         ("opt/tapstate/connectors/", "opt/tapstate/release/")
                     )
@@ -86,19 +100,24 @@ def selected_files(layout: Path, layers: list[Any], platform: str) -> dict[str, 
 
 def verify_platform(layout: Path, descriptor: dict[str, Any], platform: str,
                     entries: list[dict[str, Any]], license_files: list[dict[str, Any]],
-                    lock_bytes: bytes) -> tuple[dict[str, str], str]:
+                    lock_bytes: bytes, web_profile: str,
+                    cloud_console_url: str | None) -> tuple[dict[str, str], str]:
     manifest = object_from_bytes(blob(layout, descriptor.get("digest")), f"{platform} manifest")
     config_descriptor = manifest.get("config")
     if not isinstance(config_descriptor, dict):
         raise ImageError(f"{platform} has no OCI config descriptor")
     config = object_from_bytes(blob(layout, config_descriptor.get("digest")), f"{platform} config")
-    labels = config.get("config", {}).get("Labels")
+    image_config = config.get("config")
+    if not isinstance(image_config, dict):
+        raise ImageError(f"{platform} has no valid image config")
+    labels = image_config.get("Labels")
     if not isinstance(labels, dict):
         raise ImageError(f"{platform} has no image labels")
     relevant_labels = {}
     for key in ("org.opencontainers.image.version", "org.opencontainers.image.revision",
                 "org.opencontainers.image.licenses", "io.tapstate.web.revision",
-                "io.tapstate.web.files.sha256"):
+                "io.tapstate.web.files.sha256", "io.tapstate.distribution",
+                "io.tapstate.web.profile", "io.tapstate.web.cloud-console-url"):
         if not isinstance(labels.get(key), str) or not labels[key]:
             raise ImageError(f"{platform} is missing image label {key}")
         relevant_labels[key] = labels[key]
@@ -140,10 +159,23 @@ def verify_platform(layout: Path, descriptor: dict[str, Any], platform: str,
         license_bytes = files[path]
         if len(license_bytes) != entry["bytes"] or hashlib.sha256(license_bytes).hexdigest() != entry["sha256"]:
             raise ImageError(f"{platform} {entry['name']} companion license differs from the release lock")
+    try:
+        props = PROVENANCE.properties_from_jar(files["opt/tapstate/tapstate.jar"], platform)
+        PROVENANCE.validate_image_labels(props, labels, platform)
+        PROVENANCE.verify_declared_profile(props, web_profile, cloud_console_url)
+    except PROVENANCE.ProvenanceError as exc:
+        raise ImageError(f"Cloud Web provenance refused: {exc}") from exc
     return relevant_labels, boot_jar_sha256
 
 
-def verify(layout: Path, lock_path: Path, boot_jar_path: Path | None = None) -> str:
+def verify(layout: Path, lock_path: Path, boot_jar_path: Path | None = None, *,
+           web_profile: str, cloud_console_url: str) -> str:
+    try:
+        profile, console_url = PROVENANCE.declared_profile(web_profile, cloud_console_url)
+    except PROVENANCE.ProvenanceError as exc:
+        raise ImageError(str(exc)) from exc
+    if profile != "cloud":
+        raise ImageError("Cloud image verification requires the declared Cloud Web profile")
     try:
         entries, license_files = STAGING.read_lock(lock_path)
         lock_bytes = lock_path.read_bytes()
@@ -165,13 +197,16 @@ def verify(layout: Path, lock_path: Path, boot_jar_path: Path | None = None) -> 
         info = descriptor.get("platform") or {}
         if not isinstance(info, dict):
             raise ImageError("OCI archive has malformed platform metadata")
-        if info.get("os") != "linux" or info.get("architecture") not in {"amd64", "arm64"}:
+        architecture = info.get("architecture")
+        if architecture is not None and not isinstance(architecture, str):
+            raise ImageError("OCI archive has malformed platform metadata")
+        if info.get("os") != "linux" or architecture not in {"amd64", "arm64"}:
             continue
         platform = f"linux/{info['architecture']}"
         if platform in platforms:
             raise ImageError(f"OCI archive has duplicate platform {platform}")
         platforms[platform] = verify_platform(
-            layout, descriptor, platform, entries, license_files, lock_bytes
+            layout, descriptor, platform, entries, license_files, lock_bytes, profile, console_url
         )
     if set(platforms) != {"linux/amd64", "linux/arm64"}:
         raise ImageError(f"OCI archive platforms are {sorted(platforms)}, expected amd64 and arm64")
@@ -194,9 +229,12 @@ def main() -> int:
     parser.add_argument("--oci-layout", required=True, type=Path)
     parser.add_argument("--lock", required=True, type=Path)
     parser.add_argument("--boot-jar", required=True, type=Path)
+    parser.add_argument("--web-profile", choices=("cloud",), required=True)
+    parser.add_argument("--cloud-console-url", required=True)
     args = parser.parse_args()
     try:
-        digest = verify(args.oci_layout, args.lock, args.boot_jar)
+        digest = verify(args.oci_layout, args.lock, args.boot_jar,
+                        web_profile=args.web_profile, cloud_console_url=args.cloud_console_url)
     except ImageError as exc:
         print(f"Cloud image verification refused: {exc}", file=sys.stderr)
         return 1
