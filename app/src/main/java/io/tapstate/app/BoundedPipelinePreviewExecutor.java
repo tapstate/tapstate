@@ -26,6 +26,8 @@ import io.tapstate.runtime.probe.PipelinePreviewRequest;
 import io.tapstate.runtime.probe.PipelinePreviewStream;
 import io.tapstate.spi.capture.BoundedQueryCancellation;
 import io.tapstate.spi.store.StorePort;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -56,6 +58,7 @@ import java.util.concurrent.atomic.AtomicReference;
 final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, AutoCloseable {
 
     static final String LEASE_MAP = "__preview.leases";
+    private static final Logger LOG = LoggerFactory.getLogger(BoundedPipelinePreviewExecutor.class);
     private static final int MAX_WORKERS = 8;
     private static final int MAX_QUEUED_RUNS = 32;
     private static final int MAX_EVENTS = 32;
@@ -278,29 +281,25 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                     }
                 }
                 if (jobJoined) {
-                    boolean cleanupFailed = false;
-                    List<String> cleanupTargets = new ArrayList<>();
-                    cleanupTargets.add(resultMapName);
-                    cleanupTargets.add(traceMapName);
-                    cleanupTargets.addAll(stateMaps);
-                    for (String target : cleanupTargets) {
-                        try {
-                            destroyMap(target);
-                        } catch (RuntimeException cleanupFailure) {
-                            cleanupFailed = true;
-                        }
+                    boolean cleanupFailed = !cleanupTemporaryState(stateMaps);
+                    try {
+                        StatelessTransforms.finishPreviewJs(executionId);
+                    } catch (RuntimeException cleanupFailure) {
+                        LOG.warn("Could not close preview JavaScript contexts for {}",
+                                executionId, cleanupFailure);
+                        cleanupFailed = true;
                     }
                     if (cleanupFailed && failure == null) {
                         failure = refused("temporary preview state could not be cleaned up");
                     }
-                    StatelessTransforms.finishPreviewJs(executionId);
+                    retainLease = cleanupFailed;
                 } else {
                     retainLease = true;
                     if (failure == null) {
                         failure = refused("the preview job did not stop before temporary state cleanup");
                     }
-                    active.getFuture().whenComplete(
-                            (ignored, jobFailure) -> StatelessTransforms.finishPreviewJs(executionId));
+                    Set<String> cleanupMaps = stateMaps;
+                    active.getFuture().whenComplete((ignored, jobFailure) -> cleanupAfterUnjoinedJob(cleanupMaps));
                 }
             }
             try {
@@ -631,6 +630,43 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                 if (!cancelled.get()) {
                     throw stopping;
                 }
+            }
+        }
+
+        private boolean cleanupTemporaryState(Set<String> stateMaps) {
+            List<String> cleanupTargets = new ArrayList<>();
+            cleanupTargets.add(resultMapName);
+            cleanupTargets.add(traceMapName);
+            cleanupTargets.addAll(stateMaps);
+            boolean cleaned = true;
+            for (String target : cleanupTargets) {
+                try {
+                    destroyMap(target);
+                } catch (RuntimeException cleanupFailure) {
+                    LOG.warn("Could not destroy preview temporary map '{}'", target, cleanupFailure);
+                    cleaned = false;
+                }
+            }
+            return cleaned;
+        }
+
+        private void cleanupAfterUnjoinedJob(Set<String> stateMaps) {
+            boolean cleaned = true;
+            try {
+                StatelessTransforms.finishPreviewJs(executionId);
+            } catch (RuntimeException cleanupFailure) {
+                LOG.warn("Could not close preview JavaScript contexts for {}",
+                        executionId, cleanupFailure);
+                cleaned = false;
+            }
+            if (!cleanupTemporaryState(stateMaps)) {
+                cleaned = false;
+            }
+            if (cleaned) {
+                releaseLease();
+            } else {
+                LOG.warn("Retaining preview lease for {} until its TTL expires after cleanup failure",
+                        executionId);
             }
         }
     }
