@@ -688,23 +688,18 @@ class CaptureRunUnitTest {
     }
 
     /**
-     * A pipeline new to a chain begins its tail at the seam its own load sampled, not at the one the
-     * chain was created at.
+     * A pipeline new to a chain another pipeline holds begins its tail where the chain's reader got to, not at
+     * the seam its own load sampled.
      *
-     * <p>The same reckoning as the load above, one field over. A recorded seam says where the snapshot
-     * that recorded it began, and that snapshot belongs to one pipeline. A pipeline new to the chain has
-     * a seam of its own, sampled by its own bounded read moments ago, while the recorded one may be days
-     * old -- and a source keeps its change log for a window and refuses a start from before it. Handed
-     * the chain's, every join to a chain older than that window fails; and where a source answers such a
-     * start with an empty stream instead of a refusal, the pipeline comes up healthy, reports running and
-     * delivers nothing, which is the same shape as a source that has no changes for it.
-     *
-     * <p>Reaching back to the chain's birth buys a joiner nothing either. What a chain shares is the
-     * mining; the initial load is not part of that, so the joiner reads the source in full for itself and
-     * every change before its own seam is already covered by that read.
+     * <p>The chain's position is where the pipeline holding it still owes every change after: stopped with its
+     * state kept, it has landed none of them. A new reader beginning at the seam the joiner's load sampled
+     * moments ago would skip them for the holder for good -- that reader's start is written down as where the
+     * chain stands, and the source is told it may let go of what lies before it. Beginning at the chain's
+     * position costs the joiner only changes its own load already covered, which the idempotent sink absorbs.
+     * A source whose log no longer reaches back that far refuses the start, as it would refuse the holder's.
      */
     @Test
-    void aPipelineNewToAChainBeginsItsTailAtItsOwnSeamNotTheOneTheChainWasCreatedAt() {
+    void aPipelineNewToAHeldChainBeginsItsTailWhereTheChainGotToNotAtItsOwnSeam() {
         InMemoryMeta meta = new InMemoryMeta();
         FakeSource first = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-the-chain-began-at");
         CaptureRun firstRun = runUnit(first, meta)
@@ -712,37 +707,44 @@ class CaptureRunUnitTest {
         String chainId = firstRun.chainId().orElseThrow().value();
         // Stands in for pipe-a's sink confirming the table -- the only thing that ever marks one done.
         meta.markSnapshotComplete(chainId, "pipe-a", "orders");
+        // Stopped with its state kept: its record stays on the chain, owing every change after where it began.
+        firstRun.close();
 
         FakeSource joiner = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-the-joiner-began-at");
         runUnit(joiner, meta)
                 .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-joined"), e -> { });
 
         assertThat(joiner.cdcStart)
-                .as("the joiner's tail begins where its own load began, not where the chain did")
-                .isEqualTo(CaptureStart.resume(new SourcePosition("seam-the-joiner-began-at")));
+                .as("the joiner's tail begins where the chain got to, which pipe-a still owes everything after")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("seam-the-chain-began-at")));
+        assertThat(meta.resumeOffset(chainId)).as("and the chain still resumes from there")
+                .contains("seam-the-chain-began-at");
     }
 
+    /**
+     * A restart with nothing left to load resumes where the chain got to, not at the seam its first load
+     * sampled: the seam says where that load began, and nothing about what the chain has released since.
+     */
     @Test
-    void aPipelineWhoseCompletedLoadSamplesNoSeamRestartsAtItsOwnSeam() {
+    void aRestartWithNothingToLoadResumesWhereTheChainGotToNotAtTheSeamItsLoadBeganAt() {
         InMemoryMeta meta = new InMemoryMeta();
         FakeSource first = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-chain-birth");
         CaptureRun firstRun = runUnit(first, meta)
                 .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-completed-join"), e -> { });
         String chainId = firstRun.chainId().orElseThrow().value();
         meta.markSnapshotComplete(chainId, "pipe-a", "orders");
-
-        FakeSource joiner = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-join");
-        runUnit(joiner, meta)
-                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-completed-join"), e -> { });
-        meta.markSnapshotComplete(chainId, "pipe-b", "orders");
+        long epoch = meta.read(chainId).orElseThrow().epoch();
+        meta.advancePhysicalSourceReadOffset(chainId, epoch,
+                new ChainPosition(new SourceOrder(epoch, 7), "released-past-the-birth"), true);
+        firstRun.close();
 
         FakeSource restarted = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-not-sampled");
         runUnit(restarted, meta)
-                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-completed-join"), e -> { });
+                .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-completed-join"), e -> { });
 
         assertThat(restarted.cdcStart)
-                .as("pipe-b owes no table on restart, so its tail must not adopt pipe-a's older seam")
-                .isEqualTo(CaptureStart.resume(new SourcePosition("seam-join")));
+                .as("pipe-a owes no table on restart, so its tail resumes where the chain got to")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("released-past-the-birth")));
     }
 
     /**

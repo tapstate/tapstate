@@ -789,13 +789,19 @@ public final class CaptureRunUnit {
      * <p>Four states, in this order, and the order is the whole of it:
      *
      * <ol>
-     *   <li>a load that just ran here — {@code ownSnapshotSeam} is where it began, and the tail has to
-     *       cover every change since, or a row this load read and the source then changed is left at the
-     *       value the load saw;</li>
-     *   <li>a recorded resume point — the tail ran before and got this far, so it picks up there. That is
-     *       the last released run that carried a change, or where the stream began: a run carrying no change
-     *       moves how far the source may release, but a source can name it in a form that, resumed from,
-     *       passes over the change that follows;</li>
+     *   <li>a recorded resume point — the chain's reader ran before and got this far, so it picks up there.
+     *       That is the last released run that carried a change, or where the stream began: a run carrying no
+     *       change moves how far the source may release, but a source can name it in a form that, resumed
+     *       from, passes over the change that follows. Every change after it is still owed to somebody on
+     *       the chain -- a pipeline stopped with its state kept among them -- so it outranks even a load that
+     *       just ran here: that load's seam was sampled moments ago, and starting there would skip every
+     *       change between where the holder stopped and that seam, for the holder and for good. What this
+     *       run's own load already covered of that stretch is delivered again, which the idempotent sink
+     *       absorbs; a source whose log no longer reaches back that far refuses the start, as it would
+     *       refuse the holder's;</li>
+     *   <li>a load that just ran here, on a chain with nothing recorded — {@code ownSnapshotSeam} is where it
+     *       began, and the tail has to cover every change since, or a row this load read and the source then
+     *       changed is left at the value the load saw;</li>
      *   <li>no read offset but this pipeline's recorded seam — its snapshot ran and the tail has not
      *       advanced past where that snapshot began, so it starts at the seam and the idempotent sink
      *       absorbs the overlap;</li>
@@ -803,12 +809,9 @@ public final class CaptureRunUnit {
      *       caller resolved for a run that has no position to pick up from.</li>
      * </ol>
      *
-     * <p>This run's own seam outranks the recorded read offset, and the order matters in exactly one
-     * shape: a chain someone else is already mining. That offset moves as they mine, so by the time this
-     * run's load finishes it can name a point later than the seam this load began at — and starting there
-     * skips the changes in between. They are in the shared ring, mined by whoever is already on the
-     * chain, but this run's own reader enters that ring at its own cursor and never looks behind it.
-     * Starting at the earlier of the two only ever costs an overlap the idempotent sink absorbs.
+     * <p>The resume point cannot have run past this run's own seam while its load ran. The pipeline is on the
+     * chain, with the tables it reads selected and asked of the reader, before its load samples the seam, so
+     * every run handed over after that owes it those tables' changes and is not released before it lands them.
      *
      * <p>Taking the present in any of the first three states is the silent loss this exists to prevent:
      * the tail comes up healthy, and every change between where it had reached and now is simply gone.
@@ -819,21 +822,18 @@ public final class CaptureRunUnit {
             String pipelineId,
             String ownSnapshotSeam,
             CaptureStart firstRun) {
+        Optional<String> resumeFrom = meta.resumeOffset(miningChainId);
+        if (resumeFrom.isPresent()) {
+            return CaptureStart.resume(new SourcePosition(resumeFrom.get()));
+        }
         if (ownSnapshotSeam != null) {
             return CaptureStart.resume(new SourcePosition(ownSnapshotSeam));
         }
         return meta.read(miningChainId)
-                .map(record -> {
-                    Optional<String> resumeFrom = meta.resumeOffset(miningChainId);
-                    if (resumeFrom.isPresent()) {
-                        return CaptureStart.resume(new SourcePosition(resumeFrom.get()));
-                    }
-                    return record.consumerOffset(pipelineId)
-                            .map(consumer -> consumer.cdcStartPosition() == null
-                                    ? firstRun
-                                    : CaptureStart.resume(new SourcePosition(consumer.cdcStartPosition())))
-                            .orElse(firstRun);
-                })
+                .flatMap(record -> record.consumerOffset(pipelineId))
+                .map(consumer -> consumer.cdcStartPosition() == null
+                        ? firstRun
+                        : CaptureStart.resume(new SourcePosition(consumer.cdcStartPosition())))
                 .orElse(firstRun);
     }
 
