@@ -2109,6 +2109,10 @@ class CaptureRunUnitTest {
         public synchronized void advanceSourceReadOffset(
                 String miningChainId, ChainPosition position, boolean resumable) {
             SrsMeta m = require(miningChainId);
+            if (!resumable && !resumeFrom.containsKey(miningChainId) && m.sourceReadOffset() != null) {
+                // A record from before the resume point was kept apart resumes from its read offset; it keeps it.
+                resumeFrom.put(miningChainId, new ResumePoint(m.sourceRead(), m.sourceReadAt()));
+            }
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), position, m.consumerOffsets(),
                     m.schemaHistory(), m.retention(), m.epoch()));
@@ -2424,6 +2428,10 @@ class CaptureRunUnitTest {
                 return false;
             }
             if (ranksAfter(position, m.sourceRead())) {
+                if (!resumable && !resumeFrom.containsKey(miningChainId) && m.sourceReadOffset() != null) {
+                    // A record from before the resume point was kept apart resumes from its read offset; it keeps it.
+                    resumeFrom.put(miningChainId, new ResumePoint(m.sourceRead(), m.sourceReadAt()));
+                }
                 releasedSourceReads.add(position);
                 records.put(miningChainId, new SrsMeta(m.miningChainId(), position, m.consumerOffsets(),
                         m.schemaHistory(), m.retention(), m.epoch()));

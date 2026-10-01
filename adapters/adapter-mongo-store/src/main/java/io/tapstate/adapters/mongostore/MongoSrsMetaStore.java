@@ -35,6 +35,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 
@@ -174,6 +176,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     private final MongoCollection<Document> workloadClaims;
     private final MongoClient client;
     private final Clock clock;
+    /** Chains whose record this store has seen to carry a resume point; one never loses it while it exists. */
+    private final Set<String> resumePointKept = ConcurrentHashMap.newKeySet();
 
     public MongoSrsMetaStore(MongoClient client, MongoCollection<Document> collection) {
         this(client, collection, collection, workloadClaims(client, collection), Clock.systemUTC());
@@ -293,6 +297,9 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         Objects.requireNonNull(miningChainId, "miningChainId");
         Objects.requireNonNull(position, POSITION);
         Objects.requireNonNull(position.order(), POSITION_ORDER);
+        if (!resumable) {
+            keepTheResumePointOfARecordFromBefore(miningChainId);
+        }
         // Two updates, and the split is the guard. The first carries the ordering condition in its own
         // filter, so the comparison and the write are one atomic act: a read-then-write would let a second
         // member land its advance in between and be overwritten by this one, which is the rewind this
@@ -346,6 +353,9 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             String miningChainId, long epoch, ChainPosition position, boolean resumable) {
         Objects.requireNonNull(miningChainId, "miningChainId");
         requireRelease(epoch, position);
+        if (!resumable) {
+            keepTheResumePointOfARecordFromBefore(miningChainId);
+        }
         // The generation rides in the same filter as the ordering condition, so a newer reader opening its
         // generation cannot slip in between a check and this write. The resume point rides in the same write,
         // so it never names a position the read offset has not reached.
@@ -363,6 +373,30 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                 .projection(Projections.include("sourceReadOffset", "sourceReadEpoch", "sourceReadSeq"))
                 .first());
         return root == null ? Optional.empty() : Optional.ofNullable(sourceReadFrom(root));
+    }
+
+    /**
+     * Lays a record's read offset down as its resume point when the record has none, before a run carrying no
+     * change moves the read offset on.
+     *
+     * <p>A record written before the two were kept apart resumes from its read offset, and that offset was
+     * only ever moved by changes then. Moved by a quiet run first, it would leave the fallback naming the quiet
+     * position as where a restart begins. Copied once and not again: a record that has a resume point keeps
+     * one, so after the first look this costs nothing for the chain.
+     */
+    private void keepTheResumePointOfARecordFromBefore(String miningChainId) {
+        if (resumePointKept.contains(miningChainId)) {
+            return;
+        }
+        StoreIo.call(() -> collection.updateOne(
+                new Document("_id", miningChainId)
+                        .append(SOURCE_RESUME_OFFSET, new Document("$exists", false))
+                        .append("sourceReadOffset", new Document("$exists", true)),
+                List.of(new Document("$set", new Document(SOURCE_RESUME_OFFSET, "$sourceReadOffset")
+                        .append(SOURCE_RESUME_EPOCH, "$sourceReadEpoch")
+                        .append(SOURCE_RESUME_SEQ, "$sourceReadSeq")
+                        .append(SOURCE_RESUME_AT, "$sourceReadAt")))));
+        resumePointKept.add(miningChainId);
     }
 
     @Override

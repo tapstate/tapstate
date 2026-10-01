@@ -319,6 +319,47 @@ class MongoSrsMetaStoreIT {
     }
 
     /**
+     * A record written before the two were kept apart resumes from its read offset, which only a change ever
+     * moved. The first run carrying no change, shared or direct, keeps it as the resume point before moving
+     * the read offset on -- a fallback to the moved offset would make the quiet position where a restart
+     * begins.
+     */
+    @Test
+    void aRecordFromBeforeTheSplitKeepsItsResumePointAcrossItsFirstQuietRelease() {
+        SteppedClock clock = new SteppedClock(WRITTEN_AT);
+        withCollection(clock, (store, collection) -> {
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            ChainPosition legacy = new ChainPosition(new SourceOrder(epoch, 4), "legacy-change");
+            store.advanceSourceReadOffset(CHAIN, legacy);
+            Document unset = new Document(MongoSrsMetaStore.SOURCE_RESUME_OFFSET, "")
+                    .append(MongoSrsMetaStore.SOURCE_RESUME_EPOCH, "")
+                    .append(MongoSrsMetaStore.SOURCE_RESUME_SEQ, "")
+                    .append(MongoSrsMetaStore.SOURCE_RESUME_AT, "");
+            collection.updateOne(new Document("_id", CHAIN), new Document("$unset", unset));
+
+            clock.advance(Duration.ofMinutes(1));
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(epoch, 5), "direct-quiet"), false);
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("direct-quiet");
+            assertThat(store.resumePoint(CHAIN)).as("a direct tail's quiet run")
+                    .contains(new ResumePoint(legacy, WRITTEN_AT));
+
+            String shared = CHAIN + "-shared";
+            store.create(shared, null);
+            long sharedEpoch = store.openEpoch(shared);
+            ChainPosition sharedLegacy = new ChainPosition(new SourceOrder(sharedEpoch, 9), "legacy-shared-change");
+            store.advanceSourceReadOffset(shared, sharedLegacy);
+            collection.updateOne(new Document("_id", shared), new Document("$unset", unset));
+            clock.advance(Duration.ofMinutes(1));
+            assertThat(store.advancePhysicalSourceReadOffset(shared, sharedEpoch,
+                    new ChainPosition(new SourceOrder(sharedEpoch, 10), "shared-quiet"), false)).isTrue();
+            assertThat(store.read(shared).orElseThrow().sourceReadOffset()).isEqualTo("shared-quiet");
+            assertThat(store.resumePoint(shared)).as("the shared reader's quiet run")
+                    .contains(new ResumePoint(sharedLegacy, WRITTEN_AT.plus(Duration.ofMinutes(1))));
+        });
+    }
+
+    /**
      * The resume point keeps the order it was reached at and when it was written, apart from the read
      * offset's: a quiet release stamps the read offset and leaves the resume point's stamp alone, so the age
      * it reports is that of where a restart would begin. A point put there by hand has no order to keep.
