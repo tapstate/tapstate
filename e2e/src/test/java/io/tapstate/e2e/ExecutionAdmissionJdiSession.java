@@ -149,17 +149,22 @@ final class ExecutionAdmissionJdiSession implements AutoCloseable {
 
     static ExecutionAdmissionJdiSession start(String storeUri, String operatorDb, Path input,
             String pipelineId) throws Exception {
-        return start(storeUri, operatorDb, input, pipelineId, false);
+        return start(storeUri, operatorDb, input, pipelineId, false, List.of());
     }
 
     /** Lease counts cover every matching method call in this owned VM, without pipeline projection. */
     static ExecutionAdmissionJdiSession startWithLeaseObservation(String storeUri, String operatorDb, Path input,
             String pipelineId) throws Exception {
-        return start(storeUri, operatorDb, input, pipelineId, true);
+        return startWithLeaseObservation(storeUri, operatorDb, input, pipelineId, List.of());
+    }
+
+    static ExecutionAdmissionJdiSession startWithLeaseObservation(String storeUri, String operatorDb, Path input,
+            String pipelineId, List<String> applicationArguments) throws Exception {
+        return start(storeUri, operatorDb, input, pipelineId, true, List.copyOf(applicationArguments));
     }
 
     private static ExecutionAdmissionJdiSession start(String storeUri, String operatorDb, Path input,
-            String pipelineId, boolean observeLeases) throws Exception {
+            String pipelineId, boolean observeLeases, List<String> applicationArguments) throws Exception {
         Objects.requireNonNull(storeUri); Objects.requireNonNull(operatorDb); Objects.requireNonNull(pipelineId);
         if (pipelineId.isBlank() || pipelineId.length() > 256) { throw invalid("invalid observed pipeline identity"); }
         Path jar = input.toRealPath();
@@ -185,7 +190,7 @@ final class ExecutionAdmissionJdiSession implements AutoCloseable {
             String address = BenchmarkJdiCostObserver.numericLoopbackDialAddress(
                     arguments.get("localAddress").value(), reported, arguments.get("port").value());
             server = RealProcessServer.launchingWithJvmArguments(storeUri, operatorDb, jar,
-                    List.of("-agentlib:jdwp=transport=dt_socket,server=n,suspend=y,address=" + address), List.of());
+                    List.of("-agentlib:jdwp=transport=dt_socket,server=n,suspend=y,address=" + address), applicationArguments);
             vm = connector.accept(arguments);
             if (!vm.canGetBytecodes()) { throw invalid("target method bytecodes unavailable"); }
             connector.stopListening(arguments); listening = false;
