@@ -428,7 +428,7 @@ final class StoreBackedDagSource implements DagSource {
                         PipelineDagBuilder.nestBlockingVertices(pipeline,
                                 nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices))::get),
                         sourceExecutions(sourceVertices)),
-                sinksOf(pipeline, targets, serveStreams, viewStreams));
+                sinksOf(pipeline, targets, serveStreams, viewStreams, sourceIdByTable(sourceVertices)));
         return fence -> {
             NodeVertices drawn = new NodeVertices();
             DAG dag = PipelineDagBuilder.build(
@@ -476,7 +476,7 @@ final class StoreBackedDagSource implements DagSource {
      * table's model is.
      */
     private static List<ExecutionShapes.Sink> sinksOf(PipelineResource pipeline, Map<String, TargetTable> targets,
-            Set<String> serveStreams, Set<String> viewStreams) {
+            Set<String> serveStreams, Set<String> viewStreams, Map<String, String> sourceIdByTable) {
         List<ExecutionShapes.Sink> sinks = new ArrayList<>();
         if (pipeline.view() instanceof ViewBlock.Inline view) {
             ViewTargetResolver.ViewTarget target = ViewTargetResolver.resolve(view);
@@ -489,8 +489,9 @@ final class StoreBackedDagSource implements DagSource {
             for (int index = 0; index < serve.sync().size(); index++) {
                 SyncElement element = serve.sync().get(index);
                 Map<String, SinkTarget> lands = new LinkedHashMap<>();
-                TargetModelResolver.renameAll(targets, serveStreams, element.rename()).forEach((stream, table) ->
-                        lands.put(stream, new SinkTarget(table.name(), keyColumnsOf(table))));
+                TargetModelResolver.renameAll(targets, serveStreams, element.rename(), sourceIdByTable)
+                        .forEach((stream, table) ->
+                                lands.put(stream, new SinkTarget(table.name(), keyColumnsOf(table))));
                 sinks.add(new ExecutionShapes.Sink(
                         PipelineDagBuilder.serveVertex(element, index), element.execution(), lands));
             }
