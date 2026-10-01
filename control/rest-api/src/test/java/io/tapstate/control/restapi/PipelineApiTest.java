@@ -978,6 +978,7 @@ class PipelineApiTest {
                 .containsExactlyInAnyOrder(
                         "pipeline.list", "pipeline.catalog", "pipeline.get", "pipeline.layout.get", "pipeline.layout.update", "pipeline.create",
                         "pipeline.update",
+                        "pipeline.preview",
                         "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
                         "pipeline.status", "pipeline.metrics", "pipeline.snapshot", "pipeline.logs",
                         "pipeline.metrics.history", "pipeline.explain",
@@ -1087,7 +1088,8 @@ class PipelineApiTest {
     @EnableAutoConfiguration
     @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceProjectionServiceTestConfiguration.class,
             PipelinePositionTestConfiguration.class, ClusterTopologyTestConfiguration.class,
-            DerivedSchemaTestConfiguration.class, ObservabilityTestConfiguration.class})
+            DerivedSchemaTestConfiguration.class, ObservabilityTestConfiguration.class,
+            PipelinePreviewTestConfiguration.class})
     static class TestApp {
 
         @Bean
