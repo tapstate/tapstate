@@ -6,15 +6,17 @@ import com.mongodb.ReadConcern;
 import com.mongodb.ReadPreference;
 import com.mongodb.WriteConcern;
 import com.mongodb.client.MongoCollection;
+import com.mongodb.client.ClientSession;
+import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCursor;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.FindOneAndUpdateOptions;
 import com.mongodb.client.model.ReturnDocument;
 import com.mongodb.client.result.UpdateResult;
 import io.tapstate.core.common.TapstateException;
-import io.tapstate.core.model.Resource;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimType;
+import io.tapstate.spi.store.ArtifactMutation;
 import org.bson.Document;
 
 import java.security.SecureRandom;
@@ -38,13 +40,23 @@ public final class SourceConfigKeyringStore {
     private final MongoCollection<Document> workloadClaims;
     private final MongoCollection<Document> artifacts;
     private final SecureRandom random;
+    private final MongoClient client;
 
     public SourceConfigKeyringStore(MongoDatabase database) {
         this(database, new SecureRandom());
     }
 
     SourceConfigKeyringStore(MongoDatabase database, SecureRandom random) {
+        this(null, database, random);
+    }
+
+    SourceConfigKeyringStore(MongoClient client, MongoDatabase database) {
+        this(Objects.requireNonNull(client, "client"), database, new SecureRandom());
+    }
+
+    private SourceConfigKeyringStore(MongoClient client, MongoDatabase database, SecureRandom random) {
         Objects.requireNonNull(database, "database");
+        this.client = client;
         this.systemMeta = SystemCollections.SYSTEM_META.on(database)
                 .withReadPreference(ReadPreference.primary())
                 .withReadConcern(ReadConcern.MAJORITY)
@@ -94,6 +106,17 @@ public final class SourceConfigKeyringStore {
 
     Loaded loadExisting() {
         return decodeStored(keyringDocument());
+    }
+
+    /** Touches the active-key record in the Source transaction so activation cannot pass an uncommitted writer. */
+    boolean fenceActiveWriter(ClientSession session, String keyId) {
+        Objects.requireNonNull(session, "session");
+        Objects.requireNonNull(keyId, "keyId");
+        if (!session.hasActiveTransaction()) throw new IllegalStateException("Source keyring fence needs a transaction");
+        UpdateResult result = systemMeta.updateOne(session,
+                new Document("_id", KEYRING_ID).append("activeKeyId", keyId),
+                new Document("$inc", new Document("sourceWriteFence", 1L)));
+        return result.getMatchedCount() == 1 && result.getModifiedCount() == 1;
     }
 
     private static Loaded decodeStored(Document stored) {
@@ -185,10 +208,11 @@ public final class SourceConfigKeyringStore {
     }
 
     Loaded activatePrepared() {
+        if (client == null) throw new IllegalStateException("keyring rotation needs the owning store client");
         Document current = keyringDocument();
         Loaded loaded = decodeStored(current);
         if (loaded.preparedKeyId() == null) {
-            reencryptSources(loaded);
+            reencryptSources();
             return loaded;
         }
         if (!allLiveSessionsAcknowledged(loaded.epoch())) {
@@ -215,31 +239,30 @@ public final class SourceConfigKeyringStore {
             throw new TapstateException(StoreError.SOURCE_CONFIG_KEYRING_ROTATION_BLOCKED, Map.of(), null);
         }
         Loaded activated = loadExisting();
-        reencryptSources(activated);
+        reencryptSources();
         return activated;
     }
 
-    private void reencryptSources(Loaded keyring) {
-        EncryptedArtifactCodec codec = new EncryptedArtifactCodec(keyring.cipher());
+    private void reencryptSources() {
+        SourceConfigKeyringHandle current = new SourceConfigKeyringHandle(this);
+        EncryptedArtifactCodec codec = new EncryptedArtifactCodec(current);
+        MongoArtifactStore writes = new MongoArtifactStore(client, artifacts, current);
         try (MongoCursor<Document> cursor = artifacts.find(new Document("kind", "source")).iterator()) {
             while (cursor.hasNext()) {
                 Document document = cursor.next();
+                codec.decode(document);
                 Document body = document.get("body", Document.class);
                 String envelope = body == null ? null : body.getString("config");
-                if (keyring.activeKeyId().equals(SourceConfigCipher.envelopeKeyId(envelope))) continue;
-                Resource resource = codec.decode(document);
-                String replacement = codec.encode(resource).get("body", Document.class).getString("config");
-                Document filter = new Document("_id", document.get("_id"))
-                        .append("contentHash", document.getString("contentHash"))
-                        .append("body.config", envelope);
-                UpdateResult result = StoreIo.call(String.valueOf(document.get("_id")), () -> artifacts.updateOne(
-                        filter, new Document("$set", new Document("body.config", replacement))));
-                if (result.getMatchedCount() == 0) {
-                    Document current = StoreIo.call(() -> artifacts.find(
+                if (current.refresh().activeKeyId().equals(SourceConfigCipher.envelopeKeyId(envelope))) continue;
+                ArtifactMutation result = writes.reencryptSource(document);
+                if (result != ArtifactMutation.REPLACED) {
+                    Document latest = StoreIo.call(() -> artifacts.find(
                             new Document("_id", document.get("_id"))).first());
-                    Document currentBody = current == null ? null : current.get("body", Document.class);
-                    String currentEnvelope = currentBody == null ? null : currentBody.getString("config");
-                    if (!keyring.activeKeyId().equals(SourceConfigCipher.envelopeKeyId(currentEnvelope))) {
+                    if (latest == null) continue;
+                    codec.decode(latest);
+                    Document latestBody = latest.get("body", Document.class);
+                    String currentEnvelope = latestBody == null ? null : latestBody.getString("config");
+                    if (!current.refresh().activeKeyId().equals(SourceConfigCipher.envelopeKeyId(currentEnvelope))) {
                         throw new TapstateException(
                                 StoreError.SOURCE_CONFIG_KEYRING_ROTATION_BLOCKED, Map.of(), null);
                     }

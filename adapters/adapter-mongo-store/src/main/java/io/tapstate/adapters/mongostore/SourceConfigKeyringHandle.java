@@ -31,6 +31,16 @@ public final class SourceConfigKeyringHandle implements SourceConfigCipherProvid
         return next.cipher();
     }
 
+    @Override
+    public boolean requiresWriteFence() {
+        return true;
+    }
+
+    @Override
+    public boolean fenceWrite(SourceConfigWriteScope scope, String keyId) {
+        return scope.fence(store, keyId);
+    }
+
     public long epoch() {
         return loaded.get().epoch();
     }

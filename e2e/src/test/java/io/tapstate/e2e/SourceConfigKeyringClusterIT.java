@@ -64,6 +64,7 @@ class SourceConfigKeyringClusterIT {
                 original.second().apply(Map.of("second.tap.yml", WRITER.write(second)));
                 assertSource(database, original.second(), first, keyring.getString("activeKeyId"));
                 assertSource(database, original.first(), second, keyring.getString("activeKeyId"));
+                keyring = keyring(database);
                 secondEnding = stopGracefully(database, original, TwoMemberCluster.NODE_B);
                 firstEnding = stopGracefully(database, original, TwoMemberCluster.NODE_A);
             }

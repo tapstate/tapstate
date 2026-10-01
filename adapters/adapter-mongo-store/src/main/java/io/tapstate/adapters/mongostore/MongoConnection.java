@@ -67,7 +67,7 @@ public final class MongoConnection implements AutoCloseable {
         verifyConnectivity();
         try {
             MigrationRunner.migrate(database());
-            sourceConfigKeyring = new SourceConfigKeyringHandle(new SourceConfigKeyringStore(database()));
+            sourceConfigKeyring = new SourceConfigKeyringHandle(new SourceConfigKeyringStore(client, database()));
             verifySourceConfigStorage();
         } catch (RuntimeException e) {
             close();

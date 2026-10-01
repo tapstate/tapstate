@@ -12,6 +12,7 @@ import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.StoredArtifactRecord;
 import org.bson.Document;
+import com.mongodb.client.ClientSession;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -32,11 +33,21 @@ final class EncryptedArtifactCodec {
     }
 
     Document encode(Resource resource) {
+        return encode(resource, null);
+    }
+
+    Document encode(Resource resource, ClientSession session) {
         Map<String, Object> tree = new LinkedHashMap<>(WRITER.tree(resource));
         if (resource instanceof SourceResource source) {
             Object config = tree.getOrDefault("config", Map.of());
-            tree.put("config", ciphers.currentForWrite()
-                    .encrypt(source.id(), source.connector(), JsonWriter.write(config)));
+            SourceConfigCipher cipher = ciphers.currentForWrite();
+            if (ciphers.requiresWriteFence()) {
+                if (session == null) throw new IllegalStateException("metadata-backed Source writes require a transaction");
+                if (!ciphers.fenceWrite(new SourceConfigWriteScope(session), cipher.activeKeyId())) {
+                    throw new TapstateException(StoreError.SOURCE_CONFIG_KEYRING_NOT_READY, Map.of(), null);
+                }
+            }
+            tree.put("config", cipher.encrypt(source.id(), source.connector(), JsonWriter.write(config)));
         }
         return new Document("_id", resource.id()).append("kind", resource.kind())
                 .append("body", new Document(tree)).append("contentHash", CanonicalHash.of(resource));

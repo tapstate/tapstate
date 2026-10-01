@@ -4,6 +4,11 @@ import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
+import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
+import com.mongodb.event.CommandListener;
+import com.mongodb.event.CommandStartedEvent;
+import com.mongodb.event.CommandSucceededEvent;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Resource;
@@ -32,6 +37,9 @@ import java.util.Date;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -191,7 +199,7 @@ class SourceConfigKeyringStoreIT {
     @Test
     void rotationWaitsForEveryLiveBootThenReencryptsWithoutChangingLogicalIdentity() {
         MongoDatabase database = freshDatabase("keyring_rotation");
-        SourceConfigKeyringStore keyrings = new SourceConfigKeyringStore(database);
+        SourceConfigKeyringStore keyrings = new SourceConfigKeyringStore(client, database);
         keyrings.loadOrCreateCipher();
         SourceConfigKeyringHandle firstHandle = new SourceConfigKeyringHandle(keyrings);
         SourceConfigKeyringHandle secondHandle = new SourceConfigKeyringHandle(keyrings);
@@ -215,6 +223,8 @@ class SourceConfigKeyringStoreIT {
                   password: rotation-secret
                 """);
         artifactStore.save(source);
+        artifacts.updateOne(new Document("_id", "orders"), new Document("$set",
+                new Document("storageProvenance", new Document("marker", "preserved-storage-field"))));
         Document before = artifacts.find(new Document("_id", "orders")).first();
         String firstEnvelope = before.get("body", Document.class).getString("config");
         String firstKey = SourceConfigCipher.envelopeKeyId(firstEnvelope);
@@ -234,6 +244,7 @@ class SourceConfigKeyringStoreIT {
         assertThat(SourceConfigCipher.envelopeKeyId(secondEnvelope)).isNotEqualTo(firstKey);
         assertThat(secondEnvelope).doesNotContain("rotation-secret");
         assertThat(after.getString("contentHash")).isEqualTo(CanonicalHash.of(source));
+        assertThat(after.get("storageProvenance")).isEqualTo(before.get("storageProvenance"));
         assertThat(artifactStore.get("orders")).contains(source);
         assertThat(SystemCollections.SYSTEM_META.on(database)
                 .find(new Document("_id", "source-config-keyring")).first()
@@ -275,7 +286,7 @@ class SourceConfigKeyringStoreIT {
     @Test
     void crashedNodeStopsBlockingAfterItsNodeSessionAndAcknowledgementExpire() throws Exception {
         MongoDatabase database = freshDatabase("keyring_expired_node");
-        SourceConfigKeyringStore keyrings = new SourceConfigKeyringStore(database);
+        SourceConfigKeyringStore keyrings = new SourceConfigKeyringStore(client, database);
         keyrings.loadOrCreateCipher();
         SourceConfigKeyringHandle handle = new SourceConfigKeyringHandle(keyrings);
         MongoWorkloadClaimStore claims = new MongoWorkloadClaimStore(SystemCollections.WORKLOAD_CLAIMS.on(database));
@@ -291,6 +302,118 @@ class SourceConfigKeyringStoreIT {
 
         Thread.sleep(500);
         assertThat(handle.activatePrepared()).isEqualTo(3);
+    }
+
+    @Test
+    void aSourceWriteWhoseKeyWasLoadedBeforeActivationCannotPersistWithTheRetiredWriterKey() {
+        MongoDatabase database = freshDatabase("keyring_late_writer");
+        SourceConfigKeyringStore keyrings = new SourceConfigKeyringStore(client, database);
+        keyrings.loadOrCreateCipher();
+        SourceConfigKeyringHandle writer = new SourceConfigKeyringHandle(keyrings);
+        SourceConfigKeyringHandle rotation = new SourceConfigKeyringHandle(keyrings);
+        AtomicBoolean activated = new AtomicBoolean();
+        SourceConfigCipherProvider delayed = new SourceConfigCipherProvider() {
+            @Override public SourceConfigCipher current() { return writer.current(); }
+            @Override public boolean requiresWriteFence() { return writer.requiresWriteFence(); }
+            @Override public boolean fenceWrite(SourceConfigWriteScope scope, String keyId) {
+                return writer.fenceWrite(scope, keyId);
+            }
+
+            @Override public SourceConfigCipher refresh() {
+                SourceConfigCipher readBeforeActivation = writer.refresh();
+                if (activated.compareAndSet(false, true)) {
+                    rotation.prepareRotation();
+                    rotation.activatePrepared();
+                }
+                // A real writer can be descheduled after its keyring read and before its Mongo write.
+                return readBeforeActivation;
+            }
+        };
+        MongoCollection<Document> artifacts = SystemCollections.ARTIFACTS.on(database);
+        MongoArtifactStore store = new MongoArtifactStore(client, artifacts, delayed);
+        Resource source = new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: delayed_writer
+                connector: mysql
+                config: { password: delayed-config-sentinel }
+                """);
+        store.save(source);
+        assertThat(activated).isTrue();
+        String active = keyrings.loadExistingCipher().activeKeyId();
+        Document stored = artifacts.find(new Document("_id", "delayed_writer")).first();
+        assertThat(stored.get("body", Document.class).getString("config"))
+                .as("activation must fence or retry the in-flight old-key write")
+                .startsWith("tscfg:1:" + active + ":");
+        assertThat(stored.getString("contentHash")).isEqualTo(CanonicalHash.of(source));
+    }
+
+    @Test
+    void overlappingRotatorsCannotRewriteANewerEnvelopeWithAnEarlierActiveKey() {
+        MongoDatabase database = freshDatabase("keyring_overlapping_rotation");
+        SourceConfigKeyringStore baseline = new SourceConfigKeyringStore(client, database);
+        baseline.loadOrCreateCipher();
+        SourceConfigKeyringHandle later = new SourceConfigKeyringHandle(baseline);
+        MongoCollection<Document> artifacts = SystemCollections.ARTIFACTS.on(database);
+        Resource source = new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: overlapping_rotation
+                connector: mysql
+                config: { password: overlapping-rotation-sentinel }
+                """);
+        new MongoArtifactStore(client, artifacts, baseline.loadExistingCipher()).save(source);
+        AtomicInteger activationRequest = new AtomicInteger(-1);
+        AtomicInteger phase = new AtomicInteger();
+        AtomicReference<Throwable> hookFailure = new AtomicReference<>();
+        CommandListener ordering = new CommandListener() {
+            @Override public void commandStarted(CommandStartedEvent event) {
+                if (!"update".equals(event.getCommandName())) return;
+                var updates = event.getCommand().getArray("updates");
+                var replacement = updates.get(0).asDocument().getDocument("u");
+                if (replacement.containsKey("activeKeyId") && replacement.getNumber("epoch").longValue() == 3) {
+                    activationRequest.set(event.getRequestId());
+                }
+            }
+
+            @Override public void commandSucceeded(CommandSucceededEvent event) {
+                try {
+                    if (event.getRequestId() == activationRequest.get() && phase.compareAndSet(0, 1)) {
+                        // Persist K3 before the first rotator loads its post-activation K2 view.
+                        later.prepareRotation();
+                        return;
+                    }
+                    if (!"find".equals(event.getCommandName()) || phase.get() != 1) return;
+                    var cursor = event.getResponse().getDocument("cursor", null);
+                    if (cursor == null || !cursor.containsKey("firstBatch")) return;
+                    var rows = cursor.getArray("firstBatch");
+                    if (rows.isEmpty() || !rows.get(0).isDocument()) return;
+                    var row = rows.get(0).asDocument();
+                    if (!row.containsKey("preparedKeyId") || !row.containsKey("epoch")
+                            || row.getNumber("epoch").longValue() != 4) return;
+                    if (phase.compareAndSet(1, 2)) later.activatePrepared();
+                } catch (Throwable failure) {
+                    hookFailure.compareAndSet(null, failure);
+                }
+            }
+        };
+        MongoClientSettings settings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl(database.getName())))
+                .addCommandListener(ordering).build();
+        try (MongoClient firstClient = MongoClients.create(settings)) {
+            SourceConfigKeyringHandle first = new SourceConfigKeyringHandle(
+                    new SourceConfigKeyringStore(firstClient, firstClient.getDatabase(database.getName())));
+            first.prepareRotation();
+            first.activatePrepared();
+        }
+        assertThat(hookFailure.get()).as("both controlled rotation transitions executed successfully").isNull();
+        assertThat(phase.get()).isEqualTo(2);
+        String active = baseline.loadExistingCipher().activeKeyId();
+        Document stored = artifacts.find(new Document("_id", source.id())).first();
+        assertThat(stored.get("body", Document.class).getString("config"))
+                .as("an earlier rotator must not downgrade a completed newer rotation")
+                .startsWith("tscfg:1:" + active + ":");
+        assertThat(stored.getString("contentHash")).isEqualTo(CanonicalHash.of(source));
     }
 
     private static SourceConfigCipher load(SourceConfigKeyringStore store, CountDownLatch start) {

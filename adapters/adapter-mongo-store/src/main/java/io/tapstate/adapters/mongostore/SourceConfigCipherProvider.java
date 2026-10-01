@@ -11,6 +11,14 @@ interface SourceConfigCipherProvider {
         return refresh();
     }
 
+    default boolean requiresWriteFence() {
+        return false;
+    }
+
+    default boolean fenceWrite(SourceConfigWriteScope scope, String keyId) {
+        return true;
+    }
+
     static SourceConfigCipherProvider fixed(SourceConfigCipher cipher) {
         return new SourceConfigCipherProvider() {
             @Override
