@@ -32,6 +32,7 @@ final class ExecutionAdmissionJdiSession implements AutoCloseable {
             List<Integer> normalReturnOffsets) {
         Binding { normalReturnOffsets = List.copyOf(normalReturnOffsets); }
     }
+    record MethodProvenance(String type, String method, String signature, String artifactOrigin, String methodSha256) { }
     record Boundary(long atNanos, String artifactSha256, String pipelineId,
             Map<Target, Binding> bindings, Map<Target, Counts> counts,
             long events, int openObservedCalls, boolean eventQueueDrained,
@@ -62,6 +63,11 @@ final class ExecutionAdmissionJdiSession implements AutoCloseable {
                             && value.entries() == value.normalReturns() + value.exceptionalExits());
         }
         boolean fullyDrained() { return drained() && ownedVmDeath && ownedVmDisconnected; }
+        boolean observesTransactionalAdvance() {
+            Binding advance = bindings.get(Target.ADVANCE_STANDALONE);
+            return advance != null && advance.type().equals(SHARED_ADVANCE.type())
+                    && advance.signature().equals(SHARED_ADVANCE.signature());
+        }
     }
     private record Key(Target target, LeaseTarget lease) {
         Key {
@@ -71,6 +77,7 @@ final class ExecutionAdmissionJdiSession implements AutoCloseable {
     }
     private record Description(String type, String method, String signature, int arguments, int pipelineArgument) { }
     private record Image(String origin, byte[] code) { }
+    private record ArtifactMethods(Map<Key, Description> descriptions, Map<Key, Image> images) { }
     private record Site(Key key, boolean entry) { }
     private static final class Totals { long entries, returns, exceptional; }
     private static final class Call {
@@ -100,6 +107,9 @@ final class ExecutionAdmissionJdiSession implements AutoCloseable {
                     "(Ljava/lang/String;Ljava/lang/String;)Ljava/util/OptionalLong;", 2, 1),
             Target.SUBMIT_JOB, new Description("io.tapstate.runtime.engine.Engine", "submitJob",
                     "(Ljava/lang/String;Lcom/hazelcast/jet/core/DAG;)V", 2, 0));
+    private static final Description SHARED_ADVANCE = new Description(
+            "io.tapstate.adapters.mongostore.MongoExecutionGenerationWrites", "advanceStandalone",
+            "(Lcom/mongodb/client/ClientSession;Ljava/lang/String;Ljava/lang/String;)Ljava/util/Optional;", 3, 2);
     private static final Map<LeaseTarget, Description> LEASE_DESCRIPTIONS = Map.of(
             LeaseTarget.ACQUIRE, new Description("io.tapstate.adapters.mongostore.MongoWorkloadClaimStore", "acquire",
                     "(Lio/tapstate/spi/store/WorkloadClaimKey;Lio/tapstate/spi/store/WorkloadOwner;JLjava/time/Duration;)"
@@ -172,8 +182,9 @@ final class ExecutionAdmissionJdiSession implements AutoCloseable {
             throw invalid("application artifact unavailable or exceeded its bound");
         }
         String sha = sha256(jar);
-        Map<Key, Description> descriptions = descriptions(observeLeases);
-        Map<Key, Image> images = images(jar, descriptions);
+        ArtifactMethods artifactMethods = artifactMethods(jar, observeLeases);
+        Map<Key, Description> descriptions = artifactMethods.descriptions();
+        Map<Key, Image> images = artifactMethods.images();
         if (!sha.equals(sha256(jar))) { throw invalid("application artifact changed while reading method provenance"); }
         ListeningConnector connector = Bootstrap.virtualMachineManager().listeningConnectors().stream()
                 .filter(value -> value.name().equals("com.sun.jdi.SocketListen")).findFirst()
@@ -605,9 +616,35 @@ final class ExecutionAdmissionJdiSession implements AutoCloseable {
         return Map.copyOf(descriptions);
     }
 
-    private static Map<Key, Image> images(Path jar, Map<Key, Description> descriptions) throws Exception {
-        Map<Key, Image> images = new LinkedHashMap<>();
-        List<String> types = descriptions.values().stream().map(Description::type).distinct().toList();
+    static MethodProvenance advanceProvenance(Path jar) throws Exception {
+        ArtifactMethods selected = artifactMethods(jar, false);
+        Key key = new Key(Target.ADVANCE_STANDALONE, null);
+        Description description = selected.descriptions().get(key);
+        Image image = selected.images().get(key);
+        return new MethodProvenance(description.type(), description.method(), description.signature(),
+                image.origin(), sha256(image.code()));
+    }
+
+    private static ArtifactMethods artifactMethods(Path jar, boolean observeLeases) throws Exception {
+        Map<Key, Description> selected = new LinkedHashMap<>(descriptions(observeLeases));
+        List<Description> candidates = new ArrayList<>(selected.values());
+        candidates.add(SHARED_ADVANCE);
+        Map<Description, Image> available = images(jar, candidates);
+        if (available.containsKey(SHARED_ADVANCE)) {
+            selected.put(new Key(Target.ADVANCE_STANDALONE, null), SHARED_ADVANCE);
+        }
+        Map<Key, Image> pinned = new LinkedHashMap<>();
+        selected.forEach((key, description) -> {
+            Image image = available.get(description);
+            if (image == null) { throw invalid("application artifact lacked every requested exact method"); }
+            pinned.put(key, image);
+        });
+        return new ArtifactMethods(Map.copyOf(selected), Map.copyOf(pinned));
+    }
+
+    private static Map<Description, Image> images(Path jar, List<Description> descriptions) throws Exception {
+        Map<Description, Image> images = new LinkedHashMap<>();
+        List<String> types = descriptions.stream().map(Description::type).distinct().toList();
         try (ZipFile boot = new ZipFile(jar.toFile())) {
             for (String type : types) {
                 String resource = type.replace('.', '/') + ".class";
@@ -638,20 +675,18 @@ final class ExecutionAdmissionJdiSession implements AutoCloseable {
                 }
             }
         }
-        if (images.size() != descriptions.size()) { throw invalid("application artifact lacked every requested exact method"); }
         return Map.copyOf(images);
     }
 
-    private static void addImages(Map<Key, Image> images, Map<Key, Description> descriptions,
+    private static void addImages(Map<Description, Image> images, List<Description> descriptions,
             String type, String origin, InputStream stream) throws Exception {
         byte[] bytes = stream.readNBytes(MAX_CLASS_BYTES + 1);
         if (bytes.length > MAX_CLASS_BYTES) { throw invalid("admission class exceeded its bound"); }
-        for (Map.Entry<Key, Description> entry : descriptions.entrySet()) {
-            Description description = entry.getValue();
+        for (Description description : descriptions) {
             if (!type.equals(description.type())) { continue; }
             byte[] code = methodCode(bytes, description.method() + description.signature());
             if (code == null || BenchmarkJdiCostObserver.returnOffsets(code).isEmpty()
-                    || images.putIfAbsent(entry.getKey(), new Image(origin, code)) != null) {
+                    || images.putIfAbsent(description, new Image(origin, code)) != null) {
                 throw invalid("admission method missing, duplicated or lacked a normal return");
             }
         }

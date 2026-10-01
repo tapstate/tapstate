@@ -34,7 +34,7 @@ final class ExecutionAdmissionStages {
         }
     }
 
-    private void recordCounts(String action, ExecutionAdmissionJdiSession.Boundary current,
+    void recordCounts(String action, ExecutionAdmissionJdiSession.Boundary current,
             long advances, long submits) {
         assertThat(current.drained()).as("%s drained exact method boundaries", action).isTrue();
         assertThat(current.leaseObservationEnabled()).isTrue();
@@ -83,6 +83,10 @@ final class ExecutionAdmissionStages {
         evidence.put("ownedVmDeath", current.ownedVmDeath());
         evidence.put("ownedVmDisconnected", current.ownedVmDisconnected());
         evidence.put("physicalMongoCommandsInferred", false);
+        evidence.put("advanceObservationMode", current.observesTransactionalAdvance()
+                ? "EXACT_SHARED_GENERATION_METHOD" : "EXACT_LEGACY_PUBLIC_WRAPPER");
+        evidence.put("transactionalAdvanceObservationSupported", current.observesTransactionalAdvance());
+        evidence.put("generationMethodReturnProvesTransactionCommit", false);
         report.addFork(evidence);
         previous = current;
     }
