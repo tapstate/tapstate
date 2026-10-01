@@ -3,8 +3,10 @@ package io.tapstate.e2e;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.mongodb.ConnectionString;
+import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoCollection;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.DockerGate;
@@ -16,6 +18,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicReference;
+import org.bson.BsonTimestamp;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.io.TempDir;
@@ -36,7 +40,8 @@ import org.junit.jupiter.params.provider.EnumSource;
  * <p><b>Nobody holds the source.</b> The first pipeline is cleared, and the chain with it. A row written
  * after that and before the CDC-only pipeline starts is not delivered: there is nothing to carry on from, so
  * the new pipeline begins at its own present. A row written after its stream opens must arrive, so an empty
- * target or a tail that never started cannot satisfy the absence.
+ * target or a tail that never started cannot satisfy the absence. The source names its present as a second
+ * of its cluster time, so the row before the start is written a second ahead of it, not merely before it.
  *
  * <p><b>Another pipeline holds the source.</b> The first pipeline is stopped with its state kept, so it still
  * owes every change on its collection after where it stopped, and the chain's reader has to carry on from
@@ -62,6 +67,8 @@ class ACdcOnlyPipelineDoesNotBorrowAnotherPipelinesSnapshotSeamIT {
     private static final String WHILE_STOPPED = "written-while-the-seam-owner-was-stopped";
     private static final String BEFORE_START = "written-before-cdc-only-start";
     private static final String AFTER_START = "written-after-cdc-only-start";
+    /** Where the case writes the marks that move the source's cluster time on; neither pipeline reads it. */
+    private static final String CLOCK_DATABASE = "cdc_own_start_clock";
 
     @BeforeAll
     static void requireDockerAndTheRealConnector() {
@@ -84,7 +91,7 @@ class ACdcOnlyPipelineDoesNotBorrowAnotherPipelinesSnapshotSeamIT {
                     () -> chainRecord(run.storeUri, chain) == null,
                     () -> String.valueOf(chainRecord(run.storeUri, chain)));
 
-            run.insert(SECOND_COLLECTION, 1, BEFORE_START);
+            run.insertAndWaitOutItsSecond(SECOND_COLLECTION, 1, BEFORE_START);
             run.startTheCdcOnlyPipeline();
             run.insert(SECOND_COLLECTION, 2, AFTER_START);
             run.awaitRow(SECOND_COLLECTION, AFTER_START);
@@ -261,6 +268,34 @@ class ACdcOnlyPipelineDoesNotBorrowAnotherPipelinesSnapshotSeamIT {
         void insert(String collection, int id, String name) {
             source.getDatabase(sourceDatabase).getCollection(collection)
                     .insertOne(new Document("_id", id).append("oid", id).append("name", name));
+        }
+
+        /**
+         * Writes a row, then waits until the source's cluster time has moved into a later second than the write.
+         *
+         * <p>A MongoDB source names its present as a second of its cluster time, and a stream started there is
+         * handed everything written in that second. A row written moments before a pipeline starts can share
+         * the second, and is then handed to it although it was written first. Each wait writes a mark to a
+         * database neither pipeline reads, which is what moves the cluster time on.
+         */
+        void insertAndWaitOutItsSecond(String collection, int id, String name) {
+            BsonTimestamp written;
+            try (ClientSession session = source.startSession()) {
+                source.getDatabase(sourceDatabase).getCollection(collection).insertOne(session,
+                        new Document("_id", id).append("oid", id).append("name", name));
+                written = session.getOperationTime();
+            }
+            MongoCollection<Document> marks = source.getDatabase(CLOCK_DATABASE).getCollection("marks");
+            AtomicReference<BsonTimestamp> now = new AtomicReference<>(written);
+            Await.until("the source's cluster time to leave the second " + name + " was written in", TIMEOUT,
+                    () -> {
+                        try (ClientSession session = source.startSession()) {
+                            marks.insertOne(session, new Document());
+                            now.set(session.getOperationTime());
+                        }
+                        return now.get().getTime() > written.getTime();
+                    },
+                    () -> "written at " + written + ", cluster time now " + now.get());
         }
 
         void awaitRow(String collection, String name) {
