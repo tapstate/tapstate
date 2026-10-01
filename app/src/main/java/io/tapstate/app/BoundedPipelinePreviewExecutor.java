@@ -417,7 +417,8 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
         }
 
         private PipelineResource isolatedPipeline(PipelineResource pipeline) {
-            return new PipelineResource(executionId, pipeline.metadata(), pipeline.sources(),
+            // A leading dot is forbidden in DSL ids and keeps preview state out of user map namespaces.
+            return new PipelineResource("." + executionId, pipeline.metadata(), pipeline.sources(),
                     pipeline.transforms(), pipeline.view(), pipeline.serve(),
                     boundedSettings(pipeline.settings()), pipeline.experimental());
         }

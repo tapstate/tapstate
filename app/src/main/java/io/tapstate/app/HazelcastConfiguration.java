@@ -546,12 +546,12 @@ class HazelcastConfiguration {
                     .setFactoryImplementation(new SrsLogRingbufferStoreFactory(srsLogStore)));
         }
         config.addRingBufferConfig(rings);
-        // Preview maps are request-scoped scratch only. These more specific patterns override the
-        // durable nest/join patterns installed after member startup and deliberately carry no MapStore.
+        // Preview operator namespaces contain an extra dot before their generated id. DSL resource ids
+        // forbid dots, so these patterns cannot match a user's durable Nest or Join state.
         config.addMapConfig(previewMapConfig("__preview.*", 300));
         config.addMapConfig(previewSampleMapConfig());
-        config.addMapConfig(previewMapConfig("nest.preview_*.*", 300));
-        config.addMapConfig(previewMapConfig("join.preview_*.*", 300));
+        config.addMapConfig(previewMapConfig("nest..preview_*", 300));
+        config.addMapConfig(previewMapConfig("join..preview_*", 300));
         // What a nest state map is is NOT declared here, and the omission is load-bearing: it is declared
         // once the member is running, by makeNestCapable. A pattern placed in this static configuration
         // answers for every namespace and shadows the per-pipeline budget added later, which the substrate
