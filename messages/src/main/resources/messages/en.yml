@@ -167,7 +167,7 @@ capture.resume-anchor-unavailable:
   solution: "Use a connector build that reports where its change stream starts, or read this source as snapshot only."
 capture.shared-position-unverified:
   message: "The recorded position of chain `{chain}` was written by an earlier version while the chain carried several tables, and nothing proves every table's changes before it reached the target."
-  solution: "Rerun the pipeline to read its source again, or set a position you have verified with `pipeline set-position`, then start it."
+  solution: "Rerun the pipeline with `restart <pipeline> --rerun` to read its source again, or set a position you have verified with `position <pipeline> -f <file>`, then start it."
 capture.shared-selection-restart-required:
   message: "Chain `{chain}` is being read without a table this pipeline needs, and its reader could not add it."
   solution: "Start the pipeline again; the chain's reader subscribes to the missing table when it next starts."
