@@ -4,7 +4,6 @@ import io.tapstate.testsupport.DockerGate;
 import org.testcontainers.oracle.OracleContainer;
 
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
@@ -34,7 +33,7 @@ final class SharedOracle {
         settings.put("database", "FREE");
         settings.put("multiTenant", true);
         settings.put("pdb", "FREEPDB1");
-        try (Connection connection = DriverManager.getConnection(
+        try (Connection connection = JdbcConnections.open(
                 "jdbc:oracle:thin:@//" + server.getHost() + ":" + server.getOraclePort() + "/FREEPDB1",
                 USER, PASSWORD); Statement statement = connection.createStatement()) {
             try (var user = statement.executeQuery(
