@@ -93,6 +93,44 @@ class PhysicalSourcePrefixTest {
         assertThat(sourceRead()).as("with nothing ahead of it, released as it is recorded").isEqualTo("h3");
     }
 
+    /**
+     * A run that carried nothing a pipeline reads says nothing about that pipeline's target. Its acknowledged
+     * position stays at the last change the target confirmed while the chain moves on past the quiet run, so
+     * a source that keeps naming positions while nothing changes does not keep moving it.
+     */
+    @Test
+    void aRunCarryingNothingForAPipelineLeavesWhereItsTargetStands() {
+        select("pipe", "orders");
+        select("other", "customers");
+        PhysicalSourcePrefix prefix = shared("customers", "orders");
+        prefix.start(at("t0"));
+        prefix.admitted(Map.of("orders", 0L), "t1");
+        ack("pipe", "orders", 0);
+        prefix.tick();
+        prefix.admitted(Map.of(), "h2");
+
+        assertThat(sourceRead()).as("the quiet run still moves the chain").isEqualTo("h2");
+        assertThat(consumer("pipe").sinkAcked().token()).as("its target confirmed t1 and nothing since")
+                .isEqualTo("t1");
+        assertThat(consumer("other").sinkAcked()).as("nothing it reads has come through yet").isNull();
+    }
+
+    /** A direct tail's quiet run moves the chain the same way, and leaves its pipeline's position alone. */
+    @Test
+    void aDirectTailsQuietRunMovesTheChainButNotItsPipelinesPosition() {
+        meta.selectConsumerTables(CHAIN, "direct", List.of(), epoch);
+        PhysicalSourcePrefix prefix = PhysicalSourcePrefix.direct(meta, CHAIN, epoch, "direct", health);
+        opened.add(prefix);
+        prefix.start(at("t0"));
+        prefix.admitted(Map.of("orders", 0L), "t1");
+        ack("direct", "orders", 0);
+        prefix.tick();
+        prefix.admitted(Map.of(), "h2");
+
+        assertThat(sourceRead()).isEqualTo("h2");
+        assertThat(consumer("direct").sinkAcked().token()).isEqualTo("t1");
+    }
+
     /** A run that carried nothing and named nothing tells nobody anything, and moves nothing. */
     @Test
     void aRunNamingNoPositionIsReleasedWithoutWritingAnything() {

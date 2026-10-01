@@ -43,10 +43,13 @@ import java.util.function.BiConsumer;
  * source ever names: a source that reports where a transaction ends only after the fact would otherwise
  * never let the chain move past the last change it delivered.
  *
- * <p>Releasing writes the run's position down as the chain's source read offset and as each consumer's
- * chain-level acknowledgement, and cuts each table's durable log behind the run: everyone who reads that
- * ring has landed everything up to there. Both writes are conditional on the reader still holding the
- * generation it opened; a reader that lost it to another one stops with a code instead of carrying on.
+ * <p>Releasing writes the run's position down as the chain's source read offset, and as the chain-level
+ * acknowledgement of each consumer the run carried a change for, and cuts each table's durable log behind
+ * the run: everyone who reads that ring has landed everything up to there. A consumer's acknowledgement
+ * says where the last change its target confirmed sat, so a run that carried it nothing leaves it where it
+ * is -- a source naming positions while nothing changes would otherwise move it for ever. Every write is
+ * conditional on the reader still holding the generation it opened; a reader that lost it to another one
+ * stops with a code instead of carrying on.
  *
  * <p>The account is held in memory and bounded. A process that stops loses it, and the next reader resumes
  * from the last position released -- which only ever means reading again what had already been read. When
@@ -347,14 +350,17 @@ final class PhysicalSourcePrefix implements AutoCloseable {
 
     /**
      * Writes a released run down. Its position becomes how far the source may be told to release its log;
-     * it becomes where a restart resumes only when the run carried a change, because a run carrying none can
-     * name a point that, resumed from, passes over the change that follows it.
+     * it becomes where a restart resumes, and where a consumer's target stands, only when the run carried a
+     * change -- for the consumer, one of its own -- because a run carrying none can name a point that,
+     * resumed from, passes over the change that follows it, and that no target ever confirmed.
      */
     private void write(Batch batch, Map<String, ConsumerOffset> current) {
         ChainPosition position = batch.position();
         boolean carriedAChange = !batch.lastSeqByTable().isEmpty();
         if (directPipeline != null) {
-            meta.advanceSinkAcked(chainId, directPipeline, position);
+            if (carriedAChange) {
+                meta.advanceSinkAcked(chainId, directPipeline, position);
+            }
             ConsumerOffset own = current.get(directPipeline);
             List<ConsumerOffset> landed = current.values().stream()
                     .map(consumer -> consumer == own ? consumer.withSinkAcked(position) : consumer)
@@ -366,8 +372,9 @@ final class PhysicalSourcePrefix implements AutoCloseable {
                             chainId, safe, carriedAChange && safe.equals(position)));
             return;
         }
-        for (String pipelineId : batch.owed().keySet()) {
-            if (current.containsKey(pipelineId) && !meta.advancePhysicalSinkAcked(chainId, pipelineId, epoch, position)) {
+        for (Map.Entry<String, Map<String, Long>> debt : batch.owed().entrySet()) {
+            if (!debt.getValue().isEmpty() && current.containsKey(debt.getKey())
+                    && !meta.advancePhysicalSinkAcked(chainId, debt.getKey(), epoch, position)) {
                 throw lostOrUnverified();
             }
         }
