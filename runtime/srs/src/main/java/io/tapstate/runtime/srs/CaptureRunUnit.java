@@ -29,6 +29,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -491,7 +492,7 @@ public final class CaptureRunUnit {
         private final SharedNotes notes;
         private SrsMetaStore.PhysicalSelection published;
         /** The stream running now; read without the lock, so an acknowledgement never waits on a widening. */
-        private volatile Subscription stream;
+        private final AtomicReference<Subscription> stream = new AtomicReference<>();
         private boolean closed;
 
         SharedTail(CaptureRunSpec spec, String chainId, long epoch, CaptureHealth health) {
@@ -524,7 +525,7 @@ public final class CaptureRunUnit {
 
         /** Replaces the running subscription with one over every table asked for since; see the class. */
         synchronized boolean widen() {
-            if (closed || stream == null) {
+            if (closed || stream.get() == null) {
                 return false;
             }
             for (int attempt = 1; ; attempt++) {
@@ -533,8 +534,7 @@ public final class CaptureRunUnit {
                     meta.clearPhysicalRequests(chainId, tables);
                     return false;
                 }
-                stream.close();
-                stream = null;
+                stream.getAndSet(null).close();
                 PhysicalSourcePrefix prefix = prefixOver(tables);
                 SrsMetaStore.PhysicalSelection wider =
                         new SrsMetaStore.PhysicalSelection(epoch, published.revision() + 1, tables);
@@ -574,7 +574,7 @@ public final class CaptureRunUnit {
                 routes.put(table, new CdcPhase.TableRoute(chain, consumers));
             }
             CaptureConfig physical = spec.config().over(selection.tables()).sharing(notes);
-            stream = CdcPhase.run(port, physical, start, routes, health, prefix);
+            stream.set(CdcPhase.run(port, physical, start, routes, health, prefix));
             meta.clearPhysicalRequests(chainId, selection.tables());
         }
 
@@ -584,7 +584,7 @@ public final class CaptureRunUnit {
          */
         @Override
         public void acknowledge(SourcePosition durable) {
-            Subscription current = stream;
+            Subscription current = stream.get();
             if (current != null) {
                 current.acknowledge(durable);
             }
@@ -593,8 +593,9 @@ public final class CaptureRunUnit {
         @Override
         public synchronized void close() {
             closed = true;
-            if (stream != null) {
-                stream.close();
+            Subscription current = stream.get();
+            if (current != null) {
+                current.close();
             }
         }
     }

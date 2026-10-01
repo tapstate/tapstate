@@ -162,7 +162,9 @@ class PhysicalSourcePrefixTest {
         Throwable failure = thrown != null ? thrown : health.failure().orElseThrow();
         assertThat(failure).isInstanceOfSatisfying(TapstateException.class,
                 coded -> assertThat(coded.code()).isEqualTo(CaptureError.CHAIN_TAKEN_OVER));
-        assertThatThrownBy(() -> prefix.admitted(Map.of(), "h9")).as("nothing more is recorded after it");
+        assertThatThrownBy(() -> prefix.admitted(Map.of(), "h9"))
+                .as("nothing more is recorded after it: every later call throws that same failure")
+                .isSameAs(failure);
         assertThat(sourceRead()).isEqualTo("t0");
     }
 
