@@ -28,10 +28,14 @@ public final class CloudAuthenticationService {
         this.observer = Objects.requireNonNull(observer, "observer");
     }
 
-    public CreatedCloudSession exchangeCode(String code) {
+    public CreatedCloudSession exchangeCode(String code, String expectedAudience) {
         if (code == null || code.isBlank()) {
             throw new TapstateException(ControlError.MALFORMED_REQUEST,
                     Map.of("reason", "an exchange code is required"), null);
+        }
+        if (expectedAudience == null || expectedAudience.isBlank()) {
+            throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                    Map.of("reason", "a request audience is required"), null);
         }
         observer.entering(CloudAuthenticationObserver.Stage.CODE_EXCHANGE);
         String jwt = exchanger.exchange(code, sessions.identity().clusterId());
@@ -39,7 +43,7 @@ public final class CloudAuthenticationService {
             throw unavailable();
         }
         observer.entering(CloudAuthenticationObserver.Stage.JWT_VERIFICATION);
-        CloudLoginIdentity login = validator.validate(jwt, sessions.identity())
+        CloudLoginIdentity login = validator.validate(jwt, sessions.identity(), expectedAudience)
                 .orElseThrow(CloudAuthenticationService::unauthenticated);
         observer.entering(CloudAuthenticationObserver.Stage.SESSION_CREATE);
         return sessions.create(login).orElseThrow(CloudAuthenticationService::unauthenticated);

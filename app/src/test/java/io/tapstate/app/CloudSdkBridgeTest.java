@@ -7,6 +7,8 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CloudSessionIdentity;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Instant;
 import java.util.List;
@@ -17,6 +19,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class CloudSdkBridgeTest {
 
     private static final Instant EXPIRY = Instant.parse("2030-01-01T00:00:00Z");
+    private static final String AUDIENCE = "cluster.customer.example";
     private CloudRuntimeSettings settings;
     private ControlledSdk sdk;
     private CloudSdkBridge bridge;
@@ -48,26 +51,85 @@ class CloudSdkBridgeTest {
 
     @Test
     void acceptsOnlyVerifiedClaimsForThisDeploymentAndMapsWorkloadScope() {
-        var login = bridge.validate("signed-jwt", deployment).orElseThrow();
+        var validated = bridge.validate("signed-jwt", deployment, AUDIENCE);
+        assertThat(validated).isPresent();
+        var login = validated.orElseThrow();
         assertThat(login.userId()).isEqualTo("stable-user");
         assertThat(login.jwtId()).isEqualTo("jwt-one");
         assertThat(login.scope()).isEqualTo(Scope.WRITE);
         assertThat(login.jwtExpiresAt()).isEqualTo(EXPIRY);
         assertThat(sdk.verifiedJwt).isEqualTo("signed-jwt");
 
-        sdk.claims = claims("other-cluster", "https://cloud.example", "audience", List.of("workload:write"));
-        assertThat(bridge.validate("signed-jwt", deployment)).isEmpty();
-        sdk.claims = claims("cluster-one", "https://other.example", "cluster-one.api.tapstate.io",
+        sdk.claims = claims("other-cluster", "https://cloud.example", AUDIENCE,
                 List.of("workload:write"));
-        assertThat(bridge.validate("signed-jwt", deployment)).isEmpty();
+        assertThat(bridge.validate("signed-jwt", deployment, AUDIENCE)).isEmpty();
+        sdk.claims = claims("cluster-one", "https://other.example", AUDIENCE,
+                List.of("workload:write"));
+        assertThat(bridge.validate("signed-jwt", deployment, AUDIENCE)).isEmpty();
         sdk.claims = claims("cluster-one", "https://cloud.example", "", List.of("workload:write"));
-        assertThat(bridge.validate("signed-jwt", deployment)).isEmpty();
-        sdk.claims = claims("cluster-one", "https://cloud.example", "other-cluster.api.tapstate.io",
+        assertThat(bridge.validate("signed-jwt", deployment, AUDIENCE)).isEmpty();
+        sdk.claims = claims("cluster-one", "https://cloud.example", "other-cluster.dev.cloud.tapstate.com",
                 List.of("workload:write"));
-        assertThat(bridge.validate("signed-jwt", deployment)).isEmpty();
-        sdk.claims = claims("cluster-one", "https://cloud.example", "cluster-one.api.tapstate.io",
+        assertThat(bridge.validate("signed-jwt", deployment, AUDIENCE)).isEmpty();
+        sdk.claims = claims("cluster-one", "https://cloud.example", AUDIENCE,
                 List.of("admin"));
-        assertThat(bridge.validate("signed-jwt", deployment)).isEmpty();
+        assertThat(bridge.validate("signed-jwt", deployment, AUDIENCE)).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"cluster.dev.cloud.tapstate.com", "cluster.cloud.tapstate.com", "data.customer.example"})
+    void theCurrentRequestAudienceWorksWithoutChangingTheConfiguredCluster(String audience) {
+        sdk.claims = claims("cluster-one", "https://cloud.example", audience, List.of("workload:write"));
+        assertThat(bridge.validate("signed-jwt", deployment, audience)).isPresent();
+        assertThat(bridge.validate("signed-jwt", deployment, "another.customer.example")).isEmpty();
+    }
+
+    @Test
+    void rejectsAudiencesThatDoNotExactlyMatchThisRequest() {
+        for (String audience : List.of(
+                "cluster-one.api.tapstate.io",
+                "other-cluster.dev.cloud.tapstate.com",
+                "https://cluster-one.dev.cloud.tapstate.com",
+                "cluster-one.dev.cloud.tapstate.com.evil.example")) {
+            sdk.claims = claims("cluster-one", "https://cloud.example", audience, List.of("workload:write"));
+            assertThat(bridge.validate("signed-jwt", deployment, AUDIENCE)).as("audience: %s", audience).isEmpty();
+        }
+        sdk.claims = claims("cluster-one", "https://cloud.example", null, List.of("workload:write"));
+        assertThat(bridge.validate("signed-jwt", deployment, AUDIENCE)).isEmpty();
+    }
+
+    @Test
+    void rejectsMissingVerifiedIdentityClaims() {
+        for (var identity : List.of(
+                new CloudSdkBridge.VerifiedClaims(null, "org-one", "cluster-one", "jwt-one", EXPIRY,
+                        "https://cloud.example", AUDIENCE, List.of("workload:write")),
+                new CloudSdkBridge.VerifiedClaims("stable-user", null, "cluster-one", "jwt-one", EXPIRY,
+                        "https://cloud.example", AUDIENCE, List.of("workload:write")),
+                new CloudSdkBridge.VerifiedClaims("stable-user", "org-one", "cluster-one", null, EXPIRY,
+                        "https://cloud.example", AUDIENCE, List.of("workload:write")))) {
+            sdk.claims = identity;
+            assertThat(bridge.validate("signed-jwt", deployment, AUDIENCE)).isEmpty();
+        }
+    }
+
+    @Test
+    void mapsReadOnlyScopeWithoutGrantingWriteAndRejectsMissingScopes() {
+        sdk.claims = claims("cluster-one", "https://cloud.example", AUDIENCE,
+                List.of("workload:read"));
+        assertThat(bridge.validate("signed-jwt", deployment, AUDIENCE)).hasValueSatisfying(
+                login -> assertThat(login.scope()).isEqualTo(Scope.READ));
+        sdk.claims = claims("cluster-one", "https://cloud.example", AUDIENCE, List.of());
+        assertThat(bridge.validate("signed-jwt", deployment, AUDIENCE)).isEmpty();
+        sdk.claims = claims("cluster-one", "https://cloud.example", AUDIENCE, null);
+        assertThat(bridge.validate("signed-jwt", deployment, AUDIENCE)).isEmpty();
+    }
+
+    @Test
+    void aMissingRequestAudienceCannotDisableAudienceVerification() {
+        assertThat(bridge.validate("signed-jwt", deployment, null)).isEmpty();
+        assertThat(bridge.validate("signed-jwt", deployment, "")).isEmpty();
+        assertThat(bridge.validate("signed-jwt", deployment, " ")).isEmpty();
+        assertThat(sdk.verifiedJwt).isNull();
     }
 
     @Test
@@ -100,7 +162,7 @@ class CloudSdkBridgeTest {
                 .isInstanceOf(TapstateException.class)
                 .hasNoCause()
                 .hasMessageNotContaining("static-token-sentinel");
-        assertThat(bridge.validate("signed-jwt", deployment)).isEmpty();
+        assertThat(bridge.validate("signed-jwt", deployment, AUDIENCE)).isEmpty();
         assertThat(bridge.verify("https://cloud.example", CloudSdkBridge.DEPLOYMENT_ORGANIZATION,
                 "cluster-one", "POST", "ts", "nonce", "jti", "signature")).isFalse();
         assertThatThrownBy(() -> bridge.send(
@@ -118,7 +180,7 @@ class CloudSdkBridgeTest {
 
     private static final class ControlledSdk implements CloudSdkBridge.SdkRuntime {
         private CloudSdkBridge.VerifiedClaims claims = claims(
-                "cluster-one", "https://cloud.example", "cluster-one.api.tapstate.io",
+                "cluster-one", "https://cloud.example", AUDIENCE,
                 List.of("workload:read", "workload:write"));
         private String exchangeCode;
         private String verifiedJwt;

@@ -15,6 +15,9 @@ import io.tapstate.spi.store.CloudSessionRecord;
 import io.tapstate.spi.store.CloudSessionStore;
 import jakarta.servlet.http.Cookie;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.springframework.beans.factory.support.DefaultListableBeanFactory;
 import org.springframework.http.HttpHeaders;
 import org.springframework.mock.web.MockHttpServletRequest;
@@ -32,6 +35,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -42,6 +47,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 class CloudAuthApiTest {
 
     private static final Instant NOW = Instant.parse("2026-09-28T10:00:00Z");
+    private static final String AUDIENCE = "cluster.example";
     private static final CloudSessionIdentity IDENTITY =
             new CloudSessionIdentity("https://cloud.example", "org-a", "cluster-a");
     private final DefaultListableBeanFactory beans = new DefaultListableBeanFactory();
@@ -49,6 +55,8 @@ class CloudAuthApiTest {
     private final MutableClock clock = new MutableClock();
     private final AtomicInteger exchanges = new AtomicInteger();
     private final AtomicInteger validations = new AtomicInteger();
+    private final AtomicReference<String> jwtAudience = new AtomicReference<>(AUDIENCE);
+    private final AtomicReference<String> requestAudience = new AtomicReference<>();
     private final CloudSessionService sessions = new CloudSessionService(store, IDENTITY, new TokenSecrets() {
         @Override public GeneratedSecret generate() { return new GeneratedSecret("unused", "local-secret", "hash-local-secret"); }
         @Override public String hash(String raw) { return "hash-" + raw; }
@@ -57,16 +65,109 @@ class CloudAuthApiTest {
     private final CloudAuthenticationService authentication = new CloudAuthenticationService((code, cluster) -> {
         exchanges.incrementAndGet();
         return "raw-cloud-jwt-sentinel";
-    }, (jwt, deployment) -> {
+    }, (jwt, deployment, audience) -> {
         validations.incrementAndGet();
+        requestAudience.set(audience);
+        if (!jwtAudience.get().equals(audience)) return Optional.empty();
         return Optional.of(new CloudLoginIdentity(IDENTITY, "stable-user", "jti-a", Scope.WRITE,
                 NOW.plusSeconds(900)));
     }, sessions);
 
+    @ParameterizedTest
+    @MethodSource("invalidHosts")
+    void malformedRequestHostIsRejectedBeforeConsumingTheCode(String[] hosts) throws Exception {
+        MockMvc mvc = mvc(AuthenticationMode.CLOUD, true, false);
+        var request = get(CloudAuthController.EXCHANGE_PATH).param("code", "one-use-code-secret-sentinel");
+        if (hosts.length > 0) request.header(HttpHeaders.HOST, (Object[]) hosts);
+        var response = mvc.perform(request).andExpect(status().isBadRequest()).andReturn().getResponse();
+        assertThat(response.getContentAsString()).contains("control.malformed-request")
+                .doesNotContain("one-use-code-secret-sentinel", "untrusted-host-secret-sentinel");
+        assertThat(exchanges.get()).isZero();
+        assertThat(validations.get()).isZero();
+        assertThat(store.records).isEmpty();
+    }
+
+    private static Stream<Arguments> invalidHosts() {
+        return Stream.of(
+                new String[] {},
+                new String[] {""},
+                new String[] {" "},
+                new String[] {"cluster.example", "other.example"},
+                new String[] {"cluster.example,other.example"},
+                new String[] {"https://cluster.example"},
+                new String[] {"untrusted-host-secret-sentinel@cluster.example"},
+                new String[] {"cluster.example/path"},
+                new String[] {"cluster.example?query"},
+                new String[] {"cluster.example#fragment"},
+                new String[] {"cluster.example\\other.example"},
+                new String[] {"cluster.example\nforged"},
+                new String[] {"cluster.example:"},
+                new String[] {"cluster.example:0"},
+                new String[] {"cluster.example:65536"},
+                new String[] {"cluster.example:-1"},
+                new String[] {"cluster.example:abc"},
+                new String[] {"bad_label.example"},
+                new String[] {"-bad.example"},
+                new String[] {"bad..example"},
+                new String[] {"."},
+                new String[] {"[fe80::1%25en0]"})
+                .map(hosts -> Arguments.of((Object) hosts));
+    }
+
+    @ParameterizedTest
+    @MethodSource("validRequestHosts")
+    void handoffUsesOnlyTheNormalizedHostAndIgnoresForwardedAuthorities(String host, String audience) throws Exception {
+        jwtAudience.set(audience);
+        MockMvc mvc = mvc(AuthenticationMode.CLOUD, true, false);
+        mvc.perform(handoff("short-code", host)
+                        .header("Forwarded", "for=127.0.0.1;host=forged.example;proto=https")
+                        .header("X-Forwarded-Host", "forged.example")
+                        .header("X-Forwarded-Port", "1234"))
+                .andExpect(status().isFound());
+        assertThat(requestAudience.get()).isEqualTo(audience);
+        assertThat(exchanges.get()).isEqualTo(1);
+        assertThat(validations.get()).isEqualTo(1);
+        assertThat(store.records).hasSize(1);
+    }
+
+    private static Stream<Arguments> validRequestHosts() {
+        return Stream.of(
+                Arguments.of("Cluster-A.Dev.Cloud.Tapstate.Com:443", "cluster-a.dev.cloud.tapstate.com"),
+                Arguments.of("cluster-a.cloud.tapstate.com", "cluster-a.cloud.tapstate.com"),
+                Arguments.of("Data.Customer.Example:18443", "data.customer.example"),
+                Arguments.of("Cluster.Example.", "cluster.example"),
+                Arguments.of("localhost:8080", "localhost"),
+                Arguments.of("127.0.0.1:65535", "127.0.0.1"),
+                Arguments.of("[2001:DB8::1]:443", "[2001:db8::1]"));
+    }
+
+    @Test
+    void aDifferentHostCannotBeReplacedByAForgedForwardedHost() throws Exception {
+        MockMvc mvc = mvc(AuthenticationMode.CLOUD, true, false);
+        var response = mvc.perform(handoff("short-code", "different.example")
+                        .header("X-Forwarded-Host", AUDIENCE)
+                        .header("Forwarded", "host=" + AUDIENCE))
+                .andExpect(status().isUnauthorized()).andReturn().getResponse();
+        assertThat(response.getContentAsString()).contains("control.unauthenticated");
+        assertThat(requestAudience.get()).isEqualTo("different.example");
+        assertThat(exchanges.get()).isEqualTo(1);
+        assertThat(validations.get()).isEqualTo(1);
+        assertThat(store.records).isEmpty();
+    }
+
+    @Test
+    void aMissingCodeWithAValidHostStillCannotBeExchanged() throws Exception {
+        MockMvc mvc = mvc(AuthenticationMode.CLOUD, true, false);
+        mvc.perform(get(CloudAuthController.EXCHANGE_PATH).header(HttpHeaders.HOST, AUDIENCE))
+                .andExpect(status().isBadRequest());
+        assertThat(exchanges.get()).isZero();
+        assertThat(validations.get()).isZero();
+    }
+
     @Test
     void handoffSetsOnlyAHostOnlyHttpOnlyCookieAndRedirectsWithoutJwtOrCode() throws Exception {
         MockMvc mvc = mvc(AuthenticationMode.CLOUD, true, false);
-        var response = mvc.perform(get(CloudAuthController.EXCHANGE_PATH).param("code", "short-code"))
+        var response = mvc.perform(handoff("short-code"))
                 .andExpect(status().isFound()).andReturn().getResponse();
         assertThat(response.getHeader(HttpHeaders.LOCATION)).isEqualTo("/");
         assertThat(response.getHeader(HttpHeaders.CACHE_CONTROL)).isEqualTo("no-store");
@@ -84,13 +185,13 @@ class CloudAuthApiTest {
     @Test
     void onPremCannotUseHandoffOrBackChannelAndCloudWithoutSdkFailsClosed() throws Exception {
         MockMvc op = mvc(AuthenticationMode.ON_PREM, false, false);
-        op.perform(get(CloudAuthController.EXCHANGE_PATH).param("code", "code")).andExpect(status().isForbidden());
+        op.perform(handoff("code")).andExpect(status().isForbidden());
         op.perform(callback("controlled")).andExpect(status().isForbidden());
         assertThat(store.records).isEmpty();
         DefaultListableBeanFactory other = new DefaultListableBeanFactory();
         other.registerSingleton("mode", AuthenticationMode.CLOUD);
         MockMvc missing = controllerMvc(other);
-        missing.perform(get(CloudAuthController.EXCHANGE_PATH).param("code", "code"))
+        missing.perform(handoff("code"))
                 .andExpect(status().isServiceUnavailable());
         missing.perform(callback("controlled")).andExpect(status().isServiceUnavailable());
     }
@@ -98,7 +199,7 @@ class CloudAuthApiTest {
     @Test
     void jtiAndUserCredentialsAloneCannotAuthorizeTheRevocationCallback() throws Exception {
         MockMvc mvc = mvc(AuthenticationMode.CLOUD, true, true);
-        String cookie = authentication.exchangeCode("code").token();
+        String cookie = authentication.exchangeCode("code", AUDIENCE).token();
         mvc.perform(callback("invalid-proof")).andExpect(status().isUnauthorized());
         mvc.perform(callback("invalid-proof")
                         .header(HttpHeaders.AUTHORIZATION, "Bearer raw-user-jwt")
@@ -111,7 +212,7 @@ class CloudAuthApiTest {
     @Test
     void authenticatedCallbackInvalidatesAnActiveLocalSessionEvenAfterJwtExpiryAndIsIdempotent() throws Exception {
         MockMvc mvc = mvc(AuthenticationMode.CLOUD, true, true);
-        String cookie = authentication.exchangeCode("code").token();
+        String cookie = authentication.exchangeCode("code", AUDIENCE).token();
         clock.now = NOW.plusSeconds(20 * 60);
         assertThat(authentication.authenticate(cookie)).isPresent();
         for (int request = 0; request < 2; request++) {
@@ -125,7 +226,7 @@ class CloudAuthApiTest {
     void anEarlyAuthenticatedCallbackPreventsALateHandoffFromResurrectingTheSession() throws Exception {
         MockMvc mvc = mvc(AuthenticationMode.CLOUD, true, true);
         mvc.perform(callback("controlled")).andExpect(status().isNoContent());
-        mvc.perform(get(CloudAuthController.EXCHANGE_PATH).param("code", "code")).andExpect(status().isUnauthorized());
+        mvc.perform(handoff("code")).andExpect(status().isUnauthorized());
         assertThat(store.records).isEmpty();
     }
 
@@ -160,7 +261,7 @@ class CloudAuthApiTest {
         mvc(AuthenticationMode.CLOUD, true, false);
         AuthController controller = new AuthController(null, null, null, null,
                 beans.getBeanProvider(AuthenticationMode.class), beans.getBeanProvider(CloudAuthenticationService.class));
-        String cookie = authentication.exchangeCode("code").token();
+        String cookie = authentication.exchangeCode("code", AUDIENCE).token();
         MockHttpServletRequest request = new MockHttpServletRequest("POST", AuthWire.LOGOUT_PATH);
         request.setScheme("https"); request.setServerName("cluster.example"); request.setServerPort(443);
         request.setCookies(new Cookie(CloudSessionCookies.NAME, cookie));
@@ -179,7 +280,7 @@ class CloudAuthApiTest {
     @Test
     void cloudConverterRejectsBearersAmbiguousCookiesAndCrossSiteRequests() {
         CloudCookieAuthenticationConverter converter = new CloudCookieAuthenticationConverter();
-        String cookie = authentication.exchangeCode("code").token();
+        String cookie = authentication.exchangeCode("code", AUDIENCE).token();
         MockHttpServletRequest request = new MockHttpServletRequest("POST", "/api/artifacts:apply");
         request.setCookies(new Cookie(CloudSessionCookies.NAME, cookie));
         assertThat(((TapstateCredentialAuthenticationToken) converter.convert(request)).credential()).isEqualTo(cookie);
@@ -218,6 +319,14 @@ class CloudAuthApiTest {
                 .param("ts", "1780000000000")
                 .param("nonce", "controlled-nonce")
                 .param("sign", signature);
+    }
+
+    private static MockHttpServletRequestBuilder handoff(String code) {
+        return handoff(code, AUDIENCE);
+    }
+
+    private static MockHttpServletRequestBuilder handoff(String code, String host) {
+        return get(CloudAuthController.EXCHANGE_PATH).param("code", code).header(HttpHeaders.HOST, host);
     }
 
     private static String cookieValue(String header) { return header.substring(header.indexOf('=') + 1, header.indexOf(';')); }

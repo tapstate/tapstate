@@ -29,6 +29,7 @@ import java.util.Base64;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -39,6 +40,7 @@ class CloudSdkLiveContractTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final String CLUSTER = "cluster-one";
+    private static final String REQUEST_AUDIENCE = "cluster.dev.cloud.tapstate.com";
     private static final String TOKEN = "shared-static-token-sentinel";
     private static final String KID = "test-key-one";
 
@@ -66,7 +68,7 @@ class CloudSdkLiveContractTest {
             MockHttpServletResponse response = new MockHttpServletResponse();
             new CloudHttpDiagnosticsFilter().doFilter(request, response, (incoming, outgoing) -> {
                 assertThat(bridge.validate(rawJwt, new CloudSessionIdentity(
-                        baseUrl, CloudSdkBridge.DEPLOYMENT_ORGANIZATION, CLUSTER))).isEmpty();
+                        baseUrl, CloudSdkBridge.DEPLOYMENT_ORGANIZATION, CLUSTER), REQUEST_AUDIENCE)).isEmpty();
                 response.setStatus(401);
             });
             assertThat(captured.list).extracting(ILoggingEvent::getFormattedMessage)
@@ -130,17 +132,19 @@ class CloudSdkLiveContractTest {
         AtomicReference<JsonNode> exchangeBody = new AtomicReference<>();
         AtomicReference<String> statusAuthorization = new AtomicReference<>();
         AtomicReference<JsonNode> statusBody = new AtomicReference<>();
+        AtomicInteger exchanges = new AtomicInteger();
+        AtomicReference<String> requestedAudience = new AtomicReference<>(REQUEST_AUDIENCE);
 
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         String baseUrl = "http://127.0.0.1:" + server.getAddress().getPort();
-        String jwt = jwt(keyPair, baseUrl);
         server.createContext("/v1/api/auth/exchange", exchange -> {
+            exchanges.incrementAndGet();
             exchangeSecret.set(exchange.getRequestHeaders().getFirst("X-Cluster-Identity-Secret"));
             exchangeBody.set(JSON.readTree(exchange.getRequestBody()));
             respond(exchange, Map.of(
                     "opId", "exchange-one", "code", "ok", "msg", "ok",
                     "data", Map.of(
-                            "jwt", jwt,
+                            "jwt", jwt(keyPair, baseUrl, requestedAudience.get()),
                             "expiresAt", "2030-01-01T00:00:00Z",
                             "jti", "jwt-one",
                             "userEmail", "user@example.test",
@@ -166,13 +170,29 @@ class CloudSdkLiveContractTest {
             CloudSessionIdentity deployment = new CloudSessionIdentity(
                     baseUrl, CloudSdkBridge.DEPLOYMENT_ORGANIZATION, CLUSTER);
 
-            String exchanged = bridge.exchange("one-time-code", CLUSTER);
-            var login = bridge.validate(exchanged, deployment).orElseThrow();
-            assertThat(login.userId()).isEqualTo("stable-user-one");
-            assertThat(login.jwtId()).isEqualTo("jwt-one");
-            assertThat(exchangeSecret.get()).isEqualTo(TOKEN);
-            assertThat(exchangeBody.get().path("exchangeCode").asText()).isEqualTo("one-time-code");
-            assertThat(exchangeBody.get().path("clusterId").asText()).isEqualTo(CLUSTER);
+            int expectedExchanges = 0;
+            for (String audience : List.of(REQUEST_AUDIENCE, "cluster.cloud.tapstate.com", "data.customer.example")) {
+                requestedAudience.set(audience);
+                String code = "one-time-code-" + ++expectedExchanges;
+                String exchanged = bridge.exchange(code, CLUSTER);
+                assertThat(bridge.validate(exchanged, deployment, audience)).hasValueSatisfying(login -> {
+                    assertThat(login.userId()).isEqualTo("stable-user-one");
+                    assertThat(login.jwtId()).isEqualTo("jwt-one");
+                });
+                assertThat(exchangeSecret.get()).isEqualTo(TOKEN);
+                assertThat(exchangeBody.get().path("exchangeCode").asText()).isEqualTo(code);
+                assertThat(exchangeBody.get().path("clusterId").asText()).isEqualTo(CLUSTER);
+                assertThat(bridge.validate(exchanged, deployment, "different.customer.example")).isEmpty();
+                assertThat(bridge.validate(jwt(keyPair, baseUrl, CLUSTER + ".api.tapstate.io"), deployment, audience))
+                        .isEmpty();
+                assertThat(bridge.validate(jwt(keyPair, baseUrl, audience, "other-cluster"), deployment, audience))
+                        .isEmpty();
+                assertThat(exchanges.get()).as("JWT validation must not retry the one-time exchange")
+                        .isEqualTo(expectedExchanges);
+            }
+            assertThat(bridge.validate(jwt(keyPair, baseUrl, REQUEST_AUDIENCE, CLUSTER,
+                    Instant.now().minusSeconds(60)), deployment, REQUEST_AUDIENCE)).isEmpty();
+            assertThat(exchanges.get()).isEqualTo(3);
 
             String timestamp = "1780000000000";
             String nonce = "callback-nonce";
@@ -201,17 +221,29 @@ class CloudSdkLiveContractTest {
     }
 
     private static String jwt(KeyPair keyPair, String issuer) {
+        return jwt(keyPair, issuer, REQUEST_AUDIENCE);
+    }
+
+    private static String jwt(KeyPair keyPair, String issuer, String audience) {
+        return jwt(keyPair, issuer, audience, CLUSTER);
+    }
+
+    private static String jwt(KeyPair keyPair, String issuer, String audience, String clusterId) {
+        return jwt(keyPair, issuer, audience, clusterId, Instant.parse("2030-01-01T00:00:00Z"));
+    }
+
+    private static String jwt(KeyPair keyPair, String issuer, String audience, String clusterId, Instant expiresAt) {
         Instant issued = Instant.now();
         return Jwts.builder()
                 .subject("user@example.test")
                 .issuer(issuer)
-                .audience().add(CLUSTER + ".api.tapstate.io").and()
+                .audience().add(audience).and()
                 .issuedAt(Date.from(issued))
-                .expiration(Date.from(Instant.parse("2030-01-01T00:00:00Z")))
+                .expiration(Date.from(expiresAt))
                 .id("jwt-one")
                 .claim("user_id", "stable-user-one")
                 .claim("org_id", "org-one")
-                .claim("cluster_id", CLUSTER)
+                .claim("cluster_id", clusterId)
                 .claim("scope", List.of("workload:read", "workload:write"))
                 .header().keyId(KID).and()
                 .signWith((RSAPrivateKey) keyPair.getPrivate())

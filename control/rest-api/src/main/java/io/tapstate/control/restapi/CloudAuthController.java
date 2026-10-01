@@ -15,6 +15,8 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 
 import java.net.URI;
+import java.util.Collections;
+import java.util.Locale;
 import java.util.Map;
 
 /** Managed login and the separately authenticated back-channel invalidation surface. */
@@ -41,9 +43,10 @@ class CloudAuthController {
     }
 
     @GetMapping(EXCHANGE_PATH)
-    ResponseEntity<Void> exchange(@RequestParam(name = "code", required = false) String code) {
+    ResponseEntity<Void> exchange(HttpServletRequest request,
+            @RequestParam(name = "code", required = false) String code) {
         CloudAuthenticationService service = requireCloud();
-        var session = service.exchangeCode(code);
+        var session = service.exchangeCode(code, requestAudience(request));
         return ResponseEntity.status(302).location(URI.create("/"))
                 .header(HttpHeaders.SET_COOKIE, CloudSessionCookies.set(session.token()))
                 .header(HttpHeaders.CACHE_CONTROL, "no-store")
@@ -95,5 +98,45 @@ class CloudAuthController {
 
     private static boolean bounded(String value, int maximumLength) {
         return value != null && !value.isBlank() && value.length() <= maximumLength;
+    }
+
+    private static String requestAudience(HttpServletRequest request) {
+        // The deployment proxy owns the Host allow-list. Forwarded headers are not audience inputs.
+        var hosts = Collections.list(request.getHeaders(HttpHeaders.HOST));
+        if (hosts.size() != 1) throw malformedHost();
+        String authority = hosts.getFirst();
+        if (authority == null || authority.isEmpty() || authority.length() > 260
+                || !authority.matches("[A-Za-z0-9.\\-:\\[\\]]+")) {
+            throw malformedHost();
+        }
+        URI uri;
+        try {
+            uri = URI.create("http://" + authority);
+        } catch (IllegalArgumentException invalid) {
+            throw malformedHost();
+        }
+        String host = uri.getHost();
+        if (host == null || uri.getRawUserInfo() != null || !authority.equals(uri.getRawAuthority())
+                || !uri.getRawPath().isEmpty() || uri.getRawQuery() != null || uri.getRawFragment() != null) {
+            throw malformedHost();
+        }
+        String port = authority.substring(host.length());
+        if (!port.isEmpty() && (!port.matches(":[0-9]{1,5}") || uri.getPort() < 1 || uri.getPort() > 65535)) {
+            throw malformedHost();
+        }
+        host = host.toLowerCase(Locale.ROOT);
+        if (!host.startsWith("[")) {
+            if (host.endsWith(".")) host = host.substring(0, host.length() - 1);
+            if (host.isEmpty() || host.length() > 253) throw malformedHost();
+            for (String label : host.split("\\.", -1)) {
+                if (!label.matches("[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")) throw malformedHost();
+            }
+        }
+        return host;
+    }
+
+    private static TapstateException malformedHost() {
+        return new TapstateException(ControlError.MALFORMED_REQUEST,
+                Map.of("reason", "a single valid Host header is required"), null);
     }
 }

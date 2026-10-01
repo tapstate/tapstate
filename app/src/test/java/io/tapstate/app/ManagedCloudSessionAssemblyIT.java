@@ -138,7 +138,7 @@ class ManagedCloudSessionAssemblyIT {
             CloudSessionIdentity identity = new CloudSessionIdentity("https://cloud.example", "controlled-org",
                     clusters.identityView().clusterId());
             CloudSessionService local = new CloudSessionService(sessions, identity, secrets, clock);
-            return new CloudAuthenticationService((code, cluster) -> "controlled-raw-jwt", (jwt, expected) -> {
+            return new CloudAuthenticationService((code, cluster) -> "controlled-raw-jwt", (jwt, expected, audience) -> {
                 VALIDATIONS.incrementAndGet();
                 return Optional.of(new CloudLoginIdentity(identity, "stable-assembly-user", JTI,
                         Scope.WRITE, clock.instant().plusSeconds(900)));

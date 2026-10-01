@@ -33,7 +33,6 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
 
     static final String DEPLOYMENT_ORGANIZATION = "sdk-verified-cluster";
     private static final Logger LOG = LoggerFactory.getLogger(CloudSdkBridge.class);
-    private static final String AUDIENCE_SUFFIX = ".api.tapstate.io";
 
     private final CloudRuntimeSettings settings;
     private final SdkRuntime sdk;
@@ -64,9 +63,14 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
     }
 
     @Override
-    public Optional<CloudLoginIdentity> validate(String rawJwt, CloudSessionIdentity expectedDeployment) {
+    public Optional<CloudLoginIdentity> validate(
+            String rawJwt, CloudSessionIdentity expectedDeployment, String expectedAudience) {
         if (!deploymentMatches(expectedDeployment)) {
             logValidationFailure("claims-validation", "deployment-mismatch");
+            return Optional.empty();
+        }
+        if (!text(expectedAudience)) {
+            logValidationFailure("claims-validation", "missing-request-audience");
             return Optional.empty();
         }
         try {
@@ -76,7 +80,7 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
                     : !text(claims.jwtId()) ? "missing-jti"
                     : !settings.clusterId().equals(claims.clusterId()) ? "cluster-id-mismatch"
                     : !settings.baseUrl().toString().equals(claims.issuer()) ? "issuer-mismatch"
-                    : !(settings.clusterId() + AUDIENCE_SUFFIX).equals(claims.audience()) ? "audience-mismatch"
+                    : !expectedAudience.equals(claims.audience()) ? "audience-mismatch"
                     : null;
             if (rejected != null) {
                 logValidationFailure("claims-validation", rejected);

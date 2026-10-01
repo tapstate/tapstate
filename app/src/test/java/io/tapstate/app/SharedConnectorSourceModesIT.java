@@ -363,7 +363,7 @@ class SharedConnectorSourceModesIT {
                 Clock clock, ClusterIdentityService clusters, RecordingProbes probes) {
             CloudSessionIdentity identity = new CloudSessionIdentity("https://cloud.example", "controlled-org",
                     clusters.identityView().clusterId());
-            return new CloudAuthenticationService((code, cluster) -> "controlled-raw-jwt", (jwt, expected) -> {
+            return new CloudAuthenticationService((code, cluster) -> "controlled-raw-jwt", (jwt, expected, audience) -> {
                 probes.validations.incrementAndGet();
                 return Optional.of(new CloudLoginIdentity(identity, USER, "source-modes-jti", Scope.WRITE,
                         clock.instant().plusSeconds(900)));

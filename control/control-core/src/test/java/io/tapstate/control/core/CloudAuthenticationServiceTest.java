@@ -12,6 +12,7 @@ import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -26,6 +27,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class CloudAuthenticationServiceTest {
 
     private static final Instant NOW = Instant.parse("2026-09-28T10:00:00Z");
+    private static final String AUDIENCE = "cluster-a.customer.example";
     private static final CloudSessionIdentity DEPLOYMENT =
             new CloudSessionIdentity("https://cloud.example", "org-a", "cluster-a");
     private final MutableClock clock = new MutableClock();
@@ -50,8 +52,8 @@ class CloudAuthenticationServiceTest {
         CloudAuthenticationService deniedProof = new CloudAuthenticationService((code, cluster) -> {
             exchanges.incrementAndGet();
             return "jwt";
-        }, (jwt, target) -> Optional.empty(), observedSessions, observer);
-        assertThatThrownBy(() -> deniedProof.exchangeCode("code"))
+        }, (jwt, target, audience) -> Optional.empty(), observedSessions, observer);
+        assertThatThrownBy(() -> deniedProof.exchangeCode("code", AUDIENCE))
                 .isInstanceOfSatisfying(TapstateException.class,
                         failure -> assertThat(failure.code()).isEqualTo(ControlError.UNAUTHENTICATED));
         assertThat(phases).containsExactly(CloudAuthenticationObserver.Stage.CODE_EXCHANGE,
@@ -61,8 +63,8 @@ class CloudAuthenticationServiceTest {
 
         phases.clear();
         CloudAuthenticationService expiredProof = new CloudAuthenticationService((code, cluster) -> "jwt",
-                (jwt, target) -> Optional.of(login("expired", NOW)), observedSessions, observer);
-        assertThatThrownBy(() -> expiredProof.exchangeCode("new-code"))
+                (jwt, target, audience) -> Optional.of(login("expired", NOW)), observedSessions, observer);
+        assertThatThrownBy(() -> expiredProof.exchangeCode("new-code", AUDIENCE))
                 .isInstanceOf(TapstateException.class);
         assertThat(phases).containsExactly(CloudAuthenticationObserver.Stage.CODE_EXCHANGE,
                 CloudAuthenticationObserver.Stage.JWT_VERIFICATION, CloudAuthenticationObserver.Stage.SESSION_CREATE);
@@ -99,14 +101,15 @@ class CloudAuthenticationServiceTest {
             order.add("exchange");
             assertThat(cluster).isEqualTo(DEPLOYMENT.clusterId());
             return "raw-cloud-jwt-sentinel";
-        }, (jwt, target) -> {
+        }, (jwt, target, audience) -> {
             order.add("sdk-verify");
             assertThat(jwt).isEqualTo("raw-cloud-jwt-sentinel");
             assertThat(target).isEqualTo(DEPLOYMENT);
+            assertThat(audience).isEqualTo(AUDIENCE);
             return Optional.of(login("jti-a", NOW.plusSeconds(900)));
         }, sessions);
 
-        CreatedCloudSession created = authentication.exchangeCode("short-code");
+        CreatedCloudSession created = authentication.exchangeCode("short-code", AUDIENCE);
 
         assertThat(order).containsExactly("exchange", "sdk-verify");
         assertThat(created.idleExpiresAt()).isEqualTo(NOW.plusSeconds(1800));
@@ -122,9 +125,9 @@ class CloudAuthenticationServiceTest {
     @Test
     void aRejectedOnlineValidationNeverCreatesALocalSession() {
         CloudAuthenticationService authentication = new CloudAuthenticationService((code, cluster) -> "jwt",
-                (jwt, target) -> Optional.empty(), sessions);
+                (jwt, target, audience) -> Optional.empty(), sessions);
 
-        assertThatThrownBy(() -> authentication.exchangeCode("code"))
+        assertThatThrownBy(() -> authentication.exchangeCode("code", AUDIENCE))
                 .isInstanceOfSatisfying(TapstateException.class,
                         failure -> assertThat(failure.code()).isEqualTo(ControlError.UNAUTHENTICATED));
         assertThat(store.records).isEmpty();
@@ -133,8 +136,8 @@ class CloudAuthenticationServiceTest {
     @Test
     void unavailableValidationHasNoSessionSideEffectAndIsNotReplacedByParsedJwtClaims() {
         CloudAuthenticationService authentication = new CloudAuthenticationService((code, cluster) -> "jwt",
-                (jwt, target) -> { throw CloudAuthenticationService.unavailable(); }, sessions);
-        assertThatThrownBy(() -> authentication.exchangeCode("code"))
+                (jwt, target, audience) -> { throw CloudAuthenticationService.unavailable(); }, sessions);
+        assertThatThrownBy(() -> authentication.exchangeCode("code", AUDIENCE))
                 .isInstanceOfSatisfying(TapstateException.class,
                         failure -> assertThat(failure.code()).isEqualTo(ControlError.CLOUD_AUTH_UNAVAILABLE));
         assertThat(store.records).isEmpty();
@@ -147,11 +150,11 @@ class CloudAuthenticationServiceTest {
         CloudAuthenticationService authentication = new CloudAuthenticationService((code, cluster) -> {
             exchanges.incrementAndGet();
             return "jwt";
-        }, (jwt, target) -> {
+        }, (jwt, target, audience) -> {
             validations.incrementAndGet();
             return Optional.of(login("jti-a", NOW.plusSeconds(900)));
         }, sessions);
-        String cookie = authentication.exchangeCode("code").token();
+        String cookie = authentication.exchangeCode("code", AUDIENCE).token();
 
         clock.now = NOW.plusSeconds(16 * 60);
         assertThat(authentication.authenticate(cookie)).contains(new VerifiedToken("stable-user-a", Scope.WRITE));
@@ -163,6 +166,22 @@ class CloudAuthenticationServiceTest {
         assertThat(authentication.authenticate(cookie)).isEmpty();
         assertThat(exchanges.get()).isEqualTo(1);
         assertThat(validations.get()).isEqualTo(1);
+    }
+
+    @Test
+    void aMissingRequestAudienceIsRejectedBeforeTheOneTimeExchange() {
+        AtomicInteger exchanges = new AtomicInteger();
+        CloudAuthenticationService authentication = new CloudAuthenticationService((code, cluster) -> {
+            exchanges.incrementAndGet();
+            return "jwt";
+        }, (jwt, target, audience) -> Optional.of(login("jti-a", NOW.plusSeconds(900))), sessions);
+        for (String audience : Arrays.asList(null, "", " ")) {
+            assertThatThrownBy(() -> authentication.exchangeCode("code", audience))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
+        }
+        assertThat(exchanges.get()).isZero();
+        assertThat(store.records).isEmpty();
     }
 
     @Test
