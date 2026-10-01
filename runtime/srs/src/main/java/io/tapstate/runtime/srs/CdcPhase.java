@@ -176,11 +176,11 @@ public final class CdcPhase {
      * Writes one run of changes into the rings and hands it to the chain reader's account, which alone decides
      * when the position the source named for it may be written down.
      *
-     * <p>The account is asked for room before anything is written, so a reader whose account is full holds
-     * its source back instead of running ahead of what it can ever release. A run that carried no change but
-     * named a position is recorded too, with nothing owed: a source that reports where a transaction ends only
-     * after it has handed the transaction's changes over names that position on exactly such a run. One that
-     * named nothing and carried nothing tells nobody anything, and is let go.
+     * <p>The account is asked whether it is still recording before anything is written, so a reader that can no
+     * longer write its positions down writes no more changes either. A run that carried no change but named a
+     * position is recorded too, with nothing owed: a source that reports where a transaction ends only after
+     * it has handed the transaction's changes over names that position on exactly such a run. One that named
+     * nothing and carried nothing tells nobody anything, and is let go.
      */
     private static void writeReleased(
             List<Envelope> events,

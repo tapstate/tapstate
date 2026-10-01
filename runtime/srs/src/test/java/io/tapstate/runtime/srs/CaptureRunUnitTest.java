@@ -722,29 +722,26 @@ class CaptureRunUnitTest {
     }
 
     /**
-     * A restart with nothing left to load resumes where the chain got to, not at the seam its first load
-     * sampled: the seam says where that load began, and nothing about what the chain has released since.
+     * On a chain with no position recorded, a run with nothing to load begins at the seam its own pipeline's
+     * load recorded -- never at one another pipeline's load recorded, which says where that load began and
+     * nothing about this pipeline.
      */
     @Test
-    void aRestartWithNothingToLoadResumesWhereTheChainGotToNotAtTheSeamItsLoadBeganAt() {
+    void aRunWithNothingToLoadOnAChainWithNoPositionBeginsAtItsOwnRecordedSeam() {
         InMemoryMeta meta = new InMemoryMeta();
-        FakeSource first = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-chain-birth");
-        CaptureRun firstRun = runUnit(first, meta)
-                .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-completed-join"), e -> { });
-        String chainId = firstRun.chainId().orElseThrow().value();
-        meta.markSnapshotComplete(chainId, "pipe-a", "orders");
-        long epoch = meta.read(chainId).orElseThrow().epoch();
-        meta.advancePhysicalSourceReadOffset(chainId, epoch,
-                new ChainPosition(new SourceOrder(epoch, 7), "released-past-the-birth"), true);
-        firstRun.close();
+        String chainId = MiningChainId.resolve(config(), "chain-own-recorded-seam").value();
+        meta.create(chainId, null);
+        meta.setCdcStart(chainId, "pipe-a", "seam-pipe-a-loaded-from", 1L);
+        meta.setCdcStart(chainId, "pipe-b", "seam-pipe-b-loaded-from", 1L);
+        meta.markSnapshotComplete(chainId, "pipe-b", "orders");
 
         FakeSource restarted = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-not-sampled");
         runUnit(restarted, meta)
-                .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-completed-join"), e -> { });
+                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-own-recorded-seam"), e -> { });
 
         assertThat(restarted.cdcStart)
-                .as("pipe-a owes no table on restart, so its tail resumes where the chain got to")
-                .isEqualTo(CaptureStart.resume(new SourcePosition("released-past-the-birth")));
+                .as("pipe-b's own recorded seam, not pipe-a's")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("seam-pipe-b-loaded-from")));
     }
 
     /**
@@ -893,6 +890,29 @@ class CaptureRunUnitTest {
         assertThat(port.cdcStarted).isTrue();
         assertThat(run.chainId()).isPresent();
         assertThat(meta.created).containsExactly(run.chainId().orElseThrow().value());
+    }
+
+    /**
+     * A direct tail whose own load just ran begins at that load's seam, even on a chain that records a resume
+     * point. A shared reader on the same chain releases its runs without waiting for a direct tail's pipeline,
+     * so while the load ran it may have moved the resume point past the seam; beginning there would skip, for
+     * this pipeline, every change between the seam and that point -- changes its load did not cover.
+     */
+    @Test
+    void aDirectTailWithALoadOfItsOwnBeginsAtItsSeamNotWhereASharedReaderGotTo() {
+        InMemoryMeta meta = new InMemoryMeta();
+        MiningChainId chainId = MiningChainId.resolve(config(), "chain-direct-seam");
+        meta.create(chainId.value(), null);
+        long epoch = meta.openEpoch(chainId.value());
+        meta.advancePhysicalSourceReadOffset(chainId.value(), epoch,
+                new ChainPosition(new SourceOrder(epoch, 9L), "released-by-the-shared-reader"), true);
+
+        FakeSource port = new FakeSource(List.of(row(1)), List.of(), "seam-the-direct-load-began-at");
+        runUnit(port, meta).start(spec(ReadMode.SNAPSHOT_AND_CDC, false, "chain-direct-seam"), e -> { });
+
+        assertThat(port.cdcStart)
+                .as("the direct tail begins where its own load began")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("seam-the-direct-load-began-at")));
     }
 
     /**

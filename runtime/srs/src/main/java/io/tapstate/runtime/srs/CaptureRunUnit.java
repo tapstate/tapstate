@@ -505,7 +505,7 @@ public final class CaptureRunUnit {
 
         /** Opens the generation's first subscription, beginning where {@code ownSeam} or the record says. */
         synchronized void open(String ownSeam) {
-            CaptureStart start = tailStart(meta, chainId, spec.pipelineId(), ownSeam, CaptureStart.present());
+            CaptureStart start = tailStart(meta, chainId, spec.pipelineId(), ownSeam, false, CaptureStart.present());
             refuseAnInstantThisBufferWillNeverReach(spec.startFrom(), start, spec.retention());
             for (int attempt = 1; ; attempt++) {
                 List<String> tables = physicalSelection(spec, chainId, epoch);
@@ -543,7 +543,8 @@ public final class CaptureRunUnit {
                 SrsMetaStore.PhysicalSelection wider =
                         new SrsMetaStore.PhysicalSelection(epoch, published.revision() + 1, tables);
                 if (meta.replacePhysicalSelection(chainId, published, wider)) {
-                    begin(wider, prefix, tailStart(meta, chainId, spec.pipelineId(), null, CaptureStart.present()));
+                    begin(wider, prefix,
+                            tailStart(meta, chainId, spec.pipelineId(), null, false, CaptureStart.present()));
                     return true;
                 }
                 prefix.close();
@@ -685,7 +686,7 @@ public final class CaptureRunUnit {
         Subscription stream;
         try {
             stream = port.cdc(spec.config(),
-                    tailStart(meta, chainId, spec.pipelineId(), ownSeam, sourceStart(spec.startFrom())),
+                    tailStart(meta, chainId, spec.pipelineId(), ownSeam, true, sourceStart(spec.startFrom())),
                     health.recording(new CaptureListener() {
                         @Override
                         public void onStart(Optional<SourcePosition> position) {
@@ -813,9 +814,15 @@ public final class CaptureRunUnit {
      *       caller resolved for a run that has no position to pick up from.</li>
      * </ol>
      *
-     * <p>The resume point cannot have run past this run's own seam while its load ran. The pipeline is on the
-     * chain, with the tables it reads selected and asked of the reader, before its load samples the seam, so
-     * every run handed over after that owes it those tables' changes and is not released before it lands them.
+     * <p>That order is the shared reader's. The resume point cannot have run past this run's own seam while its
+     * load ran: the pipeline is on the chain, with the tables it reads selected and asked of the reader, before
+     * its load samples the seam, so every run handed over after that owes it those tables' changes and is not
+     * released before it lands them.
+     *
+     * <p>A direct tail ({@code seamFirst}) puts its own seam first instead. It serves its own pipeline alone,
+     * and the chain's runs do not wait for that pipeline: a shared reader on the same chain may have moved the
+     * resume point past the seam while the load ran, and beginning there would skip, for this pipeline, the
+     * changes in between, which its load did not cover.
      *
      * <p>Taking the present in any of the first three states is the silent loss this exists to prevent:
      * the tail comes up healthy, and every change between where it had reached and now is simply gone.
@@ -825,7 +832,11 @@ public final class CaptureRunUnit {
             String miningChainId,
             String pipelineId,
             String ownSnapshotSeam,
+            boolean seamFirst,
             CaptureStart firstRun) {
+        if (seamFirst && ownSnapshotSeam != null) {
+            return CaptureStart.resume(new SourcePosition(ownSnapshotSeam));
+        }
         Optional<String> resumeFrom = meta.resumeOffset(miningChainId);
         if (resumeFrom.isPresent()) {
             return CaptureStart.resume(new SourcePosition(resumeFrom.get()));
