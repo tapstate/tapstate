@@ -402,6 +402,35 @@ class PipelineConvergerTest {
     }
 
     @Test
+    void aStopKeepsTheActualCheckpointRunningUntilItsActuatorCompletes() {
+        state.create("p1", StateJson.of(RUNNING), T0);
+        desired.save(new DesiredState("p1", STOPPED, REV));
+        AtomicBoolean carrying = new AtomicBoolean(true);
+        LifecycleActuator stopping = new LifecycleActuator() {
+            @Override public void start(String pipelineId) { throw new AssertionError("unexpected start"); }
+            @Override public void pause(String pipelineId) { throw new AssertionError("unexpected pause"); }
+            @Override public void resume(String pipelineId) { throw new AssertionError("unexpected resume"); }
+            @Override public void stop(String pipelineId, boolean purgeState) {
+                CheckpointDoc whileClosing = state.read(pipelineId).orElseThrow();
+                assertThat(whileClosing.epoch()).as("stop was admitted by a fenced checkpoint write").isPositive();
+                assertThat(whileClosing.stateJson()).as("closing is not an already completed stop")
+                        .isEqualTo(StateJson.of(RUNNING));
+                carrying.set(false);
+            }
+            @Override public Optional<Throwable> failure(String pipelineId) { return Optional.empty(); }
+            @Override public boolean isCarryingAJob(String pipelineId) { return carrying.get(); }
+        };
+
+        ConvergeResult result = new PipelineConverger(desired, state, stopping, Clock.fixed(T0, ZoneOffset.UTC))
+                .converge("p1");
+
+        assertThat(result.status()).isEqualTo(CONVERGED);
+        assertThat(result.transitionFrom()).contains(RUNNING);
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(STOPPED));
+        assertThat(carrying).isFalse();
+    }
+
+    @Test
     @DisplayName("a re-dig — stop then start — cancels the job then submits a fresh one")
     void rewindActuatesStopThenStart() {
         converge(RUNNING);
