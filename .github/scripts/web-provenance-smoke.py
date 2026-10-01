@@ -171,13 +171,13 @@ def main() -> int:
             "--version", VERSION, "--tapstate-revision", TAPSTATE_REVISION, "--web-revision", WEB_REVISION,
         )
         if created.returncode or json.loads(cloud_provenance.read_text())["image"]["repository"] != "ghcr.io/tapstate/tapstate-cloud":
-            print("not ok - Cloud provenance must name the private Cloud package, not OP", file=sys.stderr)
+            print("not ok - Cloud provenance must name the distinct Cloud package, not OP", file=sys.stderr)
             return 1
         verified = invoke("verify", "--oci-layout", str(cloud_layout), "--provenance", str(cloud_provenance))
         if verified.returncode:
             print(verified.stderr, file=sys.stderr)
             return 1
-        print("ok - Cloud provenance names and verifies the private Cloud package")
+        print("ok - Cloud provenance names and verifies the distinct Cloud package")
         value = json.loads(cloud_provenance.read_text())
         value["image"]["repository"] = "ghcr.io/tapstate/tapstate"
         cloud_provenance.write_text(json.dumps(value))

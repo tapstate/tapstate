@@ -116,7 +116,7 @@ hasnt "Cloud does not rebuild Web"                   cloud-image 'pnpm build|pre
 has   "Cloud GHCR waits until satellite publication is complete" cloud-ghcr 'needs:.*satellites'
 has   "Cloud GHCR consumes the checked sealed archive" cloud-ghcr 'name: cloud-image-sealed'
 has   "Cloud GHCR uses the production environment" cloud-ghcr 'environment: cloud-ghcr-release'
-has   "Cloud GHCR uses the private digest publisher" cloud-ghcr 'ghcr-publish[.]sh publish'
+has   "Cloud GHCR uses the checked digest publisher" cloud-ghcr 'ghcr-publish[.]sh publish'
 has   "Cloud and OP use the same release version" cloud-ghcr 'needs[.]version[.]outputs[.]version'
 has   "Cloud GHCR publishes the verified archive digest" cloud-ghcr 'needs[.]cloud-image[.]outputs[.]digest'
 hasnt "Cloud never rebuilds the approved image" cloud-ghcr 'buildx build|build-push-action'
