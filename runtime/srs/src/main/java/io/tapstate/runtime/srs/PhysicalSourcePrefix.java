@@ -189,10 +189,14 @@ final class PhysicalSourcePrefix implements AutoCloseable {
      * before the first release would come back at the present, with every change it had been handed gone --
      * so the shared reader refuses. A direct tail carries on as it always has.
      *
-     * <p>A direct tail writes where it began down only on a chain that holds no offset yet. It reads for its
-     * own pipeline alone and begins where that pipeline's own load did, so its start says nothing about where
-     * the chain stands for anybody else: written over a position a pipeline stopped with its state kept still
-     * holds, it would become where that pipeline resumes, past the changes it is owed.
+     * <p>A direct tail writes where it began down as the chain's position only on a chain that holds no offset
+     * yet and that no other pipeline is on. It reads for its own pipeline alone and begins where that
+     * pipeline's own load did, so its start says nothing about where the chain stands for anybody else.
+     * Written over a position a pipeline stopped with its state kept still holds, it would become where that
+     * pipeline resumes, past the changes it is owed. Written beside a pipeline whose load is still running, it
+     * would become where that pipeline's reader opens, past the changes made after that load read its rows.
+     * Beside another pipeline, a direct tail with no load of its own writes its start down for its own
+     * pipeline instead, where only its own restart reads it.
      */
     synchronized void start(Optional<SourcePosition> position) {
         checkOpen();
@@ -208,8 +212,19 @@ final class PhysicalSourcePrefix implements AutoCloseable {
             }
             return;
         }
-        if (directPipeline != null && meta.read(chainId).map(SrsMeta::sourceReadOffset).isPresent()) {
-            return;
+        if (directPipeline != null) {
+            Optional<SrsMeta> record = meta.read(chainId);
+            if (record.map(SrsMeta::sourceReadOffset).isPresent()) {
+                return;
+            }
+            if (record.isPresent() && record.get().consumerOffsets().stream()
+                    .anyMatch(consumer -> !directPipeline.equals(consumer.pipelineId()))) {
+                // A start a load already recorded is that load's seam, and stays as it is.
+                if (record.get().consumerOffset(directPipeline).map(ConsumerOffset::cdcStartPosition).isEmpty()) {
+                    meta.setCdcStart(chainId, directPipeline, token, 0L);
+                }
+                return;
+            }
         }
         boolean anchored = meta.establishPhysicalAnchor(chainId, new ChainPosition(new SourceOrder(epoch, -1L), token));
         if (!anchored && directPipeline == null) {

@@ -14,8 +14,9 @@ import java.util.Map;
  * durably acked to the pipeline's sink (stable across a restart; the quantity a source-read-offset advance
  * is bounded by) — and the snapshot state: {@code snapshotCompletedTables}, the tables whose initial load
  * this pipeline's sink has confirmed, plus {@code cdcStartPosition} and {@code snapshotEpoch}, the seam and
- * generation at which this pipeline's load began. The acked position is absent until the pipeline's sink
- * first acks a change.
+ * generation at which this pipeline's load began -- or, with generation zero, where a direct tail that loads
+ * nothing first began on a chain other pipelines are on. The acked position is absent until the pipeline's
+ * sink first acks a change.
  *
  * <p><strong>On a chain carrying several tables, {@code sinkAcked} is the chain's contiguous prefix, not the
  * latest acknowledgement.</strong> One source log feeds every table of the chain, and the tables land

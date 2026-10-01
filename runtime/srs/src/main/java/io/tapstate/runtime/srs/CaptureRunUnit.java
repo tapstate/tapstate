@@ -809,7 +809,8 @@ public final class CaptureRunUnit {
      *       changed is left at the value the load saw;</li>
      *   <li>no read offset but this pipeline's recorded seam — its snapshot ran and the tail has not
      *       advanced past where that snapshot began, so it starts at the seam and the idempotent sink
-     *       absorbs the overlap;</li>
+     *       absorbs the overlap. A direct tail that loads nothing records where it began here too, when
+     *       another pipeline is on the chain and its start is therefore not written down as the chain's;</li>
      *   <li>none of those — nothing has read this chain, so {@code firstRun} decides: the start the
      *       caller resolved for a run that has no position to pick up from.</li>
      * </ol>
@@ -817,7 +818,8 @@ public final class CaptureRunUnit {
      * <p>That order is the shared reader's. The resume point cannot have run past this run's own seam while its
      * load ran: the pipeline is on the chain, with the tables it reads selected and asked of the reader, before
      * its load samples the seam, so every run handed over after that owes it those tables' changes and is not
-     * released before it lands them.
+     * released before it lands them, and a direct tail starting beside it does not write its start down as the
+     * chain's position.
      *
      * <p>A direct tail ({@code seamFirst}) puts its own seam first instead. It serves its own pipeline alone,
      * and the chain's runs do not wait for that pipeline: a shared reader on the same chain may have moved the

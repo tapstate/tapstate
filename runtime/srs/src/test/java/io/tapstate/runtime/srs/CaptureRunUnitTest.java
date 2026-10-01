@@ -941,6 +941,67 @@ class CaptureRunUnitTest {
     }
 
     /**
+     * A direct tail that starts on a chain another pipeline is on does not write where it began down as the
+     * chain's position, even on a chain that has none yet. Here a buffered pipeline is on the chain with its
+     * load still running: its seam is recorded and its reader has not opened. Had the direct tail's start
+     * become the chain's resume point, that reader would open there rather than at its own seam, and every
+     * change of its tables between the two -- after its load read them, before the direct tail began -- would
+     * never reach it.
+     */
+    @Test
+    void aDirectTailBesideALoadStillRunningLeavesTheChainToThatLoadsReader() {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chainId = MiningChainId.resolve(config(), "chain-direct-beside-a-load").value();
+        meta.create(chainId, null);
+        long loadingUnder = meta.openEpoch(chainId);
+        meta.selectConsumerTables(chainId, "pipe-a", List.of("orders"), loadingUnder);
+        meta.setCdcStart(chainId, "pipe-a", "seam-pipe-a-loaded-from", loadingUnder);
+
+        FakeSource direct = new FakeSource(List.of(row(1)), List.of(), "seam-the-direct-load-began-at");
+        runUnit(direct, meta).start(spec(ReadMode.SNAPSHOT_AND_CDC, false, "chain-direct-beside-a-load"), e -> { });
+
+        assertThat(meta.resumeOffset(chainId)).as("the direct tail's start is not the chain's").isEmpty();
+        assertThat(meta.read(chainId).orElseThrow().consumerOffset("pipe-1").orElseThrow().snapshotEpoch())
+                .as("the direct pipeline's own load keeps the generation it began in").isNotZero();
+
+        FakeSource shared = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-not-sampled");
+        runUnit(shared, meta)
+                .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-direct-beside-a-load"), e -> { });
+
+        assertThat(shared.cdcStart)
+                .as("pipe-a's reader opens where pipe-a's own load began")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("seam-pipe-a-loaded-from")));
+    }
+
+    /**
+     * A direct tail that loads nothing, on a chain another pipeline is on, comes back where it first began.
+     * It does not write its start down as the chain's position, so it writes it down for its own pipeline:
+     * with neither, a restart before anything was released would take the present, and every change in
+     * between would be gone for this pipeline.
+     */
+    @Test
+    void aDirectTailThatLoadsNothingBesideAnotherPipelineComesBackWhereItFirstBegan() {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chainId = MiningChainId.resolve(config(), "chain-direct-cdc-only-beside").value();
+        meta.create(chainId, null);
+        meta.selectConsumerTables(chainId, "pipe-a", List.of("orders"), meta.openEpoch(chainId));
+
+        FakeSource first = new FakeSource(List.of(), List.of());
+        runUnit(first, meta)
+                .start(spec(ReadMode.CDC_ONLY, false, "chain-direct-cdc-only-beside", StartFrom.latest()), e -> { })
+                .close();
+
+        FakeSource second = new FakeSource(List.of(), List.of());
+        runUnit(second, meta)
+                .start(spec(ReadMode.CDC_ONLY, false, "chain-direct-cdc-only-beside", StartFrom.latest()), e -> { });
+
+        assertThat(second.cdcStart)
+                .as("the second run begins where the first one did, not at the present")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("start")));
+        assertThat(meta.resumeOffset(chainId)).as("and the chain itself still records nothing").isEmpty();
+    }
+
+    /**
      * A direct tail -- {@code srs.enabled:false} -- begins where the durable record says, exactly as a
      * shared-ring tail does.
      *

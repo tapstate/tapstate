@@ -521,11 +521,15 @@ public interface SrsMetaStore {
      * caller ordering error. The consumer entry is created when the pipeline has none yet, and only these
      * two fields are touched.
      *
-     * <p>The two are one call because they are only ever read together. The seam position is the sole
-     * record that a snapshot began at all, so a snapshot resuming after a restart looks here to learn
-     * both where the tail picks up and which generation to pin its rows to. A store that could write the
-     * position without its generation would leave a resumed snapshot with nothing to pin to, and a rerun
-     * that then took the current generation would overwrite changes the earlier one had already applied.
+     * <p>The two are one call because they are only ever read together. With a generation above zero, the
+     * seam position is the sole record that a snapshot began at all, so a snapshot resuming after a restart
+     * looks here to learn both where the tail picks up and which generation to pin its rows to. A store that
+     * could write the position without its generation would leave a resumed snapshot with nothing to pin to,
+     * and a rerun that then took the current generation would overwrite changes the earlier one had already
+     * applied.
+     *
+     * <p>Generation zero says no snapshot began: the position is where a direct tail that loads nothing first
+     * began, on a chain other pipelines are on, so that its own restart picks up there.
      */
     void setCdcStart(String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch);
 
