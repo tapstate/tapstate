@@ -7,6 +7,7 @@ import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.ChangeSet;
 import io.tapstate.adapters.mongostore.ChangeSet.Fence;
 import io.tapstate.adapters.mongostore.SystemCollections;
+import io.tapstate.adapters.mongostore.IndexEnsure;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
@@ -307,7 +308,7 @@ class MigrationRunnerIT {
                         "V7RepairBlankPipelines", "V8DiscardViewSchemaPolicies", "V9RateHistoryIndexes",
                         "V10SrsConsumerOffsetIndexes", "V11RateHistoryKeysetIndex",
                         "V12PipelineEventIndexes", "V13HistoryRollupIndexes",
-                        "V14LatestObservationChunkIndexes", "V15StopReservationShape");
+                        "V14LatestObservationChunkIndexes", "V15StopReservationShape", "V16DurableRebuildHandoff");
 
         MigrationRunner.migrate(database);
 
@@ -334,6 +335,61 @@ class MigrationRunnerIT {
     }
 
     @Test
+    void phasedHandoffVersionLeavesLegacyMarkersUntouchedAndRefusesThePreviousBinary() {
+        MongoDatabase database = freshDatabase("runner_phased_handoff_shape");
+        seedSchemaDocument(database, 15, null);
+        Document marker = new Document("token", "legacy-work").append("sourceEpoch", 7L).append("reservedEpoch", 8L);
+        Document original = new Document("_id", "orders").append("stateJson", "{\"state\":\"PAUSED\"}")
+                .append("epoch", 8L).append("touchMillis", 1_780_000_000_000L).append("stopReservation", marker);
+        SystemCollections.PIPELINE_STATE.on(database).insertOne(original);
+        MigrationRunner.migrate(database);
+        MigrationRunner.migrate(database);
+        assertThat(installedVersion(database)).isEqualTo(16);
+        assertThat(SystemCollections.PIPELINE_STATE.on(database).find(new Document("_id", "orders")).first())
+                .isEqualTo(original);
+        List<ChangeSet> previous = MigrationRunner.changeSets().stream().filter(change -> change.version() <= 15).toList();
+        TapstateException refusal = catchThrowableOfType(() -> MigrationRunner.migrate(
+                database, previous, LOCK_TTL, PATIENT, CLOCK), TapstateException.class);
+        assertThat(refusal).isNotNull();
+        assertThat(refusal.code().code()).isEqualTo("migration.data-newer-than-binary");
+        assertThat(refusal.args()).containsEntry("installed", "16").containsEntry("supported", "15");
+    }
+
+    @Test
+    void privateContinuationLeaseIndexIsRegisteredAndBuiltIdempotentlyAtVersion16() {
+        MongoDatabase database = freshDatabase("runner_private_continuation_lease");
+        seedSchemaDocument(database, 15, null);
+        SystemCollections row = SystemCollections.PIPELINE_OBSERVATION;
+        SystemCollections.IndexSpec privateLease = row.indexes().stream()
+                .filter(index -> index.keys().equals(List.of("continuationPending.publishUntil", "_id")))
+                .findFirst().orElseThrow();
+        SystemCollections.IndexSpec publicLease = row.indexes().stream()
+                .filter(index -> index.keys().equals(List.of("pending.publishUntil", "_id")))
+                .findFirst().orElseThrow();
+        assertThat(privateLease.indexName()).isEqualTo("continuationPending.publishUntil__id_idx");
+        assertThat(privateLease.expireAfterSeconds()).isNull();
+        assertThat(privateLease.unique()).isFalse();
+        IndexEnsure.ensure(database, row.indexTargetOn(database), publicLease);
+        Document legacy = new Document("_id", "orders").append("legacy", true);
+        row.on(database).insertOne(legacy);
+
+        MigrationRunner.migrate(database);
+        new V16DurableRebuildHandoff().up(database, () -> { });
+        MigrationRunner.migrate(database);
+
+        List<Document> indexes = row.on(database).listIndexes().into(new ArrayList<>());
+        List<Document> privateIndexes = indexes.stream()
+                .filter(index -> privateLease.indexName().equals(index.getString("name"))).toList();
+        assertThat(privateIndexes).hasSize(1);
+        assertThat(privateIndexes.getFirst().get("key", Document.class))
+                .isEqualTo(new Document("continuationPending.publishUntil", 1).append("_id", 1));
+        assertThat(privateIndexes.getFirst()).doesNotContainKey("expireAfterSeconds");
+        assertThat(indexes).anySatisfy(index -> assertThat(index.getString("name")).isEqualTo(publicLease.indexName()));
+        assertThat(row.on(database).find(new Document("_id", "orders")).first()).isEqualTo(legacy);
+        assertThat(installedVersion(database)).isEqualTo(16);
+    }
+
+    @Test
     void stopReservationVersionLeavesOldCheckpointsUntouchedAndRefusesAnOlderBinary() {
         MongoDatabase database = freshDatabase("runner_stop_reservation_shape");
         seedSchemaDocument(database, 14, null);
@@ -343,8 +399,9 @@ class MigrationRunnerIT {
                 .append("touchMillis", 1_780_000_000_000L);
         SystemCollections.PIPELINE_STATE.on(database).insertOne(original);
 
-        MigrationRunner.migrate(database);
-        MigrationRunner.migrate(database);
+        List<ChangeSet> stopBinary = MigrationRunner.changeSets().stream().filter(change -> change.version() <= 15).toList();
+        MigrationRunner.migrate(database, stopBinary, LOCK_TTL, PATIENT, CLOCK);
+        MigrationRunner.migrate(database, stopBinary, LOCK_TTL, PATIENT, CLOCK);
 
         assertThat(installedVersion(database)).isEqualTo(15);
         assertThat(SystemCollections.PIPELINE_STATE.on(database).find(new Document("_id", "orders")).first())

@@ -14,6 +14,12 @@ import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.StateStore;
 import io.tapstate.spi.store.StopAuthority;
 import io.tapstate.spi.store.StopReservation;
+import io.tapstate.spi.store.SuccessorAdmission;
+import io.tapstate.spi.store.SuccessorEnd;
+import io.tapstate.spi.store.HandoffIdentity;
+import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.PipelineState;
 import org.bson.Document;
 
 import java.time.Instant;
@@ -54,6 +60,15 @@ public final class MongoStateStore implements StateStore {
             MongoCollection<Document> desired, MongoCollection<Document> workloadClaims) {
         this.collection = Objects.requireNonNull(collection, "collection");
         this.stops = new MongoStopReservationWrites(client, collection, desired, workloadClaims);
+    }
+
+    /** Production handoff binding also fences the artifact identity during admission. */
+    public MongoStateStore(MongoClient client, MongoCollection<Document> collection,
+            MongoCollection<Document> desired, MongoCollection<Document> workloadClaims,
+            MongoCollection<Document> artifacts) {
+        this.collection = Objects.requireNonNull(collection, "collection");
+        this.stops = new MongoStopReservationWrites(client, collection, desired, workloadClaims,
+                Objects.requireNonNull(artifacts, "artifacts"));
     }
 
     @Override
@@ -173,6 +188,47 @@ public final class MongoStateStore implements StateStore {
             StopAuthority authority, Instant touchTime) {
         return requireStops().retire(expected, successor, authority, touchTime);
     }
+
+    @Override public Optional<StopReservation> promoteStopReservation(StopReservation expectedLegacy,
+            DesiredState currentIntent, StopAuthority currentWriter, Instant at) {
+        return requireStops().promote(expectedLegacy, currentIntent, currentWriter, at);
+    }
+
+    @Override public Optional<StopReservation> markReplacementPending(StopReservation expected, Instant at) {
+        return requireStops().replacementPending(expected, at);
+    }
+
+    @Override public Optional<SuccessorAdmission> admitSuccessor(StopReservation expected,
+            String incarnation, String boot, Instant at) {
+        return requireStops().admit(expected, incarnation, boot, at);
+    }
+
+    @Override public Optional<StopReservation> bindSuccessor(StopReservation expected,
+            ObservationStore.Scope scope, StopReservation.JobIdentity job, Instant at) {
+        return requireStops().bind(expected, scope, job, at);
+    }
+
+    @Override public Optional<StopReservation> retireSuccessor(StopReservation expected,
+            SuccessorEnd end, Instant at) {
+        return requireStops().retireSuccessor(expected, end, at);
+    }
+
+    @Override public Optional<CheckpointDoc> completeHandoff(StopReservation expected,
+            HandoffIdentity ready, Instant at) {
+        return requireStops().completeHandoff(expected, ready, at);
+    }
+
+    @Override public Optional<StopReservation> recordSuccessorTerminal(StopReservation expected,
+            SuccessorEnd.Terminal end, PipelineState terminal, Instant at) {
+        return requireStops().recordTerminal(expected, end, terminal, at);
+    }
+
+    @Override public Optional<CheckpointDoc> failReplacement(StopReservation expected,
+            Optional<StopReservation.JobIdentity> factualSuccessorJob, Instant at) {
+        return requireStops().failReplacement(expected, factualSuccessorJob, at);
+    }
+
+    MongoStopReservationWrites handoffWrites() { return requireStops(); }
 
     private MongoStopReservationWrites requireStops() {
         if (stops == null) {

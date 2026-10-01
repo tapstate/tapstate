@@ -334,6 +334,7 @@ final class TelemetryDispatcher implements AutoCloseable {
     private final MetricsExport export;
     private final ObservationScopeRegistry scopes;
     private final ObservationScopeRecovery scopeRecovery;
+    private final ObservationContinuationRecovery continuations;
     private final PipelineEventStore events;
     private final TelemetryBoundaryEvents boundaryEvents;
     private final ThreadPoolExecutor latestWorkers;
@@ -401,11 +402,20 @@ final class TelemetryDispatcher implements AutoCloseable {
     TelemetryDispatcher(ObservationPublisher publisher, RateSampler sampler, MetricsExport export,
             ObservationScopeRegistry scopes, PipelineEventStore events, ObservationScopeRecovery scopeRecovery,
             int latestConcurrency, int queueCapacity, Duration writeDeadline) {
+        this(publisher, sampler, export, scopes, events, scopeRecovery, null,
+                latestConcurrency, queueCapacity, writeDeadline);
+    }
+
+    TelemetryDispatcher(ObservationPublisher publisher, RateSampler sampler, MetricsExport export,
+            ObservationScopeRegistry scopes, PipelineEventStore events, ObservationScopeRecovery scopeRecovery,
+            ObservationContinuationRecovery continuations, int latestConcurrency, int queueCapacity,
+            Duration writeDeadline) {
         this.publisher = Objects.requireNonNull(publisher, "publisher");
         this.sampler = sampler;
         this.export = Objects.requireNonNull(export, "export");
         this.scopes = scopes;
         this.scopeRecovery = scopeRecovery;
+        this.continuations = continuations;
         if (scopes != null) {
             export.bindCurrentScopes(id -> scopes.current(id).map(owner -> new MetricsExport.ScopeToken(
                     owner.pipelineIncarnationId(), owner.executionGeneration())));
@@ -748,6 +758,9 @@ final class TelemetryDispatcher implements AutoCloseable {
             return before == PublicationQualification.RETRY ? PreparationOutcome.RETRY : PreparationOutcome.SKIPPED;
         }
         BooleanSupplier current = () -> eligible(request);
+        if (continuations != null && !continuations.prepareHandoff(request.pipelineId(), request.scope(), current)) {
+            return eligible(request) ? PreparationOutcome.RETRY : PreparationOutcome.SKIPPED;
+        }
         Runnable captured = () -> operation.failureCaptured = true;
         var prepared = request.scope() == null
                 ? publisher.prepare(request.pipelineId(), request.failure(), current, captured)
@@ -761,12 +774,17 @@ final class TelemetryDispatcher implements AutoCloseable {
         if (!eligible(request)) {
             return PreparationOutcome.SKIPPED;
         }
-        ObservationPublisher.Prepared frame = scopes == null ? prepared.orElseThrow()
-                : scopes.continueFrame(prepared.orElseThrow(), request.scope());
+        var packet = continuationPacket(prepared.orElseThrow(), request.scope(), current);
+        if (continuations != null && scopes.activeContinuationKey(request.pipelineId()).isPresent() && packet.isEmpty()) {
+            return PreparationOutcome.SKIPPED;
+        }
+        ObservationPublisher.Prepared frame = packet.map(ObservationScopeRegistry.ContinuationPublication::projected)
+                .orElseGet(() -> scopes == null ? prepared.orElseThrow()
+                        : scopes.continueFrame(prepared.orElseThrow(), request.scope()));
         if (!eligible(request)) {
             return PreparationOutcome.SKIPPED;
         }
-        var published = publisher.commit(frame, request.scope(), () -> eligible(request));
+        var published = commitContinuation(frame, request.scope(), current, packet);
         if (published.isEmpty() || !eligible(request)) {
             return PreparationOutcome.SKIPPED;
         }
@@ -777,6 +795,33 @@ final class TelemetryDispatcher implements AutoCloseable {
         }
         offerProjections(frame, request.scope());
         return PreparationOutcome.PUBLISHED;
+    }
+
+    private java.util.Optional<ObservationScopeRegistry.ContinuationPublication> continuationPacket(
+            ObservationPublisher.Prepared prepared, ObservationStore.Scope scope, BooleanSupplier current) {
+        return continuations == null || scope == null ? java.util.Optional.empty()
+                : continuations.measuredTarget(prepared.observation().pipelineId(), scope, current)
+                        .flatMap(target -> scopes.prepareContinuationPublication(prepared, target, current));
+    }
+
+    private java.util.Optional<Observation> commitContinuation(ObservationPublisher.Prepared prepared,
+            ObservationStore.Scope scope, BooleanSupplier current,
+            java.util.Optional<ObservationScopeRegistry.ContinuationPublication> packet) {
+        if (packet.isEmpty() || packet.orElseThrow().snapshot().isEmpty()) {
+            return publisher.commit(prepared, scope, current);
+        }
+        var bound = packet.orElseThrow();
+        return publisher.commit(prepared, scope, current, (observation, owner) -> {
+            var result = continuations.publish(observation, owner,
+                    ObservationStore.ContinuationWrite.store(bound.snapshot().orElseThrow(), bound.expectedReceipt()));
+            if (result.committed()) {
+                result.continuationReceipt().ifPresent(receipt -> scopes.publicationAccepted(bound.ticket(), receipt));
+            } else if (current.getAsBoolean()) {
+                // A racing accepted writer changed the private revision. Read once on this cold refusal path.
+                continuations.resolveExisting(observation.pipelineId(), current).ifPresent(continuations::adoptExisting);
+            }
+            return result.committed();
+        });
     }
 
     void discardStalePreparations() {
@@ -952,6 +997,17 @@ final class TelemetryDispatcher implements AutoCloseable {
         if (!scopes.awaiting(ticket) || !frame.owner().getAsBoolean()) {
             return false;
         }
+        if (continuations != null) {
+            BooleanSupplier waiting = () -> scopes.awaiting(ticket) && frame.owner().getAsBoolean();
+            var continued = continuations.resolveExisting(pipelineId, frame.owner());
+            if (continued.isEmpty()) {
+                if (!continuations.prepareHandoff(pipelineId, null, waiting)) { return false; }
+                continued = continuations.resolveExisting(pipelineId, frame.owner());
+            }
+            if (continued.isPresent()) {
+                return recoverContinuation(pipelineId, frame, operation, continued.orElseThrow());
+            }
+        }
         var qualified = scopeRecovery.resolve(pipelineId).orElse(null);
         if (qualified == null || !scopes.awaiting(ticket) || !frame.owner().getAsBoolean()
                 || !scopeRecovery.matchesOwner(pipelineId, qualified, ticket.owner())
@@ -1011,6 +1067,36 @@ final class TelemetryDispatcher implements AutoCloseable {
         }
         scopes.restored(ticket);
         offerProjections(scopes.continueFrame(prepared, scope), scope);
+        return true;
+    }
+
+    private boolean recoverContinuation(String id, RecoveryFrame frame, Stats.Operation operation,
+            ObservationContinuationRecovery.ResolvedTarget target) {
+        var ticket = frame.ticket();
+        if (!scopes.awaiting(ticket) || !target.current().getAsBoolean()) { return false; }
+        var signals = scopes.restorationSignals(ticket);
+        var attempt = scopes.restorationFailure(ticket, target.checkpoint());
+        // The owner and physical job remain the guard after adoption invalidates the old recovery ticket.
+        BooleanSupplier current = () -> frame.owner().getAsBoolean() && target.current().getAsBoolean();
+        var raw = publisher.prepareScoped(id, attempt != null && attempt.first() ? attempt.failure() : null,
+                target.target().scope(), current).orElse(null);
+        if (raw == null || !scopes.awaiting(ticket) || !current.getAsBoolean()
+                || !continuations.adoptExisting(target)) { return false; }
+        operation.scope = target.target().scope();
+        // Adoption consumes the old recovery ticket. Its finite signals belong to the independently healthy event lane.
+        for (var signal : signals) {
+            PipelineStateEvents.of(id, operation.scope, signal.result(), signal.failure()).forEach(this::offerEvent);
+        }
+        var packet = continuationPacket(raw, operation.scope, current);
+        if (packet.isEmpty()) { return false; }
+        var persisted = commitContinuation(packet.orElseThrow().projected(), operation.scope, current, packet);
+        if (persisted.isEmpty() || !current.getAsBoolean()) { return false; }
+        var projected = packet.orElseThrow().projected();
+        if (persisted.orElseThrow() != projected.observation()) {
+            projected = new ObservationPublisher.Prepared(persisted.orElseThrow(), false,
+                    projected.nestReadings(), projected.pinned(), projected.gaps());
+        }
+        offerProjections(projected, operation.scope);
         return true;
     }
 

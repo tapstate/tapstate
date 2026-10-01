@@ -243,17 +243,37 @@ class RealHungStopParallelCdcIT {
                     assertThat(pending).as("A keeps its durable stop while the native close is held").isNotNull();
                     Document marker = pending.get("stopReservation", Document.class);
                     assertThat(marker).isNotNull();
-                    Document subject = marker.get("subject", Document.class);
-                    assertThat(subject.getString("kind")).isEqualTo("EXISTING_JOB");
-                    Document oldJob = subject.get("oldJob", Document.class);
-                    Map<String, Object> pinned = Map.of("jobId", ((Number) oldJob.get("jobId")).longValue(),
-                            "clusterId", oldJob.getString("clusterId"), "bootId", oldJob.getString("bootId"),
-                            "pipelineIncarnationId", subject.getString("pipelineIncarnationId"),
-                            "executionGeneration", ((Number) subject.get("executionGeneration")).longValue());
+                    Map<String, Object> pinned;
+                    Object sourceEpoch;
+                    Object reservedEpoch;
+                    if (marker.containsKey("v")) {
+                        assertThat(((Number) marker.get("v")).intValue()).isEqualTo(16);
+                        assertThat(marker.getString("p")).isEqualTo("STOPPING");
+                        assertThat(marker.getString("c")).isEqualTo("RESET");
+                        assertThat(marker.get("x")).isNull();
+                        Document source = marker.get("o", Document.class);
+                        Document oldJob = source.get("j", Document.class);
+                        pinned = Map.of("jobId", ((Number) oldJob.get("i")).longValue(),
+                                "clusterId", source.getString("c"), "bootId", oldJob.getString("b"),
+                                "pipelineIncarnationId", source.getString("i"),
+                                "executionGeneration", ((Number) source.get("g")).longValue());
+                        sourceEpoch = marker.get("s");
+                        reservedEpoch = marker.get("e");
+                    } else {
+                        Document subject = marker.get("subject", Document.class);
+                        assertThat(subject.getString("kind")).isEqualTo("EXISTING_JOB");
+                        Document oldJob = subject.get("oldJob", Document.class);
+                        pinned = Map.of("jobId", ((Number) oldJob.get("jobId")).longValue(),
+                                "clusterId", oldJob.getString("clusterId"), "bootId", oldJob.getString("bootId"),
+                                "pipelineIncarnationId", subject.getString("pipelineIncarnationId"),
+                                "executionGeneration", ((Number) subject.get("executionGeneration")).longValue());
+                        sourceEpoch = marker.get("sourceEpoch");
+                        reservedEpoch = marker.get("reservedEpoch");
+                    }
                     assertThat(nativeWait.execution()).as("the real wait uses exactly the durable old native job")
                             .isEqualTo(pinned);
                     report.addFork(Map.of("action", "durable-stop-still-pending", "execution", pinned,
-                            "sourceEpoch", marker.get("sourceEpoch"), "reservedEpoch", marker.get("reservedEpoch")));
+                            "sourceEpoch", sourceEpoch, "reservedEpoch", reservedEpoch));
                 }
                 observed.releaseClose();
                 Await.until("A to finish its actual stop after releasing the native close",

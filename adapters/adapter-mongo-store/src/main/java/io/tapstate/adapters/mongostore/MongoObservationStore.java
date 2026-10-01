@@ -56,17 +56,54 @@ public final class MongoObservationStore implements ObservationStore {
 
     private final MongoCollection<Document> collection;
     private final MongoLatestObservationStorage latest;
+    private final MongoObservationContinuation continuation;
+    private final MongoStopReservationWrites handoffWrites;
 
     public MongoObservationStore(MongoCollection<Document> collection) {
         this.collection = Objects.requireNonNull(collection, "collection");
         this.latest = null;
+        this.continuation = null;
+        this.handoffWrites = null;
     }
 
     public MongoObservationStore(MongoClient client, MongoCollection<Document> collection,
             MongoCollection<Document> chunks) {
+        this(client, collection, chunks, null);
+    }
+
+    MongoObservationStore(MongoClient client, MongoCollection<Document> collection,
+            MongoCollection<Document> chunks, MongoStopReservationWrites handoffWrites) {
         this.collection = Objects.requireNonNull(collection, "collection");
+        this.handoffWrites = handoffWrites;
         this.latest = new MongoLatestObservationStorage(Objects.requireNonNull(client, "client"), collection,
                 Objects.requireNonNull(chunks, "chunks"));
+        this.continuation = new MongoObservationContinuation(client, collection, chunks, latest, handoffWrites);
+    }
+
+    @Override
+    public Optional<StoredContinuation> readContinuation(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        return continuation == null ? Optional.empty() : continuation.read(pipelineId);
+    }
+
+    @Override
+    public Optional<ContinuationReceipt> saveContinuation(String pipelineId, io.tapstate.spi.store.StopReservation expectedLiveMarker,
+            Optional<ContinuationReceipt> expectedReceipt, io.tapstate.spi.store.ObservationContinuation next) {
+        if (continuation == null) { throw new UnsupportedOperationException("private continuation persistence is unavailable"); }
+        return continuation.save(pipelineId, expectedLiveMarker, expectedReceipt, next);
+    }
+
+    @Override
+    public PublicationResult saveScoped(Observation observation, Scope scope, ContinuationWrite write) {
+        if (continuation == null) { return ObservationStore.super.saveScoped(observation, scope, write); }
+        return continuation.publish(observation, scope, write);
+    }
+
+    @Override
+    public boolean clearContinuation(String pipelineId, io.tapstate.spi.store.StopReservation expectedLiveReset,
+            ContinuationReceipt expectedReceipt) {
+        if (continuation == null) { throw new UnsupportedOperationException("private continuation clearing is unavailable"); }
+        return continuation.clear(pipelineId, expectedLiveReset, expectedReceipt);
     }
 
     @Override
@@ -234,6 +271,10 @@ public final class MongoObservationStore implements ObservationStore {
     public boolean deleteIfUnchanged(LatestSnapshot snapshot) {
         Objects.requireNonNull(snapshot, "snapshot");
         if (latest != null) {
+            if (handoffWrites != null) {
+                return handoffWrites.withNoContinuationHandoff(snapshot.pipelineId(), session ->
+                        latest.deleteLegacyIfUnchanged(session, snapshot)).orElse(false);
+            }
             return latest.deleteLegacyIfUnchanged(snapshot);
         }
         Document filter = new Document("_id", snapshot.pipelineId());
@@ -249,6 +290,12 @@ public final class MongoObservationStore implements ObservationStore {
                 .<Object>map(Date::from).orElseGet(() -> new Document("$exists", false)));
         return StoreIo.call(snapshot.pipelineId(), () -> collection.withTimeout(IO_DEADLINE_SECONDS, TimeUnit.SECONDS)
                 .deleteOne(filter).getDeletedCount() != 0);
+    }
+
+    @Override
+    public boolean deleteOrphanIfUnchanged(LatestSnapshot snapshot) {
+        Objects.requireNonNull(snapshot, "snapshot");
+        return latest == null ? deleteIfUnchanged(snapshot) : latest.deleteLegacyIfUnchanged(snapshot);
     }
 
     @Override
@@ -275,6 +322,17 @@ public final class MongoObservationStore implements ObservationStore {
             return ObservationStore.super.deleteManifestIfUnchanged(snapshot);
         }
         return latest.deleteManifestIfUnchanged(snapshot);
+    }
+
+    @Override
+    public boolean deleteManifestIfUnchanged(ManifestSnapshot snapshot, String pipelineId) {
+        Objects.requireNonNull(snapshot, "snapshot");
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        if (latest == null || handoffWrites == null) {
+            return ObservationStore.super.deleteManifestIfUnchanged(snapshot, pipelineId);
+        }
+        return handoffWrites.withNoContinuationHandoff(pipelineId, session ->
+                latest.deleteManifestIfUnchanged(session, snapshot, pipelineId)).orElse(false);
     }
 
     @Override

@@ -39,6 +39,87 @@ public interface ObservationStore {
         }
     }
 
+    /** Receipt for the actual committed private carrier; payload integrity is independent of DTO equality. */
+    record ContinuationReceipt(String pipelineId, String revision, String digest, int encodingVersion,
+            String token, Scope sourceScope, Optional<ObservationContinuation.Target> target,
+            Optional<ObservationContinuation.Target> baselineOrigin, boolean knownBaseline) {
+        public ContinuationReceipt {
+            Objects.requireNonNull(pipelineId, "pipelineId");
+            Objects.requireNonNull(revision, "revision");
+            Objects.requireNonNull(digest, "digest");
+            Objects.requireNonNull(token, "token");
+            target = Objects.requireNonNull(target, "target");
+            baselineOrigin = Objects.requireNonNull(baselineOrigin, "baselineOrigin");
+            if (pipelineId.isBlank() || revision.isBlank() || token.isBlank() || encodingVersion < 1
+                    || !digest.matches("[0-9a-f]{64}")) {
+                throw new IllegalArgumentException("a private continuation receipt needs complete identity and integrity");
+            }
+        }
+
+        public boolean matches(HandoffIdentity expected) {
+            Objects.requireNonNull(expected, "expected");
+            return expected.counterPolicy() == StopReservation.CounterPolicy.CONTINUE
+                    && pipelineId.equals(expected.pipelineId()) && token.equals(expected.token())
+                    && Objects.equals(sourceScope, expected.sourceScope())
+                    && target.filter(bound -> bound.scope().equals(expected.targetScope())
+                            && bound.realJob().filter(expected.targetJob()::equals).isPresent()).isPresent();
+        }
+    }
+
+    record StoredContinuation(ObservationContinuation continuation, ContinuationReceipt receipt) {
+        public StoredContinuation {
+            Objects.requireNonNull(continuation, "continuation");
+            Objects.requireNonNull(receipt, "receipt");
+            if (!continuation.token().equals(receipt.token())
+                    || !Objects.equals(continuation.sourceScope(), receipt.sourceScope())
+                    || !continuation.target().equals(receipt.target())
+                    || !continuation.baselineOrigin().equals(receipt.baselineOrigin())
+                    || continuation.knownBaseline() != receipt.knownBaseline()) {
+                throw new IllegalArgumentException("a continuation receipt belongs to its actual stored carrier");
+            }
+        }
+    }
+
+    /** Current and private checkpoint are one atomic publication when STORE is requested. */
+    record PublicationResult(boolean committed, Optional<ContinuationReceipt> continuationReceipt) {
+        public PublicationResult {
+            continuationReceipt = Objects.requireNonNull(continuationReceipt, "continuationReceipt");
+            if (!committed && continuationReceipt.isPresent()) {
+                throw new IllegalArgumentException("a refused publication cannot claim a committed private receipt");
+            }
+        }
+    }
+
+    sealed interface ContinuationWrite permits ContinuationWrite.Keep, ContinuationWrite.Store,
+            ContinuationWrite.Reset {
+        record Keep() implements ContinuationWrite { }
+        record Store(ObservationContinuation next, Optional<ContinuationReceipt> expectedReceipt)
+                implements ContinuationWrite {
+            public Store {
+                Objects.requireNonNull(next, "next");
+                expectedReceipt = Objects.requireNonNull(expectedReceipt, "expectedReceipt");
+            }
+        }
+        record Reset(HandoffIdentity currentHandoff, Optional<ContinuationReceipt> expectedReceipt)
+                implements ContinuationWrite {
+            public Reset {
+                Objects.requireNonNull(currentHandoff, "currentHandoff");
+                expectedReceipt = Objects.requireNonNull(expectedReceipt, "expectedReceipt");
+                if (currentHandoff.counterPolicy() != StopReservation.CounterPolicy.RESET) {
+                    throw new IllegalArgumentException("clearing a private continuation requires reset authorization");
+                }
+            }
+        }
+
+        static ContinuationWrite keep() { return new Keep(); }
+        static ContinuationWrite store(ObservationContinuation next, Optional<ContinuationReceipt> expected) {
+            return new Store(next, expected);
+        }
+        static ContinuationWrite reset(HandoffIdentity current, Optional<ContinuationReceipt> expected) {
+            return new Reset(current, expected);
+        }
+    }
+
     /** The exact owner and time read during a bounded latest-document scan. */
     record LatestSnapshot(String pipelineId, Optional<Scope> scope, Optional<Instant> observedAt) {
         public LatestSnapshot {
@@ -85,6 +166,32 @@ public interface ObservationStore {
         throw new UnsupportedOperationException("scoped observation writes are unavailable");
     }
 
+    /** Publishes one prepared public frame and, when requested, its matching private producer checkpoint. */
+    default PublicationResult saveScoped(Observation observation, Scope scope, ContinuationWrite write) {
+        Objects.requireNonNull(write, "write");
+        if (!(write instanceof ContinuationWrite.Keep)) {
+            throw new UnsupportedOperationException("private continuation publication is unavailable");
+        }
+        return new PublicationResult(saveScoped(observation, scope), Optional.empty());
+    }
+
+    /** Reads the private carrier even when the logical latest has no committed public observation. */
+    default Optional<StoredContinuation> readContinuation(String pipelineId) {
+        return Optional.empty();
+    }
+
+    /** Cold attach or bind is conditional on the exact live handoff and previous private receipt. */
+    default Optional<ContinuationReceipt> saveContinuation(String pipelineId, StopReservation expectedLiveMarker,
+            Optional<ContinuationReceipt> expectedReceipt, ObservationContinuation next) {
+        throw new UnsupportedOperationException("private continuation persistence is unavailable");
+    }
+
+    /** An explicit reset clears only the matched carrier under the exact live reset handoff. */
+    default boolean clearContinuation(String pipelineId, StopReservation expectedLiveReset,
+            ContinuationReceipt expectedReceipt) {
+        throw new UnsupportedOperationException("private continuation clearing is unavailable");
+    }
+
     /** Returns the current observation for a pipeline, or empty if none has been published. */
     Optional<Observation> read(String pipelineId);
 
@@ -127,6 +234,11 @@ public interface ObservationStore {
         throw new UnsupportedOperationException("conditional observation cleanup is unavailable");
     }
 
+    /** Exact cleanup after the caller has proved the artifact is absent or belongs to another incarnation. */
+    default boolean deleteOrphanIfUnchanged(LatestSnapshot snapshot) {
+        return deleteIfUnchanged(snapshot);
+    }
+
     /** Whether a committed digest-keyed current makes the legacy string document cold residue. */
     default boolean hasCommittedManifest(String pipelineId) {
         return false;
@@ -145,6 +257,11 @@ public interface ObservationStore {
     /** Removes only the manifest revision observed by a cold scan. */
     default boolean deleteManifestIfUnchanged(ManifestSnapshot snapshot) {
         throw new UnsupportedOperationException("conditional manifest cleanup is unavailable");
+    }
+
+    /** Cold cleanup also guards a live resource's continuation reservation before retiring its manifest. */
+    default boolean deleteManifestIfUnchanged(ManifestSnapshot snapshot, String pipelineId) {
+        throw new UnsupportedOperationException("handoff-qualified manifest cleanup is unavailable");
     }
 
     /** Expires pending leases and retires/deletes at most {@code limit} physical chunk rows. */

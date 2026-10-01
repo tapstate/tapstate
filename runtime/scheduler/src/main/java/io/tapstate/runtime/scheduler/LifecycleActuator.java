@@ -2,8 +2,12 @@ package io.tapstate.runtime.scheduler;
 
 import java.util.Optional;
 import java.util.function.BooleanSupplier;
+import java.util.function.Predicate;
 import io.tapstate.spi.store.StopAuthority;
 import io.tapstate.spi.store.StopReservation;
+import io.tapstate.spi.store.SuccessorAdmission;
+import io.tapstate.spi.store.HandoffIdentity;
+import io.tapstate.core.lifecycle.PipelineState;
 
 /**
  * Turns a converged lifecycle transition into the matching data-plane job operation. The converge
@@ -26,6 +30,60 @@ public interface LifecycleActuator {
         @Override
         void close();
     }
+
+    /** Atomically admits one successor after the actuator has secured its bounded capture capacity. */
+    @FunctionalInterface
+    interface ReplacementAdmission {
+        Optional<SuccessorAdmission> admit(StopAuthority current, String incarnationId, String submissionBootId);
+    }
+
+    /** Carries the exact durable admission through the start fence and the actual native submission. */
+    interface PreparedReplacement extends PreparedStart {
+        StopReservation admitted();
+
+        Optional<StopReservation.JobIdentity> submittedJob();
+    }
+
+    /** Prepares a replacement while retaining the original durable instruction and counter policy. */
+    default PreparedReplacement prepareReplacement(StopReservation reservation, ReplacementAdmission admission,
+            Predicate<StopReservation> current) {
+        throw new UnsupportedOperationException("durable replacement actuation is unavailable");
+    }
+
+    /** Factual lookup of the recorded slot; empty job means the exact admitted execution is absent. */
+    record SuccessorInspection(Optional<StopReservation.JobIdentity> job, Optional<PipelineState> terminalState) {
+        public SuccessorInspection {
+            java.util.Objects.requireNonNull(job, "job"); java.util.Objects.requireNonNull(terminalState, "terminalState");
+            if (terminalState.filter(state -> state != PipelineState.FAILED && state != PipelineState.COMPLETED).isPresent()
+                    || terminalState.isPresent() && job.isEmpty()) {
+                throw new IllegalArgumentException("a terminal inspection needs its actual job and completed or failed state");
+            }
+        }
+
+        public SuccessorInspection(Optional<StopReservation.JobIdentity> job, boolean terminal) {
+            this(job, Optional.empty());
+            if (terminal) { throw new IllegalArgumentException("terminal inspection requires its factual state"); }
+        }
+
+        public boolean terminal() { return terminalState.isPresent(); }
+    }
+
+    default Optional<SuccessorInspection> inspectSuccessor(StopReservation reservation, BooleanSupplier current) {
+        throw new UnsupportedOperationException("durable replacement inspection is unavailable");
+    }
+
+    /** Installs a verified actual target locally without submission or generation advancement. */
+    default boolean adoptSuccessor(StopReservation reservation, BooleanSupplier current) {
+        throw new UnsupportedOperationException("durable replacement adoption is unavailable");
+    }
+
+    /** Returns only a locally acknowledged durable carrier for this exact bound target. */
+    default Optional<HandoffIdentity> continuationReady(StopReservation reservation, BooleanSupplier current) {
+        return Optional.empty();
+    }
+
+    /** Qualifies a failure's already admitted metric owner even when native submission never happened. */
+    default void observeReplacementFailure(StopReservation reservation, BooleanSupplier current) { }
 
     /**
      * Prepares a start before its RUNNING checkpoint is written. Actuators without bounded admission
@@ -78,6 +136,16 @@ public interface LifecycleActuator {
     /** A native binding supplies a factual absent job or the exact admitted old job before reservation. */
     default Optional<StopReservation.Subject> stopSubject(String pipelineId) {
         return Optional.empty();
+    }
+
+    /** Captures the immutable old execution facts before a phased reservation is accepted. */
+    default Optional<StopReservation.Source> stopSource(String pipelineId) {
+        return stopSubject(pipelineId).map(subject -> switch (subject) {
+            case StopReservation.ExistingJob old -> new StopReservation.Source(old.oldJob().clusterId(),
+                    new io.tapstate.spi.store.ObservationStore.Scope(
+                            old.pipelineIncarnationId(), old.executionGeneration()), old.oldJob());
+            case StopReservation.NoJob absent -> new StopReservation.Source(absent.clusterId(), null, null);
+        });
     }
 
     /** Reads current authority without advancing the execution sequence. */

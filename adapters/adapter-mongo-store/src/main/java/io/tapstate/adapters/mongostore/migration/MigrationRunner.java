@@ -56,7 +56,8 @@ public final class MigrationRunner {
                     new V9RateHistoryIndexes(), new V10SrsConsumerOffsetIndexes(),
                     new V11RateHistoryKeysetIndex(), new V12PipelineEventIndexes(),
                     new V13HistoryRollupIndexes(), new V14LatestObservationChunkIndexes(),
-                    new V15StopReservationShape());
+                    new V15StopReservationShape(),
+                    new V16DurableRebuildHandoff());
 
     /**
      * The highest version this build knows. A store above it is one this build must not open: it was

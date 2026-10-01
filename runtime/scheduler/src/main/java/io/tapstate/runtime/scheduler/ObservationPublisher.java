@@ -50,6 +50,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 import java.util.function.BooleanSupplier;
+import java.util.function.BiPredicate;
 import java.util.stream.Collectors;
 
 /**
@@ -1041,8 +1042,15 @@ public final class ObservationPublisher {
     }
 
     public Optional<Observation> commit(Prepared prepared, ObservationStore.Scope scope, BooleanSupplier current) {
+        return commit(prepared, scope, current, this::save);
+    }
+
+    /** Commits the same measured projection and caller-owned private metadata through one conditional writer. */
+    public Optional<Observation> commit(Prepared prepared, ObservationStore.Scope scope, BooleanSupplier current,
+            BiPredicate<Observation, ObservationStore.Scope> writer) {
         Objects.requireNonNull(prepared, "prepared");
         Objects.requireNonNull(current, "current");
+        Objects.requireNonNull(writer, "writer");
         if (!accountCurrent(prepared, scope, current)) { return Optional.empty(); }
         Observation published = prepared.observation();
         if (prepared.inheritStoredFailure()) {
@@ -1052,7 +1060,7 @@ public final class ObservationPublisher {
                         published.snapshot(), published.positions(), carried, published.observedAt(), published.facts());
             }
         }
-        if (!accountCurrent(prepared, scope, current) || !save(published, scope)) { return Optional.empty(); }
+        if (!accountCurrent(prepared, scope, current) || !writer.test(published, scope)) { return Optional.empty(); }
         // The physical conditional write owns its own fence. Losing this guard suppresses local effects;
         // it cannot undo an already accepted write.
         if (!accountCurrent(prepared, scope, current)) { return Optional.empty(); }

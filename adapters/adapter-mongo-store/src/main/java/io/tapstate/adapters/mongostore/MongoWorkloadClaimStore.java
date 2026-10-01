@@ -9,6 +9,7 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.model.FindOneAndUpdateOptions;
 import com.mongodb.client.model.ReturnDocument;
 import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
@@ -34,12 +35,14 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
     private static final int DUPLICATE_KEY = 11000;
     private static final String LEASE_REMAINING = "leaseRemainingMillis";
     private final MongoCollection<Document> collection;
+    private final MongoExecutionGenerationWrites generations;
 
     public MongoWorkloadClaimStore(MongoCollection<Document> collection) {
         this.collection = Objects.requireNonNull(collection, "collection")
                 .withReadPreference(ReadPreference.primary())
                 .withReadConcern(ReadConcern.MAJORITY)
                 .withWriteConcern(WriteConcern.MAJORITY.withJournal(true));
+        this.generations = new MongoExecutionGenerationWrites(this.collection);
     }
 
     @Override
@@ -98,49 +101,15 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
     @Override
     public Optional<WorkloadClaim> advanceUnderClaim(WorkloadClaim expected, long topologyRevision) {
         Objects.requireNonNull(expected, "expected");
-        if (topologyRevision < 0) {
-            throw new IllegalArgumentException("topologyRevision must not be negative");
-        }
-        Document next = new Document("$set", new Document("executionGeneration", nextExecutionGeneration()));
-        Document advanced = findOneAndUpdate(liveExpected(expected, topologyRevision), List.of(next), false);
-        return Optional.ofNullable(advanced).map(MongoWorkloadClaimStore::read);
+        return StoreIo.call(() -> generations.advanceUnderClaim(null, WorkloadClaimFence.from(expected), topologyRevision))
+                .map(MongoWorkloadClaimStore::read);
     }
 
     @Override
     public OptionalLong advanceStandalone(String clusterId, String pipelineId) {
-        WorkloadClaimKey key = new WorkloadClaimKey(
-                clusterId, WorkloadClaimType.PIPELINE_ACTUATION, pipelineId);
-        Document fields = new Document("clusterId", key.clusterId())
-                .append("resourceType", key.type().name())
-                .append("resourceId", key.resourceId())
-                .append("executionGeneration", nextExecutionGeneration());
-        Document eligible = new Document("$and", List.of(
-                new Document("_id", id(key)),
-                new Document("$or", List.of(
-                        new Document("ownerNodeId", new Document("$exists", false)),
-                        new Document("$and", List.of(
-                                new Document("leaseUntil", new Document("$type", "date")),
-                                new Document("$expr", new Document("$lte", List.of("$leaseUntil", "$$NOW")))))))));
-        List<Document> update = List.of(new Document("$set", fields));
-        Document advanced = findOneAndUpdate(eligible, update, false);
-        if (advanced != null) {
-            return OptionalLong.of(number(advanced, "executionGeneration"));
-        }
-        Document absentClaim = new Document("_id", id(key))
-                .append("ownerNodeId", new Document("$exists", false));
-        try {
-            advanced = collection.findOneAndUpdate(absentClaim, update,
-                    new FindOneAndUpdateOptions().upsert(true).returnDocument(ReturnDocument.AFTER));
-        } catch (MongoException raced) {
-            if (!duplicateKey(raced)) {
-                throw StoreIo.coded(raced);
-            }
-            // A simultaneous insert or an ineligible live claim can occupy this id. Retry only the
-            // conditional advance: the former gets the next number, the latter stays refused.
-            advanced = findOneAndUpdate(eligible, update, false);
-        }
-        return advanced == null ? OptionalLong.empty()
-                : OptionalLong.of(number(advanced, "executionGeneration"));
+        Optional<Document> advanced = StoreIo.call(() -> generations.advanceStandalone(null, clusterId, pipelineId));
+        return advanced.isEmpty() ? OptionalLong.empty()
+                : OptionalLong.of(number(advanced.orElseThrow(), "executionGeneration"));
     }
 
     @Override
@@ -239,16 +208,8 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
         return List.of(new Document("$set", fields));
     }
 
-    private static Document nextExecutionGeneration() {
-        return new Document("$add", List.of(
-                new Document("$ifNull", List.of("$executionGeneration", 0L)), 1L));
-    }
-
     private static Document liveExpected(WorkloadClaim expected, long topologyRevision) {
-        return new Document("$and", List.of(
-                expected(expected),
-                new Document("topologyRevision", topologyRevision),
-                new Document("$expr", new Document("$gt", List.of("$leaseUntil", "$$NOW")))));
+        return MongoExecutionGenerationWrites.liveExpected(WorkloadClaimFence.from(expected), topologyRevision);
     }
 
     private static Document expected(WorkloadClaim expected) {
@@ -264,9 +225,7 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
     }
 
     private static Document id(WorkloadClaimKey key) {
-        return new Document("clusterId", key.clusterId())
-                .append("resourceType", key.type().name())
-                .append("resourceId", key.resourceId());
+        return MongoExecutionGenerationWrites.id(key);
     }
 
     private static Document leaseUntil(Duration ttl) {
@@ -275,7 +234,7 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
                 .append("amount", ttl.toMillis()));
     }
 
-    private static WorkloadClaim read(Document document) {
+    static WorkloadClaim read(Document document) {
         return new WorkloadClaim(
                 new WorkloadClaimKey(
                         document.getString("clusterId"),

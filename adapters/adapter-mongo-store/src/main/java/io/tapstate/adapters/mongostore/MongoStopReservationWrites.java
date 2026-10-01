@@ -20,6 +20,12 @@ import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.StopAuthority;
 import io.tapstate.spi.store.StopReservation;
+import io.tapstate.spi.store.SuccessorAdmission;
+import io.tapstate.spi.store.SuccessorEnd;
+import io.tapstate.spi.store.HandoffIdentity;
+import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimType;
 import org.bson.Document;
@@ -44,14 +50,22 @@ final class MongoStopReservationWrites {
     private static final Fenced FENCED = new Fenced();
 
     private final MongoClient client;
-    private final MongoCollection<Document> states, desired, claims;
+    private final MongoCollection<Document> states, desired, claims, artifacts;
+    private final MongoExecutionGenerationWrites generations;
 
     MongoStopReservationWrites(MongoClient client, MongoCollection<Document> states,
             MongoCollection<Document> desired, MongoCollection<Document> claims) {
+        this(client, states, desired, claims, null);
+    }
+
+    MongoStopReservationWrites(MongoClient client, MongoCollection<Document> states,
+            MongoCollection<Document> desired, MongoCollection<Document> claims, MongoCollection<Document> artifacts) {
         this.client = Objects.requireNonNull(client, "client");
         this.states = Objects.requireNonNull(states, "states");
         this.desired = Objects.requireNonNull(desired, "desired");
         this.claims = Objects.requireNonNull(claims, "claims");
+        this.artifacts = artifacts;
+        this.generations = new MongoExecutionGenerationWrites(claims);
     }
 
     Optional<StopReservation> reserve(CheckpointDoc expected, StopReservation proposal, Instant at) {
@@ -63,13 +77,20 @@ final class MongoStopReservationWrites {
                 || proposal.reservedEpoch() != Math.addExact(expected.epoch(), 1)) {
             throw new IllegalArgumentException("reservation must name the checkpoint's next epoch");
         }
+        if (!proposal.legacy() && proposal.counterPolicy() != StopReservation.CounterPolicy.freeze(expected,
+                proposal.originalDesired())) {
+            throw new IllegalArgumentException("reservation policy requires the exact actual state proof");
+        }
         Document marker = StopReservationDocument.write(proposal);
         return transact(proposal.pipelineId(), session -> {
             Document current = state(session, proposal.pipelineId());
             if (current == null || current.containsKey(StopReservationDocument.FIELD)
                     || !expected.equals(MongoStateStore.toCheckpoint(current))) { throw FENCED; }
             guardDesired(session, proposal.pipelineId(), proposal.originalDesired());
-            guardAuthority(session, proposal.pipelineId(), proposal.subject(), proposal.authorityOrNull());
+            guardAuthority(session, proposal.pipelineId(), proposal.source(), proposal.writerAuthority());
+            if (!proposal.legacy() && proposal.source().scope() != null) {
+                guardArtifact(session, proposal.pipelineId(), proposal.source().scope().pipelineIncarnationId());
+            }
             Document filter = new Document("_id", proposal.pipelineId()).append("epoch", expected.epoch())
                     .append("stateJson", expected.stateJson())
                     .append(StopReservationDocument.FIELD, new Document("$exists", false));
@@ -88,12 +109,17 @@ final class MongoStopReservationWrites {
         Objects.requireNonNull(expected, "expected");
         Objects.requireNonNull(successor, "successor");
         Objects.requireNonNull(at, "at");
+        if (expected.successor() != null && expected.successor().scope().executionGeneration() != successor.executionGeneration()
+                || expected.phase() == StopReservation.Phase.STOPPING && expected.source().scope() != null
+                        && expected.source().scope().executionGeneration() != successor.executionGeneration()) {
+            return Optional.empty();
+        }
         StopReservation rebound = expected.rebind(successor, Math.addExact(expected.reservedEpoch(), 1));
         Document marker = StopReservationDocument.write(rebound);
         return transact(expected.pipelineId(), session -> {
             requireCurrent(session, expected);
             guardDesired(session, expected.pipelineId(), expected.originalDesired());
-            guardAuthority(session, expected.pipelineId(), rebound.subject(), successor);
+            guardAuthority(session, expected.pipelineId(), rebound.source(), successor);
             Document next = states.findOneAndUpdate(session, exactMarker(expected),
                     new Document("$set", new Document(StopReservationDocument.FIELD, marker)
                             .append("touchMillis", at.toEpochMilli()))
@@ -108,14 +134,8 @@ final class MongoStopReservationWrites {
         Objects.requireNonNull(expected, "expected");
         Objects.requireNonNull(successor, "successor");
         Objects.requireNonNull(at, "at");
-        String previousCluster = switch (expected.subject()) {
-            case StopReservation.NoJob absent -> absent.clusterId();
-            case StopReservation.ExistingJob old -> old.oldJob().clusterId();
-        };
-        String successorCluster = switch (successor.subject()) {
-            case StopReservation.NoJob absent -> absent.clusterId();
-            case StopReservation.ExistingJob old -> old.oldJob().clusterId();
-        };
+        String previousCluster = expected.source().clusterId();
+        String successorCluster = successor.source().clusterId();
         if (!expected.pipelineId().equals(successor.pipelineId())
                 || expected.token().equals(successor.token())
                 || successor.sourceEpoch() != expected.reservedEpoch()
@@ -128,7 +148,11 @@ final class MongoStopReservationWrites {
         return transact(expected.pipelineId(), session -> {
             requireCurrent(session, expected);
             guardDesired(session, expected.pipelineId(), successor.originalDesired());
-            guardAuthority(session, expected.pipelineId(), successor.subject(), successor.authorityOrNull());
+            if (!successor.legacy() && successor.counterPolicy() != StopReservation.CounterPolicy.freeze(
+                    MongoStateStore.toCheckpoint(state(session, expected.pipelineId())), successor.originalDesired())) {
+                throw new IllegalArgumentException("replacement policy requires the exact actual state proof");
+            }
+            guardAuthority(session, expected.pipelineId(), successor.source(), successor.writerAuthority());
             Document next = states.findOneAndUpdate(session, exactMarker(expected),
                     new Document("$set", new Document(StopReservationDocument.FIELD, marker)
                             .append("touchMillis", at.toEpochMilli()))
@@ -142,10 +166,14 @@ final class MongoStopReservationWrites {
     Optional<CheckpointDoc> complete(StopReservation expected, Instant at) {
         Objects.requireNonNull(expected, "expected");
         Objects.requireNonNull(at, "at");
+        if (expected.phase() != StopReservation.Phase.STOPPING || !expected.legacy()
+                && expected.originalDesired().targetState() == PipelineState.RUNNING) {
+            throw new IllegalArgumentException("ordinary completion cannot discard a replacement handoff");
+        }
         return transact(expected.pipelineId(), session -> {
             requireCurrent(session, expected);
             guardDesired(session, expected.pipelineId(), expected.originalDesired());
-            guardAuthority(session, expected.pipelineId(), expected.subject(), expected.authorityOrNull());
+            guardAuthority(session, expected.pipelineId(), expected.source(), expected.writerAuthority());
             Document next = states.findOneAndUpdate(session, exactMarker(expected),
                     new Document("$set", new Document("stateJson", StateJson.of(PipelineState.STOPPED))
                             .append("touchMillis", at.toEpochMilli()))
@@ -163,20 +191,18 @@ final class MongoStopReservationWrites {
         Objects.requireNonNull(at, "at");
         if (!expected.pipelineId().equals(successor.pipelineId())
                 || expected.originalDesired().equals(successor)
-                || authority == null && !(expected.subject() instanceof StopReservation.NoJob)) {
+                || authority == null && (expected.writerAuthority() != null || expected.successor() != null
+                        || expected.source().oldJob() != null)) {
             throw new IllegalArgumentException("retirement requires the superseding intent and current authority");
         }
-        String clusterId = switch (expected.subject()) {
-            case StopReservation.NoJob absent -> absent.clusterId();
-            case StopReservation.ExistingJob old -> old.oldJob().clusterId();
-        };
+        String clusterId = expected.source().clusterId();
         if (authority != null && !clusterId.equals(authority.clusterId())) {
             throw new IllegalArgumentException("retirement authority belongs to another cluster");
         }
         return transact(expected.pipelineId(), session -> {
             requireCurrent(session, expected);
             guardDesired(session, expected.pipelineId(), successor);
-            guardAuthority(session, expected.pipelineId(), expected.subject(), authority);
+            guardAuthority(session, expected.pipelineId(), expected.source(), authority);
             Document next = states.findOneAndUpdate(session, exactMarker(expected),
                     new Document("$unset", new Document(StopReservationDocument.FIELD, true))
                             .append("$set", new Document("touchMillis", at.toEpochMilli()))
@@ -186,16 +212,316 @@ final class MongoStopReservationWrites {
         });
     }
 
-    private <T> Optional<T> transact(String id, Function<ClientSession, T> action) {
-        try {
-            return Optional.of(StoreIo.call(id, () -> {
-                try (ClientSession session = client.startSession()) {
-                    return session.withTransaction(() -> action.apply(session), TRANSACTION);
+    Optional<StopReservation> promote(StopReservation expected, DesiredState currentIntent,
+            StopAuthority writer, Instant at) {
+        if (!expected.legacy()) { throw new IllegalArgumentException("only a legacy marker can be promoted"); }
+        return transact(expected.pipelineId(), session -> {
+            requireCurrent(session, expected);
+            guardDesired(session, expected.pipelineId(), currentIntent);
+            guardAuthority(session, expected.pipelineId(), expected.source(), writer);
+            CheckpointDoc actual = MongoStateStore.toCheckpoint(state(session, expected.pipelineId()));
+            StopReservation.Source source = expected.source();
+            if (source.scope() == null && expected.writerAuthority() != null && writer != null
+                    && expected.writerAuthority().executionGeneration() == writer.executionGeneration()
+                    && writer.executionGeneration() > 0 && artifacts != null) {
+                String incarnation = artifactIncarnation(session, expected.pipelineId());
+                if (incarnation != null) {
+                    guardArtifact(session, expected.pipelineId(), incarnation);
+                    source = new StopReservation.Source(source.clusterId(),
+                            new ObservationStore.Scope(incarnation, writer.executionGeneration()), null);
                 }
-            }));
-        } catch (Fenced lost) {
+            }
+            if (source.scope() != null && (writer == null
+                    || source.scope().executionGeneration() != writer.executionGeneration())) { throw FENCED; }
+            StopReservation.CounterPolicy policy;
+            try { policy = StopReservation.CounterPolicy.freeze(actual, expected.originalDesired()); }
+            catch (RuntimeException corrupt) { throw unreadable(expected.pipelineId(), "stateJson"); }
+            StopReservation promoted = moved(expected, StopReservation.Phase.STOPPING, source, policy, writer, null);
+            return writeMarker(session, expected, promoted, null, at);
+        });
+    }
+
+    Optional<StopReservation> replacementPending(StopReservation expected, Instant at) {
+        requirePhase(expected, StopReservation.Phase.STOPPING);
+        if (expected.originalDesired().targetState() != PipelineState.RUNNING) {
+            throw new IllegalArgumentException("replacement requires the original running intent");
+        }
+        return transact(expected.pipelineId(), session -> {
+            guardOriginal(session, expected);
+            StopReservation next = moved(expected, StopReservation.Phase.REPLACEMENT_PENDING,
+                    expected.source(), expected.counterPolicy(), expected.writerAuthority(), null);
+            return writeMarker(session, expected, next, StateJson.of(PipelineState.STOPPED), at);
+        });
+    }
+
+    Optional<SuccessorAdmission> admit(StopReservation expected, String incarnation, String boot, Instant at) {
+        requirePhase(expected, StopReservation.Phase.REPLACEMENT_PENDING);
+        Objects.requireNonNull(incarnation, "incarnation"); Objects.requireNonNull(boot, "boot");
+        if (incarnation.isBlank() || boot.isBlank()) { throw new IllegalArgumentException("admission identities are blank"); }
+        return transact(expected.pipelineId(), session -> {
+            guardOriginal(session, expected);
+            if (!StateJson.of(PipelineState.STOPPED).equals(state(session, expected.pipelineId()).get("stateJson"))) {
+                throw FENCED;
+            }
+            if (expected.source().scope() != null
+                    && !incarnation.equals(expected.source().scope().pipelineIncarnationId())) { throw FENCED; }
+            guardArtifact(session, expected.pipelineId(), incarnation);
+            StopAuthority prior = expected.writerAuthority();
+            Document advanced = prior != null && prior.claim() != null
+                    ? generations.advanceUnderClaim(session, prior.claim(), prior.claim().topologyRevision()).orElseThrow(() -> FENCED)
+                    : generations.advanceStandalone(session, expected.source().clusterId(), expected.pipelineId()).orElseThrow(() -> FENCED);
+            validateClaim(advanced, expected.pipelineId(), true);
+            long generation = ((Number) advanced.get("executionGeneration")).longValue();
+            if (generation < 1) { throw unreadable(expected.pipelineId(), "workloadClaims.executionGeneration"); }
+            Optional<WorkloadClaim> claim = prior != null && prior.claim() != null
+                    ? Optional.of(MongoWorkloadClaimStore.read(advanced)) : Optional.empty();
+            StopAuthority current = claim.map(value -> StopAuthority.claimed(WorkloadClaimFence.from(value)))
+                    .orElseGet(() -> StopAuthority.standalone(expected.source().clusterId(), generation));
+            StopReservation.Successor slot = new StopReservation.Successor(
+                    new ObservationStore.Scope(incarnation, generation), boot, null);
+            StopReservation next = moved(expected, StopReservation.Phase.SUCCESSOR_ADMITTED,
+                    expected.source(), expected.counterPolicy(), current, slot);
+            // True BSON encoding is inside the transaction, so an oversized slot aborts its generation too.
+            StopReservation accepted = writeMarker(session, expected, next, null, at);
+            return new SuccessorAdmission(accepted, claim);
+        });
+    }
+
+    Optional<StopReservation> bind(StopReservation expected, ObservationStore.Scope scope,
+            StopReservation.JobIdentity job, Instant at) {
+        requirePhase(expected, StopReservation.Phase.SUCCESSOR_ADMITTED);
+        Objects.requireNonNull(scope, "scope"); Objects.requireNonNull(job, "job");
+        StopReservation.Successor slot = expected.successor();
+        if (!slot.scope().equals(scope) || !slot.submissionBootId().equals(job.bootId())
+                || !expected.source().clusterId().equals(job.clusterId())) { return Optional.empty(); }
+        return transact(expected.pipelineId(), session -> {
+            guardOriginal(session, expected);
+            guardArtifact(session, expected.pipelineId(), scope.pipelineIncarnationId());
+            StopReservation next = moved(expected, StopReservation.Phase.SUCCESSOR_BOUND,
+                    expected.source(), expected.counterPolicy(), expected.writerAuthority(),
+                    new StopReservation.Successor(slot.scope(), slot.submissionBootId(), job));
+            return writeMarker(session, expected, next, StateJson.of(PipelineState.RUNNING), at);
+        });
+    }
+
+    Optional<StopReservation> retireSuccessor(StopReservation expected, SuccessorEnd end, Instant at) {
+        if (expected.legacy() || expected.successor() == null) {
+            throw new IllegalArgumentException("retirement requires an occupied successor slot");
+        }
+        Objects.requireNonNull(end, "end");
+        StopReservation.Successor slot = expected.successor();
+        boolean matches = switch (end) {
+            case SuccessorEnd.Absent absent -> expected.phase() == StopReservation.Phase.SUCCESSOR_ADMITTED
+                    && slot.scope().equals(absent.scope()) && slot.submissionBootId().equals(absent.submissionBootId());
+            case SuccessorEnd.Terminal terminal -> expected.phase() == StopReservation.Phase.SUCCESSOR_BOUND
+                    && slot.scope().equals(terminal.scope()) && slot.job().equals(terminal.job());
+        };
+        if (!matches) { return Optional.empty(); }
+        return transact(expected.pipelineId(), session -> {
+            guardOriginal(session, expected);
+            StopReservation next = moved(expected, StopReservation.Phase.REPLACEMENT_PENDING,
+                    expected.source(), expected.counterPolicy(), expected.writerAuthority(), null);
+            return writeMarker(session, expected, next, StateJson.of(PipelineState.STOPPED), at);
+        });
+    }
+
+    Optional<StopReservation> recordTerminal(StopReservation expected, SuccessorEnd.Terminal end,
+            PipelineState terminal, Instant at) {
+        requirePhase(expected, StopReservation.Phase.SUCCESSOR_BOUND);
+        Objects.requireNonNull(end, "end"); Objects.requireNonNull(terminal, "terminal");
+        if (terminal != PipelineState.FAILED && terminal != PipelineState.COMPLETED) {
+            throw new IllegalArgumentException("only factual completed or failed successors are terminal");
+        }
+        if (!expected.successor().scope().equals(end.scope()) || !expected.successor().job().equals(end.job())) {
             return Optional.empty();
         }
+        return transact(expected.pipelineId(), session -> {
+            guardOriginal(session, expected);
+            String current = state(session, expected.pipelineId()).getString("stateJson");
+            String desiredTerminal = StateJson.of(terminal);
+            if (desiredTerminal.equals(current)) { return expected; }
+            if (!StateJson.of(PipelineState.RUNNING).equals(current)) { throw FENCED; }
+            return writeMarker(session, expected, moved(expected, StopReservation.Phase.SUCCESSOR_BOUND,
+                    expected.source(), expected.counterPolicy(), expected.writerAuthority(), expected.successor()),
+                    desiredTerminal, at);
+        });
+    }
+
+    Optional<CheckpointDoc> completeHandoff(StopReservation expected, HandoffIdentity ready, Instant at) {
+        requirePhase(expected, StopReservation.Phase.SUCCESSOR_BOUND);
+        if (expected.counterPolicy() == StopReservation.CounterPolicy.CONTINUE
+                && !expected.handoffIdentity().equals(ready)
+                || expected.counterPolicy() == StopReservation.CounterPolicy.RESET
+                        && ready != null && !expected.handoffIdentity().equals(ready)) { return Optional.empty(); }
+        return transact(expected.pipelineId(), session -> {
+            guardOriginal(session, expected);
+            guardArtifact(session, expected.pipelineId(), expected.successor().scope().pipelineIncarnationId());
+            String actual = state(session, expected.pipelineId()).getString("stateJson");
+            if (!StateJson.of(PipelineState.RUNNING).equals(actual) && !StateJson.of(PipelineState.FAILED).equals(actual)
+                    && !StateJson.of(PipelineState.COMPLETED).equals(actual)) { throw FENCED; }
+            Document next = states.findOneAndUpdate(session,
+                    exactMarker(expected).append("stateJson", actual),
+                    new Document("$unset", new Document(StopReservationDocument.FIELD, true))
+                            .append("$set", new Document("touchMillis", at.toEpochMilli()))
+                            .append("$inc", new Document("epoch", 1L)), RETURN_AFTER);
+            if (next == null) { throw FENCED; }
+            return MongoStateStore.toCheckpoint(next);
+        });
+    }
+
+    Optional<CheckpointDoc> failReplacement(StopReservation expected,
+            Optional<StopReservation.JobIdentity> factualJob, Instant at) {
+        Objects.requireNonNull(expected, "expected"); Objects.requireNonNull(factualJob, "factualJob");
+        Objects.requireNonNull(at, "at");
+        if (expected.legacy() || expected.phase() != StopReservation.Phase.REPLACEMENT_PENDING
+                && expected.phase() != StopReservation.Phase.SUCCESSOR_ADMITTED) {
+            throw new IllegalArgumentException("replacement refusal requires the pending or admitted marker");
+        }
+        StopReservation.Successor slot = expected.successor();
+        if (factualJob.isPresent() && (slot == null
+                || !slot.submissionBootId().equals(factualJob.orElseThrow().bootId())
+                || !expected.source().clusterId().equals(factualJob.orElseThrow().clusterId())
+                || factualJob.orElseThrow().equals(expected.source().oldJob()))) {
+            return Optional.empty();
+        }
+        return transact(expected.pipelineId(), session -> {
+            guardOriginal(session, expected);
+            if (!StateJson.of(PipelineState.STOPPED).equals(state(session, expected.pipelineId()).get("stateJson"))) {
+                throw FENCED;
+            }
+            String incarnation = slot != null ? slot.scope().pipelineIncarnationId()
+                    : expected.source().scope() != null ? expected.source().scope().pipelineIncarnationId()
+                            : artifactIncarnation(session, expected.pipelineId());
+            if (incarnation == null) { throw FENCED; }
+            guardArtifact(session, expected.pipelineId(), incarnation);
+            if (factualJob.isPresent()) {
+                StopReservation bound = moved(expected, StopReservation.Phase.SUCCESSOR_BOUND,
+                        expected.source(), expected.counterPolicy(), expected.writerAuthority(),
+                        new StopReservation.Successor(slot.scope(), slot.submissionBootId(), factualJob.orElseThrow()));
+                writeMarker(session, expected, bound, StateJson.of(PipelineState.FAILED), at);
+                return MongoStateStore.toCheckpoint(state(session, expected.pipelineId()));
+            }
+            Document failed = states.findOneAndUpdate(session,
+                    exactMarker(expected).append("stateJson", StateJson.of(PipelineState.STOPPED)),
+                    new Document("$set", new Document("stateJson", StateJson.of(PipelineState.FAILED))
+                            .append("touchMillis", at.toEpochMilli()))
+                            .append("$unset", new Document(StopReservationDocument.FIELD, true))
+                            .append("$inc", new Document("epoch", 1L)), RETURN_AFTER);
+            if (failed == null) { throw FENCED; }
+            return MongoStateStore.toCheckpoint(failed);
+        });
+    }
+
+    private static void requirePhase(StopReservation marker, StopReservation.Phase phase) {
+        Objects.requireNonNull(marker, "marker");
+        if (marker.legacy() || marker.phase() != phase) {
+            throw new IllegalArgumentException("handoff phase does not permit this transition");
+        }
+    }
+
+    private void guardOriginal(ClientSession session, StopReservation expected) {
+        requireCurrent(session, expected);
+        guardDesired(session, expected.pipelineId(), expected.originalDesired());
+        guardAuthority(session, expected.pipelineId(), expected.source(), expected.writerAuthority());
+        if (artifacts != null && expected.source().scope() != null) {
+            guardArtifact(session, expected.pipelineId(), expected.source().scope().pipelineIncarnationId());
+        }
+    }
+
+    private static StopReservation moved(StopReservation expected, StopReservation.Phase phase,
+            StopReservation.Source source, StopReservation.CounterPolicy policy,
+            StopAuthority writer, StopReservation.Successor successor) {
+        return new StopReservation(expected.pipelineId(), expected.token(), expected.sourceEpoch(),
+                Math.incrementExact(expected.reservedEpoch()), expected.originalDesired(), source, phase, policy,
+                writer, successor, StopReservation.CURRENT_FORMAT);
+    }
+
+    private StopReservation writeMarker(ClientSession session, StopReservation expected,
+            StopReservation next, String stateJson, Instant at) {
+        Document fields = new Document(StopReservationDocument.FIELD, StopReservationDocument.write(next))
+                .append("touchMillis", at.toEpochMilli());
+        if (stateJson != null) { fields.append("stateJson", stateJson); }
+        Document applied = states.findOneAndUpdate(session, exactMarker(expected),
+                new Document("$set", fields).append("$inc", new Document("epoch", 1L)), RETURN_AFTER);
+        if (applied == null) { throw FENCED; }
+        return StopReservationDocument.read(expected.pipelineId(), MongoStateStore.toCheckpoint(applied).epoch(),
+                requireMarker(applied, expected.pipelineId()));
+    }
+
+    private String artifactIncarnation(ClientSession session, String id) {
+        if (artifacts == null) { return null; }
+        Document artifact = artifacts.find(session, new Document("_id", id).append("kind", "pipeline")).first();
+        if (artifact == null || !artifact.containsKey("pipelineIncarnationId")) { return null; }
+        Object raw = artifact.get("pipelineIncarnationId");
+        if (!(raw instanceof String value) || value.isBlank()) { throw unreadable(id, "pipelineIncarnationId"); }
+        return value;
+    }
+
+    private void guardArtifact(ClientSession session, String id, String incarnation) {
+        if (artifacts == null) { throw new UnsupportedOperationException("handoff admission requires artifact fencing"); }
+        Document filter = new Document("_id", id).append("kind", "pipeline").append("pipelineIncarnationId", incarnation);
+        if (artifacts.updateOne(session, filter, PROVE_DESIRED).getMatchedCount() != 1) { throw FENCED; }
+    }
+
+    /** Runs only cold storage commands after all lifecycle guards have written in the same transaction. */
+    <T> Optional<T> withExpectedHandoff(StopReservation expected, Function<ClientSession, T> coldWrites) {
+        Objects.requireNonNull(expected, "expected"); Objects.requireNonNull(coldWrites, "coldWrites");
+        return transact(expected.pipelineId(), session -> {
+            guardOriginal(session, expected);
+            return coldWrites.apply(session);
+        });
+    }
+
+    /** A cold delete cannot race an active continuation or create a phantom checkpoint as its fence. */
+    <T> Optional<T> withNoContinuationHandoff(String id, Function<ClientSession, T> coldWrites) {
+        Objects.requireNonNull(id, "id"); Objects.requireNonNull(coldWrites, "coldWrites");
+        return transact(id, session -> {
+            Document observed = state(session, id);
+            if (observed == null) { throw FENCED; }
+            CheckpointDoc checkpoint = MongoStateStore.toCheckpoint(observed);
+            Document marker = requireMarkerOrAbsent(observed, id);
+            if (marker != null) {
+                StopReservation handoff = StopReservationDocument.read(id, checkpoint.epoch(), marker);
+                StopReservation.CounterPolicy policy;
+                try {
+                    policy = handoff.legacy() ? StopReservation.CounterPolicy.freeze(checkpoint, handoff.originalDesired())
+                            : handoff.counterPolicy();
+                } catch (RuntimeException corrupt) { throw unreadable(id, "stateJson"); }
+                if (policy == StopReservation.CounterPolicy.CONTINUE) { throw FENCED; }
+            }
+            Object previousGuard = observed.get("stopGuardVersion");
+            if (previousGuard != null && !(previousGuard instanceof Long || previousGuard instanceof Integer)
+                    || previousGuard instanceof Number number && number.longValue() < 0) {
+                throw unreadable(id, "stopGuardVersion");
+            }
+            Document filter = new Document("_id", id).append("epoch", checkpoint.epoch())
+                    .append("stateJson", checkpoint.stateJson()).append(StopReservationDocument.FIELD,
+                            marker == null ? new Document("$exists", false) : marker);
+            if (states.updateOne(session, filter, new Document("$inc", new Document("stopGuardVersion", 1L)))
+                    .getMatchedCount() != 1) { throw FENCED; }
+            return coldWrites.apply(session);
+        });
+    }
+
+    /** A conditional cold write uses this sentinel to abort, rather than commit partial guard writes. */
+    static RuntimeException fencedHandoff() { return FENCED; }
+
+    private <T> Optional<T> transact(String id, Function<ClientSession, T> action) {
+        for (int attempt = 0; attempt < 8; attempt++) {
+            try {
+                T result;
+                try (ClientSession session = client.startSession()) {
+                    result = session.withTransaction(() -> action.apply(session), TRANSACTION);
+                }
+                return Optional.of(result);
+            } catch (Fenced lost) {
+                return Optional.empty();
+            } catch (MongoException failure) {
+                if (failure.getCode() == 11000 && attempt < 7) { continue; }
+                throw StoreIo.coded(failure);
+            }
+        }
+        throw new IllegalStateException("bounded transaction retry fell through");
     }
 
     private Document state(ClientSession session, String id) {
@@ -215,10 +541,11 @@ final class MongoStopReservationWrites {
     }
 
     private static Document exactMarker(StopReservation expected) {
-        return new Document("_id", expected.pipelineId())
-                .append("epoch", expected.reservedEpoch())
-                .append(StopReservationDocument.FIELD + ".token", expected.token())
-                .append(StopReservationDocument.FIELD + ".reservedEpoch", expected.reservedEpoch());
+        Document filter = new Document("_id", expected.pipelineId()).append("epoch", expected.reservedEpoch())
+                .append(StopReservationDocument.FIELD + (expected.legacy() ? ".token" : ".t"), expected.token())
+                .append(StopReservationDocument.FIELD + (expected.legacy() ? ".reservedEpoch" : ".e"), expected.reservedEpoch());
+        if (!expected.legacy()) { filter.append(StopReservationDocument.FIELD + ".p", expected.phase().name()); }
+        return filter;
     }
 
     private static Document requireMarker(Document state, String id) {
@@ -267,15 +594,15 @@ final class MongoStopReservationWrites {
 
     /** Current authority and this checkpoint transition write in one short Mongo transaction. */
     private void guardAuthority(ClientSession session, String id,
-            StopReservation.Subject subject, StopAuthority chosen) {
+            StopReservation.Source source, StopAuthority chosen) {
         if (chosen != null) {
             guardKnownAuthority(session, id, chosen);
             return;
         }
-        if (!(subject instanceof StopReservation.NoJob noJob)) {
+        if (source.oldJob() != null) {
             throw new IllegalArgumentException("a real old job requires current execution authority");
         }
-        guardColdNoJob(session, id, noJob.clusterId());
+        guardColdNoJob(session, id, source.clusterId());
     }
 
     private void guardKnownAuthority(ClientSession session, String id, StopAuthority authority) {
@@ -330,9 +657,7 @@ final class MongoStopReservationWrites {
     }
 
     private static Document claimId(String clusterId, String id) {
-        return new Document("clusterId", clusterId)
-                .append("resourceType", WorkloadClaimType.PIPELINE_ACTUATION.name())
-                .append("resourceId", id);
+        return MongoExecutionGenerationWrites.id(new WorkloadClaimKey(clusterId, WorkloadClaimType.PIPELINE_ACTUATION, id));
     }
 
     private static void validateClaim(Document stored, String id, boolean requireGeneration) {

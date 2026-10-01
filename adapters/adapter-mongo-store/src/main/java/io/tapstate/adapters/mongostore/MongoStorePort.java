@@ -172,7 +172,8 @@ public final class MongoStorePort implements StorePort {
         MongoDatabase database = connection.database();
         this.artifacts = new MongoArtifactStore(connection.client(), SystemCollections.ARTIFACTS.on(database));
         this.state = new MongoStateStore(connection.client(), SystemCollections.PIPELINE_STATE.on(database),
-                SystemCollections.PIPELINE_DESIRED.on(database), SystemCollections.WORKLOAD_CLAIMS.on(database));
+                SystemCollections.PIPELINE_DESIRED.on(database), SystemCollections.WORKLOAD_CLAIMS.on(database),
+                SystemCollections.ARTIFACTS.on(database));
         this.desired = new MongoDesiredStore(SystemCollections.PIPELINE_DESIRED.on(database));
         this.catalog = new MongoCatalogStore(SystemCollections.CONNECTIONS.on(database));
         this.schemas = new MongoSchemaStore(SystemCollections.SOURCE_SCHEMAS.on(database));
@@ -183,7 +184,8 @@ public final class MongoStorePort implements StorePort {
                 new MongoConnectionTestResultStore(SystemCollections.CONNECTION_TEST_RESULTS.on(database));
         this.observations = new MongoObservationStore(connection.client(),
                 SystemCollections.PIPELINE_OBSERVATION.on(database),
-                SystemCollections.PIPELINE_OBSERVATION_CHUNKS.on(database));
+                SystemCollections.PIPELINE_OBSERVATION_CHUNKS.on(database),
+                ((MongoStateStore) this.state).handoffWrites());
         this.rateHistory = new MongoRateHistoryStore(
                 database, SystemCollections.PIPELINE_RATE_HISTORY.on(database), rateHistoryRetention);
         this.historyRollups = new MongoHistoryRollupStore(

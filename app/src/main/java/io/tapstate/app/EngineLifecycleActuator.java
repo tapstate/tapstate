@@ -8,6 +8,8 @@ import io.tapstate.runtime.scheduler.StartDeferred;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.StopAuthority;
 import io.tapstate.spi.store.StopReservation;
+import io.tapstate.spi.store.SuccessorAdmission;
+import io.tapstate.spi.store.HandoffIdentity;
 import io.tapstate.runtime.engine.EngineError;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.srs.SnapshotCapacityUnavailable;
@@ -20,6 +22,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Map;
 import java.util.function.BooleanSupplier;
+import java.util.function.Predicate;
 
 /**
  * Binds the converge loop's lifecycle actuator seam to the Jet execution engine and the source-side capture
@@ -123,6 +126,30 @@ final class EngineLifecycleActuator implements LifecycleActuator {
 
     private PreparedStart startPrepared(String pipelineId, DagSource.StartPreparation prepared,
             String incarnation) {
+        return startPrepared(pipelineId, prepared, incarnation, null, null, null);
+    }
+
+    @Override
+    public PreparedReplacement prepareReplacement(StopReservation reservation, ReplacementAdmission admission,
+            Predicate<StopReservation> current) {
+        Objects.requireNonNull(reservation, "reservation");
+        Objects.requireNonNull(admission, "admission");
+        Objects.requireNonNull(current, "current");
+        String pipelineId = reservation.pipelineId();
+        if (reservation.phase() != StopReservation.Phase.REPLACEMENT_PENDING || engine.hasLiveJob(pipelineId)) {
+            throw new StartDeferred(StartDeferred.Reason.DEPENDENCY);
+        }
+        DagSource.StartPreparation prepared = dagSource.prepareStart(pipelineId, stateTeardown.defaultDatabase());
+        String incarnation = incarnations == null ? null : incarnations.current(pipelineId).orElse(null);
+        if (incarnation == null) {
+            throw new StartDeferred(StartDeferred.Reason.DEPENDENCY);
+        }
+        return startPrepared(pipelineId, prepared, incarnation, reservation, admission, current);
+    }
+
+    private PreparedReplacement startPrepared(String pipelineId, DagSource.StartPreparation prepared,
+            String incarnation, StopReservation replacement, ReplacementAdmission admission,
+            Predicate<StopReservation> currentAdmission) {
         if (captureCoordinator.hasActiveCapture(pipelineId)) {
             // A prior job can die while its source capture remains open. Close that run before opening
             // another so its reader cursor is not reused by a new job that resumes from an earlier sink ACK.
@@ -153,8 +180,17 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // Capacity and physical-ring admission are settled before advancing the durable execution
         // generation. A refused attempt is still a pending start, not a new data-plane execution.
         PipelineActuationOwnership.Execution execution;
+        SuccessorAdmission admitted;
         try {
-            execution = actuation.beginExecution(pipelineId);
+            if (replacement == null) {
+                execution = actuation.beginExecution(pipelineId);
+                admitted = null;
+            } else {
+                StopAuthority current = actuation.stopAuthority(pipelineId).orElse(null);
+                admitted = admission.admit(current, incarnation, engine.submissionBootId())
+                        .orElseThrow(() -> new StartDeferred(StartDeferred.Reason.DEPENDENCY));
+                execution = actuation.adoptAdmission(admitted);
+            }
         } catch (RuntimeException | Error failure) {
             try {
                 captureCoordinator.stopCapture(pipelineId, false);
@@ -171,8 +207,14 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         }
         ObservationStore.Scope observationScope;
         try {
-            observationScope = observationScopes == null ? null
-                    : observationScopes.begin(pipelineId, incarnation, execution.fence().executionGeneration());
+            if (observationScopes == null) {
+                observationScope = null;
+            } else if (replacement != null && replacement.counterPolicy() == StopReservation.CounterPolicy.RESET) {
+                observationScope = observationScopes.beginResetExecution(pipelineId,
+                        new ObservationStore.Scope(incarnation, execution.fence().executionGeneration()));
+            } else {
+                observationScope = observationScopes.begin(pipelineId, incarnation, execution.fence().executionGeneration());
+            }
         } catch (RuntimeException | Error failure) {
             try {
                 captureCoordinator.stopCapture(pipelineId, false);
@@ -208,14 +250,31 @@ final class EngineLifecycleActuator implements LifecycleActuator {
             }
             throw new StartDeferred(StartDeferred.Reason.DEPENDENCY);
         }
-        return new PreparedStart() {
+        SuccessorAdmission accepted = admitted;
+        return new PreparedReplacement() {
             private boolean submitted;
             private boolean closed;
+            private Engine.ExecutionJob submittedExecution;
+
+            @Override public StopReservation admitted() {
+                if (accepted == null) { throw new IllegalStateException("ordinary start has no replacement admission"); }
+                return accepted.reservation();
+            }
+
+            @Override public Optional<StopReservation.JobIdentity> submittedJob() {
+                return submitted ? engine.executionJob(pipelineId).filter(job -> observationScope != null
+                        && observationScope.equals(job.scope())).map(Engine.ExecutionJob::job) : Optional.empty();
+            }
 
             @Override
             public void submit() {
                 if (closed || submitted) {
                     throw new IllegalStateException("prepared pipeline start was closed or already submitted");
+                }
+                if (accepted != null && (!currentAdmission.test(accepted.reservation())
+                        || !Objects.equals(accepted.reservation().writerAuthority(),
+                                actuation.stopAuthority(pipelineId).orElse(null)))) {
+                    throw new StartDeferred(StartDeferred.Reason.DEPENDENCY);
                 }
                 submitted = true;
                 PipelineLogContext submitLogContext = PipelineLogContext.capture();
@@ -226,18 +285,32 @@ final class EngineLifecycleActuator implements LifecycleActuator {
                     } else {
                         engine.submit(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings(),
                                 actuation.clusterId(), observationScope);
+                        submittedExecution = engine.executionJob(pipelineId).filter(job -> observationScope.equals(job.scope())
+                                && actuation.clusterId().equals(job.job().clusterId())
+                                && engine.submissionBootId().equals(job.job().bootId())).orElseThrow(
+                                        () -> new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED,
+                                                Map.of("pipeline", pipelineId), null));
                     }
                     captureCoordinator.activateSnapshot(pipelineId);
                 } catch (RuntimeException | Error failure) {
                     // A submitted job or reserved snapshot may already exist. Give both back before
                     // another convergence pass retries.
                     try {
-                        engine.cancel(pipelineId);
+                        if (submittedExecution != null) {
+                            engine.cancelExact(pipelineId, submittedExecution);
+                        } else if (observationScope == null) {
+                            engine.cancel(pipelineId);
+                        }
                     } catch (RuntimeException cleanup) {
                         failure.addSuppressed(cleanup);
                     }
                     try {
-                        captureCoordinator.stopCapture(pipelineId, false);
+                        if ((accepted == null || currentAdmission.test(accepted.reservation()))
+                                && (observationScope == null
+                                        || submittedExecution == null && engine.noUnfinishedJob(pipelineId)
+                                        || submittedExecution != null && engine.isCurrentOrAbsent(pipelineId, submittedExecution))) {
+                            captureCoordinator.stopCapture(pipelineId, false);
+                        }
                     } catch (RuntimeException cleanup) {
                         failure.addSuppressed(cleanup);
                     }
@@ -372,20 +445,129 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     }
 
     @Override
+    public Optional<StopReservation.Source> stopSource(String pipelineId) {
+        StopReservation.Subject subject = stopSubject(pipelineId).orElseThrow();
+        return Optional.of(switch (subject) {
+            case StopReservation.ExistingJob old -> new StopReservation.Source(old.oldJob().clusterId(),
+                    new ObservationStore.Scope(old.pipelineIncarnationId(), old.executionGeneration()), old.oldJob());
+            case StopReservation.NoJob absent -> {
+                ObservationStore.Scope sourceScope = null;
+                StopAuthority known = absent.knownAuthority();
+                if (known != null && known.executionGeneration() > 0 && incarnations != null) {
+                    sourceScope = incarnations.current(pipelineId)
+                            .map(incarnation -> new ObservationStore.Scope(incarnation, known.executionGeneration()))
+                            .orElse(null);
+                }
+                yield new StopReservation.Source(absent.clusterId(), sourceScope, null);
+            }
+        });
+    }
+
+    @Override
+    public Optional<SuccessorInspection> inspectSuccessor(StopReservation reservation, BooleanSupplier current) {
+        if (reservation.successor() == null || !current.getAsBoolean()) { return Optional.empty(); }
+        String id = reservation.pipelineId();
+        var slot = reservation.successor();
+        var nativeJob = engine.executionJob(id);
+        if (!current.getAsBoolean()) { return Optional.empty(); }
+        if (nativeJob.isPresent()) {
+            Engine.ExecutionJob observed = nativeJob.orElseThrow();
+            boolean matches = slot.scope().equals(observed.scope())
+                    && slot.submissionBootId().equals(observed.job().bootId())
+                    && reservation.source().clusterId().equals(observed.job().clusterId())
+                    && (slot.job() == null || slot.job().equals(observed.job()));
+            if (matches) {
+                var terminal = engine.terminalStateExact(id, observed);
+                return current.getAsBoolean()
+                        ? Optional.of(new SuccessorInspection(Optional.of(observed.job()), terminal)) : Optional.empty();
+            }
+            // Only terminal history can coexist with an admitted slot that was never submitted.
+            if (!engine.noUnfinishedJob(id)) { return Optional.empty(); }
+        }
+        if (slot.job() != null && !engine.awaitTerminalExact(id,
+                new Engine.ExecutionJob(slot.job(), slot.scope()), Duration.ZERO)) { return Optional.empty(); }
+        return current.getAsBoolean() ? Optional.of(new SuccessorInspection(Optional.empty(), Optional.empty())) : Optional.empty();
+    }
+
+    @Override
+    public boolean adoptSuccessor(StopReservation reservation, BooleanSupplier current) {
+        var actual = inspectSuccessor(reservation, current).orElse(null);
+        if (reservation.phase() != StopReservation.Phase.SUCCESSOR_BOUND || actual == null
+                || actual.job().filter(reservation.successor().job()::equals).isEmpty()
+                || !current.getAsBoolean()) { return false; }
+        if (observationScopes == null) { return current.getAsBoolean(); }
+        if (reservation.counterPolicy() == StopReservation.CounterPolicy.RESET) {
+            if (observationScopes.current(reservation.pipelineId()).filter(reservation.successor().scope()::equals).isEmpty()
+                    || observationScopes.activeContinuationKey(reservation.pipelineId()).isPresent()) {
+                observationScopes.beginResetExecution(reservation.pipelineId(), reservation.successor().scope());
+            }
+        } else {
+            var ticket = observationScopes.beginTargetContinuation(reservation.pipelineId(), continuationKey(reservation),
+                    new ObservationScopeRegistry.ActualTarget(reservation.successor().scope(), reservation.successor().job()),
+                    current).orElse(null);
+            if (ticket == null) { return false; }
+            var adopted = observationScopes.adoptTargetContinuation(ticket, Optional.empty(), Optional.empty());
+            if (adopted.status() == ObservationScopeRegistry.PreparationStatus.INVALIDATED) { return false; }
+        }
+        return current.getAsBoolean();
+    }
+
+    @Override
+    public Optional<HandoffIdentity> continuationReady(StopReservation reservation, BooleanSupplier current) {
+        if (observationScopes == null || !current.getAsBoolean()) { return Optional.empty(); }
+        return observationScopes.durableReceipt(reservation.pipelineId(), reservation.handoffIdentity())
+                .filter(receipt -> current.getAsBoolean()).map(receipt -> reservation.handoffIdentity());
+    }
+
+    @Override
+    public void observeReplacementFailure(StopReservation reservation, BooleanSupplier current) {
+        var scope = reservation.successor() == null ? reservation.source().scope() : reservation.successor().scope();
+        if (scope != null && observationScopes != null && current.getAsBoolean()
+                && (incarnations == null || incarnations.current(reservation.pipelineId())
+                        .filter(scope.pipelineIncarnationId()::equals).isPresent())) {
+            observationScopes.begin(reservation.pipelineId(), scope.pipelineIncarnationId(), scope.executionGeneration());
+        }
+    }
+
+    private static ObservationScopeRegistry.ContinuationKey continuationKey(StopReservation marker) {
+        return new ObservationScopeRegistry.ContinuationKey(marker.token(), marker.source().scope(),
+                marker.counterPolicy(), marker.writerAuthority());
+    }
+
+    @Override
     public boolean finishStop(StopReservation reservation, boolean continuing, boolean firstAttempt,
             boolean retiring, BooleanSupplier current) {
         String id = reservation.pipelineId();
         if (!current.getAsBoolean()) { return false; }
-        Engine.ExecutionJob old = reservation.subject() instanceof StopReservation.ExistingJob existing
-                ? new Engine.ExecutionJob(existing.oldJob(), new ObservationStore.Scope(
-                        existing.pipelineIncarnationId(), existing.executionGeneration())) : null;
+        Engine.ExecutionJob old;
+        if (reservation.successor() != null) {
+            var inspected = inspectSuccessor(reservation, current).orElse(null);
+            if (inspected == null) { return false; }
+            old = inspected.job().map(job -> new Engine.ExecutionJob(job, reservation.successor().scope())).orElse(null);
+        } else {
+            old = reservation.source().oldJob() == null ? null
+                    : new Engine.ExecutionJob(reservation.source().oldJob(), reservation.source().scope());
+        }
+        if (continuing && !reservation.legacy() && observationScopes != null) {
+            var previousSource = reservation.phase() == StopReservation.Phase.SUCCESSOR_BOUND
+                    ? Optional.of(new ObservationScopeRegistry.ActualTarget(
+                            reservation.successor().scope(), reservation.successor().job()))
+                    : Optional.<ObservationScopeRegistry.ActualTarget>empty();
+            var ticket = observationScopes.beginSourceContinuation(id, continuationKey(reservation),
+                    previousSource, current).orElse(null);
+            if (ticket != null) {
+                // Already known local data is cheap. Durable reads and native collection belong to telemetry workers.
+                observationScopes.prepareSourceContinuation(ticket, Optional.empty(), Optional.empty(),
+                        ObservationScopeRegistry.SourceReadStatus.UNAVAILABLE);
+            }
+        }
         if (old == null) {
             if (!engine.noUnfinishedJob(id)) { return false; }
         } else {
-            if (continuing && !prepareStopContinuation(id, old, firstAttempt, current)) {
+            if (continuing && reservation.legacy() && !prepareStopContinuation(id, old, firstAttempt, current)) {
                 return false;
             }
-            if (firstAttempt && !continuing && engine.isCurrentOrAbsent(id, old)) {
+            if (reservation.legacy() && firstAttempt && !continuing && engine.isCurrentOrAbsent(id, old)) {
                 captureCurrentMetrics(id);
             }
             if (!current.getAsBoolean()) { return false; }

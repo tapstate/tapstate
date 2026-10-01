@@ -4,6 +4,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.StopAuthority;
 import io.tapstate.spi.store.StopReservation;
 import io.tapstate.spi.store.WorkloadClaimFence;
@@ -26,6 +27,127 @@ final class StopReservationDocument {
     private StopReservationDocument() { }
 
     static Document write(StopReservation reservation) {
+        if (reservation.legacy()) { return writeLegacy(reservation); }
+        StopReservation.Source source = reservation.source();
+        Document origin = new Document("c", source.clusterId())
+                .append("i", source.scope() == null ? null : source.scope().pipelineIncarnationId())
+                .append("g", source.scope() == null ? null : source.scope().executionGeneration())
+                .append("j", source.oldJob() == null ? null : new Document("i", source.oldJob().jobId())
+                        .append("b", source.oldJob().bootId()));
+        StopAuthority authority = reservation.writerAuthority();
+        Document writer = authority == null ? null : new Document("g", authority.executionGeneration());
+        if (writer != null && authority.claim() != null) {
+            WorkloadClaimFence claim = authority.claim();
+            writer.append("n", claim.owner().nodeId()).append("b", claim.owner().bootId())
+                    .append("c", claim.claimGeneration()).append("r", claim.topologyRevision());
+        }
+        StopReservation.Successor next = reservation.successor();
+        Document target = next == null ? null : new Document("i", next.scope().pipelineIncarnationId())
+                .append("g", next.scope().executionGeneration()).append("b", next.submissionBootId())
+                .append("j", next.job() == null ? null : next.job().jobId());
+        DesiredState intent = reservation.originalDesired();
+        Document wanted = new Document("t", intent.targetState().name()).append("r", intent.revision())
+                .append("u", intent.purgeState()).append("a", intent.assemblyRevision())
+                .append("b", intent.reassemble()).append("z", intent.rebuiltAtStateEpoch());
+        Document marker = new Document("v", StopReservation.CURRENT_FORMAT).append("t", reservation.token())
+                .append("s", reservation.sourceEpoch()).append("e", reservation.reservedEpoch())
+                .append("p", reservation.phase().name()).append("c", reservation.counterPolicy().name())
+                .append("d", wanted).append("o", origin).append("w", writer).append("x", target);
+        requireSize(marker, reservation.pipelineId());
+        return marker;
+    }
+
+    static StopReservation read(String pipelineId, long checkpointEpoch, Document marker) {
+        if (!marker.containsKey("v")) { return readLegacy(pipelineId, checkpointEpoch, marker); }
+        try {
+            if (size(marker) > MAX_BYTES || number(marker, "v", pipelineId, FIELD) != StopReservation.CURRENT_FORMAT) {
+                throw unreadable(pipelineId, FIELD);
+            }
+            long epoch = number(marker, "e", pipelineId, FIELD);
+            if (epoch != checkpointEpoch) { throw unreadable(pipelineId, FIELD + ".e"); }
+            Document origin = document(marker, "o", pipelineId, FIELD);
+            String cluster = string(origin, "c", pipelineId, FIELD + ".o");
+            requireFields(origin, pipelineId, "i", "g", "j");
+            ObservationStore.Scope scope = null;
+            if (origin.get("i") != null || origin.get("g") != null) {
+                scope = new ObservationStore.Scope(string(origin, "i", pipelineId, FIELD + ".o"),
+                        number(origin, "g", pipelineId, FIELD + ".o"));
+            }
+            Document old = optionalDocument(origin, "j", pipelineId);
+            StopReservation.JobIdentity oldJob = old == null ? null : new StopReservation.JobIdentity(cluster,
+                    number(old, "i", pipelineId, FIELD + ".o.j"), string(old, "b", pipelineId, FIELD + ".o.j"));
+            Document writer = optionalDocument(marker, "w", pipelineId);
+            StopAuthority current = null;
+            if (writer != null) {
+                long generation = number(writer, "g", pipelineId, FIELD + ".w");
+                if (writer.containsKey("n")) {
+                    current = StopAuthority.claimed(new WorkloadClaimFence(
+                            new WorkloadClaimKey(cluster, WorkloadClaimType.PIPELINE_ACTUATION, pipelineId),
+                            new WorkloadOwner(string(writer, "n", pipelineId, FIELD + ".w"),
+                                    string(writer, "b", pipelineId, FIELD + ".w")),
+                            number(writer, "c", pipelineId, FIELD + ".w"), generation,
+                            number(writer, "r", pipelineId, FIELD + ".w")));
+                } else {
+                    if (writer.containsKey("b") || writer.containsKey("c") || writer.containsKey("r")) {
+                        throw unreadable(pipelineId, FIELD + ".w");
+                    }
+                    current = StopAuthority.standalone(cluster, generation);
+                }
+            }
+            Document target = optionalDocument(marker, "x", pipelineId);
+            StopReservation.Successor successor = null;
+            if (target != null) {
+                String boot = string(target, "b", pipelineId, FIELD + ".x");
+                requireFields(target, pipelineId, "j");
+                StopReservation.JobIdentity job = target.get("j") == null ? null : new StopReservation.JobIdentity(
+                        cluster, number(target, "j", pipelineId, FIELD + ".x"), boot);
+                successor = new StopReservation.Successor(new ObservationStore.Scope(
+                        string(target, "i", pipelineId, FIELD + ".x"),
+                        number(target, "g", pipelineId, FIELD + ".x")), boot, job);
+            }
+            Document wanted = document(marker, "d", pipelineId, FIELD);
+            requireFields(wanted, pipelineId, "a", "z");
+            Object assembly = wanted.get("a"), stamp = wanted.get("z");
+            if (assembly != null && !(assembly instanceof String)
+                    || stamp != null && !(stamp instanceof Long || stamp instanceof Integer)) {
+                throw unreadable(pipelineId, FIELD + ".d");
+            }
+            DesiredState intent = new DesiredState(pipelineId,
+                    PipelineState.valueOf(string(wanted, "t", pipelineId, FIELD + ".d")),
+                    string(wanted, "r", pipelineId, FIELD + ".d"), bool(wanted, "u", pipelineId, FIELD + ".d"),
+                    (String) assembly, bool(wanted, "b", pipelineId, FIELD + ".d"),
+                    stamp == null ? null : ((Number) stamp).longValue());
+            return new StopReservation(pipelineId, string(marker, "t", pipelineId, FIELD),
+                    number(marker, "s", pipelineId, FIELD), epoch, intent,
+                    new StopReservation.Source(cluster, scope, oldJob),
+                    StopReservation.Phase.valueOf(string(marker, "p", pipelineId, FIELD)),
+                    StopReservation.CounterPolicy.valueOf(string(marker, "c", pipelineId, FIELD)),
+                    current, successor, StopReservation.CURRENT_FORMAT);
+        } catch (TapstateException coded) {
+            throw coded;
+        } catch (RuntimeException corrupt) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", pipelineId, "field", FIELD), corrupt);
+        }
+    }
+
+    private static Document optionalDocument(Document source, String field, String id) {
+        requireFields(source, id, field);
+        Object value = source.get(field);
+        if (value != null && !(value instanceof Document)) { throw unreadable(id, FIELD + "." + field); }
+        return (Document) value;
+    }
+
+    private static void requireFields(Document source, String id, String... fields) {
+        for (String field : fields) { if (!source.containsKey(field)) { throw unreadable(id, FIELD + "." + field); } }
+    }
+
+    private static void requireSize(Document marker, String id) {
+        if (size(marker) > MAX_BYTES) {
+            throw new TapstateException(IoError.DOCUMENT_TOO_LARGE, Map.of("id", id), null);
+        }
+    }
+
+    private static Document writeLegacy(StopReservation reservation) {
         Document marker = new Document("token", reservation.token())
                 .append("sourceEpoch", reservation.sourceEpoch())
                 .append("reservedEpoch", reservation.reservedEpoch())
@@ -38,7 +160,7 @@ final class StopReservationDocument {
         return marker;
     }
 
-    static StopReservation read(String pipelineId, long checkpointEpoch, Document marker) {
+    private static StopReservation readLegacy(String pipelineId, long checkpointEpoch, Document marker) {
         try {
             if (size(marker) > MAX_BYTES) { throw unreadable(pipelineId, FIELD); }
             String token = string(marker, "token", pipelineId, FIELD);

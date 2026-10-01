@@ -5,6 +5,8 @@ import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ExecutionGenerationStore;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.ObservationStore.LatestSnapshot;
+import io.tapstate.spi.store.StateStore;
+import io.tapstate.spi.store.StopReservation;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -31,6 +33,7 @@ final class ObservationJanitor implements AutoCloseable {
     private final ObservationStore observations;
     private final ArtifactStore artifacts;
     private final ExecutionGenerationStore generations;
+    private final StateStore states;
     private final String clusterId;
     private final int batchSize;
     private final ScheduledExecutorService worker;
@@ -55,9 +58,16 @@ final class ObservationJanitor implements AutoCloseable {
     ObservationJanitor(ObservationStore observations, ArtifactStore artifacts,
             ExecutionGenerationStore generations, String clusterId, int batchSize,
             Duration interval, boolean schedule) {
+        this(observations, artifacts, generations, null, clusterId, batchSize, interval, schedule);
+    }
+
+    ObservationJanitor(ObservationStore observations, ArtifactStore artifacts,
+            ExecutionGenerationStore generations, StateStore states, String clusterId, int batchSize,
+            Duration interval, boolean schedule) {
         this.observations = Objects.requireNonNull(observations, "observations");
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.generations = Objects.requireNonNull(generations, "generations");
+        this.states = states;
         this.clusterId = Objects.requireNonNull(clusterId, "clusterId");
         Objects.requireNonNull(interval, "interval");
         long intervalMillis;
@@ -125,7 +135,9 @@ final class ObservationJanitor implements AutoCloseable {
                 throw new IllegalStateException("observation cleanup page is not in ascending id order");
             }
             scanned.incrementAndGet();
-            if (orphan(snapshot) && observations.deleteIfUnchanged(snapshot)) {
+            boolean removed = orphan(snapshot) && (states != null && artifactOrphan(snapshot)
+                    ? observations.deleteOrphanIfUnchanged(snapshot) : observations.deleteIfUnchanged(snapshot));
+            if (removed) {
                 deleted.incrementAndGet();
             }
             after = Optional.of(snapshot.pipelineId());
@@ -148,7 +160,13 @@ final class ObservationJanitor implements AutoCloseable {
                 throw new IllegalStateException("observation manifest cleanup cursor did not advance");
             }
             scanned.incrementAndGet();
-            if (manifestOrphan(snapshot) && observations.deleteManifestIfUnchanged(snapshot)) {
+            Optional<String> livePipeline = snapshot.scopes().stream()
+                    .map(scope -> artifacts.pipelineIdForIncarnation(scope.pipelineIncarnationId()))
+                    .flatMap(Optional::stream).findFirst();
+            boolean removed = manifestOrphan(snapshot) && (states != null && livePipeline.isPresent()
+                    ? observations.deleteManifestIfUnchanged(snapshot, livePipeline.orElseThrow())
+                    : observations.deleteManifestIfUnchanged(snapshot));
+            if (removed) {
                 deleted.incrementAndGet();
             }
             manifestAfter = Optional.of(snapshot.cursor());
@@ -170,6 +188,8 @@ final class ObservationJanitor implements AutoCloseable {
 
     private boolean orphan(LatestSnapshot snapshot) {
         String id = snapshot.pipelineId();
+        if (states != null && artifactOrphan(snapshot)) { return true; }
+        if (protectedContinuation(id)) { return false; }
         if (observations.hasCommittedManifest(id)) {
             return true;
         }
@@ -198,6 +218,7 @@ final class ObservationJanitor implements AutoCloseable {
             if (id.isEmpty()) {
                 continue;
             }
+            if (protectedContinuation(id.orElseThrow())) { return false; }
             OptionalLong current = generations.currentGeneration(clusterId, id.orElseThrow());
             // A missing generation is insufficient evidence during startup or a mode switch.
             if (current.isEmpty() || current.getAsLong() == scope.executionGeneration()) {
@@ -205,6 +226,24 @@ final class ObservationJanitor implements AutoCloseable {
             }
         }
         return true;
+    }
+
+    private boolean protectedContinuation(String id) {
+        if (states == null || !states.supportsStopReservations()) { return false; }
+        return states.readStopReservation(id).filter(marker -> marker.legacy()
+                ? states.read(id).map(actual -> StopReservation.CounterPolicy.freeze(actual, marker.originalDesired())
+                        == StopReservation.CounterPolicy.CONTINUE).orElse(true)
+                : marker.counterPolicy() == StopReservation.CounterPolicy.CONTINUE).isPresent();
+    }
+
+    /** Missing or foreign artifact identity ends ownership; generation mismatch alone still needs the store guard. */
+    private boolean artifactOrphan(LatestSnapshot snapshot) {
+        Optional<String> incarnation = artifacts.pipelineIncarnationId(snapshot.pipelineId());
+        if (incarnation.isPresent()) {
+            return snapshot.scope().filter(scope -> incarnation.orElseThrow().equals(scope.pipelineIncarnationId())).isEmpty();
+        }
+        return artifacts.get(snapshot.pipelineId()).filter(resource -> "pipeline".equals(resource.kind())).isEmpty()
+                || snapshot.scope().isPresent();
     }
 
     Health health() {

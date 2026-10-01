@@ -5,6 +5,8 @@ import io.tapstate.core.lifecycle.MetricAttributes;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.lifecycle.MetricType;
+import io.tapstate.core.lifecycle.HistogramValue;
+import io.tapstate.spi.store.ObservationContinuation;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -32,6 +34,120 @@ final class MetricProducerEpochs {
     }
 
     private final Map<Group, Account> accounts = new LinkedHashMap<>();
+
+    /** One immutable checkpoint of the real current native epochs, never an epoch history. */
+    List<ObservationContinuation.ProducerState> snapshot() {
+        return accounts.entrySet().stream().map(entry -> {
+            Group group = entry.getKey();
+            Account account = entry.getValue();
+            return new ObservationContinuation.ProducerState(group.name(), group.type(), group.unit(),
+                    group.producer().direction(), group.producer().stage(), account.nativeStart,
+                    List.copyOf(account.offset.values()), List.copyOf(account.published.values()));
+        }).toList();
+    }
+
+    /** Only an exactly qualified target restores these private epochs; public starts are not native starts. */
+    static MetricProducerEpochs restore(List<ObservationContinuation.ProducerState> states,
+            CardinalityBudget.Folder folder) {
+        java.util.Objects.requireNonNull(states, "states");
+        java.util.Objects.requireNonNull(folder, "folder");
+        MetricProducerEpochs restored = new MetricProducerEpochs();
+        for (ObservationContinuation.ProducerState state : states) {
+            if (state.type() == MetricType.GAUGE || state.nativeStart() == null
+                    || CardinalityBudget.forInstrument(state.name()).isEmpty()) {
+                throw new IllegalArgumentException("a native checkpoint requires a budgeted cumulative producer");
+            }
+            Producer producer = new Producer(state.direction(), state.stage());
+            Group group = new Group(state.name(), state.type(), state.unit(), producer);
+            Account account = new Account(state.nativeStart());
+            account.offset = checkpointPoints(state.name(), state.type(), state.unit(), state.offsets(),
+                    producer, folder);
+            account.published.putAll(checkpointPoints(state.name(), state.type(), state.unit(), state.published(),
+                    producer, folder));
+            if (restored.accounts.putIfAbsent(group, account) != null) {
+                throw new IllegalArgumentException("a native checkpoint repeats a producer group");
+            }
+        }
+        return restored;
+    }
+
+    /** A newer owner's durable checkpoint cannot discard a more recent known local producer. */
+    static MetricProducerEpochs restore(List<ObservationContinuation.ProducerState> states,
+            CardinalityBudget.Folder folder, MetricProducerEpochs previous, List<MetricFact> baseline) {
+        MetricProducerEpochs restored = restore(states, folder);
+        Map<String, MetricFact> bases = byName(baseline);
+        previous.accounts.forEach((group, local) -> {
+            Account incoming = restored.accounts.get(group);
+            if (incoming == null || local.nativeStart.isAfter(incoming.nativeStart)) {
+                restored.accounts.put(group, copyAccount(local));
+                return;
+            }
+            Map<Map<String, String>, MetricPoint> base = new LinkedHashMap<>();
+            MetricFact fact = bases.get(group.name());
+            if (fact != null) { fact.points().forEach(point -> base.put(point.attributes(), point)); }
+            Map<Map<String, String>, MetricPoint> required = incoming.nativeStart.equals(local.nativeStart)
+                    ? local.offset : local.published;
+            Map<Map<String, String>, MetricPoint> merged = new LinkedHashMap<>(incoming.offset);
+            required.forEach((attributes, point) -> {
+                MetricPoint before = incoming.offset.getOrDefault(attributes, base.get(attributes));
+                MetricPoint larger = before == null ? point
+                        : MetricContinuation.atLeast(group.type(), before, point, point.observedAt());
+                merged.put(attributes, larger);
+                MetricPoint published = incoming.published.get(attributes);
+                if (published != null) {
+                    incoming.published.put(attributes, increaseOffset(group.type(), published, before, larger));
+                }
+            });
+            incoming.offset = Map.copyOf(merged);
+            local.published.forEach((attributes, point) -> incoming.published.merge(attributes, point,
+                    (fresh, known) -> MetricContinuation.atLeast(group.type(), fresh, known, fresh.observedAt())));
+        });
+        return restored;
+    }
+
+    private static Account copyAccount(Account source) {
+        Account copy = new Account(source.nativeStart);
+        copy.offset = Map.copyOf(source.offset); copy.published.putAll(source.published);
+        return copy;
+    }
+
+    private static MetricPoint increaseOffset(MetricType type, MetricPoint published, MetricPoint before,
+            MetricPoint after) {
+        if (type == MetricType.COUNTER) {
+            long difference = Math.subtractExact(after.value(), before == null ? 0 : before.value());
+            return MetricPoint.accumulated(published.attributes(), published.startTime(), published.observedAt(),
+                    Math.addExact(published.value(), difference));
+        }
+        HistogramValue old = before == null ? null : before.histogram();
+        HistogramValue next = after.histogram();
+        HistogramValue value = published.histogram();
+        if (!value.bounds().equals(next.bounds()) || old != null && !old.bounds().equals(next.bounds())) {
+            throw new IllegalArgumentException("a checkpoint offset keeps its histogram bounds");
+        }
+        List<Long> buckets = new ArrayList<>(value.bucketCounts().size());
+        for (int i = 0; i < value.bucketCounts().size(); i++) {
+            long difference = Math.subtractExact(next.bucketCounts().get(i), old == null ? 0 : old.bucketCounts().get(i));
+            buckets.add(Math.addExact(value.bucketCounts().get(i), difference));
+        }
+        return MetricPoint.distribution(published.attributes(), published.startTime(), published.observedAt(),
+                new HistogramValue(Math.addExact(value.count(), Math.subtractExact(next.count(), old == null ? 0 : old.count())),
+                        value.sum() + next.sum() - (old == null ? 0 : old.sum()), value.bounds(), buckets));
+    }
+
+    private static Map<Map<String, String>, MetricPoint> checkpointPoints(String name, MetricType type,
+            String unit, List<MetricPoint> points, Producer producer, CardinalityBudget.Folder folder) {
+        MetricFact folded = folder.fold(new MetricFact(name, type, unit, points));
+        Map<Map<String, String>, MetricPoint> copied = new LinkedHashMap<>();
+        for (MetricPoint point : folded.points()) {
+            if (!producer.equals(Producer.of(point))) {
+                throw new IllegalArgumentException("a native checkpoint point belongs to another producer");
+            }
+            if (copied.putIfAbsent(point.attributes(), point) != null) {
+                throw new IllegalArgumentException("a native checkpoint repeats a point");
+            }
+        }
+        return Map.copyOf(copied);
+    }
 
     List<MetricFact> continueNative(List<MetricFact> rawFacts, List<MetricFact> foldedFacts,
             List<MetricFact> alreadyContinued, Instant at) {

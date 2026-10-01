@@ -1,6 +1,8 @@
 package io.tapstate.adapters.mongostore;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.CardinalityBudget;
+import io.tapstate.core.lifecycle.MetricAttributes;
 import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
@@ -9,6 +11,8 @@ import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.TableSnapshot;
+import io.tapstate.spi.store.ObservationContinuation;
+import io.tapstate.spi.store.ObservationContinuationBounds;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -29,20 +33,24 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /** A versioned deterministic binary stream codec for one logical observation. */
 final class LatestObservationPayloadCodec {
 
     static final int ENCODING_VERSION = 2;
+    static final int CONTINUATION_ENCODING_VERSION = 3;
     static final int INLINE_PAYLOAD_LIMIT = 512 * 1024;
     static final int CHUNK_PAYLOAD_LIMIT = 1024 * 1024;
 
     private static final int MAGIC = 0x54534c4f; // TSLO
+    private static final int CONTINUATION_MAGIC = 0x54534c43; // TSLC
 
     private LatestObservationPayloadCodec() {
     }
@@ -102,6 +110,222 @@ final class LatestObservationPayloadCodec {
             throw new IllegalStateException("the in-memory observation encoder could not close", impossible);
         }
         return output.finish();
+    }
+
+    /** Identity remains in the bounded manifest header; this immutable payload holds facts and current state only. */
+    record ContinuationState(String pipelineId, List<MetricFact> baselineFacts,
+            List<ObservationContinuation.ProducerState> producerStates) { }
+
+    static Encoded encodeContinuation(String pipelineId, ObservationContinuation continuation, ChunkWriter chunks) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(continuation, "continuation");
+        continuation.baselineFacts().forEach(fact -> fact.points().forEach(point -> requirePointOwner(pipelineId, point)));
+        continuation.producerStates().forEach(state -> {
+            state.offsets().forEach(point -> requirePointOwner(pipelineId, point));
+            state.published().forEach(point -> requirePointOwner(pipelineId, point));
+        });
+        ChunkingOutput output = new ChunkingOutput(Objects.requireNonNull(chunks, "chunks"),
+                CONTINUATION_ENCODING_VERSION);
+        try (PayloadDataOutput data = new PayloadDataOutput(output)) {
+            data.writeInt(CONTINUATION_MAGIC);
+            data.writeInt(CONTINUATION_ENCODING_VERSION);
+            writeString(data, pipelineId);
+            writeContinuationFacts(data, continuation.baselineFacts());
+            data.writeInt(continuation.producerStates().size());
+            for (ObservationContinuation.ProducerState state : continuation.producerStates()) {
+                writeString(data, state.name());
+                writeString(data, state.type().name());
+                writeString(data, state.unit());
+                writeString(data, state.direction());
+                writeString(data, state.stage());
+                writeExactInstant(data, state.nativeStart());
+                writeContinuationPoints(data, state.offsets());
+                writeContinuationPoints(data, state.published());
+            }
+            data.flush();
+        } catch (IOException impossible) {
+            throw new IllegalStateException("the in-memory continuation encoder could not close", impossible);
+        }
+        return output.finish();
+    }
+
+    static ContinuationState decodeContinuationInline(byte[] payload, byte[] expectedDigest, long expectedBytes) {
+        Objects.requireNonNull(payload, "payload");
+        if (payload.length != expectedBytes || !MessageDigest.isEqual(
+                payloadDigest(payload, CONTINUATION_ENCODING_VERSION), expectedDigest)) {
+            throw new IllegalArgumentException("private payload length or digest does not match its descriptor");
+        }
+        return decodeContinuation(new ByteArrayInputStream(payload), expectedBytes);
+    }
+
+    static ContinuationState decodeContinuationChunks(Iterable<Chunk> chunks, long expectedCount,
+            long expectedBytes, byte[] expectedDigest) {
+        if (expectedCount <= 0 || expectedBytes <= 0) {
+            throw new IllegalArgumentException("a private chunk descriptor needs positive count and bytes");
+        }
+        try (ChunkInput input = new ChunkInput(chunks.iterator(), expectedCount, expectedBytes,
+                expectedDigest, CONTINUATION_ENCODING_VERSION)) {
+            ContinuationState decoded = decodeContinuation(input, expectedBytes);
+            input.verifyComplete();
+            return decoded;
+        } catch (IOException impossible) {
+            throw new IllegalStateException("the in-memory continuation decoder could not close", impossible);
+        }
+    }
+
+    private static ContinuationState decodeContinuation(InputStream input, long expectedBytes) {
+        try {
+            BudgetInput budget = new BudgetInput(input, expectedBytes, CONTINUATION_ENCODING_VERSION);
+            DataInputStream data = new DataInputStream(budget);
+            if (data.readInt() != CONTINUATION_MAGIC || data.readInt() != CONTINUATION_ENCODING_VERSION) {
+                throw new IllegalArgumentException("private continuation payload version is not supported");
+            }
+            String pipelineId = readString(data, budget);
+            CardinalityBudget.Folder folder = CardinalityBudget.folder();
+            List<MetricFact> baseline = readContinuationFacts(data, budget, pipelineId, folder);
+            int groups = readCount(data, budget, Long.BYTES * 5 + Integer.BYTES * 4);
+            if (groups > ObservationContinuationBounds.maximumProducerGroups()) {
+                throw new IllegalArgumentException("a private continuation exceeds its native-group limit");
+            }
+            List<ObservationContinuation.ProducerState> states = new ArrayList<>();
+            Set<PrivateGroup> seen = new HashSet<>();
+            for (int index = 0; index < groups; index++) {
+                String name = readString(data, budget);
+                MetricType type = MetricType.valueOf(readString(data, budget));
+                if (type == MetricType.GAUGE) { throw new IllegalArgumentException("a private native group is cumulative"); }
+                String unit = readString(data, budget);
+                String direction = readString(data, budget);
+                String stage = readString(data, budget);
+                if (!seen.add(new PrivateGroup(name, direction, stage))) {
+                    throw new IllegalArgumentException("a private continuation carries a duplicate native group");
+                }
+                ObservationContinuationBounds.validateGroup(name, direction, stage);
+                Instant nativeStart = readExactInstant(data);
+                states.add(new ObservationContinuation.ProducerState(name, type, unit, direction, stage,
+                        nativeStart, readContinuationPoints(data, budget, pipelineId, name, type, unit, folder),
+                        readContinuationPoints(data, budget, pipelineId, name, type, unit, folder)));
+            }
+            if (data.read() != -1) {
+                throw new IllegalArgumentException("private continuation payload carries trailing content");
+            }
+            return new ContinuationState(pipelineId, List.copyOf(baseline), List.copyOf(states));
+        } catch (TapstateException coded) {
+            throw coded;
+        } catch (IOException | IllegalArgumentException malformed) {
+            throw new IllegalArgumentException("private continuation payload is not a valid bounded record", malformed);
+        }
+    }
+
+    private record PrivateGroup(String name, String direction, String stage) { }
+
+    private static void requirePointOwner(String pipelineId, MetricPoint point) {
+        String owner = point.attributes().get(MetricAttributes.PIPELINE_ID);
+        if (owner != null && !owner.equals(pipelineId)) {
+            throw new IllegalArgumentException("a private continuation point belongs to its encoded pipeline owner");
+        }
+    }
+
+    private static void writeContinuationFacts(PayloadDataOutput out, List<MetricFact> facts) throws IOException {
+        out.writeInt(facts.size());
+        for (MetricFact fact : facts) {
+            writeString(out, fact.name());
+            writeString(out, fact.type().name());
+            writeString(out, fact.unit());
+            writeContinuationPoints(out, fact.points());
+        }
+    }
+
+    private static List<MetricFact> readContinuationFacts(DataInputStream in, BudgetInput budget,
+            String pipelineId, CardinalityBudget.Folder folder) throws IOException {
+        int count = readCount(in, budget, Long.BYTES * 3 + Integer.BYTES);
+        if (count > ObservationContinuationBounds.maximumFacts()) {
+            throw new IllegalArgumentException("a private continuation exceeds its fact limit");
+        }
+        List<MetricFact> facts = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (int index = 0; index < count; index++) {
+            String name = readString(in, budget);
+            if (!seen.add(name)) { throw new IllegalArgumentException("a private continuation carries a duplicate fact"); }
+            MetricType type = MetricType.valueOf(readString(in, budget));
+            if (type == MetricType.GAUGE) { throw new IllegalArgumentException("a private baseline fact is cumulative"); }
+            String unit = readString(in, budget);
+            facts.add(new MetricFact(name, type, unit, readContinuationPoints(in, budget, pipelineId, name, type, unit, folder)));
+        }
+        return facts;
+    }
+
+    private static void writeContinuationPoints(PayloadDataOutput out, List<MetricPoint> points) throws IOException {
+        out.writeInt(points.size());
+        for (MetricPoint point : points) {
+            writeStringMap(out, point.attributes());
+            out.writeBoolean(point.startTime() != null);
+            if (point.startTime() != null) { writeExactInstant(out, point.startTime()); }
+            writeExactInstant(out, point.observedAt());
+            out.writeBoolean(point.value() != null);
+            if (point.value() != null) { out.writeLong(point.value()); }
+            else { writeHistogram(out, point.histogram()); }
+        }
+    }
+
+    private static List<MetricPoint> readContinuationPoints(DataInputStream in, BudgetInput budget,
+            String pipelineId, String name, MetricType type, String unit, CardinalityBudget.Folder folder) throws IOException {
+        int count = readCount(in, budget, Integer.BYTES * 2 + Long.BYTES + 2);
+        if (count > ObservationContinuationBounds.maximumPoints(name)) {
+            throw new IllegalArgumentException("a private continuation exceeds its point limit");
+        }
+        List<MetricPoint> points = new ArrayList<>();
+        Set<Map<String, String>> seen = new HashSet<>();
+        for (int index = 0; index < count; index++) {
+            Map<String, String> attributes = readContinuationAttributes(in, budget, pipelineId, name);
+            Instant start = readBoolean(in) ? readExactInstant(in) : null;
+            Instant at = readExactInstant(in);
+            Long value = readBoolean(in) ? in.readLong() : null;
+            HistogramValue histogram = value == null ? readHistogram(in, budget) : null;
+            MetricPoint point = new MetricPoint(attributes, start, at, value, histogram);
+            requirePointOwner(pipelineId, point);
+            ObservationContinuationBounds.validatePoint(name, point);
+            if (!seen.add(point.attributes())) {
+                throw new IllegalArgumentException("a private continuation carries a duplicate series");
+            }
+            MetricFact one = MetricFact.single(name, type, unit, point);
+            if (type == MetricType.GAUGE || start == null || !folder.fold(one).equals(one)) {
+                throw new IllegalArgumentException("private continuation points are already folded cumulative measurements");
+            }
+            points.add(point);
+        }
+        return points;
+    }
+
+    private static Map<String, String> readContinuationAttributes(DataInputStream in, BudgetInput budget,
+            String pipelineId, String name) throws IOException {
+        Set<String> allowed = ObservationContinuationBounds.allowedAttributes(name);
+        int count = readCount(in, budget, Long.BYTES * 2);
+        if (count > allowed.size()) { throw new IllegalArgumentException("a private point exceeds its declared attribute limit"); }
+        Map<String, String> attributes = new LinkedHashMap<>();
+        for (int index = 0; index < count; index++) {
+            String key = readString(in, budget);
+            if (!allowed.contains(key)) { throw new IllegalArgumentException("a private point has an undeclared attribute"); }
+            String value = readString(in, budget);
+            if (MetricAttributes.PIPELINE_ID.equals(key) && !pipelineId.equals(value)) {
+                throw new IllegalArgumentException("a private continuation point belongs to its encoded pipeline owner");
+            }
+            putDistinct(attributes, key, value);
+        }
+        return attributes;
+    }
+
+    private static void writeExactInstant(PayloadDataOutput out, Instant value) throws IOException {
+        out.writeLong(value.getEpochSecond());
+        out.writeInt(value.getNano());
+    }
+
+    private static Instant readExactInstant(DataInputStream in) throws IOException {
+        long seconds = in.readLong();
+        int nanos = in.readInt();
+        if (nanos < 0 || nanos > 999_999_999) {
+            throw new IllegalArgumentException("private native epoch nanoseconds are outside their range");
+        }
+        return Instant.ofEpochSecond(seconds, nanos);
     }
 
     static Observation decodeInline(byte[] payload, byte[] expectedDigest, long expectedBytes) {
@@ -572,7 +796,8 @@ final class LatestObservationPayloadCodec {
 
     private static final class ChunkingOutput extends OutputStream {
         private final ChunkWriter target;
-        private final MessageDigest payloadDigest = digest("payload", ENCODING_VERSION);
+        private final MessageDigest payloadDigest;
+        private final int version;
         private final ThresholdBuffer inline = new ThresholdBuffer();
         private byte[] chunk;
         private int chunkBytes;
@@ -581,7 +806,12 @@ final class LatestObservationPayloadCodec {
         private boolean chunked;
         private boolean finished;
 
-        private ChunkingOutput(ChunkWriter target) { this.target = target; }
+        private ChunkingOutput(ChunkWriter target) { this(target, ENCODING_VERSION); }
+        private ChunkingOutput(ChunkWriter target, int version) {
+            this.target = target;
+            this.version = version;
+            this.payloadDigest = digest("payload", version);
+        }
 
         @Override public void write(int value) {
             if (finished) throw new IllegalStateException("payload encoding already finished");
@@ -637,7 +867,7 @@ final class LatestObservationPayloadCodec {
 
         private void flushChunk() {
             byte[] payload = Arrays.copyOf(chunk, chunkBytes);
-            target.write(new Chunk(chunks, payload, chunkDigest(payload)));
+            target.write(new Chunk(chunks, payload, chunkDigest(payload, version)));
             chunks = Math.incrementExact(chunks);
             chunkBytes = 0;
         }

@@ -101,6 +101,11 @@ public final class Engine {
         }
     }
 
+    /** The actual submitting process identity placed in every qualified native job configuration. */
+    public String submissionBootId() {
+        return bootId;
+    }
+
     /**
      * The layer behind the nest state maps, asked how much a namespace holds altogether. Absent on a run
      * that keeps its state in memory alone, where what is in memory is all there is.
@@ -313,6 +318,17 @@ public final class Engine {
     public boolean awaitTerminalExact(String pipelineId, ExecutionJob expected, Duration budget) {
         Job job = exactJob(pipelineId, expected);
         return job == null || awaitTerminal(stopFuture(job, expected), budget);
+    }
+
+    /** A completed native future and its exact current status identify the terminal outcome without waiting. */
+    public Optional<io.tapstate.core.lifecycle.PipelineState> terminalStateExact(String pipelineId, ExecutionJob expected) {
+        Job job = exactJob(pipelineId, expected);
+        if (job == null || !awaitTerminal(stopFuture(job, expected), Duration.ZERO)) { return Optional.empty(); }
+        return switch (job.getStatus()) {
+            case COMPLETED -> Optional.of(io.tapstate.core.lifecycle.PipelineState.COMPLETED);
+            case FAILED -> Optional.of(io.tapstate.core.lifecycle.PipelineState.FAILED);
+            default -> Optional.empty();
+        };
     }
 
     /**

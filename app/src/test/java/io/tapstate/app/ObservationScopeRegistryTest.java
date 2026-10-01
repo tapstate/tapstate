@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.core.lifecycle.MetricAttributes;
+import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.lifecycle.MetricType;
@@ -8,6 +9,11 @@ import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.ObservationContinuation;
+import io.tapstate.spi.store.StopAuthority;
+import io.tapstate.spi.store.StopReservation;
+import io.tapstate.spi.store.HandoffIdentity;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
@@ -27,8 +33,350 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 
 class ObservationScopeRegistryTest {
+
+    @Test
+    void aPinnedBoundSourcesFrozenBaseRemainsKnownBeforeItsFirstNativeCheckpoint() {
+        for (boolean measured : List.of(false, true)) {
+            var scopes = new ObservationScopeRegistry();
+            var key = continuationKey(42);
+            var previous = continuationTarget(42, 77);
+            var facts = frame(START, START, 7).observation().facts();
+            List<ObservationContinuation.ProducerState> producers = measured
+                    ? List.of(new ObservationContinuation.ProducerState(facts.getFirst().name(), MetricType.COUNTER,
+                            "{row}", "", "", START.plusSeconds(1), List.of(),
+                            frame(START.plusSeconds(1), START, 9).observation().facts().getFirst().points())) : List.of();
+            var stored = new ObservationContinuation(key.token(), key.sourceScope(), Optional.of(
+                    new ObservationContinuation.Target(previous.scope(), Optional.of(previous.job()))), Optional.empty(), facts, producers);
+            var source = scopes.beginSourceContinuation(PIPELINE, key, Optional.of(previous), () -> true).orElseThrow();
+            var frozen = scopes.prepareSourceContinuation(source, Optional.empty(), Optional.of(stored),
+                    ObservationScopeRegistry.SourceReadStatus.READABLE);
+            assertThat(frozen.status()).isEqualTo(ObservationScopeRegistry.PreparationStatus.KNOWN);
+            assertThat(frozen.snapshot().orElseThrow().baselineFacts()).singleElement().satisfies(fact -> {
+                assertThat(fact.points().getFirst().value()).isEqualTo(measured ? 9 : 7);
+                assertThat(fact.points().getFirst().startTime()).isEqualTo(START);
+            });
+            assertThat(frozen.snapshot().orElseThrow().baselineOrigin()).contains(previous);
+            assertThat(frozen.snapshot().orElseThrow().continuation().producerStates()).isEmpty();
+        }
+    }
+
+    @Test
+    void receiptConflictRefreshUsesTheNewerSameOwnerNativeEpochWithoutRegressingTwelveToNine() {
+        var key = continuationKey(42);
+        var target = continuationTarget(42, 77);
+        var local = knownContinuationRegistry();
+        var first = local.prepareContinuationPublication(frame(START.plusSeconds(1), START.plusSeconds(1), 2), target,
+                () -> true).orElseThrow();
+        var firstReceipt = continuationReceipt(first.snapshot().orElseThrow(), "r1");
+        assertThat(local.publicationAccepted(first.ticket(), firstReceipt)).isTrue();
+        var acceptedWriter = new ObservationScopeRegistry();
+        var initial = acceptedWriter.beginTargetContinuation(PIPELINE, key, target, () -> true).orElseThrow();
+        acceptedWriter.adoptTargetContinuation(initial, first.snapshot(), Optional.empty());
+        var newer = acceptedWriter.prepareContinuationPublication(frame(START.plusSeconds(2), START.plusSeconds(2), 3), target,
+                () -> true).orElseThrow();
+        assertThat(counter(newer.projected())).isEqualTo(12);
+        var newerReceipt = continuationReceipt(newer.snapshot().orElseThrow(), "r2");
+
+        // This is the read performed after the current writer's expected private receipt was refused.
+        var refreshed = local.beginTargetContinuation(PIPELINE, key, target, () -> true).orElseThrow();
+        assertThat(local.adoptTargetContinuation(refreshed, newer.snapshot(), Optional.empty()).status())
+                .isEqualTo(ObservationScopeRegistry.PreparationStatus.KNOWN);
+        assertThat(local.continuationRead(refreshed,
+                new ObservationStore.StoredContinuation(newer.snapshot().orElseThrow(), newerReceipt))).isTrue();
+        var late = local.prepareContinuationPublication(frame(START.plusSeconds(3), START.plusSeconds(1), 2), target,
+                () -> true).orElseThrow();
+        assertThat(late.expectedReceipt()).contains(newerReceipt);
+        assertThat(counter(late.projected())).as("the accepted T2 checkpoint fences a later-observed T1 reading")
+                .isEqualTo(12);
+        assertThat(late.snapshot().orElseThrow().producerStates()).singleElement()
+                .satisfies(state -> assertThat(state.nativeStart()).isEqualTo(START.plusSeconds(2)));
+    }
+
+    @Test
+    void sourceFreezingOmitsUnknownHistogramStartsWhilePreservingKnownCounterAndHistogramPoints() {
+        var scopes = new ObservationScopeRegistry();
+        var key = continuationKey(41);
+        var ticket = scopes.beginSourceContinuation(PIPELINE, key, () -> true).orElseThrow();
+        var buckets = new ArrayList<Long>(java.util.Collections.nCopies(HistogramBounds.RECORD_DELIVERY_DURATION.buckets(), 0L));
+        buckets.set(0, 3L);
+        MetricPoint unknown = MetricPoint.distribution(TABLE, null, START,
+                HistogramBounds.RECORD_DELIVERY_DURATION.value(3, 3.0, buckets));
+        var knownBuckets = new ArrayList<>(buckets);
+        knownBuckets.set(0, 4L);
+        MetricPoint known = MetricPoint.distribution(Map.of(MetricAttributes.PIPELINE_ID, PIPELINE,
+                MetricAttributes.TABLE_ID, "known-table"), START.minusSeconds(60), START,
+                HistogramBounds.RECORD_DELIVERY_DURATION.value(4, 4.0, knownBuckets));
+        MetricFact histogram = new MetricFact("tapstate.pipeline.record.delivery.duration", MetricType.HISTOGRAM,
+                HistogramBounds.UNIT, List.of(unknown, known));
+        var counterFact = frame(START, START.minusSeconds(60), 7).observation().facts().getFirst();
+        var saved = new Observation(PIPELINE, PipelineState.PAUSED, Map.of(), Map.of(), Map.of(), null, START,
+                List.of(counterFact, histogram));
+        var result = scopes.prepareSourceContinuation(ticket,
+                Optional.of(new ObservationStore.Stored(saved, Optional.of(key.sourceScope()))), Optional.empty(),
+                ObservationScopeRegistry.SourceReadStatus.READABLE);
+        assertThat(result.status()).isEqualTo(ObservationScopeRegistry.PreparationStatus.KNOWN);
+        var snapshot = result.snapshot().orElseThrow();
+        assertThatCode(snapshot::continuation).as("unknown starts are omitted before constructing a private carrier")
+                .doesNotThrowAnyException();
+        var retained = snapshot.continuation();
+        assertThat(retained.baselineFacts()).filteredOn(fact -> fact.name().equals("tapstate.pipeline.snapshot.rows"))
+                .singleElement().satisfies(fact -> assertThat(fact.points().getFirst().value()).isEqualTo(7));
+        assertThat(retained.baselineFacts()).filteredOn(fact -> fact.type() == MetricType.HISTOGRAM)
+                .singleElement().satisfies(fact -> {
+                    assertThat(fact.points()).containsExactly(known);
+                    assertThat(fact.points().getFirst().histogram().count()).isEqualTo(4);
+                });
+        assertThat(scopes.current(PIPELINE)).isEmpty();
+    }
+
+    @Test
+    void aQualifiedDurableSourceSurvivesAdmissionWithoutInstallingItsOldNativeScope() {
+        var scopes = new ObservationScopeRegistry();
+        var source = new ObservationStore.Scope("inc-a", 41);
+        var key = continuationKey(41);
+        var ticket = scopes.beginSourceContinuation(PIPELINE, key, () -> true).orElseThrow();
+        var prepared = scopes.prepareSourceContinuation(ticket,
+                Optional.of(new ObservationStore.Stored(frame(START, START.minusSeconds(60), 7).observation(), Optional.of(source))),
+                Optional.empty(), ObservationScopeRegistry.SourceReadStatus.READABLE);
+        assertThat(prepared.status()).isEqualTo(ObservationScopeRegistry.PreparationStatus.KNOWN);
+        assertThat(scopes.current(PIPELINE)).isEmpty();
+        assertThat(prepared.snapshot().orElseThrow().continuation().target()).isEmpty();
+        scopes.begin(PIPELINE, "inc-a", 42);
+        var target = continuationTarget(42, 77);
+        var bound = scopes.beginTargetContinuation(PIPELINE, continuationKey(42), target, () -> true).orElseThrow();
+        assertThat(scopes.adoptTargetContinuation(bound, Optional.empty(), Optional.empty()).status())
+                .isEqualTo(ObservationScopeRegistry.PreparationStatus.KNOWN);
+        var packet = scopes.prepareContinuationPublication(frame(START.plusSeconds(1), START.plusSeconds(1), 2), target, () -> true)
+                .orElseThrow();
+        assertThat(counter(packet.projected())).isEqualTo(9);
+        assertThat(start(packet.projected())).isEqualTo(START.minusSeconds(60));
+        assertThat(packet.snapshot().orElseThrow().producerStates()).singleElement()
+                .satisfies(state -> assertThat(state.nativeStart()).isEqualTo(START.plusSeconds(1)));
+    }
+
+    @Test
+    void coldAdoptionRestoresPrivateBaseAndEpochInsteadOfAddingPublishedNineAgain() {
+        var live = knownContinuationRegistry();
+        var target = continuationTarget(42, 77);
+        Instant nativeStart = START.plusSeconds(1).plusNanos(123456789);
+        var first = live.prepareContinuationPublication(frame(nativeStart, nativeStart, 2), target, () -> true).orElseThrow();
+        assertThat(counter(first.projected())).isEqualTo(9);
+        var cold = new ObservationScopeRegistry();
+        var ticket = cold.beginTargetContinuation(PIPELINE, continuationKey(42), target, () -> true).orElseThrow();
+        assertThat(cold.adoptTargetContinuation(ticket, first.snapshot(), Optional.empty()).status())
+                .isEqualTo(ObservationScopeRegistry.PreparationStatus.KNOWN);
+        var same = cold.prepareContinuationPublication(frame(nativeStart.plusSeconds(1), nativeStart, 2), target, () -> true)
+                .orElseThrow();
+        assertThat(counter(same.projected())).isEqualTo(9);
+        assertThat(start(same.projected())).isEqualTo(START);
+        var second = cold.prepareContinuationPublication(frame(nativeStart.plusSeconds(2), nativeStart.plusSeconds(2), 3), target,
+                () -> true).orElseThrow();
+        assertThat(counter(second.projected())).isEqualTo(12);
+    }
+
+    @Test
+    void aReadableUnknownCarrierAfterHandoffRetirementProvidesProofWithoutInventingZero() {
+        var scopes = new ObservationScopeRegistry();
+        var target = continuationTarget(42, 77);
+        var key = continuationKey(42);
+        var unknown = new ObservationContinuation(key.token(), key.sourceScope(), Optional.of(
+                new ObservationContinuation.Target(target.scope(), Optional.of(target.job()))), Optional.empty(), List.of(), List.of());
+        var ticket = scopes.beginTargetContinuation(PIPELINE, key, target, () -> true).orElseThrow();
+        assertThat(scopes.adoptTargetContinuation(ticket, Optional.of(unknown), Optional.empty()).status())
+                .isEqualTo(ObservationScopeRegistry.PreparationStatus.UNKNOWN);
+        var actualReceipt = continuationReceipt(unknown, "unknown-readable");
+        assertThat(scopes.continuationRead(ticket, new ObservationStore.StoredContinuation(unknown, actualReceipt))).isTrue();
+        assertThat(scopes.durableReceipt(PIPELINE, handoff(key, target))).contains(actualReceipt);
+        var packet = scopes.prepareContinuationPublication(frame(START.plusSeconds(1), START.plusSeconds(1), 2), target, () -> true)
+                .orElseThrow();
+        assertThat(packet.projected().observation().facts()).isEmpty();
+        assertThat(packet.projected().observation().metrics()).isEmpty();
+        assertThat(packet.unknownProven()).isTrue();
+        assertThat(packet.expectedReceipt()).contains(actualReceipt);
+    }
+
+    @Test
+    void unavailableSourceReadDoesNotProveAbsenceAndKnownRetryDoesNotLoseItsFloor() {
+        var scopes = new ObservationScopeRegistry();
+        var key = continuationKey(41);
+        var ticket = scopes.beginSourceContinuation(PIPELINE, key, () -> true).orElseThrow();
+        var absent = scopes.prepareSourceContinuation(ticket, Optional.empty(), Optional.empty(),
+                ObservationScopeRegistry.SourceReadStatus.UNAVAILABLE);
+        assertThat(absent.status()).isEqualTo(ObservationScopeRegistry.PreparationStatus.UNKNOWN);
+        assertThat(absent.snapshot().orElseThrow().unknownProven()).isFalse();
+        var known = scopes.prepareSourceContinuation(ticket, Optional.of(new ObservationStore.Stored(
+                frame(START, START, 7).observation(), Optional.of(key.sourceScope()))), Optional.empty(),
+                ObservationScopeRegistry.SourceReadStatus.READABLE);
+        assertThat(known.status()).isEqualTo(ObservationScopeRegistry.PreparationStatus.KNOWN);
+        assertThat(scopes.prepareSourceContinuation(ticket, Optional.empty(), Optional.empty(),
+                ObservationScopeRegistry.SourceReadStatus.UNAVAILABLE).snapshot().orElseThrow().baselineFacts())
+                .isEqualTo(known.snapshot().orElseThrow().baselineFacts());
+    }
+
+    @Test
+    void unknownTargetCanLaterAcquireItsExactSourceAndRepeatedAdoptKeepsTheNativeCheckpoint() {
+        var scopes = new ObservationScopeRegistry();
+        var key = continuationKey(42);
+        var target = continuationTarget(42, 77);
+        var first = scopes.beginTargetContinuation(PIPELINE, key, target, () -> true).orElseThrow();
+        assertThat(scopes.adoptTargetContinuation(first, Optional.empty(), Optional.empty()).status())
+                .isEqualTo(ObservationScopeRegistry.PreparationStatus.UNKNOWN);
+        var source = scopes.beginSourceContinuation(PIPELINE, key, () -> true).orElseThrow();
+        var known = scopes.prepareSourceContinuation(source, Optional.of(new ObservationStore.Stored(
+                frame(START, START, 7).observation(), Optional.of(key.sourceScope()))), Optional.empty(),
+                ObservationScopeRegistry.SourceReadStatus.READABLE);
+        var adopt = scopes.beginTargetContinuation(PIPELINE, key, target, () -> true).orElseThrow();
+        scopes.adoptTargetContinuation(adopt, Optional.empty(), known.snapshot());
+        var packet = scopes.prepareContinuationPublication(frame(START.plusSeconds(1), START.plusSeconds(1), 2), target, () -> true)
+                .orElseThrow();
+        var receipt = continuationReceipt(packet.snapshot().orElseThrow(), "first-known");
+        assertThat(scopes.publicationAccepted(packet.ticket(), receipt)).isTrue();
+        var repeated = scopes.beginTargetContinuation(PIPELINE, key, target, () -> true).orElseThrow();
+        assertThat(scopes.adoptTargetContinuation(repeated, Optional.empty(), Optional.empty()).status())
+                .isEqualTo(ObservationScopeRegistry.PreparationStatus.KNOWN);
+        assertThat(scopes.durableReceipt(PIPELINE, handoff(key, target))).contains(receipt);
+        var next = scopes.prepareContinuationPublication(frame(START.plusSeconds(2), START.plusSeconds(1), 3), target, () -> true)
+                .orElseThrow();
+        assertThat(counter(next.projected())).isEqualTo(10);
+        assertThat(next.snapshot().orElseThrow().producerStates()).singleElement()
+                .satisfies(state -> assertThat(state.nativeStart()).isEqualTo(START.plusSeconds(1)));
+    }
+
+    @Test
+    void aNewOwnerUsesItsMatchingDurableNewEpochAndRejectsALateOldEpochAsLowerTotal() {
+        var target = continuationTarget(42, 77);
+        var oldOwner = claimedContinuationKey("node-a", 1);
+        var newOwner = claimedContinuationKey("node-b", 2);
+        var base = new ObservationContinuation(oldOwner.token(), oldOwner.sourceScope(), Optional.empty(), Optional.empty(),
+                frame(START, START, 7).observation().facts(), List.of());
+        var local = new ObservationScopeRegistry();
+        var before = local.beginTargetContinuation(PIPELINE, oldOwner, target, () -> true).orElseThrow();
+        local.adoptTargetContinuation(before, Optional.of(base), Optional.empty());
+        var first = local.prepareContinuationPublication(frame(START.plusSeconds(1), START.plusSeconds(1), 2), target, () -> true)
+                .orElseThrow();
+        var durableWriter = new ObservationScopeRegistry();
+        var cold = durableWriter.beginTargetContinuation(PIPELINE, oldOwner, target, () -> true).orElseThrow();
+        durableWriter.adoptTargetContinuation(cold, first.snapshot(), Optional.empty());
+        var durable = durableWriter.prepareContinuationPublication(frame(START.plusSeconds(2), START.plusSeconds(2), 3), target,
+                () -> true).orElseThrow();
+        assertThat(counter(durable.projected())).isEqualTo(12);
+        var takeover = local.beginTargetContinuation(PIPELINE, newOwner, target, () -> true).orElseThrow();
+        local.adoptTargetContinuation(takeover, durable.snapshot(), Optional.empty());
+        var late = local.prepareContinuationPublication(frame(START.plusSeconds(3), START.plusSeconds(1), 2), target, () -> true)
+                .orElseThrow();
+        assertThat(counter(late.projected())).isEqualTo(12);
+        assertThat(late.snapshot().orElseThrow().producerStates()).singleElement()
+                .satisfies(state -> assertThat(state.nativeStart()).isEqualTo(START.plusSeconds(2)));
+    }
+
+    @Test
+    void aPreviousBoundTargetIsExplicitlyTheNewFloorOriginAndItsEpochDoesNotFollowTheSuccessor() {
+        var previous = continuationTarget(42, 77);
+        var live = knownContinuationRegistry();
+        var packet = live.prepareContinuationPublication(frame(START.plusSeconds(1), START.plusSeconds(1), 2), previous, () -> true)
+                .orElseThrow();
+        var replacement = new ObservationScopeRegistry();
+        var source = replacement.beginSourceContinuation(PIPELINE, continuationKey(42), Optional.of(previous), () -> true)
+                .orElseThrow();
+        var frozen = replacement.prepareSourceContinuation(source, Optional.empty(), packet.snapshot(),
+                ObservationScopeRegistry.SourceReadStatus.READABLE).snapshot().orElseThrow();
+        assertThat(frozen.baselineFacts().getFirst().points().getFirst().value()).isEqualTo(9);
+        assertThat(frozen.continuation().baselineOrigin().orElseThrow().realJob()).contains(previous.job());
+        assertThat(frozen.continuation().producerStates()).isEmpty();
+        var target = continuationTarget(43, 78);
+        var ticket = replacement.beginTargetContinuation(PIPELINE, continuationKey(43), target, () -> true).orElseThrow();
+        replacement.adoptTargetContinuation(ticket, Optional.empty(), Optional.of(frozen));
+        var next = replacement.prepareContinuationPublication(frame(START.plusSeconds(2), START.plusSeconds(2), 2), target, () -> true)
+                .orElseThrow();
+        assertThat(counter(next.projected())).isEqualTo(11);
+    }
+
+    @Test
+    void resetAndIncarnationDeletionClearActiveContinuationButAdmissionKeepsTheQualifiedSource() {
+        for (boolean deletion : List.of(false, true)) {
+            var scopes = knownContinuationRegistry();
+            var target = continuationTarget(42, 77);
+            var packet = scopes.prepareContinuationPublication(frame(START.plusSeconds(1), START.plusSeconds(1), 2), target, () -> true)
+                    .orElseThrow();
+            var receipt = continuationReceipt(packet.snapshot().orElseThrow(), "reset-proof");
+            scopes.publicationAccepted(packet.ticket(), receipt);
+            if (deletion) { scopes.forgetIncarnation(PIPELINE, "inc-a"); }
+            var fresh = new ObservationStore.Scope(deletion ? "inc-b" : "inc-a", 43);
+            scopes.beginResetExecution(PIPELINE, fresh);
+            assertThat(scopes.activeContinuationTarget(PIPELINE)).isEmpty();
+            assertThat(scopes.activeContinuationKey(PIPELINE)).isEmpty();
+            assertThat(scopes.durableReceipt(PIPELINE, handoff(continuationKey(42), target))).isEmpty();
+            var current = new ObservationScopeRegistry.ActualTarget(fresh,
+                    new StopReservation.JobIdentity("single", 78, "boot-78"));
+            var reset = scopes.prepareContinuationPublication(frame(START.plusSeconds(2), START.plusSeconds(2), 2), current, () -> true)
+                    .orElseThrow();
+            assertThat(counter(reset.projected())).isEqualTo(2);
+            assertThat(start(reset.projected())).isEqualTo(START.plusSeconds(2));
+            assertThat(reset.snapshot()).isEmpty();
+        }
+    }
+
+    @Test
+    void sourceAndTargetChecksRunOutsideTheEntryLockAndLateIOCannotReviveResetState() throws Exception {
+        try (var executor = Executors.newSingleThreadExecutor()) {
+            var scopes = new ObservationScopeRegistry();
+            var key = continuationKey(42);
+            var target = continuationTarget(42, 77);
+            AtomicInteger checks = new AtomicInteger();
+            var ticket = scopes.beginTargetContinuation(PIPELINE, key, target, () -> {
+                if (checks.incrementAndGet() == 2) {
+                    try { executor.submit(() -> scopes.beginResetExecution(PIPELINE, new ObservationStore.Scope("inc-a", 43)))
+                            .get(5, TimeUnit.SECONDS); }
+                    catch (Exception failed) { throw new AssertionError(failed); }
+                }
+                return true;
+            }).orElseThrow();
+            assertThat(scopes.adoptTargetContinuation(ticket, Optional.empty(), Optional.empty()).status())
+                    .isEqualTo(ObservationScopeRegistry.PreparationStatus.INVALIDATED);
+            assertThat(scopes.current(PIPELINE)).contains(new ObservationStore.Scope("inc-a", 43));
+            assertThat(scopes.activeContinuationTarget(PIPELINE)).isEmpty();
+        }
+    }
+
+    private static ObservationScopeRegistry knownContinuationRegistry() {
+        var scopes = new ObservationScopeRegistry();
+        var target = continuationTarget(42, 77);
+        var key = continuationKey(42);
+        var base = new ObservationContinuation(key.token(), key.sourceScope(), Optional.empty(), Optional.empty(),
+                frame(START, START, 7).observation().facts(), List.of());
+        var ticket = scopes.beginTargetContinuation(PIPELINE, key, target, () -> true).orElseThrow();
+        scopes.adoptTargetContinuation(ticket, Optional.of(base), Optional.empty());
+        return scopes;
+    }
+
+    private static ObservationScopeRegistry.ContinuationKey continuationKey(long generation) {
+        return new ObservationScopeRegistry.ContinuationKey("durable-resume", new ObservationStore.Scope("inc-a", 41),
+                StopReservation.CounterPolicy.CONTINUE, StopAuthority.standalone("single", generation));
+    }
+
+    private static ObservationScopeRegistry.ContinuationKey claimedContinuationKey(String owner, long claimGeneration) {
+        var claim = new WorkloadClaim(new WorkloadClaimKey("single", WorkloadClaimType.PIPELINE_ACTUATION, PIPELINE),
+                new WorkloadOwner(owner, "boot-" + owner), claimGeneration, 42, 3, START.plusSeconds(60));
+        return new ObservationScopeRegistry.ContinuationKey("durable-resume", new ObservationStore.Scope("inc-a", 41),
+                StopReservation.CounterPolicy.CONTINUE, StopAuthority.claimed(WorkloadClaimFence.from(claim)));
+    }
+
+    private static ObservationScopeRegistry.ActualTarget continuationTarget(long generation, long job) {
+        return new ObservationScopeRegistry.ActualTarget(new ObservationStore.Scope("inc-a", generation),
+                new StopReservation.JobIdentity("single", job, "boot-" + job));
+    }
+
+    private static HandoffIdentity handoff(ObservationScopeRegistry.ContinuationKey key, ObservationScopeRegistry.ActualTarget target) {
+        return new HandoffIdentity(PIPELINE, key.token(), key.policy(), key.sourceScope(), target.scope(), target.job());
+    }
+
+    private static ObservationStore.ContinuationReceipt continuationReceipt(ObservationContinuation snapshot, String revision) {
+        return new ObservationStore.ContinuationReceipt(PIPELINE, revision, "a".repeat(64), 1, snapshot.token(), snapshot.sourceScope(),
+                snapshot.target(), snapshot.baselineOrigin(), snapshot.knownBaseline());
+    }
 
     @Test
     void aColdRebuildKeepsItsQualifiedStoredFloorWithoutInstallingAnObservationScope() {

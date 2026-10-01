@@ -146,14 +146,18 @@ class RuntimeConvergenceConfiguration {
     @Bean(destroyMethod = "close")
     TelemetryDispatcher telemetryDispatcher(ObservationPublisher publisher, RateSampler sampler,
             MetricsExport export, ObservationScopeRegistry scopes, StorePort storePort,
-            ExecutionGenerationStore generations, ClusterProperties cluster, ClusterIdentityStore identities) {
+            ExecutionGenerationStore generations, ClusterProperties cluster, ClusterIdentityStore identities,
+            LifecycleActuator lifecycleActuator, Engine engine) {
         String clusterId = cluster.getProfile() == ClusterProperties.Profile.SINGLE
                 ? DataPlaneActuationConfiguration.standaloneClusterId(cluster, identities)
                 : cluster.getId();
         ObservationScopeRecovery recovery = new ObservationScopeRecovery(storePort.artifacts(), generations,
                 storePort.observations(), storePort.state(), clusterId);
+        ObservationContinuationRecovery continuations = new ObservationContinuationRecovery(scopes,
+                storePort.observations(), storePort.state(), storePort.desired(), storePort.artifacts(), lifecycleActuator, engine);
         return new TelemetryDispatcher(publisher, sampler, export, scopes, storePort.events(), recovery,
-                TelemetryDispatcher.DEFAULT_LATEST_WORKERS, TelemetryDispatcher.DEFAULT_QUEUE_CAPACITY);
+                continuations, TelemetryDispatcher.DEFAULT_LATEST_WORKERS, TelemetryDispatcher.DEFAULT_QUEUE_CAPACITY,
+                Duration.ofSeconds(5));
     }
 
     /** Orphan cleanup has its own cold worker and never runs on the convergence scheduler. */
@@ -166,7 +170,7 @@ class RuntimeConvergenceConfiguration {
                 ? DataPlaneActuationConfiguration.standaloneClusterId(cluster, identities)
                 : cluster.getId();
         ObservationJanitor janitor = new ObservationJanitor(storePort.observations(), storePort.artifacts(),
-                storePort.workloadClaims(), clusterId, batchSize, interval);
+                storePort.workloadClaims(), storePort.state(), clusterId, batchSize, interval, true);
         Instant startedAt = clock.instant();
         export.observeProcess("janitor", () -> ObservationJanitorFacts.snapshot(
                 janitor.health(), startedAt, clock.instant()));

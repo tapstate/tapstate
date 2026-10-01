@@ -5,8 +5,10 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
+import java.util.function.Predicate;
 import io.tapstate.spi.store.StopAuthority;
 import io.tapstate.spi.store.StopReservation;
+import io.tapstate.spi.store.HandoffIdentity;
 
 /** Measures real engine/capture operations at the assembly seam, including failures and cleanup. */
 final class MeasuredLifecycleActuator implements LifecycleActuator {
@@ -56,6 +58,56 @@ final class MeasuredLifecycleActuator implements LifecycleActuator {
             facts.recordVerb(LifecycleWorkDispatcher.Verb.START, System.nanoTime() - began);
             throw failure;
         }
+    }
+
+    @Override
+    public PreparedReplacement prepareReplacement(StopReservation reservation, ReplacementAdmission admission,
+            Predicate<StopReservation> current) {
+        long began = System.nanoTime();
+        try {
+            PreparedReplacement prepared = delegate.prepareReplacement(reservation, admission, current);
+            long preparationNanos = System.nanoTime() - began;
+            return new PreparedReplacement() {
+                private long workNanos = preparationNanos;
+                private boolean recorded;
+
+                @Override public StopReservation admitted() { return prepared.admitted(); }
+                @Override public Optional<StopReservation.JobIdentity> submittedJob() { return prepared.submittedJob(); }
+                @Override public void submit() {
+                    long submitting = System.nanoTime();
+                    try { prepared.submit(); }
+                    finally { workNanos += System.nanoTime() - submitting; }
+                }
+                @Override public void close() {
+                    long closing = System.nanoTime();
+                    try { prepared.close(); }
+                    finally {
+                        workNanos += System.nanoTime() - closing;
+                        if (!recorded) {
+                            recorded = true;
+                            facts.recordVerb(LifecycleWorkDispatcher.Verb.START, workNanos);
+                        }
+                    }
+                }
+            };
+        } catch (RuntimeException | Error failure) {
+            facts.recordVerb(LifecycleWorkDispatcher.Verb.START, System.nanoTime() - began);
+            throw failure;
+        }
+    }
+
+    @Override public Optional<SuccessorInspection> inspectSuccessor(StopReservation reservation,
+            BooleanSupplier current) { return delegate.inspectSuccessor(reservation, current); }
+
+    @Override public boolean adoptSuccessor(StopReservation reservation, BooleanSupplier current) {
+        return delegate.adoptSuccessor(reservation, current);
+    }
+
+    @Override public Optional<HandoffIdentity> continuationReady(StopReservation reservation,
+            BooleanSupplier current) { return delegate.continuationReady(reservation, current); }
+
+    @Override public void observeReplacementFailure(StopReservation reservation, BooleanSupplier current) {
+        delegate.observeReplacementFailure(reservation, current);
     }
 
     @Override
@@ -126,6 +178,11 @@ final class MeasuredLifecycleActuator implements LifecycleActuator {
     @Override
     public Optional<StopReservation.Subject> stopSubject(String pipelineId) {
         return delegate.stopSubject(pipelineId);
+    }
+
+    @Override
+    public Optional<StopReservation.Source> stopSource(String pipelineId) {
+        return delegate.stopSource(pipelineId);
     }
 
     @Override

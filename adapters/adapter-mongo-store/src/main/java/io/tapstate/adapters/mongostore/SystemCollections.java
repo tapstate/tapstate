@@ -48,7 +48,8 @@ public enum SystemCollections {
     PIPELINE_DESIRED(MongoStorePort.PIPELINE_DESIRED, Database.STORE, MongoDesiredStore.class, Strategy.MIGRATED, 0),
     PIPELINE_OBSERVATION(
             MongoStorePort.PIPELINE_OBSERVATION, Database.STORE, MongoObservationStore.class, Strategy.MIGRATED, 0,
-            new IndexSpec(List.of("pending.publishUntil", "_id"), false)),
+            new IndexSpec(List.of("pending.publishUntil", "_id"), false),
+            new IndexSpec(List.of("continuationPending.publishUntil", "_id"), false)),
     WORKLOAD_CLAIMS(
             MongoStorePort.WORKLOAD_CLAIMS, Database.STORE, MongoWorkloadClaimStore.class,
             Strategy.OWNED_ELSEWHERE, 0),

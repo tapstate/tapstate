@@ -11,6 +11,7 @@ import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.StateStore;
 import io.tapstate.spi.store.StopAuthority;
 import io.tapstate.spi.store.StopReservation;
+import io.tapstate.spi.store.SuccessorEnd;
 
 import java.time.Clock;
 import java.util.Objects;
@@ -300,10 +301,16 @@ public final class PipelineConverger {
         if (!state.supportsStopReservations()) {
             return legacyStop(current, intent, replacement);
         }
-        StopReservation.Subject subject = actuator.stopSubject(pipelineId)
-                .orElseThrow(() -> new IllegalStateException("durable stop binding supplied no factual subject"));
-        StopReservation proposal = new StopReservation(pipelineId, UUID.randomUUID().toString(), current.epoch(),
-                Math.incrementExact(current.epoch()), intent, subject);
+        StopAuthority authority = actuator.stopAuthority(pipelineId).orElse(null);
+        StopReservation.Source source = actuator.stopSource(pipelineId)
+                .orElseThrow(() -> new IllegalStateException("durable stop binding supplied no factual source"));
+        if (!Objects.equals(authority, actuator.stopAuthority(pipelineId).orElse(null))
+                || source.scope() != null && (authority == null
+                        || source.scope().executionGeneration() != authority.executionGeneration())) {
+            return ConvergeResult.superseded();
+        }
+        StopReservation proposal = StopReservation.stopping(pipelineId, UUID.randomUUID().toString(), current.epoch(),
+                intent, source, StopReservation.CounterPolicy.freeze(current, intent), authority);
         return state.reserveStop(current, proposal, clock.instant())
                 .map(accepted -> resumeStop(accepted, intent, true)).orElseGet(ConvergeResult::superseded);
     }
@@ -311,66 +318,178 @@ public final class PipelineConverger {
     private ConvergeResult resumeStop(StopReservation marker, DesiredState intent, boolean firstAttempt) {
         String id = marker.pipelineId();
         StopAuthority authority = actuator.stopAuthority(id).orElse(null);
-        if (marker.authorityOrNull() != null && authority == null) {
-            return ConvergeResult.superseded();
-        }
+        if (marker.writerAuthority() != null && authority == null) { return ConvergeResult.superseded(); }
         boolean retiring = !marker.originalDesired().equals(intent);
-        if (retiring && intent.targetState() == PipelineState.RUNNING && intent.reassemble()
-                && Objects.equals(intent.rebuiltAtStateEpoch(), marker.reservedEpoch())) {
-            StopReservation expectedOld = marker;
-            java.util.function.BooleanSupplier currentOld = () -> !Thread.currentThread().isInterrupted()
-                    && desired.read(id).filter(intent::equals).isPresent()
-                    && state.readStopReservation(id).filter(expectedOld::equals).isPresent()
-                    && Objects.equals(authority, actuator.stopAuthority(id).orElse(null));
-            if (!currentOld.getAsBoolean()) { return ConvergeResult.superseded(); }
-            CheckpointDoc before = requireCheckpoint(id);
-            boolean continuing = continuesCounters(before, intent);
-            if (!actuator.finishStop(expectedOld, continuing, firstAttempt, true, currentOld)) {
-                return currentOld.getAsBoolean() ? ConvergeResult.stopPending(requireCheckpoint(id))
-                        : ConvergeResult.superseded();
-            }
-            if (!currentOld.getAsBoolean()) { return ConvergeResult.superseded(); }
-            StopReservation.Subject subject = actuator.stopSubject(id)
-                    .orElseThrow(() -> new IllegalStateException("durable stop binding supplied no factual subject"));
-            if (!currentOld.getAsBoolean()) { return ConvergeResult.superseded(); }
-            StopReservation replacement = new StopReservation(id, UUID.randomUUID().toString(),
-                    marker.reservedEpoch(), Math.incrementExact(marker.reservedEpoch()), intent, subject);
-            return state.replaceStop(marker, replacement, clock.instant())
-                    .map(accepted -> resumeStop(accepted, intent, true)).orElseGet(ConvergeResult::superseded);
+        if (marker.legacy() && !retiring) {
+            marker = state.promoteStopReservation(marker, intent, authority, clock.instant()).orElse(null);
+            if (marker == null) { return ConvergeResult.superseded(); }
         }
-        if (!retiring && !Objects.equals(marker.authorityOrNull(), authority)) {
-            if (authority == null || marker.subject() instanceof StopReservation.ExistingJob old
-                    && old.executionGeneration() != authority.executionGeneration()) {
-                return ConvergeResult.superseded();
-            }
-            marker = state.rebindStop(marker, authority, clock.instant()).orElse(null);
+        if (!retiring && !Objects.equals(marker.writerAuthority(), authority)) {
+            marker = authority == null ? null : state.rebindStop(marker, authority, clock.instant()).orElse(null);
             if (marker == null) { return ConvergeResult.superseded(); }
         }
         StopReservation expected = marker;
-        java.util.function.BooleanSupplier current = () -> !Thread.currentThread().isInterrupted()
-                && desired.read(id).filter(intent::equals).isPresent()
-                && state.readStopReservation(id).filter(expected::equals).isPresent()
-                && Objects.equals(authority, actuator.stopAuthority(id).orElse(null));
+        java.util.function.BooleanSupplier current = () -> currentMarker(expected, intent, authority);
         if (!current.getAsBoolean()) { return ConvergeResult.superseded(); }
         CheckpointDoc before = requireCheckpoint(id);
-        boolean continuing = continuesCounters(before, intent);
-        if (!actuator.finishStop(expected, continuing, firstAttempt, retiring, current)) {
-            return current.getAsBoolean() ? ConvergeResult.stopPending(requireCheckpoint(id))
-                    : ConvergeResult.superseded();
-        }
-        if (!current.getAsBoolean()) { return ConvergeResult.superseded(); }
         if (retiring) {
+            boolean continuing = continuesCounters(before, intent);
+            if (!actuator.finishStop(expected, continuing, firstAttempt, true, current)) {
+                return pendingOrSuperseded(id, current);
+            }
+            if (!current.getAsBoolean()) { return ConvergeResult.superseded(); }
+            // A stamped START must survive the epoch reserved by the old unfinished operation.
+            if (intent.targetState() == PipelineState.RUNNING && intent.reassemble()
+                    && Objects.equals(intent.rebuiltAtStateEpoch(), marker.reservedEpoch())) {
+                StopReservation.Source source = actuator.stopSource(id).orElseThrow(
+                        () -> new IllegalStateException("durable stop binding supplied no factual source"));
+                if (!current.getAsBoolean()) { return ConvergeResult.superseded(); }
+                StopReservation replacement = StopReservation.stopping(id, UUID.randomUUID().toString(),
+                        marker.reservedEpoch(), intent, source, StopReservation.CounterPolicy.freeze(before, intent), authority);
+                return state.replaceStop(marker, replacement, clock.instant())
+                        .map(accepted -> resumeStop(accepted, intent, true)).orElseGet(ConvergeResult::superseded);
+            }
             state.retireStop(expected, intent, authority, clock.instant());
             return ConvergeResult.superseded();
         }
-        Optional<CheckpointDoc> completed = state.completeStop(expected, clock.instant());
-        if (completed.isEmpty()) { return ConvergeResult.superseded(); }
-        CheckpointDoc stopped = completed.orElseThrow();
-        if (intent.targetState() == PipelineState.RUNNING && desired.read(id).filter(intent::equals).isPresent()
-                && !Thread.currentThread().isInterrupted()) {
-            return driveTo(id, PipelineState.RUNNING, false, stopped, false, false, false);
+        return switch (expected.phase()) {
+            case STOPPING -> {
+                boolean continuing = expected.counterPolicy() == StopReservation.CounterPolicy.CONTINUE;
+                if (!actuator.finishStop(expected, continuing, firstAttempt, false, current)) {
+                    yield pendingOrSuperseded(id, current);
+                }
+                if (!current.getAsBoolean()) { yield ConvergeResult.superseded(); }
+                if (intent.targetState() == PipelineState.RUNNING) {
+                    yield state.markReplacementPending(expected, clock.instant())
+                            .map(accepted -> resumeStop(accepted, intent, false))
+                            .orElseGet(ConvergeResult::superseded);
+                }
+                yield state.completeStop(expected, clock.instant())
+                        .map(done -> ConvergeResult.converged(done, StateJson.parse(before.stateJson())))
+                        .orElseGet(ConvergeResult::superseded);
+            }
+            case REPLACEMENT_PENDING -> admitReplacement(expected, intent, current);
+            case SUCCESSOR_ADMITTED, SUCCESSOR_BOUND -> recoverSuccessor(expected, intent, current);
+        };
+    }
+
+    private boolean currentMarker(StopReservation marker, DesiredState intent, StopAuthority authority) {
+        return !Thread.currentThread().isInterrupted()
+                && desired.read(marker.pipelineId()).filter(intent::equals).isPresent()
+                && state.readStopReservation(marker.pipelineId()).filter(marker::equals).isPresent()
+                && Objects.equals(authority, actuator.stopAuthority(marker.pipelineId()).orElse(null));
+    }
+
+    private ConvergeResult pendingOrSuperseded(String id, java.util.function.BooleanSupplier current) {
+        return current.getAsBoolean() ? ConvergeResult.stopPending(requireCheckpoint(id))
+                : ConvergeResult.superseded();
+    }
+
+    private ConvergeResult admitReplacement(StopReservation marker, DesiredState intent,
+            java.util.function.BooleanSupplier current) {
+        String id = marker.pipelineId();
+        var admittedAttempt = new java.util.concurrent.atomic.AtomicReference<StopReservation>();
+        try (LifecycleActuator.PreparedReplacement prepared = actuator.prepareReplacement(marker,
+                (writer, incarnation, boot) -> {
+                    if (!current.getAsBoolean() || !Objects.equals(marker.writerAuthority(), writer)) { return Optional.empty(); }
+                    var accepted = state.admitSuccessor(marker, incarnation, boot, clock.instant());
+                    accepted.ifPresent(value -> admittedAttempt.set(value.reservation()));
+                    return accepted;
+                },
+                admitted -> currentMarker(admitted, intent, admitted.writerAuthority()))) {
+            StopReservation admitted = prepared.admitted();
+            if (!currentMarker(admitted, intent, admitted.writerAuthority())) { return ConvergeResult.superseded(); }
+            prepared.submit();
+            return prepared.submittedJob()
+                    .flatMap(job -> state.bindSuccessor(admitted, admitted.successor().scope(), job, clock.instant()))
+                    .map(bound -> resumeStop(bound, intent, false))
+                    .orElseGet(() -> ConvergeResult.stopPending(requireCheckpoint(id)));
+        } catch (StartDeferred waiting) {
+            return ConvergeResult.startDeferred(requireCheckpoint(id), waiting.reason());
+        } catch (TapstateException refused) {
+            StopReservation expected = Optional.ofNullable(admittedAttempt.get()).orElse(marker);
+            java.util.function.BooleanSupplier stillCurrent = () -> currentMarker(expected, intent, expected.writerAuthority());
+            if (!stillCurrent.getAsBoolean()) { return ConvergeResult.superseded(); }
+            Optional<StopReservation.JobIdentity> job = Optional.empty();
+            if (expected.successor() != null) {
+                var actual = actuator.inspectSuccessor(expected, stillCurrent).orElse(null);
+                if (actual == null || !stillCurrent.getAsBoolean()) { return ConvergeResult.superseded(); }
+                job = actual.job();
+            }
+            var failed = state.failReplacement(expected, job, clock.instant()).orElse(null);
+            if (failed == null) { return ConvergeResult.superseded(); }
+            java.util.function.BooleanSupplier failureCurrent = () -> !Thread.currentThread().isInterrupted()
+                    && desired.read(id).filter(intent::equals).isPresent()
+                    && state.read(id).filter(failed::equals).isPresent()
+                    && Objects.equals(expected.writerAuthority(), actuator.stopAuthority(id).orElse(null));
+            actuator.observeReplacementFailure(expected, failureCurrent);
+            return ConvergeResult.failed(failed, refused, Optional.of(PipelineState.STOPPED));
         }
-        return ConvergeResult.converged(stopped, StateJson.parse(before.stateJson()));
+    }
+
+    private ConvergeResult recoverSuccessor(StopReservation marker, DesiredState intent,
+            java.util.function.BooleanSupplier current) {
+        String id = marker.pipelineId();
+        var actual = actuator.inspectSuccessor(marker, current).orElse(null);
+        if (actual == null || !current.getAsBoolean()) { return ConvergeResult.superseded(); }
+        if (actual.job().isEmpty()) {
+            CheckpointDoc concluded = requireCheckpoint(id);
+            PipelineState concludedState = StateJson.parse(concluded.stateJson());
+            if (marker.phase() == StopReservation.Phase.SUCCESSOR_BOUND
+                    && (concludedState == PipelineState.FAILED || concludedState == PipelineState.COMPLETED)) {
+                var ready = marker.counterPolicy() == StopReservation.CounterPolicy.RESET
+                        ? Optional.of(marker.handoffIdentity()) : actuator.continuationReady(marker, current);
+                return ready.isPresent() ? state.completeHandoff(marker, ready.orElseThrow(), clock.instant())
+                        .map(ConvergeResult::converged).orElseGet(ConvergeResult::superseded)
+                        : ConvergeResult.converged(concluded);
+            }
+            SuccessorEnd end;
+            if (marker.phase() == StopReservation.Phase.SUCCESSOR_ADMITTED) {
+                end = new SuccessorEnd.Absent(marker.successor().scope(), marker.successor().submissionBootId());
+            } else {
+                // Preserve the last bound target's floor before retiring its now absent physical job.
+                if (!actuator.finishStop(marker, marker.counterPolicy() == StopReservation.CounterPolicy.CONTINUE,
+                        false, false, current)) { return pendingOrSuperseded(id, current); }
+                end = new SuccessorEnd.Terminal(marker.successor().scope(), marker.successor().job());
+            }
+            return state.retireSuccessor(marker, end, clock.instant())
+                    .map(pending -> ConvergeResult.stopPending(requireCheckpoint(id)))
+                    .orElseGet(ConvergeResult::superseded);
+        }
+        if (marker.phase() == StopReservation.Phase.SUCCESSOR_ADMITTED) {
+            return state.bindSuccessor(marker, marker.successor().scope(), actual.job().orElseThrow(), clock.instant())
+                    .map(bound -> resumeStop(bound, intent, false)).orElseGet(ConvergeResult::superseded);
+        }
+        CheckpointDoc before = requireCheckpoint(id);
+        if (actual.terminalState().isPresent()
+                && StateJson.parse(before.stateJson()) != actual.terminalState().orElseThrow()) {
+            PipelineState terminal = actual.terminalState().orElseThrow();
+            var ended = state.recordSuccessorTerminal(marker,
+                    new SuccessorEnd.Terminal(marker.successor().scope(), actual.job().orElseThrow()),
+                    terminal, clock.instant()).orElse(null);
+            if (ended == null) { return ConvergeResult.superseded(); }
+            ConvergeResult driven = resumeStop(ended, intent, false);
+            if (driven.checkpoint().isPresent()) {
+                Optional<Throwable> cause = terminal == PipelineState.FAILED ? actuator.failure(id) : Optional.empty();
+                if (cause.isPresent()) {
+                    return ConvergeResult.failed(driven.checkpoint().orElseThrow(), cause.orElseThrow(),
+                            Optional.of(StateJson.parse(before.stateJson())));
+                }
+                return ConvergeResult.converged(driven.checkpoint().orElseThrow(), StateJson.parse(before.stateJson()));
+            }
+            return driven;
+        }
+        if (!actuator.adoptSuccessor(marker, current) || !current.getAsBoolean()) {
+            return ConvergeResult.superseded();
+        }
+        var ready = marker.counterPolicy() == StopReservation.CounterPolicy.RESET
+                ? Optional.of(marker.handoffIdentity()) : actuator.continuationReady(marker, current);
+        if (ready.isPresent()) {
+            return state.completeHandoff(marker, ready.orElseThrow(), clock.instant())
+                    .map(ConvergeResult::converged).orElseGet(ConvergeResult::superseded);
+        }
+        // The actual job is running. Telemetry completion stays independently pending in the marker.
+        return ConvergeResult.converged(requireCheckpoint(id));
     }
 
     /** A genuine resume carries known totals; a stamped restart or purge starts fresh counters. */

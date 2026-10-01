@@ -49,6 +49,10 @@ import io.tapstate.spi.store.ExecutionGenerationStore;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.StopAuthority;
 import io.tapstate.spi.store.StopReservation;
+import io.tapstate.spi.store.SuccessorAdmission;
+import io.tapstate.spi.store.SuccessorEnd;
+import io.tapstate.spi.store.HandoffIdentity;
+import io.tapstate.spi.store.ObservationContinuation;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
@@ -341,7 +345,7 @@ class EngineLifecycleActuatorTest {
         var incarnations = coldStopIncarnations();
         var desired = new InMemoryDesiredStore();
         var state = new RestartableStopStateStore();
-        state.enableStops(desired, id -> ownership.stopAuthority(id).orElse(null));
+        state.enableStops(desired, id -> ownership.stopAuthority(id).orElse(null), generations);
         var coordinator = new RecordingCaptureCoordinator(events);
         var dags = new RecordingDagSource(events);
         var originalEngine = new Engine(member);
@@ -386,11 +390,16 @@ class EngineLifecycleActuatorTest {
         assertThat(observations.readStored(PIPE)).contains(stored);
         assertThat(dags.fences).extracting(ExecutionFence::executionGeneration)
                 .containsExactly(old.scope().executionGeneration());
+        assertThat(state.readStopReservation(PIPE).orElseThrow().phase())
+                .isEqualTo(StopReservation.Phase.REPLACEMENT_PENDING);
+        assertThat(continuationRecovery(stoppingScopes, observations, state, desired, incarnations,
+                stopping, stoppingEngine).prepareHandoff(PIPE, null, () -> true)).isTrue();
+        assertThat(observations.readContinuation(PIPE).orElseThrow().continuation().knownBaseline()).isTrue();
 
         // Discard the stopped actor, registry, native-future cache and capture coordinator.
         // The exact desired intent, checkpoint and seven-record observation remain durable.
         var restartedOwnership = PipelineActuationOwnership.single("single", generations);
-        state.enableStops(desired, id -> restartedOwnership.stopAuthority(id).orElse(null));
+        state.enableStops(desired, id -> restartedOwnership.stopAuthority(id).orElse(null), generations);
         var restartedEngine = new Engine(member);
         var restartedScopes = new ObservationScopeRegistry();
         var restartedCapture = new RecordingCaptureCoordinator(events);
@@ -413,8 +422,11 @@ class EngineLifecycleActuatorTest {
         assertThat(restartedDags.fences).extracting(ExecutionFence::executionGeneration)
                 .containsExactly(next.executionGeneration());
         Instant measuredAt = started.plusSeconds(30);
-        Observation continued = restartedScopes.continueFrame(
-                metricFrame(measuredAt, measuredAt, 2, 1, 22), next).observation();
+        assertThat(continuationRecovery(restartedScopes, observations, state, desired, incarnations,
+                restarted, restartedEngine).prepareHandoff(PIPE, next, () -> true)).isTrue();
+        Observation continued = commitContinuationFrame(restartedScopes, observations,
+                metricFrame(measuredAt, measuredAt, 2, 1, 22), restartedEngine.executionJob(PIPE).orElseThrow());
+        assertThat(restartedLoop.converge(PIPE).status()).isEqualTo(ConvergeStatus.CONVERGED);
 
         assertThat(point(continued, "tapstate.pipeline.records").value())
                 .as("a deferred rebuilding resume retains the durable seven-record floor across restart")
@@ -426,6 +438,38 @@ class EngineLifecycleActuatorTest {
         assertThat(point(continued, "tapstate.pipeline.lag").value()).isEqualTo(22);
         assertThat(state.readStopReservation(PIPE)).isEmpty();
         assertThat(StateJson.parse(state.read(PIPE).orElseThrow().stateJson())).isEqualTo(PipelineState.RUNNING);
+
+        // Rebuild the service view again after the marker is gone while retaining this same real Job.
+        var sameJobEngine = new Engine(member);
+        var sameJobScopes = new ObservationScopeRegistry();
+        var sameJobActor = new EngineLifecycleActuator(sameJobEngine, restartedDags, restartedCapture, teardown(),
+                restartedOwnership, incarnations, sameJobScopes, null, observations);
+        var sameJobRecovery = continuationRecovery(sameJobScopes, observations, state, desired, incarnations,
+                sameJobActor, sameJobEngine);
+        var resolved = sameJobRecovery.resolveExisting(PIPE, () -> true).orElseThrow();
+        assertThat(sameJobRecovery.adoptExisting(resolved)).isTrue();
+        Engine.ExecutionJob samePhysical = sameJobEngine.executionJob(PIPE).orElseThrow();
+        assertThat(samePhysical.job().jobId()).isEqualTo(replacement.getId());
+        Observation reread = commitContinuationFrame(sameJobScopes, observations,
+                metricFrame(started.plusSeconds(40), measuredAt, 2, 1, 22), samePhysical);
+        assertThat(point(reread, "tapstate.pipeline.records").value())
+                .as("the public nine is not added again to the same native two") .isEqualTo(9);
+        assertThat(point(reread, "tapstate.pipeline.records").startTime()).isEqualTo(started);
+        assertThat(generations.executionGeneration(standaloneKey())).isEqualTo(next.executionGeneration());
+
+        Instant nativeRestart = started.plusSeconds(50);
+        Observation nextEpoch = commitContinuationFrame(sameJobScopes, observations,
+                metricFrame(nativeRestart, nativeRestart, 3, 2, 23), samePhysical);
+        assertThat(point(nextEpoch, "tapstate.pipeline.records").value())
+                .as("a real new native producer epoch adds three to the known logical nine") .isEqualTo(12);
+        assertThat(point(nextEpoch, "tapstate.pipeline.record.delivery.duration").histogram().count()).isEqualTo(6);
+        Observation lateOldEpoch = commitContinuationFrame(sameJobScopes, observations,
+                metricFrame(started.plusSeconds(60), measuredAt, 2, 1, 24), samePhysical);
+        assertThat(point(lateOldEpoch, "tapstate.pipeline.records").value())
+                .as("a late old native epoch cannot lower or re-add the current logical twelve") .isEqualTo(12);
+        assertThat(point(lateOldEpoch, "tapstate.pipeline.records").startTime()).isEqualTo(started);
+        assertThat(sameJobEngine.executionJob(PIPE)).contains(samePhysical);
+        assertThat(restartedDags.fences).hasSize(1);
     }
 
     @Test
@@ -447,7 +491,7 @@ class EngineLifecycleActuatorTest {
         var incarnations = coldStopIncarnations();
         var desired = new InMemoryDesiredStore();
         var state = new RestartableStopStateStore();
-        state.enableStops(desired, id -> ownership.stopAuthority(id).orElse(null));
+        state.enableStops(desired, id -> ownership.stopAuthority(id).orElse(null), generations);
         var coordinator = new RecordingCaptureCoordinator(events);
         var dags = new RecordingDagSource(events);
         var originalEngine = new Engine(member);
@@ -504,13 +548,26 @@ class EngineLifecycleActuatorTest {
                 .containsExactly(old.scope().executionGeneration(), next.executionGeneration());
         assertThat(generations.executionGeneration(standaloneKey())).isEqualTo(next.executionGeneration());
         assertThat(coordinator.hasActiveCapture(PIPE)).isTrue();
-        assertThat(state.readStopReservation(PIPE)).isEmpty();
+        if (startAfterStop) {
+            assertThat(state.readStopReservation(PIPE)).isEmpty();
+        } else {
+            assertThat(state.readStopReservation(PIPE).orElseThrow().phase())
+                    .isEqualTo(StopReservation.Phase.SUCCESSOR_BOUND);
+        }
         assertThat(desired.read(PIPE)).contains(nextIntent);
         assertThat(observations.readStored(PIPE)).contains(stored);
 
+        if (!startAfterStop) {
+            assertThat(continuationRecovery(replacementScopes, observations, state, desired, incarnations,
+                    replacement, replacementEngine).prepareHandoff(PIPE, next, () -> true)).isTrue();
+        }
         Instant measuredAt = started.plusSeconds(30);
-        Observation measured = replacementScopes.continueFrame(
-                metricFrame(measuredAt, measuredAt, 2, 1, 22), next).observation();
+        Observation measured = startAfterStop ? replacementScopes.continueFrame(
+                metricFrame(measuredAt, measuredAt, 2, 1, 22), next).observation()
+                : commitContinuationFrame(replacementScopes, observations,
+                        metricFrame(measuredAt, measuredAt, 2, 1, 22), replacementEngine.executionJob(PIPE).orElseThrow());
+        assertThat(replacementLoop.converge(PIPE).status()).isEqualTo(ConvergeStatus.CONVERGED);
+        assertThat(state.readStopReservation(PIPE)).isEmpty();
         long expectedRecords = startAfterStop ? 2 : 9;
         long expectedDurationCount = startAfterStop ? 1 : 4;
         Instant expectedStart = startAfterStop ? measuredAt : started;
@@ -547,16 +604,90 @@ class EngineLifecycleActuatorTest {
     }
 
     private static ObservationStore retainedObservation(ObservationStore.Stored stored) {
-        return new ObservationStore() {
-            @Override public void save(Observation observation) { throw new AssertionError("unexpected write"); }
-            @Override public Optional<Observation> read(String id) {
-                return readStored(id).map(Stored::observation);
+        return new RetainedObservations(stored);
+    }
+
+    /** Retains only typed latest/continuation values; the real Mongo transaction proof lives in integration tests. */
+    private static final class RetainedObservations implements ObservationStore {
+        private Stored current;
+        private StoredContinuation continuation;
+        private long revision;
+        private RetainedObservations(Stored initial) { current = initial; }
+        @Override public synchronized void save(Observation observation) { throw new AssertionError("unexpected legacy write"); }
+        @Override public synchronized Optional<Observation> read(String id) { return readStored(id).map(Stored::observation); }
+        @Override public synchronized Optional<Stored> readStored(String id) {
+            return current != null && current.observation().pipelineId().equals(id) ? Optional.of(current) : Optional.empty();
+        }
+        @Override public synchronized Optional<StoredContinuation> readContinuation(String id) {
+            return continuation == null || !continuation.receipt().pipelineId().equals(id)
+                    ? Optional.empty() : Optional.of(continuation);
+        }
+        @Override public synchronized Optional<ContinuationReceipt> saveContinuation(String id, StopReservation marker,
+                Optional<ContinuationReceipt> expected, ObservationContinuation next) {
+            if (!id.equals(marker.pipelineId()) || !marker.token().equals(next.token())
+                    || !Objects.equals(marker.source().scope(), next.sourceScope()) || !expected.equals(receipt())) {
+                return Optional.empty();
             }
-            @Override public Optional<Stored> readStored(String id) {
-                return stored.observation().pipelineId().equals(id) ? Optional.of(stored) : Optional.empty();
+            continuation = storedContinuation(id, next);
+            return receipt();
+        }
+        @Override public synchronized boolean saveScoped(Observation observation, Scope scope) {
+            return saveScoped(observation, scope, ContinuationWrite.keep()).committed();
+        }
+        @Override public synchronized PublicationResult saveScoped(Observation observation, Scope scope, ContinuationWrite write) {
+            if (current != null && current.scope().isPresent()) {
+                Scope before = current.scope().orElseThrow();
+                if (before.executionGeneration() > scope.executionGeneration()
+                        || before.executionGeneration() == scope.executionGeneration()
+                                && (!before.equals(scope) || !observation.observedAt().isAfter(current.observation().observedAt()))) {
+                    return new PublicationResult(false, Optional.empty());
+                }
             }
-            @Override public void delete(String id) { throw new AssertionError("unexpected delete"); }
+            if (write instanceof ContinuationWrite.Store store) {
+                if (!store.expectedReceipt().equals(receipt())
+                        || store.next().target().filter(target -> target.scope().equals(scope)).isEmpty()) {
+                    return new PublicationResult(false, Optional.empty());
+                }
+                continuation = storedContinuation(observation.pipelineId(), store.next());
+            }
+            current = new Stored(observation, Optional.of(scope));
+            return new PublicationResult(true, write instanceof ContinuationWrite.Store ? receipt() : Optional.empty());
+        }
+        private Optional<ContinuationReceipt> receipt() {
+            return continuation == null ? Optional.empty() : Optional.of(continuation.receipt());
+        }
+        private StoredContinuation storedContinuation(String id, ObservationContinuation next) {
+            try {
+                String digest = java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
+                        .digest(next.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+                return new StoredContinuation(next, new ContinuationReceipt(id, "typed-test-" + ++revision,
+                        digest, 3, next.token(), next.sourceScope(), next.target(), next.baselineOrigin(), next.knownBaseline()));
+            } catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+        }
+        @Override public void delete(String id) { throw new AssertionError("unexpected delete"); }
+    }
+
+    private ObservationContinuationRecovery continuationRecovery(ObservationScopeRegistry scopes, ObservationStore observations,
+            StateStore state, DesiredStore desired, PipelineIncarnationService incarnations,
+            LifecycleActuator actor, Engine engine) {
+        ArtifactStore artifacts = new ArtifactStore() {
+            @Override public void saveAll(List<io.tapstate.core.model.Resource> resources) { throw new UnsupportedOperationException(); }
+            @Override public Optional<io.tapstate.core.model.Resource> get(String id) { return Optional.empty(); }
+            @Override public List<io.tapstate.core.model.Resource> list() { return List.of(); }
+            @Override public Optional<String> pipelineIncarnationId(String id) { return incarnations.current(id); }
         };
+        return new ObservationContinuationRecovery(scopes, observations, state, desired, artifacts, actor, engine);
+    }
+
+    private static Observation commitContinuationFrame(ObservationScopeRegistry scopes, ObservationStore observations,
+            ObservationPublisher.Prepared raw, Engine.ExecutionJob job) {
+        var packet = scopes.prepareContinuationPublication(raw,
+                new ObservationScopeRegistry.ActualTarget(job.scope(), job.job()), () -> true).orElseThrow();
+        var result = observations.saveScoped(packet.projected().observation(), job.scope(),
+                ObservationStore.ContinuationWrite.store(packet.snapshot().orElseThrow(), packet.expectedReceipt()));
+        assertThat(result.committed()).isTrue();
+        assertThat(scopes.publicationAccepted(packet.ticket(), result.continuationReceipt().orElseThrow())).isTrue();
+        return packet.projected().observation();
     }
 
     private static ObservationPublisher.Prepared metricFrame(Instant at, Instant since,
@@ -1402,6 +1533,7 @@ class EngineLifecycleActuatorTest {
         private int swapAttempts = 0;
         private final Map<String, StopReservation> stops = new HashMap<>();
         private DesiredStore stopIntents;
+        private ExecutionGenerationStore generations;
         private Function<String, StopAuthority> authorities;
         private Runnable beforeComplete = () -> { };
         private int reservations;
@@ -1449,7 +1581,9 @@ class EngineLifecycleActuatorTest {
             return swapAttempts;
         }
 
-        void enableStops(DesiredStore intents, Function<String, StopAuthority> currentAuthority) {
+        void enableStops(DesiredStore intents, Function<String, StopAuthority> currentAuthority,
+                ExecutionGenerationStore generations) {
+            this.generations = Objects.requireNonNull(generations);
             stopIntents = Objects.requireNonNull(intents);
             authorities = Objects.requireNonNull(currentAuthority);
         }
@@ -1484,6 +1618,88 @@ class EngineLifecycleActuatorTest {
             advance(expected, docs.get(expected.pipelineId()).stateJson(), at);
             stops.put(expected.pipelineId(), rebound);
             return Optional.of(rebound);
+        }
+
+        @Override public synchronized Optional<StopReservation> promoteStopReservation(StopReservation expected,
+                DesiredState intent, StopAuthority writer, Instant at) {
+            if (!exact(expected) || !expected.legacy() || !intent(intent) || !authority(expected.pipelineId(), writer)) {
+                return Optional.empty();
+            }
+            StopReservation promoted = move(expected, StopReservation.Phase.STOPPING,
+                    StopReservation.CounterPolicy.freeze(docs.get(expected.pipelineId()), expected.originalDesired()),
+                    writer, null, docs.get(expected.pipelineId()).stateJson(), at);
+            return Optional.of(promoted);
+        }
+
+        @Override public synchronized Optional<StopReservation> markReplacementPending(StopReservation expected, Instant at) {
+            if (!guard(expected)) { return Optional.empty(); }
+            return Optional.of(move(expected, StopReservation.Phase.REPLACEMENT_PENDING, expected.counterPolicy(),
+                    expected.writerAuthority(), null, StateJson.of(PipelineState.STOPPED), at));
+        }
+
+        @Override public synchronized Optional<SuccessorAdmission> admitSuccessor(StopReservation expected,
+                String incarnation, String boot, Instant at) {
+            if (!guard(expected) || expected.phase() != StopReservation.Phase.REPLACEMENT_PENDING
+                    || !StateJson.of(PipelineState.STOPPED).equals(docs.get(expected.pipelineId()).stateJson())) {
+                return Optional.empty();
+            }
+            long generation = generations.advanceStandalone(expected.source().clusterId(), expected.pipelineId()).orElseThrow();
+            var writer = StopAuthority.standalone(expected.source().clusterId(), generation);
+            var slot = new StopReservation.Successor(new ObservationStore.Scope(incarnation, generation), boot, null);
+            return Optional.of(new SuccessorAdmission(move(expected, StopReservation.Phase.SUCCESSOR_ADMITTED,
+                    expected.counterPolicy(), writer, slot, StateJson.of(PipelineState.STOPPED), at), Optional.empty()));
+        }
+
+        @Override public synchronized Optional<StopReservation> bindSuccessor(StopReservation expected,
+                ObservationStore.Scope scope, StopReservation.JobIdentity job, Instant at) {
+            if (!guard(expected) || expected.phase() != StopReservation.Phase.SUCCESSOR_ADMITTED
+                    || !expected.successor().scope().equals(scope) || !expected.successor().submissionBootId().equals(job.bootId())) {
+                return Optional.empty();
+            }
+            return Optional.of(move(expected, StopReservation.Phase.SUCCESSOR_BOUND, expected.counterPolicy(),
+                    expected.writerAuthority(), new StopReservation.Successor(scope, job.bootId(), job),
+                    StateJson.of(PipelineState.RUNNING), at));
+        }
+
+        @Override public synchronized Optional<StopReservation> retireSuccessor(StopReservation expected,
+                SuccessorEnd end, Instant at) {
+            if (!guard(expected)) { return Optional.empty(); }
+            boolean matches = switch (end) {
+                case SuccessorEnd.Absent absent -> expected.phase() == StopReservation.Phase.SUCCESSOR_ADMITTED
+                        && expected.successor().scope().equals(absent.scope())
+                        && expected.successor().submissionBootId().equals(absent.submissionBootId());
+                case SuccessorEnd.Terminal terminal -> expected.phase() == StopReservation.Phase.SUCCESSOR_BOUND
+                        && expected.successor().scope().equals(terminal.scope()) && expected.successor().job().equals(terminal.job());
+            };
+            return matches ? Optional.of(move(expected, StopReservation.Phase.REPLACEMENT_PENDING,
+                    expected.counterPolicy(), expected.writerAuthority(), null, StateJson.of(PipelineState.STOPPED), at))
+                    : Optional.empty();
+        }
+
+        @Override public synchronized Optional<CheckpointDoc> completeHandoff(StopReservation expected,
+                HandoffIdentity ready, Instant at) {
+            beforeComplete.run();
+            if (!guard(expected) || expected.phase() != StopReservation.Phase.SUCCESSOR_BOUND
+                    || !expected.handoffIdentity().equals(ready)) { return Optional.empty(); }
+            CheckpointDoc completed = advance(expected, StateJson.of(PipelineState.RUNNING), at);
+            stops.remove(expected.pipelineId());
+            return Optional.of(completed);
+        }
+
+        private boolean guard(StopReservation expected) {
+            return exact(expected) && intent(expected.originalDesired())
+                    && authority(expected.pipelineId(), expected.writerAuthority());
+        }
+
+        private StopReservation move(StopReservation expected, StopReservation.Phase phase,
+                StopReservation.CounterPolicy policy, StopAuthority writer, StopReservation.Successor slot,
+                String actual, Instant at) {
+            CheckpointDoc checkpoint = advance(expected, actual, at);
+            var moved = new StopReservation(expected.pipelineId(), expected.token(), expected.sourceEpoch(),
+                    checkpoint.epoch(), expected.originalDesired(), expected.source(), phase, policy, writer, slot,
+                    StopReservation.CURRENT_FORMAT);
+            stops.put(expected.pipelineId(), moved);
+            return moved;
         }
 
         @Override public synchronized Optional<CheckpointDoc> completeStop(StopReservation expected, Instant at) {

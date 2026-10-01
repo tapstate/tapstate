@@ -89,6 +89,7 @@ final class MongoLatestObservationStorage {
     private final MongoCollection<Document> manifests;
     private final MongoCollection<Document> chunks;
     private TimedCursor pendingAfter;
+    private TimedCursor continuationPendingAfter;
     private TimedCursor retiredAfter;
     private Binary chunkAfter;
     private int reclaimStartPhase;
@@ -131,6 +132,38 @@ final class MongoLatestObservationStorage {
     ManifestChunks publication(Observation observation, ObservationStore.Scope scope) {
         return new ManifestChunks(observation, manifestKey(observation.pipelineId()),
                 ownerDigest(observation.pipelineId()), scope, observation.observedAt());
+    }
+
+    record PreparedCurrent(Document descriptor, Document filter, ManifestChunks writer) { }
+
+    PreparedCurrent prepareCurrent(Observation observation, ObservationStore.Scope scope) {
+        Objects.requireNonNull(observation.observedAt(), "observedAt");
+        if (observation.observedAt().getNano() % 1_000_000 != 0) {
+            throw new IllegalArgumentException("a scoped observation time must have millisecond precision");
+        }
+        ObservationBsonBounds.requireHeader(observation.pipelineId(), baseDescriptor(scope, observation.observedAt()));
+        ManifestChunks writer = publication(observation, scope);
+        LatestObservationPayloadCodec.Encoded encoded = LatestObservationPayloadCodec.encode(observation, writer);
+        Document descriptor = encoded.inline() ? inlineCurrent(scope, observation.observedAt(), encoded)
+                : chunkedCurrent(scope, observation.observedAt(), writer.token, encoded);
+        ObservationBsonBounds.requireDescriptor(observation.pipelineId(), descriptor);
+        Document filter = headerFilter(writer.key, writer.owner).append("$and", List.of(
+                currentFence(scope, observation.observedAt(), encoded.payloadDigest(),
+                        encoded.inline() ? "inline" : "chunked", false),
+                encoded.inline() ? pendingAvailableForInline(scope) : new Document(PENDING + "." + TOKEN, writer.token)
+                        .append("$expr", new Document("$gt", List.of("$" + PENDING + ".publishUntil", "$$NOW")))));
+        return new PreparedCurrent(descriptor, filter, writer);
+    }
+
+    void abandon(PreparedCurrent prepared) {
+        if (prepared.writer().begun && !prepared.writer().replay) {
+            clearOwnedPending(prepared.writer().key, prepared.writer().owner, prepared.writer().token);
+        }
+    }
+
+    ObservationStore.Stored readPublicDescriptor(String pipelineId, Document descriptor) {
+        return readCurrent(pipelineId, manifestKey(pipelineId), ownerDigest(pipelineId), descriptor,
+                new ReadDeadline());
     }
 
     void saveLegacy(Observation observation) {
@@ -246,6 +279,8 @@ final class MongoLatestObservationStorage {
         readHeader(pipelineId, key, owner);
         unsetOwnedDescriptor(key, owner, CURRENT, incarnationId);
         unsetOwnedDescriptor(key, owner, PENDING, incarnationId);
+        unsetPrivateIncarnation(key, owner, MongoObservationContinuation.CONTINUATION, incarnationId);
+        unsetPrivateIncarnation(key, owner, MongoObservationContinuation.CONTINUATION_PENDING, incarnationId);
         deleteLegacyMatching(pipelineId, new Document("_id", pipelineId).append(INCARNATION, incarnationId));
     }
 
@@ -256,6 +291,17 @@ final class MongoLatestObservationStorage {
     }
 
     boolean deleteLegacyIfUnchanged(ObservationStore.LatestSnapshot snapshot) {
+        return deleteLegacyMatching(snapshot.pipelineId(), legacySnapshotFilter(snapshot)) != 0;
+    }
+
+    boolean deleteLegacyIfUnchanged(ClientSession session, ObservationStore.LatestSnapshot snapshot) {
+        if (deleteLegacyMatching(session, snapshot.pipelineId(), legacySnapshotFilter(snapshot)) == 0) {
+            throw MongoStopReservationWrites.fencedHandoff();
+        }
+        return true;
+    }
+
+    private static Document legacySnapshotFilter(ObservationStore.LatestSnapshot snapshot) {
         Document filter = new Document("_id", snapshot.pipelineId());
         if (snapshot.scope().isPresent()) {
             ObservationStore.Scope scope = snapshot.scope().orElseThrow();
@@ -267,32 +313,35 @@ final class MongoLatestObservationStorage {
         }
         filter.append(OBSERVED_AT, snapshot.observedAt().<Object>map(Date::from)
                 .orElseGet(() -> new Document("$exists", false)));
-        return deleteLegacyMatching(snapshot.pipelineId(), filter) != 0;
+        return filter;
     }
 
     private long deleteLegacyMatching(String pipelineId, Document filter) {
-        Binary key = manifestKey(pipelineId);
-        Binary owner = ownerDigest(pipelineId);
         return StoreIo.call(() -> {
             try (ClientSession session = client.startSession()) {
-                return session.withTransaction(() -> {
-                    readHeader(session, pipelineId, key, owner);
-                    long deleted = manifests.deleteOne(session, filter).getDeletedCount();
-                    Document residue = manifests.find(session, new Document("_id", pipelineId))
-                            .projection(new Document("_id", 1)).first();
-                    if (residue == null) {
-                        manifests.updateOne(session, headerFilter(key, owner), new Document("$set",
-                                new Document(LEGACY_RESIDUE, false)
-                                        .append(REVISION, UUID.randomUUID().toString())));
-                        manifests.deleteOne(session, headerFilter(key, owner)
-                                .append(CURRENT, new Document("$exists", false))
-                                .append(PENDING, new Document("$exists", false))
-                                .append(LEGACY_RESIDUE, false));
-                    }
-                    return deleted;
-                }, CUTOVER_TRANSACTION);
+                return session.withTransaction(() -> deleteLegacyMatching(session, pipelineId, filter), CUTOVER_TRANSACTION);
             }
         });
+    }
+
+    private long deleteLegacyMatching(ClientSession session, String pipelineId, Document filter) {
+        Binary key = manifestKey(pipelineId);
+        Binary owner = ownerDigest(pipelineId);
+        readHeader(session, pipelineId, key, owner);
+        long deleted = manifests.deleteOne(session, filter).getDeletedCount();
+        Document residue = manifests.find(session, new Document("_id", pipelineId))
+                .projection(new Document("_id", 1)).first();
+        if (residue == null) {
+            manifests.updateOne(session, headerFilter(key, owner), new Document("$set",
+                    new Document(LEGACY_RESIDUE, false).append(REVISION, UUID.randomUUID().toString())));
+            manifests.deleteOne(session, headerFilter(key, owner)
+                    .append(CURRENT, new Document("$exists", false))
+                    .append(PENDING, new Document("$exists", false))
+                    .append(MongoObservationContinuation.CONTINUATION, new Document("$exists", false))
+                    .append(MongoObservationContinuation.CONTINUATION_PENDING, new Document("$exists", false))
+                    .append(LEGACY_RESIDUE, false));
+        }
+        return deleted;
     }
 
     boolean hasCommittedManifest(String pipelineId) {
@@ -310,7 +359,13 @@ final class MongoLatestObservationStorage {
         Document projection = new Document("_id", 1).append(FORMAT, 1).append(OWNER, 1)
                 .append(REVISION, 1).append(LEGACY_FALLBACK, 1).append(LEGACY_RESIDUE, 1)
                 .append(CURRENT + "." + INCARNATION, 1).append(CURRENT + "." + GENERATION, 1)
-                .append(PENDING + "." + INCARNATION, 1).append(PENDING + "." + GENERATION, 1);
+                .append(PENDING + "." + INCARNATION, 1).append(PENDING + "." + GENERATION, 1)
+                .append(MongoObservationContinuation.CONTINUATION + ".sourceScope", 1)
+                .append(MongoObservationContinuation.CONTINUATION + ".target.scope", 1)
+                .append(MongoObservationContinuation.CONTINUATION + ".baselineOrigin.scope", 1)
+                .append(MongoObservationContinuation.CONTINUATION_PENDING + ".sourceScope", 1)
+                .append(MongoObservationContinuation.CONTINUATION_PENDING + ".target.scope", 1)
+                .append(MongoObservationContinuation.CONTINUATION_PENDING + ".baselineOrigin.scope", 1);
         List<Document> page = StoreIo.call(() -> manifests.withTimeout(IO_DEADLINE_SECONDS, TimeUnit.SECONDS)
                 .find(new Document("_id", id)).projection(projection).sort(new Document("_id", 1))
                 .limit(limit).into(new ArrayList<>(limit)));
@@ -327,6 +382,8 @@ final class MongoLatestObservationStorage {
             }
             addScope(manifest.get(CURRENT), scopes, encodeCursor(key), CURRENT);
             addScope(manifest.get(PENDING), scopes, encodeCursor(key), PENDING);
+            addPrivateScopes(manifest.get(MongoObservationContinuation.CONTINUATION), scopes, encodeCursor(key));
+            addPrivateScopes(manifest.get(MongoObservationContinuation.CONTINUATION_PENDING), scopes, encodeCursor(key));
             snapshots.add(new ObservationStore.ManifestSnapshot(encodeCursor(key), revision, scopes));
         }
         return List.copyOf(snapshots);
@@ -348,6 +405,21 @@ final class MongoLatestObservationStorage {
                 .getDeletedCount()) != 0;
     }
 
+    boolean deleteManifestIfUnchanged(ClientSession session, ObservationStore.ManifestSnapshot snapshot, String pipelineId) {
+        Binary key = decodeCursor(snapshot.cursor());
+        Binary owner = ownerDigest(pipelineId);
+        if (!key.equals(manifestKey(pipelineId))) { throw MongoStopReservationWrites.fencedHandoff(); }
+        Document header = manifests.find(session, headerFilter(key, owner).append(REVISION, snapshot.revision()))
+                .projection(headerProjection()).first();
+        if (header == null) { throw MongoStopReservationWrites.fencedHandoff(); }
+        validateHeader(header, pipelineId, owner);
+        if (manifests.deleteOne(session, headerFilter(key, owner).append(REVISION, snapshot.revision())
+                .append(LEGACY_RESIDUE, false)).getDeletedCount() == 0) {
+            throw MongoStopReservationWrites.fencedHandoff();
+        }
+        return true;
+    }
+
     synchronized ObservationStore.ReclaimResult reclaimChunks(int limit) {
         if (limit < 1 || limit > ObservationStore.MAX_LATEST_SCAN_BATCH) {
             throw new IllegalArgumentException("observation chunk cleanup batch must be between 1 and "
@@ -364,6 +436,7 @@ final class MongoLatestObservationStorage {
                 case 0 -> clearPendingCandidates(budgets[phase]);
                 case 1 -> deleteRetiredCandidates(budgets[phase]);
                 case 2 -> retireOrphanCandidates(budgets[phase]);
+                case 3 -> clearContinuationPendingCandidates(budgets[phase]);
                 default -> throw new IllegalStateException("unknown observation reclaim phase");
             };
             scanned = Math.addExact(scanned, result.scanned());
@@ -373,11 +446,43 @@ final class MongoLatestObservationStorage {
     }
 
     private int[] reclaimBudgets(int limit) {
-        int[] budgets = new int[3];
+        int[] budgets = new int[4];
         for (int index = 0; index < limit; index++) {
             budgets[(reclaimStartPhase + index) % budgets.length]++;
         }
         return budgets;
+    }
+
+    private ObservationStore.ReclaimResult clearContinuationPendingCandidates(int limit) {
+        if (limit == 0) { return new ObservationStore.ReclaimResult(0, 0); }
+        String pending = MongoObservationContinuation.CONTINUATION_PENDING;
+        Document filter = new Document("_id", new Document("$type", "binData"))
+                .append(FORMAT, FORMAT_VERSION).append(pending + ".publishUntil", new Document("$type", "date"));
+        if (continuationPendingAfter != null) {
+            filter.append("$and", List.of(afterTimed(pending + ".publishUntil", continuationPendingAfter)));
+        }
+        List<Document> page = StoreIo.call(() -> manifests.withTimeout(IO_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                .find(filter).projection(new Document(FORMAT, 1).append(OWNER, 1).append(REVISION, 1)
+                        .append(LEGACY_FALLBACK, 1).append(LEGACY_RESIDUE, 1).append(pending, 1))
+                .sort(new Document(pending + ".publishUntil", 1).append("_id", 1)).limit(limit)
+                .into(new ArrayList<>(limit)));
+        for (Document candidate : page) {
+            Binary key = requireBinaryValue(candidate.get("_id"), "continuation", "_id");
+            Binary owner = requireBinaryValue(candidate.get(OWNER), encodeCursor(key), OWNER);
+            validateHeader(candidate, encodeCursor(key), owner);
+            Document value = requireDocument(candidate.get(pending), encodeCursor(key), pending);
+            Instant until = requireDate(value.get("publishUntil"), encodeCursor(key), pending + ".publishUntil");
+            String token = requireString(value.get(TOKEN), encodeCursor(key), pending + "." + TOKEN);
+            Document exact = headerFilter(key, owner).append(pending + "." + TOKEN, token)
+                    .append(pending + ".publishUntil", Date.from(until))
+                    .append("$expr", new Document("$lte", List.of("$" + pending + ".publishUntil", "$$NOW")));
+            StoreIo.run(() -> manifests.withTimeout(IO_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                    .updateOne(exact, new Document("$unset", new Document(pending, true))
+                            .append("$set", new Document(REVISION, UUID.randomUUID().toString()))));
+            continuationPendingAfter = new TimedCursor(until, key);
+        }
+        if (page.size() < limit) { continuationPendingAfter = null; }
+        return new ObservationStore.ReclaimResult(page.size(), 0);
     }
 
     private ObservationStore.ReclaimResult clearPendingCandidates(int limit) {
@@ -606,7 +711,7 @@ final class MongoLatestObservationStorage {
         }
     }
 
-    private static boolean legacyAllows(Document legacy, Observation observation,
+    static boolean legacyAllows(Document legacy, Observation observation,
             ObservationStore.Scope incoming) {
         if (legacy == null) {
             return true;
@@ -635,7 +740,7 @@ final class MongoLatestObservationStorage {
         return MongoObservationStore.toObservation(legacy).equals(observation);
     }
 
-    private static Document legacyFence(Document legacy) {
+    static Document legacyFence(Document legacy) {
         String pipelineId = requireString(legacy.get("_id"), String.valueOf(legacy.get("_id")), "_id");
         Document filter = new Document("_id", pipelineId);
         for (String field : List.of(INCARNATION, GENERATION, OBSERVED_AT)) {
@@ -667,12 +772,31 @@ final class MongoLatestObservationStorage {
         }
     }
 
-    private static List<Bson> currentUpdate(Binary owner, Document current) {
+    static List<Bson> currentUpdate(Binary owner, Document current) {
         return List.of(new Document("$set", new Document(FORMAT, FORMAT_VERSION)
                         .append(OWNER, owner).append(REVISION, UUID.randomUUID().toString())
                         .append(LEGACY_FALLBACK, false)
-                        .append(CURRENT, new Document("$literal", current))),
+                        .append(CURRENT, new Document("$literal", current))
+                        .append(MongoObservationContinuation.CONTINUATION,
+                                retainPrivate(MongoObservationContinuation.CONTINUATION, current))
+                        .append(MongoObservationContinuation.CONTINUATION_PENDING,
+                                retainPrivate(MongoObservationContinuation.CONTINUATION_PENDING, current))),
                 new Document("$unset", PENDING));
+    }
+
+    private static Document retainPrivate(String field, Document current) {
+        String root = "$" + field;
+        Object incarnation = new Document("$ifNull", List.of(root + ".target.scope.pipelineIncarnationId",
+                new Document("$ifNull", List.of(root + ".baselineOrigin.scope.pipelineIncarnationId",
+                        new Document("$ifNull", List.of(root + ".sourceScope.pipelineIncarnationId", ""))))));
+        Object maxGeneration = new Document("$max", List.of(
+                new Document("$ifNull", List.of(root + ".target.scope.executionGeneration", 0L)),
+                new Document("$ifNull", List.of(root + ".baselineOrigin.scope.executionGeneration", 0L)),
+                new Document("$ifNull", List.of(root + ".sourceScope.executionGeneration", 0L))));
+        Document retained = new Document("$and", List.of(
+                new Document("$eq", List.of(incarnation, current.get(INCARNATION))),
+                new Document("$lte", List.of(current.get(GENERATION), maxGeneration))));
+        return new Document("$cond", List.of(retained, root, "$$REMOVE"));
     }
 
     private CurrentWrite classifyCurrent(String pipelineId, Binary key, Binary owner, Document expected) {
@@ -777,6 +901,16 @@ final class MongoLatestObservationStorage {
             throw corrupt(pipelineId, "observation scope");
         }
         return Optional.of(new ObservationStore.Stored(MongoObservationStore.toObservation(legacy), scope));
+    }
+
+    private void unsetPrivateIncarnation(Binary key, Binary owner, String field, String incarnation) {
+        Document filter = headerFilter(key, owner).append("$or", List.of(
+                new Document(field + ".sourceScope." + INCARNATION, incarnation),
+                new Document(field + ".target.scope." + INCARNATION, incarnation),
+                new Document(field + ".baselineOrigin.scope." + INCARNATION, incarnation)));
+        StoreIo.run(() -> manifests.withTimeout(IO_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                .updateOne(filter, new Document("$unset", new Document(field, true))
+                        .append("$set", new Document(REVISION, UUID.randomUUID().toString()))));
     }
 
     private void unsetOwnedDescriptor(Binary key, Binary owner, String field, String incarnationId) {
@@ -1048,7 +1182,7 @@ final class MongoLatestObservationStorage {
         });
     }
 
-    private static Document headerFilter(Binary key, Binary owner) {
+    static Document headerFilter(Binary key, Binary owner) {
         return new Document("_id", key).append(FORMAT,
                         new Document("$eq", FORMAT_VERSION).append("$type", "int"))
                 .append(OWNER, owner).append(LEGACY_FALLBACK, new Document("$type", "bool"))
@@ -1057,7 +1191,7 @@ final class MongoLatestObservationStorage {
                         .append(CURRENT, new Document("$exists", true))));
     }
 
-    private static Document currentFence(ObservationStore.Scope scope, Instant observedAt,
+    static Document currentFence(ObservationStore.Scope scope, Instant observedAt,
             byte[] exactDigest, String exactMode, boolean allowEqualUnknown) {
         List<Document> allowed = new java.util.ArrayList<>();
         allowed.add(new Document(CURRENT, new Document("$exists", false)));
@@ -1087,7 +1221,7 @@ final class MongoLatestObservationStorage {
                 expiredPending()));
     }
 
-    private static Document pendingAvailableForInline(ObservationStore.Scope scope) {
+    static Document pendingAvailableForInline(ObservationStore.Scope scope) {
         return new Document("$or", List.of(
                 new Document(PENDING, new Document("$exists", false)),
                 new Document(PENDING + "." + GENERATION, new Document("$lt", scope.executionGeneration())),
@@ -1098,11 +1232,11 @@ final class MongoLatestObservationStorage {
         return new Document("$expr", new Document("$lte", List.of("$" + PENDING + ".publishUntil", "$$NOW")));
     }
 
-    private static Document unexpiredPending() {
+    static Document unexpiredPending() {
         return new Document("$expr", new Document("$gt", List.of("$" + PENDING + ".publishUntil", "$$NOW")));
     }
 
-    private static Document leaseUntilExpression() {
+    static Document leaseUntilExpression() {
         return new Document("$dateAdd", new Document("startDate", "$$NOW")
                 .append("unit", "second").append("amount", PUBLISH_LEASE_SECONDS));
     }
@@ -1117,13 +1251,16 @@ final class MongoLatestObservationStorage {
                 .find(new Document("_id", key)).projection(new Document(FORMAT, 1).append(OWNER, 1)
                         .append(REVISION, 1).append(LEGACY_FALLBACK, 1).append(LEGACY_RESIDUE, 1)
                         .append(CURRENT + "." + TOKEN, 1)
-                        .append(PENDING + "." + TOKEN, 1)).first());
+                        .append(PENDING + "." + TOKEN, 1)
+                        .append(MongoObservationContinuation.CONTINUATION + "." + TOKEN, 1)
+                        .append(MongoObservationContinuation.CONTINUATION_PENDING + "." + TOKEN, 1)).first());
         if (manifest == null) {
             return false;
         }
         String id = encodeCursor(key);
         validateHeader(manifest, id, owner);
-        for (String field : List.of(CURRENT, PENDING)) {
+        for (String field : List.of(CURRENT, PENDING, MongoObservationContinuation.CONTINUATION,
+                MongoObservationContinuation.CONTINUATION_PENDING)) {
             if (manifest.containsKey(field)) {
                 Document descriptor = requireDocument(manifest.get(field), id, field);
                 if (token.equals(descriptor.get(TOKEN))) {
@@ -1140,7 +1277,7 @@ final class MongoLatestObservationStorage {
                 .append(OBSERVED_AT, Date.from(observedAt));
     }
 
-    private static Document inlineCurrent(ObservationStore.Scope scope, Instant observedAt,
+    static Document inlineCurrent(ObservationStore.Scope scope, Instant observedAt,
             LatestObservationPayloadCodec.Encoded encoded) {
         return baseDescriptor(scope, observedAt)
                 .append(MODE, "inline")
@@ -1150,7 +1287,7 @@ final class MongoLatestObservationStorage {
                 .append(INLINE_PAYLOAD, new Binary(encoded.inlinePayload()));
     }
 
-    private static Document chunkedCurrent(ObservationStore.Scope scope, Instant observedAt, String token,
+    static Document chunkedCurrent(ObservationStore.Scope scope, Instant observedAt, String token,
             LatestObservationPayloadCodec.Encoded encoded) {
         return baseDescriptor(scope, observedAt)
                 .append(MODE, "chunked")
@@ -1199,7 +1336,7 @@ final class MongoLatestObservationStorage {
                 .append(CHUNK_PAYLOAD, new Binary(chunk.payload()));
     }
 
-    private static void validateHeader(Document manifest, String pipelineId, Binary owner) {
+    static void validateHeader(Document manifest, String pipelineId, Binary owner) {
         if (!(manifest.get(FORMAT) instanceof Integer version) || version != FORMAT_VERSION
                 || !(manifest.get(OWNER) instanceof Binary storedOwner)
                 || storedOwner.getData().length != 32 || !storedOwner.equals(owner)
@@ -1211,7 +1348,8 @@ final class MongoLatestObservationStorage {
         if (manifest.containsKey(CURRENT) && manifest.getBoolean(LEGACY_FALLBACK)) {
             throw corrupt(pipelineId, "latest manifest authority");
         }
-        for (String field : List.of(CURRENT, PENDING)) {
+        for (String field : List.of(CURRENT, PENDING, MongoObservationContinuation.CONTINUATION,
+                MongoObservationContinuation.CONTINUATION_PENDING)) {
             if (manifest.containsKey(field) && !(manifest.get(field) instanceof Document)) {
                 throw corrupt(pipelineId, field);
             }
@@ -1234,6 +1372,20 @@ final class MongoLatestObservationStorage {
         ObservationStore.Scope scope = readScope(descriptor, id, field);
         if (!scopes.contains(scope)) {
             scopes.add(scope);
+        }
+    }
+
+    private static void addPrivateScopes(Object raw, List<ObservationStore.Scope> scopes, String id) {
+        if (raw == null) { return; }
+        Document descriptor = requireDocument(raw, id, "private continuation");
+        for (String field : List.of("sourceScope", "target", "baselineOrigin")) {
+            Object value = descriptor.get(field);
+            if (value == null) { continue; }
+            Document scope = field.equals("sourceScope") ? requireDocument(value, id, field)
+                    : requireDocument(requireDocument(value, id, field).get("scope"), id, field + ".scope");
+            ObservationStore.Scope found = new ObservationStore.Scope(requireString(scope.get(INCARNATION), id, field),
+                    requirePositiveLong(scope.get(GENERATION), id, field));
+            if (!scopes.contains(found)) { scopes.add(found); }
         }
     }
 
@@ -1298,8 +1450,11 @@ final class MongoLatestObservationStorage {
     }
 
     static Binary chunkId(Binary key, Binary owner, String token, long ordinal) {
-        return new Binary(sha256(CHUNK_ID_DOMAIN, owner.getData(), key.getData(),
-                intBytes(LatestObservationPayloadCodec.ENCODING_VERSION),
+        return chunkId(key, owner, token, ordinal, LatestObservationPayloadCodec.ENCODING_VERSION);
+    }
+
+    static Binary chunkId(Binary key, Binary owner, String token, long ordinal, int encodingVersion) {
+        return new Binary(sha256(CHUNK_ID_DOMAIN, owner.getData(), key.getData(), intBytes(encodingVersion),
                 token.getBytes(StandardCharsets.UTF_8), longBytes(ordinal)));
     }
 

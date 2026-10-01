@@ -10,6 +10,7 @@ import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import io.tapstate.spi.store.StopAuthority;
+import io.tapstate.spi.store.SuccessorAdmission;
 import io.tapstate.spi.store.WorkloadClaimFence;
 
 import java.time.Duration;
@@ -300,6 +301,52 @@ final class PipelineActuationOwnership {
     }
 
     String clusterId() { return clusterId; }
+
+    /** Installs the already advanced authority returned by the atomic handoff admission, without advancing again. */
+    Execution adoptAdmission(SuccessorAdmission admission) {
+        Objects.requireNonNull(admission, "admission");
+        var marker = admission.reservation();
+        StopAuthority authority = marker.writerAuthority();
+        if (authority == null || !clusterId.equals(authority.clusterId())
+                || marker.successor() == null
+                || authority.executionGeneration() != marker.successor().scope().executionGeneration()) {
+            throw new IllegalStateException("atomic admission returned an inconsistent execution authority");
+        }
+        if (!fenced) {
+            if (!authority.standalone() || admission.advancedClaim().isPresent()) {
+                throw new IllegalStateException("standalone admission returned a lease");
+            }
+            return new Execution(true, new ExecutionFence(marker.pipelineId(), 0, authority.executionGeneration()));
+        }
+        WorkloadClaim advanced = admission.advancedClaim()
+                .orElseThrow(() -> new IllegalStateException("cluster admission returned no advanced claim"));
+        if (!owner.equals(advanced.owner())
+                || !authority.equals(StopAuthority.claimed(WorkloadClaimFence.from(advanced)))) {
+            return Execution.refused();
+        }
+        Held state = held.computeIfAbsent(marker.pipelineId(), id -> new Held());
+        state.lock.lock();
+        try {
+            if (held.get(marker.pipelineId()) != state || !membership.businessEligible()) {
+                return Execution.refused();
+            }
+            ClusterMembership planned = membership.committed();
+            if (planned == null || planned.revision() != advanced.topologyRevision()
+                    || state.claim != null && (state.claim.claimGeneration() > advanced.claimGeneration()
+                            || state.claim.executionGeneration() > advanced.executionGeneration())) {
+                return Execution.refused();
+            }
+            state.claim = advanced;
+            state.runMembers = plannedOver(planned);
+            // Prove the returned lease again before native submission, including time spent preparing the DAG.
+            state.contacted = true;
+            state.nextContactNanos = nanoTime.getAsLong();
+            return new Execution(true, new ExecutionFence(marker.pipelineId(), advanced.claimGeneration(),
+                    advanced.executionGeneration()));
+        } finally {
+            state.lock.unlock();
+        }
+    }
 
     /** Current stop authority is a read; stopping never allocates a new execution or a standalone lease. */
     Optional<StopAuthority> stopAuthority(String pipelineId) {
