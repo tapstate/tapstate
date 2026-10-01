@@ -469,10 +469,13 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         private JoinedCapture(CaptureRunSpec joinedWith, CaptureHandoff passthrough) {
             // A snapshot-only read has no tail for anybody to take over.
             this.tails = joinedWith.readMode() != ReadMode.SNAPSHOT_ONLY;
+            // Carrying what the pipeline reads from the chain over all of its sources there: opened with the
+            // one source it joined through, the tail would record that source's tables as all it reads.
             this.tailSpec = new CaptureRunSpec(
                     joinedWith.config(), ReadMode.CDC_ONLY, joinedWith.srsKey(), joinedWith.srsEnabled(),
                     joinedWith.sourceId(), joinedWith.pipelineId(), joinedWith.startFrom(),
-                    joinedWith.retention(), joinedWith.schemaVer(), joinedWith.snapshotEpoch());
+                    joinedWith.retention(), joinedWith.schemaVer(), joinedWith.snapshotEpoch(),
+                    null, joinedWith.selectedChainTables());
             this.tailPassthrough = passthrough;
         }
     }

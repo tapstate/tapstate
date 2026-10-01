@@ -135,6 +135,61 @@ class CaptureOwnershipTest {
     }
 
     /**
+     * A member taking a capture over opens its tail with every table the pipeline it opens it for reads from
+     * the chain, over all of that pipeline's sources there -- not with the tables of the one source the
+     * pipeline happened to join through. Opened with those, the chain's record would say the pipeline reads
+     * that one source's tables alone: the reader would stop reading the others for it, and nothing would wait
+     * for them.
+     */
+    @Test
+    void aTailTakenOverSelectsEveryTableItsPipelineReadsFromTheChain() {
+        SourceResource customers = new SourceResource(
+                "customers-source", null, "mysql", Map.of("host", "db.internal"), SourceMode.CDC,
+                List.of(TableRef.literal("customers")), null, null);
+        InMemoryArtifactStore artifacts = artifactsWith(ReadMode.CDC_ONLY, "p");
+        artifacts.save(customers);
+        artifacts.save(new PipelineResource(
+                "q", null, List.of(SourceRef.spec("orders-source", true), SourceRef.spec("customers-source", true)),
+                null, null,
+                new ServeBlock.Inline(
+                        null, FromClause.list(FromRef.literal("orders-source"), FromRef.literal("customers-source")),
+                        List.of(new SyncElement("sync", "target", null, null, null)), null, null),
+                new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        MemoryClaims raw = new MemoryClaims();
+        ClusterMembershipGate gate = eligibleGate();
+        CaptureAttacher holding = (spec, handoff, startTail) -> {
+            if (startTail) {
+                opensTheRing(store);
+            }
+            return run(() -> { });
+        };
+        StoreBackedPipelineCaptureCoordinator nodeA =
+                managed(store, holding, gate, raw, new WorkloadOwner("node-a", "boot-a"));
+        nodeA.startCapture("p");
+
+        AtomicReference<List<String>> takenOverWith = new AtomicReference<>();
+        CaptureAttacher joining = (spec, handoff, startTail) -> {
+            if (startTail) {
+                takenOverWith.set(spec.chainSelection());
+            }
+            return run(() -> { });
+        };
+        StoreBackedPipelineCaptureCoordinator nodeB =
+                managed(store, joining, gate, raw, new WorkloadOwner("node-b", "boot-b"));
+        nodeB.startCapture("q");
+        nodeA.stopCapture("p", false);
+
+        nodeB.tailWhatNobodyTails();
+
+        assertThat(takenOverWith.get()).as("the chain's tables of both of q's sources")
+                .containsExactlyInAnyOrder("customers", "orders");
+        nodeB.stopCapture("q", false);
+        nodeA.close();
+        nodeB.close();
+    }
+
+    /**
      * Stopping the pipeline whose run the others on a capture share lets go of that pipeline's load. The run
      * stays, because the pipelines still on the capture read what it goes on to do; the load in it was the
      * stopped pipeline's alone. Left reading, it went on handing rows to a hand-off the stop had already
