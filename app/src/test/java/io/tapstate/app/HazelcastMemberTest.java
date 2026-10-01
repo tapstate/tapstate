@@ -685,8 +685,19 @@ class HazelcastMemberTest {
 
         MapConfig previewJoin = config.getMapConfigs().get("join..preview_*");
         MapConfig previewNest = config.getMapConfigs().get("nest..preview_*");
+        MapConfig previewSamples = config.getMapConfigs().get(PreviewSampleCache.MAP_NAME);
+        MapConfig previewSampleIndex = config.getMapConfigs().get(PreviewSampleCache.INDEX_MAP_NAME);
         assertThat(previewJoin).isNotNull();
         assertThat(previewNest).isNotNull();
+        assertThat(previewSamples).isNotNull();
+        assertThat(previewSamples.getInMemoryFormat()).isEqualTo(InMemoryFormat.BINARY);
+        assertThat(previewSamples.getBackupCount()).isZero();
+        assertThat(previewSamples.getTimeToLiveSeconds()).isEqualTo(300);
+        assertThat(previewSamples.getMapStoreConfig().isEnabled()).isFalse();
+        assertThat(previewSampleIndex).isNotNull();
+        assertThat(previewSampleIndex.getTimeToLiveSeconds())
+                .isEqualTo(PreviewSampleCache.INDEX_TTL.toSeconds());
+        assertThat(previewSampleIndex.getMaxIdleSeconds()).isZero();
         for (MapConfig preview : List.of(previewJoin, previewNest)) {
             assertThat(preview.getBackupCount()).isZero();
             assertThat(preview.getAsyncBackupCount()).isZero();

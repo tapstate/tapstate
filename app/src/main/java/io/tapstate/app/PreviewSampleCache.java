@@ -27,14 +27,23 @@ import java.util.concurrent.TimeUnit;
 /** Short-lived, identity-scoped cache of repeatable raw bounded source reads. */
 final class PreviewSampleCache {
 
-    static final String MAP_NAME = "__preview.samples";
+    static final String MAP_NAME = "__preview.samples.v2";
+    static final String INDEX_MAP_NAME = "__preview.samples.v2.index";
     static final Duration TTL = Duration.ofMinutes(5);
+    // The index outlives its values so expiration cannot leave an uncounted cache entry.
+    static final Duration INDEX_TTL = TTL.plusSeconds(10);
+    // Enforced under a cluster-wide map lock; per-node Hazelcast eviction scales with partition count.
+    static final int MAX_ENTRIES = 8;
+    private static final String CAPACITY_LOCK_KEY = "capacity-lock";
     private static final long MAX_ENTRY_BYTES = 32L * 1024L * 1024L;
 
     private final IMap<String, Entry> entries;
+    private final IMap<String, Long> index;
 
     PreviewSampleCache(HazelcastInstance member) {
-        this.entries = Objects.requireNonNull(member, "member").getMap(MAP_NAME);
+        HazelcastInstance required = Objects.requireNonNull(member, "member");
+        this.entries = required.getMap(MAP_NAME);
+        this.index = required.getMap(INDEX_MAP_NAME);
     }
 
     BoundedSnapshotQueryResult get(String principal, String pipelineId, String sampleId,
@@ -74,12 +83,68 @@ final class PreviewSampleCache {
             encodedBytes += rowBytes;
         }
         String key = key(principal, pipelineId, sampleId, connectorIdentity, request);
+        boolean locked = false;
         try {
+            index.lock(CAPACITY_LOCK_KEY);
+            locked = true;
+            pruneExpiredEntries();
+            if (!index.containsKey(key)) {
+                while (index.size() >= MAX_ENTRIES) {
+                    if (!evictOldestEntry()) {
+                        return;
+                    }
+                }
+            }
+            index.put(key, System.currentTimeMillis(), INDEX_TTL.toMillis(), TimeUnit.MILLISECONDS);
             entries.put(key, new Entry(result.rows(), result.hasMore(), result.sampledAt()),
                     TTL.toMillis(), TimeUnit.MILLISECONDS);
         } catch (HazelcastException unavailable) {
             // Caching is opportunistic; a running preview must not depend on cache availability.
+            try {
+                entries.remove(key);
+                index.remove(key);
+            } catch (HazelcastException ignored) {
+                // Both maps expire independently after the same short cache lifetime.
+            }
+        } finally {
+            if (locked) {
+                try {
+                    index.unlock(CAPACITY_LOCK_KEY);
+                } catch (HazelcastException ignored) {
+                    // The member may have left while this opportunistic cache write was in flight.
+                }
+            }
         }
+    }
+
+    private void pruneExpiredEntries() {
+        for (String indexedKey : index.keySet()) {
+            if (!entries.containsKey(indexedKey)) {
+                index.remove(indexedKey);
+            }
+        }
+    }
+
+    private boolean evictOldestEntry() {
+        String oldestKey = null;
+        long oldestAt = Long.MAX_VALUE;
+        for (Map.Entry<String, Long> candidate : index.entrySet()) {
+            if (!entries.containsKey(candidate.getKey())) {
+                index.remove(candidate.getKey());
+                continue;
+            }
+            Long insertedAt = candidate.getValue();
+            if (insertedAt != null && insertedAt < oldestAt) {
+                oldestKey = candidate.getKey();
+                oldestAt = insertedAt;
+            }
+        }
+        if (oldestKey == null) {
+            return false;
+        }
+        entries.remove(oldestKey);
+        index.remove(oldestKey);
+        return true;
     }
 
     private static String key(String principal, String pipelineId, String sampleId, String connectorIdentity,

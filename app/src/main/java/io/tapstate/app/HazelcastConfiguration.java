@@ -1,13 +1,10 @@
 package io.tapstate.app;
 
 import com.hazelcast.config.Config;
-import com.hazelcast.config.EvictionConfig;
-import com.hazelcast.config.EvictionPolicy;
 import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.JoinConfig;
 import com.hazelcast.config.MapConfig;
 import com.hazelcast.config.MapStoreConfig;
-import com.hazelcast.config.MaxSizePolicy;
 import com.hazelcast.config.RingbufferConfig;
 import com.hazelcast.config.RingbufferStoreConfig;
 import com.hazelcast.config.SerializerConfig;
@@ -550,6 +547,9 @@ class HazelcastConfiguration {
         // forbid dots, so these patterns cannot match a user's durable Nest or Join state.
         config.addMapConfig(previewMapConfig("__preview.*", 300));
         config.addMapConfig(previewSampleMapConfig());
+        config.addMapConfig(previewMapConfig(
+                PreviewSampleCache.INDEX_MAP_NAME, (int) PreviewSampleCache.INDEX_TTL.toSeconds())
+                .setMaxIdleSeconds(0));
         config.addMapConfig(previewMapConfig("nest..preview_*", 300));
         config.addMapConfig(previewMapConfig("join..preview_*", 300));
         // What a nest state map is is NOT declared here, and the omission is load-bearing: it is declared
@@ -576,11 +576,7 @@ class HazelcastConfiguration {
 
     private static MapConfig previewSampleMapConfig() {
         return previewMapConfig(PreviewSampleCache.MAP_NAME, (int) PreviewSampleCache.TTL.toSeconds())
-                .setInMemoryFormat(InMemoryFormat.BINARY)
-                .setEvictionConfig(new EvictionConfig()
-                        .setSize(8)
-                        .setMaxSizePolicy(MaxSizePolicy.PER_NODE)
-                        .setEvictionPolicy(EvictionPolicy.LRU));
+                .setInMemoryFormat(InMemoryFormat.BINARY);
     }
 
     /**
