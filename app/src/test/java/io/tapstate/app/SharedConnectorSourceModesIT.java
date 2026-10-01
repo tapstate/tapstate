@@ -358,6 +358,7 @@ class SharedConnectorSourceModesIT {
         @Bean @Primary SchemaDiscoveryProbe controlledSchemaDiscoveryProbe(RecordingProbes probes) { return probes::discover; }
 
         @Bean
+        @Primary
         @ConditionalOnProperty(prefix = "tapstate.cloud", name = "base-url")
         CloudAuthenticationService controlledAuthentication(CloudSessionStore sessions, TokenSecrets secrets,
                 Clock clock, ClusterIdentityService clusters, RecordingProbes probes) {
