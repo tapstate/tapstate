@@ -792,7 +792,10 @@ public final class CaptureRunUnit {
      *   <li>a load that just ran here — {@code ownSnapshotSeam} is where it began, and the tail has to
      *       cover every change since, or a row this load read and the source then changed is left at the
      *       value the load saw;</li>
-     *   <li>a recorded read offset — the tail ran before and got this far, so it picks up there;</li>
+     *   <li>a recorded resume point — the tail ran before and got this far, so it picks up there. That is
+     *       the last released run that carried a change, or where the stream began: a run carrying no change
+     *       moves how far the source may release, but a source can name it in a form that, resumed from,
+     *       passes over the change that follows;</li>
      *   <li>no read offset but this pipeline's recorded seam — its snapshot ran and the tail has not
      *       advanced past where that snapshot began, so it starts at the seam and the idempotent sink
      *       absorbs the overlap;</li>
@@ -821,8 +824,9 @@ public final class CaptureRunUnit {
         }
         return meta.read(miningChainId)
                 .map(record -> {
-                    if (record.sourceReadOffset() != null) {
-                        return CaptureStart.resume(new SourcePosition(record.sourceReadOffset()));
+                    Optional<String> resumeFrom = meta.resumeOffset(miningChainId);
+                    if (resumeFrom.isPresent()) {
+                        return CaptureStart.resume(new SourcePosition(resumeFrom.get()));
                     }
                     return record.consumerOffset(pipelineId)
                             .map(consumer -> consumer.cdcStartPosition() == null

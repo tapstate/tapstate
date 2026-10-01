@@ -104,6 +104,13 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      */
     static final String PHYSICAL_PREFIX_TRUSTED = "physicalPrefixTrusted";
 
+    /**
+     * Where a restart resumes, when it is not the source read offset itself: the token of the last released
+     * run that carried a change, where the stream began, or a position put there by hand. Absent on a record
+     * written before the two were kept apart, which resumes from the read offset as it always did.
+     */
+    static final String SOURCE_RESUME_OFFSET = "sourceResumeOffset";
+
     /** The generation, revision and tables of the one subscription the chain's reader holds on its source. */
     static final String PHYSICAL_CAPTURE_EPOCH = "physicalCaptureEpoch";
     static final String PHYSICAL_CAPTURE_REVISION = "physicalCaptureRevision";
@@ -269,6 +276,11 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
 
     @Override
     public void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
+        advanceSourceReadOffset(miningChainId, position, true);
+    }
+
+    @Override
+    public void advanceSourceReadOffset(String miningChainId, ChainPosition position, boolean resumable) {
         Objects.requireNonNull(miningChainId, "miningChainId");
         Objects.requireNonNull(position, POSITION);
         Objects.requireNonNull(position.order(), POSITION_ORDER);
@@ -278,7 +290,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         // exists to stop. It matches nothing when the recorded position already ranks at or after this one.
         long matched = writeChainWithConsumerMigration(miningChainId, () -> collection.updateOne(
                 sourceReadAdvanceFilter(miningChainId, position.order()),
-                new Document("$set", sourceReadFields(position, Instant.now(clock)))).getMatchedCount());
+                new Document("$set", sourceReadFields(position, Instant.now(clock), resumable))).getMatchedCount());
         if (matched > 0) {
             return;
         }
@@ -299,6 +311,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         long matched = writeChainWithConsumerMigration(miningChainId, () -> collection.updateOne(
                         new Document("_id", miningChainId),
                         new Document("$set", new Document("sourceReadOffset", token)
+                                .append(SOURCE_RESUME_OFFSET, token)
                                 .append("sourceReadAt", Instant.now(clock).toEpochMilli())
                                 .append(PHYSICAL_PREFIX_TRUSTED, true))
                                 .append("$unset", new Document("sourceReadEpoch", "")
@@ -312,13 +325,20 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
 
     @Override
     public boolean advancePhysicalSourceReadOffset(String miningChainId, long epoch, ChainPosition position) {
+        return advancePhysicalSourceReadOffset(miningChainId, epoch, position, true);
+    }
+
+    @Override
+    public boolean advancePhysicalSourceReadOffset(
+            String miningChainId, long epoch, ChainPosition position, boolean resumable) {
         Objects.requireNonNull(miningChainId, "miningChainId");
         requireRelease(epoch, position);
         // The generation rides in the same filter as the ordering condition, so a newer reader opening its
-        // generation cannot slip in between a check and this write.
+        // generation cannot slip in between a check and this write. The resume point rides in the same write,
+        // so it never names a position the read offset has not reached.
         long matched = writeChainWithConsumerMigration(miningChainId, () -> collection.updateOne(
                 sourceReadAdvanceFilter(miningChainId, position.order()).append("epoch", epoch),
-                new Document("$set", sourceReadFields(position, Instant.now(clock)))).getMatchedCount());
+                new Document("$set", sourceReadFields(position, Instant.now(clock), resumable))).getMatchedCount());
         return matched == 1 || epochOf(miningChainId) == epoch;
     }
 
@@ -330,6 +350,24 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                 .projection(Projections.include("sourceReadOffset", "sourceReadEpoch", "sourceReadSeq"))
                 .first());
         return root == null ? Optional.empty() : Optional.ofNullable(sourceReadFrom(root));
+    }
+
+    @Override
+    public Optional<String> resumeOffset(String miningChainId) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Document root = StoreIo.call(() -> collection.find(new Document("_id", miningChainId))
+                .projection(Projections.include(SOURCE_RESUME_OFFSET, "sourceReadOffset"))
+                .first());
+        if (root == null) {
+            return Optional.empty();
+        }
+        Object resume = root.get(SOURCE_RESUME_OFFSET);
+        Object read = resume != null ? resume : root.get("sourceReadOffset");
+        if (read != null && !(read instanceof String)) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", miningChainId,
+                    "field", resume != null ? SOURCE_RESUME_OFFSET : "sourceReadOffset"), null);
+        }
+        return Optional.ofNullable((String) read);
     }
 
     @Override
@@ -356,7 +394,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                         new Document("sourceReadEpoch", new Document("$exists", false)),
                         new Document("sourceReadEpoch", new Document("$lt", epoch))))));
         long matched = writeChainWithConsumerMigration(miningChainId, () -> collection.updateOne(filter,
-                new Document("$set", sourceReadFields(position, Instant.now(clock))
+                new Document("$set", sourceReadFields(position, Instant.now(clock), true)
                         .append(PHYSICAL_PREFIX_TRUSTED, true))).getMatchedCount());
         if (matched == 1) {
             return true;
@@ -537,7 +575,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * longer be ranked, and an order without its token is nothing a read can resume from — so each part
      * is written only when it is there, and after a rewind the order is the part that is not.
      */
-    private static Document sourceReadFields(ChainPosition position, Instant at) {
+    private static Document sourceReadFields(ChainPosition position, Instant at, boolean resumable) {
         Document fields = new Document();
         if (position.order() != null) {
             fields.append("sourceReadEpoch", position.order().epoch())
@@ -545,6 +583,9 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         }
         if (position.token() != null) {
             fields.append("sourceReadOffset", position.token());
+            if (resumable) {
+                fields.append(SOURCE_RESUME_OFFSET, position.token());
+            }
         }
         if (at != null) {
             fields.append("sourceReadAt", at.toEpochMilli());
@@ -1777,7 +1818,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                 .append("schemaHistory", schemaHistory)
                 .append(CONSUMER_WRITE_REVISION, 0L);
         if (meta.sourceRead() != null) {
-            document.putAll(sourceReadFields(meta.sourceRead(), meta.sourceReadAt()));
+            document.putAll(sourceReadFields(meta.sourceRead(), meta.sourceReadAt(), true));
         }
         if (meta.retention() != null) {
             document.append("retention", meta.retention());

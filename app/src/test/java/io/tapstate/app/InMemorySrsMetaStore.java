@@ -33,6 +33,8 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     private final Map<String, Map<String, Map<String, Long>>> ringDone = new LinkedHashMap<>();
     /** The chains whose source read offset every table they carry can resume from. */
     private final Set<String> trusted = new HashSet<>();
+    /** Per chain, where a restart resumes when that is not the read offset itself. */
+    private final Map<String, String> resumeFrom = new LinkedHashMap<>();
     /** What each chain's reader subscribed to, as its record would carry it. */
     private final Map<String, PhysicalSelection> selections = new LinkedHashMap<>();
     /** Tables asked for by pipelines arriving on each chain, until a subscription serves them. */
@@ -116,6 +118,12 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     @Override
     public synchronized boolean advancePhysicalSourceReadOffset(
             String miningChainId, long epoch, ChainPosition position) {
+        return advancePhysicalSourceReadOffset(miningChainId, epoch, position, true);
+    }
+
+    @Override
+    public synchronized boolean advancePhysicalSourceReadOffset(
+            String miningChainId, long epoch, ChainPosition position, boolean resumable) {
         SrsMeta m = require(miningChainId);
         if (m.epoch() != epoch) {
             return false;
@@ -123,8 +131,17 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         if (ranksAfter(position, m.sourceRead())) {
             records.put(miningChainId, new SrsMeta(m.miningChainId(), position, m.consumerOffsets(),
                     m.schemaHistory(), m.retention(), m.epoch(), Instant.now()));
+            if (resumable && position.token() != null) {
+                resumeFrom.put(miningChainId, position.token());
+            }
         }
         return true;
+    }
+
+    @Override
+    public synchronized Optional<String> resumeOffset(String miningChainId) {
+        String resume = resumeFrom.get(miningChainId);
+        return resume != null ? Optional.of(resume) : read(miningChainId).map(SrsMeta::sourceReadOffset);
     }
 
     @Override
@@ -145,6 +162,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
                 || trustedNow && (stored.order() == null || stored.order().epoch() < epoch)) {
             records.put(miningChainId, new SrsMeta(m.miningChainId(), position, m.consumerOffsets(),
                     m.schemaHistory(), m.retention(), m.epoch(), Instant.now()));
+            resumeFrom.put(miningChainId, position.token());
             trusted.add(miningChainId);
             return true;
         }
@@ -193,15 +211,25 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), new ChainPosition(null, token), m.consumerOffsets(),
                 m.schemaHistory(), m.retention(), m.epoch(), Instant.now()));
+        resumeFrom.put(miningChainId, token);
         trusted.add(miningChainId);
     }
 
     @Override
     public synchronized void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
+        advanceSourceReadOffset(miningChainId, position, true);
+    }
+
+    @Override
+    public synchronized void advanceSourceReadOffset(
+            String miningChainId, ChainPosition position, boolean resumable) {
         SrsMeta m = require(miningChainId);
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), position, m.consumerOffsets(),
                 m.schemaHistory(), m.retention(), m.epoch()));
+        if (resumable && position.token() != null) {
+            resumeFrom.put(miningChainId, position.token());
+        }
     }
 
     @Override
@@ -473,6 +501,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         // Idempotent for the same reason the detach below is: an absent chain already satisfies it.
         records.remove(miningChainId);
         ringDone.remove(miningChainId);
+        resumeFrom.remove(miningChainId);
         trusted.remove(miningChainId);
         selections.remove(miningChainId);
         sinkWriters.remove(miningChainId);

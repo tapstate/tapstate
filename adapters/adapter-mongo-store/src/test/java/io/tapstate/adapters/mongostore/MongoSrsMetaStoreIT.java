@@ -276,6 +276,45 @@ class MongoSrsMetaStoreIT {
         });
     }
 
+    /**
+     * A released run that carried no change moves the read offset -- how far the source may release -- and
+     * leaves where a restart resumes at the last run that carried one. Where a stream began, a position put
+     * there by hand and a released change are all resume points; a record written before the two were kept
+     * apart resumes from its read offset.
+     */
+    @Test
+    void aQuietReleaseMovesTheReadOffsetButNotWhereARestartResumes() {
+        withCollection((store, collection) -> {
+            store.create(CHAIN, null);
+            assertThat(store.resumeOffset(CHAIN)).isEmpty();
+            long epoch = store.openEpoch(CHAIN);
+            store.establishPhysicalAnchor(CHAIN, new ChainPosition(new SourceOrder(epoch, -1L), "start"));
+            assertThat(store.resumeOffset(CHAIN)).as("where the stream began").contains("start");
+
+            assertThat(store.advancePhysicalSourceReadOffset(CHAIN, epoch,
+                    new ChainPosition(new SourceOrder(epoch, 0), "change-0"), true)).isTrue();
+            assertThat(store.advancePhysicalSourceReadOffset(CHAIN, epoch,
+                    new ChainPosition(new SourceOrder(epoch, 1), "quiet-1"), false)).isTrue();
+
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("quiet-1");
+            assertThat(store.durableSourceRead(CHAIN).map(ChainPosition::token)).contains("quiet-1");
+            assertThat(store.resumeOffset(CHAIN)).as("the last released change").contains("change-0");
+
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(epoch, 2), "direct-quiet-2"), false);
+            assertThat(store.resumeOffset(CHAIN)).contains("change-0");
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(epoch, 3), "direct-change-3"), true);
+            assertThat(store.resumeOffset(CHAIN)).contains("direct-change-3");
+
+            store.rewindSourceReadOffset(CHAIN, "by-hand");
+            assertThat(store.resumeOffset(CHAIN)).as("a position put there by hand").contains("by-hand");
+
+            // A record from before the resume point was kept apart carries the read offset alone.
+            collection.updateOne(new Document("_id", CHAIN), new Document("$unset",
+                    new Document(MongoSrsMetaStore.SOURCE_RESUME_OFFSET, "")));
+            assertThat(store.resumeOffset(CHAIN)).as("it resumes from its read offset").contains("by-hand");
+        });
+    }
+
     @Test
     void anOffsetFromBeforeTrustExistedIsNotAnchoredOverUntilItIsTrusted() {
         withStore(store -> {

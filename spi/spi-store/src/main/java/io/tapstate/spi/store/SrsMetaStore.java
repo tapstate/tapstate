@@ -177,7 +177,7 @@ public interface SrsMetaStore {
      *
      * <p>The offset it leaves is {@linkplain #physicalPrefixTrusted trusted}: somebody chose it knowing
      * where every pipeline on the chain stands, which is the one proof an offset written before per-table
-     * acknowledgements existed cannot otherwise get.
+     * acknowledgements existed cannot otherwise get. It is also where the next restart resumes.
      */
     void rewindSourceReadOffset(String miningChainId, String token);
 
@@ -197,6 +197,42 @@ public interface SrsMetaStore {
      */
     default boolean advancePhysicalSourceReadOffset(String miningChainId, long epoch, ChainPosition position) {
         throw new UnsupportedOperationException("this store does not fence source read releases by generation");
+    }
+
+    /**
+     * Advances the source read offset as {@link #advancePhysicalSourceReadOffset(String, long, ChainPosition)}
+     * does, and makes the position the one a restart resumes from only when {@code resumable}: when the run
+     * that named it carried a change.
+     *
+     * <p>A run carrying no change still says how far the source has been read, which is how far the source
+     * may be told to release its log. It is not a point every source resumes after correctly: a source may
+     * name it in the form it keeps for the last change handed over -- PostgreSQL names the end of the last
+     * commit, which is where the next transaction's first change begins -- and a stream resumed there passes
+     * over that change as one already read. Nothing lies between the last released change and a quiet run
+     * released after it, so resuming from the change reads nothing that was not read before. The default
+     * keeps the two together, which is what a store without the distinction did.
+     */
+    default boolean advancePhysicalSourceReadOffset(
+            String miningChainId, long epoch, ChainPosition position, boolean resumable) {
+        return advancePhysicalSourceReadOffset(miningChainId, epoch, position);
+    }
+
+    /**
+     * The same split for {@link #advanceSourceReadOffset(String, ChainPosition)}, which a tail reading its
+     * source directly writes through.
+     */
+    default void advanceSourceReadOffset(String miningChainId, ChainPosition position, boolean resumable) {
+        advanceSourceReadOffset(miningChainId, position);
+    }
+
+    /**
+     * Where a restart of the chain's reader resumes: the position of the last released run that carried a
+     * change, where the stream began, or a position put there by hand -- whichever was recorded last. Empty
+     * for a chain with no offset or no record. The default answers the source read offset itself, which is
+     * what a store that does not keep the two apart, and every record written before they were, means.
+     */
+    default Optional<String> resumeOffset(String miningChainId) {
+        return read(miningChainId).map(SrsMeta::sourceReadOffset);
     }
 
     /**
@@ -236,7 +272,8 @@ public interface SrsMetaStore {
      * only point it can be resumed from. A trusted offset already in this generation is kept -- it is a
      * release the same reader made, or a start it already laid down. An offset that is not trusted is left
      * alone and the answer is false: laying a start over it would make it look proven. So is a chain that
-     * has moved to another generation. A mutate on an unseeded chain is a caller ordering error.
+     * has moved to another generation. Where it is laid down it is also where a restart resumes. A mutate on
+     * an unseeded chain is a caller ordering error.
      */
     default boolean establishPhysicalAnchor(String miningChainId, ChainPosition position) {
         throw new UnsupportedOperationException("this store does not record physical anchors");

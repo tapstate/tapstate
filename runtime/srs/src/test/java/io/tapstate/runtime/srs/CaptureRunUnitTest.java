@@ -1035,6 +1035,60 @@ class CaptureRunUnitTest {
         awaitSourceRead(meta, chainId, "hb-12");
     }
 
+    /**
+     * A restart resumes from the last run that carried a change, not from a quiet run released after it. A
+     * run carrying no change says how far the source has been read, and a source may say that in the form it
+     * keeps for "the last change I handed over": PostgreSQL names the end of the last commit, which is where
+     * the next transaction's first change begins, and a stream resumed there passes over that change as one
+     * already read. The quiet run still moves the position the source is told it may release.
+     */
+    @Test
+    void aRestartResumesFromTheLastChangeNotFromAQuietRunReleasedAfterIt() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRunSpec spec = specOver("pipe-1", "k-quiet-resume", "orders");
+        CaptureRun first = runUnit(new FakeSource(List.of(), List.of(change(10))).withHeartbeatAt("hb-12"), meta)
+                .start(spec, e -> { });
+        String chainId = first.chainId().orElseThrow().value();
+        try {
+            long epoch = meta.read(chainId).orElseThrow().epoch();
+            meta.advanceTableSinkAcked(chainId, "pipe-1", "orders",
+                    new ChainPosition(new SourceOrder(epoch, 0), "src-10"));
+            awaitSourceRead(meta, chainId, "hb-12");
+        } finally {
+            first.close();
+        }
+
+        FakeSource next = new FakeSource(List.of(), List.of());
+        CaptureRun again = runUnit(next, meta).start(spec, e -> { });
+        try {
+            assertThat(next.cdcStart)
+                    .as("where the next run resumes: the last change, not the quiet run behind it")
+                    .isEqualTo(CaptureStart.resume(new SourcePosition("src-10")));
+        } finally {
+            again.close();
+        }
+    }
+
+    /** The same for a tail reading its source directly, which writes its positions down through a path of its own. */
+    @Test
+    void aDirectTailResumesFromTheLastChangeNotFromAQuietRunReleasedAfterIt() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chainId = MiningChainId.resolve(config(), "chain-direct-quiet-resume").value();
+        List<Envelope> forwarded = new CopyOnWriteArrayList<>();
+        runUnit(new FakeSource(List.of(), List.of(change(10))).withHeartbeatAt("hb-12"), meta)
+                .start(spec(ReadMode.CDC_ONLY, false, "chain-direct-quiet-resume"), forwarded::add);
+        Envelope change = forwarded.getFirst();
+        meta.advanceTableSinkAcked(chainId, "pipe-1", change.src(), change.position());
+        awaitSourceRead(meta, chainId, "hb-12");
+
+        FakeSource next = new FakeSource(List.of(), List.of());
+        runUnit(next, meta).start(spec(ReadMode.CDC_ONLY, false, "chain-direct-quiet-resume"), e -> { });
+
+        assertThat(next.cdcStart)
+                .as("where the next run resumes: the last change, not the quiet run behind it")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("src-10")));
+    }
+
     @Test
     void aDirectTailStampsEachChangeWithAnOrderSoASinkCanRankIt() {
         InMemoryMeta meta = new InMemoryMeta();
@@ -1917,6 +1971,8 @@ class CaptureRunUnitTest {
     static class InMemoryMeta implements SrsMetaStore {
         /** Per chain and pipeline, how far each table's ring is done with -- kept once, never raised here. */
         final Map<String, Map<String, Long>> ringDone = new LinkedHashMap<>();
+        /** Per chain, where a restart resumes when that is not the read offset itself. */
+        private final Map<String, String> resumeFrom = new LinkedHashMap<>();
         private volatile String pausedPipeline;
         private volatile CountDownLatch registrationReached;
         private volatile CountDownLatch allowRegistration;
@@ -2012,10 +2068,26 @@ class CaptureRunUnitTest {
 
         @Override
         public synchronized void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
+            advanceSourceReadOffset(miningChainId, position, true);
+        }
+
+        @Override
+        public synchronized void advanceSourceReadOffset(
+                String miningChainId, ChainPosition position, boolean resumable) {
             SrsMeta m = require(miningChainId);
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), position, m.consumerOffsets(),
                     m.schemaHistory(), m.retention(), m.epoch()));
+            if (resumable && position.token() != null) {
+                resumeFrom.put(miningChainId, position.token());
+            }
+        }
+
+        @Override
+        public synchronized java.util.Optional<String> resumeOffset(String miningChainId) {
+            String resume = resumeFrom.get(miningChainId);
+            return resume != null ? java.util.Optional.of(resume)
+                    : read(miningChainId).map(SrsMeta::sourceReadOffset);
         }
 
         @Override
@@ -2308,6 +2380,12 @@ class CaptureRunUnitTest {
         @Override
         public synchronized boolean advancePhysicalSourceReadOffset(
                 String miningChainId, long epoch, ChainPosition position) {
+            return advancePhysicalSourceReadOffset(miningChainId, epoch, position, true);
+        }
+
+        @Override
+        public synchronized boolean advancePhysicalSourceReadOffset(
+                String miningChainId, long epoch, ChainPosition position, boolean resumable) {
             SrsMeta m = require(miningChainId);
             if (m.epoch() != epoch) {
                 return false;
@@ -2316,6 +2394,9 @@ class CaptureRunUnitTest {
                 releasedSourceReads.add(position);
                 records.put(miningChainId, new SrsMeta(m.miningChainId(), position, m.consumerOffsets(),
                         m.schemaHistory(), m.retention(), m.epoch()));
+                if (resumable && position.token() != null) {
+                    resumeFrom.put(miningChainId, position.token());
+                }
             }
             return true;
         }
@@ -2338,6 +2419,7 @@ class CaptureRunUnitTest {
                     || trustedNow && (stored.order() == null || stored.order().epoch() < epoch)) {
                 records.put(miningChainId, new SrsMeta(m.miningChainId(), position, m.consumerOffsets(),
                         m.schemaHistory(), m.retention(), m.epoch()));
+                resumeFrom.put(miningChainId, position.token());
                 trusted.add(miningChainId);
                 return true;
             }

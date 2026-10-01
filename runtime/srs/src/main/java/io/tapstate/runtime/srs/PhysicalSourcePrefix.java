@@ -345,16 +345,25 @@ final class PhysicalSourcePrefix implements AutoCloseable {
         return true;
     }
 
+    /**
+     * Writes a released run down. Its position becomes how far the source may be told to release its log;
+     * it becomes where a restart resumes only when the run carried a change, because a run carrying none can
+     * name a point that, resumed from, passes over the change that follows it.
+     */
     private void write(Batch batch, Map<String, ConsumerOffset> current) {
         ChainPosition position = batch.position();
+        boolean carriedAChange = !batch.lastSeqByTable().isEmpty();
         if (directPipeline != null) {
             meta.advanceSinkAcked(chainId, directPipeline, position);
             ConsumerOffset own = current.get(directPipeline);
             List<ConsumerOffset> landed = current.values().stream()
                     .map(consumer -> consumer == own ? consumer.withSinkAcked(position) : consumer)
                     .toList();
+            // A position held back to another consumer's is that consumer's run, not this one: nothing says it
+            // carried a change, so it is not made a resume point.
             SrsDurableFrontier.safeAdvance(position, own == null ? List.of() : landed)
-                    .ifPresent(safe -> meta.advanceSourceReadOffset(chainId, safe));
+                    .ifPresent(safe -> meta.advanceSourceReadOffset(
+                            chainId, safe, carriedAChange && safe.equals(position)));
             return;
         }
         for (String pipelineId : batch.owed().keySet()) {
@@ -362,7 +371,7 @@ final class PhysicalSourcePrefix implements AutoCloseable {
                 throw lostOrUnverified();
             }
         }
-        if (!meta.advancePhysicalSourceReadOffset(chainId, epoch, position)) {
+        if (!meta.advancePhysicalSourceReadOffset(chainId, epoch, position, carriedAChange)) {
             throw lostOrUnverified();
         }
         batch.lastSeqByTable().forEach(trimThrough);
