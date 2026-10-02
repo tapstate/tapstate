@@ -5,6 +5,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.CaptureStart;
+import io.tapstate.spi.capture.CaptureStartedListener;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.capture.SourcePosition;
@@ -22,6 +23,7 @@ import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.Function;
 import java.util.function.LongConsumer;
@@ -183,6 +185,37 @@ public final class CdcPhase {
     }
 
     /**
+     * One physical capture whose rings write through to recoverable SRS before admitting a change.
+     * Its database checkpoint belongs to the complete source batch, independent of table confirmations.
+     */
+    public static Subscription runDurable(CapturePort port, CaptureConfig config, CaptureStart start,
+            Map<String, TableRoute> routes, CaptureHealth health, AtomicLong batchOrder) {
+        Map<String, TableRoute> selected = Map.copyOf(routes);
+        List<String> servedTables = List.copyOf(selected.keySet());
+        CdcChain physical = selected.values().iterator().next().chain();
+        AtomicReference<ChainPosition> lastWritten = new AtomicReference<>();
+        return port.cdc(config, start, health.recording(new CaptureStartedListener() {
+            @Override
+            public void onStart(SourcePosition position) {
+                if (physical.meta().read(physical.miningChainId()).orElseThrow().sourceRead() == null) {
+                    physical.meta().advanceCaptureCheckpoint(physical.miningChainId(),
+                            new ChainPosition(SourceOrder.snapshotRow(physical.epoch()), position.token()),
+                            servedTables);
+                }
+            }
+
+            @Override
+            public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                writeBatch(events, position, selected::get, lastWritten, true);
+                position.ifPresent(token -> physical.meta().advanceCaptureCheckpoint(
+                        physical.miningChainId(), new ChainPosition(
+                                new SourceOrder(physical.epoch(), batchOrder.incrementAndGet()), token.token()),
+                        servedTables));
+            }
+        }));
+    }
+
+    /**
      * The slowest subscribed consumer's read cursor into one table's ring — how far ahead of its readers
      * the ring may be written. {@link Long#MAX_VALUE} when no consumer subscribes to the table, and
      * {@code -1} for a subscribed consumer that has read nothing of it.
@@ -217,6 +250,11 @@ public final class CdcPhase {
             Optional<SourcePosition> position,
             Function<String, TableRoute> routes,
             AtomicReference<ChainPosition> lastWritten) {
+        writeBatch(events, position, routes, lastWritten, false);
+    }
+
+    private static void writeBatch(List<Envelope> events, Optional<SourcePosition> position,
+            Function<String, TableRoute> routes, AtomicReference<ChainPosition> lastWritten, boolean durable) {
         if (events.isEmpty()) {
             // The source handed over only events that carry no change -- a heartbeat and its like. There is
             // nothing to write, and nothing has been read past, so the offset does not move either.
@@ -237,13 +275,13 @@ public final class CdcPhase {
             SourcePosition pos = i == last ? position.orElse(null) : null;
             byTable.computeIfAbsent(event.src(), table -> new ArrayList<>()).add(new SrsItem(
                     pos, event.op(), event.ts(), event.before(), event.after(), route.chain().schemaVer(),
-                    route.chain().captureFence()));
+                    route.chain().captureFence(), route.chain().epoch()));
         }
         String closingTable = events.get(last).src();
         long closingSeq = -1;
         Collection<ConsumerOffset> closingOffsets = List.of();
         for (Map.Entry<String, List<SrsItem>> entry : byTable.entrySet()) {
-            Admitted admitted = admit(routes.apply(entry.getKey()), entry.getKey(), entry.getValue());
+            Admitted admitted = admit(routes.apply(entry.getKey()), entry.getKey(), entry.getValue(), durable);
             if (entry.getKey().equals(closingTable)) {
                 closingSeq = admitted.lastSeq();
                 // The cursors the admission read, rather than a second reading of them. They are the same
@@ -251,6 +289,9 @@ public final class CdcPhase {
                 // advance shorter, never further, so the bound it enforces still holds.
                 closingOffsets = admitted.offsets();
             }
+        }
+        if (durable) {
+            return;
         }
         // The run is in the rings; advance the durable read offset to the position that closes it, clamped
         // so it never passes the slowest consumer's sink-acked position -- a change only ever in the
@@ -293,7 +334,7 @@ public final class CdcPhase {
      * whole capture would stop with nothing thrown -- the source asks for a bounded batch, but what a
      * connector hands over is the connector's to decide.
      */
-    private static Admitted admit(TableRoute route, String table, List<SrsItem> items) {
+    private static Admitted admit(TableRoute route, String table, List<SrsItem> items, boolean durable) {
         SrsWriteGate gate = route.chain().gate();
         int capacity = (int) Math.min(capacityOnceTheClusterAllowsIt(gate, table), Integer.MAX_VALUE);
         long lastSeq = -1;
@@ -308,7 +349,7 @@ public final class CdcPhase {
                 offsets = route.consumers().get();
                 OptionalLong appended;
                 try {
-                    appended = gate.appendAll(piece, headroomBound(offsets, table));
+                    appended = gate.appendAll(piece, durable ? Long.MAX_VALUE : headroomBound(offsets, table));
                 } catch (RingWriteRefusedException refused) {
                     // The cluster refused, not the headroom: nothing was written, and what refused clears
                     // itself as the members' verdicts converge. Waiting here is what pauses the source

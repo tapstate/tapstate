@@ -6,18 +6,26 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.model.PipelineNode;
+import io.tapstate.core.model.ReadMode;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.CaptureStart;
+import io.tapstate.spi.capture.CaptureStartedListener;
 import io.tapstate.spi.capture.SourcePosition;
+import io.tapstate.spi.capture.SharedNotes;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
+import io.tapstate.spi.store.SrsConsumerId;
+import io.tapstate.spi.store.ConsumerProgressKind;
 
 import java.time.Instant;
 import java.util.Collection;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -25,6 +33,9 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 import java.util.function.LongConsumer;
@@ -37,13 +48,14 @@ import java.util.function.Supplier;
  *
  * <p>The dispatch is driven entirely by the plan (read mode x {@code srs.enabled}): a snapshot phase drains
  * straight to the pass-through sink; a shared-ring tail provisions the mining chain, attaches the consumer,
- * writes the change ring and exposes a Jet source over it; an srs-disabled tail provisions and attaches the
- * same way and streams straight to the one consumer, with no ring. See {@link #start} for the exact ordering.
+ * writes the change ring and exposes a Jet source over it; an srs-disabled tail provisions an independent
+ * channel and streams straight to its consumer, with no ring. See {@link #start} for the exact ordering.
  *
- * <p><strong>{@code srs.enabled} decides the buffering and nothing else.</strong> Any tail opens the chain
- * and keeps its durable record, so where a tail resumes from does not depend on the flag: a pipeline that
- * turns the buffering off keeps the position it had, and one that turns it back on finds it still there.
- * The alternative is a second account to move a position between, and the move is the step that loses one.
+ * <p>Shared capture records the source-database checkpoint after a complete batch is in the durable log.
+ * Each source node separately records its confirmed consumption cursor for every table it reads. A direct
+ * channel instead keeps its own source-database recovery checkpoint, so two readers of the same database
+ * cannot overwrite one another's recovery progress. A change between these modes must not reinterpret
+ * their different coordinates as equivalent progress.
  *
  * <p>What the flag does decide is where a run with nothing recorded begins, because the two paths read
  * {@code start_from} in different coordinates: a direct tail resolves it against the source's own log,
@@ -78,6 +90,7 @@ public final class CaptureRunUnit {
     private final HazelcastInstance hz;
     /** The fallback for direct callers that do not supply the product's durable per-pipeline generation. */
     private final AtomicLong chainlessSnapshotEpoch = new AtomicLong();
+    private final ConcurrentMap<String, SharedTail> sharedTails = new ConcurrentHashMap<>();
 
     public CaptureRunUnit(CapturePort port, SrsCoordinator coordinator, SrsMetaStore meta, HazelcastInstance hz) {
         this.port = Objects.requireNonNull(port, "port");
@@ -184,27 +197,30 @@ public final class CaptureRunUnit {
             // one seam for however many pipelines load from it: read back, a pipeline new to the chain
             // gets whichever load reached the record first and starts its tail where that one began.
             String ownSeam = tailSeam(state.load);
-            Supplier<Optional<Subscription>> tail =
-                    () -> openTail(spec, plan, state.chainId, state.epoch, ownSeam,
-                            startTail, health, handoff);
+            Supplier<Optional<Subscription>> tail = () -> {
+                Optional<Subscription> opened = openTail(spec, plan, state.chainId, state.epoch, ownSeam,
+                        startTail, health, handoff);
+                state.sharedTail = state.chainId == null ? null : sharedTails.get(state.chainId.value());
+                return opened;
+            };
 
             Optional<CaptureRun> backgroundRun = beginBackgroundLoad(
                     spec, handoff, inBackground, tail, state, ringSource, health);
             if (backgroundRun.isPresent()) {
-                return backgroundRun.get();
+                return withWidening(backgroundRun.get(), state);
             }
 
             SnapshotRead snapshot = readSnapshot(state.load, handoff, health);
             state.subscription = tail.get();
-            return new CaptureRun(
+            return withWidening(new CaptureRun(
                     Optional.ofNullable(state.chainId), state.merged, snapshot.count(), snapshot.counts(),
-                    ringSource, state.subscription, health);
+                    ringSource, state.subscription, health), state);
         } catch (RuntimeException | Error failure) {
             if (state.load != null) {
                 state.load.close();
             }
             RuntimeException cleanupFailure = rollbackStartFailure(
-                    state.chainId, spec.pipelineId(), state.chainCreated,
+                    state.chainId, spec.consumerId(), state.chainCreated,
                     state.consumerAttached, state.subscription);
             if (cleanupFailure != null) {
                 failure.addSuppressed(cleanupFailure);
@@ -213,15 +229,23 @@ public final class CaptureRunUnit {
         }
     }
 
+    private static CaptureRun withWidening(CaptureRun run, OpenState state) {
+        return run.withWidening(() -> {
+            if (state.sharedTail != null) {
+                state.sharedTail.widen();
+            }
+        });
+    }
+
     private void provisionChain(
             CaptureRunSpec spec, ConsumptionPlan plan, boolean startTail, OpenState state) {
-        // Any tail opens the chain, buffered or not. The flag chooses whether changes go through the
-        // shared ring; it does not choose whether this source has a durable record, because that record
-        // is what the next run reads to know where to start -- a question the flag has no bearing on.
+        // Both incremental paths retain recovery progress. Shared capture keys its physical source;
+        // direct capture keys this pipeline's source node so independent channels cannot mix records.
         if (!plan.tail()) {
             return;
         }
-        state.chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
+        state.chainId = spec.miningChainId();
+        validateRecovery(spec, state.chainId, plan, startTail);
         // Only the member that runs the tail opens a generation; an attachment reads the one that tail
         // writes under.
         ProvisionOutcome provisioned = startTail
@@ -231,6 +255,12 @@ public final class CaptureRunUnit {
         state.merged = provisioned.merged();
         state.epoch = provisioned.epoch();
         state.chainCreated = !state.merged;
+        if (plan.sharedRing()) {
+            meta.requestCaptureTables(state.chainId.value(), spec.config().streams());
+            LinkedHashSet<String> tables = new LinkedHashSet<>(meta.captureTables(state.chainId.value()));
+            tables.addAll(spec.config().streams());
+            requireRecoverableRings(state.chainId.value(), List.copyOf(tables));
+        }
     }
 
     private void markPipelineArrival(
@@ -240,7 +270,7 @@ public final class CaptureRunUnit {
         // above the mark. A cdc-only read from the earliest change or from an instant is placed by that
         // start instead, when its reader opens. A pipeline coming back keeps the place it had.
         if (plan.sharedRing() && (plan.snapshot() || spec.startFrom() instanceof StartFrom.Latest)) {
-            markWhereThisPipelineArrives(chainId.value(), spec.pipelineId(), tables);
+            markWhereThisPipelineArrives(chainId.value(), spec.consumerId(), tables);
         }
     }
 
@@ -254,17 +284,17 @@ public final class CaptureRunUnit {
         // the last consumer to give it back closes it, and a load read while the job runs gives any
         // other pipeline on the chain the whole length of the load in which to stop.
         if (plan.sharedRing()) {
-            coordinator.attachConsumer(state.chainId, spec.pipelineId());
+            coordinator.attachConsumer(state.chainId, spec.consumerId());
             state.consumerAttached = true;
             // A selected table protects its ring before arrival is sampled. If a writer gets there first,
             // the later sample moves arrival past what it wrote; once this registration lands, the writer
             // is constrained until that sample and its cursor are published together. Raising the floor
             // to -1 also leaves an already advanced cursor where a returning run left it.
-            registerConsumerTables(state.chainId.value(), spec.pipelineId(), tables);
+            registerConsumerTables(state.chainId.value(), spec.consumerId(), tables);
         } else if (plan.directTail() && startTail) {
             coordinator.attachConsumer(
                     Objects.requireNonNull(state.chainId, "a tail resolves its chain before it runs"),
-                    spec.pipelineId());
+                    spec.consumerId());
             state.consumerAttached = true;
         }
     }
@@ -278,7 +308,7 @@ public final class CaptureRunUnit {
         String firstRing = SrsRingbuffer.ringName(chainId.value(), firstTable);
         return Optional.of(SrsRingSource.create(
                 firstRing, spec.startFrom(),
-                readCursorPublisher(chainId.value(), spec.pipelineId(), firstTable), spec.retention()));
+                readCursorPublisher(chainId.value(), spec.consumerId(), firstTable), spec.retention()));
     }
 
     private SnapshotPhase.Load openLoad(
@@ -293,8 +323,10 @@ public final class CaptureRunUnit {
             return null;
         }
         if (chainId != null) {
+            CaptureConfig config = plan.sharedRing() && durableLog() != null
+                    ? spec.config().sharing(sharedNotes(spec, chainId.value())) : spec.config();
             return SnapshotPhase.open(
-                    port, spec.config(), chainId.value(), spec.pipelineId(), tables, epoch, meta);
+                    port, config, chainId.value(), spec.consumerId(), tables, epoch, meta);
         }
         long snapshotEpoch = spec.snapshotEpoch() > 0
                 ? spec.snapshotEpoch()
@@ -355,12 +387,222 @@ public final class CaptureRunUnit {
         private long epoch;
         private Optional<Subscription> subscription = Optional.empty();
         private SnapshotPhase.Load load;
+        private volatile SharedTail sharedTail;
     }
 
     private void registerConsumerTables(String chainId, String pipelineId, List<String> tables) {
         for (String table : tables) {
             meta.advanceConsumerReadSeq(chainId, pipelineId, table, -1L);
         }
+    }
+
+    private SrsLogStore durableLog() {
+        Object bound = hz.getUserContext().get(SRS_LOG_USER_CONTEXT_KEY);
+        return bound instanceof SrsLogStore log ? log : null;
+    }
+
+    /**
+     * Requires write-through in the effective member configuration before any ring is resolved. A
+     * dynamic exact-name config cannot override a static wildcard, and changing configuration after a
+     * ring has opened cannot attach a store to that existing ring.
+     */
+    private void requireRecoverableRings(String chain, List<String> tables) {
+        SrsLogStore log = durableLog();
+        if (log == null) {
+            return;
+        }
+        for (String table : tables) {
+            String name = SrsRingbuffer.ringName(chain, table);
+            com.hazelcast.config.RingbufferConfig existing = hz.getConfig().findRingbufferConfig(name);
+            if (!existing.getRingbufferStoreConfig().isEnabled()
+                    || !(existing.getRingbufferStoreConfig().getFactoryImplementation()
+                            instanceof SrsLogRingbufferStoreFactory factory)
+                    || !factory.backs(log)
+                    || existing.getInMemoryFormat() != com.hazelcast.config.InMemoryFormat.OBJECT) {
+                throw new TapstateException(CaptureError.SRS_NOT_RECOVERABLE, Map.of("chain", chain), null);
+            }
+        }
+    }
+
+    private void validateRecovery(
+            CaptureRunSpec spec, MiningChainId chain, ConsumptionPlan plan, boolean startTail) {
+        if (spec.consumerId().equals(spec.pipelineId())) {
+            return;
+        }
+        Optional<SrsMeta> retained = meta.read(chain.value());
+        boolean legacy = retained.flatMap(record -> record.consumerOffset(spec.pipelineId()))
+                .map(CaptureRunUnit::hasRecoveryState).orElse(false);
+        MiningChainId other = spec.srsEnabled()
+                ? MiningChainId.forChannel(spec.config(), spec.srsKey(), spec.pipelineId(), spec.sourceId())
+                : MiningChainId.resolve(spec.config(), spec.srsKey());
+        boolean switched = meta.read(other.value()).flatMap(record -> record.consumerOffset(spec.consumerId()))
+                .map(CaptureRunUnit::hasRecoveryState).orElse(false);
+        boolean unsafeCheckpoint = plan.sharedRing() && retained.filter(record ->
+                record.sourceRead() != null && !record.sourceReadDurable()).isPresent();
+        SharedTail localTail = sharedTails.get(chain.value());
+        boolean restartingSharedProducer = plan.sharedRing() && spec.readMode() == ReadMode.CDC_ONLY
+                && startTail && (localTail == null || localTail.closed);
+        boolean missingAnchor = (plan.directTail() || restartingSharedProducer)
+                && retained.filter(record -> record.epoch() > 0
+                && record.sourceReadOffset() == null
+                && record.consumerOffset(spec.consumerId()).map(offset -> offset.cdcStartPosition() == null)
+                        .orElse(true)).isPresent();
+        if (legacy || switched || unsafeCheckpoint || missingAnchor) {
+            throw new TapstateException(CaptureError.RECOVERY_PROGRESS_UNPROVEN,
+                    Map.of("pipeline", spec.pipelineId(), "source", spec.sourceId()), null);
+        }
+    }
+
+    private static boolean hasRecoveryState(ConsumerOffset offset) {
+        return offset.sinkAcked() != null || !offset.sinkAckedByTable().isEmpty()
+                || !offset.snapshotCompletedTables().isEmpty() || offset.cdcStartPosition() != null
+                || offset.perTableSeq().values().stream().anyMatch(sequence -> sequence >= 0);
+    }
+
+    /** One physical subscription, widened only between complete source batches. */
+    private final class SharedTail {
+        private final CaptureRunSpec spec;
+        private final String chain;
+        private final long epoch;
+        private final CaptureHealth health;
+        private final SrsLogStore log;
+        private final AtomicInteger references = new AtomicInteger(1);
+        private final AtomicLong batchOrder;
+        private volatile boolean closed;
+        private List<String> serving = List.of();
+        private Subscription subscription;
+        private final String firstSeam;
+        private long nextTrim;
+
+        private SharedTail(CaptureRunSpec spec, String chain, long epoch, String seam,
+                CaptureHealth health, SrsLogStore log) {
+            this.spec = spec;
+            this.chain = chain;
+            this.epoch = epoch;
+            this.firstSeam = seam;
+            this.health = health;
+            this.log = log;
+            long recorded = meta.read(chain).map(SrsMeta::sourceRead)
+                    .filter(position -> position.order() != null && position.order().epoch() == epoch)
+                    .map(position -> Math.max(0L, position.order().seq())).orElse(0L);
+            this.batchOrder = new AtomicLong(recorded);
+            open();
+        }
+
+        private synchronized void open() {
+            LinkedHashSet<String> requested = new LinkedHashSet<>(meta.captureTables(chain));
+            requested.addAll(spec.config().streams());
+            List<String> tables = List.copyOf(requested);
+            requireRecoverableRings(chain, tables);
+            if (!meta.publishCaptureTables(chain, epoch, tables)) {
+                requested.addAll(meta.captureTables(chain));
+                tables = List.copyOf(requested);
+                requireRecoverableRings(chain, tables);
+                if (!meta.publishCaptureTables(chain, epoch, tables)) {
+                    throw new TapstateException(CaptureError.CLAIM_LOST,
+                            Map.of("captureId", CaptureId.of(spec).value()), null);
+                }
+            }
+            Map<String, CdcPhase.TableRoute> routes = new LinkedHashMap<>();
+            for (String table : tables) {
+                String ring = SrsRingbuffer.ringName(chain, table);
+                SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer(ring)));
+                routes.put(table, new CdcPhase.TableRoute(
+                        new CdcChain(gate, meta, chain, epoch, spec.schemaVer(), spec.captureFence()),
+                        () -> meta.consumerOffsets(chain), ignored -> { }));
+            }
+            CaptureConfig config = new CaptureConfig(spec.config().connectorId(), spec.config().settings(),
+                    tables, spec.config().node()).sharing(sharedNotes(spec, chain));
+            Optional<SrsMeta> state = meta.read(chain);
+            CaptureStart start = state.filter(record -> record.sourceReadDurable()
+                            && record.sourceReadOffset() != null)
+                    .map(record -> CaptureStart.resume(new SourcePosition(record.sourceReadOffset())))
+                    .orElseGet(() -> tailStart(meta, chain, spec.consumerId(), firstSeam, CaptureStart.present()));
+            refuseAnInstantThisBufferWillNeverReach(spec.startFrom(), start, spec.retention());
+            serving = tables;
+            subscription = CdcPhase.runDurable(port, config, start, routes, health, batchOrder);
+        }
+
+        private void trim(String table, String ring, Collection<ConsumerOffset> consumers,
+                Map<String, Map<String, Long>> confirmations) {
+            long through = Long.MAX_VALUE;
+            boolean subscribed = false;
+            for (ConsumerOffset consumer : consumers) {
+                if (!consumer.perTableSeq().containsKey(table)) {
+                    continue;
+                }
+                subscribed = true;
+                Long confirmed = confirmations.get(consumer.pipelineId()).get(table);
+                if (confirmed == null) {
+                    return;
+                }
+                through = Math.min(through, confirmed);
+            }
+            if (subscribed && through >= 0 && through != Long.MAX_VALUE) {
+                long already = log.bounds(ring).trimmedThrough();
+                if (through > already) {
+                    log.trim(ring, through);
+                }
+            }
+        }
+
+        private synchronized void widen() {
+            if (closed) {
+                return;
+            }
+            if (serving.containsAll(meta.captureTables(chain))) {
+                long now = System.nanoTime();
+                if (now < nextTrim) {
+                    return;
+                }
+                nextTrim = now + java.time.Duration.ofSeconds(1).toNanos();
+                Collection<ConsumerOffset> consumers = meta.consumerOffsets(chain);
+                Map<String, Map<String, Long>> confirmations = new LinkedHashMap<>();
+                for (ConsumerOffset consumer : consumers) {
+                    confirmations.put(consumer.pipelineId(), meta.ringDoneThrough(chain, consumer.pipelineId()));
+                }
+                for (String table : serving) {
+                    trim(table, SrsRingbuffer.ringName(chain, table), consumers, confirmations);
+                }
+                return;
+            }
+            try {
+                if (subscription != null) {
+                    subscription.close();
+                }
+                open();
+            } catch (RuntimeException | Error failure) {
+                health.fail(failure);
+                throw failure;
+            }
+        }
+
+        private synchronized void release() {
+            if (references.decrementAndGet() != 0 || closed) {
+                return;
+            }
+            closed = true;
+            sharedTails.remove(chain, this);
+            if (subscription != null) {
+                subscription.close();
+            }
+        }
+    }
+
+    /** Only source nodes registered on this physical chain can provide its earlier native notes. */
+    private SharedNotes sharedNotes(CaptureRunSpec spec, String chain) {
+        LinkedHashSet<PipelineNode> earlier = new LinkedHashSet<>();
+        if (spec.config().node() != null) {
+            earlier.add(spec.config().node());
+        }
+        for (ConsumerOffset consumer : meta.consumerOffsets(chain)) {
+            if (consumer.progressKind() == ConsumerProgressKind.DIRECT_SOURCE) {
+                continue;
+            }
+            SrsConsumerId.sourceOf(consumer.pipelineId()).ifPresent(source -> earlier.add(new PipelineNode(
+                    SrsConsumerId.pipelineOf(consumer.pipelineId()), source)));
+        }
+        return new SharedNotes(chain, List.copyOf(earlier));
     }
 
     /**
@@ -386,6 +628,21 @@ public final class CaptureRunUnit {
         List<String> tables = spec.config().streams();
         if (plan.sharedRing()) {
             String cid = chainId.value();
+            SrsLogStore durable = durableLog();
+            if (durable != null) {
+                SharedTail shared = sharedTails.compute(cid, (key, running) -> {
+                    if (running != null && !running.closed) {
+                        running.references.incrementAndGet();
+                        running.widen();
+                        return running;
+                    }
+                    return new SharedTail(spec, cid, epoch, ownSeam, health, durable);
+                });
+                return Optional.of(() -> shared.release());
+            }
+            if (!spec.consumerId().equals(spec.pipelineId()) || spec.captureFence() != null) {
+                throw new TapstateException(CaptureError.SRS_NOT_RECOVERABLE, Map.of("chain", cid), null);
+            }
             // The cursors alone, not the whole record: this is read on every run of changes, and the
             // record also carries a schema history that grows per DDL and is never read here.
             Supplier<Collection<ConsumerOffset>> consumers = () -> meta.consumerOffsets(cid);
@@ -411,26 +668,51 @@ public final class CaptureRunUnit {
                 LongConsumer trim = cuttable ? seq -> log.trim(ringName, seq) : seq -> { };
                 routes.put(table, new CdcPhase.TableRoute(chain, consumers, trim));
             }
-            CaptureStart minerStart = tailStart(meta, cid, spec.pipelineId(), ownSeam, CaptureStart.present());
+            CaptureStart minerStart = tailStart(meta, cid, spec.consumerId(), ownSeam, CaptureStart.present());
             refuseAnInstantThisBufferWillNeverReach(spec.startFrom(), minerStart, spec.retention());
             return Optional.of(CdcPhase.run(port, spec.config(), minerStart, routes, health));
         }
         if (plan.directTail()) {
-            // srs.enabled:false: the tail streams straight to the consumer with no shared ring. The ring
-            // is the whole of what the flag decides -- the chain is open and its record is kept either
-            // way -- so this tail begins where that record says, exactly as a buffered one does. Taking
-            // the present here instead is a silent loss: the tail comes up healthy and every change
-            // between where it had reached and now is gone.
+            // Direct capture has no shared replay log. It resumes from this channel's safely processed
+            // source checkpoint; an unconfirmed downstream effect must be re-read from the source.
             String directChain = chainId.value();
             Supplier<Collection<ConsumerOffset>> directConsumers = () -> meta.consumerOffsets(directChain);
             AtomicLong forwarded = new AtomicLong();
             AtomicReference<ChainPosition> directLastWritten = new AtomicReference<>();
+            CaptureStart start = tailStart(meta, directChain, spec.consumerId(), ownSeam,
+                    sourceStart(spec.startFrom()));
+            String anchor = start instanceof CaptureStart.Resume resume ? resume.position().token() : null;
+            meta.beginDirectCapture(directChain, spec.consumerId(), epoch, anchor);
+            Map<String, Long> targets = new LinkedHashMap<>();
             return Optional.of(port.cdc(
-                    spec.config(), tailStart(
-                            meta, directChain, spec.pipelineId(), ownSeam, sourceStart(spec.startFrom())),
-                    health.recording((events, position) -> forwardDirect(
-                            events, position, directChain, epoch, forwarded,
-                            directConsumers, directLastWritten, passthrough))));
+                    spec.config(), start, health.recording(new CaptureStartedListener() {
+                        @Override
+                        public void onStart(SourcePosition position) {
+                            meta.beginDirectCapture(directChain, spec.consumerId(), epoch, position.token());
+                        }
+
+                        @Override
+                        public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                            if (spec.consumerId().equals(spec.pipelineId())) {
+                                forwardDirect(events, position, directChain, epoch, forwarded,
+                                        directConsumers, directLastWritten, passthrough);
+                                return;
+                            }
+                            List<Envelope> ordered = new ArrayList<>(events.size());
+                            for (int i = 0; i < events.size(); i++) {
+                                long sequence = forwarded.getAndIncrement();
+                                Envelope event = events.get(i);
+                                targets.put(event.src(), sequence);
+                                ordered.add(event.withPosition(new ChainPosition(new SourceOrder(epoch, sequence),
+                                        i == events.size() - 1 ? position.map(SourcePosition::token).orElse(null) : null)));
+                            }
+                            long boundary = forwarded.getAndIncrement();
+                            position.ifPresent(token -> meta.recordDirectBatch(directChain, spec.consumerId(),
+                                    new ChainPosition(new SourceOrder(epoch, boundary), token.token()),
+                                    Map.copyOf(targets)));
+                            ordered.forEach(passthrough);
+                        }
+                    })));
         }
         return Optional.empty();
     }
@@ -651,7 +933,10 @@ public final class CaptureRunUnit {
     private void markWhereThisPipelineArrives(String chainId, String pipelineId, List<String> tables) {
         for (String table : tables) {
             SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer(SrsRingbuffer.ringName(chainId, table)));
-            meta.startRingAfter(chainId, pipelineId, table, ring.tailSequence());
+            SrsLogStore log = durableLog();
+            long arrived = log == null ? ring.tailSequence()
+                    : log.bounds(SrsRingbuffer.ringName(chainId, table)).largestSequence();
+            meta.startRingAfter(chainId, pipelineId, table, arrived);
         }
     }
 
@@ -664,12 +949,39 @@ public final class CaptureRunUnit {
      */
     public static SrsReadCursorPublisherFactory readCursorPublisher(
             String miningChainId, String pipelineId, String table) {
-        return member -> {
-            Object bound = member.getUserContext().get(SRS_META_USER_CONTEXT_KEY);
-            if (!(bound instanceof SrsMetaStore memberMeta)) {
-                return lastReadSeq -> { };
+        return new SrsReadCursorPublisherFactory() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            public LongConsumer resolve(HazelcastInstance member) {
+                Object bound = member.getUserContext().get(SRS_META_USER_CONTEXT_KEY);
+                if (!(bound instanceof SrsMetaStore memberMeta)) {
+                    return lastReadSeq -> { };
+                }
+                return lastReadSeq -> memberMeta.advanceConsumerReadSeq(
+                        miningChainId, pipelineId, table, lastReadSeq);
             }
-            return lastReadSeq -> memberMeta.advanceConsumerReadSeq(miningChainId, pipelineId, table, lastReadSeq);
+
+            @Override
+            public Optional<ChainPosition> confirmedPosition(HazelcastInstance member) {
+                Object bound = member.getUserContext().get(SRS_META_USER_CONTEXT_KEY);
+                return bound instanceof SrsMetaStore memberMeta
+                        ? memberMeta.read(miningChainId).flatMap(record -> record.consumerOffset(pipelineId))
+                                .map(offset -> offset.sinkAckedByTable().get(table))
+                                .filter(position -> position.order().seq() >= 0)
+                        : Optional.empty();
+            }
+
+            @Override
+            public java.util.OptionalLong recoverySequence(HazelcastInstance member) {
+                Object bound = member.getUserContext().get(SRS_META_USER_CONTEXT_KEY);
+                if (!(bound instanceof SrsMetaStore memberMeta)) {
+                    return java.util.OptionalLong.empty();
+                }
+                Long confirmed = memberMeta.ringDoneThrough(miningChainId, pipelineId).get(table);
+                return confirmed == null ? java.util.OptionalLong.empty()
+                        : java.util.OptionalLong.of(confirmed);
+            }
         };
     }
 }

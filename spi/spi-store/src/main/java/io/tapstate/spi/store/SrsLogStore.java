@@ -1,6 +1,9 @@
 package io.tapstate.spi.store;
 
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 
 /**
@@ -40,6 +43,40 @@ public interface SrsLogStore {
      * naming the same change across a restart.
      */
     long largestSequence(String ring);
+
+    /**
+     * The durable highest-written and trimmed-through sequences. A store without retention metadata can
+     * report its existing highest sequence but cannot claim that any prefix was retired. A recovery read
+     * still has to prove every expected sequence rather than interpreting absence as permission to skip.
+     */
+    default SrsLogBounds bounds(String ring) {
+        return new SrsLogBounds(largestSequence(ring), -1L);
+    }
+
+    /**
+     * Reads at most {@code maxSize} consecutive sequence positions beginning at {@code firstSeq}, returning
+     * each record under its actual sequence key. Missing positions stay missing so a caller can diagnose a
+     * gap. The compatibility implementation uses exact reads; durable adapters can serve the same bounded
+     * range in one query.
+     */
+    default SrsLogBatch readBatch(String ring, long firstSeq, int maxSize) {
+        Objects.requireNonNull(ring, "ring");
+        if (firstSeq < 0 || maxSize < 1) {
+            throw new IllegalArgumentException("an SRS log read requires a non-negative sequence and positive size");
+        }
+        SrsLogBounds observed = bounds(ring);
+        Map<Long, SrsLogRecord> records = new LinkedHashMap<>();
+        long sequence = firstSeq;
+        for (int i = 0; i < maxSize && sequence <= observed.largestSequence(); i++) {
+            long at = sequence;
+            load(ring, at).ifPresent(record -> records.put(at, record));
+            if (sequence == Long.MAX_VALUE) {
+                break;
+            }
+            sequence++;
+        }
+        return new SrsLogBatch(observed, records);
+    }
 
     /**
      * Drops every change of {@code ring} at or below {@code throughSeq}. Without it the log grows without

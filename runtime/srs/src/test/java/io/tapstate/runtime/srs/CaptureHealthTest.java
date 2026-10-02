@@ -2,6 +2,8 @@ package io.tapstate.runtime.srs;
 
 import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.capture.CaptureListener;
+import io.tapstate.spi.capture.CaptureStartedListener;
+import io.tapstate.spi.capture.SourcePosition;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -42,6 +44,7 @@ class CaptureHealthTest {
         CaptureHealth health = new CaptureHealth();
         Envelope[] delivered = new Envelope[1];
         CaptureListener listener = health.recording((events, pos) -> delivered[0] = events.get(0));
+        assertThat(listener).isNotInstanceOf(CaptureStartedListener.class);
         Envelope event = Envelope.insert(1L, "orders", Map.of("id", 1), Map.of());
 
         listener.onBatch(List.of(event), Optional.empty());
@@ -51,5 +54,36 @@ class CaptureHealthTest {
         RuntimeException boom = new RuntimeException("stream boom");
         listener.onError(boom);
         assertThat(health.failure()).as("an error on the listener is recorded on the health").contains(boom);
+    }
+
+    @Test
+    void onlyAnOptedInDelegateReceivesItsStartingAnchorWithoutCountingItAsAChange() {
+        CaptureHealth health = new CaptureHealth();
+        SourcePosition[] observed = new SourcePosition[1];
+        Envelope[] delivered = new Envelope[1];
+        CaptureListener recorded = health.recording(new CaptureStartedListener() {
+            @Override
+            public void onStart(SourcePosition position) {
+                observed[0] = position;
+            }
+
+            @Override
+            public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                delivered[0] = events.get(0);
+            }
+        });
+        assertThat(recorded).isInstanceOf(CaptureStartedListener.class);
+        SourcePosition anchor = new SourcePosition("before-first-change");
+        ((CaptureStartedListener) recorded).onStart(anchor);
+
+        assertThat(observed[0]).isSameAs(anchor);
+        assertThat(health.receivedRows()).isEmpty();
+        Envelope change = Envelope.insert(1L, "orders", Map.of("id", 1), Map.of());
+        recorded.onBatch(List.of(change), Optional.empty());
+        assertThat(delivered[0]).isSameAs(change);
+        assertThat(health.receivedRows()).isEqualTo(Map.of("orders", Map.of("i", 1L)));
+        RuntimeException failure = new RuntimeException("capture failed");
+        recorded.onError(failure);
+        assertThat(health.failure()).contains(failure);
     }
 }

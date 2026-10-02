@@ -7,6 +7,7 @@ import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.SrsDurableFrontier;
+import io.tapstate.spi.store.ConsumerProgressKind;
 import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import java.util.ArrayList;
@@ -21,23 +22,27 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * The production sink-ack factory carried onto the DAG: it advances one consumer pipeline's durable
- * sink-acked source position as the sink confirms writes, so the source-read durable frontier has a real
- * input. It holds only serializable coordinates — a {@code table -> mining chain id} map for every source
- * the pipeline reads, the consumer pipeline id, and the stable writer plan compiled from the DAG — and
+ * The production sink-ack factory carried onto the DAG: it confirms each source node's own per-table
+ * recovery progress as the sink confirms writes. It holds only serializable coordinates — a table map
+ * naming the physical chain, source-scoped consumer and progress kind, plus the stable writer plan — and
  * resolves the durable store on the member that runs the sink, mirroring how the source's read-cursor
  * publisher binds its store member-side. An assembly-only store handle checks the complete writer plan
  * before the DAG can be submitted; it is transient, so the store itself never crosses the wire.
  *
  * <p>The sink knows a chain only by the {@code src} stream name its events carry — a table at L1 — so this
  * maps that stream to the mining chain that keys its durable record and advances that writer's position.
- * The store exposes the minimum over every writer expected on the stream as the pipeline position, so a
+ * The store exposes the minimum over every writer expected on the stream as that table's position, so a
  * fast target cannot move a replacement run past changes another target has not written. A member with no
  * store bound resolves to a no-op ack, so a sink still runs before the assembly layer makes the member
  * SRS-capable. A stream the map does not carry is a builder-side wiring defect (the sink saw a chain the
  * pipeline never sourced) and crashes bare.
  *
- * <p>A snapshot row is ordered but carries no token, and what is persisted for it is the pipeline's cdc
+ * <p>Shared SRS consumption never advances the physical source checkpoint here. Capture owns that
+ * checkpoint after a recoverable log batch has landed; consumer ACKs own which table records may be
+ * replayed or retired. A direct channel has one forwarding order across its tables and can carry its
+ * confirmed source position back from here without borrowing another channel's progress.
+ *
+ * <p>A snapshot row is ordered but carries no token, and what is persisted for it is the source node's cdc
  * start position: the read has confirmed rows of a snapshot but no change at all, so a resume belongs
  * where changes begin. Resolving it here rather than at the sink is what keeps the durable store out of
  * the engine — the sink says which position it reached, this says what that spells on disk.
@@ -55,8 +60,7 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
 
     private static final long serialVersionUID = 1L;
 
-    private final Map<String, String> chainIdByTable;
-    private final String pipelineId;
+    private final Map<String, SourceProgress> progressByTable;
     private final String writerId;
     private final Set<String> writerStreams;
     private final Map<String, List<String>> writerIdsByStream;
@@ -70,21 +74,23 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
 
     StoreBackedSinkAckFactory(
             Map<String, String> chainIdByTable, String pipelineId, SrsMetaStore assemblyStore) {
-        this(chainIdByTable, pipelineId, null, Set.of(), Map.of(),
+        this(legacyProgress(chainIdByTable, pipelineId), assemblyStore);
+    }
+
+    StoreBackedSinkAckFactory(Map<String, SourceProgress> progressByTable, SrsMetaStore assemblyStore) {
+        this(progressByTable, null, Set.of(), Map.of(),
                 new AtomicInteger(), new ConcurrentHashMap<>(), assemblyStore);
     }
 
     private StoreBackedSinkAckFactory(
-            Map<String, String> chainIdByTable,
-            String pipelineId,
+            Map<String, SourceProgress> progressByTable,
             String writerId,
             Set<String> writerStreams,
             Map<String, List<String>> writerIdsByStream,
             AtomicInteger resolvedWriterSequence,
             Map<String, List<String>> resolvedWriterIdsByStream,
             SrsMetaStore assemblyStore) {
-        this.chainIdByTable = Map.copyOf(chainIdByTable);
-        this.pipelineId = pipelineId;
+        this.progressByTable = Map.copyOf(progressByTable);
         this.writerId = writerId;
         this.writerStreams = Set.copyOf(writerStreams);
         this.writerIdsByStream = copyPlan(writerIdsByStream);
@@ -102,18 +108,18 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
         if (assemblyStore == null) {
             return;
         }
-        LinkedHashSet<String> miningChainIds = new LinkedHashSet<>();
+        LinkedHashSet<SourceProgress> sourceProgresses = new LinkedHashSet<>();
         for (String stream : writerIdsByStream.keySet()) {
-            String miningChainId = chainIdByTable.get(stream);
-            if (miningChainId == null) {
+            SourceProgress progress = progressByTable.get(stream);
+            if (progress == null) {
                 throw new IllegalStateException(
                         "sink writer plan names a chain the pipeline never sourced: '" + stream + "'");
             }
-            miningChainIds.add(miningChainId);
+            sourceProgresses.add(progress);
         }
-        for (String miningChainId : miningChainIds) {
-            if (assemblyStore.read(miningChainId).isPresent()) {
-                configure(assemblyStore, miningChainId, writerIdsByStream);
+        for (SourceProgress progress : sourceProgresses) {
+            if (assemblyStore.read(progress.miningChainId()).isPresent()) {
+                configure(assemblyStore, progress, writerIdsByStream);
             }
         }
     }
@@ -125,8 +131,7 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
             throw new IllegalArgumentException("sink writer id must be non-blank");
         }
         return new StoreBackedSinkAckFactory(
-                chainIdByTable,
-                pipelineId,
+                progressByTable,
                 writerId,
                 new LinkedHashSet<>(streams),
                 writerIdsByStream,
@@ -144,8 +149,8 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
         WriterBinding writer = writerId == null
                 ? bindResolvedWriter()
                 : new WriterBinding(writerId, writerStreams, writerIdsByStream);
-        ConcurrentMap<String, Optional<WorkloadClaimFence>> configuredMiningChains = new ConcurrentHashMap<>();
-        Map<String, ChainPosition> recorded = new ConcurrentHashMap<>();
+        ConcurrentMap<SourceProgress, Optional<WorkloadClaimFence>> configuredMiningChains = new ConcurrentHashMap<>();
+        Map<SourceProgress, ChainPosition> recorded = new ConcurrentHashMap<>();
         return new SinkAck() {
             @Override
             public void advance(String chain, ChainPosition position) {
@@ -163,13 +168,13 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
     private void acknowledge(
             SrsMetaStore meta,
             WriterBinding writer,
-            ConcurrentMap<String, Optional<WorkloadClaimFence>> configuredMiningChains,
-            Map<String, ChainPosition> recorded,
+            ConcurrentMap<SourceProgress, Optional<WorkloadClaimFence>> configuredMiningChains,
+            Map<SourceProgress, ChainPosition> recorded,
             String chain,
             ChainPosition position,
             WorkloadClaimFence fence) {
-        String miningChainId = chainIdByTable.get(chain);
-        if (miningChainId == null) {
+        SourceProgress progress = progressByTable.get(chain);
+        if (progress == null) {
             throw new IllegalStateException(
                     "sink acked a chain the pipeline never sourced: '" + chain + "'");
         }
@@ -177,18 +182,22 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
             throw new IllegalStateException("sink writer '" + writer.id()
                     + "' acked a chain it does not receive: '" + chain + "'");
         }
-        ensureConfigured(meta, writer, miningChainId, configuredMiningChains, fence);
+        ensureConfigured(meta, writer, progress, configuredMiningChains, fence);
         String token = position.token() != null ? position.token()
-                : isSnapshotOf(position) ? cdcStart(meta, miningChainId, pipelineId) : null;
+                : isSnapshotOf(position) ? cdcStart(meta, progress.miningChainId(), progress.consumerId()) : null;
         ChainPosition acked = new ChainPosition(position.order(), token);
         if (isSnapshotOf(position)) {
-            advanceWriterAck(meta, miningChainId, writer.id(), chain, acked, fence);
-            markWriterSnapshotComplete(meta, miningChainId, writer.id(), chain, fence);
+            advanceWriterAck(meta, progress, writer.id(), chain, acked, fence);
+            markWriterSnapshotComplete(meta, progress, writer.id(), chain, fence);
         } else {
             // A change is also recorded against its own table's ring, at the sequence it sat at there,
             // so a run replacing this one carries on from it instead of from the head of the ring.
-            advanceWriterAck(meta, miningChainId, writer.id(), chain, acked, fence);
-            recordHowFarTheSourceHasBeenRead(meta, miningChainId, acked, recorded);
+            advanceWriterAck(meta, progress, writer.id(), chain, acked, fence);
+            if (progress.kind() == ConsumerProgressKind.DIRECT_SOURCE
+                    || (progress.kind() == ConsumerProgressKind.LEGACY
+                            && progressByTable.values().stream().filter(progress::equals).count() == 1)) {
+                recordHowFarTheSourceHasBeenRead(meta, progress, acked, recorded);
+            }
         }
     }
 
@@ -200,14 +209,14 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
     private WriterBinding bindResolvedWriter() {
         synchronized (resolvedWriterIdsByStream) {
             String resolvedId = "resolved-" + resolvedWriterSequence.getAndIncrement();
-            for (String stream : chainIdByTable.keySet()) {
+            for (String stream : progressByTable.keySet()) {
                 resolvedWriterIdsByStream.compute(stream, (ignored, writers) -> {
                     List<String> next = new ArrayList<>(writers == null ? List.of() : writers);
                     next.add(resolvedId);
                     return List.copyOf(next);
                 });
             }
-            return new WriterBinding(resolvedId, chainIdByTable.keySet(), null);
+            return new WriterBinding(resolvedId, progressByTable.keySet(), null);
         }
     }
 
@@ -215,11 +224,11 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
     private void ensureConfigured(
             SrsMetaStore meta,
             WriterBinding writer,
-            String miningChainId,
-            ConcurrentMap<String, Optional<WorkloadClaimFence>> configuredMiningChains,
+            SourceProgress progress,
+            ConcurrentMap<SourceProgress, Optional<WorkloadClaimFence>> configuredMiningChains,
             WorkloadClaimFence fence) {
         Optional<WorkloadClaimFence> expected = Optional.ofNullable(fence);
-        configuredMiningChains.compute(miningChainId, (ignored, configured) -> {
+        configuredMiningChains.compute(progress, (ignored, configured) -> {
             if (expected.equals(configured)) {
                 return configured;
             }
@@ -229,68 +238,69 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                     plan = copyPlan(resolvedWriterIdsByStream);
                 }
             }
-            configure(meta, miningChainId, plan, fence);
+            configure(meta, progress, plan, fence);
             return expected;
         });
     }
 
-    /** Registers the complete table-to-writer plan for {@code miningChainId} without touching another. */
+    /** Registers only the tables belonging to this source node, even when another shares its capture. */
     private void configure(
-            SrsMetaStore meta, String miningChainId, Map<String, List<String>> plan) {
-        configure(meta, miningChainId, plan, null);
+            SrsMetaStore meta, SourceProgress progress, Map<String, List<String>> plan) {
+        configure(meta, progress, plan, null);
     }
 
     private void configure(
             SrsMetaStore meta,
-            String miningChainId,
+            SourceProgress progress,
             Map<String, List<String>> plan,
             WorkloadClaimFence fence) {
         Map<String, List<String>> writersByTable = new LinkedHashMap<>();
         for (Map.Entry<String, List<String>> entry : plan.entrySet()) {
-            String entryMiningChainId = chainIdByTable.get(entry.getKey());
-            if (entryMiningChainId == null) {
+            SourceProgress entryProgress = progressByTable.get(entry.getKey());
+            if (entryProgress == null) {
                 throw new IllegalStateException(
                         "sink writer plan names a chain the pipeline never sourced: '" + entry.getKey() + "'");
             }
-            if (entryMiningChainId.equals(miningChainId)) {
+            if (entryProgress.equals(progress)) {
                 writersByTable.put(entry.getKey(), entry.getValue());
             }
         }
         if (writersByTable.isEmpty()) {
             throw new IllegalStateException(
-                    "sink writer plan names no stream on mining chain '" + miningChainId + "'");
+                    "sink writer plan names no stream for source consumer '" + progress.consumerId() + "'");
         }
         if (fence == null) {
-            meta.configureSinkWriters(miningChainId, pipelineId, writersByTable);
+            meta.configureSinkWriters(progress.miningChainId(), progress.consumerId(), writersByTable, progress.kind());
         } else {
-            meta.configureSinkWriters(miningChainId, pipelineId, writersByTable, fence);
+            meta.configureSinkWriters(
+                    progress.miningChainId(), progress.consumerId(), writersByTable, progress.kind(), fence);
         }
     }
 
     private void advanceWriterAck(
             SrsMetaStore meta,
-            String miningChainId,
+            SourceProgress progress,
             String writerId,
             String table,
             ChainPosition acked,
             WorkloadClaimFence fence) {
         if (fence == null) {
-            meta.advanceSinkWriterAcked(miningChainId, pipelineId, writerId, table, acked);
+            meta.advanceSinkWriterAcked(progress.miningChainId(), progress.consumerId(), writerId, table, acked);
         } else {
-            meta.advanceSinkWriterAcked(miningChainId, pipelineId, writerId, table, acked, fence);
+            meta.advanceSinkWriterAcked(progress.miningChainId(), progress.consumerId(), writerId, table, acked, fence);
         }
     }
 
     private void markWriterSnapshotComplete(
             SrsMetaStore meta,
-            String miningChainId,
+            SourceProgress progress,
             String writerId,
             String table,
             WorkloadClaimFence fence) {
         if (fence == null) {
-            meta.markSinkWriterSnapshotComplete(miningChainId, pipelineId, writerId, table);
+            meta.markSinkWriterSnapshotComplete(progress.miningChainId(), progress.consumerId(), writerId, table);
         } else {
-            meta.markSinkWriterSnapshotComplete(miningChainId, pipelineId, writerId, table, fence);
+            meta.markSinkWriterSnapshotComplete(progress.miningChainId(), progress.consumerId(), writerId, table, fence);
         }
     }
 
@@ -298,6 +308,22 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
         Map<String, List<String>> copy = new LinkedHashMap<>();
         plan.forEach((stream, writers) -> copy.put(stream, List.copyOf(writers)));
         return Map.copyOf(copy);
+    }
+
+    static Map<String, SourceProgress> legacyProgress(Map<String, String> chainIdByTable, String pipelineId) {
+        Map<String, SourceProgress> progress = new LinkedHashMap<>();
+        chainIdByTable.forEach((table, chainId) ->
+                progress.put(table, new SourceProgress(chainId, pipelineId, ConsumerProgressKind.LEGACY)));
+        return Map.copyOf(progress);
+    }
+
+    record SourceProgress(String miningChainId, String consumerId, ConsumerProgressKind kind)
+            implements java.io.Serializable {
+        SourceProgress {
+            java.util.Objects.requireNonNull(miningChainId, "miningChainId");
+            java.util.Objects.requireNonNull(consumerId, "consumerId");
+            java.util.Objects.requireNonNull(kind, "kind");
+        }
     }
 
     private record WriterBinding(String id, Set<String> streams, Map<String, List<String>> plan) {
@@ -309,7 +335,8 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
 
     /**
      * Works out again, now that this acknowledgement has landed, how far the chain may say its source has
-     * been read.
+     * been read. Only isolated direct channels and proven single-table legacy callers use this path;
+     * shared SRS capture checkpoints are advanced by recoverable log writes instead.
      *
      * <p>That value is the lowest of what the source read and what every consumer has durably landed, and
      * it used to be resolved only while a run of changes was being forwarded — against the acknowledgements
@@ -340,13 +367,13 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
      */
     private static void recordHowFarTheSourceHasBeenRead(
             SrsMetaStore meta,
-            String miningChainId,
+            SourceProgress progress,
             ChainPosition acked,
-            Map<String, ChainPosition> recorded) {
-        SrsDurableFrontier.safeAdvance(acked, meta.consumerOffsets(miningChainId)).ifPresent(safe -> {
-            if (!safe.equals(recorded.get(miningChainId))) {
-                meta.advanceSourceReadOffset(miningChainId, safe);
-                recorded.put(miningChainId, safe);
+            Map<SourceProgress, ChainPosition> recorded) {
+        SrsDurableFrontier.safeAdvance(acked, meta.consumerOffsets(progress.miningChainId())).ifPresent(safe -> {
+            if (!safe.equals(recorded.get(progress))) {
+                meta.advanceSourceReadOffset(progress.miningChainId(), safe);
+                recorded.put(progress, safe);
             }
         });
     }

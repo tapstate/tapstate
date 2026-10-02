@@ -25,6 +25,55 @@ import java.util.Optional;
  */
 public interface SrsMetaStore {
 
+    /** Records a requested table union for one physical capture without broadening any consumer. */
+    default void requestCaptureTables(String miningChainId, List<String> tables) {
+    }
+
+    /** The physical capture's durable requested table set, independent of source-node consumption. */
+    default List<String> captureTables(String miningChainId) {
+        return List.of();
+    }
+
+    /** Tables actually served by the current physical capture, not merely requested by a consumer. */
+    default List<String> captureServingTables(String miningChainId) {
+        return List.of();
+    }
+
+    /** Publishes a same-generation subscription only when it covers every current request. */
+    default boolean publishCaptureTables(String miningChainId, long epoch, List<String> tables) {
+        return true;
+    }
+
+    /**
+     * Checkpoints the physical capture after every change in its source batch was written to recoverable
+     * SRS. Consumer confirmations are independent; they never certify this source-database position.
+     */
+    default void advanceCaptureCheckpoint(String miningChainId, ChainPosition position) {
+        throw new UnsupportedOperationException("a durable capture checkpoint requires its served table selection");
+    }
+
+    /**
+     * Checkpoints only while this callback's immutable served selection covers every requested table.
+     * An older narrow callback cannot certify a position after a wider subscription is published.
+     * Backends must make the selection check atomic with the checkpoint write.
+     */
+    default void advanceCaptureCheckpoint(
+            String miningChainId, ChainPosition position, List<String> servedTables) {
+        throw new UnsupportedOperationException("durable capture checkpoints are not implemented by this store");
+    }
+
+    /** Starts one isolated direct stream without carrying pending batches into a new source generation. */
+    default void beginDirectCapture(String miningChainId, String consumerId, long epoch, String anchor) {
+    }
+
+    /**
+     * Records the source-stream batch boundary and the last event each selected table must confirm.
+     * Orders here belong to one direct channel; quiet tables with no event do not pin its checkpoint.
+     */
+    default void recordDirectBatch(String miningChainId, String consumerId, ChainPosition position,
+            Map<String, Long> targets) {
+    }
+
     /** Returns the meta record for a mining chain, or empty if the chain has not been seeded. */
     Optional<SrsMeta> read(String miningChainId);
 
@@ -179,6 +228,18 @@ public interface SrsMetaStore {
      */
     default void configureSinkWriters(
             String miningChainId, String pipelineId, Map<String, List<String>> writerIdsByTable) {
+    }
+
+    /** Installs the writer plan and its source node's recovery coordinate system together. */
+    default void configureSinkWriters(String miningChainId, String consumerId,
+            Map<String, List<String>> writerIdsByTable, ConsumerProgressKind kind) {
+        configureSinkWriters(miningChainId, consumerId, writerIdsByTable);
+    }
+
+    /** The same plan and coordinate-system write under the source node's current execution fence. */
+    default void configureSinkWriters(String miningChainId, String consumerId,
+            Map<String, List<String>> writerIdsByTable, ConsumerProgressKind kind, WorkloadClaimFence fence) {
+        configureSinkWriters(miningChainId, consumerId, writerIdsByTable, fence);
     }
 
     /**
