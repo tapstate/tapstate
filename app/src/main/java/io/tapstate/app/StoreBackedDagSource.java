@@ -301,12 +301,7 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     /** Builds the official topology with finite sources and run-scoped, no-external-write sinks. */
-    DAG previewDag(PipelineResource pipeline, Map<String, List<Envelope>> rowsBySourceKey,
-            String materializerMap, DagTraceBinding trace) {
-        return previewDag(pipeline, rowsBySourceKey, materializerMap, trace, null);
-    }
-
-    DAG previewDag(PipelineResource pipeline, Map<String, List<Envelope>> rowsBySourceKey,
+    DAG previewDag(PipelineResource pipeline, String sampleMap,
             String materializerMap, DagTraceBinding trace, String previewExecutionId) {
         Map<String, SourceVertex> vertices = sourceVertices(pipeline);
         Map<String, String> sourceKeyByTable = sourceKeyByTable(vertices);
@@ -320,8 +315,7 @@ final class StoreBackedDagSource implements DagSource {
         Map<String, List<String>> viewKeys = viewOutput ? outputKeys : Map.of();
         Map<String, List<String>> sinkKeys = outputKeys;
         DagBindings bindings = new DagBindings(
-                key -> FiniteEnvelopeSourceProcessor.metaSupplier(
-                        key, rowsBySourceKey.getOrDefault(key, List.of())),
+                key -> FiniteEnvelopeSourceProcessor.metaSupplier(key, sampleMap, key),
                 step -> transformBinding(step, inlineStepsById(pipeline), vertices,
                         sourceKeyByTable, sourceKeysById, stepIds, previewExecutionId),
                 element -> new PreviewMaterializerSinkWriterFactory(

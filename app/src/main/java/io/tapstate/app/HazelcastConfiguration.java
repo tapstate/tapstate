@@ -18,6 +18,7 @@ import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.runtime.engine.EnvelopeSerializer;
+import io.tapstate.runtime.engine.FiniteEnvelopeSourceProcessor;
 import io.tapstate.runtime.engine.MemberOutOfMemory;
 import io.tapstate.runtime.engine.nest.DurableNestDeadLetter;
 import io.tapstate.runtime.engine.join.JoinMaps;
@@ -521,6 +522,9 @@ class HazelcastConfiguration {
         config.getSerializationConfig().addSerializerConfig(new SerializerConfig()
                 .setTypeClass(PreviewSampleCache.Entry.class)
                 .setImplementation(new PreviewSampleCache.EntrySerializer()));
+        config.getSerializationConfig().addSerializerConfig(new SerializerConfig()
+                .setTypeClass(FiniteEnvelopeSourceProcessor.Sample.class)
+                .setImplementation(new FiniteEnvelopeSourceProcessor.SampleSerializer()));
         RingbufferConfig rings = new RingbufferConfig("srs.*")
                 .setCapacity(SRS_RING_CAPACITY)
                 .setInMemoryFormat(InMemoryFormat.OBJECT)

@@ -22,6 +22,7 @@ import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.runtime.engine.DagTraceBinding;
+import io.tapstate.runtime.engine.FiniteEnvelopeSourceProcessor;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.probe.PipelinePreviewEvent;
 import io.tapstate.runtime.probe.PipelinePreviewProbe;
@@ -122,6 +123,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
         private final AtomicReference<Job> job = new AtomicReference<>();
         private final BoundedQueryCancellation queryCancellation = new BoundedQueryCancellation();
         private final String executionId;
+        private final String inputMapName;
         private final String resultMapName;
         private final String traceMapName;
         private final String leaseBase;
@@ -132,7 +134,8 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
 
         PreviewStream(PipelinePreviewRequest request) {
             this.request = request;
-            this.executionId = "preview_" + request.runId().replaceAll("[^A-Za-z0-9_-]", "_");
+            this.executionId = "preview_" + UUID.randomUUID();
+            this.inputMapName = "__preview.inputs." + executionId;
             this.resultMapName = "__preview.results." + executionId;
             this.traceMapName = "__preview.trace." + executionId;
             this.leaseBase = "pipeline:" + digest(request.principal() + "\n" + request.pipelineId());
@@ -237,6 +240,8 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                 sample = planner.load(request.principal(), request.pipelineId(), sampleId,
                         executionPipeline, dagSource, request.rootLimit(),
                         request.deadline(), queryCancellation);
+                stageSampleInputs(sample.rowsBySourceKey());
+                checkActive();
                 stateMaps = dagSource.previewStateMapNames(executionPipeline);
                 cacheHit = sample.cacheHit();
                 emit("sample.completed", Map.ofEntries(
@@ -259,7 +264,8 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                                 "preview.trace.input." + digest(nodeId + "\u0000" + alias),
                                 nodeId, alias, traceMapName));
                 DAG dag = dagSource.previewDag(
-                        executionPipeline, sample.rowsBySourceKey(), resultMapName, traceBinding, executionId);
+                        executionPipeline, inputMapName, resultMapName, traceBinding, executionId);
+                checkActive();
                 JobConfig config = new JobConfig()
                         .setName(executionId)
                         .setProcessingGuarantee(com.hazelcast.jet.config.ProcessingGuarantee.NONE)
@@ -280,6 +286,10 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
             } catch (Exception problem) {
                 if (!(problem instanceof InterruptedException) || !cancelled.get()) {
                     failure = problem;
+                    if (!(problem instanceof TapstateException)) {
+                        LOG.warn("Preview run {} failed unexpectedly (exception types: {})",
+                                request.runId(), exceptionTypes(problem));
+                    }
                 }
                 if (problem instanceof InterruptedException) {
                     Thread.currentThread().interrupt();
@@ -378,6 +388,16 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                     boundedSettings(pipeline.settings()), pipeline.experimental());
         }
 
+        private void stageSampleInputs(Map<String, List<Envelope>> rowsBySourceKey) {
+            if (rowsBySourceKey.isEmpty()) {
+                throw refused("the selected pipeline has no bounded source samples");
+            }
+            Map<String, FiniteEnvelopeSourceProcessor.Sample> batches = new LinkedHashMap<>();
+            rowsBySourceKey.forEach((sourceKey, rows) ->
+                    batches.put(sourceKey, new FiniteEnvelopeSourceProcessor.Sample(rows)));
+            member.<String, FiniteEnvelopeSourceProcessor.Sample>getMap(inputMapName).putAll(batches);
+        }
+
         private PipelineResource pruneToOutput(PipelineResource pipeline) {
             if (pipeline.transforms() == null || pipeline.transforms().isEmpty()) {
                 return pipeline;
@@ -451,8 +471,6 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                 if (cause instanceof TapstateException coded) {
                     throw coded;
                 }
-                LOG.warn("Preview job {} failed unexpectedly (exception types: {})",
-                        request.runId(), exceptionTypes(cause));
                 throw refused("the isolated preview pipeline failed during execution");
             }
         }
@@ -667,6 +685,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
 
         private boolean cleanupTemporaryState(Set<String> stateMaps) {
             List<String> cleanupTargets = new ArrayList<>();
+            cleanupTargets.add(inputMapName);
             cleanupTargets.add(resultMapName);
             cleanupTargets.add(traceMapName);
             cleanupTargets.addAll(stateMaps);

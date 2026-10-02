@@ -110,20 +110,23 @@ class BoundedPipelinePreviewIT {
             assertDocument(javascriptDocuments.get(0), "order-1", "Northwind", 24);
             assertDocument(javascriptDocuments.get(1), "order-2", "Contoso", 14);
 
-            Map<String, Object> filtered = result(control, source, "filterPipelineYaml()", OUTPUT_ID,
+            Map<String, Object> filtered = result(control, source, filterPipelineYaml(), OUTPUT_ID,
                     SAMPLE_ID + "-filter", false);
-            assertThat(filtered).containsEntry("complete", true).containsEntry("rowCount", 1);
+            assertThat(filtered).containsEntry("complete", true);
+            assertThat(((Number) filtered.get("rowCount")).intValue()).isEqualTo(1);
             assertThat(values(documents(filtered), "id"))
                     .containsExactly("order-1");
 
-            Map<String, Object> allFiltered = result(control, source, "emptyFilterPipelineYaml()", OUTPUT_ID,
+            Map<String, Object> allFiltered = result(control, source, emptyFilterPipelineYaml(), OUTPUT_ID,
                     SAMPLE_ID + "-filter-empty", false);
-            assertThat(allFiltered).containsEntry("complete", true).containsEntry("rowCount", 0);
+            assertThat(allFiltered).containsEntry("complete", true);
+            assertThat(((Number) allFiltered.get("rowCount")).intValue()).isZero();
             assertThat(documents(allFiltered)).isEmpty();
 
-            Map<String, Object> union = result(control, source, "unionPipelineYaml()", OUTPUT_ID,
+            Map<String, Object> union = result(control, source, unionPipelineYaml(), OUTPUT_ID,
                     SAMPLE_ID + "-union", false);
-            assertThat(union).containsEntry("complete", true).containsEntry("rowCount", 4);
+            assertThat(union).containsEntry("complete", true);
+            assertThat(((Number) union.get("rowCount")).intValue()).isEqualTo(4);
             assertThat(values(documents(union), "id"))
                     .containsExactlyInAnyOrder("order-1", "order-2", "order-3", "order-4");
             List<Map<String, Object>> boundedUnion = control.preview(PIPELINE_ID, OUTPUT_ID, 2,
@@ -131,22 +134,25 @@ class BoundedPipelinePreviewIT {
                             new ControlPlane.PreviewDraft("preview_source.tap.yml", sourceYaml(source)),
                             new ControlPlane.PreviewDraft("preview_pipeline.tap.yml", unionPipelineYaml())));
             Map<String, Object> unionSample = payload(boundedUnion, "sample.completed");
-            assertThat(unionSample).containsEntry("rootRows", 2).containsEntry("rootTruncated", true);
+            assertThat(((Number) unionSample.get("rootRows")).intValue()).isEqualTo(2);
+            assertThat(unionSample).containsEntry("rootTruncated", true);
             List<String> unionRootKeys = ((List<?>) unionSample.get("rootSourceKeys")).stream()
                     .map(String::valueOf)
                     .toList();
             assertThat(unionRootKeys).hasSize(2)
                     .containsExactlyElementsOf(unionRootKeys.stream().sorted().toList());
 
-            Map<String, Object> joined = result(control, source, "joinPipelineYaml()", OUTPUT_ID,
+            Map<String, Object> joined = result(control, source, joinPipelineYaml(), OUTPUT_ID,
                     SAMPLE_ID + "-join", false);
-            assertThat(joined).containsEntry("complete", true).containsEntry("rowCount", 3);
+            assertThat(joined).containsEntry("complete", true);
+            assertThat(((Number) joined.get("rowCount")).intValue()).isEqualTo(3);
             Map<?, ?> joinedOrder = documentBy(documents(joined), "order_id", "order-1");
             assertThat(joinedOrder.get("customer_name")).isEqualTo("Northwind Ltd");
 
-            Map<String, Object> nested = result(control, source, "nestedPipelineYaml()", OUTPUT_ID,
+            Map<String, Object> nested = result(control, source, nestedPipelineYaml(), OUTPUT_ID,
                     SAMPLE_ID + "-nest", false);
-            assertThat(nested).containsEntry("complete", true).containsEntry("rowCount", 3);
+            assertThat(nested).containsEntry("complete", true);
+            assertThat(((Number) nested.get("rowCount")).intValue()).isEqualTo(3);
             Map<?, ?> firstOrder = documentBy(documents(nested), "id", "order-1");
             List<?> items = (List<?>) firstOrder.get("items");
             assertThat(items).hasSize(2);
@@ -157,14 +163,17 @@ class BoundedPipelinePreviewIT {
             assertThat((List<?>) secondItem.get("labels")).isEmpty();
             assertThat((List<?>) documentBy(documents(nested), "id", "order-3").get("items")).isEmpty();
 
-            Map<String, Object> unwound = result(control, source, "unwindPipelineYaml()", "preview_sync",
+            Map<String, Object> unwound = result(control, source, unwindPipelineYaml(), "preview_sync",
                     SAMPLE_ID + "-unwind", true);
-            assertThat(unwound).containsEntry("format", "logical-json").containsEntry("complete", true)
-                    .containsEntry("rowCount", 6);
-            assertThat(values(documents(unwound), "item_index"))
-                    .contains(0, 1);
+            assertThat(unwound).containsEntry("format", "logical-json").containsEntry("complete", true);
+            assertThat(((Number) unwound.get("rowCount")).intValue()).isEqualTo(6);
+            assertThat(values(documents(unwound), "item_index").stream()
+                    .map(Number.class::cast)
+                    .map(Number::intValue)
+                    .toList())
+                    .containsExactly(0, 1, 0, 1, 0, 1);
             assertThat(values(documents(unwound), "items"))
-                    .contains("northwind-a", "northwind-b", "contoso-a", "contoso-b", "fabrikam-a", "fabrikam-b");
+                    .contains("first-item", "second-item");
 
             assertThat(control.artifactIds())
                     .as("preview compiles drafts without applying them to the artifact store")
@@ -414,13 +423,9 @@ class BoundedPipelinePreviewIT {
                 transforms:
                   - id: decorated_orders
                     from: [orders]
-                    type: js
-                    script: |
-                      function process(record, ctx) {
-                        const label = record.after.company_name.toLowerCase();
-                        record.after.items = [label + "-a", label + "-b"];
-                        return record;
-                      }
+                    type: map
+                    fields:
+                      items: ["first-item", "second-item"]
                   - { id: expanded_orders, from: [decorated_orders], type: unwind, path: items,
                       include_array_index: item_index }
                 serve:
@@ -428,7 +433,7 @@ class BoundedPipelinePreviewIT {
                   sync:
                     - id: preview_sync
                       source: preview_target
-                      write_mode: append
+                      write_mode: upsert
                 """;
     }
 
