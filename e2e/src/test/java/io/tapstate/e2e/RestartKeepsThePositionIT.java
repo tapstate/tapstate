@@ -161,9 +161,11 @@ class RestartKeepsThePositionIT {
                     "the change the first run captured");
 
             // The pair the terminal composes for the rerun: the stop clears, so there is nothing left
-            // to carry on from.
+            // to carry on from. Its new full load goes into a target holding the first run's documents,
+            // so the start asks first; keeping them is the answer, because what this case reads is how
+            // much the rerun read, not what the target holds afterwards.
             control.stop(fixture.pipelineId(), true);
-            control.lifecycle(fixture.pipelineId(), LifecycleVerb.START);
+            control.startAnswering(fixture.pipelineId(), "target-not-empty", "keep");
 
             // The count is its own liveness here: nought would mean the run never started, and every
             // seeded document is the only reading that says it really read the collection again.

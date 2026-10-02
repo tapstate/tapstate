@@ -1120,6 +1120,89 @@ final class ControlPlane {
                 200, LifecycleVerb.STOP.id() + " " + pipelineId);
     }
 
+    /** What a start of the pipeline would be asked, read without starting it: its start checks report. */
+    Map<String, Object> startChecks(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/start-checks"));
+        expect(response, 200, "read the start checks of " + pipelineId);
+        return asObject((Map<?, ?>) JsonReader.parse(response.body()));
+    }
+
+    /**
+     * Starts the pipeline the way a person who was asked does: reads what its start checks ask, and answers
+     * every question {@code check} asks with {@code action}, against the definition the checks read. With
+     * nothing asked it is the plain start.
+     *
+     * <p>A question from another check fails the call rather than being answered: a case answers what it
+     * expects to be asked, and a question it did not expect is a finding of its own.
+     */
+    void startAnswering(String pipelineId, String check, String action) {
+        Map<String, Object> report = startChecks(pipelineId);
+        List<Map<String, Object>> decisions = new ArrayList<>();
+        for (Object item : (List<?>) report.get("findings")) {
+            Map<?, ?> finding = (Map<?, ?>) item;
+            if (!"CONFIRM".equals(finding.get("behavior"))) {
+                continue;
+            }
+            if (!check.equals(finding.get("check"))) {
+                throw new AssertionError("starting " + pipelineId + " asks " + finding.get("key")
+                        + ", which this case does not answer: " + finding.get("message"));
+            }
+            decisions.add(Map.of("finding", finding.get("key"), "action", action));
+        }
+        StartAnswer answer = start(pipelineId, decisions,
+                decisions.isEmpty() ? null : (String) report.get("contentHash"));
+        if (answer.status() != 200) {
+            throw new AssertionError("could not start " + pipelineId + " answering " + check + "=" + action
+                    + ": expected HTTP 200, got " + answer.status() + " - " + answer.body());
+        }
+    }
+
+    /**
+     * How a start was answered, refused or not: the HTTP status and the decoded body.
+     *
+     * @param body the body as the product sent it; empty when it sent none
+     */
+    record StartAnswer(int status, Map<String, Object> body) {
+
+        /** The start checks report the answer carried, or an empty map when it carried none. */
+        Map<String, Object> startChecks() {
+            return body.get("startChecks") instanceof Map<?, ?> report ? asObject(report) : Map.of();
+        }
+
+        /** The findings of {@link #startChecks()}, in the order the product listed them. */
+        List<Map<String, Object>> findings() {
+            List<Map<String, Object>> findings = new ArrayList<>();
+            if (startChecks().get("findings") instanceof List<?> listed) {
+                listed.forEach(item -> findings.add(asObject((Map<?, ?>) item)));
+            }
+            return findings;
+        }
+    }
+
+    /**
+     * Sends a start carrying {@code decisions} under {@code contentHash}, and answers whatever the product
+     * said: for a case about a start that is refused, and about the answers that get one through. No answers
+     * is a bare start; a null hash sends no precondition.
+     */
+    StartAnswer start(String pipelineId, List<Map<String, Object>> decisions, String contentHash) {
+        HttpRequest.Builder request = HttpRequest.newBuilder(
+                        baseUrl.resolve("/api/pipelines/" + pipelineId + ":" + LifecycleVerb.START.id()))
+                .timeout(TIMEOUT)
+                .header("Authorization", "Bearer " + requireCredential());
+        if (decisions.isEmpty()) {
+            request.POST(HttpRequest.BodyPublishers.noBody());
+        } else {
+            request.header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers.ofString(
+                    JsonWriter.write(Map.of("decisions", decisions)), StandardCharsets.UTF_8));
+        }
+        if (contentHash != null) {
+            request.header("If-Match", "\"" + contentHash + "\"");
+        }
+        HttpResponse<String> response = send(request.build());
+        Object body = response.body() == null || response.body().isBlank() ? null : JsonReader.parse(response.body());
+        return new StartAnswer(response.statusCode(), body instanceof Map<?, ?> map ? asObject(map) : Map.of());
+    }
+
     /**
      * The published lifecycle state, or empty when the pipeline has published no observation yet.
      *
