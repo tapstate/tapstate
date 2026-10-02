@@ -17,7 +17,7 @@ class ResourceMetadataJsonContractTest {
         String encoded = JSON.writeValueAsString(new Metadata(Map.of("team", "data"), "Orders"));
 
         assertThat(encoded).isEqualTo(
-                "{\"labels\":{\"team\":\"data\"},\"description\":\"Orders\",\"empty\":false}");
+                "{\"labels\":{\"team\":\"data\"},\"description\":\"Orders\"}");
         assertThat(encoded).doesNotContain("cloud", "user_id", "userId");
     }
 
@@ -27,7 +27,7 @@ class ResourceMetadataJsonContractTest {
                 new Metadata(Map.of(), null, true, "cloud-user-7"));
 
         assertThat(encoded).isEqualTo(
-                "{\"labels\":{},\"cloud\":true,\"user_id\":\"cloud-user-7\",\"empty\":false}");
+                "{\"labels\":{},\"description\":null,\"cloud\":true,\"user_id\":\"cloud-user-7\"}");
         assertThat(encoded).doesNotContain("userId");
     }
 }
