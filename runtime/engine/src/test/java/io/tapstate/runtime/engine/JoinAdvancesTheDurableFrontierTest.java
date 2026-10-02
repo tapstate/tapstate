@@ -45,6 +45,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -150,14 +151,18 @@ class JoinAdvancesTheDurableFrontierTest {
             facts.add(new Row(row("o_id", id, "o_cust_id", 1L),
                     new SourceOrder(1, id)));
         }
+        Set<Object> factKeys = facts.stream().map(fact -> fact.fields().get("o_id"))
+                .collect(Collectors.toSet());
         SourceOrder changedAt = new SourceOrder(1, 10);
         run(facts, List.of(
                 new Row(row("c_id", 1L, "c_name", "Ada"), CUSTOMER_AT),
                 new Row(row("c_id", 1L, "c_name", "Grace"),
                         row("c_id", 1L, "c_name", "Ada"), changedAt, true)));
 
+        // Fact loading and initial dimension fan-out can both publish the same target key.
         await(() -> written().stream().filter(event -> event.after() != null
-                && "Ada".equals(event.after().get("customer_name"))).count() == facts.size());
+                && "Ada".equals(event.after().get("customer_name")))
+                .map(event -> event.after().get("order_id")).collect(Collectors.toSet()).equals(factKeys));
         UPDATE_RELEASED.set(true);
         await(() -> GRACE_WRITES.get() >= 2);
         assertThat(acked()).doesNotContain(ack(CUSTOMERS, changedAt));
