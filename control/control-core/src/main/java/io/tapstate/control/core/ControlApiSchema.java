@@ -211,7 +211,28 @@ public final class ControlApiSchema {
 
         Map<String, Object> pipelineId = object(List.of("id"), Map.of("id", id), false);
         pair(defs, "PipelineList", listRequest, opaque);
-        pair(defs, "PipelineStart", pipelineId, opaque);
+        // A start carries the answers to its start checks, and the definition they were given against.
+        // Neither is required, because a start with nothing to answer is a bare one; answers without the
+        // precondition are refused, because an answer belongs to the definition its report was evaluated on.
+        Map<String, Object> decision = object(
+                List.of("finding", "action"),
+                Map.of(
+                        "finding", string("The key of the finding answered, as the start checks report it"),
+                        "action", string("The id of the answer chosen, one that finding offers")),
+                false);
+        Map<String, Object> decisions = new LinkedHashMap<>(array(decision));
+        decisions.put("description", "Answers to the questions the start checks ask, each one chosen by the "
+                + "person starting the Pipeline");
+        Map<String, Object> startRequest = object(
+                List.of("id"),
+                Map.of(
+                        "id", id,
+                        "decisions", decisions,
+                        "expectedContentHash",
+                        string("The contentHash of the start check report the answers were given against; "
+                                + "required with decisions")),
+                false);
+        pair(defs, "PipelineStart", startRequest, opaque);
         Map<String, Object> intent = new LinkedHashMap<>(enumString("start", "rerun"));
         intent.put("description", "Which start to check: a plain start (the default), or a rerun from the "
                 + "beginning -- a stop that clears this pipeline's state followed by a start");

@@ -14,6 +14,8 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -652,6 +654,157 @@ class McpOperationExecutorTest {
             // Asserted non-empty first: "does not contain" is satisfied by a body that carries nothing
             // at all, which is the outcome this whole test exists to rule out.
             assertThat(result.body()).isNotEmpty().doesNotContainKey("removed");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    // ---- the start, through its start checks ---------------------------------------------------------
+
+    /** The versioned report every client reads, read where it lives. */
+    private static final Path CLIENT_FIXTURE = Path.of("..").toAbsolutePath().normalize()
+            .resolve("rest-api/src/test/resources/start-checks/client-fixture-v1.json");
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> answerableReport() throws IOException {
+        Map<String, Object> fixture = (Map<String, Object>) JsonReader.parse(Files.readString(CLIENT_FIXTURE));
+        assertThat(fixture.get("fixtureVersion")).as("the fixture version this face is written against")
+                .isEqualTo(1L);
+        return (Map<String, Object>) fixture.get("answerable");
+    }
+
+    /**
+     * A server with start checks, as far as a start goes: one carrying answers and their precondition goes
+     * ahead, one carrying answers without it is refused for the precondition, and one carrying no answers is
+     * stopped with the report. Every body and precondition it is sent is written down.
+     */
+    private static HttpServer startCheckingServer(
+            Map<String, Object> report, List<String> bodies, List<String> preconditions) throws IOException {
+        return server(exchange -> {
+            String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            String ifMatch = exchange.getRequestHeaders().getFirst("If-Match");
+            bodies.add(body);
+            preconditions.add(String.valueOf(ifMatch));
+            Object decisions = body.isBlank() ? null : ((Map<?, ?>) JsonReader.parse(body)).get("decisions");
+            if (decisions == null) {
+                Map<String, Object> refusal = new LinkedHashMap<>();
+                refusal.put("code", "lifecycle.start-needs-confirmation");
+                refusal.put("params", Map.of("pipeline", "lead_view", "questions", 2));
+                refusal.put("message", "lead_view needs 2 answers before it starts.");
+                refusal.put("startChecks", report);
+                answer(exchange, 409, JsonWriter.write(refusal));
+            } else if (ifMatch == null) {
+                answer(exchange, 428, "{\"code\":\"pipeline.precondition-required\",\"message\":\"none\"}");
+            } else {
+                answer(exchange, 200, "{\"pipelineId\":\"lead_view\",\"targetState\":\"RUNNING\"}");
+            }
+        });
+    }
+
+    @Test
+    void aStartItsChecksStopComesBackWithTheWholeReport() throws Exception {
+        Map<String, Object> report = answerableReport();
+        HttpServer server = startCheckingServer(report, new ArrayList<>(), new ArrayList<>());
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            McpOperationExecutor executor = new McpOperationExecutor(baseOf(server), "token", Map.of(), client);
+
+            McpResult result = executor.execute(ControlOperations.PIPELINE_START, Map.of("id", "lead_view"));
+
+            assertThat(result.error()).isTrue();
+            // the report as the server sent it, beside the four fields every refusal has: what the caller
+            // puts to a person, every question with the answers it offers
+            assertThat(result.body())
+                    .containsEntry("code", "lifecycle.start-needs-confirmation")
+                    .containsEntry("status", 409)
+                    .containsEntry("startChecks", report);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void answersToEveryQuestionInTheReportStartThePipeline() throws Exception {
+        Map<String, Object> report = answerableReport();
+        List<String> bodies = Collections.synchronizedList(new ArrayList<>());
+        List<String> preconditions = Collections.synchronizedList(new ArrayList<>());
+        HttpServer server = startCheckingServer(report, bodies, preconditions);
+        // an answer each question offers, the action no client knows by name included
+        List<Map<String, Object>> decisions = new ArrayList<>();
+        for (Object item : (List<?>) report.get("findings")) {
+            Map<?, ?> finding = (Map<?, ?>) item;
+            if ("CONFIRM".equals(finding.get("behavior"))) {
+                Map<?, ?> offered = (Map<?, ?>) ((List<?>) finding.get("actions")).get(0);
+                decisions.add(Map.of("finding", finding.get("key"), "action", offered.get("id")));
+            }
+        }
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            McpOperationExecutor executor = new McpOperationExecutor(baseOf(server), "token", Map.of(), client);
+
+            McpResult result = executor.execute(ControlOperations.PIPELINE_START, Map.of("id", "lead_view",
+                    "decisions", decisions, "expectedContentHash", report.get("contentHash")));
+
+            // A start sent with no body would be stopped again with the same report.
+            assertThat(result.error()).as("%s", result.body()).isFalse();
+            assertThat(JsonReader.parse(bodies.getLast())).isEqualTo(Map.of("decisions", decisions));
+            assertThat(preconditions.getLast()).isEqualTo("\"" + report.get("contentHash") + "\"");
+            assertThat(decisions).extracting(decision -> decision.get("action")).containsExactly("clear", "accept");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void answersWithoutThePreconditionAreRefusedBeforeAnyRequest() throws Exception {
+        List<String> bodies = Collections.synchronizedList(new ArrayList<>());
+        HttpServer server = startCheckingServer(answerableReport(), bodies, new ArrayList<>());
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            McpOperationExecutor executor = new McpOperationExecutor(baseOf(server), "token", Map.of(), client);
+
+            McpResult result = executor.execute(ControlOperations.PIPELINE_START, Map.of("id", "lead_view",
+                    "decisions", List.of(Map.of("finding", "target-not-empty/views/lead", "action", "keep"))));
+
+            assertThat(result.error()).isTrue();
+            assertThat(JsonWriter.write(result.body())).contains("expectedContentHash");
+            assertThat(bodies).isEmpty();
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void aBareStartSendsNeitherAnswersNorAPrecondition() throws Exception {
+        List<String> bodies = Collections.synchronizedList(new ArrayList<>());
+        List<String> preconditions = Collections.synchronizedList(new ArrayList<>());
+        HttpServer server = startCheckingServer(answerableReport(), bodies, preconditions);
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            McpOperationExecutor executor = new McpOperationExecutor(baseOf(server), "token", Map.of(), client);
+
+            executor.execute(ControlOperations.PIPELINE_START, Map.of("id", "lead_view", "decisions", List.of()));
+
+            assertThat(bodies).containsExactly("");
+            assertThat(preconditions).containsExactly("null");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void aStartHasTheHeavyBudgetBecauseItsChecksLookAtEveryTarget() throws Exception {
+        HttpServer server = server(exchange -> {
+            try {
+                Thread.sleep(600);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            answer(exchange, 200, "{\"pipelineId\":\"orders\",\"targetState\":\"RUNNING\"}");
+        });
+        try (HttpControlClient client = new HttpControlClient(Duration.ofMillis(150), Duration.ofSeconds(5))) {
+            McpOperationExecutor executor = new McpOperationExecutor(baseOf(server), "token", Map.of(), client);
+
+            McpResult result = executor.execute(ControlOperations.PIPELINE_START, Map.of("id", "orders"));
+
+            // on the light budget this answer arrives after the request has been given up on
+            assertThat(result.error()).as("%s", result.body()).isFalse();
         } finally {
             server.stop(0);
         }

@@ -65,7 +65,7 @@ final class McpOperationExecutor {
                 case "artifact.get" -> get("/api/artifacts/" + segment(required(args, "id")));
                 case "artifact.delete" -> artifactDelete(args);
                 case "pipeline.list" -> get(listPath("/api/pipelines:artifacts", args));
-                case "pipeline.start" -> pipelineAction(args, "start");
+                case "pipeline.start" -> pipelineStart(args);
                 case "pipeline.start-checks" -> pipelineStartChecks(args);
                 case "pipeline.stop" -> pipelineStop(args);
                 case "pipeline.pause" -> pipelineAction(args, "pause");
@@ -94,6 +94,32 @@ final class McpOperationExecutor {
                 "/api/pipelines/" + segment(required(arguments, "id")) + ":" + action,
                 null,
                 RequestBudget.LIGHT);
+    }
+
+    /**
+     * A start, through its start checks. Without answers it is the plain start, and one the checks stop comes
+     * back as a refusal carrying their report, which is the caller's to put to a person. With answers it sends
+     * them under the precondition they were given against: an answer belongs to the definition its report was
+     * evaluated on, and the server refuses answers without one -- refusing at this end names the argument that
+     * is missing instead of handing back a refusal the caller has to decode.
+     *
+     * <p>Each answer is passed on as given. Which answers a finding offers is the server's to judge, and every
+     * question offers exactly one that goes ahead as configured; a model choosing among them is choosing for
+     * the person it is acting for, which is why the tool says to ask.
+     */
+    private McpResult pipelineStart(Map<String, Object> arguments) {
+        String path = "/api/pipelines/" + segment(required(arguments, "id")) + ":start";
+        Object decisions = arguments.get("decisions");
+        Object expected = arguments.get("expectedContentHash");
+        String expectedContentHash = expected instanceof String text && !text.isBlank() ? text : null;
+        if (decisions == null || decisions instanceof List<?> none && none.isEmpty()) {
+            return McpResult.from(client.post(server, token, path, null, RequestBudget.HEAVY, expectedContentHash));
+        }
+        if (!(decisions instanceof List<?> answers) || answers.stream().anyMatch(answer -> !(answer instanceof Map<?, ?>))) {
+            throw malformedListArgument("`decisions` must be an array of {finding, action} objects");
+        }
+        return McpResult.from(client.post(server, token, path, Map.of("decisions", answers), RequestBudget.HEAVY,
+                required(arguments, "expectedContentHash")));
     }
 
     /**

@@ -227,9 +227,17 @@ public final class ControlOperations {
             "pipeline-draft.rebase", Scope.WRITE, true, null,
             "Explicitly rebase one Pipeline draft onto the artifact hash the caller has just read, preserving its content.",
             CLI_AND_REST);
+    // The start runs its start checks first. The answer convention is in the description because the
+    // caller on that face is a model: it relays the questions and carries back a person's answers, and the
+    // precondition proves that somebody answered the report as it stood, never that a person did.
     public static final Operation PIPELINE_START = mcp(
             "pipeline.start", Scope.WRITE, true,
-            "Set a Pipeline's desired state to running after its workspace has been applied.");
+            "Set a Pipeline's desired state to running after its workspace has been applied. Its start "
+                    + "checks run first: a start they stop is refused with their report under startChecks, "
+                    + "each question listing the answers it offers. Relay the findings to the person starting "
+                    + "the Pipeline and send back the answers they choose as decisions, with the report's "
+                    + "contentHash as expectedContentHash. Never choose an answer that changes the Pipeline "
+                    + "or clears data unless the person said to.");
     // The start checks a start would be asked, read without starting anything: what a client shows
     // before it starts, and what a rerun asks about while the pipeline still runs untouched. Read-scoped,
     // so a caller with no write capability can still see why a start would stop.
