@@ -42,7 +42,27 @@ public enum LifecycleError implements TapstateErrorCode {
      * {@code pipeline} is the id the caller gave. Permanent -- unlike an applied pipeline with no
      * observation published yet, waiting will never turn this into a usable id.
      */
-    UNKNOWN_PIPELINE("lifecycle.unknown-pipeline", Set.of("pipeline"));
+    UNKNOWN_PIPELINE("lifecycle.unknown-pipeline", Set.of("pipeline")),
+
+    /**
+     * A {@code start} refused because at least one start check asks a question nobody has answered yet:
+     * {@code pipeline} is the pipeline, {@code count} how many questions are open, {@code check} and
+     * {@code subject} the first of them. The full set travels beside this code, as the start check
+     * report; the message alone has to be enough for a client that cannot read that report.
+     */
+    START_NEEDS_CONFIRMATION("lifecycle.start-needs-confirmation", Set.of("pipeline", "count", "check", "subject")),
+
+    /**
+     * A {@code start} refused because at least one start check refuses it outright, whatever is answered:
+     * the same arguments as {@link #START_NEEDS_CONFIRMATION}, counting the refusals.
+     */
+    START_BLOCKED("lifecycle.start-blocked", Set.of("pipeline", "count", "check", "subject")),
+
+    /**
+     * A {@code start} carrying a decision the start checks cannot take: {@code finding} names a question
+     * that does not offer {@code action}, or the same question was answered twice.
+     */
+    INVALID_START_DECISION("lifecycle.invalid-start-decision", Set.of("pipeline", "finding", "action"));
 
     private final String code;
     private final Set<String> placeholders;

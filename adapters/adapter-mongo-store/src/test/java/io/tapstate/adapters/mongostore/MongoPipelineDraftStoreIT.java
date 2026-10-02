@@ -242,6 +242,101 @@ class MongoPipelineDraftStoreIT {
         }
     }
 
+    @Test
+    void changesTheDefinitionAndTheDraftBasedOnItInOneTransaction() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            Fixture fixture = fixture(client, "tapstate_definition_change_it");
+            String before = fixture.published("orders");
+            Resource changed = changedArtifact("orders");
+            String after = CanonicalHash.of(changed);
+
+            assertThat(fixture.store.changeDefinition(new PipelineDraft.DefinitionChange("orders", before, changed,
+                    after, Map.of(), draft -> renamed(draft, after))))
+                    .isEqualTo(PipelineDraftMutation.REPLACED);
+
+            assertThat(fixture.artifacts.find(new Document("_id", "orders")).first().getString("contentHash"))
+                    .isEqualTo(after);
+            PipelineDraft synced = fixture.store.get("orders").orElseThrow();
+            assertThat(synced.revision()).isEqualTo(2);
+            assertThat(synced.baseArtifactHash()).isEqualTo(after);
+            assertThat(synced.name()).isEqualTo("changed with the definition");
+        }
+    }
+
+    @Test
+    void leavesADraftBasedOnAnotherDefinitionAsItIs() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            Fixture fixture = fixture(client, "tapstate_definition_change_behind_it");
+            String before = fixture.published("orders");
+            assertThat(fixture.store.replace("orders", 1, draft("orders", 2, PipelineDraft.Mode.DAG,
+                    "an-older-definition", 1L, before))).isEqualTo(PipelineDraftMutation.REPLACED);
+            PipelineDraft behind = fixture.store.get("orders").orElseThrow();
+            Resource changed = changedArtifact("orders");
+
+            assertThat(fixture.store.changeDefinition(new PipelineDraft.DefinitionChange("orders", before, changed,
+                    CanonicalHash.of(changed), Map.of(), draft -> renamed(draft, CanonicalHash.of(changed)))))
+                    .isEqualTo(PipelineDraftMutation.REPLACED);
+
+            assertThat(fixture.store.get("orders")).contains(behind);
+        }
+    }
+
+    @Test
+    void refusesADefinitionThatMovedOrADependencyThatMovedAndWritesNothing() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            Fixture fixture = fixture(client, "tapstate_definition_change_conflict_it");
+            String before = fixture.published("orders");
+            PipelineDraft draft = fixture.store.get("orders").orElseThrow();
+            Resource changed = changedArtifact("orders");
+            String after = CanonicalHash.of(changed);
+
+            assertThat(fixture.store.changeDefinition(new PipelineDraft.DefinitionChange("orders", "a-moved-definition",
+                    changed, after, Map.of(), current -> renamed(current, after))))
+                    .isEqualTo(PipelineDraftMutation.ARTIFACT_CONFLICT);
+            assertThat(fixture.store.changeDefinition(new PipelineDraft.DefinitionChange("orders", before, changed,
+                    after, Map.of("crm", "a-moved-dependency"), current -> renamed(current, after))))
+                    .isEqualTo(PipelineDraftMutation.ARTIFACT_CONFLICT);
+
+            assertThat(fixture.artifacts.find(new Document("_id", "orders")).first().getString("contentHash"))
+                    .isEqualTo(before);
+            assertThat(fixture.store.get("orders")).contains(draft);
+        }
+    }
+
+    private static Fixture fixture(MongoClient client, String databaseName) {
+        var database = client.getDatabase(databaseName);
+        var drafts = database.getCollection("pipeline_drafts");
+        var artifacts = database.getCollection("artifacts");
+        drafts.drop();
+        artifacts.drop();
+        return new Fixture(new MongoPipelineDraftStore(client, drafts, artifacts), artifacts);
+    }
+
+    private record Fixture(MongoPipelineDraftStore store, com.mongodb.client.MongoCollection<Document> artifacts) {
+
+        /** A draft created and published, so draft and definition are in step; answers the definition's hash. */
+        String published(String id) {
+            assertThat(store.create(draft(id, 1, PipelineDraft.Mode.DAG))).isEqualTo(PipelineDraftMutation.CREATED);
+            Resource artifact = artifact(id);
+            String hash = CanonicalHash.of(artifact);
+            assertThat(store.publish(new PipelineDraft.Publication(id, 1, null, artifact, hash,
+                    Instant.parse("2026-09-21T01:00:00Z"), "publisher"))).isEqualTo(PipelineDraftMutation.PUBLISHED);
+            return hash;
+        }
+    }
+
+    private static Resource changedArtifact(String id) {
+        return new PipelineResource(id, new io.tapstate.core.model.Metadata(Map.of(), "changed"),
+                List.of(SourceRef.bare("crm")), List.of(), null, null, null, Map.of());
+    }
+
+    private static PipelineDraft renamed(PipelineDraft draft, String base) {
+        return new PipelineDraft(draft.pipelineId(), draft.schemaVersion(), draft.revision() + 1, draft.mode(),
+                "changed with the definition", draft.description(), draft.graph(), draft.wizard(), base,
+                draft.publishedDraftRevision(), draft.publishedArtifactHash(), draft.createdAt(), draft.updatedAt(),
+                draft.updatedBy());
+    }
+
     private static PipelineDraft draft(String id, long revision, PipelineDraft.Mode mode) {
         return draft(id, revision, mode, revision == 1 ? null : "artifact-hash", null, null);
     }

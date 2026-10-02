@@ -66,6 +66,7 @@ final class McpOperationExecutor {
                 case "artifact.delete" -> artifactDelete(args);
                 case "pipeline.list" -> get(listPath("/api/pipelines:artifacts", args));
                 case "pipeline.start" -> pipelineAction(args, "start");
+                case "pipeline.start-checks" -> pipelineStartChecks(args);
                 case "pipeline.stop" -> pipelineStop(args);
                 case "pipeline.pause" -> pipelineAction(args, "pause");
                 case "pipeline.resume" -> pipelineAction(args, "resume");
@@ -324,6 +325,20 @@ final class McpOperationExecutor {
 
     private McpResult pipelineRead(Map<String, Object> arguments, String view) {
         return get("/api/pipelines/" + segment(required(arguments, "id")) + "/" + view);
+    }
+
+    /**
+     * The start checks a start would be asked. The intent is passed only when the caller named one the
+     * server knows; anything else is left to the server to refuse, so a mistyped intent is never quietly
+     * read as a plain start.
+     */
+    private McpResult pipelineStartChecks(Map<String, Object> arguments) {
+        String path = "/api/pipelines/" + segment(required(arguments, "id")) + "/start-checks";
+        Object intent = arguments.get("intent");
+        if (intent instanceof String text && !text.isBlank()) {
+            path += "?intent=" + segment(text);
+        }
+        return get(path);
     }
 
     private McpResult pipelineLogs(Map<String, Object> arguments) {

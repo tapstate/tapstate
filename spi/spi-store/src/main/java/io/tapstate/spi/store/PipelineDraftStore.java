@@ -51,6 +51,20 @@ public interface PipelineDraftStore {
     /** Atomically writes the candidate Artifact and advances the draft publication markers. */
     PipelineDraftMutation publish(PipelineDraft.Publication publication);
 
+    /**
+     * Atomically replaces a pipeline's definition while it is still {@code expectedArtifactHash}, and carries
+     * the change into the pipeline's draft when the draft is based on that definition. Answers
+     * {@link PipelineDraftMutation#REPLACED} when the definition was written, with or without the draft;
+     * {@link PipelineDraftMutation#ARTIFACT_CONFLICT} when the definition, or a resource it depends on, has
+     * moved -- nothing is written then.
+     *
+     * <p>A store that cannot write both in one transaction does not offer it: half of it is the split write
+     * this exists to avoid.
+     */
+    default PipelineDraftMutation changeDefinition(PipelineDraft.DefinitionChange change) {
+        throw new UnsupportedOperationException("this draft store cannot change a definition and its draft together");
+    }
+
     private static PipelineDraftSummary summary(PipelineDraft draft) {
         return new PipelineDraftSummary(draft.pipelineId(), draft.mode(), draft.name(), draft.description(),
                 draft.revision(), draft.baseArtifactHash(), draft.publishedDraftRevision(),

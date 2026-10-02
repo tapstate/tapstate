@@ -320,6 +320,72 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
         }
     }
 
+    @Override
+    public PipelineDraftMutation changeDefinition(PipelineDraft.DefinitionChange change) {
+        Objects.requireNonNull(change, "change");
+        return StoreIo.call(() -> changeDefinitionInTransaction(change));
+    }
+
+    /**
+     * The definition and the draft that would publish it back, in one transaction: the definition is
+     * replaced only while it is still the one the change was worked out against, and the draft only while
+     * it is based on that same definition and still at the revision read here.
+     */
+    private PipelineDraftMutation changeDefinitionInTransaction(PipelineDraft.DefinitionChange change) {
+        try (ClientSession session = client.startSession()) {
+            session.startTransaction();
+            try {
+                Document currentArtifact = artifacts.find(session, new Document("_id", change.pipelineId()))
+                        .projection(new Document("contentHash", 1).append("kind", 1)).first();
+                if (currentArtifact == null || !"pipeline".equals(currentArtifact.getString("kind"))
+                        || !change.expectedArtifactHash().equals(currentArtifact.getString("contentHash"))
+                        || hasStaleWorkspacePrecondition(session, change.workspacePreconditions())) {
+                    session.abortTransaction();
+                    return PipelineDraftMutation.ARTIFACT_CONFLICT;
+                }
+                if (artifacts.replaceOne(session, new Document("_id", change.pipelineId())
+                                .append("contentHash", change.expectedArtifactHash()),
+                        MongoArtifactStore.toDocument(change.artifact())).getMatchedCount() != 1) {
+                    session.abortTransaction();
+                    return PipelineDraftMutation.ARTIFACT_CONFLICT;
+                }
+                Document currentDraft = drafts.find(session, activeDraft(change.pipelineId())).first();
+                if (currentDraft != null
+                        && change.expectedArtifactHash().equals(currentDraft.getString("baseArtifactHash"))) {
+                    PipelineDraft draft = fromDocument(PipelineDraftMigrations.migrate(currentDraft));
+                    PipelineDraft changed = change.draftChange().apply(draft);
+                    if (!changed.equals(draft) && drafts.replaceOne(session, activeDraft(change.pipelineId())
+                            .append(REVISION, draft.revision()), toDocument(changed)).getMatchedCount() != 1) {
+                        session.abortTransaction();
+                        return PipelineDraftMutation.ARTIFACT_CONFLICT;
+                    }
+                }
+                while (true) {
+                    try {
+                        session.commitTransaction();
+                        break;
+                    } catch (MongoException commitError) {
+                        if (!commitError.hasErrorLabel(MongoException.UNKNOWN_TRANSACTION_COMMIT_RESULT_LABEL)) {
+                            throw commitError;
+                        }
+                    }
+                }
+                return PipelineDraftMutation.REPLACED;
+            } catch (RuntimeException error) {
+                try {
+                    session.abortTransaction();
+                } catch (RuntimeException abortFailure) {
+                    error.addSuppressed(abortFailure);
+                }
+                if (error instanceof MongoException mongo
+                        && mongo.hasErrorLabel(MongoException.TRANSIENT_TRANSACTION_ERROR_LABEL)) {
+                    return PipelineDraftMutation.ARTIFACT_CONFLICT;
+                }
+                throw error;
+            }
+        }
+    }
+
     private boolean hasStaleWorkspacePrecondition(ClientSession session, Map<String, String> preconditions) {
         for (Map.Entry<String, String> expected : preconditions.entrySet()) {
             Document dependency = artifacts.find(session, new Document("_id", expected.getKey()))

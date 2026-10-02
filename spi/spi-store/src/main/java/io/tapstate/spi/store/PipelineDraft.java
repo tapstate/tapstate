@@ -169,6 +169,36 @@ public record PipelineDraft(
         }
     }
 
+    /**
+     * A pipeline's definition rewritten from outside its draft -- an answer a person gave when starting it --
+     * and the same change for the draft, written together or not at all.
+     *
+     * <p>The draft is changed only when it is based on the definition being replaced: a draft based on that
+     * definition would otherwise publish the old setting straight back over the new one, while a draft based
+     * on another one already conflicts with the stored definition and is left for its author to resolve.
+     *
+     * @param expectedArtifactHash the definition being replaced; the write is refused if it is no longer stored
+     * @param artifact             the definition written in its place
+     * @param artifactHash         its content hash
+     * @param workspacePreconditions the content hash each resource it depends on must still have
+     * @param draftChange          the same change for a draft based on {@code expectedArtifactHash}; it returns
+     *                             the draft to store -- its base moved to {@code artifactHash} -- or the draft it
+     *                             was given, unchanged, when the change cannot be expressed in it
+     */
+    public record DefinitionChange(String pipelineId, String expectedArtifactHash, Resource artifact,
+            String artifactHash, Map<String, String> workspacePreconditions,
+            java.util.function.UnaryOperator<PipelineDraft> draftChange) {
+
+        public DefinitionChange {
+            requireText(pipelineId, "pipeline id");
+            requireText(expectedArtifactHash, "expected artifact hash");
+            Objects.requireNonNull(artifact, "artifact");
+            requireText(artifactHash, "artifact hash");
+            workspacePreconditions = Map.copyOf(workspacePreconditions);
+            Objects.requireNonNull(draftChange, "draftChange");
+        }
+    }
+
     /** Candidate Artifact and conditions used by an atomic publish operation. */
     public record Publication(String pipelineId, long expectedDraftRevision,
             String expectedArtifactHash, Resource artifact, String publishedArtifactHash,

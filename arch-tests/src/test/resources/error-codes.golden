@@ -209,8 +209,11 @@ io.store-unavailable
 io.workload-claim-fenced
 lifecycle.illegal-transition
 lifecycle.incompatible-revision
+lifecycle.invalid-start-decision
 lifecycle.pipeline-not-runnable
 lifecycle.purge-state-not-stated
+lifecycle.start-blocked
+lifecycle.start-needs-confirmation
 lifecycle.unknown-pipeline
 mcp.connector-spec-unavailable
 mcp.environment-missing
@@ -277,6 +280,15 @@ source.not-found
 source.precondition-required
 source.srs-change-while-running
 source.version-conflict
+start-check.clear-before-full-load
+start-check.keep-existing-rows
+start-check.target-empty
+start-check.target-not-empty
+start-check.target-not-empty-refused
+start-check.target-not-empty-shared
+start-check.target-rows-unknown
+start-check.target-set-to-clear
+start-check.unavailable
 store.invalid-operator-state-database
 store.invalid-uri
 store.not-replica-set

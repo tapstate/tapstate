@@ -149,6 +149,9 @@ public final class Cli implements Runnable {
             Map.entry("token.list", "token"),
             Map.entry("token.revoke", "token"),
             Map.entry("pipeline.start", "start"),
+            // Read through the start verb itself, as start --checks-only: what a start would be asked is
+            // looked at where the start is made.
+            Map.entry("pipeline.start-checks", "start"),
             Map.entry("pipeline.stop", "stop"),
             Map.entry("pipeline.pause", "pause"),
             Map.entry("pipeline.resume", "resume"),

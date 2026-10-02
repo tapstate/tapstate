@@ -115,10 +115,7 @@ public final class PipelineDraftCompiler {
         if (destinationId == null || destinationTable == null) {
             throw new IllegalArgumentException("wizard output requires sourceId and table");
         }
-        String syncId = firstText(output.config(), "syncId");
-        if (syncId == null) {
-            syncId = destinationId + "_" + destinationTable;
-        }
+        String syncId = wizardSyncId(output.config());
         RenameSpec rename = inputTable != null && !inputTable.equals(destinationTable)
                 ? new RenameSpec(Map.of(inputTable, destinationTable), null, null, null) : null;
         String serveId = "atlas".equals(output.kind()) ? "atlas" : "target";
@@ -126,6 +123,25 @@ public final class PipelineDraftCompiler {
                 List.of(new SyncElement(syncId, destinationId,
                         outputWriteMode(output.config()), rename, null,
                         onFullLoad(output.config(), syncId))), null, null);
+    }
+
+    /**
+     * The id a wizard's output publishes its sync element under: the one it names, or its destination and
+     * table joined. Read by anything that has to find that element in the draft again.
+     */
+    static String wizardSyncId(Map<String, Object> config) {
+        String syncId = firstText(config, "syncId");
+        if (syncId != null) {
+            return syncId;
+        }
+        return firstText(config, "sourceId", "destinationId", "source") + "_"
+                + firstText(config, "table", "destinationTable");
+    }
+
+    /** The id a graph's view node publishes its view under: the one it names, or the node's own. */
+    static String graphViewId(PipelineDraft.Node node) {
+        String viewId = optionalText(node.metadata(), "viewId");
+        return viewId == null ? node.id() : viewId;
     }
 
     private static String firstText(Map<String, Object> values, String... names) {
@@ -332,10 +348,7 @@ public final class PipelineDraftCompiler {
                     throw new IllegalArgumentException("view node requires exactly one input: " + node.id());
                 }
                 String use = optionalText(node.config(), "use");
-                String viewId = optionalText(node.metadata(), "viewId");
-                if (viewId == null) {
-                    viewId = node.id();
-                }
+                String viewId = graphViewId(node);
                 view = use == null
                         ? new ViewBlock.Inline(viewId, graphFromRef(refs.getFirst()),
                                 optionalText(node.config(), "primaryKey", "primary_key"), null,
