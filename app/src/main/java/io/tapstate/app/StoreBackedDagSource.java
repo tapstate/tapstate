@@ -1331,7 +1331,7 @@ final class StoreBackedDagSource implements DagSource {
                 ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
                 sourceKeysById::get,
                 view -> FencedSinkWriterFactory.heldTo(
-                        viewSink(pipeline, view, viewTargets, viewStreams, sourceKeysById), fence),
+                        viewSink(pipeline, view, viewTargets, viewStreams, sourceKeysById, freshFullLoad), fence),
                 nestBinding(pipeline, sourceIdByTable(sourceVertices)),
                 joinBinding(compiledJoins));
     }
@@ -1543,13 +1543,14 @@ final class StoreBackedDagSource implements DagSource {
      * deployment's managed state store is resolved on the view's behalf. Everything after that is the
      * same seam the sync path uses, so a view is written by the same writer over the same binding.
      *
-     * <p>Write mode and ddl policy take the sync defaults. A view converges on its key, which is what
-     * upsert means; and the ddl policy governs how an incoming schema change is handled, not whether the
+     * <p>Write mode and full-load policy are the view's own, with the defaults a sync element has: upsert,
+     * because a view converges on its key, and keeping the rows already there on a new full load. The ddl
+     * policy stays the sync default -- it governs how an incoming schema change is handled, not whether the
      * target may be created, so refusing to drift costs the materialization nothing.
      */
     private SupplierEx<? extends SinkWriter> viewSink(
             PipelineResource pipeline, ViewBlock view, Map<String, TargetTable> targets,
-            Set<String> viewStreams, Map<String, List<String>> tablesBySourceId) {
+            Set<String> viewStreams, Map<String, List<String>> tablesBySourceId, boolean freshFullLoad) {
         if (!(view instanceof ViewBlock.Inline inline)) {
             throw new IllegalArgumentException(
                     "view block is a use-reference; resolve it to an inline view first");
@@ -1591,8 +1592,8 @@ final class StoreBackedDagSource implements DagSource {
                     viewTargetTable(target, targets == null ? null : targets.get(sourceTable)));
         }
         SupplierEx<? extends SinkWriter> writer = sinkWriterBinder.bind(
-                store.connector(), store.config(), WriteMode.UPSERT, DdlPolicy.FAIL, bySourceTable,
-                new PipelineNode(pipeline.id(), inline.id()));
+                store.connector(), store.config(), writeMode(inline.writeMode()), DdlPolicy.FAIL, bySourceTable,
+                new PipelineNode(pipeline.id(), inline.id()), onFullLoad(inline.onFullLoad()), freshFullLoad);
         String viewId = inline.id();
         String viewKey = inline.primaryKey();
         // A unique current value says nothing about what the capture stream puts in an earlier image.
@@ -2428,8 +2429,12 @@ final class StoreBackedDagSource implements DagSource {
                 sink.connector(), sink.config(), writeMode(element.writeMode()), ddl(element.ddl()),
                 TargetModelResolver.renameAll(targets, serveStreams, element.rename(), sourceIdByTable),
                 new PipelineNode(pipeline.id(), syncNodeId(element)),
-                element.onFullLoad() == null ? OnFullLoad.APPEND : OnFullLoad.valueOf(element.onFullLoad().name()),
-                freshFullLoad);
+                onFullLoad(element.onFullLoad()), freshFullLoad);
+    }
+
+    /** A declared full-load policy as the sink takes it, keeping the rows already there when none is declared. */
+    private static OnFullLoad onFullLoad(io.tapstate.core.model.OnFullLoad declared) {
+        return declared == null ? OnFullLoad.APPEND : OnFullLoad.valueOf(declared.name());
     }
 
     /**
@@ -2490,7 +2495,8 @@ final class StoreBackedDagSource implements DagSource {
             String definedIn = definition.view() instanceof ViewBlock.Use use ? use.use() : null;
             written.add(new PipelineWriteTargets.WriteTarget(view.id(),
                     PipelineWriteTargets.WriteTarget.Kind.VIEW, target.sourceId(), target.collection(),
-                    io.tapstate.core.model.OnFullLoad.APPEND, definedIn));
+                    view.onFullLoad() == null ? io.tapstate.core.model.OnFullLoad.APPEND : view.onFullLoad(),
+                    definedIn));
         }
         return List.copyOf(written);
     }

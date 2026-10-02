@@ -7,6 +7,7 @@ import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.Metadata;
+import io.tapstate.core.model.OnFullLoad;
 import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.RenameSpec;
@@ -123,7 +124,8 @@ public final class PipelineDraftCompiler {
         String serveId = "atlas".equals(output.kind()) ? "atlas" : "target";
         return new ServeBlock.Inline(serveId, FromClause.list(FromRef.literal(from)),
                 List.of(new SyncElement(syncId, destinationId,
-                        outputWriteMode(output.config()), rename, null, null)), null, null);
+                        outputWriteMode(output.config()), rename, null,
+                        onFullLoad(output.config(), syncId))), null, null);
     }
 
     private static String firstText(Map<String, Object> values, String... names) {
@@ -336,7 +338,8 @@ public final class PipelineDraftCompiler {
                 }
                 view = use == null
                         ? new ViewBlock.Inline(viewId, graphFromRef(refs.getFirst()),
-                                optionalText(node.config(), "primaryKey", "primary_key"), null)
+                                optionalText(node.config(), "primaryKey", "primary_key"), null,
+                                declaredWriteMode(node.config(), node.id()), onFullLoad(node.config(), node.id()))
                         : new ViewBlock.Use(viewId, use, graphFromRef(refs.getFirst()));
             } else if ("target".equals(node.type())) {
                 if (serve != null) {
@@ -363,7 +366,8 @@ public final class PipelineDraftCompiler {
                 }
                 serve = new ServeBlock.Inline(serveId,
                         new FromClause.Flow(refs.stream().map(PipelineDraftCompiler::graphFromRef).toList()),
-                        List.of(new SyncElement(node.id(), targetSource, writeMode(node.config(), node.id()), rename, null, null)), null, null);
+                        List.of(new SyncElement(node.id(), targetSource, writeMode(node.config(), node.id()), rename,
+                                null, onFullLoad(node.config(), node.id()))), null, null);
             } else {
                 graphOutputs(node.id(), nodes, inputs, outputs, visiting, steps);
             }
@@ -799,6 +803,32 @@ public final class PipelineDraftCompiler {
             return WriteMode.APPEND;
         }
         throw new IllegalArgumentException("unsupported target write mode: " + nodeId);
+    }
+
+    /**
+     * A view node's write mode, null when it declares none. Unlike a target's, an absent one is left absent
+     * rather than spelled out: the view is a newer place for the setting, and a draft written before it
+     * existed must compile to exactly the definition it always did.
+     */
+    private static WriteMode declaredWriteMode(Map<String, Object> config, String nodeId) {
+        return optionalText(config, "writeMode", "write_mode") == null ? null : writeMode(config, nodeId);
+    }
+
+    /**
+     * What a new full load does to rows already in a node's target, null when the node does not say -- the
+     * default then applies, and the published definition is the same as one that never mentioned it.
+     */
+    private static OnFullLoad onFullLoad(Map<String, Object> config, String nodeId) {
+        String value = optionalText(config, "onFullLoad", "on_full_load");
+        if (value == null) {
+            return null;
+        }
+        for (OnFullLoad policy : OnFullLoad.values()) {
+            if (policy.yaml().equals(value) || policy.name().equals(value)) {
+                return policy;
+            }
+        }
+        throw new IllegalArgumentException("unsupported full-load policy: " + nodeId);
     }
 
     private static Metadata metadata(PipelineDraft draft) {

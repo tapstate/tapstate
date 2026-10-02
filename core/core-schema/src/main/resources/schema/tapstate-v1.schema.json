@@ -1300,6 +1300,16 @@
         "storage": {
           "description": "Storage backend used to persist this view.",
           "$ref": "#/$defs/Storage"
+        },
+        "write_mode": {
+          "description": "How rows are written to the view — for example upsert or append.",
+          "$ref": "#/$defs/WriteMode",
+          "default": "upsert"
+        },
+        "on_full_load": {
+          "description": "Treatment of existing view rows before a new full load; resume, recovery and CDC-only never clear rows.",
+          "$ref": "#/$defs/OnFullLoad",
+          "default": "append"
         }
       },
       "required": [
@@ -1359,6 +1369,16 @@
         "storage": {
           "description": "Where and how the view's data is materialized.",
           "$ref": "#/$defs/Storage"
+        },
+        "write_mode": {
+          "description": "How rows are written to the view — for example upsert or append.",
+          "$ref": "#/$defs/WriteMode",
+          "default": "upsert"
+        },
+        "on_full_load": {
+          "description": "Treatment of existing view rows before a new full load; resume, recovery and CDC-only never clear rows.",
+          "$ref": "#/$defs/OnFullLoad",
+          "default": "append"
         },
         "experimental": {
           "description": "Experimental fields, exempt from the v1 compatibility freeze.",

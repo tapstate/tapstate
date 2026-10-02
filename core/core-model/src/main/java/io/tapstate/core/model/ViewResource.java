@@ -19,6 +19,11 @@ public record ViewResource(
         String primaryKey,
         @Doc("Where and how the view's data is materialized.")
         Storage storage,
+        @Doc(value = "How rows are written to the view — for example upsert or append.", def = "upsert")
+        WriteMode writeMode,
+        @Doc(value = "Treatment of existing view rows before a new full load; resume, recovery and CDC-only never clear rows.",
+                def = "append")
+        OnFullLoad onFullLoad,
         @Doc("Experimental fields, exempt from the v1 compatibility freeze.")
         Map<String, Object> experimental)
         implements Resource {
@@ -27,6 +32,12 @@ public record ViewResource(
         Objects.requireNonNull(id, "id");
         experimental = experimental == null ? null
                 : Collections.unmodifiableMap(new LinkedHashMap<>(experimental));
+    }
+
+    /** A view definition written with the default write settings: upsert, and keep rows on a full load. */
+    public ViewResource(String id, Metadata metadata, String primaryKey, Storage storage,
+            Map<String, Object> experimental) {
+        this(id, metadata, primaryKey, storage, null, null, experimental);
     }
 
     @Override

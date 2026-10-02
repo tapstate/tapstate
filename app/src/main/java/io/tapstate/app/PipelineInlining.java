@@ -48,7 +48,7 @@ final class PipelineInlining {
         }
         ViewResource definition = require(artifacts, use.use(), ViewResource.class, "view");
         return new ViewBlock.Inline(use.id(), use.from(),
-                definition.primaryKey(), definition.storage());
+                definition.primaryKey(), definition.storage(), definition.writeMode(), definition.onFullLoad());
     }
 
     private static ServeBlock inlineServe(ServeBlock serve, ArtifactStore artifacts) {
