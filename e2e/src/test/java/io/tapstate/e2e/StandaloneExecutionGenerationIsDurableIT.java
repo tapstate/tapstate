@@ -48,26 +48,32 @@ class StandaloneExecutionGenerationIsDurableIT {
         ExecutionAdmissionStages admissions = new ExecutionAdmissionStages(report, directCounts);
         try {
             String sha = PipelineBenchmarkLiveRunIT.sha256(jar);
-            report.begin(Map.of("purpose", directCounts ? "REAL_STANDALONE_LIFECYCLE_ADMISSION_COUNTS"
+            report.begin(Map.of("purpose", directCounts ? "REAL_STANDALONE_LIFECYCLE_ADMISSION_AND_PHYSICAL_COUNTS"
                             : "REAL_STANDALONE_LIFECYCLE_IDENTITY",
                     "application", PipelineBenchmarkLiveRunIT.artifact(jar), "discoveryMode", "none"),
                     PipelineBenchmarkLiveRunIT.environment(), List.of());
             var workload = BenchmarkWorkloadDefinitions.byId("copy");
             String pipeline = workload.pipelineIds().getFirst();
-            try (var fork = BenchmarkForkEnvironment.open(workload, jar, "standalone-identity",
+            try (var coordination = new ExecutionCoordinationProfileStages(report, directCounts, pipeline);
+                    var fork = BenchmarkForkEnvironment.open(workload, jar, "standalone-identity",
                     (uri, operator, artifact) -> {
                         if (!directCounts) { return BenchmarkForkEnvironment.OwnedBoot.plain(uri, operator, artifact); }
-                        var observer = ExecutionAdmissionJdiSession.startWithLeaseObservation(uri, operator, artifact, pipeline);
+                        String nativeUri = coordination.openOwned(uri);
+                        var observer = ExecutionAdmissionJdiSession.startWithLeaseObservation(nativeUri, operator, artifact, pipeline);
                         admissions.bind(observer);
                         return new BenchmarkForkEnvironment.OwnedBoot(observer.server(), null, observer);
-                    }, boot -> admissions.stage("before-first-start", 0, 0));
+                    }, boot -> {
+                        admissions.stage("before-first-start", 0, 0);
+                        coordination.stage("before-first-start", Map.of("appliedPipeline", pipeline, "startRequested", false));
+                        coordination.begin("first-start");
+                    });
                     var client = MongoClients.create(fork.storeUri())) {
                 MongoDatabase database = client.getDatabase(new ConnectionString(fork.storeUri()).getDatabase());
                 var latest = new MongoObservationStore(client,
                         database.getCollection(MongoStorePort.PIPELINE_OBSERVATION),
                         database.getCollection(MongoStorePort.PIPELINE_OBSERVATION_CHUNKS));
-                fork.runPhase(workload.phases().getFirst(), true);
-                fork.runPhase(workload.phases().get(1), true);
+                var initialPhase = fork.runPhase(workload.phases().getFirst(), true);
+                var warmupPhase = fork.runPhase(workload.phases().get(1), true);
                 ControlPlane control = fork.control();
                 Document firstClaim = claim(database, pipeline);
                 long firstGeneration = generation(firstClaim);
@@ -80,9 +86,15 @@ class StandaloneExecutionGenerationIsDurableIT {
                 String incarnation = first.scope().orElseThrow().pipelineIncarnationId();
                 record(report, "initial-start", first, firstClaim);
                 admissions.stage("first-start", 1, 1);
+                coordination.stage("first-start", readiness(first, Map.of("targetPhases",
+                        List.of(targetReadiness(initialPhase), targetReadiness(warmupPhase)))));
+                coordination.begin("running-ticks");
                 if (directCounts) { awaitTicks(latest, pipeline, firstGeneration, PipelineState.RUNNING); }
                 admissions.stage("running-ticks", 0, 0);
+                coordination.stage("running-ticks", readiness(stored(latest, pipeline, firstGeneration, PipelineState.RUNNING),
+                        Map.of("distinctObservationTimestampsRequired", 3)));
 
+                coordination.begin("pause-and-paused-ticks");
                 control.lifecycle(pipeline, LifecycleVerb.PAUSE);
                 Await.until("the actual control state to become PAUSED", WAIT,
                         () -> control.state(pipeline).filter(PipelineState.PAUSED::equals).isPresent(),
@@ -101,7 +113,10 @@ class StandaloneExecutionGenerationIsDurableIT {
                 record(report, "pause", paused, claim(database, pipeline));
                 if (directCounts) { awaitTicks(latest, pipeline, firstGeneration, PipelineState.PAUSED); }
                 admissions.stage("pause-and-paused-ticks", 0, 0);
+                coordination.stage("pause-and-paused-ticks", readiness(stored(latest, pipeline, firstGeneration, PipelineState.PAUSED),
+                        Map.of("distinctObservationTimestampsRequired", 3)));
 
+                coordination.begin("ordinary-resume");
                 long resumedAmount = targetAmount(client, fork.externalTargetUri()) + 1;
                 fork.executeSource("UPDATE bench_copy_orders SET amount=amount+1 WHERE id=1");
                 control.lifecycle(pipeline, LifecycleVerb.RESUME);
@@ -111,7 +126,10 @@ class StandaloneExecutionGenerationIsDurableIT {
                 assertThat(generation(claim(database, pipeline))).isEqualTo(firstGeneration);
                 record(report, "ordinary-resume", resumed, claim(database, pipeline));
                 admissions.stage("ordinary-resume", 0, 0);
+                coordination.stage("ordinary-resume", readiness(resumed, Map.of("targetExpectedAmount", resumedAmount,
+                        "targetActualAmount", targetAmount(client, fork.externalTargetUri()))));
 
+                coordination.begin("stop");
                 control.stop(pipeline, false);
                 var stopped = stored(latest, pipeline, firstGeneration, PipelineState.STOPPED);
                 assertThat(stopped.scope()).isEqualTo(first.scope());
@@ -121,6 +139,8 @@ class StandaloneExecutionGenerationIsDurableIT {
                 assertThat(finalCounter.value()).isGreaterThanOrEqualTo(resumedRecords);
                 record(report, "stop", stopped, claim(database, pipeline));
                 admissions.stage("stop", 0, 0);
+                coordination.stage("stop", readiness(stopped, Map.of()));
+                coordination.begin("stop-start");
                 control.lifecycle(pipeline, LifecycleVerb.START);
                 var restarted = stored(latest, pipeline, firstGeneration + 1, PipelineState.RUNNING);
                 assertThat(restarted.scope().orElseThrow().pipelineIncarnationId()).isEqualTo(incarnation);
@@ -133,18 +153,26 @@ class StandaloneExecutionGenerationIsDurableIT {
                 assertThat(generation(claim(database, pipeline))).isEqualTo(firstGeneration + 1);
                 record(report, "stop-start", restarted, claim(database, pipeline));
                 admissions.stage("stop-start", 1, 1);
+                coordination.stage("stop-start", readiness(restarted, Map.of("targetExpectedAmount", restartedAmount,
+                        "targetActualAmount", targetAmount(client, fork.externalTargetUri()))));
                 long beforeProcessGeneration = firstGeneration + 1;
 
+                coordination.begin("stop-before-process-restart");
                 control.stop(pipeline, false);
-                stored(latest, pipeline, beforeProcessGeneration, PipelineState.STOPPED);
+                var beforeProcessStop = stored(latest, pipeline, beforeProcessGeneration, PipelineState.STOPPED);
                 admissions.stage("stop-before-process-restart", 0, 0);
+                coordination.stage("stop-before-process-restart", readiness(beforeProcessStop, Map.of()));
+                coordination.begin("first-process-shutdown");
                 admissions.shutdown("first-process-shutdown");
+                coordination.stage("first-process-shutdown", Map.of("ownedVmDeathAndDisconnectVerified", true));
                 fork.closeBoot();
                 assertThat(generation(claim(database, pipeline))).isEqualTo(beforeProcessGeneration);
+                coordination.begin("new-process-boot-without-start");
+                String restoredNativeUri = coordination.nativeUri(fork.storeUri());
                 var nextObserver = directCounts ? ExecutionAdmissionJdiSession.startWithLeaseObservation(
-                        fork.storeUri(), new ConnectionString(fork.operatorStateUri()).getDatabase(), jar, pipeline) : null;
+                        restoredNativeUri, new ConnectionString(fork.operatorStateUri()).getDatabase(), jar, pipeline) : null;
                 try (var next = nextObserver == null
-                        ? BenchmarkForkEnvironment.OwnedBoot.plain(fork.storeUri(),
+                        ? BenchmarkForkEnvironment.OwnedBoot.plain(restoredNativeUri,
                                 new ConnectionString(fork.operatorStateUri()).getDatabase(), jar)
                         : new BenchmarkForkEnvironment.OwnedBoot(nextObserver.server(), null, nextObserver)) {
                     if (nextObserver != null) { admissions.bind(nextObserver); }
@@ -153,6 +181,10 @@ class StandaloneExecutionGenerationIsDurableIT {
                     assertThat(generation(claim(database, pipeline))).isEqualTo(beforeProcessGeneration);
                     if (directCounts) { awaitTicks(latest, pipeline, beforeProcessGeneration, PipelineState.STOPPED); }
                     admissions.stage("new-process-boot-without-start", 0, 0);
+                    coordination.stage("new-process-boot-without-start", readiness(stored(latest, pipeline,
+                            beforeProcessGeneration, PipelineState.STOPPED),
+                            Map.of("restoredControlLoginCompleted", true, "startRequested", false)));
+                    coordination.begin("new-process-start");
                     restored.lifecycle(pipeline, LifecycleVerb.START);
                     var afterProcessRestart = stored(latest, pipeline, beforeProcessGeneration + 1, PipelineState.RUNNING);
                     assertThat(afterProcessRestart.scope().orElseThrow().pipelineIncarnationId()).isEqualTo(incarnation);
@@ -164,16 +196,25 @@ class StandaloneExecutionGenerationIsDurableIT {
                             .isAfter(restartCounter.startTime());
                     record(report, "process-restart-start", afterProcessRestart, claim(database, pipeline));
                     admissions.stage("new-process-start", 1, 1);
+                    coordination.stage("new-process-start", readiness(afterProcessRestart,
+                            Map.of("targetExpectedAmount", processRestartAmount,
+                                    "targetActualAmount", targetAmount(client, fork.externalTargetUri()))));
 
+                    coordination.begin("stop-before-recreate");
                     restored.stop(pipeline, false);
-                    stored(latest, pipeline, beforeProcessGeneration + 1, PipelineState.STOPPED);
+                    var beforeRecreateStop = stored(latest, pipeline, beforeProcessGeneration + 1, PipelineState.STOPPED);
                     admissions.stage("stop-before-recreate", 0, 0);
+                    coordination.stage("stop-before-recreate", readiness(beforeRecreateStop, Map.of()));
+                    coordination.begin("delete-recreate-without-start");
                     restored.deleteArtifact(pipeline, restored.contentHash(pipeline));
                     assertThat(restored.artifact(pipeline)).isEmpty();
                     assertThat(generation(claim(database, pipeline))).isEqualTo(beforeProcessGeneration + 1);
                     restored.apply(workload.resources(fork.sourceSettings(),
                             fork.externalTargetUri()));
                     admissions.stage("delete-recreate-without-start", 0, 0);
+                    coordination.stage("delete-recreate-without-start", Map.of("deletedArtifactAbsenceVerified", true,
+                            "recreatedResourcesApplied", true, "startRequested", false));
+                    coordination.begin("recreate-start");
                     restored.lifecycle(pipeline, LifecycleVerb.START);
                     var recreated = stored(latest, pipeline, beforeProcessGeneration + 2, PipelineState.RUNNING);
                     assertThat(recreated.scope().orElseThrow().pipelineIncarnationId()).isNotEqualTo(incarnation);
@@ -185,18 +226,24 @@ class StandaloneExecutionGenerationIsDurableIT {
                             .isAfter(outputCounter(afterProcessRestart.observation()).startTime());
                     record(report, "delete-recreate-start", recreated, claim(database, pipeline));
                     admissions.stage("recreate-start", 1, 1);
+                    coordination.stage("recreate-start", readiness(recreated, Map.of("targetExpectedAmount", recreatedAmount,
+                            "targetActualAmount", targetAmount(client, fork.externalTargetUri()))));
+                    coordination.begin("final-stop");
                     restored.stop(pipeline, false);
-                    stored(latest, pipeline, beforeProcessGeneration + 2, PipelineState.STOPPED);
+                    var finalStop = stored(latest, pipeline, beforeProcessGeneration + 2, PipelineState.STOPPED);
                     admissions.stage("final-stop", 0, 0);
+                    coordination.stage("final-stop", readiness(finalStop, Map.of()));
+                    coordination.begin("second-process-shutdown");
                     admissions.shutdown("second-process-shutdown");
+                    coordination.stage("second-process-shutdown", Map.of("ownedVmDeathAndDisconnectVerified", true));
                 }
+                coordination.requireComplete();
             }
             assertThat(PipelineBenchmarkLiveRunIT.sha256(jar)).isEqualTo(sha);
             report.completeDiagnostic(Map.of("correctness", "REAL_LIFECYCLE_IDENTITIES_MATCHED_DURABLE_GENERATIONS",
                     "performanceAcceptanceEligible", false,
                     "unverified", directCounts
-                            ? List.of("SNAPSHOT_REBUILD_RESUME", "PHYSICAL_MONGO_COMMAND_COUNTS",
-                                    "ALL_TELEMETRY_SURFACE_IDENTITIES")
+                            ? List.of("SNAPSHOT_REBUILD_RESUME", "ALL_TELEMETRY_SURFACE_IDENTITIES")
                             : List.of("SNAPSHOT_REBUILD_RESUME", "FAILED_CAS_NO_JOB",
                                     "COMMAND_LEVEL_ADVANCE_COUNTS", "ALL_TELEMETRY_SURFACE_IDENTITIES")));
         } catch (Exception | Error failure) {
@@ -289,6 +336,27 @@ class StandaloneExecutionGenerationIsDurableIT {
 
     private static OutputCounter outputCounter(Observation observation) {
         return counterIfKnown(observation).orElseThrow(() -> new AssertionError("output counter is not wired"));
+    }
+
+    private static Map<String, Object> readiness(ObservationStore.Stored stored, Map<String, Object> target) {
+        var scope = stored.scope().orElseThrow();
+        Map<String, Object> evidence = new LinkedHashMap<>(target);
+        evidence.put("state", stored.observation().state().name());
+        evidence.put("incarnation", scope.pipelineIncarnationId());
+        evidence.put("executionGeneration", scope.executionGeneration());
+        evidence.put("observedAt", stored.observation().observedAt().toString());
+        var counter = counterIfKnown(stored.observation());
+        evidence.put("counterState", counter.isPresent() ? "RECORDED" : "UNAVAILABLE");
+        counter.ifPresent(value -> {
+            evidence.put("counterStartTime", value.startTime().toString());
+            evidence.put("recordsOut", value.value());
+        });
+        return evidence;
+    }
+
+    private static Map<String, Object> targetReadiness(BenchmarkForkEnvironment.PhaseResult phase) {
+        return Map.of("phase", phase.phase().id(), "targets", phase.targets().stream().map(target ->
+                Map.of("rows", target.rows(), "checksum", target.checksum(), "matches", target.matches())).toList());
     }
 
     private static void record(BenchmarkLiveReport report, String action,
