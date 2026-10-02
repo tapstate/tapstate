@@ -268,7 +268,7 @@ class MongoPipelineDraftStoreIT {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
             Fixture fixture = fixture(client, "tapstate_definition_change_behind_it");
             String before = fixture.published("orders");
-            assertThat(fixture.store.replace("orders", 1, draft("orders", 2, PipelineDraft.Mode.DAG,
+            assertThat(fixture.store.rebase("orders", 1, before, draft("orders", 2, PipelineDraft.Mode.DAG,
                     "an-older-definition", 1L, before))).isEqualTo(PipelineDraftMutation.REPLACED);
             PipelineDraft behind = fixture.store.get("orders").orElseThrow();
             Resource changed = changedArtifact("orders");
