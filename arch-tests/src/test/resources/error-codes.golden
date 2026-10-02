@@ -87,6 +87,9 @@ cli.context-not-found
 cli.context-required
 cli.context-source-conflict
 cli.context-usage
+cli.decide-malformed
+cli.decide-not-offered
+cli.decide-on-a-refusal
 cli.demo-workspace-exists
 cli.docker-unavailable
 cli.if-match-needs-one-resource
@@ -104,6 +107,10 @@ cli.request-timed-out
 cli.resource-not-found
 cli.server-not-named
 cli.sign-in-unusable
+cli.start-checks-not-run
+cli.start-checks-unsupported
+cli.start-may-have-gone-ahead
+cli.start-needs-an-answer
 cli.unknown-connector
 cli.verb-not-implemented
 cli.version-mismatch

@@ -257,12 +257,16 @@ public final class Cli implements Runnable {
                     "Show a connection's discovered schema, or one table of it.")),
             Map.entry("token", new VerbHelp("<create|list|revoke> [ARGS...] [-o text|json|yaml]",
                     "Create, list, or revoke machine tokens.")),
-            Map.entry("start", new VerbHelp("<pipeline-id>",
-                    "Start a pipeline.")),
+            Map.entry("start", new VerbHelp(
+                    "<pipeline-id> [-y] [--decide <check>[/<subject>]=<answer>]... [--checks-only] [-o text|json|yaml]",
+                    "Start a pipeline after its start checks: answer their questions at the terminal, with "
+                            + "--decide, or with -y to go ahead as configured; --checks-only only shows them.")),
             Map.entry("stop", new VerbHelp("<pipeline-id> [--keep-state] [-y]",
                     "Stop a pipeline and clear what it accumulated; --keep-state keeps it.")),
-            Map.entry("restart", new VerbHelp("<pipeline-id> [--rerun] [-y]",
-                    "Cycle a pipeline and carry on; --rerun reads the whole source again.")),
+            Map.entry("restart", new VerbHelp(
+                    "<pipeline-id> [--rerun] [-y] [--decide <check>[/<subject>]=<answer>]...",
+                    "Cycle a pipeline and carry on; --rerun reads the whole source again, asking its start "
+                            + "checks before anything is stopped.")),
             Map.entry("pause", new VerbHelp("<pipeline-id>",
                     "Pause a running pipeline, holding its position.")),
             Map.entry("resume", new VerbHelp("<pipeline-id>",

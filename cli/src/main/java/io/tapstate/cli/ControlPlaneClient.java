@@ -218,6 +218,36 @@ interface ControlPlaneClient extends AutoCloseable {
             URI baseUrl, String credential, String pipelineId, String verb, Boolean purgeState);
 
     /**
+     * Starts a pipeline through its start checks via {@code POST {baseUrl}/api/pipelines/{pipelineId}:start},
+     * carrying {@code decisions} -- with {@code ifMatch}, the content hash they were given against -- when there
+     * are any. Waits as long as a heavy verb does and is never sent twice: the checks look at every target the
+     * start writes, and a start that timed out may still have gone ahead. Never throws.
+     *
+     * <p>The default reaches the plain lifecycle verb, which is all a client that predates start checks has.
+     */
+    default StartAttempt start(URI baseUrl, String credential, String pipelineId, java.util.List<StartDecision> decisions,
+            String ifMatch) {
+        return switch (lifecycle(baseUrl, credential, pipelineId, "start", null)) {
+            case LifecycleOutcome.Accepted accepted -> new StartAttempt.Started(accepted.pipelineId(),
+                    accepted.targetState(), accepted.revision(), null, java.util.List.of(), java.util.List.of(),
+                    java.util.Map.of("pipelineId", accepted.pipelineId(), "targetState", accepted.targetState(),
+                            "revision", accepted.revision()));
+            case LifecycleOutcome.Rejected rejected -> new StartAttempt.Rejected(
+                    rejected.code(), java.util.Map.of(), rejected.message(), java.util.List.of());
+            case LifecycleOutcome.Unreachable ignored -> new StartAttempt.Unreachable(true);
+        };
+    }
+
+    /**
+     * Reads the start checks a start of {@code pipelineId} would be asked, via
+     * {@code GET {baseUrl}/api/pipelines/{pipelineId}/start-checks?intent={intent}}, without starting it. A server
+     * released before start checks answers {@link StartChecksOutcome.NotSupported}. Never throws.
+     */
+    default StartChecksOutcome startChecks(URI baseUrl, String credential, String pipelineId, String intent) {
+        return new StartChecksOutcome.NotSupported();
+    }
+
+    /**
      * Reads a pipeline's lifecycle state via {@code GET {baseUrl}/api/pipelines/{pipelineId}/status},
      * authenticated by the bearer {@code credential}: the state on success, a coded rejection when the
      * server refuses (a pipeline with no published observation is {@code monitor.no-observation}), or

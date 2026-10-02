@@ -234,6 +234,25 @@ cli.mcp-unavailable:
 cli.confirmation-needs-a-terminal:
   message: "`{verb}` clears what the pipeline accumulated, and there is no terminal here to confirm at."
   solution: "Add `-y` to go ahead without being asked, or run `stop <pipeline-id> --keep-state` to stop it and keep everything it has."
+cli.start-needs-an-answer:
+  message: "{pipeline} was left as it is: {count} start check question(s) need an answer, and there is no terminal here to ask at."
+  solution: "Answer them on the command line: {commands}"
+cli.start-checks-unsupported:
+  message: "This server does not run start checks, so {option} cannot take effect; nothing was started."
+  solution: "Upgrade the server, or start without {option}."
+cli.start-checks-not-run:
+  message: "The server started {pipeline} without running start checks; it is likely older than this client."
+cli.decide-malformed:
+  message: "--decide {decide} is not an answer: write <check>=<action>, or <check>/<subject>=<action> for one question."
+cli.decide-not-offered:
+  message: "--decide {decide} cannot be taken: {findings} do(es) not offer that answer."
+  solution: "Answer each of them on its own with --decide <check>/<subject>=<action>, using an answer it offers."
+cli.decide-on-a-refusal:
+  message: "--decide {decide} answers a start check that refuses the start, and no answer changes a refusal."
+  solution: "Read the start checks for what the refusal needs changed, change it, then start again."
+cli.start-may-have-gone-ahead:
+  message: "The start of {pipeline} was sent to {server}, and no answer came back in time; it may have gone ahead there."
+  solution: "Check with 'tapstate status {pipeline}' before starting it again."
 cli.watch-needs-a-terminal:
   message: "`watch` redraws one row in place, which needs a terminal; here its output is a pipe or a file."
   solution: "Use `tail <source>.<collection>` for a stream you can pipe, or `<source>.<collection>.find(...)` for a one-shot look."
