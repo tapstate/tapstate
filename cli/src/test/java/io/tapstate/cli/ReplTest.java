@@ -180,6 +180,7 @@ class ReplTest {
         /** The canned connected-verb outcomes (used when the target base is healthy) and their call logs. */
         ApplyOutcome applyOutcome = new ApplyOutcome.Unreachable();
         GetOutcome getOutcome = new GetOutcome.Unreachable();
+        ConnectionSettingsOutcome connectionSettingsOutcome;
         DeleteOutcome deleteOutcome = new DeleteOutcome.Unreachable();
         /** Every removal asked for, as {@code credential@base/id#hash} — the hash is what the tests pin. */
         final List<String> deleteCalls = new ArrayList<>();
@@ -425,6 +426,20 @@ class ReplTest {
         public GetOutcome get(URI baseUrl, String credential, String id) {
             getCalls.add(credential + "@" + baseUrl + "/" + id);
             return healthy.contains(baseUrl) ? getOutcome : new GetOutcome.Unreachable();
+        }
+
+        @Override
+        public ConnectionSettingsOutcome connectionSettings(URI baseUrl, String credential, String id) {
+            if (!healthy.contains(baseUrl)) return new ConnectionSettingsOutcome.Unreachable();
+            if (connectionSettingsOutcome != null) return connectionSettingsOutcome;
+            // Legacy fixtures already carry the complete Source. The production transport instead
+            // obtains the protected config from the dedicated Source endpoint.
+            if (getOutcome instanceof GetOutcome.Found found
+                    && new io.tapstate.core.dsl.DslParser().parse(found.artifact().canonicalForm())
+                    instanceof io.tapstate.core.model.SourceResource source) {
+                return new ConnectionSettingsOutcome.Found(source.connector(), source.config());
+            }
+            return new ConnectionSettingsOutcome.Unreachable();
         }
 
         @Override
@@ -2818,6 +2833,44 @@ class ReplTest {
 
         String out = h.sink().toString().substring(mark);
         assertThat(out).contains("connectionId: my-mongo").contains("outcome: PASSED").contains("name: ping");
+    }
+
+    @Test
+    void probesUseDedicatedSettingsWhenTheGenericSourceHasNoConfig() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.getOutcome = new GetOutcome.Found(new RemoteArtifact("my-mongo", "source", """
+                version: tapstate/v1
+                kind: source
+                id: my-mongo
+                connector: mongodb
+                """));
+        client.connectionSettingsOutcome = new ConnectionSettingsOutcome.Found(
+                "mongodb", Map.of("uri", "mongodb://<redacted>@db.example/rows", "isUri", true));
+        client.testOutcome = passedReport();
+        client.discoverSchemaOutcome = new ConnectionDiscoverSchemaOutcome.Discovered(
+                new ConnectionSchema("my-mongo", "mongodb", List.of(), 1752000000000L));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        h.repl().dispatch("test my-mongo");
+        h.repl().dispatch("discover-schema my-mongo");
+        assertThat(client.testCalls).hasSize(1);
+        assertThat(client.discoverSchemaCalls).hasSize(1);
+        assertThat(client.testCalls.getFirst()).contains("db.example/rows");
+        assertThat(client.discoverSchemaCalls.getFirst()).contains("db.example/rows");
+        assertThat(h.sink().toString()).doesNotContain("db.example/rows");
+    }
+
+    @Test
+    void aRefusedDedicatedSettingsReadNeverRunsAProbe() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.getOutcome = storedConnection();
+        client.connectionSettingsOutcome = new ConnectionSettingsOutcome.Rejected(
+                "control.forbidden", "Protected Source read refused");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        h.repl().dispatch("test my-mongo");
+        h.repl().dispatch("discover-schema my-mongo");
+        assertThat(client.testCalls).isEmpty();
+        assertThat(client.discoverSchemaCalls).isEmpty();
+        assertThat(h.sink().toString()).contains("control.forbidden", "Protected Source read refused");
     }
 
     @Test

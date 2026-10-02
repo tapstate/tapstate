@@ -257,6 +257,20 @@
       <version>${revision}</version>
       <scope>test</scope>
     </dependency>
+    <!-- Order the isolated MCP executable before its real-process integration witnesses. Neither the
+         sidecar nor its framework belongs in the service or in the host test JVM. -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>mcp-server</artifactId>
+      <version>${revision}</version>
+      <scope>test</scope>
+      <exclusions>
+        <exclusion>
+          <groupId>*</groupId>
+          <artifactId>*</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
     <!-- Testcontainers: a throwaway Mongo replica-set to witness that the assembly root exposes a
          working StorePort bean (the all role) against a real store. Skipped automatically where
          Docker is absent, so a Docker-less build stays green. -->
@@ -293,6 +307,15 @@
       </resource>
     </resources>
     <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <classpathDependencyExcludes>
+            <classpathDependencyExclude>io.tapstate:mcp-server</classpathDependencyExclude>
+          </classpathDependencyExcludes>
+        </configuration>
+      </plugin>
       <!-- Stamp the module openings the shipped boot jar needs into its manifest, so a bare `java -jar`
            has them without the caller setting JAVA_OPTS (the spring-boot repackage below preserves the
            jar manifest's own entries). Two unrelated things need them.
@@ -331,6 +354,9 @@
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-failsafe-plugin</artifactId>
         <configuration>
+          <classpathDependencyExcludes>
+            <classpathDependencyExclude>io.tapstate:mcp-server</classpathDependencyExclude>
+          </classpathDependencyExcludes>
           <!-- The PDK runtime uses cglib to bind real connector configuration. Mirror the Boot JAR's
                manifest opening in the integration-test fork while retaining JaCoCo's argLine. Extra
                JVM arguments are reserved for local live-test environment requirements. -->
@@ -339,6 +365,7 @@
                bundled into the shipped artifact (repackage runs in package, before integration-test). -->
           <systemPropertyVariables>
             <tapstate.app.boot-jar>${project.build.directory}/${project.build.finalName}-boot.jar</tapstate.app.boot-jar>
+            <tapstate.app.mcp-boot-jar>${project.basedir}/../control/mcp-server/target/mcp-server-${revision}-boot.jar</tapstate.app.mcp-boot-jar>
           </systemPropertyVariables>
         </configuration>
         <executions>
