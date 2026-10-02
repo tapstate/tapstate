@@ -587,6 +587,20 @@ class CaptureRunUnitJetSmokeTest {
         }
 
         @Override
+        public synchronized boolean setCdcStartIfCurrent(String miningChainId, String pipelineId,
+                String cursorWriterToken, long selectedTablesEpoch, String cdcStartPosition, long snapshotEpoch) {
+            SrsMeta current = require(miningChainId);
+            ConsumerOffset consumer = current.consumerOffset(pipelineId).orElse(null);
+            if (current.epoch() != selectedTablesEpoch || consumer == null
+                    || !Objects.equals(consumer.selectedTablesEpoch(), selectedTablesEpoch)
+                    || !Objects.equals(consumer.cursorWriterToken(), cursorWriterToken)) {
+                return false;
+            }
+            setCdcStart(miningChainId, pipelineId, cdcStartPosition, snapshotEpoch);
+            return true;
+        }
+
+        @Override
         public synchronized void appendSchemaVersion(String miningChainId, SchemaVersion version) {
             SrsMeta m = require(miningChainId);
             List<SchemaVersion> next = new ArrayList<>(m.schemaHistory());
