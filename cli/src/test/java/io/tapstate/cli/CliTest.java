@@ -706,7 +706,7 @@ class CliTest {
         // table, `status` taking --watch, and which verbs accept -o at all were discoverable only by
         // typing the verb wrong and reading the complaint
         Run r = run(verb, "--help");
-        assertThat(r.out()).contains(Cli.VERB_HELP.get(verb).operands());
+        assertThat(r.out().replaceAll("\\s+", " ")).contains(Cli.VERB_HELP.get(verb).operands());
         assertThat(r.out()).contains(Cli.VERB_HELP.get(verb).summary());
     }
 

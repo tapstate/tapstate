@@ -19,6 +19,7 @@ import org.junit.jupiter.api.Test;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -125,6 +126,7 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                 "nestStateBackfillMillis.nest.orders.doc.$root",
                 "nestStatePendingHighWater.nest.orders.doc.$root",
                 "nestStateStored.nest.orders.doc.$root",
+                "nestStateColdLayerOverThreshold.nest.orders.doc.$root",
                 "nestDeadLettered.nest.orders.doc.$root",
                 "joinRecomputeRowsDone.orders.region",
                 "joinRecomputeRowsExpected.orders.region");
@@ -132,13 +134,17 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                 .containsEntry("frontierGap.chain-a", 4L)
                 .containsEntry("frontierStalledMillis.chain-b", 61_000L)
                 .containsEntry("nestStateStored.nest.orders.doc.$root", 400_000L)
+                .containsEntry("nestStateColdLayerOverThreshold.nest.orders.doc.$root", 0L)
                 .containsEntry("nestDeadLettered.nest.orders.doc.$root", 3L);
         assertThat(published.snapshot())
                 .containsOnly(entry("orders", new TableSnapshot(90_000L, 120_000L, 75)));
-        // The facts on the document are the measured facts, all of them and as measured: what the flat
-        // view dropped is here whole, with its table attribute, and what the flat view squeezed is here
-        // with every point it squeezed. A projection may carry less; the document does not.
-        assertThat(published.facts()).containsExactlyInAnyOrderElementsOf(measured);
+        // Publication also carries the scoped watch's current threshold decision. The unscoped
+        // measurement above cannot retrieve that assessment; all original measurements remain whole.
+        List<MetricFact> publishedFacts = new ArrayList<>(measured);
+        publishedFacts.add(new MetricFact("tapstate.pipeline.nest.cold_layer.over_threshold", MetricType.GAUGE,
+                "1", List.of(MetricPoint.reading(Map.of(MetricAttributes.PIPELINE_ID, "orders",
+                        "tapstate.nest.namespace", "nest.orders.doc.$root"), AT, 0L))));
+        assertThat(published.facts()).containsExactlyInAnyOrderElementsOf(publishedFacts);
         assertThat(published.facts()).extracting(MetricFact::name)
                 .contains("tapstate.pipeline.snapshot.rows", "tapstate.pipeline.snapshot.rows.total");
     }
