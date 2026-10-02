@@ -49,8 +49,9 @@ public final class ControlOperations {
     // compute for itself; without this read on the same face, that verb is callable and unusable.
     public static final Operation ARTIFACT_GET = mcp(
             "artifact.get", Scope.READ, false,
-            "Read one applied resource of any kind by id, as its canonical tapstate/v1 YAML plus the "
-                    + "content hash of those exact bytes. Pass that hash back as the expectedContentHash "
+            "Read one applied resource of any kind by id, as canonical tapstate/v1 YAML plus its stored "
+                    + "resource content hash. Source config is omitted; its hash belongs to the complete stored "
+                    + "resource, not the displayed YAML. Pass the returned hash back as expectedContentHash "
                     + "of a removal, or as a per-resource precondition when applying an edit.");
     public static final Operation ARTIFACT_LIST = new Operation("artifact.list", Scope.READ, false, null, CLI_ONLY);
     // The removal verb, one path for every kind. It destroys a named resource for good, which no other
