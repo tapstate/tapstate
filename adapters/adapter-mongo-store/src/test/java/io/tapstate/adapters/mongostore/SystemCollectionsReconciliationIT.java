@@ -13,6 +13,7 @@ import io.tapstate.spi.store.ConnectionTestItem;
 import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.NestDeadLetterRecord;
+import io.tapstate.spi.store.PipelineDraft;
 import io.tapstate.spi.store.RegistrationSource;
 import io.tapstate.spi.store.SessionRecord;
 import io.tapstate.spi.store.SourceModel;
@@ -136,6 +137,11 @@ class SystemCollectionsReconciliationIT {
                 "held-child".getBytes(StandardCharsets.UTF_8));
         port.nestDeadLetters().record(new NestDeadLetterRecord("nest.orders_sync.assemble.items",
                 "[\"items\"]#[1]~i", "mysql-a", "1:1", 0L, 9_000L, Map.of("id", 1)));
+        Instant now = Instant.parse("2026-09-02T00:00:00Z");
+        port.drafts().create(new PipelineDraft("orders_sync", PipelineDraft.CURRENT_SCHEMA_VERSION, 1,
+                PipelineDraft.Mode.DAG, "Orders", "",
+                new PipelineDraft.Graph(List.of(), List.of(), new PipelineDraft.Viewport(0, 0, 1)), null,
+                null, null, null, now, now, "admin"));
 
         auth.users().save(new User("admin", "hash", "ADMIN"));
         auth.tokens().save(new TokenRecord("tok-1", "WRITE", "hash-abc", false, WHEN));

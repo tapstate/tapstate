@@ -107,6 +107,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
 
     @Override
     public PreparedStart prepareStart(String pipelineId) {
+        engine.refuseIfLost(pipelineId);
         // Submitting by name is idempotent, but preparing another execution before this check would
         // move its fence while the existing Jet job and capture still use the previous one.
         if (engine.hasLiveJob(pipelineId)) {
@@ -136,6 +137,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         Objects.requireNonNull(admission, "admission");
         Objects.requireNonNull(current, "current");
         String pipelineId = reservation.pipelineId();
+        engine.refuseIfLost(pipelineId);
         if (reservation.phase() != StopReservation.Phase.REPLACEMENT_PENDING || engine.hasLiveJob(pipelineId)) {
             throw new StartDeferred(StartDeferred.Reason.DEPENDENCY);
         }
@@ -187,7 +189,9 @@ final class EngineLifecycleActuator implements LifecycleActuator {
                 admitted = null;
             } else {
                 StopAuthority current = actuation.stopAuthority(pipelineId).orElse(null);
-                admitted = admission.admit(current, incarnation, engine.submissionBootId())
+                java.util.Set<String> members = actuation.plannedExecutionMembers(pipelineId, current)
+                        .orElseThrow(() -> new StartDeferred(StartDeferred.Reason.DEPENDENCY));
+                admitted = admission.admit(current, incarnation, engine.submissionBootId(), members)
                         .orElseThrow(() -> new StartDeferred(StartDeferred.Reason.DEPENDENCY));
                 execution = actuation.adoptAdmission(admitted);
             }
@@ -283,8 +287,13 @@ final class EngineLifecycleActuator implements LifecycleActuator {
                     if (observationScope == null) {
                         engine.submit(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings());
                     } else {
-                        engine.submit(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings(),
-                                actuation.clusterId(), observationScope);
+                        if (execution.executionNodeIds().isEmpty()) {
+                            engine.submit(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings(),
+                                    actuation.clusterId(), observationScope);
+                        } else {
+                            engine.submit(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings(),
+                                    actuation.clusterId(), observationScope, execution.executionNodeIds());
+                        }
                         submittedExecution = engine.executionJob(pipelineId).filter(job -> observationScope.equals(job.scope())
                                 && actuation.clusterId().equals(job.job().clusterId())
                                 && engine.submissionBootId().equals(job.job().bootId())).orElseThrow(
@@ -692,9 +701,15 @@ final class EngineLifecycleActuator implements LifecycleActuator {
                     pipelineId, dagSource.stateLocations(pipelineId, stateTeardown.defaultDatabase()));
         }
         captureCoordinator.stopCapture(pipelineId, purgeState);
-        if (purgeState) {
+        if (purgeState && jobOver && !engine.isLost()) {
             // Only once nothing is left to write into it. A processor still winding down writes state as it
             // closes, and a drop racing that leaves entries behind with the note already gone.
+            //
+            // Nor on an engine whose member was shut down for want of memory. Half of the drop is on that
+            // member, which refuses it with an uncoded error, and "no job" there only means the member no
+            // longer answers: its shutdown can still be waiting for the job to end. Left noted, the drop is
+            // finished by the next start, which on a lost engine comes after the restart that is the only
+            // way back.
             stateTeardown.finishPending(pipelineId);
         }
     }
@@ -705,6 +720,13 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // cdc capture feeding its ring dies while the job keeps running over a ring gone quiet (coordinator).
         // Either surfaces here so the converge side drives the pipeline into the observable FAILED state.
         return engine.failureOf(pipelineId).or(() -> captureCoordinator.captureFailure(pipelineId));
+    }
+
+    @Override
+    public Optional<Throwable> lost(String pipelineId) {
+        // The engine alone: a member shut down for want of memory took every job it held with it. The capture is
+        // not asked. It keeps running behind a paused pipeline, and whether it has died is failure()'s to say.
+        return engine.lost(pipelineId).map(Throwable.class::cast);
     }
 
     @Override

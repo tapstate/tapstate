@@ -8,6 +8,7 @@ import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.Settings;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.runtime.srs.CaptureHandoff;
 import io.tapstate.runtime.srs.CaptureHealth;
 import io.tapstate.runtime.srs.CaptureRun;
 import io.tapstate.runtime.srs.CaptureError;
@@ -40,6 +41,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CancellationException;
@@ -58,8 +60,8 @@ import org.slf4j.LoggerFactory;
 /**
  * The store-backed capture coordinator: it resolves a pipeline and the sources it reads from the store,
  * attaches every pipeline to its source contract and holds the live handles so a stop can tear them down.
- * In cluster mode, one CAPTURE claim owns the shared tail for a normalized source/read contract; later local
- * pipelines attach to that tail without opening the source again, and another member cannot cross the claim.
+ * One local run owns the shared tail for a normalized source/read contract; later local pipelines attach
+ * without opening the source again. In cluster mode, a CAPTURE claim prevents another member from tailing it.
  * The claim decides who tails a source and nothing about how a pipeline reads it: a pipeline driven by a
  * member that does not hold the claim attaches there exactly as it would beside the tail -- its own load
  * where its record says one is owed, then the changes the holder's tail writes into the shared ring.
@@ -109,17 +111,16 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     /** One member-wide poll of durable expansion requests for captures this member owns. */
     private volatile ScheduledExecutorService physicalReconfigurations;
 
-    /** What each running pipeline's load read, keyed by pipeline; dropped when it stops. */
-    private final Map<String, SnapshotReading> snapshotsByPipeline = new ConcurrentHashMap<>();
+    /** How far each running pipeline's load has got, keyed by pipeline; dropped when it stops. */
+    private final Map<String, PipelineLoad> loadsByPipeline = new ConcurrentHashMap<>();
     private final Map<String, LiveSnapshot> liveSnapshotsByPipeline = new ConcurrentHashMap<>();
 
     /**
      * The tables each running pipeline's snapshot covers, per chain; dropped when it stops. Only the
      * durable record can say whether a load reached the target, and it answers per pipeline, per chain,
      * per table -- so what is kept here is the question rather than the answer: which tables to ask about
-     * and on which chain to ask. The map above cannot stand in for it. That one is keyed by table name
-     * alone, qualified on collision, and carries no chain; and it holds an entry for every selected table
-     * from the moment a run starts, so a set covering it is covered from the start.
+     * and on which chain to ask. The load above cannot stand in for it. Its published tables are keyed by
+     * table name, qualified on collision, and a table still being read has no entry yet.
      */
     private final Map<String, List<SnapshotOnChain>> snapshotTablesByPipeline = new ConcurrentHashMap<>();
 
@@ -134,6 +135,14 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         this.managedOwnership = false;
         this.srsCoordinator = Objects.requireNonNull(srsCoordinator, "srsCoordinator");
         this.snapshotBuffer = Objects.requireNonNull(snapshotBuffer, "snapshotBuffer");
+    }
+
+    /** A single member shares its tails locally, without a cluster claim or lease renewal. */
+    StoreBackedPipelineCaptureCoordinator(
+            StorePort storePort, CaptureAttacher captureAttacher, SrsCoordinator srsCoordinator,
+            SnapshotBuffer snapshotBuffer) {
+        this(storePort, captureAttacher, srsCoordinator, snapshotBuffer,
+                CaptureOwnership.single(), Duration.ZERO);
     }
 
     StoreBackedPipelineCaptureCoordinator(
@@ -417,7 +426,6 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     private void startPlannedCapture(String pipelineId, List<SourcePlan> plans, PendingStart pending) {
         Map<CaptureId, OpeningClaim> permits = new LinkedHashMap<>();
         List<PipelineRun> runs = new ArrayList<>();
-        List<AttributedSnapshot> attributed = new ArrayList<>();
         List<SnapshotOnChain> snapshotTables = new ArrayList<>();
         // Taken before the first source is opened, because the load is what these totals accumulate from
         // and its first row is read inside the loop below. Stamping it afterwards would date the whole
@@ -428,6 +436,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         if (liveSnapshot != null) {
             liveSnapshotsByPipeline.put(pipelineId, liveSnapshot);
         }
+        PipelineLoad load = PipelineLoad.of(plans, loadBegan);
         try {
             settlePermits(pipelineId, plans, permits, pending);
             for (SourcePlan plan : plans) {
@@ -435,18 +444,24 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 SourceCaptureResolution resolution = plan.resolution();
                 CaptureRunSpec spec = plan.spec();
                 CaptureId captureId = plan.captureId();
+                // Written by the thread reading the load and read by whoever asks how far it has got.
                 Map<String, Long> observedSnapshotCounts = new ConcurrentHashMap<>();
-                Consumer<Envelope> receive = snapshotPassthrough(pipelineId, plan.sourceId(), resolution,
-                        spec.cursorWriterToken(), liveSnapshot, observedSnapshotCounts);
+                if (CapturePlan.forReadMode(spec.readMode()).snapshot()) {
+                    // Before the run starts, and so before the job that takes its rows is even assembled: the
+                    // source vertex reads the declaration when it starts, and one that found none would read
+                    // its ring at once, ahead of snapshot rows still to come.
+                    resolution.tables().forEach(
+                            table -> snapshotBuffer.declareSnapshot(pipelineId, resolution.ringName(table)));
+                }
+                CaptureHandoff handoff = snapshotPassthrough(pipelineId, plan, observedSnapshotCounts, load, liveSnapshot);
                 CaptureRun run;
                 if (!managedOwnership) {
-                    run = captureStarter.start(spec, receive);
+                    run = captureStarter.start(spec, handoff);
                     runs.add(PipelineRun.unmanaged(run));
                 } else {
                     OwnedCapture existing = ownedCaptures.get(captureId);
                     if (existing != null) {
-                        run = captureAttacher.start(
-                                spec.withCaptureFence(existing.permit.fence()), receive, false);
+                        run = captureAttacher.start(spec.withCaptureFence(existing.permit.fence()), handoff, false);
                         existing.pipelines.add(pipelineId);
                     } else {
                         OpeningClaim opening = permits.get(captureId);
@@ -457,7 +472,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                             try {
                                 opening.check();
                                 CaptureRunSpec ownedSpec = spec.withCaptureFence(opening.permit.fence());
-                                started = captureAttacher.start(ownedSpec, receive, true);
+                                started = captureAttacher.start(ownedSpec, handoff, true);
                                 opening.check();
                                 pending.check();
                                 run = started;
@@ -468,7 +483,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                                 if (joined != null) {
                                     pipelines.addAll(joined.pipelines);
                                 }
-                                opening.publish(run, pipelines, ownedSpec, receive);
+                                opening.publish(run, pipelines, ownedSpec, handoff);
                             } catch (RuntimeException | Error failure) {
                                 boolean interrupted = Thread.interrupted();
                                 try {
@@ -495,17 +510,28 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                             // Another member tails this source. The pipeline reads it no differently for
                             // that: its own load where its record says one is owed, then the changes the
                             // other member's tail writes into the shared ring.
-                            run = captureAttacher.start(spec, receive, false);
-                            joinedCaptures.computeIfAbsent(captureId, ignored -> new JoinedCapture(spec, receive))
+                            run = captureAttacher.start(spec, handoff, false);
+                            joinedCaptures.computeIfAbsent(captureId, ignored -> new JoinedCapture(spec, handoff))
                                     .pipelines.add(pipelineId);
                             lookForCapturesNobodyTails();
                         }
                     }
-                    runs.add(PipelineRun.managed(captureId, run));
+                    runs.add(PipelineRun.managed(
+                            captureId, run, spec.srsEnabled() && spec.readMode() != ReadMode.SNAPSHOT_ONLY));
                 }
                 pending.check();
-                recordSnapshot(attributed, plan.sourceId(), spec, run, observedSnapshotCounts, plan.discovered());
-                snapshotOnChain(spec, run).ifPresent(snapshotTables::add);
+                if (run.loadOverWhenHandedBack()) {
+                    // Handed back with its load already over -- read on this thread, or none owed. What the
+                    // run said about each table as it went is said again here, so a starter that says
+                    // nothing still leaves every table reported and every declared load ended.
+                    //
+                    // Only such a run. A load read behind the run reports each table itself, as its rows
+                    // are all in, and one that has ended by the time this looks may have ended by failing:
+                    // what arrived of the table it failed on is a prefix, and ending that declaration here
+                    // is what would let the table be recorded as written short.
+                    loadOver(pipelineId, plan, run, observedSnapshotCounts, load);
+                }
+                snapshotOnChain(plan.sourceId(), spec, run).ifPresent(snapshotTables::add);
             }
             pending.check();
         } catch (RuntimeException | Error failure) {
@@ -532,11 +558,50 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             throw failure;
         }
         runsByPipeline.put(pipelineId, runs);
-        snapshotsByPipeline.put(pipelineId, reading(attributed, loadBegan));
+        loadsByPipeline.put(pipelineId, load);
         snapshotTablesByPipeline.put(pipelineId, List.copyOf(snapshotTables));
     }
 
-    /** One source of a start as resolved before any claim or source is opened. */
+    /**
+     * Ends and reports every table of a run that came back with its load over, the way the run's own hand-off
+     * would have as each table went through. Saying it twice changes nothing: an ended load stays ended, and a
+     * table reported again is reported with what it had already read.
+     */
+    private void loadOver(
+            String pipelineId,
+            SourcePlan plan,
+            CaptureRun run,
+            Map<String, Long> observedSnapshotCounts,
+            PipelineLoad load) {
+        CaptureRunSpec spec = plan.spec();
+        if (!CapturePlan.forReadMode(spec.readMode()).snapshot()) {
+            return;
+        }
+        List<String> streams = spec.config().streams();
+        Map<String, Long> counts = run.snapshotCounts().isEmpty() ? observedSnapshotCounts : run.snapshotCounts();
+        for (String table : streams) {
+            long count = streams.size() == 1
+                    ? counts.getOrDefault(table, run.snapshotCount())
+                    : counts.getOrDefault(table, 0L);
+            saveLoadCountIfOwed(spec, run.chainId().map(MiningChainId::value), table, count);
+            snapshotBuffer.endSnapshot(pipelineId, plan.resolution().ringName(table));
+            load.loaded(plan.sourceId(), table, count, estimatedRows(plan.discovered(), table));
+        }
+    }
+
+    /** Keep each measured load until its target confirms it, including across a replacement run. */
+    private void saveLoadCountIfOwed(CaptureRunSpec spec, Optional<String> chainId, String table, long count) {
+        chainId.ifPresent(chain -> {
+            boolean completed = storePort.meta().read(chain)
+                    .map(record -> record.snapshotCompletedTables(spec.pipelineId()).contains(table))
+                    .orElse(false);
+            if (!completed) {
+                SnapshotLoadCounts.save(storePort.keyedState(), spec.pipelineId(), chain, table, count);
+            }
+        });
+    }
+
+    /** One source of a start as it was settled before anything was opened: what to open and for what. */
     private record SourcePlan(
             String sourceId,
             SourceModel discovered,
@@ -639,14 +704,14 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         permits.clear();
     }
 
-    private record PipelineRun(CaptureId captureId, CaptureRun run, boolean managed) {
+    private record PipelineRun(CaptureId captureId, CaptureRun run, boolean managed, boolean sharedTail) {
 
         static PipelineRun unmanaged(CaptureRun run) {
-            return new PipelineRun(null, run, false);
+            return new PipelineRun(null, run, false, false);
         }
 
-        static PipelineRun managed(CaptureId captureId, CaptureRun run) {
-            return new PipelineRun(captureId, run, true);
+        static PipelineRun managed(CaptureId captureId, CaptureRun run, boolean sharedTail) {
+            return new PipelineRun(captureId, run, true, sharedTail);
         }
     }
 
@@ -697,7 +762,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         }
 
         private void publish(CaptureRun run, Set<String> pipelines,
-                CaptureRunSpec spec, Consumer<Envelope> receive) {
+                CaptureRunSpec spec, CaptureHandoff receive) {
             OwnedCapture owned = new OwnedCapture(run, permit, pipelines, spec, receive);
             owned.lease = lease;
             published = owned;
@@ -717,12 +782,12 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         private final CaptureOwnership.Permit permit;
         private final Set<String> pipelines = new LinkedHashSet<>();
         private final CaptureRunSpec spec;
-        private final Consumer<Envelope> receive;
+        private final CaptureHandoff receive;
         private CaptureClaimLease lease;
         private volatile Thread reconfiguring;
 
         private OwnedCapture(CaptureRun run, CaptureOwnership.Permit permit, Collection<String> pipelines,
-                CaptureRunSpec spec, Consumer<Envelope> receive) {
+                CaptureRunSpec spec, CaptureHandoff receive) {
             this.run = run;
             this.permit = permit;
             this.pipelines.addAll(pipelines);
@@ -740,10 +805,10 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     private static final class JoinedCapture {
         private final boolean tails;
         private final CaptureRunSpec tailSpec;
-        private final Consumer<Envelope> tailPassthrough;
+        private final CaptureHandoff tailPassthrough;
         private final Set<String> pipelines = new LinkedHashSet<>();
 
-        private JoinedCapture(CaptureRunSpec joinedWith, Consumer<Envelope> passthrough) {
+        private JoinedCapture(CaptureRunSpec joinedWith, CaptureHandoff passthrough) {
             // A snapshot-only read has no tail for anybody to take over.
             this.tails = joinedWith.readMode() != ReadMode.SNAPSHOT_ONLY;
             this.tailSpec = new CaptureRunSpec(
@@ -830,6 +895,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 if (capture == null || !capture.tails) {
                     continue;
                 }
+                if (stillLoading(capture.pipelines)) { continue; }
                 CaptureOwnership.Permit permit = ownership.acquire(captureId);
                 if (!permit.acquired()) {
                     continue;
@@ -879,6 +945,15 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                         capture.pipelines);
             }
         }
+    }
+
+    /** Whether any run of {@code pipelines} here is still reading its load. */
+    private boolean stillLoading(Collection<String> pipelines) {
+        return pipelines.stream()
+                .map(runsByPipeline::get)
+                .filter(Objects::nonNull)
+                .flatMap(List::stream)
+                .anyMatch(pipelineRun -> pipelineRun.run.loading());
     }
 
     private synchronized void lookForCapturesNobodyTails() {
@@ -1011,7 +1086,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     /** One source run's snapshot: its completion chain, if any, and the tables it covers. */
-    private record SnapshotOnChain(Optional<String> chainId, List<String> tables) {
+    private record SnapshotOnChain(String sourceId, Optional<String> chainId, List<String> tables) {
     }
 
     /**
@@ -1022,18 +1097,35 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      * for it. Keep its tables with an absent chain so they remain owed: without delivery evidence, a
      * resume must re-read the load rather than restart a vertex over an empty snapshot hand-off.
      */
-    private static Optional<SnapshotOnChain> snapshotOnChain(CaptureRunSpec spec, CaptureRun run) {
+    private static Optional<SnapshotOnChain> snapshotOnChain(String sourceId, CaptureRunSpec spec, CaptureRun run) {
         if (!CapturePlan.forReadMode(spec.readMode()).snapshot()) {
             return Optional.empty();
         }
-        return Optional.of(new SnapshotOnChain(run.chainId().map(MiningChainId::value), spec.config().streams()));
-    }
-
-    /** One source's attributed snapshot load: which source, which table, and what it loaded. */
-    private record AttributedSnapshot(String sourceId, String table, TableSnapshot snapshot) {
+        return Optional.of(new SnapshotOnChain(
+                sourceId, run.chainId().map(MiningChainId::value), spec.config().streams()));
     }
 
     private record SnapshotTableKey(String sourceId, String table) {
+    }
+
+    /** One source's attributed snapshot reading, qualified when selected table names collide. */
+    private record AttributedSnapshot(String sourceId, String table, TableSnapshot snapshot) {
+    }
+
+    private static SnapshotReading reading(List<AttributedSnapshot> attributed, Instant loadBegan) {
+        if (attributed.isEmpty()) { return SnapshotReading.NONE; }
+        return new SnapshotReading(keyByTableOrQualifyOnCollision(attributed), loadBegan);
+    }
+
+    private static Map<String, TableSnapshot> keyByTableOrQualifyOnCollision(List<AttributedSnapshot> attributed) {
+        Map<String, Long> occurrences = attributed.stream()
+                .collect(Collectors.groupingBy(AttributedSnapshot::table, Collectors.counting()));
+        Map<String, TableSnapshot> loaded = new LinkedHashMap<>();
+        for (AttributedSnapshot entry : attributed) {
+            String key = occurrences.get(entry.table()) > 1 ? entry.sourceId() + "." + entry.table() : entry.table();
+            loaded.put(key, entry.snapshot());
+        }
+        return loaded;
     }
 
     /** A live snapshot reading from connector callbacks, available before the bounded load finishes. */
@@ -1087,29 +1179,90 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     /**
-     * Records what each selected stream's snapshot loaded, so {@link #startCapture} can key the pipeline's
-     * published snapshot map once every source has run. A cdc-only run has no entries because it never ran a
-     * bounded snapshot phase.
+     * One pipeline's load as the read face is told about it: every table it covers, each published once its
+     * rows are all in, and the moment the load began.
+     *
+     * <p>A table is absent until then rather than shown at the rows read so far, which is what the read face
+     * has always been handed: a count that exists only once a table is through. The load is read while the
+     * pipeline runs, so a table now arrives the moment its own read is over instead of all of them arriving
+     * together before the pipeline had a job; nothing about what a published entry means has moved.
+     *
+     * <p>The name each table is published under is settled when the start is planned. It is the bare table
+     * name, unless more than one source in this pipeline reads a table of that same name (a normal shape: the
+     * same table name in two different databases), in which case every entry for that name is qualified
+     * {@code source_id.table}, the same addressing form `serve.from` and friends already use to disambiguate a
+     * table reference. That depends on every source of the pipeline and not on which of their loads is through
+     * first, so it cannot wait for the tables to arrive. A plain table-name key would otherwise have the last
+     * source silently overwrite an earlier one's count and attribute it to the wrong source; qualifying only
+     * the names that actually collide keeps the common single-source case unchanged.
      */
-    private static void recordSnapshot(
-            List<AttributedSnapshot> attributed,
-            String sourceId,
-            CaptureRunSpec spec,
-            CaptureRun run,
-            Map<String, Long> observedSnapshotCounts,
-            SourceModel discovered) {
-        List<String> streams = spec.config().streams();
-        if (!CapturePlan.forReadMode(spec.readMode()).snapshot()) {
-            return;
+    private static final class PipelineLoad {
+
+        private final Instant began;
+        private final Map<CoveredTable, String> keys;
+        private final Map<CoveredTable, Long> estimates;
+        private final Map<String, TableSnapshot> through = new ConcurrentHashMap<>();
+
+        private PipelineLoad(Instant began, Map<CoveredTable, String> keys, Map<CoveredTable, Long> estimates) {
+            this.began = began;
+            this.keys = keys;
+            this.estimates = estimates;
         }
-        for (String table : streams) {
-            Map<String, Long> counts = run.snapshotCounts().isEmpty() ? observedSnapshotCounts : run.snapshotCounts();
-            long count = streams.size() == 1
-                    ? counts.getOrDefault(table, run.snapshotCount())
-                    : counts.getOrDefault(table, 0L);
-            Long total = estimatedRows(discovered, table);
-            attributed.add(new AttributedSnapshot(sourceId, table, new TableSnapshot(count, total, share(count, total))));
+
+        /** The load of every source among {@code plans} that reads one; a cdc-only source covers nothing. */
+        static PipelineLoad of(List<SourcePlan> plans, Instant began) {
+            List<CoveredTable> covered = new ArrayList<>();
+            Map<CoveredTable, Long> estimates = new LinkedHashMap<>();
+            for (SourcePlan plan : plans) {
+                if (CapturePlan.forReadMode(plan.spec().readMode()).snapshot()) {
+                    for (String table : plan.spec().config().streams()) {
+                        CoveredTable entry = new CoveredTable(plan.sourceId(), table);
+                        covered.add(entry);
+                        Long total = StoreBackedPipelineCaptureCoordinator.estimatedRows(plan.discovered(), table);
+                        if (total != null) {
+                            estimates.put(entry, total);
+                        }
+                    }
+                }
+            }
+            Map<String, Long> occurrences = covered.stream()
+                    .collect(Collectors.groupingBy(CoveredTable::table, Collectors.counting()));
+            Map<CoveredTable, String> keys = new LinkedHashMap<>();
+            for (CoveredTable entry : covered) {
+                keys.put(entry, occurrences.get(entry.table()) > 1
+                        ? entry.sourceId() + "." + entry.table() : entry.table());
+            }
+            return new PipelineLoad(began, Map.copyOf(keys), Map.copyOf(estimates));
         }
+
+        /** {@code table} of {@code sourceId} is through, having read {@code rows} out of about {@code total}. */
+        void loaded(String sourceId, String table, long rows, Long total) {
+            String key = keys.get(new CoveredTable(sourceId, table));
+            if (key != null) {
+                through.put(key, new TableSnapshot(rows, total, share(rows, total)));
+            }
+        }
+
+        /**
+         * The tables through so far, counted from when the load began; nothing at all while none is. A
+         * pipeline that ran no bounded load likewise reports nothing rather than a start with no rows: the
+         * two are not the same claim, and a table through at zero rows already says "read, and empty".
+         */
+        SnapshotReading reading() {
+            return through.isEmpty() ? SnapshotReading.NONE : new SnapshotReading(Map.copyOf(through), began);
+        }
+
+        Long estimatedRows(String sourceId, String table) {
+            return estimates.get(new CoveredTable(sourceId, table));
+        }
+
+        String keyOf(String sourceId, String table) {
+            return keys.get(new CoveredTable(sourceId, table));
+        }
+    }
+
+    /** One table of one source, as a pipeline's load covers it. */
+    private record CoveredTable(String sourceId, String table) {
     }
 
     /**
@@ -1143,8 +1296,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      * is what discovery counted, but a load that read rows out of a table counted as empty says the count
      * is stale, and no percentage describes that.
      *
-     * <p>A share past a hundred is reported as a hundred. The load is finished by the time this is asked,
-     * so overshooting a stale estimate means complete, and a progress figure above full is not a state
+     * <p>A share past a hundred is reported as a hundred. The table's load is finished by the time this is
+     * asked, so overshooting a stale estimate means complete, and a progress figure above full is not a state
      * anything can be in -- publishing one would leave every reader to decide for themselves what it meant.
      */
     private static Integer share(long loaded, Long total) {
@@ -1154,55 +1307,67 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         return (int) Math.min(100L, loaded * 100L / total);
     }
 
-    /**
-     * What {@code attributed} amounts to for the whole pipeline: the per-table loads keyed for the read
-     * face, counted from {@code loadBegan}.
-     *
-     * <p>A pipeline that ran no bounded load reports nothing at all rather than a start with no rows. The
-     * two are not the same claim: one says no load ran, and the other would say a load ran and read
-     * nothing, which is a real and different state that a table entry at zero rows already expresses.
-     */
-    private static SnapshotReading reading(List<AttributedSnapshot> attributed, Instant loadBegan) {
-        if (attributed.isEmpty()) {
+    @Override
+    public SnapshotReading snapshotProgress(String pipelineId) {
+        PipelineLoad load = loadsByPipeline.get(pipelineId);
+        if (load == null) {
             return SnapshotReading.NONE;
         }
-        return new SnapshotReading(keyByTableOrQualifyOnCollision(attributed), loadBegan);
-    }
-
-    /**
-     * Keys each attributed load by its bare table name, unless more than one source in this pipeline read a
-     * table of that same name (a normal shape: the same table name in two different databases) — in that
-     * case every entry for that name is instead qualified {@code source_id.table}, the same addressing form
-     * `serve.from` and friends already use to disambiguate a table reference. A plain table-name key would
-     * otherwise have the last source silently overwrite an earlier one's count and attribute it to the wrong
-     * source; qualifying only the names that actually collide keeps the common single-source case unchanged.
-     */
-    private static Map<String, TableSnapshot> keyByTableOrQualifyOnCollision(List<AttributedSnapshot> attributed) {
-        Map<String, Long> occurrences = attributed.stream()
-                .collect(Collectors.groupingBy(AttributedSnapshot::table, Collectors.counting()));
-        Map<String, TableSnapshot> loaded = new LinkedHashMap<>();
-        for (AttributedSnapshot entry : attributed) {
-            String key = occurrences.get(entry.table()) > 1 ? entry.sourceId() + "." + entry.table() : entry.table();
-            loaded.put(key, entry.snapshot());
+        // A table this run skipped may not have been published by its hand-off yet, because another
+        // table is still being read. Its sink's durable completion mark already answers for it. The
+        // measured count was saved before that sink could confirm the load; discovery's estimate is the
+        // fallback for an older completed record without one.
+        SnapshotReading current = runSnapshotProgress(pipelineId);
+        List<SnapshotOnChain> covered = snapshotTablesByPipeline.getOrDefault(pipelineId, List.of());
+        if (covered.isEmpty()) {
+            return current;
         }
-        return loaded;
+        Map<String, TableSnapshot> completed = new LinkedHashMap<>(current.byTable());
+        boolean changed = false;
+        for (SnapshotOnChain source : covered) {
+            if (source.chainId().isEmpty()) {
+                continue;
+            }
+            List<String> confirmed = storePort.meta().read(source.chainId().orElseThrow())
+                    .map(record -> record.snapshotCompletedTables(pipelineId)).orElse(List.of());
+            for (String table : source.tables()) {
+                if (!confirmed.contains(table)) {
+                    continue;
+                }
+                String key = load.keyOf(source.sourceId(), table);
+                if (key == null) {
+                    continue;
+                }
+                TableSnapshot reading = completed.get(key);
+                OptionalLong saved = SnapshotLoadCounts.read(storePort.keyedState(), pipelineId,
+                        source.chainId().orElseThrow(), table);
+                Long rows = saved.isPresent() ? saved.getAsLong()
+                        : reading != null && reading.rowsDone() > 0L ? reading.rowsDone()
+                        : reading != null && reading.rowsTotal() != null ? reading.rowsTotal()
+                        : load.estimatedRows(source.sourceId(), table);
+                if (rows == null) {
+                    continue;
+                }
+                completed.put(key, new TableSnapshot(rows, rows, 100));
+                changed = true;
+            }
+        }
+        return changed ? new SnapshotReading(completed, load.began) : current;
     }
 
     @Override
-    public SnapshotReading snapshotProgress(String pipelineId) {
+    public SnapshotReading runSnapshotProgress(String pipelineId) {
+        PipelineLoad load = loadsByPipeline.get(pipelineId);
+        SnapshotReading settled = load == null ? SnapshotReading.NONE : load.reading();
         LiveSnapshot live = liveSnapshotsByPipeline.get(pipelineId);
-        SnapshotReading settled = snapshotsByPipeline.getOrDefault(pipelineId, SnapshotReading.NONE);
-        if (live == null) {
-            return settled;
-        }
-        SnapshotReading moving = live.reading();
-        Map<String, TableSnapshot> combined = new LinkedHashMap<>(settled.byTable());
-        moving.byTable().forEach((table, current) -> combined.merge(table, current, (previous, now) -> {
-            long rows = Math.max(previous.rowsDone(), now.rowsDone());
-            Long total = previous.rowsTotal() != null ? previous.rowsTotal() : now.rowsTotal();
+        if (live == null) { return settled; }
+        Map<String, TableSnapshot> current = new LinkedHashMap<>(settled.byTable());
+        live.reading().byTable().forEach((table, moving) -> current.merge(table, moving, (complete, now) -> {
+            long rows = Math.max(complete.rowsDone(), now.rowsDone());
+            Long total = complete.rowsTotal() != null ? complete.rowsTotal() : now.rowsTotal();
             return new TableSnapshot(rows, total, share(rows, total));
         }));
-        return new SnapshotReading(combined, live.began);
+        return new SnapshotReading(current, live.began);
     }
 
     /**
@@ -1284,7 +1449,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     private void stopCaptureLocked(String pipelineId, boolean purgeState) {
         // The load belongs to the run being torn down: a stopped pipeline reports no snapshot rather than the
         // rows its previous run happened to load.
-        snapshotsByPipeline.remove(pipelineId);
+        loadsByPipeline.remove(pipelineId);
         liveSnapshotsByPipeline.remove(pipelineId);
         snapshotTablesByPipeline.remove(pipelineId);
         // Holding no runs is not the same as having nothing to release. A pipeline whose start threw part
@@ -1418,6 +1583,9 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             for (String chainId : storePort.meta().miningChainIdsWithConsumer(pipelineId)) {
                 firstFailure = purgeWhatTheRecordStillHolds(chainId, pipelineId, firstFailure);
             }
+            firstFailure = runCleanup(
+                    () -> storePort.keyedState().dropNamespace(SnapshotLoadCounts.namespaceOf(pipelineId)),
+                    firstFailure);
         }
         return firstFailure;
     }
@@ -1455,6 +1623,13 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         if (!owned.pipelines.isEmpty()) {
             if (pipelineRun.run != owned.run) {
                 pipelineRun.run.close();
+            } else {
+                // The run stays, because the pipelines still on the capture read what it goes on to do; the
+                // load in it was this pipeline's alone, so that is let go of. Left reading, it would end on
+                // the release of this pipeline's hand-off below, as a failure of the run the others read --
+                // or, not waiting for room at that moment, go on handing rows to a queue nothing declares,
+                // bounds or drains.
+                owned.run.abandonLoad();
             }
             return;
         }
@@ -1587,13 +1762,16 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         if (runs == null) {
             return Optional.empty();
         }
-        // The pipeline's cdc capture has failed if any of its source runs' tails died; surface the first, so a
-        // dead tail becomes a failure the converge loop drives to the observable FAILED state rather than an
-        // engine job that stays running over a ring gone quiet.
+        // Surface a failure of this pipeline's own run or a tail it shares with another pipeline. A
+        // snapshot-only capture has no shared tail; its owner's load failure belongs to that owner alone.
         return runs.stream()
                 .map(run -> {
-                    OwnedCapture owned = run.managed ? ownedCaptures.get(run.captureId) : null;
-                    return owned == null ? run.run.failure() : owned.run.failure();
+                    Optional<Throwable> ownFailure = run.run.failure();
+                    if (ownFailure.isPresent()) {
+                        return ownFailure;
+                    }
+                    OwnedCapture shared = run.sharedTail ? ownedCaptures.get(run.captureId) : null;
+                    return shared == null ? Optional.<Throwable>empty() : shared.run.failure();
                 })
                 .filter(Optional::isPresent)
                 .map(Optional::get)
@@ -1623,39 +1801,59 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     /**
-     * The callback for one source: counts snapshot rows as they arrive and hands a direct tail's CDC events
-     * to the legacy member-local buffer. A deferred snapshot has already inserted its row into the bounded
-     * session under the same token; appending it here again would deliver it twice. A stale token is refused
-     * so an old callback cannot feed a replacement run's buffer.
+     * The snapshot pass-through for one source: it appends each snapshot row to the shared buffer under this
+     * consumer pipeline and the source's change-ring name. Only that pipeline's source vertex can drain the
+     * rows, then emits them ahead of the cdc tail, so the snapshot flows through the same transform-to-sink
+     * chain as cdc, strictly before it. A read mode that runs no snapshot never calls this, so the buffer for
+     * that pipeline and ring stays empty and the source is a pure tail.
+     *
+     * <p>A declared load is held to a few thousand rows in that buffer, so an append waits whenever the
+     * pipeline has not yet taken what is there -- which is how the pipeline's own pace reaches the source
+     * read. When a table's load is through, its declaration is ended, which lets the source vertex move on
+     * to the ring, and the table is published to the read face with what it read.
      */
-    private Consumer<Envelope> snapshotPassthrough(
-            String pipelineId, String sourceId, SourceCaptureResolution resolution, String token,
-            LiveSnapshot liveSnapshot,
-            Map<String, Long> observedSnapshotCounts) {
+    private CaptureHandoff snapshotPassthrough(
+            String pipelineId, SourcePlan plan, Map<String, Long> observedSnapshotCounts, PipelineLoad load, LiveSnapshot liveSnapshot) {
+        SourceCaptureResolution resolution = plan.resolution();
         Set<String> selectedTables = Set.copyOf(resolution.tables());
-        return event -> {
-            if (!selectedTables.contains(event.src())) {
-                throw new TapstateException(
-                        CaptureError.EVENT_TABLE_NOT_SELECTED, Map.of("table", event.src()), null);
-            }
-            String ringName = resolution.ringName(event.src());
-            if (event.op() == Op.READ) {
-                observedSnapshotCounts.merge(event.src(), 1L, Long::sum);
-                if (snapshotBuffer.hasSnapshot(pipelineId, ringName)) {
-                    if (!snapshotBuffer.hasSnapshot(pipelineId, ringName, token)) {
-                        throw new CancellationException("snapshot row belongs to an obsolete capture run");
-                    }
-                    // The deferred capture already wrote this row into its bounded session.
-                    if (liveSnapshot != null) {
-                        liveSnapshot.received(sourceId, event.src());
-                    }
-                    return;
+        CaptureRunSpec spec = plan.spec();
+        CapturePlan phases = CapturePlan.forReadMode(spec.readMode());
+        Optional<String> chainId = phases.snapshot() && phases.cdc()
+                ? Optional.of(MiningChainId.resolve(spec.config(), spec.srsKey()).value()) : Optional.empty();
+        return new CaptureHandoff() {
+            @Override
+            public void accept(Envelope event) {
+                if (!selectedTables.contains(event.src())) {
+                    throw new TapstateException(
+                            CaptureError.EVENT_TABLE_NOT_SELECTED, Map.of("table", event.src()), null);
                 }
-                if (liveSnapshot != null) {
-                    liveSnapshot.received(sourceId, event.src());
+                String ring = resolution.ringName(event.src());
+                if (event.op() == Op.READ) {
+                    observedSnapshotCounts.merge(event.src(), 1L, Long::sum);
+                    if (liveSnapshot != null) { liveSnapshot.received(plan.sourceId(), event.src()); }
+                    if (snapshotBuffer.hasSnapshot(pipelineId, ring)) {
+                        if (!snapshotBuffer.hasSnapshot(pipelineId, ring, spec.cursorWriterToken())) {
+                            throw new CancellationException("snapshot row belongs to an obsolete capture run");
+                        }
+                        // The deferred reader has already appended this row to its exact bounded session.
+                        return;
+                    }
                 }
+                snapshotBuffer.append(pipelineId, ring, event);
             }
-            snapshotBuffer.append(pipelineId, ringName, event);
+
+            @Override
+            public void loaded(String table) {
+                String ring = resolution.ringName(table);
+                if (snapshotBuffer.hasSnapshot(pipelineId, ring)
+                        && !snapshotBuffer.hasSnapshot(pipelineId, ring, spec.cursorWriterToken())) {
+                    throw new CancellationException("snapshot completion belongs to an obsolete capture run");
+                }
+                saveLoadCountIfOwed(spec, chainId, table, observedSnapshotCounts.getOrDefault(table, 0L));
+                snapshotBuffer.endSnapshot(pipelineId, resolution.ringName(table));
+                load.loaded(plan.sourceId(), table, observedSnapshotCounts.getOrDefault(table, 0L),
+                        estimatedRows(plan.discovered(), table));
+            }
         };
     }
 

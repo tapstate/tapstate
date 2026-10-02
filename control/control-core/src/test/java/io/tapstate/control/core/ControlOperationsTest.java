@@ -40,11 +40,20 @@ class ControlOperationsTest {
                         "data-browser.stats",
                         "cluster.members",
                         "pipeline.list",
+                        "pipeline.catalog",
                         "pipeline.get",
                         "pipeline.layout.get",
                         "pipeline.layout.update",
                         "pipeline.create",
                         "pipeline.update",
+                        "pipeline-draft.list",
+                        "pipeline-draft.get",
+                        "pipeline-draft.create",
+                        "pipeline-draft.replace",
+                        "pipeline-draft.delete",
+                        "pipeline-draft.preview",
+                        "pipeline-draft.publish",
+                        "pipeline-draft.rebase",
                         "pipeline.start",
                         "pipeline.stop",
                         "pipeline.pause",
@@ -118,7 +127,7 @@ class ControlOperationsTest {
         // The static Pipeline projection, layout read, and observation reads are all
         // read faces; read-scoped, unaudited.
         for (String id : List.of(
-                "pipeline.list", "pipeline.get", "pipeline.layout.get", "pipeline.status", "pipeline.metrics",
+                "pipeline.list", "pipeline.catalog", "pipeline.get", "pipeline.layout.get", "pipeline.status", "pipeline.metrics",
                 "pipeline.snapshot", "pipeline.logs", "pipeline.metrics.history", "pipeline.events", "pipeline.explain")) {
             assertThat(registry.resolve(id).scope()).as(id).isEqualTo(Scope.READ);
         }
@@ -139,6 +148,7 @@ class ControlOperationsTest {
                         "connection.test",
                         "connection.discover-schema",
                         "connector.register",
+                        "pipeline-draft.rebase",
                         "pipeline.start",
                         "pipeline.stop",
                         "pipeline.pause",
@@ -172,6 +182,7 @@ class ControlOperationsTest {
                 "user.list",
                 "token.list",
                 "pipeline.list",
+                "pipeline.catalog",
                 "pipeline.get",
                 "pipeline.layout.get",
                 "pipeline.layout.update",
@@ -191,7 +202,7 @@ class ControlOperationsTest {
         // A scope statement about the registry alone: the CLI face opens every registered operation and
         // clips none of them. Whether each one has a verb behind it is not knowable from here
         // — control-core cannot see the CLI — and is gated where both are visible, in arch-tests.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(52);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(61);
         assertThat(registry.all()).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
     }
@@ -206,7 +217,7 @@ class ControlOperationsTest {
     }
 
     @Test
-    void mcpFaceIsTheOnlineAuthoringClosurePlusTheReadFaceAndRestExposureRemainsEmpty() {
+    void mcpFaceIsTheOnlineAuthoringClosureAndRestCarriesWebDraftAuthoring() {
         // The read face joins on the same terms as everything else here — a mark on the registry entry.
         // The three are read-scoped, so a caller holding no write capability still gets all three.
         // pause / resume are here for the stop's sake: with only the clearing verb open, the answer it
@@ -227,9 +238,12 @@ class ControlOperationsTest {
                         // Neither half of the resume-point pair is here: where to resume from turns on
                         // the source's retention window, which nothing on this face can see.
                         "data-browser.collections", "data-browser.find", "data-browser.stats");
-        // Deliberately the widest ceiling, not the shipped one: REST carries no operation at any stage,
-        // which is a stronger statement than "none has reached the stage we ship".
-        assertThat(registry.exposedOn(Frontend.REST, Maturity.GA)).isEmpty();
+        assertThat(registry.exposedOn(Frontend.REST, Maturity.GA))
+                .extracting(Operation::id)
+                .containsExactlyInAnyOrder(
+                        "pipeline-draft.list", "pipeline-draft.get", "pipeline-draft.create",
+                        "pipeline-draft.replace", "pipeline-draft.delete", "pipeline-draft.preview",
+                        "pipeline-draft.publish", "pipeline-draft.rebase", "pipeline.catalog");
     }
 
     /**

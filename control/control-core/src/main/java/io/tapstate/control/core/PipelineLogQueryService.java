@@ -17,7 +17,7 @@ import java.util.Objects;
  */
 public final class PipelineLogQueryService {
 
-    public enum Scope {
+    public enum LogScope {
         CURRENT,
         INCARNATION
     }
@@ -44,10 +44,10 @@ public final class PipelineLogQueryService {
 
     /** The pipeline's most recent log lines, oldest to newest; empty when it has logged nothing here. */
     public PipelineLogs logs(String pipelineId) {
-        return logs(pipelineId, Scope.CURRENT);
+        return logs(pipelineId, LogScope.CURRENT);
     }
 
-    public PipelineLogs logs(String pipelineId, Scope scope) {
+    public PipelineLogs logs(String pipelineId, LogScope scope) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(scope, "scope");
         return new PipelineLogs(pipelineId, selectedLines(pipelineId, scope));
@@ -55,10 +55,10 @@ public final class PipelineLogQueryService {
 
     /** The pipeline's most recent {@code limit} lines, oldest to newest. */
     public PipelineLogs logs(String pipelineId, int limit) {
-        return logs(pipelineId, limit, Scope.CURRENT);
+        return logs(pipelineId, limit, LogScope.CURRENT);
     }
 
-    public PipelineLogs logs(String pipelineId, int limit, Scope scope) {
+    public PipelineLogs logs(String pipelineId, int limit, LogScope scope) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(scope, "scope");
         if (limit < 1) {
@@ -69,7 +69,7 @@ public final class PipelineLogQueryService {
         return new PipelineLogs(pipelineId, lines.subList(from, lines.size()));
     }
 
-    private List<LogLine> selectedLines(String pipelineId, Scope scope) {
+    private List<LogLine> selectedLines(String pipelineId, LogScope scope) {
         if (artifacts == null) {
             return logs.tail(pipelineId);
         }
@@ -80,7 +80,7 @@ public final class PipelineLogQueryService {
         if (incarnation.isEmpty()) {
             return logs.tail(pipelineId);
         }
-        if (scope == Scope.INCARNATION) {
+        if (scope == LogScope.INCARNATION) {
             return logs.tailIncarnation(pipelineId, incarnation.get());
         }
         var generation = generations.currentGeneration(clusterId, pipelineId);

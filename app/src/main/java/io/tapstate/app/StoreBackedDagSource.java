@@ -166,9 +166,14 @@ final class StoreBackedDagSource implements DagSource {
         captured.validateStart(pipelineId);
         NestCapacity capacity = captured.capacityOf(pipelineId);
         Set<OperatorStateLocation> locations = captured.stateLocations(pipelineId, defaultDatabase);
+        PipelineResource pipeline = PipelineInlining.inline(
+                StoredArtifacts.requirePipeline(captured.artifacts(), pipelineId), captured.artifacts());
+        // Freshness belongs to the start before capture registers its ring cursor and snapshot seam.
+        // Carry that answer into the deferred build rather than re-reading capture's own mutations.
+        boolean freshFullLoad = captured.freshFullLoad(pipeline);
         return new StartPreparation(
                 capacity, locations, Optional.of(snapshot), cursorToken,
-                fence -> captured.dagFor(pipelineId, fence));
+                fence -> captured.dagFor(pipelineId, fence, freshFullLoad));
     }
 
     @Override
@@ -267,10 +272,21 @@ final class StoreBackedDagSource implements DagSource {
      */
     @Override
     public DAG dagFor(String pipelineId, ExecutionFence fence) {
-        // Expanded before anything reads the blocks, so every later step - target resolution included -
-        // sees one shape rather than having to know a reference from a body.
         PipelineResource pipeline = PipelineInlining.inline(
                 StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        return dagFor(pipelineId, fence, pipeline, freshFullLoad(pipeline));
+    }
+
+    private DAG dagFor(String pipelineId, ExecutionFence fence, boolean freshFullLoad) {
+        PipelineResource pipeline = PipelineInlining.inline(
+                StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        return dagFor(pipelineId, fence, pipeline, freshFullLoad);
+    }
+
+    private DAG dagFor(
+            String pipelineId, ExecutionFence fence, PipelineResource pipeline, boolean freshFullLoad) {
+        // Expanded before anything reads the blocks, so every later step - target resolution included -
+        // sees one shape rather than having to know a reference from a body.
         Map<String, SourceVertex> sourceVertices = sourceVertices(pipeline);
         // The pipeline takes its own copy of what discovery found for each table it reads, before anything
         // downstream is worked out from it. Reading the discovery directly instead would let a
@@ -349,7 +365,7 @@ final class StoreBackedDagSource implements DagSource {
         return PipelineDagBuilder.build(
                 builtPipeline,
                 bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets, viewTargets,
-                        serveStreams, viewStreams, stepIds, frontier, compiledJoins, fence),
+                        serveStreams, viewStreams, stepIds, frontier, compiledJoins, freshFullLoad, fence),
                 FencedSinkAckFactory.heldTo(sinkAckFactory(pipeline, pipelineId), fence), frontier);
     }
 
@@ -382,6 +398,7 @@ final class StoreBackedDagSource implements DagSource {
             holdings.add(PipelineStateInventory.OPERATOR_STATE.in(operatorNamespaces));
         }
         Set<String> driveNamespaces = new LinkedHashSet<>(connectorStateNamespaces(pipeline));
+        driveNamespaces.add(SnapshotLoadCounts.namespaceOf(pipelineId));
         if (readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY) {
             // This is capture-side state kept for the next drive, just as a connector's own notes are.
             // Clearing that state clears the generation too; keeping it lets a reread outrank operator
@@ -695,9 +712,12 @@ final class StoreBackedDagSource implements DagSource {
                 published.put(stream, publishedAs(base, produced, atTheSource(pipelineId, stream,
                         sourceVertices)));
             } else if (produced != null) {
-                // Unknown lineage cannot preserve source attributes or secondary uniqueness.
+                // Unknown lineage cannot preserve source attributes or secondary uniqueness. A decimal
+                // type token also declares bounds, so it cannot survive a script that may replace it.
                 published.put(stream, TargetModelResolver.keyedOn(new TargetTable(base.name(), base.fields().stream()
-                        .map(field -> new TargetField(field.name(), field.type(), field.primaryKey(), field.inferredType()))
+                        .map(field -> new TargetField(field.name(),
+                                field.inferredType() == io.tapstate.core.common.TapstateType.DECIMAL
+                                        ? null : field.type(), field.primaryKey(), field.inferredType()))
                         .toList(), List.of()), base.fields().stream().filter(TargetField::primaryKey)
                         .map(TargetField::name).toList()));
             }
@@ -1056,9 +1076,15 @@ final class StoreBackedDagSource implements DagSource {
         produced.origins().forEach((output, origin) -> parentNames.put(origin, output));
         for (String column : produced.columns().keySet()) {
             TargetField carried = declared.get(column);
-            boolean spellingStillHolds = carried != null && !retyped(column, produced, atTheSource);
+            var inferred = JoinSchemaDrift.typeOf(produced.columns().get(column));
+            // A decimal without a descriptor can reuse an older source spelling only while the value
+            // is unchanged. A computed value with the same name has no declared source range.
+            boolean spellingStillHolds = carried != null && !retyped(column, produced, atTheSource)
+                    && (inferred != io.tapstate.core.common.TapstateType.DECIMAL
+                    || produced.numericTypes().containsKey(column)
+                    || produced.unchangedFields().contains(column));
             fields.add(new TargetField(column, spellingStillHolds ? carried.type() : null, false,
-                    JoinSchemaDrift.typeOf(produced.columns().get(column)),
+                    inferred,
                     produced.numericTypes().get(column), produced.stringTypes().get(column)));
             TargetField identity = produced.expanded()
                     ? declared.get(produced.origins().get(column)) : carried;
@@ -1278,7 +1304,7 @@ final class StoreBackedDagSource implements DagSource {
         if (readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY) {
             return SinkAckFactory.NONE;
         }
-        return new StoreBackedSinkAckFactory(chainIdByTable(pipeline), pipelineId);
+        return new StoreBackedSinkAckFactory(chainIdByTable(pipeline), pipelineId, storePort.meta());
     }
 
     /**
@@ -1315,6 +1341,7 @@ final class StoreBackedDagSource implements DagSource {
             Set<String> stepIds,
             FrontierBinding frontier,
             Map<String, CompiledJoin> compiledJoins,
+            boolean freshFullLoad,
             ExecutionFence fence) {
         ChainAxes axes = frontier.axes();
         boolean snapshotOnly = readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY;
@@ -1328,7 +1355,7 @@ final class StoreBackedDagSource implements DagSource {
                 key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch, freshStart),
                 step -> transformBinding(step, stepsById, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds),
                 element -> FencedSinkWriterFactory.heldTo(
-                        sinkWriter(pipeline, element, targets, serveStreams), fence),
+                        sinkWriter(pipeline, element, targets, serveStreams, sourceIdByTable, freshFullLoad), fence),
                 ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
                 sourceKeysById::get,
                 view -> FencedSinkWriterFactory.heldTo(
@@ -2440,17 +2467,17 @@ final class StoreBackedDagSource implements DagSource {
      */
     private SupplierEx<? extends SinkWriter> sinkWriter(
             PipelineResource pipeline, SyncElement element, Map<String, TargetTable> targets,
-            Set<String> serveStreams) {
+            Set<String> serveStreams, Map<String, String> sourceIdByTable, boolean freshFullLoad) {
         SourceResource sink = StoredArtifacts.requireSource(artifacts(), element.source());
         return sinkWriterBinder.bind(
                 sink.connector(), sink.config(), writeMode(element.writeMode()), ddl(element.ddl()),
-                TargetModelResolver.renameAll(targets, serveStreams, element.rename()),
+                TargetModelResolver.renameAll(targets, serveStreams, element.rename(), sourceIdByTable),
                 new PipelineNode(pipeline.id(), syncNodeId(element)),
                 element.onFullLoad() == null ? OnFullLoad.APPEND : OnFullLoad.valueOf(element.onFullLoad().name()),
-                freshFullLoad(pipeline));
+                freshFullLoad);
     }
 
-    /** A CDC-only read and any previously delivered load suppress destructive target preparation. */
+    /** A CDC-only read and any durable consumer state suppress target preparation. */
     private boolean freshFullLoad(PipelineResource pipeline) {
         if (pipeline.settings() != null
                 && pipeline.settings().readMode() == io.tapstate.core.model.ReadMode.CDC_ONLY) {
@@ -2459,7 +2486,11 @@ final class StoreBackedDagSource implements DagSource {
         return sourceVertices(pipeline).values().stream().noneMatch(vertex ->
                 storePort.meta().read(vertex.resolution().chainId().value())
                         .map(meta -> meta.consumerOffsets().stream().anyMatch(
-                                consumer -> consumer.pipelineId().equals(pipeline.id())))
+                                consumer -> consumer.pipelineId().equals(pipeline.id())
+                                        && (!consumer.perTableSeq().isEmpty()
+                                                || consumer.sinkAcked() != null
+                                                || !consumer.snapshotCompletedTables().isEmpty()
+                                                || consumer.cdcStartPosition() != null)))
                         .orElse(false));
     }
 

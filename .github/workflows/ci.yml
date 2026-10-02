@@ -226,6 +226,7 @@ jobs:
             -Dsonar.host.url="$SONAR_HOST_URL"
             -Dsonar.login="$SONAR_TOKEN"
             -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=1800
           )
           # On a release tag (e.g. v1.2.3) stamp the analysis with the release version (strip the
           # leading v), so it creates a version event. With the "previous version" New Code
@@ -258,8 +259,23 @@ jobs:
           ps="$(curl -s -u "$SONAR_TOKEN:" "$host/api/qualitygates/project_status?projectKey=tapstate&pullRequest=${PR_NUMBER}" || true)"
           status="$(printf '%s' "$ps" | jq -r '.projectStatus.status // "UNKNOWN"' 2>/dev/null || echo UNKNOWN)"
           details="$(printf '%s' "$ps" | jq -r '.projectStatus.conditions[]? | select(.status=="ERROR") | "- `\(.metricKey)`: \(.actualValue) (fails \(.comparator) \(.errorThreshold))"' 2>/dev/null || true)"
-          bugs="$(curl -s -u "$SONAR_TOKEN:" "$host/api/issues/search?componentKeys=tapstate&pullRequest=${PR_NUMBER}&resolved=false&types=BUG&ps=100" || true)"
-          bug_details="$(printf '%s' "$bugs" | jq -r '.issues[]? | "- `\(.rule)` [\(.severity)]: `\(.component | sub("^tapstate:"; "")):\(.line // "?")` — \(.message)"' 2>/dev/null || true)"
+          issue_details=""
+          page=1
+          while :; do
+            issues="$(curl -s -u "$SONAR_TOKEN:" "$host/api/issues/search?componentKeys=tapstate&pullRequest=${PR_NUMBER}&resolved=false&ps=100&p=${page}" || true)"
+            page_details="$(printf '%s' "$issues" | jq -r '.issues[]? | "- `\(.rule)` [\(.severity)]: `\(.component | sub("^tapstate:"; "")):\(.line // "?")` — \(.message)"' 2>/dev/null || true)"
+            if [ -n "$page_details" ]; then
+              if [ -n "$issue_details" ]; then
+                issue_details="${issue_details}"$'\n'
+              fi
+              issue_details="${issue_details}${page_details}"
+            fi
+            next_page="$(printf '%s' "$issues" | jq -r '.paging | select((.pageIndex * .pageSize) < .total) | (.pageIndex + 1)' 2>/dev/null || true)"
+            if ! [[ "$next_page" =~ ^[0-9]+$ ]] || [ "$next_page" -le "$page" ]; then
+              break
+            fi
+            page="$next_page"
+          done
 
           case "$status" in
             OK)    emoji="white_check_mark";   verdict="passed" ;;
@@ -277,8 +293,8 @@ jobs:
             if [ -n "${details:-}" ]; then
               printf 'Failing conditions:\n%s\n\n' "$details"
             fi
-            if [ -n "${bug_details:-}" ]; then
-              printf 'Open reliability issues:\n%s\n\n' "$bug_details"
+            if [ -n "${issue_details:-}" ]; then
+              printf 'Open unresolved issues:\n%s\n\n' "$issue_details"
             fi
             printf '[Open the pull-request dashboard](%s)\n\n' "$dashboard"
             printf '_Posted by CI from the SonarQube pull-request quality gate._\n'
@@ -415,19 +431,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: shellcheck the catalog scripts
         # One invocation over all four rather than a line each: a `run: |` block runs under bash -e,
         # so the first script to report anything aborts the step and the ones after it are never
         # checked - which reads as "the rest were clean". The installer job above lost three scripts
         # that way for three sessions. Checked against 0.9.0, which is what the runner's apt ships and
         # is stricter here than a current local build.
-        run: shellcheck scripts/refresh-catalog.sh scripts/refresh-catalog-smoke.sh scripts/build-real-connectors.sh scripts/build-real-connectors-smoke.sh .github/scripts/catalog-age-days.sh .github/scripts/catalog-age-days-smoke.sh .github/scripts/diff-coverage.sh .github/scripts/diff-coverage-smoke.sh .github/scripts/translate-intake.sh .github/scripts/translate-intake-smoke.sh .github/scripts/fork-sonar-smoke.sh .github/scripts/issue-templates-smoke.sh .github/scripts/latest-release-tag.sh .github/scripts/latest-release-tag-smoke.sh .github/scripts/set-version.sh .github/scripts/set-version-smoke.sh .github/scripts/next-version.sh .github/scripts/next-version-smoke.sh .github/scripts/release-manifest.sh .github/scripts/release-manifest-smoke.sh .github/scripts/site-from-tag.sh .github/scripts/site-from-tag-smoke.sh .github/scripts/changeset-parity.sh .github/scripts/changeset-parity-smoke.sh .github/scripts/_pr-section.sh .github/scripts/docs-impact.sh .github/scripts/checks-on-commit.sh .github/scripts/checks-on-commit-smoke.sh .github/scripts/docs-gate.sh .github/scripts/docs-gate-smoke.sh .github/scripts/release-notes.sh .github/scripts/release-notes-smoke.sh .github/scripts/release-shape-smoke.sh .github/scripts/quickstart-live-shape-smoke.sh .github/scripts/roadmap-shipped.sh .github/scripts/roadmap-shipped-smoke.sh .github/scripts/satellites.sh .github/scripts/satellites-smoke.sh .github/scripts/docs-release.sh .github/scripts/docs-release-smoke.sh .github/scripts/ci-timing.sh .github/scripts/ci-timing-smoke.sh .github/scripts/ci-shard.sh .github/scripts/ci-shard-smoke.sh .github/scripts/ci-aggregate.sh .github/scripts/ci-aggregate-smoke.sh .github/scripts/ci-shape-smoke.sh .github/scripts/ci-maven-cache.sh .github/scripts/ci-maven-cache-smoke.sh .github/scripts/sonar-inputs.sh .github/scripts/sonar-inputs-smoke.sh .github/scripts/sonar-workflow-smoke.sh .github/scripts/connector-witnesses.sh .github/scripts/connector-witnesses-smoke.sh .github/scripts/connector-cache.sh .github/scripts/connector-cache-smoke.sh .github/scripts/connector-workflow-smoke.sh .github/scripts/one-verify.sh .github/scripts/one-verify-smoke.sh .github/scripts/sonar-cache-key.sh .github/scripts/sonar-cache-smoke.sh
+        run: shellcheck scripts/refresh-catalog.sh scripts/refresh-catalog-smoke.sh scripts/build-real-connectors.sh scripts/build-real-connectors-smoke.sh .github/scripts/catalog-age-days.sh .github/scripts/catalog-age-days-smoke.sh .github/scripts/diff-coverage.sh .github/scripts/diff-coverage-smoke.sh .github/scripts/translate-intake.sh .github/scripts/translate-intake-smoke.sh .github/scripts/fork-sonar-smoke.sh .github/scripts/issue-templates-smoke.sh .github/scripts/latest-release-tag.sh .github/scripts/latest-release-tag-smoke.sh .github/scripts/set-version.sh .github/scripts/set-version-smoke.sh .github/scripts/next-version.sh .github/scripts/next-version-smoke.sh .github/scripts/release-manifest.sh .github/scripts/release-manifest-smoke.sh .github/scripts/site-from-tag.sh .github/scripts/site-from-tag-smoke.sh .github/scripts/changeset-parity.sh .github/scripts/changeset-parity-smoke.sh .github/scripts/_pr-section.sh .github/scripts/docs-impact.sh .github/scripts/checks-on-commit.sh .github/scripts/checks-on-commit-smoke.sh .github/scripts/docs-gate.sh .github/scripts/docs-gate-smoke.sh .github/scripts/release-notes.sh .github/scripts/release-notes-smoke.sh .github/scripts/release-shape-smoke.sh .github/scripts/quickstart-live-shape-smoke.sh .github/scripts/roadmap-shipped.sh .github/scripts/roadmap-shipped-smoke.sh .github/scripts/satellites.sh .github/scripts/satellites-smoke.sh .github/scripts/docs-release.sh .github/scripts/docs-release-smoke.sh .github/scripts/ci-timing.sh .github/scripts/ci-timing-smoke.sh .github/scripts/ci-shard.sh .github/scripts/ci-shard-smoke.sh .github/scripts/ci-aggregate.sh .github/scripts/ci-aggregate-smoke.sh .github/scripts/ci-shape-smoke.sh .github/scripts/ci-maven-cache.sh .github/scripts/ci-maven-cache-smoke.sh .github/scripts/sonar-inputs.sh .github/scripts/sonar-inputs-smoke.sh .github/scripts/sonar-workflow-smoke.sh .github/scripts/connector-witnesses.sh .github/scripts/connector-witnesses-smoke.sh .github/scripts/connector-cache.sh .github/scripts/connector-cache-smoke.sh .github/scripts/connector-workflow-smoke.sh .github/scripts/one-verify.sh .github/scripts/one-verify-smoke.sh .github/scripts/sonar-cache-key.sh .github/scripts/sonar-cache-smoke.sh .github/scripts/nightly-upgrade-expiry-smoke.sh
       - name: One automatic full test suite
         run: bash .github/scripts/one-verify.sh
       - name: Full test invocation cases
         run: bash .github/scripts/one-verify-smoke.sh
       - name: CI shard and aggregate cases
         run: |
+          python3 .github/scripts/connector-witness-coverage-test.py
           bash .github/scripts/connector-witnesses-smoke.sh
           bash .github/scripts/connector-cache-smoke.sh
           bash .github/scripts/connector-workflow-smoke.sh
@@ -437,6 +456,7 @@ jobs:
           bash .github/scripts/ci-maven-cache-smoke.sh
           bash .github/scripts/sonar-inputs-smoke.sh
           bash .github/scripts/sonar-workflow-smoke.sh
+          python3 .github/scripts/sonar-main-gate-timeout-test.py
           bash .github/scripts/sonar-cache-smoke.sh
       - name: CI timing cases
         run: bash .github/scripts/ci-timing-smoke.sh
@@ -520,6 +540,9 @@ jobs:
       # three leave the lane green.
       - name: The quickstart lanes still cover arm64, and still upgrade across the volumes
         run: bash .github/scripts/quickstart-live-shape-smoke.sh
+
+      - name: The upgrade lane no longer uses an expired Git recipe
+        run: bash .github/scripts/nightly-upgrade-expiry-smoke.sh
 
       # The gate itself, not its cases: six files pin the release version, and rewriting them from
       # <revision> has to be a no-op. Five of the six already had something watching them one at a

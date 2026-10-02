@@ -112,8 +112,8 @@ final class RealProcessServer implements ServerHandle {
      *
      * <p>Only one witness needs this, and it needs it structurally: the reactor builds this build and
      * nothing else, so a case whose subject is what an <em>older</em> binary does when handed a store
-     * this build has migrated cannot get its subject from here. The jar is built beside the run and
-     * named to it.
+     * this build has migrated cannot get its subject from here. The lane supplies the published jar
+     * and names it to this run.
      */
     static RealProcessServer start(String storeUri, Path jar) {
         return start(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, jar);
@@ -221,19 +221,43 @@ final class RealProcessServer implements ServerHandle {
 
     static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
             String listenAddress, IntFunction<List<String>> extraArguments) {
-        return launching(storeUri, operatorStateDatabase, jar, listenAddress, extraArguments, List.of());
+        return launching(storeUri, operatorStateDatabase, jar, listenAddress, List.of(), extraArguments);
+    }
+
+    /**
+     * Launches this build in a JVM given {@code jvmOptions}, and returns once its health probe answers.
+     *
+     * <p>For a witness whose subject is how the deliverable behaves inside a runtime of a particular shape -- a
+     * heap too small to hold a load whole, say. The options go before {@code -jar}, where the JVM reads them;
+     * handed to the product instead they would be settings nobody reads.
+     */
+    static RealProcessServer startInJvm(String storeUri, List<String> jvmOptions) {
+        RealProcessServer server = launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, bootJar(), LOOPBACK,
+                jvmOptions, port -> List.of());
+        try {
+            awaitHealthy(server.process, server.baseUrl, server.output);
+        } catch (RuntimeException | AssertionError e) {
+            server.process.destroyForcibly();
+            throw e;
+        }
+        return server;
     }
 
     private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
             String listenAddress, IntFunction<List<String>> extraArguments, List<String> jvmArguments) {
+        return launching(storeUri, operatorStateDatabase, jar, listenAddress, jvmArguments, extraArguments);
+    }
+
+    private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
+            String listenAddress, List<String> jvmOptions, IntFunction<List<String>> extraArguments) {
         int port = freePort();
         // The literal address, not the name: "localhost" resolves to both 127.0.0.1 and ::1, and the
         // launch below binds only the first.
         URI baseUrl = URI.create("http://" + LOOPBACK + ":" + port);
         Path workingDirectory = workingDirectory();
         Path output = workingDirectory.resolve("server.out");
-        Process process = launch(jar, port, listenAddress, storeUri, operatorStateDatabase,
-                workingDirectory, output, extraArguments.apply(port), jvmArguments);
+        Process process = launch(jar, jvmOptions, port, listenAddress, storeUri, operatorStateDatabase,
+                workingDirectory, output, extraArguments.apply(port));
         return new RealProcessServer(process, baseUrl, output);
     }
 
@@ -314,11 +338,13 @@ final class RealProcessServer implements ServerHandle {
         }
     }
 
-    private static Process launch(Path jar, int port, String listenAddress, String storeUri,
-            String operatorStateDatabase, Path workingDirectory, Path output, List<String> extraArguments,
-            List<String> jvmArguments) {
-        List<String> command = new ArrayList<>(List.of(
-                javaBinary(),
+    private static Process launch(Path jar, List<String> jvmOptions, int port, String listenAddress,
+            String storeUri, String operatorStateDatabase, Path workingDirectory, Path output,
+            List<String> extraArguments) {
+        List<String> command = new ArrayList<>();
+        command.add(javaBinary());
+        command.addAll(jvmOptions);
+        command.addAll(List.of(
                 "-jar",
                 jar.toString(),
                 // The role the deliverable is documented to take; parsed by the product before Spring starts.
@@ -341,7 +367,6 @@ final class RealProcessServer implements ServerHandle {
         // is joined with the earlier one by comma rather than winning over it, so anything a case needs
         // to set differently is a parameter above instead of an argument here.
         command.addAll(extraArguments);
-        command.addAll(1, jvmArguments);
         try {
             return new ProcessBuilder(command)
                     .directory(workingDirectory.toFile())

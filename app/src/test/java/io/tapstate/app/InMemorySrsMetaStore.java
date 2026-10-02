@@ -1,20 +1,24 @@
 package io.tapstate.app;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.OptionalLong;
-import java.util.Objects;
-import java.util.Set;
 import java.util.LinkedHashSet;
+import java.util.Objects;
+import java.util.OptionalLong;
+import java.util.Set;
 
 /**
  * A faithful in-memory {@link SrsMetaStore} for the data-plane tests, synchronized so a Jet worker's
@@ -32,6 +36,19 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     private final Map<String, Map<String, Long>> ringStarts = new LinkedHashMap<>();
     /** Per chain, per pipeline: the ring sequence of the last change each table's sink confirmed. */
     private final Map<String, Map<String, Map<String, Long>>> ringDone = new LinkedHashMap<>();
+    /** Per chain and pipeline, the writer plan and the progress kept apart beneath its derived cursor. */
+    private final Map<String, Map<String, SinkWriters>> sinkWriters = new LinkedHashMap<>();
+
+    private static final class SinkWriters {
+        private Map<String, List<String>> expected = Map.of();
+        private final Map<String, Map<String, WriterProgress>> progress = new LinkedHashMap<>();
+    }
+
+    private static final class WriterProgress {
+        private ChainPosition acked;
+        private Long ringDone;
+        private boolean snapshotComplete;
+    }
 
     @Override
     public synchronized Optional<SrsMeta> read(String miningChainId) {
@@ -194,6 +211,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         SrsMeta m = require(miningChainId);
         // A rewritten record carries no per-table acks, as the real store's replacement carries none.
         forgetRingSeqs(miningChainId, offset.pipelineId());
+        forgetSinkWriters(miningChainId, offset.pipelineId());
         List<ConsumerOffset> next = new ArrayList<>(m.consumerOffsets());
         next.removeIf(c -> c.pipelineId().equals(offset.pipelineId()));
         next.add(offset);
@@ -461,6 +479,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         physicalRequests.remove(miningChainId);
         ringStarts.remove(miningChainId);
         ringDone.remove(miningChainId);
+        sinkWriters.remove(miningChainId);
     }
 
     @Override
@@ -514,18 +533,179 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     }
 
     @Override
+    public synchronized void advanceSinkAcked(
+            String miningChainId,
+            String pipelineId,
+            String table,
+            ChainPosition position,
+            WorkloadClaimFence fence) {
+        advanceSinkAcked(miningChainId, pipelineId, table, position);
+    }
+
+    @Override
+    public synchronized void configureSinkWriters(
+            String miningChainId, String pipelineId, Map<String, List<String>> writerIdsByTable) {
+        SrsMeta meta = require(miningChainId);
+        if (meta.consumerOffset(pipelineId).isEmpty()) {
+            List<ConsumerOffset> consumers = new ArrayList<>(meta.consumerOffsets());
+            consumers.add(new ConsumerOffset(pipelineId, Map.of(), null));
+            meta = new SrsMeta(meta.miningChainId(), meta.sourceRead(), consumers,
+                    meta.schemaHistory(), meta.retention(), meta.epoch());
+            records.put(miningChainId, meta);
+        }
+        ConsumerOffset existing = meta.consumerOffset(pipelineId).orElse(null);
+        Map<String, Long> completedRing = ringDoneThrough(miningChainId, pipelineId);
+        Set<String> completedSnapshots = existing == null
+                ? Set.of()
+                : Set.copyOf(existing.snapshotCompletedTables());
+        LinkedHashSet<String> allWriterIds = new LinkedHashSet<>();
+        writerIdsByTable.values().forEach(allWriterIds::addAll);
+        SinkWriters priorPlan = writers(miningChainId, pipelineId);
+        boolean hasAggregateProgress = (existing != null && existing.sinkAcked() != null)
+                || !completedSnapshots.isEmpty();
+        if (priorPlan == null && allWriterIds.size() > 1 && hasAggregateProgress) {
+            throw new TapstateException(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS,
+                    Map.of("pipeline", pipelineId), null);
+        }
+        SinkWriters writers = priorPlan != null
+                ? priorPlan
+                : sinkWriters.computeIfAbsent(miningChainId, ignored -> new LinkedHashMap<>())
+                        .computeIfAbsent(pipelineId, ignored -> new SinkWriters());
+        Map<String, List<String>> expected = new LinkedHashMap<>();
+        writerIdsByTable.forEach((table, writerIds) -> {
+            expected.put(table, List.copyOf(writerIds));
+            for (String writerId : writerIds) {
+                WriterProgress progress = writerProgress(writers, writerId, table);
+                if (progress.acked == null && existing != null) {
+                    progress.acked = existing.sinkAcked();
+                }
+                if (progress.ringDone == null) {
+                    progress.ringDone = completedRing.get(table);
+                }
+                if (completedSnapshots.contains(table)) {
+                    progress.snapshotComplete = true;
+                }
+            }
+        });
+        writers.expected = Map.copyOf(expected);
+    }
+
+    @Override
+    public synchronized void configureSinkWriters(
+            String miningChainId,
+            String pipelineId,
+            Map<String, List<String>> writerIdsByTable,
+            WorkloadClaimFence fence) {
+        configureSinkWriters(miningChainId, pipelineId, writerIdsByTable);
+    }
+
+    @Override
+    public synchronized void advanceSinkWriterAcked(
+            String miningChainId,
+            String pipelineId,
+            String writerId,
+            String table,
+            ChainPosition position) {
+        require(miningChainId);
+        SinkWriters writers = requireSinkWriter(writers(miningChainId, pipelineId), writerId, table);
+        WriterProgress progress = writerProgress(writers, writerId, table);
+        if (progress.acked == null || position.order().compareTo(progress.acked.order()) > 0) {
+            progress.acked = position;
+        }
+        if (position.order().seq() >= 0) {
+            progress.ringDone = progress.ringDone == null
+                    ? position.order().seq()
+                    : Math.max(progress.ringDone, position.order().seq());
+        }
+        ConsumerOffset selectedConsumer = require(miningChainId).consumerOffset(pipelineId).orElse(null);
+        boolean singleTable = (selectedConsumer == null || selectedConsumer.selectedTables() == null
+                || selectedConsumer.selectedTables().size() <= 1) && writers.expected.size() <= 1;
+        if (singleTable) { derivedAck(writers).ifPresent(derived -> {
+            ConsumerOffset current = require(miningChainId).consumerOffset(pipelineId).orElse(null);
+            if (current == null || current.sinkAcked() == null
+                    || derived.order().compareTo(current.sinkAcked().order()) > 0) {
+                advanceSinkAcked(miningChainId, pipelineId, derived);
+            }
+        }); }
+        List<String> requiredWriters = writers.expected.getOrDefault(table, List.of());
+        ChainPosition tableAck = null;
+        boolean all = !requiredWriters.isEmpty();
+        for (String required : requiredWriters) {
+            ChainPosition ack = writerProgress(writers, required, table).acked;
+            if (ack == null) { all = false; break; }
+            if (tableAck == null || ack.order().compareTo(tableAck.order()) < 0) { tableAck = ack; }
+        }
+        if (all) { advanceTableSinkAcked(miningChainId, pipelineId, table, tableAck); }
+        derivedRing(writers, table).ifPresent(seq ->
+                ringDone.computeIfAbsent(miningChainId, ignored -> new LinkedHashMap<>())
+                        .computeIfAbsent(pipelineId, ignored -> new LinkedHashMap<>())
+                        .merge(table, seq, Math::max));
+    }
+
+    @Override
+    public synchronized void advanceSinkWriterAcked(
+            String miningChainId,
+            String pipelineId,
+            String writerId,
+            String table,
+            ChainPosition position,
+            WorkloadClaimFence fence) {
+        advanceSinkWriterAcked(miningChainId, pipelineId, writerId, table, position);
+    }
+
+    @Override
+    public synchronized void markSinkWriterSnapshotComplete(
+            String miningChainId, String pipelineId, String writerId, String table) {
+        require(miningChainId);
+        SinkWriters writers = requireSinkWriter(writers(miningChainId, pipelineId), writerId, table);
+        writerProgress(writers, writerId, table).snapshotComplete = true;
+        if (writers.expected.get(table).stream()
+                .allMatch(expected -> writerProgress(writers, expected, table).snapshotComplete)) {
+            markSnapshotComplete(miningChainId, pipelineId, table);
+        }
+    }
+
+    @Override
+    public synchronized void markSnapshotComplete(
+            String miningChainId, String pipelineId, String table, WorkloadClaimFence fence) {
+        markSnapshotComplete(miningChainId, pipelineId, table);
+    }
+
+    @Override
+    public synchronized void markSinkWriterSnapshotComplete(
+            String miningChainId,
+            String pipelineId,
+            String writerId,
+            String table,
+            WorkloadClaimFence fence) {
+        markSinkWriterSnapshotComplete(miningChainId, pipelineId, writerId, table);
+    }
+
+    @Override
     public synchronized void startRingAfter(String miningChainId, String pipelineId, String table, long seq) {
         ConsumerOffset consumer = require(miningChainId).consumerOffset(pipelineId).orElse(null);
-        if (consumer == null || consumer.selectedTablesEpoch() != null) {
+        if (consumer != null && consumer.selectedTablesEpoch() != null) {
             return;
         }
         putRingArrival(miningChainId, pipelineId, table, seq);
     }
 
     private void putRingArrival(String miningChainId, String pipelineId, String table, long seq) {
-        ringDone.computeIfAbsent(miningChainId, chain -> new LinkedHashMap<>())
+        Long done = ringDone.computeIfAbsent(miningChainId, chain -> new LinkedHashMap<>())
                 .computeIfAbsent(pipelineId, pipeline -> new LinkedHashMap<>())
                 .putIfAbsent(table, seq);
+        if (done == null) {
+            advanceConsumerReadSeq(miningChainId, pipelineId, table, seq);
+            SinkWriters writers = writers(miningChainId, pipelineId);
+            if (writers != null && writers.expected.containsKey(table)) {
+                for (String writerId : writers.expected.get(table)) {
+                    WriterProgress progress = writerProgress(writers, writerId, table);
+                    if (progress.ringDone == null) {
+                        progress.ringDone = seq;
+                    }
+                }
+            }
+        }
     }
 
     @Override
@@ -552,6 +732,13 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         }
     }
 
+    private void forgetSinkWriters(String miningChainId, String pipelineId) {
+        Map<String, SinkWriters> byPipeline = sinkWriters.get(miningChainId);
+        if (byPipeline != null) {
+            byPipeline.remove(pipelineId);
+        }
+    }
+
     @Override
     public synchronized void detachConsumer(String miningChainId, String pipelineId) {
         // Idempotent, unlike the advancing mutators: an absent chain already satisfies what a detach states.
@@ -562,6 +749,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         List<ConsumerOffset> next = new ArrayList<>(m.consumerOffsets());
         next.removeIf(c -> c.pipelineId().equals(pipelineId));
         forgetRingSeqs(miningChainId, pipelineId);
+        forgetSinkWriters(miningChainId, pipelineId);
         // Every field but the departing consumer is carried across. The chain generation and every
         // staying consumer's snapshot state remain unchanged.
         records.put(miningChainId, new SrsMeta(
@@ -575,5 +763,50 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
             throw new IllegalStateException("mining chain not seeded: " + miningChainId);
         }
         return m;
+    }
+
+    private SinkWriters writers(String miningChainId, String pipelineId) {
+        return sinkWriters.getOrDefault(miningChainId, Map.of()).get(pipelineId);
+    }
+
+    private static SinkWriters requireSinkWriter(SinkWriters writers, String writerId, String table) {
+        if (writers == null || !writers.expected.getOrDefault(table, List.of()).contains(writerId)) {
+            throw new IllegalStateException("sink writer '" + writerId
+                    + "' is not configured to receive table '" + table + "'");
+        }
+        return writers;
+    }
+
+    private static WriterProgress writerProgress(SinkWriters writers, String writerId, String table) {
+        return writers.progress.computeIfAbsent(writerId, ignored -> new LinkedHashMap<>())
+                .computeIfAbsent(table, ignored -> new WriterProgress());
+    }
+
+    private static Optional<ChainPosition> derivedAck(SinkWriters writers) {
+        ChainPosition lowest = null;
+        for (Map.Entry<String, List<String>> entry : writers.expected.entrySet()) {
+            for (String writerId : entry.getValue()) {
+                ChainPosition acked = writerProgress(writers, writerId, entry.getKey()).acked;
+                if (acked == null) {
+                    return Optional.empty();
+                }
+                if (lowest == null || acked.order().compareTo(lowest.order()) < 0) {
+                    lowest = acked;
+                }
+            }
+        }
+        return Optional.ofNullable(lowest);
+    }
+
+    private static Optional<Long> derivedRing(SinkWriters writers, String table) {
+        Long lowest = null;
+        for (String writerId : writers.expected.getOrDefault(table, List.of())) {
+            Long done = writerProgress(writers, writerId, table).ringDone;
+            if (done == null) {
+                return Optional.empty();
+            }
+            lowest = lowest == null ? done : Math.min(lowest, done);
+        }
+        return Optional.ofNullable(lowest);
     }
 }

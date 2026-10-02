@@ -140,6 +140,51 @@ class ArtifactQueryServiceTest {
     }
 
     @Test
+    void genericArtifactReadsDoNotExposeMongoDbAtlasUriCredentials() {
+        apply.apply("alice", List.of(draft(ATLAS)));
+        store.putUnreadable("unreadable-atlas", "source", ATLAS + "not: [valid");
+
+        String got = query.get("atlas").orElseThrow().canonicalForm();
+        List<ArtifactListEntry> listed = query.list("source");
+        String readable = listed.stream()
+                .filter(row -> row.id().equals("atlas"))
+                .findFirst().orElseThrow().canonicalForm();
+        String unreadable = listed.stream()
+                .filter(row -> row.id().equals("unreadable-atlas"))
+                .findFirst().orElseThrow().canonicalForm();
+
+        assertThat(List.of(got, readable, unreadable)).allSatisfy(canonical ->
+                assertThat(canonical)
+                        .contains("cluster.example/test")
+                        .doesNotContain("probe", "sentinel-secret"));
+    }
+
+    @Test
+    void genericArtifactReadsRedactMongoDbCredentialsContainingAnApostrophe() {
+        apply.apply("alice", List.of(draft(ATLAS_WITH_APOSTROPHE)));
+
+        String got = query.get("atlas-apostrophe").orElseThrow().canonicalForm();
+        String listed = query.list("source").getFirst().canonicalForm();
+
+        assertThat(List.of(got, listed)).allSatisfy(canonical ->
+                assertThat(canonical)
+                        .contains("cluster.example/test")
+                        .doesNotContain("probe", "sentinel'secret"));
+    }
+
+    @Test
+    void credentialFreeMongoDbAtCharactersSurviveGenericReadsAndReapply() {
+        apply.apply("alice", List.of(draft(MONGO_WITH_AT_IN_PATH), draft(MONGO_WITH_AT_IN_QUERY)));
+
+        String path = query.get("mongo-at-path").orElseThrow().canonicalForm();
+        String queryValue = query.get("mongo-at-query").orElseThrow().canonicalForm();
+
+        assertThat(path).isEqualTo(offlineCanonical(MONGO_WITH_AT_IN_PATH));
+        assertThat(queryValue).isEqualTo(offlineCanonical(MONGO_WITH_AT_IN_QUERY));
+        apply.apply("alice", List.of(draft(path), draft(queryValue)));
+    }
+
+    @Test
     void listIsEmptyWhenNothingIsStored() {
         assertThat(query.list()).isEmpty();
     }
@@ -268,6 +313,38 @@ class ArtifactQueryServiceTest {
             id: tgt_mg
             connector: mongodb
             config: { uri: "mongodb://10.30.0.12:27017/ods" }
+            """;
+
+    private static final String ATLAS = """
+            version: tapstate/v1
+            kind: source
+            id: atlas
+            connector: mongodb-atlas
+            config: { uri: "mongodb+srv://probe:sentinel-secret@cluster.example/test" }
+            """;
+
+    private static final String ATLAS_WITH_APOSTROPHE = """
+            version: tapstate/v1
+            kind: source
+            id: atlas-apostrophe
+            connector: mongodb-atlas
+            config: { uri: "mongodb://probe:sentinel'secret@cluster.example/test" }
+            """;
+
+    private static final String MONGO_WITH_AT_IN_PATH = """
+            version: tapstate/v1
+            kind: source
+            id: mongo-at-path
+            connector: mongodb
+            config: { uri: "mongodb://cluster.example/test@archive" }
+            """;
+
+    private static final String MONGO_WITH_AT_IN_QUERY = """
+            version: tapstate/v1
+            kind: source
+            id: mongo-at-query
+            connector: mongodb
+            config: { uri: "mongodb://cluster.example/test?appName=ops@example.com" }
             """;
 
     private static final String SRC_ORA = """

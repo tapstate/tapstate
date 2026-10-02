@@ -203,12 +203,14 @@ class DataPlaneActuationConfiguration {
      */
     @Bean
     RebuildAdmission rebuildAdmission(
-            ClusterProperties clusterProperties, PipelineActuationOwnership pipelineActuationOwnership) {
+            ClusterProperties clusterProperties, HazelcastProperties hazelcastProperties,
+            PipelineActuationOwnership pipelineActuationOwnership) {
         if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
             return RebuildAdmission.never();
         }
         return new ClusterRebuildAdmission(
-                pipelineActuationOwnership, clusterProperties.getWorkloadClaimTtl());
+                pipelineActuationOwnership, clusterProperties.getWorkloadClaimTtl(),
+                hazelcastProperties.getMaximumNoHeartbeat());
     }
 
     /**
@@ -263,9 +265,9 @@ class DataPlaneActuationConfiguration {
             ClusterProperties clusterProperties) {
         CaptureAttacher attacher = new CaptureAttacher() {
             @Override
-            public CaptureRun start(CaptureRunSpec spec, java.util.function.Consumer<Envelope> receive,
+            public CaptureRun start(CaptureRunSpec spec, io.tapstate.runtime.srs.CaptureHandoff handoff,
                     boolean startTail) {
-                return captureRunUnit.start(spec, receive, startTail);
+                return captureRunUnit.begin(spec, handoff, startTail);
             }
 
             @Override

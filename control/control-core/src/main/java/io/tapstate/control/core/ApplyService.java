@@ -93,6 +93,7 @@ public final class ApplyService {
      * only the other one would be a guard in name.
      */
     private final LivePipelines live;
+    private final DeploymentProfile deploymentProfile;
     private final DslParser parser = new DslParser();
     private final CanonicalWriter writer = new CanonicalWriter();
 
@@ -105,7 +106,15 @@ public final class ApplyService {
     public ApplyService(
             Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
             PlanAdvisories advisories, SchemaDerivation derivation, LivePipelines live) {
+        this(catalog, store, auditGate, schemas, advisories, derivation, live, DeploymentProfile.ON_PREM);
+    }
+
+    public ApplyService(
+            Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
+            PlanAdvisories advisories, SchemaDerivation derivation, LivePipelines live,
+            DeploymentProfile deploymentProfile) {
         this.live = live;
+        this.deploymentProfile = Objects.requireNonNull(deploymentProfile, "deploymentProfile");
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.store = Objects.requireNonNull(store, "store");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
@@ -162,6 +171,14 @@ public final class ApplyService {
         Objects.requireNonNull(submitted, "submitted");
         Objects.requireNonNull(preconditions, "preconditions");
         Objects.requireNonNull(validationScope, "validationScope");
+        for (Resource resource : submitted) {
+            if (resource instanceof SourceResource source
+                    && SourceReadProjection.containsDisplayMarker(source)) {
+                throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                        Map.of("reason", "redacted Source settings cannot be applied; provide complete credentials"),
+                        null);
+            }
+        }
         Set<String> submittedIds = submitted.stream().map(Resource::id).collect(java.util.stream.Collectors.toSet());
         List<Resource> storedResources = ReadableArtifactInventory.list(store);
         List<Resource> candidate = new ArrayList<>();
@@ -191,7 +208,8 @@ public final class ApplyService {
         // that reaches stored referrers, which must not be refused for an edit they were pulled into,
         // and a write target is a connection document normally filed by an earlier batch, which has
         // to be resolvable or every sync whose target was not resubmitted would pass unjudged.
-        TargetConnectorRules.validate(submitted, candidate);
+        TargetConnectorRules.validate(
+                submitted, candidate, liveCatalog, deploymentProfile == DeploymentProfile.CLOUD);
         List<Resource> validated = List.copyOf(workspace.resources());
         Map<String, String> workspacePreconditions = new LinkedHashMap<>();
         for (Resource resource : validated) {
@@ -396,6 +414,52 @@ public final class ApplyService {
             outcomes.add(outcome(prepared));
         }
         return new ArtifactValidationResult(true, outcomes, List.of(), planned.warnings());
+    }
+
+    /** Validates one typed resource against the stored workspace without writing or auditing it. */
+    public ArtifactValidationResult validateTyped(Resource resource) {
+        Objects.requireNonNull(resource, "resource");
+        final ApplyPlan planned;
+        try {
+            planned = planResources(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE);
+        } catch (TapstateException diagnostic) {
+            return new ArtifactValidationResult(false, List.of(),
+                    List.of(new ValidationDiagnostic(diagnostic.code().code(), diagnostic.args())), List.of());
+        }
+        List<ArtifactOutcome> outcomes = planned.artifacts().stream().map(this::outcome).toList();
+        return new ArtifactValidationResult(true, outcomes, List.of(), planned.warnings());
+    }
+
+    /** Validates and materializes one typed resource against the stored workspace without writing it. */
+    public Resource prepareTyped(Resource resource) {
+        Objects.requireNonNull(resource, "resource");
+        return planResources(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE)
+                .artifacts().getFirst().resource();
+    }
+
+    /** Validates a Pipeline draft for publication, including the same live-buffering guard as artifact writes. */
+    public ApplyPlan planDraftPublication(Resource resource) {
+        Objects.requireNonNull(resource, "resource");
+        ApplyPlan plan = planResources(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE);
+        Resource prepared = plan.artifacts().getFirst().resource();
+        if (live != null && prepared instanceof PipelineResource replacement) {
+            ReadableArtifactInventory.Snapshot inventory = ReadableArtifactInventory.scan(store);
+            live.refuseBufferingChangeWhileLive(storedPipeline(inventory.resources(), replacement.id()), replacement);
+        }
+        return plan;
+    }
+
+    /** Re-derives the published pipeline's schema after the artifact transaction has committed. */
+    public List<ValidationDiagnostic> refreshPublishedPipeline(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        try {
+            derivation.derive(pipelineId);
+            return List.of();
+        } catch (TapstateException failure) {
+            return List.of(new ValidationDiagnostic(ControlError.SCHEMA_DERIVATION_INCOMPLETE.code(),
+                    Map.of("pipeline", pipelineId, "causeCode", failure.code().code(),
+                            "causeParams", failure.args())));
+        }
     }
 
     /**

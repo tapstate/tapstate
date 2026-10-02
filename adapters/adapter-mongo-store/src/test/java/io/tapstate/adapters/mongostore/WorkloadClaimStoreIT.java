@@ -12,6 +12,16 @@ import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.CheckpointDoc;
+import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.StateJson;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.spi.store.StopAuthority;
+import io.tapstate.spi.store.StopReservation;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -20,15 +30,19 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Atomic Mongo-time workload ownership: one winner, monotonic generations, and no TTL deletion. */
 @RequiresDocker
@@ -88,11 +102,14 @@ class WorkloadClaimStoreIT {
                     new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders"),
                     new WorkloadOwner("node-a", "boot-1"), 7, TTL).claim();
 
-            WorkloadClaim advanced = store.advanceUnderClaim(claim, 7).orElseThrow();
+            WorkloadClaim advanced = store.advanceExecution(claim, 7, Set.of("node-a", "node-b")).orElseThrow();
 
             assertThat(advanced.claimGeneration()).isEqualTo(claim.claimGeneration());
             assertThat(advanced.executionGeneration()).isEqualTo(1);
-            assertThat(store.advanceUnderClaim(claim, 7)).isEmpty();
+            assertThat(advanced.contextExecutionGeneration()).isEqualTo(advanced.executionGeneration());
+            assertThat(advanced.executionClaimGeneration()).isEqualTo(claim.claimGeneration());
+            assertThat(advanced.executionNodeIds()).containsExactlyInAnyOrder("node-a", "node-b");
+            assertThat(store.advanceExecution(claim, 7, Set.of("node-a", "node-b"))).isEmpty();
         });
     }
 
@@ -117,6 +134,9 @@ class WorkloadClaimStoreIT {
             assertThat(first.executionGeneration()).isEqualTo(3);
             WorkloadClaim fourth = reopened.advanceUnderClaim(first, 7).orElseThrow();
             assertThat(fourth.executionGeneration()).isEqualTo(4);
+            assertThat(fourth.contextExecutionGeneration())
+                    .as("a legacy advance supplied no factual planned members").isLessThan(fourth.executionGeneration());
+            assertThat(reopened.recordExecutionFailure(fourth, false)).isEmpty();
             assertThat(reopened.currentGeneration("cluster-a", "orders")).hasValue(4);
             assertThat(reopened.advanceUnderClaim(first, 7)).as("stale expected generation is refused").isEmpty();
             assertThat(reopened.advanceStandalone("cluster-a", "orders"))
@@ -158,6 +178,127 @@ class WorkloadClaimStoreIT {
             assertThat(collection.find(new Document("_id", id)).first()
                     .getLong("executionGeneration")).isEqualTo(9L);
         });
+    }
+
+    @Test
+    void executionAndFirstFailureContextSurviveTakeoverAndResetForTheNextRun() {
+        withStore((store, collection) -> {
+            WorkloadClaimKey pipeline =
+                    new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+            WorkloadClaim first = store.acquire(
+                    pipeline, new WorkloadOwner("node-a", "boot-1"), 7, TTL).claim();
+            WorkloadClaim run = store.advanceExecution(first, 7, Set.of("node-b", "node-a")).orElseThrow();
+            WorkloadClaim failed = store.recordExecutionFailure(run, false).orElseThrow();
+
+            var stored = collection.find().first();
+            assertThat(stored).isNotNull();
+            assertThat(stored.getLong("executionClaimGeneration")).isEqualTo(1L);
+            assertThat(stored.getLong("contextExecutionGeneration")).isEqualTo(1L);
+            assertThat(stored.getList("executionNodeIds", String.class)).containsExactly("node-a", "node-b");
+            assertThat(stored.getLong("failureClaimGeneration")).isEqualTo(1L);
+            assertThat(stored.getBoolean("failureAfterMemberLoss")).isFalse();
+            assertThat(store.recordExecutionFailure(failed, true).orElseThrow().failureAfterMemberLoss())
+                    .as("the first failure observation fixes the order of failure and member loss")
+                    .isFalse();
+
+            assertThat(store.release(failed)).isTrue();
+            WorkloadClaim inherited = store.acquire(
+                    pipeline, new WorkloadOwner("node-b", "boot-2"), 7, TTL).claim();
+            assertThat(inherited.claimGeneration()).isEqualTo(2);
+            assertThat(inherited.executionGeneration()).isEqualTo(run.executionGeneration());
+            assertThat(inherited.contextExecutionGeneration()).isEqualTo(run.executionGeneration());
+            assertThat(inherited.executionClaimGeneration()).isEqualTo(1);
+            assertThat(inherited.executionNodeIds()).containsExactlyInAnyOrder("node-a", "node-b");
+            assertThat(inherited.failureClaimGeneration()).isEqualTo(1);
+            assertThat(store.recordExecutionFailure(failed, true)).isEmpty();
+
+            WorkloadClaim nextRun = store.advanceExecution(inherited, 7, Set.of("node-b")).orElseThrow();
+            assertThat(nextRun.executionClaimGeneration()).isEqualTo(2);
+            assertThat(nextRun.contextExecutionGeneration()).isEqualTo(nextRun.executionGeneration());
+            assertThat(nextRun.executionNodeIds()).containsExactly("node-b");
+            assertThat(nextRun.failureClaimGeneration()).isZero();
+            assertThat(nextRun.failureAfterMemberLoss()).isFalse();
+
+            // An older member can advance the generation without writing the newer context fields.
+            // The mismatch must be visible, so a new holder does not reuse the prior run's verdict.
+            collection.updateOne(new org.bson.Document("resourceId", "orders"),
+                    new org.bson.Document("$inc", new org.bson.Document("executionGeneration", 1L)));
+            WorkloadClaim olderWriter = store.read(pipeline).orElseThrow().claim();
+            assertThat(olderWriter.contextExecutionGeneration())
+                    .isLessThan(olderWriter.executionGeneration());
+            assertThat(store.recordExecutionFailure(olderWriter, false)).isEmpty();
+        });
+    }
+
+    @Test
+    void legacyClaimedAdvanceCannotReuseThePriorExecutionsFailureVerdict() {
+        withStore((store, collection) -> {
+            WorkloadClaimKey pipeline = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+            WorkloadClaim first = store.acquire(pipeline, new WorkloadOwner("node-a", "boot-1"), 7, TTL).claim();
+            WorkloadClaim run = store.advanceExecution(first, 7, Set.of("node-a", "node-b")).orElseThrow();
+            WorkloadClaim failed = store.recordExecutionFailure(run, false).orElseThrow();
+
+            WorkloadClaim legacy = store.advanceUnderClaim(failed, 7).orElseThrow();
+
+            assertThat(legacy.executionGeneration()).isEqualTo(2);
+            assertThat(legacy.contextExecutionGeneration()).isEqualTo(run.executionGeneration());
+            assertThat(legacy.contextExecutionGeneration()).isLessThan(legacy.executionGeneration());
+            assertThat(store.recordExecutionFailure(legacy, true)).isEmpty();
+            WorkloadClaim next = store.advanceExecution(legacy, 7, Set.of("node-a")).orElseThrow();
+            assertThat(next.contextExecutionGeneration()).isEqualTo(next.executionGeneration());
+            assertThat(next.executionNodeIds()).containsExactly("node-a");
+            assertThat(next.failureClaimGeneration()).isZero();
+            assertThat(next.failureAfterMemberLoss()).isFalse();
+            assertThat(collection.countDocuments()).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void phasedAdmissionRecordsTheSameContextAndRollsBackEveryFieldOnRefusal() {
+        try (PhasedClaimFixture f = new PhasedClaimFixture()) {
+            Document prior = f.database.getCollection("workload_claims").find().first();
+            assertThatThrownBy(() -> f.state.admitSuccessor(f.pending, "inc-a", "submit-b", Set.of(), f.at))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> f.state.admitSuccessor(f.pending, "inc-a", "b".repeat(5000),
+                    Set.of("node-c", "node-a"), f.at))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_TOO_LARGE));
+            assertThat(f.database.getCollection("workload_claims").find().first()).isEqualTo(prior);
+            assertThat(f.state.readStopReservation("orders")).contains(f.pending);
+
+            var admitted = f.state.admitSuccessor(f.pending, "inc-a", "submit-b",
+                    Set.of("node-c", "node-a"), f.at).orElseThrow();
+            WorkloadClaim next = admitted.advancedClaim().orElseThrow();
+
+            assertThat(next.executionGeneration()).isEqualTo(2);
+            assertThat(next.contextExecutionGeneration()).isEqualTo(next.executionGeneration());
+            assertThat(next.executionClaimGeneration()).isEqualTo(f.priorRun.claimGeneration());
+            assertThat(next.executionNodeIds()).containsExactlyInAnyOrder("node-a", "node-c");
+            assertThat(next.failureClaimGeneration()).isZero();
+            assertThat(next.failureAfterMemberLoss()).isFalse();
+            assertThat(next.leaseUntil()).isEqualTo(f.priorRun.leaseUntil());
+            assertThat(f.claims.read(next.key()).orElseThrow().claim()).isEqualTo(next);
+            assertThat(admitted.reservation().writerAuthority()).isEqualTo(StopAuthority.claimed(WorkloadClaimFence.from(next)));
+            assertThat(admitted.reservation().source()).isEqualTo(f.pending.source());
+            assertThat(admitted.reservation().originalDesired()).isEqualTo(f.pending.originalDesired());
+            assertThat(f.state.read("orders").orElseThrow().stateJson()).isEqualTo(StateJson.of(PipelineState.STOPPED));
+        }
+    }
+
+    @Test
+    void legacyPhasedAdmissionDoesNotInventCurrentExecutionMembers() {
+        try (PhasedClaimFixture f = new PhasedClaimFixture()) {
+            var admitted = f.state.admitSuccessor(f.pending, "inc-a", "submit-b", f.at).orElseThrow();
+            WorkloadClaim legacy = admitted.advancedClaim().orElseThrow();
+
+            assertThat(legacy.executionGeneration()).isEqualTo(2);
+            assertThat(legacy.contextExecutionGeneration()).isEqualTo(f.priorRun.executionGeneration());
+            assertThat(legacy.contextExecutionGeneration()).isLessThan(legacy.executionGeneration());
+            assertThat(legacy.executionNodeIds()).isEqualTo(f.priorRun.executionNodeIds());
+            assertThat(f.claims.recordExecutionFailure(legacy, true)).isEmpty();
+            assertThat(legacy.leaseUntil()).isEqualTo(f.priorRun.leaseUntil());
+            assertThat(admitted.reservation().source()).isEqualTo(f.pending.source());
+        }
     }
 
     @Test
@@ -274,6 +415,40 @@ class WorkloadClaimStoreIT {
         } catch (Exception failure) {
             throw new AssertionError(failure);
         }
+    }
+
+    private static final class PhasedClaimFixture implements AutoCloseable {
+        private final MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl());
+        private final com.mongodb.client.MongoDatabase database = client.getDatabase(
+                "phased_claim_" + UUID.randomUUID().toString().replace("-", ""));
+        private final MongoWorkloadClaimStore claims = new MongoWorkloadClaimStore(database.getCollection("workload_claims"));
+        private final MongoDesiredStore desired = new MongoDesiredStore(database.getCollection("desired"));
+        private final MongoStateStore state = new MongoStateStore(client, database.getCollection("states"),
+                database.getCollection("desired"), database.getCollection("workload_claims"), database.getCollection("artifacts"));
+        private final Instant at = Instant.parse("2026-10-02T00:00:00Z");
+        private final WorkloadClaim priorRun;
+        private final StopReservation pending;
+
+        private PhasedClaimFixture() {
+            WorkloadClaimKey key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+            WorkloadClaim claimed = claims.acquire(key, new WorkloadOwner("node-a", "boot-1"), 7, TTL).claim();
+            priorRun = claims.recordExecutionFailure(
+                    claims.advanceExecution(claimed, 7, Set.of("node-a", "node-b")).orElseThrow(), false).orElseThrow();
+            database.getCollection("artifacts").insertOne(new Document("_id", "orders").append("kind", "pipeline")
+                    .append("pipelineIncarnationId", "inc-a"));
+            state.create("orders", StateJson.of(PipelineState.FAILED), at);
+            DesiredState intent = new DesiredState("orders", PipelineState.RUNNING, "rev-a", false,
+                    "assembly-a", true, 0L);
+            desired.save(intent);
+            CheckpointDoc actual = state.read("orders").orElseThrow();
+            StopReservation proposal = StopReservation.stopping("orders", "phased-claim", actual.epoch(), intent,
+                    new StopReservation.Source("cluster-a", new ObservationStore.Scope("inc-a", 1),
+                            new StopReservation.JobIdentity("cluster-a", 11, "old-boot")),
+                    StopReservation.CounterPolicy.freeze(actual, intent), StopAuthority.claimed(WorkloadClaimFence.from(priorRun)));
+            pending = state.markReplacementPending(state.reserveStop(actual, proposal, at).orElseThrow(), at).orElseThrow();
+        }
+
+        @Override public void close() { database.drop(); client.close(); }
     }
 
     @FunctionalInterface

@@ -19,6 +19,7 @@ import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -30,6 +31,29 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * at test time stand in for a real connector jar and the PDK runtime the host does not yet provide.
  */
 class PdkSinkPortTest {
+
+    @Test
+    void a_renamed_target_is_used_by_both_the_table_model_and_written_record(@TempDir Path dir) throws Throwable {
+        Path jar = Synthetic.countingSink(dir);
+        PdkConnector connector = PdkConnector.open("demo", provisioner(jar, "synthetic.CountingSink")
+                .resolve("demo"), Map.of());
+        TargetTable target = new TargetTable("k2", List.of(new TargetField("ID", "int", true)));
+        AtomicReference<String> writtenTable = new AtomicReference<>();
+        AtomicReference<List<String>> recordTables = new AtomicReference<>();
+        try (SinkWriter writer = new PdkSinkWriter(connector, (context, events, table, result) -> {
+            writtenTable.set(table.getId());
+            recordTables.set(events.stream().map(event -> event.getTableId()).toList());
+            result.accept(new io.tapdata.pdk.apis.entity.WriteListResult<>(3L, 0L, 0L));
+        }, configWithTarget(target), Map.of("AA_0716", target), null)) {
+            assertThat(await(writer, List.of(
+                    Envelope.insert(1L, "AA_0716", Map.of("ID", 1), null),
+                    Envelope.update(2L, "AA_0716", Map.of("ID", 1), Map.of("ID", 1), null),
+                    Envelope.delete(3L, "AA_0716", Map.of("ID", 1), null))).written()).isEqualTo(3);
+        }
+
+        assertThat(writtenTable).hasValue("k2");
+        assertThat(recordTables).hasValue(List.of("k2", "k2", "k2"));
+    }
 
     @Test
     void missingDecimalMetadataIsCodedBeforeAnyWrite(@TempDir Path dir) throws Throwable {

@@ -17,6 +17,7 @@ import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.runtime.engine.EnvelopeSerializer;
+import io.tapstate.runtime.engine.MemberOutOfMemory;
 import io.tapstate.runtime.engine.nest.DurableNestDeadLetter;
 import io.tapstate.runtime.engine.join.JoinMaps;
 import io.tapstate.runtime.engine.join.JoinStateMapStoreFactory;
@@ -137,6 +138,10 @@ class HazelcastConfiguration {
                     io.tapstate.runtime.engine.nest.NestMemoryBudget.SPLIT_BRAIN_PROTECTION_CONTEXT_KEY,
                     ClusterMembershipGate.PROTECTION_NAME);
         }
+        // A member its own out-of-memory handling shuts down leaves this process up and serving HTTP over an
+        // engine that no longer exists. Have that written down on the member: the engine reads it to fail the
+        // pipelines the member carried, and the process's liveness reads it to report the process broken.
+        MemberOutOfMemory.watch(member);
         // Bind the SRS meta store onto the member so the read-cursor publisher factory -- carried onto the
         // Jet source and resolved member-side -- can reach it through the user context and publish durable
         // read cursors. A run with no store (mongo disabled) binds nothing, and the publisher then no-ops.
@@ -284,6 +289,16 @@ class HazelcastConfiguration {
                 throw new org.springframework.beans.factory.NoSuchBeanDefinitionException(Object.class);
             }
         };
+    }
+
+    /**
+     * The application's availability, in place of the one Spring Boot would keep, which learns of a change only
+     * when the change is announced to it. This one also reads, whenever its liveness is asked for, whether
+     * {@code member} has been shut down for want of memory, and is broken once it has.
+     */
+    @Bean
+    EngineAvailability applicationAvailability(HazelcastInstance member) {
+        return new EngineAvailability(member);
     }
 
     /**

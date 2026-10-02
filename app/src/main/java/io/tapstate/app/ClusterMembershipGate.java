@@ -22,7 +22,11 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
     private final ClusterProperties.Profile profile;
     private final int bootstrapMinMembers;
     private final AtomicReference<ClusterMembership> committed = new AtomicReference<>();
-    private final AtomicReference<Set<String>> visible = new AtomicReference<>(Set.of());
+    private final AtomicReference<VisibleSnapshot> visible =
+            new AtomicReference<>(new VisibleSnapshot(0, Set.of()));
+
+    /** A publication changes the revision even when the visible members have not changed. */
+    record VisibleSnapshot(long revision, Set<String> nodeIds) {}
 
     /**
      * The data plane's own answer to this same predicate. Until a member binds one, nothing is asked -
@@ -57,7 +61,7 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
      * pause, and disagreeing by admitting is a dead run.
      */
     boolean businessEligible() {
-        return eligible(visible.get()) && dataPlane.get().getAsBoolean();
+        return eligible(visibleNodeIds()) && dataPlane.get().getAsBoolean();
     }
 
     /**
@@ -106,6 +110,10 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
      * minority's back -- and so an absence is never visible there. Empty until the first look.
      */
     Set<String> visibleNodeIds() {
+        return visible.get().nodeIds();
+    }
+
+    VisibleSnapshot visibleSnapshot() {
         return visible.get();
     }
 
@@ -143,7 +151,7 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
 
     private Set<String> rememberVisible(Set<String> visibleNodeIds) {
         Set<String> snapshot = Set.copyOf(visibleNodeIds);
-        visible.set(snapshot);
+        visible.updateAndGet(previous -> new VisibleSnapshot(previous.revision() + 1, snapshot));
         return snapshot;
     }
 

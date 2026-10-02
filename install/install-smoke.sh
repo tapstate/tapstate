@@ -584,7 +584,7 @@ else
   OTHER_VERSION=9.9.9
   _real_version="$VERSION"; VERSION="$OTHER_VERSION"; make_asset darwin-arm64; VERSION="$_real_version"
 
-  beacon_reset() { : > "$SINK_DIR/log"; }
+  beacon_reset() { : > "$SINK_DIR/log"; rm -f "$SINK_DIR/default-target"; }
   beacon_count() { grep -c . "$SINK_DIR/log" 2>/dev/null | tr -d ' '; }
   beacon_field() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" "$SINK_DIR/log" | head -1; }
 
@@ -599,13 +599,30 @@ else
     # shellcheck disable=SC2016
     printf '#!/bin/sh\ncase "$1" in -s) echo Darwin ;; -m) echo arm64 ;; *) echo unknown ;; esac\n' > "$shim/uname"
     chmod +x "$shim/uname"
+    # Default-endpoint controls record the selected production target and redirect it to our sink.
+    # An incorrect send is observable without allowing the smoke to reach production.
+    if [ "${EV_URL+x}" = x ]; then
+      cat > "$shim/curl" <<'SHIM'
+#!/usr/bin/env bash
+args=("$@")
+last=$((${#args[@]} - 1))
+if [ "${args[$last]}" = https://install.tapstate.dev/e ]; then
+  printf '%s\n' "${args[$last]}" > "$EV_DEFAULT_TARGET"
+  args[$last]="$EV_SINK_URL"
+fi
+exec "$EV_REAL_CURL" "${args[@]}"
+SHIM
+      chmod +x "$shim/curl"
+    fi
     # shellcheck disable=SC2086
     env ${EV_ENV:-} \
       PATH="$shim:$PATH" \
       TAPSTATE_VERSION="$fver" \
       TAPSTATE_BASE_URL="file://$STUB" \
       TAPSTATE_INSTALL_DIR="$idir" \
-      TAPSTATE_TELEMETRY_URL="$SINK_URL" \
+      TAPSTATE_TELEMETRY_URL="${EV_URL-$SINK_URL}" \
+      EV_REAL_CURL="$(command -v curl)" EV_SINK_URL="$SINK_URL" \
+      EV_DEFAULT_TARGET="$SINK_DIR/default-target" \
       sh "$INSTALL_SH" "$@" >"$outf" 2>"$errf"
     rm -rf "$shim"
   }
@@ -659,6 +676,60 @@ else
   beacon_reset; EV_ENV="TAPSTATE_TELEMETRY_CHANNEL=interal" ev_run "$d_ch3" "$OTHER_VERSION" "$ev_err" "$ev_out"; EV_ENV=""
   if [ "$(beacon_field channel)" = community ]; then ok "a misspelt channel is community, not quietly internal"
   else bad "a misspelt channel produced channel='$(beacon_field channel)'"; fi
+
+  # The sender owns this policy because a stale fork's workflow cannot inherit a newer fence.
+  # Suppression keeps its installation identity; an explicit endpoint still observes the same channel.
+  d_ci="$(mktemp -d)/bin"
+  beacon_reset; EV_URL="" EV_ENV="GITHUB_ACTIONS=true GITHUB_EVENT_NAME=schedule" \
+    ev_run "$d_ci" "$OTHER_VERSION" "$ev_err" "$ev_out"
+  if [ -x "$d_ci/tapstate" ] && [ -s "$d_ci/.installation-id" ] \
+      && [ "$(beacon_count)" = 0 ] && [ ! -e "$SINK_DIR/default-target" ]; then
+    ok "scheduled GitHub Actions installs keep an id without posting to the default endpoint"
+  else bad "scheduled install did not complete with an id, or still selected a default POST"; fi
+  if grep -q 'skip the default telemetry POST' "$ev_err" \
+      && ! grep -q 'reports one anonymous install event' "$ev_err"; then
+    ok "the scheduled default install discloses that its telemetry POST is skipped"
+  else bad "the scheduled default install disclosure does not describe suppression"; fi
+  ci_id="$(cat "$d_ci/.installation-id" 2>/dev/null)"
+  beacon_reset; EV_URL="" EV_ENV="GITHUB_ACTIONS=true GITHUB_EVENT_NAME=schedule" \
+    ev_run "$d_ci" "$OTHER_VERSION" "$ev_err" "$ev_out"
+  if [ -n "$ci_id" ] && [ "$(cat "$d_ci/.installation-id" 2>/dev/null)" = "$ci_id" ] \
+      && [ "$(beacon_count)" = 0 ] && [ ! -e "$SINK_DIR/default-target" ]; then
+    ok "a suppressed scheduled reinstall preserves its installation id"
+  else bad "a suppressed scheduled reinstall changed its id or selected a POST"; fi
+
+  beacon_reset; EV_ENV="GITHUB_ACTIONS=true GITHUB_EVENT_NAME=schedule" \
+    ev_run "$d_ci" "$OTHER_VERSION" "$ev_err" "$ev_out"
+  if [ "$(beacon_count)" = 1 ] && [ "$(beacon_field installation_id)" = "$ci_id" ] \
+      && [ "$(beacon_field channel)" = community ]; then
+    ok "a scheduled install's explicit endpoint receives its existing id and community channel"
+  else bad "an explicit scheduled endpoint was suppressed or its id/channel changed"; fi
+  beacon_reset; EV_ENV="GITHUB_ACTIONS=true GITHUB_EVENT_NAME=schedule TAPSTATE_TELEMETRY_CHANNEL=internal" \
+    ev_run "$d_ci" "$OTHER_VERSION" "$ev_err" "$ev_out"
+  if [ "$(beacon_count)" = 1 ] && [ "$(beacon_field channel)" = internal ]; then
+    ok "a scheduled install's explicit internal channel stays internal"
+  else bad "a scheduled install's explicit internal channel was changed or suppressed"; fi
+
+  beacon_reset; EV_URL=https://install.tapstate.dev/e \
+    EV_ENV="GITHUB_ACTIONS=true GITHUB_EVENT_NAME=schedule" \
+    ev_run "$d_ci" "$OTHER_VERSION" "$ev_err" "$ev_out"
+  if [ "$(beacon_count)" = 1 ] && [ -s "$SINK_DIR/default-target" ] \
+      && [ "$(beacon_field channel)" = community ]; then
+    ok "a scheduled install honors an explicit production endpoint (intercepted locally)"
+  else bad "a scheduled install did not honor its explicit production endpoint"; fi
+
+  beacon_reset; EV_URL="" EV_ENV="GITHUB_ACTIONS=true GITHUB_EVENT_NAME=workflow_dispatch" \
+    ev_run "$d_ci" "$OTHER_VERSION" "$ev_err" "$ev_out"
+  if [ "$(beacon_count)" = 1 ] && [ -s "$SINK_DIR/default-target" ] \
+      && [ "$(beacon_field channel)" = community ]; then
+    ok "manual GitHub Actions installs still use the default community endpoint"
+  else bad "manual GitHub Actions default telemetry was suppressed or reclassified"; fi
+  beacon_reset; EV_URL="" EV_ENV="GITHUB_ACTIONS=false GITHUB_EVENT_NAME=schedule" \
+    ev_run "$d_ci" "$OTHER_VERSION" "$ev_err" "$ev_out"
+  if [ "$(beacon_count)" = 1 ] && [ -s "$SINK_DIR/default-target" ] \
+      && [ "$(beacon_field channel)" = community ]; then
+    ok "a schedule value outside GitHub Actions still uses the default community endpoint"
+  else bad "a schedule value outside GitHub Actions changed default telemetry"; fi
 
   # opt-out: nothing sent AND nothing written. Skipping only the request still leaves an identifier on
   # the user's disk, and no network assertion would ever notice.

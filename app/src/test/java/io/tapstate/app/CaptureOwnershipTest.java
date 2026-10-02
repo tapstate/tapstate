@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.lifecycle.CaptureReading;
@@ -19,9 +20,18 @@ import io.tapstate.runtime.srs.CaptureHealth;
 import io.tapstate.runtime.srs.CaptureId;
 import io.tapstate.runtime.srs.CaptureRun;
 import io.tapstate.runtime.srs.CaptureRunSpec;
+import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.MiningChainId;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
+import io.tapstate.spi.capture.CaptureBatch;
+import io.tapstate.spi.capture.CaptureConfig;
+import io.tapstate.spi.capture.CaptureListener;
+import io.tapstate.spi.capture.CapturePort;
+import io.tapstate.spi.capture.CaptureStart;
+import io.tapstate.spi.capture.ConnectionReport;
+import io.tapstate.spi.capture.DiscoveredSchema;
+import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.ConsumerOffset;
@@ -43,14 +53,19 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 class CaptureOwnershipTest {
 
@@ -68,6 +83,139 @@ class CaptureOwnershipTest {
 
     /** The chain every pipeline here reads, whichever member drives it. */
     private static final String CHAIN = SourceCaptureResolution.of(SOURCE).chainId().value();
+
+    /**
+     * A capture nobody tails is not taken over while a pipeline here is still reading its own load of it.
+     * The tail would hand its changes over while that load is still arriving, and a change ahead of a
+     * snapshot row of the same key is overwritten by the older value. The tail resumes from where the durable
+     * record says the last one got to, so asking again on a later pass costs time and nothing else.
+     */
+    @Test
+    void aCaptureIsNotTakenOverWhileAPipelineOnItIsStillReadingItsLoad() {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith(ReadMode.SNAPSHOT_AND_CDC, "p", "q"));
+        MemoryClaims raw = new MemoryClaims();
+        ClusterMembershipGate gate = eligibleGate();
+        AtomicInteger tails = new AtomicInteger();
+        CaptureAttacher holding = (spec, handoff, startTail) -> {
+            if (startTail) {
+                tails.incrementAndGet();
+                opensTheRing(store);
+            }
+            return run(() -> { });
+        };
+        StoreBackedPipelineCaptureCoordinator nodeA =
+                managed(store, holding, gate, raw, new WorkloadOwner("node-a", "boot-a"));
+        nodeA.startCapture("p");
+
+        AtomicBoolean reading = new AtomicBoolean(true);
+        CaptureRun loading = mock(CaptureRun.class);
+        when(loading.loading()).thenAnswer(invocation -> reading.get());
+        CaptureAttacher joining = (spec, handoff, startTail) -> {
+            if (startTail) {
+                tails.incrementAndGet();
+                return run(() -> { });
+            }
+            return loading;
+        };
+        StoreBackedPipelineCaptureCoordinator nodeB =
+                managed(store, joining, gate, raw, new WorkloadOwner("node-b", "boot-b"));
+        nodeB.startCapture("q");
+        nodeA.stopCapture("p", false);
+
+        nodeB.tailWhatNobodyTails();
+        assertThat(tails).as("nothing taken over while q is still reading its load").hasValue(1);
+
+        reading.set(false);
+        nodeB.tailWhatNobodyTails();
+        assertThat(tails).as("taken over once the load is through").hasValue(2);
+
+        nodeB.stopCapture("q", false);
+        nodeA.close();
+        nodeB.close();
+    }
+
+    /**
+     * Stopping the pipeline whose run the others on a capture share lets go of that pipeline's load. The run
+     * stays, because the pipelines still on the capture read what it goes on to do; the load in it was the
+     * stopped pipeline's alone. Left reading, it went on handing rows to a hand-off the stop had already
+     * released -- a queue nobody declared, bounds or drains -- which is the rest of the table on the heap, for
+     * nobody.
+     */
+    @Test
+    void stoppingThePipelineWhoseRunOthersShareLetsGoOfItsLoad() throws Exception {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith(ReadMode.SNAPSHOT_ONLY, "p", "q"));
+        HeldSnapshots source = new HeldSnapshots(true);
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        StoreBackedPipelineCaptureCoordinator node = managed(store, reading(source, store), buffer);
+        node.startCapture("p");
+        node.startCapture("q");
+
+        node.stopCapture("p", false);
+        source.rest.countDown();
+        awaitLoadLetGo("p");
+
+        assertThat(buffer.drain("p", SourceCaptureResolution.of(SOURCE).ringName()))
+                .as("rows of the stopped pipeline's load, handed over after the stop").isEmpty();
+        assertThat(node.captureFailure("q")).isEmpty();
+        node.stopCapture("q", false);
+        node.close();
+    }
+
+    /**
+     * Nor is that stop a failure of the pipelines still on the capture. The load ends when the stop releases
+     * the hand-off it is waiting on, the way a closed run's load ends, and that end is the stop's: the run the
+     * others read goes on healthy.
+     */
+    @Test
+    void stoppingThePipelineWhoseRunOthersShareIsNotTheirFailure() throws Exception {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith(ReadMode.SNAPSHOT_ONLY, "p", "q"));
+        // Room for one row, so the second of each load waits for room nobody is making.
+        SnapshotBuffer buffer = new SnapshotBuffer(1);
+        StoreBackedPipelineCaptureCoordinator node =
+                managed(store, reading(new HeldSnapshots(false), store), buffer);
+        node.startCapture("p");
+        node.startCapture("q");
+        awaitLoadWaitingForRoom("p");
+
+        node.stopCapture("p", false);
+        awaitLoadLetGo("p");
+
+        assertThat(node.captureFailure("q")).isEmpty();
+        node.stopCapture("q", false);
+        node.close();
+    }
+
+    /** The run unit reading {@code source}, with nothing of a ring to open: its loads are snapshot-only. */
+    private static CaptureAttacher reading(CapturePort source, InMemoryStorePort store) {
+        CaptureRunUnit unit = new CaptureRunUnit(
+                source, new SrsCoordinator(store.meta()), store.meta(), mock(HazelcastInstance.class));
+        return unit::begin;
+    }
+
+    /** Waits for the thread reading {@code pipelineId}'s load to be gone, so what it did is all it did. */
+    private static void awaitLoadLetGo(String pipelineId) throws InterruptedException {
+        awaitLoadThread(pipelineId, "let go", List::isEmpty);
+    }
+
+    /** Waits for the thread reading {@code pipelineId}'s load to be parked, waiting for room. */
+    private static void awaitLoadWaitingForRoom(String pipelineId) throws InterruptedException {
+        awaitLoadThread(pipelineId, "wait for room",
+                threads -> threads.stream().anyMatch(thread -> thread.getState() == Thread.State.WAITING));
+    }
+
+    private static void awaitLoadThread(String pipelineId, String what, Predicate<List<Thread>> reached)
+            throws InterruptedException {
+        String name = "tapstate-load-" + pipelineId + "-" + SOURCE.id();
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (!reached.test(Thread.getAllStackTraces().keySet().stream()
+                .filter(thread -> thread.getName().equals(name) && thread.isAlive())
+                .toList())) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("the load of " + pipelineId + " did not " + what);
+            }
+            Thread.sleep(20);
+        }
+    }
 
     @Test
     void twoMemberBaselineReadsTwiceWithoutAClaimAndOnceWithCaptureOwnership() {
@@ -278,7 +426,7 @@ class CaptureOwnershipTest {
         }
 
         @Override
-        public CaptureRun start(CaptureRunSpec spec, Consumer<Envelope> receive, boolean startTail) {
+        public CaptureRun start(CaptureRunSpec spec, io.tapstate.runtime.srs.CaptureHandoff receive, boolean startTail) {
             MiningChainId chain = MiningChainId.resolve(spec.config(), spec.srsKey());
             if (startTail) {
                 chains.provisionSource(spec.sourceId(), chain, spec.config().streams(), spec.retention());
@@ -541,6 +689,166 @@ class CaptureOwnershipTest {
             coordinator.stopCapture("q", false);
             coordinator.close();
         }
+    }
+
+    @Test
+    void anAttachedPipelinesOwnFailureIsVisibleWhileTheSharedTailIsHealthy() {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith(ReadMode.SNAPSHOT_AND_CDC, "p", "q"));
+        RuntimeException failedLoad = new RuntimeException("q's load failed");
+        CaptureAttacher attacher = (spec, handoff, startTail) -> {
+            CaptureHealth health = new CaptureHealth();
+            if (!startTail) {
+                health.fail(failedLoad);
+            }
+            return new CaptureRun(Optional.empty(), false, 0L, Optional.empty(),
+                    Optional.of(() -> { }), health);
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, attacher, new SrsCoordinator(store.meta()), new SnapshotBuffer());
+
+        coordinator.startCapture("p");
+        coordinator.startCapture("q");
+
+        assertThat(coordinator.captureFailure("p")).isEmpty();
+        assertThat(coordinator.captureFailure("q")).containsSame(failedLoad);
+        coordinator.stopCapture("p", false);
+        coordinator.stopCapture("q", false);
+    }
+
+    @Test
+    void aFailedSnapshotOnlyLoadDoesNotFailAnotherPipelineOnTheSameSource() throws InterruptedException {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith(ReadMode.SNAPSHOT_ONLY, "p", "q"));
+        HeldSnapshots snapshots = new HeldSnapshots(true);
+        AtomicInteger openedLoads = new AtomicInteger();
+        AtomicInteger openedTails = new AtomicInteger();
+        AtomicReference<RuntimeException> firstLoadFailure = new AtomicReference<>();
+        CountDownLatch firstRows = new CountDownLatch(2);
+        CapturePort source = new CapturePort() {
+            @Override
+            public CaptureBatch snapshot(CaptureConfig config) {
+                boolean firstLoad = openedLoads.getAndIncrement() == 0;
+                CaptureBatch batch = snapshots.snapshot(config);
+                return new CaptureBatch() {
+                    @Override
+                    public boolean hasNext() {
+                        boolean hasNext = batch.hasNext();
+                        RuntimeException failure = firstLoad ? firstLoadFailure.get() : null;
+                        if (failure != null) {
+                            throw failure;
+                        }
+                        return hasNext;
+                    }
+
+                    @Override
+                    public Envelope next() {
+                        Envelope row = batch.next();
+                        firstRows.countDown();
+                        return row;
+                    }
+
+                    @Override
+                    public Optional<SourcePosition> seam() {
+                        return batch.seam();
+                    }
+
+                    @Override
+                    public void close() {
+                        batch.close();
+                    }
+                };
+            }
+
+            @Override
+            public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+                openedTails.incrementAndGet();
+                throw new AssertionError("a snapshot-only read cannot open a CDC tail");
+            }
+
+            @Override
+            public ConnectionReport testConnection(CaptureConfig config) {
+                return snapshots.testConnection(config);
+            }
+
+            @Override
+            public DiscoveredSchema discoverSchema(CaptureConfig config) {
+                return snapshots.discoverSchema(config);
+            }
+        };
+        CaptureRunUnit unit = new CaptureRunUnit(
+                source, new SrsCoordinator(store.meta()), store.meta(), mock(HazelcastInstance.class));
+        List<CaptureRunSpec> starts = new ArrayList<>();
+        List<CaptureRun> runs = new ArrayList<>();
+        CaptureAttacher attacher = (spec, handoff, startTail) -> {
+            starts.add(spec);
+            CaptureRun run = unit.begin(spec, handoff, startTail);
+            runs.add(run);
+            return run;
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, attacher, new SrsCoordinator(store.meta()), new SnapshotBuffer());
+
+        try {
+            coordinator.startCapture("p");
+            coordinator.startCapture("q");
+            assertThat(starts).extracting(CaptureRunSpec::pipelineId).containsExactly("p", "q");
+            assertThat(starts).extracting(CaptureRunSpec::readMode).containsOnly(ReadMode.SNAPSHOT_ONLY);
+            assertThat(openedLoads.get()).as("each pipeline opens its own bounded load").isEqualTo(2);
+            assertThat(firstRows.await(10, TimeUnit.SECONDS)).as("both loads have started reading").isTrue();
+            assertThat(runs).hasSize(2).allSatisfy(run -> {
+                assertThat(run.chainId()).isEmpty();
+                assertThat(run.ringSource()).isEmpty();
+                assertThat(run.cdcSubscription()).isEmpty();
+            });
+            assertThat(runs.get(0).health()).isNotSameAs(runs.get(1).health());
+            assertThat(new StoreBackedPipelineCaptures(store).captureIds("p"))
+                    .as("bounded loads belong to their own pipelines")
+                    .isNotEqualTo(new StoreBackedPipelineCaptures(store).captureIds("q"));
+
+            RuntimeException failedLoad = new RuntimeException("p's load failed");
+            firstLoadFailure.set(failedLoad);
+            snapshots.rest.countDown();
+            assertThat(runs.get(0).awaitLoaded(Duration.ofSeconds(10))).isTrue();
+            assertThat(runs.get(1).awaitLoaded(Duration.ofSeconds(10))).isTrue();
+
+            assertThat(coordinator.captureFailure("p")).containsSame(failedLoad);
+            assertThat(runs.get(1).failure()).isEmpty();
+            assertThat(runs.get(1).snapshotCounts()).containsExactlyEntriesOf(Map.of("orders", 3L));
+            assertThat(coordinator.captureFailure("q")).as("q's independent load stays healthy").isEmpty();
+            assertThat(openedTails.get()).as("snapshot-only runs open no incremental tail").isZero();
+            assertThat(runs).allSatisfy(run -> assertThat(run.cdcSubscription()).isEmpty());
+        } finally {
+            snapshots.rest.countDown();
+            coordinator.stopCapture("p", false);
+            coordinator.stopCapture("q", false);
+            coordinator.close();
+        }
+    }
+
+    @Test
+    void aFailedSharedTailIsVisibleToAnAttachedPipeline() {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith(ReadMode.CDC_ONLY, "p", "q"));
+        CaptureHealth ownerHealth = new CaptureHealth();
+        CaptureHealth attachedHealth = new CaptureHealth();
+        List<Boolean> starts = new ArrayList<>();
+        CaptureAttacher attacher = (spec, handoff, startTail) -> {
+            starts.add(startTail);
+            return new CaptureRun(Optional.empty(), false, 0L, Optional.empty(), Optional.of(() -> { }),
+                    spec.pipelineId().equals("p") ? ownerHealth : attachedHealth);
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, attacher, new SrsCoordinator(store.meta()), new SnapshotBuffer());
+
+        coordinator.startCapture("p");
+        coordinator.startCapture("q");
+        assertThat(starts).containsExactly(true, false);
+
+        RuntimeException failedTail = new RuntimeException("the shared tail failed");
+        ownerHealth.fail(failedTail);
+
+        assertThat(coordinator.captureFailure("p")).containsSame(failedTail);
+        assertThat(coordinator.captureFailure("q")).containsSame(failedTail);
+        coordinator.stopCapture("p", false);
+        coordinator.stopCapture("q", false);
     }
 
     @Test
@@ -955,10 +1263,99 @@ class CaptureOwnershipTest {
             ClusterMembershipGate gate,
             MemoryClaims raw,
             WorkloadOwner owner) {
+        return managed(store, attacher, gate, raw, owner, new SnapshotBuffer());
+    }
+
+    /** One member alone in its cluster, handing its loads over through {@code buffer}. */
+    private static StoreBackedPipelineCaptureCoordinator managed(
+            InMemoryStorePort store, CaptureAttacher attacher, SnapshotBuffer buffer) {
+        return managed(store, attacher, eligibleGate(), new MemoryClaims(), Member.owner("node-a"), buffer);
+    }
+
+    private static StoreBackedPipelineCaptureCoordinator managed(
+            InMemoryStorePort store,
+            CaptureAttacher attacher,
+            ClusterMembershipGate gate,
+            MemoryClaims raw,
+            WorkloadOwner owner,
+            SnapshotBuffer buffer) {
         CaptureOwnership ownership = new CaptureOwnership(
                 "cluster-a", owner, gate, new ClusterWorkloadClaims(raw, gate), TTL);
         return new StoreBackedPipelineCaptureCoordinator(
-                store, attacher, new SrsCoordinator(store.meta()), new SnapshotBuffer(), ownership, RENEW);
+                store, attacher, new SrsCoordinator(store.meta()), buffer, ownership, RENEW);
+    }
+
+    /**
+     * A snapshot source whose every read hands its first row over at once and, when it {@code holds}, keeps
+     * the other two back until {@link #rest} opens or that read is closed -- which is what letting go of a
+     * load does to it.
+     */
+    private static final class HeldSnapshots implements CapturePort {
+        private final boolean holds;
+        final CountDownLatch rest = new CountDownLatch(1);
+
+        HeldSnapshots(boolean holds) {
+            this.holds = holds;
+        }
+
+        @Override
+        public CaptureBatch snapshot(CaptureConfig config) {
+            return new CaptureBatch() {
+                private int next = 1;
+                private volatile boolean closed;
+
+                @Override
+                public boolean hasNext() {
+                    if (next == 2 && holds) {
+                        awaitRest();
+                    }
+                    return next <= 3;
+                }
+
+                @Override
+                public Envelope next() {
+                    return Envelope.read(1L, "orders", Map.of("id", (long) next++), Map.of());
+                }
+
+                @Override
+                public Optional<SourcePosition> seam() {
+                    return Optional.of(new SourcePosition("seam-0"));
+                }
+
+                @Override
+                public void close() {
+                    closed = true;
+                }
+
+                private void awaitRest() {
+                    try {
+                        while (!rest.await(20, TimeUnit.MILLISECONDS)) {
+                            if (closed) {
+                                throw new CancellationException("closed while holding the rest");
+                            }
+                        }
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new CancellationException("interrupted while holding the rest");
+                    }
+                }
+            };
+        }
+
+        @Override
+        public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+            throw new UnsupportedOperationException("a snapshot-only read opens no tail");
+        }
+
+        @Override
+        public ConnectionReport testConnection(CaptureConfig config) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public DiscoveredSchema discoverSchema(CaptureConfig config) {
+            throw new UnsupportedOperationException();
+        }
     }
 
     private static ClusterMembershipGate eligibleGate() {
@@ -1116,8 +1513,14 @@ class CaptureOwnershipTest {
         }
 
         @Override
-        public synchronized Optional<WorkloadClaim> advanceUnderClaim(
-                WorkloadClaim expected, long topologyRevision) {
+        public synchronized Optional<WorkloadClaim> advanceExecution(
+                WorkloadClaim expected, long topologyRevision, java.util.Set<String> executionNodeIds) {
+            return Optional.empty();
+        }
+
+        @Override
+        public synchronized Optional<WorkloadClaim> recordExecutionFailure(
+                WorkloadClaim expected, boolean afterMemberLoss) {
             return Optional.empty();
         }
 

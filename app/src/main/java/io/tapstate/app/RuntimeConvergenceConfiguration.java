@@ -113,6 +113,7 @@ class RuntimeConvergenceConfiguration {
                 engine::queueReading,
                 engine::stateStoreCostReadings,
                 (ObservationPublisher.StageRuntimeFacts) engine::stageRuntimeReading,
+                captureCoordinator::runSnapshotProgress,
                 Clock.systemUTC());
     }
 

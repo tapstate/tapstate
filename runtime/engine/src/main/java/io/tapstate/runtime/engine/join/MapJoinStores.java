@@ -3,9 +3,11 @@ package io.tapstate.runtime.engine.join;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * A join's state over ordinary maps: what a case runs against, and the reference the distributed
@@ -24,6 +26,7 @@ public final class MapJoinStores implements JoinStores {
     private final Map<String, Map<String, Object>> facts;
     private final Map<String, Map<String, Map<String, Object>>> dimensions = new HashMap<>();
     private final Map<String, Map<ReverseBucket.At, ReverseBucket>> indexes = new HashMap<>();
+    private final Map<String, Long> takenIn = new HashMap<>();
     private final int pageSize;
 
     public MapJoinStores() {
@@ -89,6 +92,25 @@ public final class MapJoinStores implements JoinStores {
     }
 
     @Override
+    public Map<ReverseBucket.At, Set<String>> indexNames(String source,
+            Map<ReverseBucket.At, Set<String>> asked) {
+        ReverseIndex index = index(source);
+        Map<ReverseBucket.At, Set<String>> named = new LinkedHashMap<>();
+        asked.forEach((at, factKeys) -> {
+            Set<String> found = new LinkedHashSet<>();
+            for (String factKey : index.page(at.dimensionKey(), at.page())) {
+                if (factKeys.contains(factKey)) {
+                    found.add(factKey);
+                }
+            }
+            if (!found.isEmpty()) {
+                named.put(at, found);
+            }
+        });
+        return named;
+    }
+
+    @Override
     public void indexAdd(String source, String dimensionKey, String factKey) {
         index(source).add(dimensionKey, factKey);
     }
@@ -98,9 +120,19 @@ public final class MapJoinStores implements JoinStores {
         index(source).remove(dimensionKey, factKey);
     }
 
-    /** How many entries this is holding, over all three kinds - what a case looks at to see it settle. */
+    @Override
+    public long batchesTakenIn(String writer) {
+        return takenIn.getOrDefault(writer, 0L);
+    }
+
+    @Override
+    public void putBatchesTakenIn(String writer, long batch) {
+        takenIn.put(Objects.requireNonNull(writer, "writer"), batch);
+    }
+
+    /** How many entries this is holding, over all four kinds - what a case looks at to see it settle. */
     public int entries() {
-        int held = facts.size();
+        int held = facts.size() + takenIn.size();
         for (Map<String, Map<String, Object>> rows : dimensions.values()) {
             held += rows.size();
         }

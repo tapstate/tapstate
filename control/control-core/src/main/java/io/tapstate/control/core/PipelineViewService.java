@@ -35,11 +35,21 @@ public final class PipelineViewService {
 
     /** Lists stored Pipelines in stable id order. */
     public List<PipelineView> list() {
-        return artifacts.listResources().stream()
+        return list(0, Integer.MAX_VALUE);
+    }
+
+    /** Lists one artifact-backed page, resolving Source summaries only for rows in that page. */
+    public List<PipelineView> list(int offset, int limit) {
+        if (offset < 0 || limit < 1) {
+            throw new IllegalArgumentException("pipeline page offset must be non-negative and limit positive");
+        }
+        List<StoredResource> matching = artifacts.listResources().stream()
                 .filter(stored -> stored.resource() instanceof PipelineResource)
                 .sorted(Comparator.comparing(stored -> stored.resource().id()))
-                .map(this::view)
                 .toList();
+        if (offset >= matching.size()) return List.of();
+        int end = (int) Math.min((long) matching.size(), (long) offset + limit);
+        return matching.subList(offset, end).stream().map(this::view).toList();
     }
 
     /** Returns the typed Pipeline view when the id resolves to a stored Pipeline. */

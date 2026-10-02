@@ -34,7 +34,8 @@ public interface LifecycleActuator {
     /** Atomically admits one successor after the actuator has secured its bounded capture capacity. */
     @FunctionalInterface
     interface ReplacementAdmission {
-        Optional<SuccessorAdmission> admit(StopAuthority current, String incarnationId, String submissionBootId);
+        Optional<SuccessorAdmission> admit(StopAuthority current, String incarnationId, String submissionBootId,
+                java.util.Set<String> executionMembers);
     }
 
     /** Carries the exact durable admission through the start fence and the actual native submission. */
@@ -168,6 +169,16 @@ public interface LifecycleActuator {
      * a stop's own cancellation is not a failure and must not be reported as one.
      */
     Optional<Throwable> failure(String pipelineId);
+
+    /**
+     * Why nothing here can hold this pipeline's job any more, or empty while something can.
+     *
+     * <p>Asked of a paused pipeline, which {@link #failure} is not asked of: its job is held rather than run,
+     * so it does not die on its own, and anything else that goes wrong behind it is found once it is meant to
+     * run again. Losing the data plane that holds the job is different. The job goes with it, so there is
+     * nothing left to resume.
+     */
+    Optional<Throwable> lost(String pipelineId);
 
     /**
      * Whether a job is running this pipeline right now, as this actuator sees it.

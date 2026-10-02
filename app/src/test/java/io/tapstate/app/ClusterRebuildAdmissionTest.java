@@ -2,13 +2,30 @@ package io.tapstate.app;
 
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.WorkloadOwner;
+import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimAttempt;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimReading;
+import io.tapstate.spi.store.WorkloadClaimStore;
 import org.junit.jupiter.api.Test;
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 
 import java.time.Duration;
 import java.util.Set;
+import java.util.AbstractCollection;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 
 /**
  * When a failed run may be replaced without anybody asking, driven through the real claim store and a
@@ -21,6 +38,7 @@ class ClusterRebuildAdmissionTest {
     private static final Duration TTL = Duration.ofSeconds(30);
     private static final Duration RENEW = Duration.ofSeconds(10);
     private static final Duration BACKOFF = TTL;
+    private static final Duration DETECTION = Duration.ofSeconds(30);
     private static final WorkloadOwner NODE_A = new WorkloadOwner("node-a", "boot-a");
 
     private final InMemoryWorkloadClaimStore claims = new InMemoryWorkloadClaimStore();
@@ -31,7 +49,7 @@ class ClusterRebuildAdmissionTest {
             "cluster-a", NODE_A, membership, new ClusterWorkloadClaims(claims, membership), TTL, RENEW,
             nanos::get);
     private final ClusterRebuildAdmission admission =
-            new ClusterRebuildAdmission(ownership, BACKOFF, nanos::get);
+            new ClusterRebuildAdmission(ownership, BACKOFF, DETECTION, nanos::get);
 
     @Test
     void aRunNothingMovedUnderIsNotRebuilt() {
@@ -42,6 +60,187 @@ class ClusterRebuildAdmissionTest {
                 .as("the cluster is where it was when this run was fenced, so this death is the "
                         + "pipeline's own and stays recorded as one")
                 .isFalse();
+    }
+
+    @Test
+    void aRunThatFailedBeforeItsDriverRestartedIsNotRebuiltOnClaimTakeover() {
+        committed(7, "node-a", "node-b", "node-c");
+        assertThat(ownership.permit("orders").granted()).isTrue();
+        assertThat(ownership.beginExecution("orders").allowed()).isTrue();
+
+        // Admission is asked for a FAILED run. The intact view must survive failure detection.
+        assertThat(admission.admits("orders"))
+                .as("recovery waits for the member-loss detection window")
+                .isFalse();
+        membership.canCommit(Set.of("node-a", "node-b", "node-c"));
+        assertThat(admission.admits("orders"))
+                .as("an early intact publication cannot make the verdict durable")
+                .isFalse();
+        nanos.addAndGet(DETECTION.toNanos());
+        assertThat(admission.admits("orders"))
+                .as("the last publication may predate failure detection")
+                .isFalse();
+        membership.canCommit(Set.of("node-a", "node-b", "node-c"));
+        assertThat(admission.admits("orders"))
+                .as("an intact view after the detection window records an independent failure")
+                .isFalse();
+
+        // The driver restarts after that failure. Its stable node id remains in the committed and
+        // visible membership, but its new boot id must take over the expired claim.
+        claims.elapse(TTL.plusSeconds(1));
+        nanos.addAndGet(RENEW.toNanos());
+        PipelineActuationOwnership restarted = new PipelineActuationOwnership(
+                "cluster-a", new WorkloadOwner("node-a", "boot-a-restarted"), membership,
+                new ClusterWorkloadClaims(claims, membership), TTL, RENEW, nanos::get);
+        PipelineActuationOwnership.Permit taken = restarted.permit("orders");
+        assertThat(taken.granted()).isTrue();
+        assertThat(taken.claim().claimGeneration()).isEqualTo(2);
+        assertThat(taken.claim().executionGeneration()).isEqualTo(1);
+        assertThat(membership.visibleNodeIds()).containsExactlyInAnyOrder("node-a", "node-b", "node-c");
+
+        assertThat(new ClusterRebuildAdmission(restarted, BACKOFF, DETECTION, nanos::get).admits("orders"))
+                .as("the run was already FAILED for its own reason before the claim changed hands")
+                .isFalse();
+    }
+
+    @Test
+    void aFailureRecordedBeforeAMemberLeavesDoesNotBecomeRecoverableLater() {
+        committed(7, "node-a", "node-b", "node-c");
+        submitRunUnder(7);
+
+        assertThat(admission.admits("orders")).isFalse();
+        membership.canCommit(Set.of("node-a", "node-b", "node-c"));
+        assertThat(admission.admits("orders"))
+                .as("an early intact view cannot confirm the failure was independent")
+                .isFalse();
+        nanos.addAndGet(DETECTION.toNanos());
+        assertThat(admission.admits("orders")).isFalse();
+        membership.canCommit(Set.of("node-a", "node-b", "node-c"));
+        assertThat(admission.admits("orders"))
+                .as("the intact view after failure detection confirms the independent failure")
+                .isFalse();
+        membership.canCommit(Set.of("node-a", "node-b"));
+
+        assertThat(admission.admits("orders"))
+                .as("the missing member appeared only after the failure was recorded")
+                .isFalse();
+    }
+
+    @Test
+    void aFailureSeenBeforeMembershipRefreshCanRecoverWhenTheMissingMemberBecomesVisible() {
+        committed(7, "node-a", "node-b", "node-c");
+        submitRunUnder(7);
+
+        admission.recordFailure("orders");
+        assertThat(admission.admits("orders"))
+                .as("the last visible snapshot still includes every member, so recovery waits")
+                .isFalse();
+        assertThat(admission.admits("orders"))
+                .as("another pass over the same view is not new membership evidence")
+                .isFalse();
+        membership.canCommit(Set.of("node-a", "node-b"));
+
+        assertThat(admission.admits("orders"))
+                .as("the refreshed view reveals the member lost under the failed run")
+                .isTrue();
+    }
+
+    @Test
+    void aStaleUnchangedPublicationCannotMakeTheFailureIndependentlyPermanent() {
+        committed(7, "node-a", "node-b", "node-c");
+        submitRunUnder(7);
+
+        admission.recordFailure("orders");
+        // The membership reconciler can publish its old view again before Hazelcast detects the loss.
+        membership.canCommit(Set.of("node-a", "node-b", "node-c"));
+        assertThat(admission.admits("orders")).isFalse();
+        nanos.addAndGet(DETECTION.toNanos());
+        assertThat(admission.admits("orders"))
+                .as("the stale view cannot confirm a no-loss verdict at the detection boundary")
+                .isFalse();
+        membership.canCommit(Set.of("node-a", "node-b"));
+
+        assertThat(admission.admits("orders"))
+                .as("an unchanged pre-detection view cannot make the later loss unrecoverable")
+                .isTrue();
+    }
+
+    @Test
+    void anUnmarkedFailureCanBeRebuiltWhenItsDriverLeavesDuringDetection() {
+        committed(7, "node-a", "node-b", "node-c");
+        submitRunUnder(7);
+        admission.recordFailure("orders");
+
+        claims.elapse(TTL.plusSeconds(1));
+        nanos.addAndGet(RENEW.toNanos());
+        membership.canCommit(Set.of("node-b", "node-c"));
+        PipelineActuationOwnership survivor = new PipelineActuationOwnership(
+                "cluster-a", new WorkloadOwner("node-b", "boot-b"), membership,
+                new ClusterWorkloadClaims(claims, membership), TTL, RENEW, nanos::get);
+        assertThat(survivor.permit("orders").granted()).isTrue();
+
+        assertThat(new ClusterRebuildAdmission(survivor, BACKOFF, DETECTION, nanos::get).admits("orders"))
+                .as("the failure was still unclassified when its driver left")
+                .isTrue();
+    }
+
+    @Test
+    void aKnownSinkFailureMarkerStaysIndependentWhenMemberLossAppearsDuringDetection() {
+        committed(7, "node-a", "node-b", "node-c");
+        submitRunUnder(7);
+        assertThat(claims.recordExecutionFailure(ownership.permit("orders").claim(), false))
+                .as("a sink member records its known failure under the run before reporting it")
+                .isPresent();
+
+        membership.canCommit(Set.of("node-a", "node-b"));
+
+        assertThat(admission.admits("orders"))
+                .as("the later loss must not override the sink failure recorded under this run")
+                .isFalse();
+    }
+
+    @Test
+    void aFailureRecordedAfterMemberLossRemainsRecoverableAcrossTakeoverAndReturn() {
+        committed(7, "node-a", "node-b", "node-c");
+        submitRunUnder(7);
+        membership.canCommit(Set.of("node-a", "node-b"));
+
+        assertThat(admission.admits("orders")).isTrue();
+        claims.elapse(TTL.plusSeconds(1));
+        nanos.addAndGet(RENEW.toNanos());
+        membership.canCommit(Set.of("node-a", "node-b", "node-c"));
+
+        PipelineActuationOwnership restarted = new PipelineActuationOwnership(
+                "cluster-a", new WorkloadOwner("node-a", "boot-a-restarted"), membership,
+                new ClusterWorkloadClaims(claims, membership), TTL, RENEW, nanos::get);
+        assertThat(restarted.permit("orders").granted()).isTrue();
+        assertThat(new ClusterRebuildAdmission(restarted, BACKOFF, DETECTION, nanos::get).admits("orders"))
+                .as("the departure had already been recorded with the failure, even though the member returned")
+                .isTrue();
+    }
+
+    @Test
+    void aRunThatFailsWhileItsDriverIsClosingIsRecoveredAfterTakeover() {
+        committed(7, "node-a", "node-b", "node-c");
+        assertThat(ownership.permit("orders").granted()).isTrue();
+        assertThat(ownership.beginExecution("orders").allowed()).isTrue();
+
+        try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext()) {
+            context.registerBean("ownership", PipelineActuationOwnership.class, () -> ownership);
+            context.refresh();
+        }
+        assertThat(ownership.permit("orders").granted()).isFalse();
+        admission.recordFailure("orders");
+        claims.elapse(TTL.plusSeconds(1));
+        nanos.addAndGet(RENEW.toNanos());
+
+        PipelineActuationOwnership restarted = new PipelineActuationOwnership(
+                "cluster-a", new WorkloadOwner("node-a", "boot-a-restarted"), membership,
+                new ClusterWorkloadClaims(claims, membership), TTL, RENEW, nanos::get);
+        assertThat(restarted.permit("orders").granted()).isTrue();
+        assertThat(new ClusterRebuildAdmission(restarted, BACKOFF, DETECTION, nanos::get).admits("orders"))
+                .as("the run died after its driver began shutting down, even though every node id is in sight")
+                .isTrue();
     }
 
     @Test
@@ -265,6 +464,162 @@ class ClusterRebuildAdmissionTest {
                         + "trouble, and restarting it every backoff for ever is the restart loop this "
                         + "budget exists to stop")
                 .isFalse();
+    }
+
+    @Test
+    void retentionCanOverlapAdmissionWithoutLosingIndependentPipelineBudgets() throws Exception {
+        committed(7, "node-a", "node-b", "node-c");
+        List<String> pipelines = List.of("orders", "invoices", "payments");
+        runningPipelines(ownership, pipelines);
+        membership.canCommit(Set.of("node-a", "node-b"));
+        assertThat(admission.admits("orders")).isTrue();
+        assertThat(admission.admits("invoices")).isTrue();
+        CountDownLatch retaining = new CountDownLatch(1);
+        CountDownLatch releaseRetention = new CountDownLatch(1);
+        AtomicBoolean paused = new AtomicBoolean();
+        var active = new AbstractCollection<String>() {
+            @Override public Iterator<String> iterator() { return pipelines.iterator(); }
+            @Override public int size() { return pipelines.size(); }
+            @Override public boolean contains(Object pipeline) {
+                if (paused.compareAndSet(false, true)) {
+                    retaining.countDown();
+                    awaitGate(releaseRetention);
+                }
+                return pipelines.contains(pipeline);
+            }
+        };
+        try (ExecutorService workers = Executors.newFixedThreadPool(2)) {
+            Future<?> retained = workers.submit(() -> admission.retain(active));
+            try {
+                assertThat(retaining.await(5, TimeUnit.SECONDS)).isTrue();
+                Future<Boolean> added = workers.submit(() -> admission.admits("payments"));
+                assertThatCode(() -> added.get(2, TimeUnit.SECONDS))
+                        .as("an independent worker must admit while retention is paused")
+                        .doesNotThrowAnyException();
+                assertThat(added.get(2, TimeUnit.SECONDS)).isTrue();
+            } finally {
+                releaseRetention.countDown();
+            }
+            assertThatCode(() -> retained.get(5, TimeUnit.SECONDS))
+                    .as("retention cannot fail when a worker adds another pipeline budget")
+                    .doesNotThrowAnyException();
+        }
+        assertRemainingBudgets(admission, pipelines);
+    }
+
+    @Test
+    void concurrentWorkersPreserveDistinctPipelineBackoffAndAttemptLimits() throws Exception {
+        committed(7, "node-a", "node-b", "node-c");
+        List<String> pipelines = List.of("orders", "invoices", "payments", "shipments");
+        runningPipelines(ownership, pipelines);
+        membership.canCommit(Set.of("node-a", "node-b"));
+        try (ExecutorService workers = Executors.newFixedThreadPool(4)) {
+            for (int attempt = 0; attempt < ClusterRebuildAdmission.MAX_ATTEMPTS; attempt++) {
+                assertThat(admitTogether(workers, pipelines)).containsOnly(true).hasSize(4);
+                assertThat(admitTogether(workers, pipelines))
+                        .as("every pipeline keeps its own backoff after simultaneous admissions")
+                        .containsOnly(false).hasSize(4);
+                nanos.addAndGet(BACKOFF.toNanos());
+            }
+            assertThat(admitTogether(workers, pipelines))
+                    .as("every worker pipeline exhausts the same bounded budget")
+                    .containsOnly(false).hasSize(4);
+        }
+    }
+
+    @Test
+    void onePipelinesBlockedOwnershipIoDoesNotPreventAnotherAdmission() throws Exception {
+        committed(7, "node-a", "node-b", "node-c");
+        CountDownLatch inOwnership = new CountDownLatch(1);
+        CountDownLatch releaseOwnership = new CountDownLatch(1);
+        WorkloadClaimStore delayed = new WorkloadClaimStore() {
+            @Override public WorkloadClaimAttempt acquire(WorkloadClaimKey key, WorkloadOwner owner,
+                    long revision, Duration ttl) { return claims.acquire(key, owner, revision, ttl); }
+            @Override public Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
+                return claims.renew(expected, ttl);
+            }
+            @Override public boolean release(WorkloadClaim expected) { return claims.release(expected); }
+            @Override public Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long revision,
+                    Set<String> members) { return claims.advanceExecution(expected, revision, members); }
+            @Override public Optional<WorkloadClaim> recordExecutionFailure(WorkloadClaim expected, boolean memberLoss) {
+                if ("slow".equals(expected.key().resourceId())) {
+                    inOwnership.countDown();
+                    awaitGate(releaseOwnership);
+                }
+                return claims.recordExecutionFailure(expected, memberLoss);
+            }
+            @Override public Optional<WorkloadClaimReading> read(WorkloadClaimKey key) { return claims.read(key); }
+        };
+        PipelineActuationOwnership driven = new PipelineActuationOwnership("cluster-a", NODE_A, membership,
+                new ClusterWorkloadClaims(delayed, membership), TTL, RENEW, nanos::get);
+        runningPipelines(driven, List.of("slow", "fast"));
+        membership.canCommit(Set.of("node-a", "node-b"));
+        ClusterRebuildAdmission controlled = new ClusterRebuildAdmission(driven, BACKOFF, DETECTION, nanos::get);
+        try (ExecutorService workers = Executors.newFixedThreadPool(2)) {
+            Future<Boolean> slow = workers.submit(() -> controlled.admits("slow"));
+            try {
+                assertThat(inOwnership.await(5, TimeUnit.SECONDS)).isTrue();
+                Future<Boolean> fast = workers.submit(() -> controlled.admits("fast"));
+                assertThatCode(() -> fast.get(2, TimeUnit.SECONDS))
+                        .as("ownership I/O for one pipeline must not hold another pipeline's admission lock")
+                        .doesNotThrowAnyException();
+                assertThat(fast.get(2, TimeUnit.SECONDS)).isTrue();
+            } finally {
+                releaseOwnership.countDown();
+            }
+            assertThat(slow.get(5, TimeUnit.SECONDS)).isTrue();
+        }
+        assertRemainingBudgets(controlled, List.of("slow", "fast"));
+    }
+
+    private void runningPipelines(PipelineActuationOwnership driven, List<String> pipelines) {
+        for (String pipeline : pipelines) {
+            assertThat(driven.permit(pipeline).granted()).as("real claim for %s", pipeline).isTrue();
+            assertThat(driven.beginExecution(pipeline).allowed()).as("real run context for %s", pipeline).isTrue();
+        }
+    }
+
+    private void assertRemainingBudgets(ClusterRebuildAdmission controlled, List<String> pipelines) {
+        for (String pipeline : pipelines) { assertThat(controlled.admits(pipeline)).isFalse(); }
+        for (int attempt = 1; attempt < ClusterRebuildAdmission.MAX_ATTEMPTS; attempt++) {
+            nanos.addAndGet(BACKOFF.toNanos());
+            for (String pipeline : pipelines) { assertThat(controlled.admits(pipeline)).as(pipeline).isTrue(); }
+        }
+        nanos.addAndGet(BACKOFF.toNanos());
+        for (String pipeline : pipelines) { assertThat(controlled.admits(pipeline)).as(pipeline).isFalse(); }
+    }
+
+    private List<Boolean> admitTogether(ExecutorService workers, List<String> pipelines) throws Exception {
+        CountDownLatch ready = new CountDownLatch(pipelines.size());
+        CountDownLatch release = new CountDownLatch(1);
+        List<Future<Boolean>> calls = pipelines.stream().map(pipeline -> workers.submit(() -> {
+            ready.countDown();
+            awaitGate(release);
+            return admission.admits(pipeline);
+        })).toList();
+        try {
+            assertThat(ready.await(5, TimeUnit.SECONDS)).isTrue();
+        } finally {
+            release.countDown();
+        }
+        for (Future<Boolean> call : calls) {
+            assertThatCode(() -> call.get(5, TimeUnit.SECONDS))
+                    .as("a concurrent worker admission must return without map mutation failure")
+                    .doesNotThrowAnyException();
+        }
+        return calls.stream().map(call -> {
+            try { return call.get(5, TimeUnit.SECONDS); }
+            catch (Exception failure) { throw new AssertionError(failure); }
+        }).toList();
+    }
+
+    private static void awaitGate(CountDownLatch gate) {
+        try {
+            if (!gate.await(5, TimeUnit.SECONDS)) { throw new AssertionError("bounded concurrency gate did not open"); }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(interrupted);
+        }
     }
 
     /** Installs a committed membership at {@code revision} and lets the gate see those nodes. */

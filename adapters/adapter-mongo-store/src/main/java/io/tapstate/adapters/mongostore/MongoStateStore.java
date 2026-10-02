@@ -26,6 +26,7 @@ import java.time.Instant;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * The MongoDB pipeline-state store: one checkpoint document per pipeline, whose transitions land only
@@ -201,6 +202,12 @@ public final class MongoStateStore implements StateStore {
     @Override public Optional<SuccessorAdmission> admitSuccessor(StopReservation expected,
             String incarnation, String boot, Instant at) {
         return requireStops().admit(expected, incarnation, boot, at);
+    }
+
+    @Override public Optional<SuccessorAdmission> admitSuccessor(StopReservation expected,
+            String incarnation, String boot, Set<String> executionMembers, Instant at) {
+        Objects.requireNonNull(executionMembers, "executionMembers");
+        return requireStops().admit(expected, incarnation, boot, executionMembers, at);
     }
 
     @Override public Optional<StopReservation> bindSuccessor(StopReservation expected,

@@ -18,6 +18,10 @@ interface PipelineCaptureCoordinator {
     /**
      * Starts the cdc capture for every source the pipeline reads, retaining the live handles for a later stop.
      *
+     * <p>Returns once every source's load is open, before its rows are read. The rows are read while the job
+     * that takes them runs, into a hand-off that holds a few thousand of them at a time, and the tail follows
+     * each load once it is through; a failure of either is reported by {@link #captureFailure}.
+     *
      * <p>May give the start back with {@link RingNotOpenYet} instead, having opened nothing: a capture it reads
      * is held by another member that has not opened its ring yet. The caller submits nothing for the
      * pipeline and starts it again on a later pass.
@@ -63,10 +67,10 @@ interface PipelineCaptureCoordinator {
     void stopCapture(String pipelineId, boolean purgeState);
 
     /**
-     * The failure a running pipeline's cdc capture died with, or empty while it is healthy. The cdc stream runs
-     * on its own thread feeding the ring the Jet job reads, so a tail that dies leaves the job running over a
-     * quiet ring; this is how the actuator seam surfaces that death for the converge loop to act on. A
-     * coordinator that runs no capture reports none.
+     * The failure a running pipeline's capture died with, or empty while it is healthy. The load and the cdc
+     * stream both run on threads of their own feeding what the Jet job reads, so a read that dies leaves the
+     * job running over a quiet hand-off or ring; this is how the actuator seam surfaces that death for the
+     * converge loop to act on. A coordinator that runs no capture reports none.
      */
     default Optional<Throwable> captureFailure(String pipelineId) {
         return Optional.empty();
@@ -102,6 +106,11 @@ interface PipelineCaptureCoordinator {
      * same observation otherwise. Counts advance from source callbacks while a load is running.
      */
     default SnapshotReading snapshotProgress(String pipelineId) {
+        return SnapshotReading.NONE;
+    }
+
+    /** The rows this run itself read during its bounded snapshot, without earlier completed loads. */
+    default SnapshotReading runSnapshotProgress(String pipelineId) {
         return SnapshotReading.NONE;
     }
 

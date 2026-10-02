@@ -209,6 +209,64 @@ class CaptureRunsOnOneMemberOnlyIT {
         }
     }
 
+    @Test
+    void twoPipelinesOnOneServerShareTheTailAndKeepItAfterTheFirstStops(@TempDir Path directory)
+            throws Exception {
+        byte[] connector = Files.readAllBytes(E2eConnectorJar.buildInto(directory));
+        Path source = Files.createDirectories(directory.resolve("src"));
+        Path ledger = Files.createDirectories(directory.resolve("reads"));
+        Path firstTarget = Files.createDirectories(directory.resolve("tgt-first"));
+        Path secondTarget = Files.createDirectories(directory.resolve("tgt-second"));
+        try (FileEndpoints files = new FileEndpoints()) {
+            EndpointAddress address = EndpointAddress.uri(source.toString());
+            files.seed(address, TABLE, SeedRows.generated(SEEDED_ROWS));
+            String store = SharedMongo.replicaSetUrl("e2e_capture_once_single_pair");
+            try (RealProcessServer server = RealProcessServer.start(store)) {
+                ControlPlane control = new ControlPlane(server.baseUrl());
+                control.bootstrapAndLogin(ADMIN, PASSWORD);
+                control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);
+                control.discoverSchema(SOURCE_ID, E2eConnectorJar.CONNECTOR_ID, settings(source, ledger));
+
+                Map<String, String> resources = new LinkedHashMap<>(sourceResource(source, ledger));
+                resources.putAll(pipelineResources(FIRST_PIPELINE, FIRST_TARGET, firstTarget));
+                resources.putAll(pipelineResources(SECOND_PIPELINE, SECOND_TARGET, secondTarget));
+                control.apply(resources);
+
+                control.lifecycle(FIRST_PIPELINE, LifecycleVerb.START);
+                awaitRunning(control, FIRST_PIPELINE);
+                awaitTheRowsAtTheTarget(files, firstTarget);
+                control.lifecycle(SECOND_PIPELINE, LifecycleVerb.START);
+                awaitRunning(control, SECOND_PIPELINE);
+                awaitTheRowsAtTheTarget(files, secondTarget);
+
+                Reads bothRunning = settle(ledger);
+                assertThat(bothRunning.tails())
+                        .as("one server opens one source tail for both running pipelines: %s", bothRunning)
+                        .isEqualTo(1);
+                assertThat(bothRunning.snapshots())
+                        .as("each pipeline still reads its own snapshot: %s", bothRunning)
+                        .isEqualTo(2);
+
+                control.stop(FIRST_PIPELINE, false);
+                Await.until("the first pipeline to stop",
+                        () -> control.state(FIRST_PIPELINE).filter(PipelineState.STOPPED::equals).isPresent(),
+                        () -> String.valueOf(control.state(FIRST_PIPELINE)));
+                files.cdc(address, TABLE, CdcOp.INSERT, 1);
+                Await.until("the remaining pipeline to keep receiving changes",
+                        () -> files.count(EndpointAddress.uri(secondTarget.toString()), TABLE) >= SEEDED_ROWS + 1,
+                        () -> "rows at second target = "
+                                + files.count(EndpointAddress.uri(secondTarget.toString()), TABLE));
+                Reads afterStop = settle(ledger);
+                assertThat(afterStop.lines().stream()
+                        .filter(line -> line.contains("\ttail\t"))
+                        .map(line -> Integer.parseInt(line.split("\t")[3]))
+                        .toList())
+                        .as("the original tail reads only the new row; a reopened one rereads the whole file")
+                        .containsExactly((int) SEEDED_ROWS, 1);
+            }
+        }
+    }
+
     /**
      * Runs the same pipeline over the same rows on a single member, and answers what the source served.
      *

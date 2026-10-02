@@ -27,6 +27,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.Optional;
+import java.util.Set;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.List;
@@ -884,15 +885,17 @@ class DurableStopConvergenceTest {
                     expected.counterPolicy(), expected.writerAuthority(), null), StateJson.of(STOPPED), at));
         }
         @Override public Optional<SuccessorAdmission> admitSuccessor(StopReservation expected, String incarnation,
-                String boot, Instant at) {
+                String boot, Set<String> executionMembers, Instant at) {
             if (!guard(expected) || expected.phase() != StopReservation.Phase.REPLACEMENT_PENDING) { return Optional.empty(); }
             long generation = expected.writerAuthority() == null ? 1 : expected.writerAuthority().executionGeneration() + 1;
             StopAuthority writer;
             Optional<WorkloadClaim> fullClaim = Optional.empty();
             if (expected.writerAuthority() != null && expected.writerAuthority().claim() != null) {
+                if (executionMembers.isEmpty()) { throw new AssertionError("claimed fixture admission needs its planned members"); }
                 WorkloadClaimFence old = expected.writerAuthority().claim();
                 WorkloadClaim claim = new WorkloadClaim(old.key(), old.owner(), old.claimGeneration(), generation,
-                        old.topologyRevision(), AT.plusSeconds(3600));
+                        old.topologyRevision(), AT.plusSeconds(3600), generation, old.claimGeneration(),
+                        Set.copyOf(executionMembers), 0, false);
                 fullClaim = Optional.of(claim); writer = StopAuthority.claimed(WorkloadClaimFence.from(claim));
             } else { writer = StopAuthority.standalone(expected.source().clusterId(), generation); }
             StopReservation slot = changed(expected, StopReservation.Phase.SUCCESSOR_ADMITTED, expected.counterPolicy(), writer,
@@ -1025,6 +1028,7 @@ class DurableStopConvergenceTest {
         @Override public void resume(String id) { throw new AssertionError("unexpected resume"); }
         @Override public void stop(String id, boolean purge) { throw new AssertionError("legacy stop was bypassed"); }
         @Override public Optional<Throwable> failure(String id) { return Optional.empty(); }
+        @Override public Optional<Throwable> lost(String id) { return Optional.empty(); }
         @Override public boolean isCarryingAJob(String id) { return carrying; }
         @Override public boolean needsRebuildOnResume(String id) { return resumeNeedsRebuild; }
         @Override public Optional<StopReservation.Subject> stopSubject(String id) {
@@ -1037,7 +1041,7 @@ class DurableStopConvergenceTest {
             replacementPreparations.incrementAndGet();
             if (capacityUnavailable) { throw new StartDeferred(StartDeferred.Reason.CAPACITY); }
             if (beforeAdmissionRefusal != null) { throw beforeAdmissionRefusal; }
-            StopReservation admitted = admission.admit(authority, "inc-a", "submit-boot")
+            StopReservation admitted = admission.admit(authority, "inc-a", "submit-boot", java.util.Set.of("fixture-data-member"))
                     .orElseThrow(() -> new AssertionError("unexpected admission fence")).reservation();
             lastAdmission = admitted;
             if (crashAfterAdmission) { throw new AssertionError("process lost after durable admission"); }

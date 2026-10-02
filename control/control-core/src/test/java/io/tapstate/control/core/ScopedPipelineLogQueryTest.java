@@ -29,7 +29,7 @@ class ScopedPipelineLogQueryTest {
 
         assertThat(query.logs("orders").lines()).extracting(LogLine::message)
                 .containsExactly("current execution");
-        assertThat(query.logs("orders", PipelineLogQueryService.Scope.INCARNATION).lines())
+        assertThat(query.logs("orders", PipelineLogQueryService.LogScope.INCARNATION).lines())
                 .extracting(LogLine::message).containsExactly("earlier execution", "current execution");
 
         artifacts.incarnation = "resource-b";
@@ -37,7 +37,7 @@ class ScopedPipelineLogQueryTest {
         sink.append("orders", new LogSink.Scope("resource-b", 11), line("recreated resource"));
         assertThat(query.logs("orders").lines()).extracting(LogLine::message)
                 .containsExactly("recreated resource");
-        assertThat(query.logs("orders", PipelineLogQueryService.Scope.INCARNATION).lines())
+        assertThat(query.logs("orders", PipelineLogQueryService.LogScope.INCARNATION).lines())
                 .extracting(LogLine::message).containsExactly("recreated resource");
 
         sink.clearIncarnation("orders", "resource-a");
@@ -58,7 +58,7 @@ class ScopedPipelineLogQueryTest {
 
         artifacts.incarnation = "resource-a";
         assertThat(query.logs("orders").lines()).isEmpty();
-        assertThat(query.logs("orders", PipelineLogQueryService.Scope.INCARNATION).lines()).isEmpty();
+        assertThat(query.logs("orders", PipelineLogQueryService.LogScope.INCARNATION).lines()).isEmpty();
     }
 
     private static LogLine line(String message) {

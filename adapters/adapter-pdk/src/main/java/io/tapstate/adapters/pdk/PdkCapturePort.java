@@ -12,6 +12,7 @@ import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
 import io.tapstate.spi.capture.FieldSchema;
 import io.tapstate.spi.capture.SourcePosition;
+import io.tapstate.spi.capture.SnapshotSession;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.capture.TableSchema;
@@ -33,16 +34,19 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * The PDK implementation of the read-side capture port: it provisions a connector, refuses it with a
@@ -52,19 +56,21 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * for a read capability it does not provide is a caller invariant violation (the DSL validated the
  * connector's modes upstream) and crashes bare rather than being laundered into a code.
  *
- * <p>The legacy snapshot batch is collected eagerly; the streaming entry delivers connector callbacks
- * as they arrive, without a second whole-snapshot list. The cdc stream runs on a background
- * thread that delivers each decoded change to the listener; how a stream failure reaches the caller
- * and the backpressure that bounds the stream belong to the runtime that owns stream execution, not
- * to this port.
+ * <p>A snapshot read runs on a background thread of its own, staying a few of the connector's batches ahead
+ * of whoever takes the rows, who decodes each batch as it takes it; the connector's read loop waits when it
+ * gets further ahead than that, so a table of any size holds the same few thousand rows at once. The cdc
+ * stream runs on a background thread that delivers each decoded change to the listener; how a
+ * stream failure reaches the caller and the backpressure that bounds the stream belong to the runtime that
+ * owns stream execution, not to this port.
  */
-public final class PdkCapturePort implements CapturePort {
+public final class PdkCapturePort implements CapturePort, SnapshotSession.Provider {
 
     private static final Logger LOG = LoggerFactory.getLogger(PdkCapturePort.class);
 
     private static final int BATCH_SIZE = 1000;
     private static final int SAMPLE_SIZE = 10;
     private static final long SHUTDOWN_JOIN_MILLIS = 2000;
+    private static final long CDC_SHUTDOWN_GRACE_MILLIS = 5000;
 
     /** The longest an Oracle LogMiner start waits for connector initialization and schema discovery. */
     public static final Duration DEFAULT_PREFLIGHT_TIMEOUT = Duration.ofSeconds(30);
@@ -107,18 +113,101 @@ public final class PdkCapturePort implements CapturePort {
     @Override
     public CaptureBatch snapshot(CaptureConfig config) {
         PdkConnector connector = open(config);
+        BatchReadFunction batch;
         try {
             // Resolve the read capability before entering the drive: a non-source connector is a caller
             // invariant violation (the modes were validated upstream) and crashes bare here rather than
             // being laundered into a coded capture failure.
-            BatchReadFunction batch = requireFunction(connector.functions().getBatchReadFunction());
-            Read raw = read(connector, () -> batchRead(connector, config, batch));
-            List<Envelope> rows = decodeSnapshot(connector, raw.events(), raw.tables());
-            return new PdkCaptureBatch(rows, position(connector, raw.seam()), connector);
+            batch = requireFunction(connector.functions().getBatchReadFunction());
         } catch (RuntimeException e) {
             connector.stopQuietly();
             connector.close();
             throw e;
+        }
+        // The batch stops and closes the connector itself when the read fails before its seam is taken, and
+        // on close afterwards.
+        return PdkCaptureBatch.start(
+                connector,
+                reading -> read(connector, () -> batchRead(connector, config, batch, reading)),
+                "tapstate-snapshot-" + connector.connectorId());
+    }
+
+    /** One initialized connector serves every table of a chained snapshot round. */
+    @Override
+    public SnapshotSession snapshotSession(CaptureConfig config) {
+        PdkConnector connector = open(config);
+        try {
+            BatchReadFunction batch = requireFunction(connector.functions().getBatchReadFunction());
+            return new SharedSnapshotSession(connector, config, batch);
+        } catch (RuntimeException | Error failure) {
+            connector.close();
+            throw failure;
+        }
+    }
+
+    private final class SharedSnapshotSession implements SnapshotSession {
+
+        private final PdkConnector connector;
+        private final CaptureConfig config;
+        private final BatchReadFunction batch;
+        private final AtomicReference<PreparedSnapshot> prepared = new AtomicReference<>();
+        private PdkCaptureBatch active;
+        private volatile boolean closed;
+
+        private SharedSnapshotSession(PdkConnector connector, CaptureConfig config, BatchReadFunction batch) {
+            this.connector = connector;
+            this.config = config;
+            this.batch = batch;
+        }
+
+        @Override
+        public CaptureBatch read(String table) {
+            if (closed) {
+                throw new java.util.concurrent.CancellationException("the snapshot session was closed");
+            }
+            PdkCaptureBatch opened = PdkCaptureBatch.start(connector,
+                    reading -> PdkCapturePort.read(connector, () -> {
+                        PreparedSnapshot snapshot = prepared.get();
+                        if (snapshot == null) {
+                            snapshot = prepareSnapshot(connector, config);
+                            prepared.set(snapshot);
+                        }
+                        reading.seamSampled(snapshot.seam());
+                        readTable(connector, snapshot, table, batch, reading);
+                        return null;
+                    }),
+                    "tapstate-snapshot-" + connector.connectorId(), false);
+            synchronized (this) {
+                if (!closed) {
+                    active = opened;
+                    return opened;
+                }
+            }
+            opened.close();
+            throw new java.util.concurrent.CancellationException("the snapshot session was closed");
+        }
+
+        @Override
+        public void close() {
+            PdkCaptureBatch reading;
+            synchronized (this) {
+                if (closed) {
+                    return;
+                }
+                closed = true;
+                reading = active;
+            }
+            if (reading != null) {
+                reading.requestClose();
+            }
+            connector.stopQuietly();
+            try {
+                if (reading != null) {
+                    reading.close();
+                }
+            } finally {
+                connector.close();
+            }
         }
     }
 
@@ -129,15 +218,15 @@ public final class PdkCapturePort implements CapturePort {
         try {
             BatchReadFunction batch = requireFunction(connector.functions().getBatchReadFunction());
             read(connector, () -> {
-                SnapshotSetup setup = prepareSnapshot(connector, config);
+                PreparedSnapshot setup = prepareSnapshot(connector, config);
                 try {
-                    listener.seam(position(connector, setup.seam()));
+                    listener.seam(setup.seam());
                 } catch (RuntimeException | Error downstream) {
                     throw new SnapshotListenerFailure(downstream);
                 }
-                Map<String, Map<String, String>> declared = declaredTypes(setup.tables());
-                for (String stream : setup.streams()) {
-                    TapTable table = setup.tables().get(stream);
+                Map<String, Map<String, String>> declared = setup.declared();
+                for (String stream : config.streams().isEmpty() ? new ArrayList<>(setup.discovered().keySet()) : config.streams()) {
+                    TapTable table = setup.discovered().get(stream);
                     if (table == null) {
                         throw new IllegalStateException(
                                 "stream " + stream + " was requested but the connector did not discover it");
@@ -232,50 +321,45 @@ public final class PdkCapturePort implements CapturePort {
         // refuses the start instead of letting the pipeline report RUNNING before its tail fails.
         CompletableFuture<Void> preflight = OracleLogMinerIdentifiers.appliesTo(config)
                 ? new CompletableFuture<>() : null;
+        CdcDelivery delivery = new CdcDelivery();
         Thread thread = new Thread(
-                () -> streamLoop(connector, config, resumeAt, startAt, listener, stream, preflight),
+                () -> streamLoop(connector, config, resumeAt, startAt, listener, stream, preflight, delivery),
                 "tapstate-cdc-" + connector.connectorId());
         thread.setDaemon(true);
         thread.start();
-        awaitPreflight(preflight, connector, thread);
-        AtomicBoolean closed = new AtomicBoolean();
+        awaitPreflight(preflight, connector, thread, delivery);
         return () -> {
-            if (!closed.compareAndSet(false, true)) {
+            if (!delivery.cancel()) {
                 return;
             }
-            thread.interrupt();
-            connector.stopQuietly();
-            joinQuietly(thread);
-            connector.close();
-            if (thread.isAlive()) {
-                throw new TapstateException(ConnectorError.CAPTURE_FAILED,
-                        Map.of("connector", connector.connectorId(),
-                                "detail", "stream did not stop within " + SHUTDOWN_JOIN_MILLIS + "ms"), null);
-            }
+            shutDown(connector, thread, CDC_SHUTDOWN_GRACE_MILLIS);
         };
     }
 
     /** Waits until LogMiner's worker has accepted its discovered identifiers, cleaning up a refusal. */
     private void awaitPreflight(
-            CompletableFuture<Void> preflight, PdkConnector connector, Thread thread) {
+            CompletableFuture<Void> preflight, PdkConnector connector, Thread thread, CdcDelivery delivery) {
         if (preflight == null) {
             return;
         }
         try {
             preflight.get(preflightTimeout.toNanos(), TimeUnit.NANOSECONDS);
         } catch (TimeoutException failure) {
-            shutDown(connector, thread);
+            delivery.cancel();
+            shutDown(connector, thread, 0);
             throw new TapstateException(ConnectorError.LOGMINER_PREFLIGHT_TIMEOUT,
                     Map.of("connector", connector.connectorId(),
                             "timeout", preflightTimeout.toMillis() + "ms"), failure);
         } catch (InterruptedException failure) {
-            shutDown(connector, thread);
+            delivery.cancel();
+            shutDown(connector, thread, 0);
             Thread.currentThread().interrupt();
             throw new TapstateException(ConnectorError.CAPTURE_FAILED,
                     Map.of("connector", connector.connectorId(),
                             "detail", "change-capture preflight was interrupted"), failure);
         } catch (ExecutionException failure) {
-            shutDown(connector, thread);
+            delivery.cancel();
+            shutDown(connector, thread, 0);
             Throwable cause = failure.getCause();
             if (cause instanceof RuntimeException runtime) {
                 throw runtime;
@@ -287,12 +371,57 @@ public final class PdkCapturePort implements CapturePort {
         }
     }
 
-    /** Ends a worker whose preflight cannot be returned, then discards its connector handle. */
-    private static void shutDown(PdkConnector connector, Thread thread) {
-        thread.interrupt();
+    /** Lets a cancelled read release its cursor before stopping the client; aborts remain bounded. */
+    private static void shutDown(PdkConnector connector, Thread thread, long graceMillis) {
+        if (graceMillis > 0) {
+            joinQuietly(thread, graceMillis);
+        }
+        if (thread.isAlive()) {
+            thread.interrupt();
+        }
         connector.stopQuietly();
-        joinQuietly(thread);
+        joinQuietly(thread, SHUTDOWN_JOIN_MILLIS);
         connector.close();
+    }
+
+    /** Cancels at the consumer boundary without interrupting the source cursor's cleanup. */
+    private static final class CdcDelivery {
+        private final Set<Thread> active = new HashSet<>();
+        private volatile boolean closed;
+
+        synchronized boolean cancel() {
+            if (closed) {
+                return false;
+            }
+            closed = true;
+            // Wake a listener blocked on downstream capacity, including connector-owned delivery threads.
+            active.forEach(Thread::interrupt);
+            return true;
+        }
+
+        void accept(Runnable batch) {
+            Thread current = Thread.currentThread();
+            synchronized (this) {
+                if (closed) {
+                    throw new CancellationException("the change capture was closed");
+                }
+                active.add(current);
+            }
+            try {
+                batch.run();
+                if (closed) {
+                    throw new CancellationException("the change capture was closed");
+                }
+            } finally {
+                synchronized (this) {
+                    active.remove(current);
+                    if (closed) {
+                        // Our listener wake-up must not prevent a connector's finally block doing I/O.
+                        Thread.interrupted();
+                    }
+                }
+            }
+        }
     }
 
     @Override
@@ -351,32 +480,35 @@ public final class PdkCapturePort implements CapturePort {
 
     /**
      * Inits the connector once, discovers its tables, samples the seam, then batch-reads the configured
-     * streams (or every discovered stream).
+     * streams (or every discovered stream) into {@code reading}, a batch at a time as the connector hands
+     * them over.
      *
      * <p>The seam is sampled <em>before</em> the first row is read, which is what makes the join to the
      * change tail gapless. A change made while the snapshot runs then falls after the seam and is
      * re-delivered by the tail, and the idempotent write downstream absorbs that overlap. Sampled after
      * the read instead, every change made during it would fall before the seam and never be delivered at
-     * all -- the same shape of loss, but silent.
+     * all -- the same shape of loss, but silent. It is handed over the moment it is taken, rather than
+     * with the rows, because it is only the right position while it is the one taken before the first row.
+     *
+     * <p>Each of the connector's batches is decoded when it is taken, against the tables it was read from --
+     * not here, inside the connector's own read loop, where a refusal would be the connector's to wrap or to
+     * swallow before it reached anybody. A connector's own way back from a converted value reads the column's
+     * declared type to decide what to rebuild, so a row decoded without its table can be written to a target
+     * of the same kind and still land as text.
      */
-    private Read batchRead(PdkConnector connector, CaptureConfig config, BatchReadFunction batch) throws Throwable {
-        SnapshotSetup setup = prepareSnapshot(connector, config);
-        List<TapEvent> raw = new ArrayList<>();
-        for (String stream : setup.streams()) {
-            TapTable table = setup.tables().get(stream);
-            if (table == null) {
-                throw new IllegalStateException(
-                        "stream " + stream + " was requested but the connector did not discover it");
-            }
-            measuredBatchRead(() -> {
-                batch.batchRead(connector.context(), table, null, BATCH_SIZE, (events, offset) -> raw.addAll(events));
-                return null;
-            });
+    private Void batchRead(PdkConnector connector, CaptureConfig config, BatchReadFunction batch,
+            PdkCaptureBatch reading) throws Throwable {
+        PreparedSnapshot snapshot = prepareSnapshot(connector, config);
+        reading.seamSampled(snapshot.seam());
+        List<String> streams = config.streams().isEmpty()
+                ? new ArrayList<>(snapshot.discovered().keySet()) : config.streams();
+        for (String stream : streams) {
+            readTable(connector, snapshot, stream, batch, reading);
         }
-        return new Read(raw, setup.tables(), setup.seam());
+        return null;
     }
 
-    private SnapshotSetup prepareSnapshot(PdkConnector connector, CaptureConfig config) throws Throwable {
+    private PreparedSnapshot prepareSnapshot(PdkConnector connector, CaptureConfig config) throws Throwable {
         connector.connector().init(connector.context());
         // A connector builds its read from the table's own columns, so it is handed the table as
         // discovered - with its fields - not a bare name. Discovery does not re-init: init has run.
@@ -385,28 +517,31 @@ public final class PdkCapturePort implements CapturePort {
         connector.context().setTableMap(tableMap(discovered));
         // Position discovery may inspect the selected tables too. Populate their context first, while
         // still sampling before any snapshot row is read so the snapshot-to-stream transition has no gap.
-        Object seam = startOffset(connector, null);
-        List<String> streams = config.streams().isEmpty()
-                ? new ArrayList<>(discovered.keySet()) : config.streams();
-        return new SnapshotSetup(discovered, streams, seam);
+        return new PreparedSnapshot(discovered, declaredTypes(discovered),
+                position(connector, startOffset(connector, null)));
     }
 
-    private record SnapshotSetup(Map<String, TapTable> tables, List<String> streams, Object seam) {
+    private void readTable(PdkConnector connector, PreparedSnapshot snapshot, String stream,
+            BatchReadFunction batch, PdkCaptureBatch reading) throws Throwable {
+        TapTable table = snapshot.discovered().get(stream);
+        if (table == null) {
+            throw new IllegalStateException(
+                    "stream " + stream + " was requested but the connector did not discover it");
+        }
+        measuredBatchRead(() -> {
+            batch.batchRead(connector.context(), table, null, BATCH_SIZE, (events, offset) -> {
+                if (events.isEmpty()) {
+                    return;
+                }
+                List<TapEvent> handed = new ArrayList<>(events);
+                reading.rowsRead(() -> decodeSnapshotRows(connector, handed, snapshot.declared()));
+            });
+            return null;
+        });
     }
 
-    /**
-     * One batch read: the rows, the tables they were read from, and the stream position sampled before
-     * the read began.
-     *
-     * <p>The seam rides here rather than being sampled again by the caller because it is only the right
-     * position while it is the one taken before the first row; re-taken afterwards it is a different
-     * moment, and the changes made in between are the ones nothing would ever deliver.
-     *
-     * <p>The tables travel with the rows because decoding needs them. A connector's own way back from a
-     * converted value reads the column's declared type to decide what to rebuild, so a row decoded
-     * without its table can be written to a target of the same kind and still land as text.
-     */
-    private record Read(List<TapEvent> events, Map<String, TapTable> tables, Object seam) {
+    private record PreparedSnapshot(Map<String, TapTable> discovered,
+            Map<String, Map<String, String>> declared, Optional<SourcePosition> seam) {
     }
 
     /**
@@ -518,7 +653,8 @@ public final class PdkCapturePort implements CapturePort {
     }
 
     private void streamLoop(PdkConnector connector, CaptureConfig config, Object resumeAt, Long startAt,
-            CaptureListener listener, StreamReadFunction stream, CompletableFuture<Void> preflight) {
+            CaptureListener listener, StreamReadFunction stream, CompletableFuture<Void> preflight,
+            CdcDelivery delivery) {
         try {
             connector.underLoader(() -> {
                 // streamRead is handed only stream names, so the connector reads each changed table's
@@ -538,7 +674,7 @@ public final class PdkCapturePort implements CapturePort {
                 Object startOffset = resumeAt != null ? resumeAt : startOffset(connector, startAt);
                 listener.onStart(position(connector, startOffset));
                 Map<String, Map<String, String>> declared = declaredTypes(tables);
-                StreamReadConsumer consumer = StreamReadConsumer.create((events, offset) -> {
+                StreamReadConsumer consumer = StreamReadConsumer.create((events, offset) -> delivery.accept(() -> {
                     // A change stream also carries control events (heartbeats and the like) that signal
                     // the tail is alive but carry no row; they are not decodable changes, so skip them.
                     List<TapEvent> changes = new ArrayList<>(events.size());
@@ -559,13 +695,17 @@ public final class PdkCapturePort implements CapturePort {
                                 change, connector.codecs(), declaredTypes(declared, change)));
                     }
                     listener.onBatch(decoded, position(connector, offset));
-                });
+                }));
                 Object readerOffset = MysqlResumeOffset.forReader(connector.connectorId(), startOffset,
                         connector.context().getStateMap(), () -> InstanceFactory.instance(JsonParser.class));
                 stream.streamRead(connector.context(), config.streams(), readerOffset, BATCH_SIZE, consumer);
                 return null;
             });
         } catch (Throwable t) {
+            if (t instanceof CancellationException && delivery.closed) {
+                // Consumer cancellation is the requested stop, not a connector failure to publish.
+                return;
+            }
             // The cdc stream runs on this daemon thread; its failure cannot be returned to the caller, so it
             // is delivered through the listener's error channel for the runtime to observe and drive the
             // pipeline into an error state. It is logged as well, so a dead stream is visible in the logs.
@@ -718,8 +858,13 @@ public final class PdkCapturePort implements CapturePort {
     /** Projects raw snapshot rows to envelopes; a codec refusal is a projection failure, not a read failure. */
     private static List<Envelope> decodeSnapshot(
             PdkConnector connector, List<TapEvent> raw, Map<String, TapTable> tables) {
+        return decodeSnapshotRows(connector, raw, declaredTypes(tables));
+    }
+
+    /** The same, against the declared types already read off the tables -- once per read, not per batch. */
+    private static List<Envelope> decodeSnapshotRows(
+            PdkConnector connector, List<TapEvent> raw, Map<String, Map<String, String>> declared) {
         List<Envelope> rows = new ArrayList<>(raw.size());
-        Map<String, Map<String, String>> declared = declaredTypes(tables);
         try {
             for (TapEvent event : raw) {
                 rows.add(TapEventCodec.decodeSnapshotRow(
@@ -760,9 +905,9 @@ public final class PdkCapturePort implements CapturePort {
     }
 
     /** Waits a bounded time for the stream thread to exit before its loader is closed. */
-    private static void joinQuietly(Thread thread) {
+    private static void joinQuietly(Thread thread, long millis) {
         try {
-            thread.join(SHUTDOWN_JOIN_MILLIS);
+            thread.join(millis);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }

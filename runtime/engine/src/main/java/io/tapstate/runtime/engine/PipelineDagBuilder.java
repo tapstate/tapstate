@@ -26,7 +26,9 @@ import io.tapstate.runtime.engine.nest.NestStateLedger;
 import io.tapstate.runtime.engine.nest.NestTable;
 import io.tapstate.runtime.engine.nest.NestTopology;
 import io.tapstate.spi.sink.SinkWriter;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -138,7 +140,8 @@ public final class PipelineDagBuilder {
 
     /**
      * Every namespace this pipeline's joins keep state in, empty for a pipeline that has none: the mirror of
-     * the driving rows, and a mirror and a reverse index for each source the step is wired to.
+     * the driving rows, the record of how far each run got, and a mirror and a reverse index for each
+     * source the step is wired to.
      *
      * <p>Named here rather than left out because the state is not a cache. The mirrors hold each dimension
      * row as it last was, so a run inheriting them widens fresh driving rows with values the source no
@@ -166,6 +169,7 @@ public final class PipelineDagBuilder {
                 continue;
             }
             namespaces.add(JoinMaps.factMirror(pipeline.id(), step.id()));
+            namespaces.add(JoinMaps.writers(pipeline.id(), step.id()));
             // A join's from: is an alias map by construction - the step model refuses any other shape for
             // one - so this is an invariant rather than a case, and a violation crashes bare.
             for (String alias : ((FromClause.Aliases) step.from()).aliases().keySet()) {
@@ -296,7 +300,8 @@ public final class PipelineDagBuilder {
             }
             for (String sourceKey : sourceKeys) {
                 byKey.put(sourceKey, StageWorkDag.measured(dag,
-                        dag.newVertex(sourceKey, bindings.sourceVertices().apply(sourceKey)), Stage.SOURCE, true));
+                        dag.newVertex(sourceKey, StageOutputPressureProcessor.wrap(
+                                bindings.sourceVertices().apply(sourceKey))), Stage.SOURCE, true));
                 // Per vertex rather than per source: a source reading several tables reads several chains,
                 // and a bound carrying one of their names for all of them would say how far one table had
                 // travelled about changes of a table nobody had read.
@@ -388,15 +393,14 @@ public final class PipelineDagBuilder {
         // this the parser's own default - serve.from = the view's id - resolves to no vertex at all.
         Map<String, List<Vertex>> readsAs = new HashMap<>();
 
+        List<SinkPlan> sinkPlans = new ArrayList<>();
         if (pipeline.view() instanceof ViewBlock.Inline view) {
             // A declared view IS its own instruction to materialize: the pipeline needs no serve block
             // to reach the state store, and the vertex is a terminal sink like any other.
             List<Vertex> upstream = upstreamOf(view.from(), byKey, bindings);
             String viewName = VIEW_VERTEX_PREFIX + view.id();
-            Vertex vertex = dag.newVertex(viewName,
-                    sinkVertex(viewName, bindings.viewSinks().apply(view), sinkAck, axes, assembled));
-            StageWorkDag.measured(dag, vertex, Stage.SINK, true);
-            connect(dag, upstream, vertex, outboundOrdinal, inboundOrdinal);
+            sinkPlans.add(new SinkPlan(viewName, writerIdFor(viewName), bindings.viewSinks().apply(view), upstream,
+                    chainsOf(upstream, byKey, chains)));
             readsAs.put(view.id(), upstream);
         }
 
@@ -410,18 +414,76 @@ public final class PipelineDagBuilder {
             for (int i = 0; i < sync.size(); i++) {
                 SyncElement element = sync.get(i);
                 String name = SERVE_VERTEX_PREFIX + (element.id() != null ? element.id() : i);
-                Vertex vertex = dag.newVertex(name,
-                        sinkVertex(name, bindings.sinkWriters().apply(element), sinkAck, axes, assembled));
-                StageWorkDag.measured(dag, vertex, Stage.SINK, true);
-                connect(dag, upstream, vertex, outboundOrdinal, inboundOrdinal);
+                sinkPlans.add(new SinkPlan(name, writerIdFor(name), bindings.sinkWriters().apply(element), upstream,
+                        chainsOf(upstream, byKey, chains)));
             }
+        }
+
+        Map<String, List<String>> writerIdsByStream = new LinkedHashMap<>();
+        for (SinkPlan plan : sinkPlans) {
+            for (String stream : plan.streams()) {
+                writerIdsByStream.computeIfAbsent(stream, ignored -> new ArrayList<>()).add(plan.writerId());
+            }
+        }
+        writerIdsByStream.replaceAll((stream, writers) -> List.copyOf(writers));
+        Map<String, List<String>> writerPlan = Map.copyOf(writerIdsByStream);
+        if (sinkAck != null) {
+            sinkAck.prepareWriterPlan(writerPlan);
+        }
+        for (SinkPlan plan : sinkPlans) {
+            SinkAckFactory writerAck = sinkAck == null
+                    ? null
+                    : sinkAck.forWriter(plan.writerId(), plan.streams(), writerPlan);
+            Vertex vertex = dag.newVertex(plan.vertexName(),
+                    sinkVertex(plan.vertexName(), plan.writerFactory(), writerAck, axes, assembled));
+            StageWorkDag.measured(dag, vertex, Stage.SINK, true);
+            connect(dag, plan.upstream(), vertex, outboundOrdinal, inboundOrdinal);
         }
 
         if (!costNamespaces.isEmpty()) {
             dag.newVertex(StateStoreCostMetricNames.VERTEX,
                     StateStoreCostBridge.metaSupplier(costNamespaces)).localParallelism(1);
         }
+
         return dag;
+    }
+
+    /** One terminal writer and the source streams the graph proves can reach it. */
+    private record SinkPlan(
+            String vertexName,
+            String writerId,
+            SupplierEx<? extends SinkWriter> writerFactory,
+            List<Vertex> upstream,
+            List<String> streams) {
+    }
+
+    /**
+     * A durable writer key from the terminal's stable identity. URL-safe Base64 preserves every byte
+     * while keeping author-chosen ids, including a leading {@code $}, inside one Mongo field name.
+     */
+    private static String writerIdFor(String sinkIdentity) {
+        String encoded = Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(sinkIdentity.getBytes(StandardCharsets.UTF_8));
+        return "sink-" + encoded;
+    }
+
+    /** The source streams carried by {@code upstream}, or none when frontier binding is absent. */
+    private static List<String> chainsOf(
+            List<Vertex> upstream, Map<String, Vertex> byKey, PipelineChains chains) {
+        if (chains == null) {
+            return List.of();
+        }
+        List<String> keys = new ArrayList<>();
+        for (Vertex vertex : upstream) {
+            String key = byKey.entrySet().stream()
+                    .filter(entry -> entry.getValue() == vertex)
+                    .map(Map.Entry::getKey)
+                    .findFirst()
+                    .orElseThrow(() -> new IllegalStateException(
+                            "upstream vertex '" + vertex.getName() + "' has no pipeline key"));
+            keys.add(key);
+        }
+        return chains.union(keys);
     }
 
     /**

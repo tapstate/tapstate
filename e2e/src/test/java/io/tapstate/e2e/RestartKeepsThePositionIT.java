@@ -47,7 +47,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * handed, so the reading is a reading of the engine.
  *
  * <p>Liveness before the reading, in the case that asserts nought. A run that never started has read
- * nothing either, and the snapshot face of a pipeline with no live run answers nothing at all -- which a
+ * nothing either, and the run-local snapshot metric of a pipeline with no live run answers nothing at all -- which a
  * reading defaulted to nought reports as a collection that was never read. So the restarted run is first
  * made to carry a document written after the restart, and beside the claim stands a guard reading the
  * state and the run's own record count. Both have to hold, and the claim is asserted first on purpose --
@@ -287,7 +287,7 @@ class RestartKeepsThePositionIT {
     /**
      * Says that the reading just taken is a reading of a run that is there and is a new one. Two
      * situations answer "it read nought" while the claim resting on it is false: a pipeline with no live
-     * run answers the snapshot face with nothing, and the default that reading takes for a missing
+     * run answers the run-local snapshot metric with nothing, and the default that reading takes for a missing
      * collection turns that into the very value the claim asserts; and a restart that did not restart
      * leaves the run before it delivering, so the documents the case waited for arrive on time while
      * saying nothing about a run that was never built.
@@ -312,7 +312,7 @@ class RestartKeepsThePositionIT {
                         + "would have answered just the same", pipelineId, read)
                 .contains(PipelineState.RUNNING);
         assertThat(control.snapshotRowsRead(pipelineId))
-                .as("the snapshot face of %s: with no live run it answers nothing at all, which the "
+                .as("the run-local snapshot metric of %s: with no live run it answers nothing at all, which the "
                         + "reading taken from it would report as a collection that was never read",
                         pipelineId)
                 .containsKey(COLLECTION);

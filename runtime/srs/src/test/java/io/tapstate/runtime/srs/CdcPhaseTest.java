@@ -253,6 +253,26 @@ class CdcPhaseTest {
     }
 
     @Test
+    void disjointTableConsumerDoesNotPinHeadroom() {
+        ConsumerOffset nest = selected("nest",
+                Map.of("bench_nest_orders", 7L, "bench_nest_items", 7L), "bench_nest_items", RING_GENERATION);
+        ConsumerOffset unreadNest = selected("unread-nest",
+                Map.of("bench_nest_items", -1L), "bench_nest_items", RING_GENERATION);
+        ConsumerOffset join = selected("join",
+                Map.of("bench_join_orders", -1L), "bench_join_orders", RING_GENERATION);
+
+        assertThat(CdcPhase.headroomBound(List.of(nest, unreadNest), "bench_nest_items", RING_GENERATION))
+                .as("a subscribed consumer that has read nothing still protects its table")
+                .isEqualTo(-1L);
+        assertThat(CdcPhase.headroomBound(List.of(nest, join), "bench_nest_items", RING_GENERATION))
+                .as("a Join-only consumer cannot hold back Nest's item ring")
+                .isEqualTo(7L);
+        assertThat(CdcPhase.headroomBound(List.of(nest, join), "bench_nest_items", RING_GENERATION + 1))
+                .as("an earlier selected generation cannot grant room in a newer ring")
+                .isEqualTo(-1L);
+    }
+
+    @Test
     void projectsEachCdcChangeToTheRingInOrder() throws Exception {
         Ringbuffer<SrsItem> ring = hz.getRingbuffer("srs.chain.order");
         SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(ring));
@@ -806,6 +826,43 @@ class CdcPhaseTest {
         } finally {
             freed.set(true);
             writer.interrupt();
+        }
+    }
+
+    @Test
+    void aBackpressuredCdcWriteStopsWhenItsThreadIsInterrupted() throws Exception {
+        Ringbuffer<SrsItem> raw = hz.getRingbuffer("srs.chain.interrupted-park");
+        SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(raw));
+        for (int i = 0; i < 8; i++) {
+            assertThat(gate.append(cdcItem("f" + i), -1L)).isPresent();
+        }
+        AtomicBoolean freed = new AtomicBoolean(false);
+        Supplier<Collection<ConsumerOffset>> minRead = () -> List.of(new ConsumerOffset(
+                "p1", Map.of("orders", freed.get() ? 0L : -1L), null));
+        CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
+        FakeCdcPort port = new FakeCdcPort(
+                List.of(Envelope.insert(9, "orders", Map.of("id", 9), Map.of())));
+        Thread writer = new Thread(
+                () -> CdcPhase.run(port, config(), chain, minRead, new CaptureHealth()),
+                "interrupted-cdc-writer");
+        writer.setDaemon(true);
+
+        try {
+            writer.start();
+            assertThat(awaitState(writer, Thread.State.TIMED_WAITING, Duration.ofSeconds(2)))
+                    .as("the writer reached the headroom park before teardown interrupted it")
+                    .isTrue();
+
+            writer.interrupt();
+            writer.join(2_000);
+
+            assertThat(writer.isAlive())
+                    .as("an interrupted backpressured writer stops within the subscription close join")
+                    .isFalse();
+        } finally {
+            freed.set(true);
+            writer.interrupt();
+            writer.join(2_000);
         }
     }
 

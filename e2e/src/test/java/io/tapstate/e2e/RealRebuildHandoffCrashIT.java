@@ -182,6 +182,12 @@ class RealRebuildHandoffCrashIT {
                             () -> matched(latest, restarted, expected, savedFloor, null));
                     assertCumulativeExactly(firstKnown, savedFloor);
                     assertThat(generation(database)).isEqualTo(expectedGeneration);
+                    report.addFork(Map.of("action", "known-counter-recovery", "scope", RebuildHandoffJdiSession.scopeEvidence(expected),
+                            "job", RebuildHandoffJdiSession.jobEvidence(firstKnown.raw().job()),
+                            "rawBinding", restarted.rawBinding().evidence(), "knownFloor", factsEvidence(savedFloor.baselineFacts()),
+                            "rawNative", factsEvidence(firstKnown.raw().facts()),
+                            "cumulative", factsEvidence(firstKnown.publicValue().observation().facts()),
+                            "durableGeneration", expectedGeneration));
                     assertThat(firstKnown.raw().job().bootId()).isNotEqualTo(marker.source().oldJob().bootId());
                     if (marker.successor() != null) {
                         assertThat(firstKnown.raw().job().bootId()).isNotEqualTo(marker.successor().submissionBootId());
@@ -192,11 +198,18 @@ class RealRebuildHandoffCrashIT {
                                             .filter(PipelineState.RUNNING::equals).isPresent(),
                             () -> "marker=" + actual.readStopReservation(PIPELINE) + ", actual=" + actual.read(PIPELINE));
                     Await.until("snapshot and crash-time CDC to reach the physical target", DELIVERY_WAIT,
-                            () -> target.getCollection(TABLE).countDocuments() == ROWS
-                                    && row(target, INSERTED, "inserted-during-crash")
-                                    && row(target, UPDATED, "updated-during-crash")
-                                    && target.getCollection(TABLE).find(new Document("id", (long) DELETED)).first() == null
-                                    && snapshotConfirmed(database),
+                            () -> {
+                                if (actual.read(PIPELINE).map(value -> StateJson.parse(value.stateJson()))
+                                        .filter(PipelineState.FAILED::equals).isPresent()) {
+                                    throw new AssertionError("the recovered real pipeline failed before crash-time CDC completed: "
+                                            + control.metrics(PIPELINE));
+                                }
+                                return target.getCollection(TABLE).countDocuments() == ROWS
+                                        && row(target, INSERTED, "inserted-during-crash")
+                                        && row(target, UPDATED, "updated-during-crash")
+                                        && target.getCollection(TABLE).find(new Document("id", (long) DELETED)).first() == null
+                                        && snapshotConfirmed(database);
+                            },
                             () -> "targetRows=" + target.getCollection(TABLE).countDocuments()
                                     + ", actual=" + actual.read(PIPELINE) + ", offsets=" + sourceCheckpoint(database));
                     String coverageSha = assertFullTargetContent(target);

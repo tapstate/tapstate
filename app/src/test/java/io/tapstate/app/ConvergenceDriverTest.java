@@ -146,6 +146,7 @@ class ConvergenceDriverTest {
                 }
             }
             @Override public Optional<Throwable> failure(String pipelineId) { return Optional.empty(); }
+            @Override public Optional<Throwable> lost(String pipelineId) { return Optional.empty(); }
             @Override public boolean isCarryingAJob(String pipelineId) { return true; }
         };
         desired.save(new DesiredState("slow", RUNNING, "rev-1"));
@@ -245,6 +246,7 @@ class ConvergenceDriverTest {
                 @Override public void resume(String pipelineId) { }
                 @Override public void stop(String pipelineId, boolean purgeState) { stops.incrementAndGet(); }
                 @Override public Optional<Throwable> failure(String pipelineId) { return Optional.empty(); }
+                @Override public Optional<Throwable> lost(String pipelineId) { return Optional.empty(); }
                 @Override public boolean isCarryingAJob(String pipelineId) { return submitted.get(); }
             };
             intents.save(new DesiredState(id, RUNNING, "rev-1"));
@@ -300,6 +302,7 @@ class ConvergenceDriverTest {
             @Override public void resume(String pipelineId) { }
             @Override public void stop(String pipelineId, boolean purgeState) { }
             @Override public Optional<Throwable> failure(String pipelineId) { return Optional.empty(); }
+            @Override public Optional<Throwable> lost(String pipelineId) { return Optional.empty(); }
             @Override public boolean isCarryingAJob(String pipelineId) { return hasSlot.get(); }
         };
         desired.save(new DesiredState("orders", RUNNING, "rev-1"));
@@ -344,6 +347,7 @@ class ConvergenceDriverTest {
             @Override public void resume(String id) { }
             @Override public void stop(String id, boolean purgeState) { }
             @Override public Optional<Throwable> failure(String id) { return Optional.empty(); }
+            @Override public Optional<Throwable> lost(String id) { return Optional.empty(); }
             @Override public boolean isCarryingAJob(String id) { return true; }
         };
         desired.save(new DesiredState("slow", RUNNING, "rev-1"));
@@ -382,6 +386,7 @@ class ConvergenceDriverTest {
             @Override public void resume(String id) { }
             @Override public void stop(String id, boolean purgeState) { carrying.set(false); }
             @Override public Optional<Throwable> failure(String id) { return Optional.empty(); }
+            @Override public Optional<Throwable> lost(String id) { return Optional.empty(); }
             @Override public boolean isCarryingAJob(String id) { return carrying.get(); }
         };
         PipelineConverger loop = new PipelineConverger(desired, state, job, Clock.fixed(T0, ZoneOffset.UTC));
@@ -453,6 +458,7 @@ class ConvergenceDriverTest {
             @Override public void resume(String pipelineId) { }
             @Override public void stop(String pipelineId, boolean purgeState) { }
             @Override public Optional<Throwable> failure(String pipelineId) { return Optional.empty(); }
+            @Override public Optional<Throwable> lost(String pipelineId) { return Optional.empty(); }
             @Override public boolean isCarryingAJob(String pipelineId) { return true; }
         };
         desired.save(new DesiredState("slow", RUNNING, "rev-1"));
@@ -923,6 +929,11 @@ class ConvergenceDriverTest {
         @Override
         public Optional<Throwable> failure(String pipelineId) {
             return Optional.ofNullable(failure);
+        }
+
+        @Override
+        public Optional<Throwable> lost(String pipelineId) {
+            return Optional.empty();
         }
 
         /** Always carrying: these cases are about what the driver does with a converge result. */

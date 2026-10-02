@@ -97,6 +97,9 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
             Cut.SUBMIT_PRE_BIND, new Site("io.tapstate.adapters.mongostore.MongoStateStore", "bindSuccessor",
                     "(Lio/tapstate/spi/store/StopReservation;Lio/tapstate/spi/store/ObservationStore$Scope;"
                             + "Lio/tapstate/spi/store/StopReservation$JobIdentity;Ljava/time/Instant;)Ljava/util/Optional;"));
+    private static final Site MEMBER_ADMISSION = new Site("io.tapstate.adapters.mongostore.MongoStateStore", "admitSuccessor",
+            "(Lio/tapstate/spi/store/StopReservation;Ljava/lang/String;Ljava/lang/String;Ljava/util/Set;"
+                    + "Ljava/time/Instant;)Ljava/util/Optional;");
     static final Set<String> INSTRUMENTS = Set.of("tapstate.pipeline.records", "tapstate.pipeline.bytes",
             "tapstate.pipeline.record.delivery.duration");
     private static final int MAX_EVENTS = 20_000, MAX_FRAMES = 128, MAX_FACTS = 256, MAX_POINTS = 64;
@@ -129,9 +132,9 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
     private long events;
 
     private RebuildHandoffJdiSession(Path jar, String artifactSha, String pipelineId, String table,
-            Cut cut, Map<Site, Image> images, RealProcessServer server, VirtualMachine vm, Path retainedOutput) {
+            Cut cut, Site selectedCut, Map<Site, Image> images, RealProcessServer server, VirtualMachine vm, Path retainedOutput) {
         this.jar = jar; this.artifactSha = artifactSha; this.pipelineId = pipelineId; this.table = table;
-        this.cut = cut; this.cutSite = cut == null ? null : CUTS.get(cut);
+        this.cut = cut; this.cutSite = selectedCut;
         this.images = images; this.server = server; this.vm = vm;
         this.retainedOutput = retainedOutput;
         pump = new Thread(this::loop, "rebuild-handoff-jdi-events"); pump.setDaemon(true);
@@ -149,7 +152,16 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
         if (!Files.isRegularFile(jar) || Files.size(jar) > 512L * 1024 * 1024) { throw invalid("artifact unavailable or unbounded"); }
         String sha = PipelineBenchmarkLiveRunIT.sha256(jar);
         Set<Site> selected = cut == null ? Set.of(RAW) : Set.of(CUTS.get(cut), JOB_LOOKUP);
-        Map<Site, Image> images = images(jar, selected);
+        Site selectedCut = cut == null ? null : CUTS.get(cut);
+        Map<Site, Image> images;
+        if (cut == Cut.PRE_ADMISSION) {
+            Map<Site, Image> available = images(jar, Set.of(selectedCut, MEMBER_ADMISSION, JOB_LOOKUP),
+                    Set.of(MEMBER_ADMISSION));
+            if (available.containsKey(MEMBER_ADMISSION)) { selectedCut = MEMBER_ADMISSION; }
+            images = Map.of(selectedCut, available.get(selectedCut), JOB_LOOKUP, available.get(JOB_LOOKUP));
+        } else {
+            images = images(jar, selected, Set.of());
+        }
         if (!sha.equals(PipelineBenchmarkLiveRunIT.sha256(jar))) { throw invalid("artifact changed during provenance reads"); }
         ListeningConnector connector = Bootstrap.virtualMachineManager().listeningConnectors().stream()
                 .filter(value -> value.name().equals("com.sun.jdi.SocketListen")).findFirst()
@@ -172,7 +184,7 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
             if (cut != null && !vm.canGetMethodReturnValues()) { throw invalid("genuine native Job return values unavailable"); }
             connector.stopListening(arguments); listening = false;
             Path retained = logDirectory.resolve(processLabel + "-" + server.pid() + "-server.out");
-            session = new RebuildHandoffJdiSession(jar, sha, pipelineId, table, cut, images, server, vm, retained);
+            session = new RebuildHandoffJdiSession(jar, sha, pipelineId, table, cut, selectedCut, images, server, vm, retained);
             session.install(); session.pump.start(); server.awaitHealthy(); session.awaitReady(MAX_WAIT);
             session.retainOutput();
             return session;
@@ -412,7 +424,8 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
             if (!scope.pipelineIncarnationId().equals(armedSource.pipelineIncarnationId())
                     || scope.executionGeneration() != Math.incrementExact(armedSource.executionGeneration())) { return false; }
         } else {
-            if (arguments.size() != 4) { throw invalid("reservation boundary arguments changed"); }
+            int expectedArguments = cut == Cut.PRE_ADMISSION && cutSite.equals(MEMBER_ADMISSION) ? 5 : 4;
+            if (arguments.size() != expectedArguments) { throw invalid("reservation boundary arguments changed"); }
             ObjectReference marker = object(arguments.getFirst(), MARKER);
             id = text(value(marker, "pipelineId", "Ljava/lang/String;")); if (!pipelineId.equals(id)) { return false; }
             token = text(value(marker, "token", "Ljava/lang/String;"));
@@ -616,14 +629,14 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
         if (!artifactSha.equals(PipelineBenchmarkLiveRunIT.sha256(jar))) { throw invalid("artifact changed during the witness"); }
     }
 
-    private static Map<Site, Image> images(Path jar, Set<Site> selected) throws Exception {
+    private static Map<Site, Image> images(Path jar, Set<Site> selected, Set<Site> optional) throws Exception {
         Map<Site, Image> found = new HashMap<>();
         try (ZipFile boot = new ZipFile(jar.toFile())) {
             for (String type : selected.stream().map(Site::type).distinct().toList()) {
                 ZipEntry direct = boot.getEntry("BOOT-INF/classes/" + type.replace('.', '/') + ".class");
                 if (direct != null) {
                     try (InputStream input = boot.getInputStream(direct)) {
-                        addImages(found, selected.stream().filter(site -> site.type().equals(type)).toList(), direct.getName(), input);
+                        addImages(found, selected.stream().filter(site -> site.type().equals(type)).toList(), direct.getName(), input, optional);
                     }
                 }
             }
@@ -639,21 +652,24 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
                         String resource = entry.getName();
                         List<Site> sites = selected.stream().filter(site -> resource.equals(site.type().replace('.', '/') + ".class")).toList();
                         if (!sites.isEmpty()) {
-                            addImages(found, sites, library.getName() + "!/" + resource, nested);
+                            addImages(found, sites, library.getName() + "!/" + resource, nested, optional);
                         }
                     }
                 }
             }
         }
-        if (found.size() != selected.size()) { throw invalid("artifact lacks the selected exact methods"); }
+        if (!found.keySet().containsAll(selected.stream().filter(site -> !optional.contains(site)).toList())) {
+            throw invalid("artifact lacks the selected exact methods");
+        }
         return Map.copyOf(found);
     }
 
-    private static void addImages(Map<Site, Image> found, List<Site> sites, String origin, InputStream input) throws Exception {
+    private static void addImages(Map<Site, Image> found, List<Site> sites, String origin, InputStream input, Set<Site> optional) throws Exception {
         byte[] bytes = input.readNBytes(MAX_CLASS_BYTES + 1);
         if (bytes.length > MAX_CLASS_BYTES) { throw invalid("class byte bound exceeded"); }
         for (Site site : sites) {
             byte[] code = methodCode(bytes, site.name() + site.signature());
+            if (code == null && optional.contains(site)) { continue; }
             if (code == null || found.putIfAbsent(site, new Image(origin, code)) != null) { throw invalid("method absent or duplicated"); }
         }
     }

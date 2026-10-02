@@ -20,6 +20,7 @@ final class RecordingActuator implements LifecycleActuator {
     private final List<String> calls = new ArrayList<>();
     private int rebuildingStops;
     private Throwable failure;
+    private Throwable lost;
 
     /**
      * Whether a job is carrying the pipeline. True by default, which is the state every existing case
@@ -67,6 +68,11 @@ final class RecordingActuator implements LifecycleActuator {
     }
 
     @Override
+    public Optional<Throwable> lost(String pipelineId) {
+        return Optional.ofNullable(lost);
+    }
+
+    @Override
     public boolean isCarryingAJob(String pipelineId) {
         return carryingAJob;
     }
@@ -97,6 +103,11 @@ final class RecordingActuator implements LifecycleActuator {
     /** Arms failure() to report this cause, as if the pipeline's job had died on its own. */
     void failWith(Throwable cause) {
         this.failure = cause;
+    }
+
+    /** Arms lost() to report this cause, as if the data plane holding the pipeline's job had gone. */
+    void loseWith(Throwable cause) {
+        this.lost = cause;
     }
 
     /**

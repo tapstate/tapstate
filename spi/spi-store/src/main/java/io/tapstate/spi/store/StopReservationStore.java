@@ -6,6 +6,8 @@ import io.tapstate.core.lifecycle.PipelineState;
 
 import java.time.Instant;
 import java.util.Optional;
+import java.util.Objects;
+import java.util.Set;
 
 /** Cold-path writes for one stop marker in the same document as the actual checkpoint. */
 public interface StopReservationStore {
@@ -47,9 +49,20 @@ public interface StopReservationStore {
         throw new UnsupportedOperationException("phased stop reservations are unavailable");
     }
 
+    /** Legacy admission supplies no new planned-member evidence; claimed execution context is unknown. */
     default Optional<SuccessorAdmission> admitSuccessor(StopReservation expectedPending,
             String pipelineIncarnationId, String submissionBootId, Instant at) {
         throw new UnsupportedOperationException("phased stop reservations are unavailable");
+    }
+
+    /** Atomically records the factual planned members with a claimed successor's generation. */
+    default Optional<SuccessorAdmission> admitSuccessor(StopReservation expectedPending,
+            String pipelineIncarnationId, String submissionBootId, Set<String> executionMembers, Instant at) {
+        Objects.requireNonNull(executionMembers, "executionMembers");
+        if (expectedPending.writerAuthority() != null && !expectedPending.writerAuthority().standalone()) {
+            throw new UnsupportedOperationException("claimed successor admission requires execution context support");
+        }
+        return admitSuccessor(expectedPending, pipelineIncarnationId, submissionBootId, at);
     }
 
     default Optional<StopReservation> bindSuccessor(StopReservation expectedAdmitted,

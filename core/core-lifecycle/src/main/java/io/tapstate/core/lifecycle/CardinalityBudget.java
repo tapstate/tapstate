@@ -82,6 +82,8 @@ public enum CardinalityBudget {
     SINK_BATCH_WRITE_DURATION("tapstate.pipeline.sink.batch.write.duration", null, 1, Fold.ADDED),
     SINK_BACKPRESSURE_DURATION("tapstate.pipeline.sink.backpressure.duration", null, 1, Fold.ADDED),
     SNAPSHOT_ROWS("tapstate.pipeline.snapshot.rows", MetricAttributes.TABLE_ID, 1_000, Fold.ADDED),
+    SNAPSHOT_ROWS_CURRENT_RUN("tapstate.pipeline.snapshot.rows.current_run",
+            MetricAttributes.TABLE_ID, 1_000, Fold.ADDED),
     SNAPSHOT_ROWS_TOTAL("tapstate.pipeline.snapshot.rows.total", MetricAttributes.TABLE_ID, 1_000, Fold.ADDED),
     /** Codes come from a catalog and from connectors, not from rows, but a connector may contribute any number. */
     ERRORS("tapstate.pipeline.errors", MetricAttributes.CODE, 200, Fold.ADDED),

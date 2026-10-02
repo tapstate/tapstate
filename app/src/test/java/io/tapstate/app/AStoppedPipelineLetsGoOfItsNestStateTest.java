@@ -1,12 +1,14 @@
 package io.tapstate.app;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 
 import com.hazelcast.config.Config;
 import com.hazelcast.config.JoinConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
+import com.hazelcast.internal.util.executor.HazelcastManagedThread;
 import com.hazelcast.jet.Job;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.DAG;
@@ -36,6 +38,7 @@ import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.lifecycle.PipelineStateHolding;
 import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.runtime.engine.Engine;
+import io.tapstate.runtime.engine.MemberOutOfMemory;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceModel;
@@ -89,6 +92,7 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
 
     /** Where this pipeline's outstanding drop, and the record of where its runs keep state, are written. */
     private static final String TEARDOWN_NAMESPACE = "nest.teardown." + PIPELINE;
+    private static final String SNAPSHOT_COUNT_NAMESPACE = "snapshot.load.counts." + PIPELINE;
 
     /** A namespace belonging to some other pipeline, which no stop of this one may touch. */
     private static final String OTHER_PIPELINE_NAMESPACE = "nest.other_pipe.some_step.$root";
@@ -148,7 +152,8 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         // under a name no run afterwards looks at.
         assertThat(namespaces).containsExactlyInAnyOrder(ROOT_NAMESPACE, ITEMS_NAMESPACE, SHAPE_NAMESPACE,
                 ROOT_NAMESPACE + ".parking", ITEMS_NAMESPACE + ".parking", SOURCE_CONNECTOR_NAMESPACE,
-                CHILD_CONNECTOR_NAMESPACE, GRANDCHILD_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE, SINK_PREPARATION_NAMESPACE);
+                CHILD_CONNECTOR_NAMESPACE, GRANDCHILD_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE,
+                SINK_PREPARATION_NAMESPACE, SNAPSHOT_COUNT_NAMESPACE);
     }
 
     @Test
@@ -177,7 +182,8 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         store.artifacts().save(pipelineWithoutNest());
 
         assertThat(namespacesOf(new StoreBackedDagSource(store).stateHeldBy(PIPELINE)))
-                .containsExactlyInAnyOrder(SOURCE_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE, SINK_PREPARATION_NAMESPACE);
+                .containsExactlyInAnyOrder(SOURCE_CONNECTOR_NAMESPACE, SINK_CONNECTOR_NAMESPACE,
+                        SINK_PREPARATION_NAMESPACE, SNAPSHOT_COUNT_NAMESPACE);
     }
 
     @Test
@@ -186,7 +192,8 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
         store.artifacts().save(pipelineWithView());
 
         assertThat(namespacesOf(new StoreBackedDagSource(store).stateHeldBy(PIPELINE)))
-                .containsExactlyInAnyOrder(SOURCE_CONNECTOR_NAMESPACE, VIEW_CONNECTOR_NAMESPACE, VIEW_PREPARATION_NAMESPACE);
+                .containsExactlyInAnyOrder(SOURCE_CONNECTOR_NAMESPACE, VIEW_CONNECTOR_NAMESPACE,
+                        VIEW_PREPARATION_NAMESPACE, SNAPSHOT_COUNT_NAMESPACE);
     }
 
     @Test
@@ -514,6 +521,39 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
     }
 
     @Test
+    @DisplayName("a clearing stop on an engine lost for want of memory leaves its drop to the next start")
+    void aClearingStopOnAnEngineLostForWantOfMemoryLeavesItsDropToTheNextStart() {
+        InMemoryStorePort store = seedStore();
+        seedState(store, ROOT_NAMESPACE, ITEMS_NAMESPACE, SHAPE_NAMESPACE);
+        EngineLifecycleActuator actuator = actuator(store);
+        MemberOutOfMemory.watch(member);
+        runOutOfMemoryOnAMemberThread();
+        assertThat(MemberOutOfMemory.of(member))
+                .describedAs("the member's own out-of-memory handling took it down, so what follows is a stop "
+                        + "on a lost engine")
+                .isPresent();
+
+        // Half of what the drop lets go of is on the member, and a lost member refuses every question with an
+        // error that says nothing about why. The stop runs once, after the stopped state is already written,
+        // so that error escaping here is reported as a defect of the process while the drop stops where it
+        // was.
+        assertThatCode(() -> actuator.stop(PIPELINE, true)).doesNotThrowAnyException();
+        assertThat(store.keyedState().load(TEARDOWN_NAMESPACE, "namespaces"))
+                .describedAs("the drop stays noted, for the next start to finish")
+                .isPresent();
+
+        // A restart is the only way back from a lost engine, and the first start after it finishes the drop
+        // before its run can read any of what the stop was asked to let go of.
+        member.shutdown();
+        startMember();
+        actuator(store).start(PIPELINE);
+
+        assertThat(store.keyedState().load(ROOT_NAMESPACE, "k")).isEmpty();
+        assertThat(store.keyedState().load(ITEMS_NAMESPACE, "k")).isEmpty();
+        assertThat(store.keyedState().load(TEARDOWN_NAMESPACE, "namespaces")).isEmpty();
+    }
+
+    @Test
     void droppingTheSameNamespacesAgainIsNotAnError() {
         InMemoryStorePort store = seedStore();
         seedState(store, ROOT_NAMESPACE);
@@ -565,6 +605,26 @@ class AStoppedPipelineLetsGoOfItsNestStateTest {
             throw new AssertionError("the job was still running 15s after the stop");
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * Lets an out-of-memory error escape one of the member's own threads, which is how the member hears of it,
+     * and returns once the member's out-of-memory handling is done with it. The error is the one the collector
+     * raises when it gives up, which the handling acts on however full the heap is.
+     */
+    private static void runOutOfMemoryOnAMemberThread() {
+        Thread memberThread = new HazelcastManagedThread(() -> {
+            throw new OutOfMemoryError("GC overhead limit exceeded");
+        }, "test-member-out-of-memory");
+        memberThread.start();
+        try {
+            assertThat(memberThread.join(Duration.ofSeconds(60)))
+                    .describedAs("the member thread hands its out-of-memory error over and ends")
+                    .isTrue();
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("interrupted while the out-of-memory handling ran", interrupted);
         }
     }
 

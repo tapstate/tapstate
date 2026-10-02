@@ -1,5 +1,6 @@
 package io.tapstate.adapters.pdk;
 
+import io.tapstate.adapters.pdk.fixture.StopAwaitingReadSource;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
@@ -11,6 +12,7 @@ import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
 import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
+import io.tapstate.spi.capture.SnapshotSession;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -22,12 +24,15 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -180,6 +185,48 @@ class PdkCapturePortTest {
                 .get(PdkExternalCallStats.Outcome.SUCCESS).count()).isEqualTo(1);
     }
 
+    /**
+     * A snapshot is read as it is taken, not collected first: with one row taken, the connector has handed
+     * over a few of its batches and is waiting, not the whole table.
+     *
+     * <p>The bound is what makes the heap a load needs independent of the table. A port that collects the
+     * read before handing over its first row holds the table whole on the heap -- as the connector's events
+     * and again decoded -- so a table larger than the heap cannot be read at all, and one merely large
+     * crowds out everything else the server runs. The count is read after a pause, so a read with no bound
+     * has had every chance to run on ahead before it is looked at; and the rows are then taken to the end,
+     * so a bound that simply lost the tail of the table would not pass for one that paced it.
+     */
+    @Test
+    void aSnapshotReadsOnlyAFewBatchesAheadOfTheRowsTaken(@TempDir Path dir) throws Exception {
+        int rows = 50_000;
+        String counter = "synthetic.large.handed." + System.nanoTime();
+        AtomicLong handed = new AtomicLong();
+        System.getProperties().put(counter, handed);
+        try {
+            Path jar = Synthetic.largeSource(dir, rows, counter);
+            PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.LargeSource", null));
+            try (CaptureBatch batch = port.snapshot(config("t1"))) {
+                assertThat(batch.hasNext()).isTrue();
+                assertThat(batch.next().after()).containsEntry("id", 1L);
+                Thread.sleep(300);
+
+                assertThat(handed.get())
+                        .as("rows the connector handed over with one of them taken: a few batches of a "
+                                + "thousand, not the %d-row table", rows)
+                        .isLessThanOrEqualTo(10_000L);
+
+                long taken = 1;
+                while (batch.hasNext()) {
+                    batch.next();
+                    taken++;
+                }
+                assertThat(taken).as("every row still arrives, however far ahead the read may run").isEqualTo(rows);
+            }
+        } finally {
+            System.getProperties().remove(counter);
+        }
+    }
+
     @Test
     void snapshotHandsTheConnectorItsDiscoveredTableNotABareName(@TempDir Path dir) throws Exception {
         // A real connector builds its read from the table's own columns - a mysql SELECT names them - and
@@ -254,12 +301,90 @@ class PdkCapturePortTest {
     }
 
     @Test
+    void snapshotSessionKeepsOneInitializedConnectorAcrossTableReads(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.singleInitSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.SingleInit", null));
+        PdkConnector connector;
+
+        try (SnapshotSession session = port.snapshotSession(config("t1"))) {
+            PdkCaptureBatch first = (PdkCaptureBatch) session.read("t1");
+            assertThat(takeAll(first)).hasSize(1);
+            connector = first.connector();
+            assertThat(connector.isAlive()).as("closing one table leaves the session connector usable").isTrue();
+
+            PdkCaptureBatch second = (PdkCaptureBatch) session.read("t1");
+            assertThat(takeAll(second)).hasSize(1);
+            assertThat(second.connector()).isSameAs(connector);
+        }
+        assertThat(connector.isAlive()).as("closing the session stops its connector").isFalse();
+    }
+
+    @Test
+    void closingSessionWakesFullReadAheadBeforeStoppingConnector() throws Exception {
+        String connectorId = "stop-awaiting-read-" + System.nanoTime();
+        Path classes = Path.of(StopAwaitingReadSource.class.getProtectionDomain()
+                .getCodeSource().getLocation().toURI());
+        PdkCapturePort port = new PdkCapturePort(provisioner(
+                classes, StopAwaitingReadSource.class.getName(), null));
+        CountDownLatch fifthBatch = new CountDownLatch(1);
+        CountDownLatch readExited = new CountDownLatch(1);
+        AtomicBoolean stopSawExit = new AtomicBoolean();
+        System.getProperties().put(StopAwaitingReadSource.FIFTH_BATCH, fifthBatch);
+        System.getProperties().put(StopAwaitingReadSource.READ_EXITED, readExited);
+        System.getProperties().put(StopAwaitingReadSource.STOP_SAW_EXIT, stopSawExit);
+        try (SnapshotSession session = port.snapshotSession(
+                new CaptureConfig(connectorId, Map.of(), List.of("t1")))) {
+            session.read("t1");
+            assertThat(fifthBatch.await(5, TimeUnit.SECONDS)).as("the four queued batches filled read-ahead")
+                    .isTrue();
+            Thread reader = readerWaitingForQueue("tapstate-snapshot-" + connectorId);
+            assertThat(reader).as("the fifth batch is blocked on the full queue").isNotNull();
+            AtomicReference<Throwable> uncaught = new AtomicReference<>();
+            reader.setUncaughtExceptionHandler((thread, failure) -> uncaught.set(failure));
+
+            session.close();
+
+            assertThat(readExited.getCount()).as("the batch reader exited").isZero();
+            assertThat(stopSawExit).as("connector stop observed the read exit").isTrue();
+            assertThat(reader.isAlive()).as("the reader was joined before the session closed").isFalse();
+            assertThat(uncaught.get()).as("reader cancellation did not escape its thread").isNull();
+        } finally {
+            System.getProperties().remove(StopAwaitingReadSource.FIFTH_BATCH);
+            System.getProperties().remove(StopAwaitingReadSource.READ_EXITED);
+            System.getProperties().remove(StopAwaitingReadSource.STOP_SAW_EXIT);
+        }
+    }
+
+    private static Thread readerWaitingForQueue(String threadName) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline) {
+            for (Map.Entry<Thread, StackTraceElement[]> entry : Thread.getAllStackTraces().entrySet()) {
+                if (!entry.getKey().getName().equals(threadName)
+                        || entry.getKey().getState() != Thread.State.TIMED_WAITING) {
+                    continue;
+                }
+                for (StackTraceElement frame : entry.getValue()) {
+                    if (frame.getClassName().equals(PdkCaptureBatch.class.getName())
+                            && frame.getMethodName().equals("put")) {
+                        return entry.getKey();
+                    }
+                }
+            }
+            Thread.sleep(10);
+        }
+        return null;
+    }
+
+    // A failure after the seam is sampled reaches whoever is taking the rows, as the rows would have: the read
+    // is under way by the time the batch is handed back. What it is, and its code, are what they always were.
+
+    @Test
     void aConnectorThatThrowsWhileReadingIsACodedCaptureFailure(@TempDir Path dir) throws Exception {
         Path jar = Synthetic.throwingReadSource(dir);
         PdkExternalCallStats calls = new PdkExternalCallStats(true);
         PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.ThrowingRead", null), null,
                 PdkCapturePort.DEFAULT_PREFLIGHT_TIMEOUT, calls);
-        assertThatThrownBy(() -> port.snapshot(config("t1")))
+        assertThatThrownBy(() -> takeAll(port.snapshot(config("t1"))))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> assertThat(((TapstateException) e).code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
         assertThat(calls.snapshot().get(PdkExternalCallStats.Call.SNAPSHOT_READ)
@@ -274,9 +399,67 @@ class PdkCapturePortTest {
         // so the codec refuses it. That is a projection failure, distinct from a connector read failure.
         Path jar = Synthetic.badRowSource(dir);
         PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.BadRow", null));
-        assertThatThrownBy(() -> port.snapshot(config("t1")))
+        assertThatThrownBy(() -> takeAll(port.snapshot(config("t1"))))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> assertThat(((TapstateException) e).code()).isEqualTo(ConnectorError.PROJECTION_FAILED));
+    }
+
+    /**
+     * Still a projection failure when the connector wraps whatever its hand-over throws, as a JDBC one does
+     * around the callback its query runs the result set through. A row refused while the hand-over is under
+     * way reaches the taker inside the connector's exception, and so under the code for a read that failed:
+     * a message sending whoever reads it to the source rather than to the row.
+     */
+    @Test
+    void anUnprojectableRowIsAProjectionFailureWhenTheConnectorWrapsWhatItsHandOverThrows(@TempDir Path dir) {
+        Path jar = Synthetic.wrappingBadRowSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.WrappingBadRow", null));
+        assertThatThrownBy(() -> takeAll(port.snapshot(config("t1"))))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(e -> assertThat(((TapstateException) e).code()).isEqualTo(ConnectorError.PROJECTION_FAILED));
+    }
+
+    /**
+     * And not lost when the connector catches whatever its hand-over throws and reads on. A row refused while
+     * the hand-over is under way goes with the batch the connector drops, and the read then ends as one read
+     * through: the table short, and nothing said.
+     */
+    @Test
+    void anUnprojectableRowIsNotLostWhenTheConnectorSwallowsWhatItsHandOverThrows(@TempDir Path dir) {
+        Path jar = Synthetic.swallowingBadRowSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.SwallowingBadRow", null));
+        assertThatThrownBy(() -> takeAll(port.snapshot(config("t1"))))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(e -> assertThat(((TapstateException) e).code()).isEqualTo(ConnectorError.PROJECTION_FAILED));
+    }
+
+    /**
+     * A read abandoned before it has sampled its seam leaves no connector running behind it. The abandonment
+     * is reported as itself, and waiting on the seam hands such an end back unwrapped -- past the clean-up
+     * that every other early failure of the read goes through.
+     */
+    @Test
+    void aReadAbandonedBeforeItsSeamStopsItsConnector(@TempDir Path dir) {
+        Path jar = Synthetic.emittingSource(dir);
+        PdkConnector connector = PdkConnector.open(
+                "demo", new ConnectorRef(List.of(jar), "synthetic.EmittingSource", "2.0.8", null), Map.of());
+        CancellationException abandoned = new CancellationException("abandoned before its seam");
+
+        assertThatThrownBy(() -> PdkCaptureBatch.start(connector, reading -> {
+            throw abandoned;
+        }, "abandoned-read")).isSameAs(abandoned);
+        assertThat(connector.isAlive()).as("the connector was stopped").isFalse();
+    }
+
+    /** Takes every row of {@code batch} and closes it, the way a snapshot phase does. */
+    private static List<Envelope> takeAll(CaptureBatch batch) {
+        List<Envelope> rows = new ArrayList<>();
+        try (batch) {
+            while (batch.hasNext()) {
+                rows.add(batch.next());
+            }
+        }
+        return rows;
     }
 
     // ---- cdc drive: streamRead -> decodeChange ---------------------------------------------------
@@ -703,6 +886,44 @@ class PdkCapturePortTest {
         assertThatCode(sub::close).doesNotThrowAnyException();
     }
 
+    @Test
+    void closingACdcSubscriptionDoesNotReportItsInterruptedBatchAsAFailure(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.emittingSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.EmittingSource", null));
+        CountDownLatch batchEntered = new CountDownLatch(1);
+        CountDownLatch keepBatchParked = new CountDownLatch(1);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        CaptureListener listener = new CaptureListener() {
+            @Override
+            public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                batchEntered.countDown();
+                try {
+                    keepBatchParked.await();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new CancellationException("the cdc batch was interrupted while it waited for room");
+                }
+            }
+
+            @Override
+            public void onError(Throwable error) {
+                failure.set(error);
+            }
+        };
+        try (Subscription sub = port.cdc(config("t1"), CaptureStart.present(), listener)) {
+            assertThat(batchEntered.await(5, TimeUnit.SECONDS)).as("the stream reached its parked batch").isTrue();
+
+            long closing = System.nanoTime();
+            sub.close();
+
+            assertThat(Duration.ofNanos(System.nanoTime() - closing))
+                    .as("close interrupts and joins the parked stream without waiting out its backpressure")
+                    .isLessThan(Duration.ofSeconds(1));
+        }
+        assertThat(failure.get())
+                .as("an interruption caused by subscription close is normal teardown")
+                .isNull();
+    }
 
     @Test
     void handsARecordedPositionBackToTheConnectorAsTheObjectItIssued(@TempDir Path dir) throws Exception {

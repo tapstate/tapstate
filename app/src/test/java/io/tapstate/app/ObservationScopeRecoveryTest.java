@@ -571,6 +571,7 @@ class ObservationScopeRecoveryTest {
                 @Override public void resume(String id) { }
                 @Override public void stop(String id, boolean purgeState) { }
                 @Override public Optional<Throwable> failure(String id) { return Optional.empty(); }
+                @Override public Optional<Throwable> lost(String id) { return Optional.empty(); }
                 @Override public boolean isCarryingAJob(String id) { return !PIPELINE.equals(id); }
             };
             return new ConvergenceDriver(new PipelineConverger(desired, state, actuator,

@@ -35,6 +35,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Function;
 
 /** Short checkpoint transactions that also write the desired and authority documents they prove. */
@@ -255,6 +256,21 @@ final class MongoStopReservationWrites {
     }
 
     Optional<SuccessorAdmission> admit(StopReservation expected, String incarnation, String boot, Instant at) {
+        return admit(expected, incarnation, boot, Optional.empty(), at);
+    }
+
+    Optional<SuccessorAdmission> admit(StopReservation expected, String incarnation, String boot,
+            Set<String> executionMembers, Instant at) {
+        Objects.requireNonNull(executionMembers, "executionMembers");
+        if (expected.writerAuthority() != null && !expected.writerAuthority().standalone()
+                && executionMembers.isEmpty()) {
+            throw new IllegalArgumentException("a clustered successor needs its factual planned members");
+        }
+        return admit(expected, incarnation, boot, Optional.of(Set.copyOf(executionMembers)), at);
+    }
+
+    private Optional<SuccessorAdmission> admit(StopReservation expected, String incarnation, String boot,
+            Optional<Set<String>> executionMembers, Instant at) {
         requirePhase(expected, StopReservation.Phase.REPLACEMENT_PENDING);
         Objects.requireNonNull(incarnation, "incarnation"); Objects.requireNonNull(boot, "boot");
         if (incarnation.isBlank() || boot.isBlank()) { throw new IllegalArgumentException("admission identities are blank"); }
@@ -268,7 +284,10 @@ final class MongoStopReservationWrites {
             guardArtifact(session, expected.pipelineId(), incarnation);
             StopAuthority prior = expected.writerAuthority();
             Document advanced = prior != null && prior.claim() != null
-                    ? generations.advanceUnderClaim(session, prior.claim(), prior.claim().topologyRevision()).orElseThrow(() -> FENCED)
+                    ? (executionMembers.isPresent() ? generations.advanceUnderClaim(session, prior.claim(),
+                            prior.claim().topologyRevision(), executionMembers.orElseThrow())
+                            : generations.advanceUnderClaim(session, prior.claim(), prior.claim().topologyRevision()))
+                            .orElseThrow(() -> FENCED)
                     : generations.advanceStandalone(session, expected.source().clusterId(), expected.pipelineId()).orElseThrow(() -> FENCED);
             validateClaim(advanced, expected.pipelineId(), true);
             long generation = ((Number) advanced.get("executionGeneration")).longValue();

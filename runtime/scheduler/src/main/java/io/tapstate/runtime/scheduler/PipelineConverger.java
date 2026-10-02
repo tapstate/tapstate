@@ -132,10 +132,11 @@ public final class PipelineConverger {
         }
 
         if (target == PipelineState.PAUSED && actual == PipelineState.PAUSED) {
-            Optional<Throwable> failure = actuator.failure(pipelineId);
+            Optional<Throwable> failure = actuator.lost(pipelineId);
             if (failure.isEmpty() && !actuator.isCarryingAJob(pipelineId)) {
-                failure = Optional.of(new TapstateException(LifecycleError.PAUSED_JOB_MISSING,
-                        Map.of("pipeline", pipelineId), null));
+                failure = actuator.failure(pipelineId).or(() -> Optional.of(
+                        new TapstateException(LifecycleError.PAUSED_JOB_MISSING,
+                                Map.of("pipeline", pipelineId), null)));
             }
             if (failure.isPresent()) {
                 ConvergeResult driven = driveTo(
@@ -147,24 +148,23 @@ public final class PipelineConverger {
             }
         }
 
-        if (target == PipelineState.PAUSED && actual == PipelineState.FAILED) {
-            // The intent stays paused; the failed execution is not a job that can be paused again.
-            return ConvergeResult.converged(actualDoc.orElseThrow());
-        }
-
-        if (target == PipelineState.RUNNING && actual == PipelineState.FAILED && !rebuildOwed) {
+        if ((target == PipelineState.RUNNING || target == PipelineState.PAUSED)
+                && actual == PipelineState.FAILED && !rebuildOwed) {
+            rebuilds.recordFailure(pipelineId);
             // A run that died because the cluster changed under it is the one death this loop may answer
             // by itself, and it is asked here rather than where the death was observed so that the
             // failure is recorded and published first: whatever is decided next, nobody is left reading a
             // healthy pipeline over a dead job while it is being decided. The admission bounds itself --
             // a yes that never runs out is a restart loop wearing the word "recovery".
-            if (rebuilds.admits(pipelineId)) {
+            if (target == PipelineState.RUNNING && rebuilds.admits(pipelineId)) {
                 return driveTo(pipelineId, target, false, actualDoc.orElse(null), false, true, false, intent.get());
             }
             // Otherwise a failed run stays failed: re-driving it toward RUNNING would restart the dead job
-            // on every tick. The user recovers by stopping it then starting a fresh run -- which arrives
-            // as the one instruction above, and that is let through: it is somebody saying so once,
-            // which is the whole difference from this loop noticing the same death every second.
+            // on every tick, and toward PAUSED would try every tick to hold a job that is gone, be refused,
+            // and fail the pipeline over again. The user recovers by stopping it then starting a fresh
+            // run -- which arrives as the one instruction above, and that is let through: it is somebody
+            // saying so once, which is the whole difference from this loop noticing the same death every
+            // second.
             // actual is FAILED only when the checkpoint was read and parsed, so
             // the doc is necessarily present; orElseThrow makes that invariant explicit and fail-loud.
             return ConvergeResult.converged(actualDoc.orElseThrow());
@@ -248,6 +248,7 @@ public final class PipelineConverger {
                 }
                 CasOutcome outcome = state.compareAndSwap(pipelineId, current.epoch(), targetJson, clock.instant());
                 if (outcome instanceof CasOutcome.Applied applied) {
+                    if (target == PipelineState.FAILED) { rebuilds.recordFailure(pipelineId); }
                     // The store remains the state truth. A prepared start may reserve bounded inputs
                     // before this CAS, but submits its Jet job only after the CAS has landed.
                     try {
@@ -332,6 +333,7 @@ public final class PipelineConverger {
         java.util.function.BooleanSupplier current = () -> currentMarker(expected, intent, authority);
         if (!current.getAsBoolean()) { return ConvergeResult.superseded(); }
         CheckpointDoc before = requireCheckpoint(id);
+        if (StateJson.parse(before.stateJson()) == PipelineState.FAILED) { rebuilds.recordFailure(id); }
         if (retiring) {
             boolean continuing = continuesCounters(before, intent);
             if (!actuator.finishStop(expected, continuing, firstAttempt, true, current)) {
@@ -390,9 +392,9 @@ public final class PipelineConverger {
         String id = marker.pipelineId();
         var admittedAttempt = new java.util.concurrent.atomic.AtomicReference<StopReservation>();
         try (LifecycleActuator.PreparedReplacement prepared = actuator.prepareReplacement(marker,
-                (writer, incarnation, boot) -> {
+                (writer, incarnation, boot, executionMembers) -> {
                     if (!current.getAsBoolean() || !Objects.equals(marker.writerAuthority(), writer)) { return Optional.empty(); }
-                    var accepted = state.admitSuccessor(marker, incarnation, boot, clock.instant());
+                    var accepted = state.admitSuccessor(marker, incarnation, boot, executionMembers, clock.instant());
                     accepted.ifPresent(value -> admittedAttempt.set(value.reservation()));
                     return accepted;
                 },
@@ -558,7 +560,7 @@ public final class PipelineConverger {
      * it as the observation's coded failure. Shared with the dead-job path, which reaches the same state
      * by a different road.
      */
-    private ConvergeResult failedWith(String pipelineId, TapstateException cause) {
+    private ConvergeResult failedWith(String pipelineId, Throwable cause) {
         ConvergeResult driven =
                 driveTo(pipelineId, PipelineState.FAILED, false, requireCheckpoint(pipelineId), false);
         return driven.checkpoint()

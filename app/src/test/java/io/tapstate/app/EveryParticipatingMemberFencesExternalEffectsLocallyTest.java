@@ -208,8 +208,15 @@ class EveryParticipatingMemberFencesExternalEffectsLocallyTest {
         }
 
         @Override
-        public Optional<WorkloadClaim> advanceUnderClaim(WorkloadClaim expected, long topologyRevision) {
-            return delegate.advanceUnderClaim(expected, topologyRevision);
+        public Optional<WorkloadClaim> advanceExecution(
+                WorkloadClaim expected, long topologyRevision, java.util.Set<String> executionNodeIds) {
+            return delegate.advanceExecution(expected, topologyRevision, executionNodeIds);
+        }
+
+        @Override
+        public Optional<WorkloadClaim> recordExecutionFailure(
+                WorkloadClaim expected, boolean afterMemberLoss) {
+            return delegate.recordExecutionFailure(expected, afterMemberLoss);
         }
     }
 }

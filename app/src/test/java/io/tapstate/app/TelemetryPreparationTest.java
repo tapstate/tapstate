@@ -468,6 +468,7 @@ class TelemetryPreparationTest {
             @Override public void pause(String pipelineId) { }
             @Override public void resume(String pipelineId) { }
             @Override public void stop(String pipelineId, boolean purgeState) { }
+            @Override public Optional<Throwable> lost(String pipelineId) { return Optional.empty(); }
             @Override public boolean isCarryingAJob(String pipelineId) { return true; }
             @Override public Optional<Throwable> failure(String pipelineId) {
                 if (failureChecks.incrementAndGet() == 1) {

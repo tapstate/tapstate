@@ -5,12 +5,20 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.hazelcast.function.FunctionEx;
 import com.hazelcast.function.SupplierEx;
+import com.hazelcast.cluster.Address;
+import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Edge;
+import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
+import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Vertex;
 import com.hazelcast.jet.core.processor.Processors;
+import com.hazelcast.jet.core.test.TestOutbox;
+import com.hazelcast.jet.core.test.TestProcessorContext;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.lifecycle.Stage;
+import io.tapstate.core.lifecycle.Staged;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
@@ -40,6 +48,61 @@ import org.junit.jupiter.api.Test;
  * these tests carry no dependency on the SRS source path.
  */
 class PipelineDagBuilderTest {
+
+    @Test
+    void sourcePressureMeasurementPreservesPlacementAndOutputRetries() throws Exception {
+        Address owner = new Address("127.0.0.1", 5701);
+        Address other = new Address("127.0.0.1", 5702);
+        ProcessorMetaSupplier placed = new PlacedSource(owner);
+        PipelineResource pipeline = new PipelineResource("p", null,
+                List.of(SourceRef.bare("orders_src")), null, null,
+                serve(FromRef.literal("orders_src"), sync("sync_1", "orders_dest")), null, null);
+        DagBindings bindings = new DagBindings(id -> placed,
+                step -> (SupplierEx<TransformPort>) () -> event -> List.of(event),
+                syncElement -> stubWriter(), ref -> List.of("orders_src"));
+        ProcessorMetaSupplier assembled = PipelineDagBuilder.build(pipeline, bindings)
+                .getVertex("orders_src").getMetaSupplier();
+        assertThat(assembled.preferredLocalParallelism()).isEqualTo(1);
+        assertThat(assembled.initIsCooperative()).isFalse();
+        assertThat(assembled.closeIsCooperative()).isFalse();
+        assertThat(assembled.getTags()).containsExactlyEntriesOf(placed.getTags());
+        var suppliers = assembled.get(List.of(owner, other));
+        assertThat(suppliers.apply(other).get(1)).singleElement()
+                .isNotInstanceOf(StageOutputPressureProcessor.class);
+        Processor measured = suppliers.apply(owner).get(1).iterator().next();
+        assertThat(measured).isInstanceOf(StageOutputPressureProcessor.class);
+        assertThat(measured.isCooperative()).isFalse();
+        TestOutbox outbox = new TestOutbox(1);
+        measured.init(outbox, new TestProcessorContext());
+        assertThat(outbox.offer("occupied")).isTrue();
+        assertThat(measured.complete()).isFalse();
+        assertThat(outbox.queue(0)).containsExactly("occupied");
+        outbox.queue(0).clear();
+        assertThat(measured.complete()).isTrue();
+        assertThat(outbox.queue(0)).containsExactly("source-row");
+        measured.close();
+    }
+
+    private static final class OutputSource extends AbstractProcessor implements Staged {
+        @Override public Stage stage() { return Stage.SOURCE; }
+        @Override public boolean isCooperative() { return false; }
+        @Override public boolean complete() { return tryEmit("source-row"); }
+    }
+
+    private static final class PlacedSource implements ProcessorMetaSupplier, java.io.Serializable {
+        private static final long serialVersionUID = 1L;
+        private final int ownerPort;
+        private PlacedSource(Address owner) { ownerPort = owner.getPort(); }
+        @Override public int preferredLocalParallelism() { return 1; }
+        @Override public boolean initIsCooperative() { return false; }
+        @Override public boolean closeIsCooperative() { return false; }
+        @Override public Map<String, String> getTags() { return Map.of("binding", "placed"); }
+        @Override public Function<Address, ProcessorSupplier> get(List<Address> addresses) {
+            assertThat(addresses).extracting(Address::getPort).contains(ownerPort);
+            return address -> ProcessorSupplier.of(() -> address.getPort() == ownerPort
+                    ? new OutputSource() : new AbstractProcessor() { });
+        }
+    }
 
     @Test
     void recordingBusinessMetadataDoesNotChangeTheVertexSchedulingChoice() {

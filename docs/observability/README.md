@@ -31,6 +31,13 @@ pipeline. Observability GET responses, including coded and authentication errors
 | Which retained lifecycle or telemetry events occurred? | `GET /api/pipelines/{id}/events` | `events <id> --from ... --to ...` | `pipeline_events` |
 | Why does the latest observation look this way? | `GET /api/pipelines/{id}/explain` | `explain <id>` or `status <id>` | `pipeline_explain` |
 
+The snapshot read shows progress for the pipeline's initial load. A replacement run keeps a table's
+confirmed progress even when it skips reading that table again. Once the target confirms the load,
+the face shows 100% and uses the durably recorded row count when available; an older load without
+that count falls back to the last discovery's estimate. Before confirmation, `rowsTotal` is only
+that estimate and can lag a growing table. The current run's own snapshot read count is available as
+`snapshot.rows.read.<table>` on the metrics face.
+
 `pipeline.explain` requires a current observation. A newly started pipeline may return
 `monitor.no-observation` until its first observation is published. History is independent of the
 latest observation and can still return retained samples for a stopped pipeline. Events also do not

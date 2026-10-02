@@ -4,7 +4,9 @@ import com.hazelcast.internal.metrics.MetricDescriptor;
 import com.hazelcast.internal.metrics.MetricsCollectionContext;
 import com.hazelcast.jet.core.Outbox;
 import com.hazelcast.jet.core.Processor;
+import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.impl.processor.ProcessorWrapper;
+import com.hazelcast.jet.impl.util.WrappingProcessorMetaSupplier;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.Staged;
 import java.util.Objects;
@@ -30,6 +32,12 @@ public final class StageOutputPressureProcessor extends ProcessorWrapper impleme
             return processor;
         }
         return new StageOutputPressureProcessor(processor, staged.stage(), System::nanoTime);
+    }
+
+    /** Decorates source instances after their supplier has selected the member that owns the input. */
+    public static ProcessorMetaSupplier wrap(ProcessorMetaSupplier supplier) {
+        return new WrappingProcessorMetaSupplier(Objects.requireNonNull(supplier, "supplier"),
+                StageOutputPressureProcessor::wrap);
     }
 
     @Override

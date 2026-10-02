@@ -25,6 +25,19 @@ import org.junit.jupiter.api.Test;
 class TargetModelResolverTest {
 
     @Test
+    void legacy_qualified_rename_follows_the_source_model_name_for_an_assembled_stream() {
+        TargetTable root = TargetModelResolver.toTargetTable(oneColumnTable("AA_0716"));
+
+        Map<String, TargetTable> targets = TargetModelResolver.renameAll(
+                Map.of("k2__nest", root), List.of("k2__nest"),
+                new io.tapstate.core.model.RenameSpec(Map.of("mysql.AA_0716", "k2"), null, null, null),
+                Map.of("AA_0716", "mysql"));
+
+        assertThat(targets).containsOnlyKeys("k2__nest");
+        assertThat(targets.get("k2__nest").name()).isEqualTo("k2");
+    }
+
+    @Test
     void numericDescriptorSurvivesTableRenamingAndRekeying() throws Exception {
         var number = new io.tapstate.core.common.NumericType(128, true, false, true, new java.math.BigDecimal("-99999999999999.9999"), new java.math.BigDecimal("99999999999999.9999"), 18, 4);
         var source = new SourceTable("orders", List.of(new SourceField("amount", "decimal(18,4)",

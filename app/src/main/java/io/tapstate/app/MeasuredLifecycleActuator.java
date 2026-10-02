@@ -171,6 +171,11 @@ final class MeasuredLifecycleActuator implements LifecycleActuator {
     }
 
     @Override
+    public Optional<Throwable> lost(String pipelineId) {
+        return delegate.lost(pipelineId);
+    }
+
+    @Override
     public boolean isCarryingAJob(String pipelineId) {
         return delegate.isCarryingAJob(pipelineId);
     }

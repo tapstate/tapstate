@@ -218,18 +218,18 @@ public final class ObservationPublisher {
     private static final String STAGE_ATTRIBUTE = MetricAttributes.STAGE;
 
     /**
-     * The bounded load's two measurements, which carry their table as an attribute the way the pair above
-     * do. They are a monitoring backend's view of the same load the observation's own snapshot dataset
-     * describes, taken from the same reading rather than counted a second time -- one account, two
-     * projections, so the two faces cannot come to disagree.
+     * The load's table measurements. Loaded progress may retain a completed table from an earlier
+     * execution; its row total remains a gauge. When current-run readings are wired, the accumulating
+     * row counter uses only those actual reads, so continuation cannot add retained progress again.
      *
      * <p>How far the load got accumulates and about how far it has to go does not, which is why they are a
-     * counter and a gauge and not two of either. The total is what the last discovery of the source
-     * counted: an estimate, never maintained since, and free to be revised downwards by the next
-     * discovery. Declaring it a counter would promise a reader it only ever rises, and the first
-     * re-discovery of a table that shrank would break that promise silently.
+     * counter and a gauge and not two of either. The total begins as what the last discovery counted and
+     * becomes the confirmed row count when the target finishes the load. Declaring it a counter would
+     * promise it only ever rises, which a later discovery of a table that shrank could break.
      */
     private static final String SNAPSHOT_ROWS_METRIC = "tapstate.pipeline.snapshot.rows";
+    private static final String SNAPSHOT_ROWS_CURRENT_RUN_METRIC =
+            "tapstate.pipeline.snapshot.rows.current_run";
     private static final String SNAPSHOT_ROWS_TOTAL_METRIC = "tapstate.pipeline.snapshot.rows.total";
 
     /**
@@ -307,6 +307,7 @@ public final class ObservationPublisher {
             Map.entry(RECORDS_METRIC, keyed("records.", DIRECTION_ATTRIBUTE)),
             Map.entry(BYTES_METRIC, keyed("bytes.", DIRECTION_ATTRIBUTE)),
             Map.entry(LAG_METRIC, keyed("lag.", TABLE_ID_ATTRIBUTE)),
+            Map.entry(SNAPSHOT_ROWS_CURRENT_RUN_METRIC, keyed("snapshot.rows.read.", TABLE_ID_ATTRIBUTE)),
             // Reduced and not dropped, which is the opposite of what the load's two measurements get, and
             // for the reason that decides between them: a drop is only honest when another face carries
             // the metric, and the load has one - this observation's own snapshot dataset. Failures have
@@ -397,6 +398,8 @@ public final class ObservationPublisher {
     private final Function<String, OptionalLong> recordCounts;
     private final Function<String, Map<String, String>> positions;
     private final Function<String, SnapshotReading> snapshots;
+    private final Function<String, SnapshotReading> runSnapshots;
+    private static final Function<String, SnapshotReading> UNWIRED_RUN_SNAPSHOTS = id -> SnapshotReading.NONE;
     private final Function<String, Map<String, Long>> frontierGaps;
     private final Function<String, Map<String, NestStateReading>> nestStateReadings;
     private final Function<String, Map<String, Long>> frontierStalls;
@@ -814,6 +817,25 @@ public final class ObservationPublisher {
             Function<String, SinkBatchReading> sinkBatches, Function<String, Optional<QueueReading>> queues,
             Function<String, Map<String, StateStoreCostReading>> stateCosts,
             StageRuntimeFacts stageRuntime, Clock clock) {
+        this(state, observations, recordCounts, positions, snapshots, frontierGaps, nestStateReadings,
+                coldLayer, frontierStalls, frontierStall, nestDeadLetters, joinRecomputeDone,
+                joinRecomputeExpected, captures, deliveries, stages, sinkBatches, queues, stateCosts,
+                stageRuntime, UNWIRED_RUN_SNAPSHOTS, clock);
+    }
+
+    /** Also reads the factual row count of the current physical load on the same telemetry worker. */
+    public ObservationPublisher(StateStore state, ObservationStore observations,
+            Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
+            Function<String, SnapshotReading> snapshots, Function<String, Map<String, Long>> frontierGaps,
+            Function<String, Map<String, NestStateReading>> nestStateReadings, NestColdLayerWatch coldLayer,
+            Function<String, Map<String, Long>> frontierStalls, FrontierStallWatch frontierStall,
+            Function<String, Map<String, Long>> nestDeadLetters,
+            Function<String, Map<String, Long>> joinRecomputeDone,
+            Function<String, Map<String, Long>> joinRecomputeExpected, Function<String, CaptureReading> captures,
+            Function<String, DeliveryReading> deliveries, Function<String, StageReading> stages,
+            Function<String, SinkBatchReading> sinkBatches, Function<String, Optional<QueueReading>> queues,
+            Function<String, Map<String, StateStoreCostReading>> stateCosts,
+            StageRuntimeFacts stageRuntime, Function<String, SnapshotReading> runSnapshots, Clock clock) {
         this.stageRuntime = Objects.requireNonNull(stageRuntime, "stageRuntime");
         this.captures = Objects.requireNonNull(captures, "captures");
         this.deliveries = Objects.requireNonNull(deliveries, "deliveries");
@@ -834,6 +856,7 @@ public final class ObservationPublisher {
         this.recordCounts = Objects.requireNonNull(recordCounts, "recordCounts");
         this.positions = Objects.requireNonNull(positions, "positions");
         this.snapshots = Objects.requireNonNull(snapshots, "snapshots");
+        this.runSnapshots = Objects.requireNonNull(runSnapshots, "runSnapshots");
         this.frontierGaps = Objects.requireNonNull(frontierGaps, "frontierGaps");
         this.nestStateReadings = Objects.requireNonNull(nestStateReadings, "nestStateReadings");
         this.coldLayer = Objects.requireNonNull(coldLayer, "coldLayer");
@@ -989,9 +1012,11 @@ public final class ObservationPublisher {
         Map<String, Long> pinned = orderedSnapshot(frontierStalls.apply(pipelineId));
         Instant at = observedNow();
         SnapshotReading loaded = snapshots.apply(pipelineId);
+        SnapshotReading readThisRun = runSnapshots.apply(pipelineId);
         List<MetricFact> raw = facts(pipelineId, actual, at, readings, gaps, pinned,
                 nestDeadLetters.apply(pipelineId), joinRecomputeDone.apply(pipelineId),
-                joinRecomputeExpected.apply(pipelineId), loaded, scope, failureReading);
+                joinRecomputeExpected.apply(pipelineId), loaded, readThisRun,
+                runSnapshots != UNWIRED_RUN_SNAPSHOTS, scope, failureReading);
         Map<String, String> sourcePositions = orderedSnapshot(positions.apply(pipelineId));
         // A wait before the frame clock must not attach a newer time to an obsolete checkpoint.
         // This read is part of bounded preparation on a telemetry worker, never a hot-path CAS.
@@ -1205,7 +1230,7 @@ public final class ObservationPublisher {
             Map<String, Long> discarded, Map<String, Long> rebuildDone, Map<String, Long> rebuildExpected,
             SnapshotReading loaded) {
         return facts(pipelineId, actual, at, nestReadings, gaps, pinned, discarded, rebuildDone,
-                rebuildExpected, loaded, null);
+                rebuildExpected, loaded, (ObservationStore.Scope) null);
     }
 
     private List<MetricFact> facts(String pipelineId, PipelineState actual, Instant at,
@@ -1215,13 +1240,24 @@ public final class ObservationPublisher {
         FailureReading captured;
         synchronized (accountLock) { captured = failureReading(pipelineId, null, false); }
         return facts(pipelineId, actual, at, nestReadings, gaps, pinned, discarded, rebuildDone,
-                rebuildExpected, loaded, scope, captured);
+                rebuildExpected, loaded, SnapshotReading.NONE, false, scope, captured);
+    }
+
+    List<MetricFact> facts(String pipelineId, PipelineState actual, Instant at,
+            Map<String, NestStateReading> nestReadings, Map<String, Long> gaps, Map<String, Long> pinned,
+            Map<String, Long> discarded, Map<String, Long> rebuildDone, Map<String, Long> rebuildExpected,
+            SnapshotReading loaded, SnapshotReading readThisRun) {
+        FailureReading captured;
+        synchronized (accountLock) { captured = failureReading(pipelineId, null, false); }
+        return facts(pipelineId, actual, at, nestReadings, gaps, pinned, discarded, rebuildDone,
+                rebuildExpected, loaded, readThisRun, runSnapshots != UNWIRED_RUN_SNAPSHOTS, null, captured);
     }
 
     private List<MetricFact> facts(String pipelineId, PipelineState actual, Instant at,
             Map<String, NestStateReading> nestReadings, Map<String, Long> gaps, Map<String, Long> pinned,
             Map<String, Long> discarded, Map<String, Long> rebuildDone, Map<String, Long> rebuildExpected,
-            SnapshotReading loaded, ObservationStore.Scope scope, FailureReading failureReading) {
+            SnapshotReading loaded, SnapshotReading readThisRun, boolean currentRunSnapshotRows,
+            ObservationStore.Scope scope, FailureReading failureReading) {
         List<MetricFact> facts = new ArrayList<>();
         failures(pipelineId, at, failureReading).ifPresent(facts::add);
         recordCounts.apply(pipelineId)
@@ -1292,7 +1328,8 @@ public final class ObservationPublisher {
         }
         sinkBatchFacts(pipelineId, at, sinkBatches.apply(pipelineId)).forEach(facts::add);
         queues.apply(pipelineId).ifPresent(reading -> queueFacts(pipelineId, at, reading).forEach(facts::add));
-        load(pipelineId, at, loaded).forEach(facts::add);
+        load(pipelineId, at, loaded, currentRunSnapshotRows ? readThisRun : loaded).forEach(facts::add);
+        runLoad(pipelineId, at, readThisRun).ifPresent(facts::add);
         return facts;
     }
 
@@ -1427,6 +1464,18 @@ public final class ObservationPublisher {
         return Map.copyOf(dimensioned);
     }
 
+    private static Optional<MetricFact> runLoad(String pipelineId, Instant at, SnapshotReading read) {
+        if (read == null || read.start().isEmpty()) {
+            return Optional.empty();
+        }
+        List<MetricPoint> points = new ArrayList<>();
+        read.byTable().forEach((table, progress) -> points.add(MetricPoint.accumulated(
+                Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, TABLE_ID_ATTRIBUTE, table),
+                read.countingSince(), at, progress.rowsDone())));
+        return points.isEmpty() ? Optional.empty()
+                : Optional.of(new MetricFact(SNAPSHOT_ROWS_CURRENT_RUN_METRIC, MetricType.COUNTER, "{row}", points));
+    }
+
     /**
      * Where the run's time went, as one distribution per stage; empty for a run reporting none. The stage
      * is a closed set, so every point here is one of five and nothing arriving from the data can add one.
@@ -1545,29 +1594,31 @@ public final class ObservationPublisher {
      * each of those tables was last counted to hold. Empty for a pipeline that ran no load, so one reading
      * a change stream alone is absent rather than present at zero rows.
      *
-     * <p>Both come from the reading the observation's snapshot dataset is built from, on the same pass, so
-     * a monitoring backend and the read face can never be describing different moments of the same load.
+     * <p>The row-total gauge uses the same loaded reading as the snapshot dataset. The row counter uses
+     * the already sampled current-run reading when available; older unwired bindings retain their
+     * loaded-reading behavior. Neither projection performs another measurement.
      *
      * <p>The total is left out per table rather than for the reading as a whole. A pipeline may read one
      * table off a connector that can count and another off one that cannot, and a total defaulted for the
      * second would size an unmeasured table at whatever the default was. Nothing here turns an absent
      * count into a zero or into the rows already done: both would read as a finished load.
      */
-    private static List<MetricFact> load(String pipelineId, Instant at, SnapshotReading loaded) {
-        if (loaded == null || loaded.start().isEmpty()) {
-            return List.of();
-        }
-        Instant start = loaded.countingSince();
+    private static List<MetricFact> load(String pipelineId, Instant at, SnapshotReading loaded, SnapshotReading read) {
         List<MetricPoint> done = new ArrayList<>();
         List<MetricPoint> expected = new ArrayList<>();
-        loaded.byTable().forEach((table, progress) -> {
-            Map<String, String> attributes =
-                    Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, TABLE_ID_ATTRIBUTE, table);
-            done.add(MetricPoint.accumulated(attributes, start, at, progress.rowsDone()));
-            if (progress.rowsTotal() != null) {
-                expected.add(MetricPoint.reading(attributes, at, progress.rowsTotal()));
-            }
-        });
+        if (read != null && read.start().isPresent()) {
+            read.byTable().forEach((table, progress) -> done.add(MetricPoint.accumulated(
+                    Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, TABLE_ID_ATTRIBUTE, table),
+                    read.countingSince(), at, progress.rowsDone())));
+        }
+        if (loaded != null && loaded.start().isPresent()) {
+            loaded.byTable().forEach((table, progress) -> {
+                if (progress.rowsTotal() != null) {
+                    expected.add(MetricPoint.reading(Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, TABLE_ID_ATTRIBUTE, table),
+                            at, progress.rowsTotal()));
+                }
+            });
+        }
         List<MetricFact> facts = new ArrayList<>();
         if (!done.isEmpty()) {
             facts.add(new MetricFact(SNAPSHOT_ROWS_METRIC, MetricType.COUNTER, "{row}", done));

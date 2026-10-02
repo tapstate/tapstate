@@ -32,6 +32,11 @@ final class NoOpActuator implements LifecycleActuator {
         return Optional.empty();
     }
 
+    @Override
+    public Optional<Throwable> lost(String pipelineId) {
+        return Optional.empty();
+    }
+
     /** Always carrying: this double stands in for a data plane that is doing what it was told. */
     @Override
     public boolean isCarryingAJob(String pipelineId) {

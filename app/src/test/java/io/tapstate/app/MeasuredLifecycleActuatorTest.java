@@ -71,6 +71,11 @@ class MeasuredLifecycleActuatorTest {
         }
 
         @Override
+        public Optional<Throwable> lost(String pipelineId) {
+            return Optional.empty();
+        }
+
+        @Override
         public boolean isCarryingAJob(String pipelineId) {
             return false;
         }

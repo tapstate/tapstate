@@ -1,6 +1,7 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.AssemblyIdentity;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
@@ -14,25 +15,25 @@ import java.util.Optional;
 
 /**
  * The resource-type-agnostic read side of the double-layer model: the store is the truth layer, and a
- * read returns an artifact as its canonical form straight from that layer — never from a local draft
- * (server-as-truth). {@link ApplyService} is the write side; this is its read peer, backing the artifact
- * read verbs (get / list).
+ * read returns an artifact from that layer — never from a local draft (server-as-truth). Public Source
+ * reads redact Mongo URI userinfo while their stored resource, content hash, and typed internal reads
+ * remain unchanged. {@link ApplyService} is the write side; this is its read peer.
  *
- * <p>The canonical form a read returns is produced by the same {@link CanonicalWriter} the offline
- * authoring path uses, so an applied artifact reads back byte-for-byte as its offline canonical form:
- * the online path reuses the one canonical contract rather than forking it. Reconstructing the stored
- * form is the store's concern; this layer only re-serializes the reconstructed resource to canonical.
+ * <p>Non-sensitive artifacts retain the byte-stable canonical form produced by the same {@link
+ * CanonicalWriter} as offline authoring. A Source projection starts from that form and replaces only
+ * Mongo URI userinfo; it is deliberately display-only and keeps the authoritative hash beside it.
  */
 public final class ArtifactQueryService {
 
     private final ArtifactStore store;
     private final CanonicalWriter writer = new CanonicalWriter();
+    private final SourceReadProjection sourceProjection = new SourceReadProjection();
 
     public ArtifactQueryService(ArtifactStore store) {
         this.store = Objects.requireNonNull(store, "store");
     }
 
-    /** Returns the stored artifact for the id as its canonical form, or empty when none is stored. */
+    /** Returns the stored artifact for the id as its public canonical form, or empty when none is stored. */
     public Optional<StoredArtifact> get(String id) {
         Objects.requireNonNull(id, "id");
         return store.get(id).map(this::view);
@@ -88,13 +89,18 @@ public final class ArtifactQueryService {
         // The hash comes back beside the canonical form rather than being derivable from it: it is taken
         // over the resource's structure, so a caller holding only these bytes cannot recompute it and
         // must hand this field straight back as a precondition.
-        return new StoredArtifact(
-                resource.id(), resource.kind(), writer.write(resource), CanonicalHash.of(resource));
+        String canonical = resource instanceof SourceResource source
+                ? sourceProjection.canonicalForRead(source) : writer.write(resource);
+        return new StoredArtifact(resource.id(), resource.kind(), canonical, CanonicalHash.of(resource));
     }
 
     private ArtifactListEntry view(StoredArtifactRecord row) {
+        String canonical = row.canonicalForm();
+        if ("source".equals(row.kind()) && canonical != null) {
+            canonical = sourceProjection.canonicalForRead(canonical);
+        }
         return new ArtifactListEntry(
-                row.id(), row.kind(), row.canonicalForm(), row.contentHash(), row.readable());
+                row.id(), row.kind(), canonical, row.contentHash(), row.readable());
     }
 
     private StoredResource typedView(Resource resource) {

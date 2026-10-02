@@ -16,6 +16,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 class MongoStorePortTest {
 
     @Test
+    void pipelineDraftIndexRegistryKeepsThePersistedNames() {
+        assertThat(SystemCollections.PIPELINE_DRAFTS.indexes())
+                .extracting(SystemCollections.IndexSpec::indexName)
+                .containsExactly("pipeline_drafts_revision", "pipeline_drafts_updated_at");
+    }
+
+    @Test
     void bindsEachConcernToItsOwnDistinctNamedStorage() {
         assertThat(List.of(
                 MongoStorePort.ARTIFACTS,
@@ -26,6 +33,7 @@ class MongoStorePortTest {
                 MongoStorePort.PIPELINE_EVENTS,
                 MongoStorePort.PIPELINE_HISTORY_ROLLUPS,
                 MongoStorePort.PIPELINE_LAYOUTS,
+                MongoStorePort.PIPELINE_DRAFTS,
                 MongoStorePort.CONNECTIONS,
                 MongoStorePort.SOURCE_SCHEMAS,
                 MongoStorePort.CONNECTOR_ARTIFACTS,
@@ -37,7 +45,8 @@ class MongoStorePortTest {
                 MongoAuthStores.CLUSTER_IDENTITY))
                 .doesNotHaveDuplicates()
                 .containsExactly("artifacts", "pipeline_state", "pipeline_desired", "pipeline_observation",
-                        "pipeline_observation_chunks", "pipeline_events", "pipeline_history_rollups", "pipeline_layouts",
+                        "pipeline_observation_chunks", "pipeline_events", "pipeline_history_rollups",
+                        "pipeline_layouts", "pipeline_drafts",
                         "connections", "source_schemas", "connector_artifacts", "connector_catalog",
                         "connector_specs", "connection_test_results", "srs_meta", "srs_consumer_offsets",
                         "cluster_identity");

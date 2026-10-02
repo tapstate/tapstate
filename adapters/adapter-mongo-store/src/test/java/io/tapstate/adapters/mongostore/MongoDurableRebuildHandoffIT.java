@@ -29,6 +29,7 @@ import org.testcontainers.utility.DockerImageName;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -153,6 +154,53 @@ class MongoDurableRebuildHandoffIT {
             assertThat(rebound.successor()).isEqualTo(admitted.reservation().successor());
             assertThat(f.state.bindSuccessor(admitted.reservation(), admitted.reservation().successor().scope(),
                     new StopReservation.JobIdentity(CLUSTER, 42, "submit-a"), AT)).isEmpty();
+        }
+    }
+
+    @Test void claimedPhasedAdmissionResetsTheInheritedExecutionContextAtomically() {
+        try (Fixture f = new Fixture(PipelineState.FAILED)) {
+            WorkloadClaim acquired = f.claims.acquire(KEY, new WorkloadOwner("node-a", "boot-a"),
+                    1, Duration.ofMinutes(2)).claim();
+            Set<String> oldMembers = Set.of("node-a", "node-b");
+            WorkloadClaim oldRun = f.claims.advanceExecution(acquired, 1, oldMembers).orElseThrow();
+            WorkloadClaim failed = f.claims.recordExecutionFailure(oldRun, true).orElseThrow();
+            assertThat(failed.failureClaimGeneration()).isEqualTo(oldRun.claimGeneration());
+            assertThat(failed.failureAfterMemberLoss()).isTrue();
+            assertThat(f.claims.release(failed)).isTrue();
+            WorkloadClaim current = f.claims.acquire(KEY, new WorkloadOwner("node-b", "boot-b"),
+                    2, Duration.ofMinutes(2)).claim();
+            assertThat(current.claimGeneration()).isGreaterThan(current.executionClaimGeneration());
+            assertThat(current.executionNodeIds()).isEqualTo(oldMembers);
+            StopReservation pending = f.state.markReplacementPending(f.stop(true,
+                    StopAuthority.claimed(WorkloadClaimFence.from(current))), AT).orElseThrow();
+            Set<String> nextMembers = Set.of("node-b", "node-c");
+
+            SuccessorAdmission admitted = f.state.admitSuccessor(pending, INC, "submit-b", nextMembers, AT).orElseThrow();
+
+            WorkloadClaim advanced = admitted.advancedClaim().orElseThrow();
+            StopReservation slot = admitted.reservation();
+            assertThat(advanced.executionGeneration()).isEqualTo(current.executionGeneration() + 1);
+            assertThat(slot.phase()).isEqualTo(StopReservation.Phase.SUCCESSOR_ADMITTED);
+            assertThat(slot.successor().scope().executionGeneration()).isEqualTo(advanced.executionGeneration());
+            assertThat(slot.successor().scope().pipelineIncarnationId()).isEqualTo(INC);
+            assertThat(slot.successor().submissionBootId()).isEqualTo("submit-b");
+            assertThat(slot.successor().job()).isNull();
+            assertThat(advanced.contextExecutionGeneration()).isEqualTo(slot.successor().scope().executionGeneration());
+            assertThat(advanced.executionClaimGeneration()).isEqualTo(current.claimGeneration());
+            assertThat(advanced.executionNodeIds()).isEqualTo(nextMembers).isNotEqualTo(oldMembers);
+            assertThat(advanced.failureClaimGeneration()).isZero();
+            assertThat(advanced.failureAfterMemberLoss()).isFalse();
+            assertThat(advanced.leaseUntil()).isEqualTo(current.leaseUntil());
+            assertThat(f.claims.read(KEY).orElseThrow().claim()).isEqualTo(advanced);
+            assertThat(f.state.readStopReservation(PIPE)).contains(slot);
+            assertThat(f.state.read(PIPE).orElseThrow().epoch()).isEqualTo(slot.reservedEpoch());
+            assertThat(f.claims.currentGeneration(CLUSTER, PIPE)).hasValue(slot.successor().scope().executionGeneration());
+            assertThat(slot.writerAuthority()).isEqualTo(StopAuthority.claimed(WorkloadClaimFence.from(advanced)));
+            assertThat(slot.source()).isEqualTo(pending.source());
+            assertThat(slot.token()).isEqualTo(pending.token());
+            assertThat(slot.originalDesired()).isEqualTo(pending.originalDesired());
+            assertThat(slot.counterPolicy()).isEqualTo(pending.counterPolicy());
+            assertThat(f.actual()).isEqualTo(PipelineState.STOPPED);
         }
     }
 
@@ -490,10 +538,11 @@ class MongoDurableRebuildHandoffIT {
         final MongoDesiredStore desired = new MongoDesiredStore(database.getCollection("desired"));
         final MongoStateStore state = new MongoStateStore(client, database.getCollection("states"),
                 database.getCollection("desired"), database.getCollection("workload_claims"), database.getCollection("artifacts"));
-        Fixture() {
+        Fixture() { this(PipelineState.PAUSED); }
+        Fixture(PipelineState initialState) {
             database.getCollection("artifacts").insertOne(new Document("_id", PIPE).append("kind", "pipeline")
                     .append("pipelineIncarnationId", INC));
-            state.create(PIPE, StateJson.of(PipelineState.PAUSED), AT);
+            state.create(PIPE, StateJson.of(initialState), AT);
         }
         StopReservation stop(boolean reset) {
             claims.advanceStandalone(CLUSTER, PIPE);

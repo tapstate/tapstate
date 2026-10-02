@@ -97,7 +97,8 @@ class PipelineActuationOwnershipConcurrencyTest {
         }
 
         @Override
-        public Optional<WorkloadClaim> advanceUnderClaim(WorkloadClaim expected, long topologyRevision) {
+        public Optional<WorkloadClaim> advanceExecution(
+                WorkloadClaim expected, long topologyRevision, Set<String> executionNodeIds) {
             if (expected.key().resourceId().equals("orders")) {
                 enteredAdvance.countDown();
                 try {
@@ -109,7 +110,12 @@ class PipelineActuationOwnershipConcurrencyTest {
                     throw new AssertionError(interrupted);
                 }
             }
-            return delegate.advanceUnderClaim(expected, topologyRevision);
+            return delegate.advanceExecution(expected, topologyRevision, executionNodeIds);
+        }
+
+        @Override
+        public Optional<WorkloadClaim> recordExecutionFailure(WorkloadClaim expected, boolean afterMemberLoss) {
+            return delegate.recordExecutionFailure(expected, afterMemberLoss);
         }
 
         @Override

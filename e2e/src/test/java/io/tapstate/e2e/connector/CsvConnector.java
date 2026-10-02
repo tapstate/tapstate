@@ -25,6 +25,7 @@ import io.tapdata.pdk.apis.functions.connection.TableInfo;
 
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -93,6 +94,13 @@ public class CsvConnector implements TapConnector {
     private static final String FAIL_WRITES = "fail_writes";
 
     /**
+     * A test affordance naming a signal directory that holds a target write until {@code release}
+     * appears. The connector creates {@code waiting} after the write has reached it, so an end-to-end
+     * case can put two real sink vertices at different durable positions without guessing from timing.
+     */
+    private static final String HOLD_WRITES = "hold_writes";
+
+    /**
      * A test affordance on the read side, the mirror of {@link #FAIL_WRITES}: when set truthy for one source
      * use, the cdc tail starts and then throws. The connector declares it on its node form and reads it only
      * from the node config, so the published failure case also witnesses that node parameters cross the host
@@ -122,6 +130,20 @@ public class CsvConnector implements TapConnector {
      * read of nothing, and counting polls would make the ledger a measure of how long the case ran.
      */
     private static final String READ_WITNESS = "read_witness";
+    /**
+     * A test affordance naming a directory through which a case holds a schema discovery part way through
+     * reading a resource of this connector's own jar: the discovery reads the resource's first bytes,
+     * creates {@code paused} in the directory, waits for {@code resume} to appear there, then reads the rest
+     * and fails if it cannot.
+     *
+     * <p>It exists because a driver reads its own messages this way, from a static initializer, while its
+     * connector starts; and a pipeline's second source can be starting just as its first closes. Holding the
+     * read open is what puts two connectors on one jar in that state every time, instead of whenever the two
+     * happen to line up.
+     */
+    private static final String PAUSE_RESOURCE_READ = "pause_resource_read";
+    /** How long a held read waits to be told to go on before it gives up. */
+    private static final long PAUSE_LIMIT_MILLIS = 60_000;
 
     /** What this connector says when it is driven without the password its settings declare it needs. */
     private static final String CANNOT_AUTHENTICATE = "password authentication failed: no password was given";
@@ -194,6 +216,9 @@ public class CsvConnector implements TapConnector {
                 .supportTimestampToStreamOffset((context, startTime) -> highWaterMarks(context))
                 .supportWriteRecord((context, events, table, consumer) ->
                         consumer.accept(write(context, events, table)))
+                .supportClearTable((context, event) -> clear(context, event.getTableId()))
+                .supportCountByPartitionFilterFunction((context, table, filter) ->
+                        rows(file(context, table.getId())).size())
                 // The three the read face drives. Registering them is what lets a specification exercise
                 // the browse chain without a real database at the far end; a connector missing any one of
                 // them is refused by name before the read starts.
@@ -258,6 +283,7 @@ public class CsvConnector implements TapConnector {
         if (passwordRequired(context) && !passwordPresent(context)) {
             throw new IllegalArgumentException("this connector requires the 'password' setting");
         }
+        readOwnResourceWhenAsked(context);
         List<TapTable> discovered = new ArrayList<>();
         for (String name : tables.isEmpty() ? tableNames(context) : tables) {
             List<String> header = header(file(context, name));
@@ -337,10 +363,7 @@ public class CsvConnector implements TapConnector {
                     consumer.accept(fresh, null);
                 }
             }
-            try {
-                Thread.sleep(POLL_MILLIS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+            if (!pausedBetweenPolls(POLL_MILLIS)) {
                 break;
             }
         }
@@ -388,6 +411,12 @@ public class CsvConnector implements TapConnector {
 
     // ---- writes ----------------------------------------------------------------------------------
 
+    /** Clears an existing table while retaining its declared columns for the next write. */
+    private static void clear(TapConnectorContext context, String table) {
+        Path file = file(context, table);
+        write(file, header(file), List.of());
+    }
+
     /**
      * Applies a batch to the target file, creating it when this is the first write. Rows are keyed on
      * the target model's primary key when it declares one, and appended when it does not - the product
@@ -396,6 +425,7 @@ public class CsvConnector implements TapConnector {
      */
     private WriteListResult<TapRecordEvent> write(
             TapConnectionContext context, List<TapRecordEvent> events, TapTable target) {
+        awaitWriteRelease(context);
         if (writesRejected(context)) {
             // The product wraps whatever a connector's write throws into a coded write failure, so the type
             // here is immaterial; what matters is that the batch does not complete.
@@ -441,6 +471,28 @@ public class CsvConnector implements TapConnector {
                 .insertedCount(inserted)
                 .modifiedCount(modified)
                 .removedCount(removed);
+    }
+
+    /** Holds this target's write at the connector boundary until the harness releases it. */
+    private static void awaitWriteRelease(TapConnectionContext context) {
+        Object configured = context.getConnectionConfig() == null
+                ? null
+                : context.getConnectionConfig().getObject(HOLD_WRITES);
+        if (configured == null || String.valueOf(configured).isBlank()) {
+            return;
+        }
+        Path signals = Path.of(String.valueOf(configured));
+        try {
+            Files.createDirectories(signals);
+            Files.writeString(signals.resolve("waiting"), "");
+        } catch (IOException failure) {
+            throw new UncheckedIOException("publishing the held-write signal at " + signals, failure);
+        }
+        while (!Files.exists(signals.resolve("release"))) {
+            if (!pausedBetweenPolls(20)) {
+                throw new IllegalStateException("a held target write was interrupted before release");
+            }
+        }
     }
 
     /**
@@ -758,6 +810,56 @@ public class CsvConnector implements TapConnector {
                 ? null
                 : context.getNodeConfig().getObject(FAIL_CDC);
         return flag != null && Boolean.parseBoolean(String.valueOf(flag));
+    }
+
+    /**
+     * Reads this connector's own class file out of its jar, held part way through while the connection
+     * names a {@link #PAUSE_RESOURCE_READ} directory; a connection that names none reads nothing, so every
+     * other specification driving this connector is untouched.
+     */
+    private static void readOwnResourceWhenAsked(TapConnectionContext context) {
+        Object configured = context.getConnectionConfig() == null
+                ? null
+                : context.getConnectionConfig().getObject(PAUSE_RESOURCE_READ);
+        if (configured == null || String.valueOf(configured).isBlank()) {
+            return;
+        }
+        Path signals = Path.of(String.valueOf(configured));
+        String resource = CsvConnector.class.getName().replace('.', '/') + ".class";
+        try (InputStream in = CsvConnector.class.getClassLoader().getResourceAsStream(resource)) {
+            if (in == null) {
+                throw new IllegalStateException("this connector's jar carries no " + resource);
+            }
+            in.readNBytes(64);
+            Files.writeString(signals.resolve("paused"), "");
+            long deadline = System.currentTimeMillis() + PAUSE_LIMIT_MILLIS;
+            while (!Files.exists(signals.resolve("resume"))) {
+                if (System.currentTimeMillis() > deadline) {
+                    throw new IllegalStateException("a held resource read was never told to go on");
+                }
+                if (!pausedBetweenPolls(20)) {
+                    throw new IllegalStateException("a held resource read was interrupted");
+                }
+            }
+            in.readAllBytes();
+        } catch (IOException failure) {
+            throw new UncheckedIOException("reading this connector's own " + resource, failure);
+        }
+    }
+
+    /**
+     * The one pause this connector takes, between two looks at something it is waiting for: the tail's next
+     * look at its files, and a held read's next look for the signal to go on. Answers false when interrupted,
+     * with the interrupt kept for whoever asks next.
+     */
+    private static boolean pausedBetweenPolls(long millis) {
+        try {
+            Thread.sleep(millis);
+            return true;
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
     }
 
     private static boolean passwordRequired(TapConnectionContext context) {

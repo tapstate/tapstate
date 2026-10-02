@@ -35,6 +35,7 @@ import io.tapstate.runtime.engine.SettledPositions;
 import io.tapstate.runtime.engine.join.ImapJoinStores;
 import io.tapstate.runtime.engine.join.JoinBinding;
 import io.tapstate.runtime.engine.join.JoinStores;
+import io.tapstate.runtime.engine.join.ReverseBucket;
 import io.tapstate.runtime.engine.nest.CostGateNestStores;
 import io.tapstate.runtime.engine.nest.NestBinding;
 import io.tapstate.runtime.engine.nest.NestSettings;
@@ -54,6 +55,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -273,8 +275,9 @@ class PipelinePerformanceCostGateTest {
                     // three driver reads (page count, fact, dimension), two nonempty final-projection
                     // reads (fact batch, dimension), and two empty batch requests for the ordered
                     // position-only words. All seven API calls count; the two empty requests incur
-                    // no map IO. Its three writes are dimension, fact and reverse-index operations.
-                    ledger.expect(4, 0, 7, 3, cold.snapshot(), 10);
+                    // no map IO. Its four writes are dimension, fact, reverse-index and the completed
+                    // fact-batch marker, which makes mirrored rows safe to reuse after a failed run.
+                    ledger.expect(4, 0, 7, 4, cold.snapshot(), 10);
                 }
             }
         }
@@ -567,7 +570,17 @@ class PipelinePerformanceCostGateTest {
         @Override public void removeDimensionRow(String source, String key) { ledger.joinWrites++; delegate.removeDimensionRow(source, key); }
         @Override public int indexPageCount(String source, String key) { ledger.joinReads++; return delegate.indexPageCount(source, key); }
         @Override public List<String> indexPage(String source, String key, int page) { ledger.joinReads++; return delegate.indexPage(source, key, page); }
+        @Override public Map<ReverseBucket.At, Set<String>> indexNames(String source,
+                Map<ReverseBucket.At, Set<String>> asked) {
+            ledger.joinReads++; return delegate.indexNames(source, asked);
+        }
         @Override public void indexAdd(String source, String key, String fact) { ledger.joinWrites++; delegate.indexAdd(source, key, fact); }
         @Override public void indexRemove(String source, String key, String fact) { ledger.joinWrites++; delegate.indexRemove(source, key, fact); }
+        @Override public long batchesTakenIn(String writer) {
+            ledger.joinReads++; return delegate.batchesTakenIn(writer);
+        }
+        @Override public void putBatchesTakenIn(String writer, long batch) {
+            ledger.joinWrites++; delegate.putBatchesTakenIn(writer, batch);
+        }
     }
 }

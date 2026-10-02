@@ -92,6 +92,20 @@ class APipelineRecordsItsOwnSrsSwitchTest {
         assertThat(switchOn("p1", "orders_src")).isFalse();
     }
 
+    @Test
+    void typedPreparationMaterializesThePipelineSwitchWithoutWritingTheArtifact() {
+        service.apply("author", List.of(draft(BUFFERED)));
+
+        io.tapstate.core.model.PipelineResource prepared = (io.tapstate.core.model.PipelineResource)
+                service.prepareTyped(new DslParser().parse(pipelineReading("orders_src")));
+
+        assertThat(prepared.sources()).singleElement()
+                .isInstanceOf(io.tapstate.core.model.SourceRef.Spec.class)
+                .extracting(source -> ((io.tapstate.core.model.SourceRef.Spec) source).srs())
+                .isEqualTo(true);
+        assertThat(store.get("p1")).isEmpty();
+    }
+
     // ---- row 2: first apply, the author wrote one -------------------------------------------
 
     @Test

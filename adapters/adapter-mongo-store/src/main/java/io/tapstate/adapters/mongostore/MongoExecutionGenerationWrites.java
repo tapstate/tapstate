@@ -13,6 +13,7 @@ import org.bson.Document;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 
 /** The one generation algorithm, usable alone or in a caller-owned short transaction. */
 final class MongoExecutionGenerationWrites {
@@ -23,9 +24,30 @@ final class MongoExecutionGenerationWrites {
     }
 
     Optional<Document> advanceUnderClaim(ClientSession session, WorkloadClaimFence expected, long topologyRevision) {
+        return advanceUnderClaim(session, expected, topologyRevision, Optional.empty());
+    }
+
+    Optional<Document> advanceUnderClaim(ClientSession session, WorkloadClaimFence expected, long topologyRevision,
+            Set<String> executionNodeIds) {
+        Objects.requireNonNull(executionNodeIds, "executionNodeIds");
+        if (executionNodeIds.isEmpty()) {
+            throw new IllegalArgumentException("a clustered execution needs its factual planned members");
+        }
+        return advanceUnderClaim(session, expected, topologyRevision, Optional.of(Set.copyOf(executionNodeIds)));
+    }
+
+    private Optional<Document> advanceUnderClaim(ClientSession session, WorkloadClaimFence expected, long topologyRevision,
+            Optional<Set<String>> executionNodeIds) {
         Objects.requireNonNull(expected, "expected");
         if (topologyRevision < 0) { throw new IllegalArgumentException("topologyRevision must not be negative"); }
-        Document next = new Document("$set", new Document("executionGeneration", nextExecutionGeneration()));
+        Document generation = nextExecutionGeneration();
+        Document fields = new Document("executionGeneration", generation);
+        executionNodeIds.ifPresent(members -> fields.append("contextExecutionGeneration", generation)
+                .append("executionClaimGeneration", "$claimGeneration")
+                .append("executionNodeIds", members.stream().sorted().toList())
+                .append("failureClaimGeneration", 0L).append("failureAfterMemberLoss", false));
+        // Legacy callers supplied no membership. Retained context then belongs to an older generation.
+        Document next = new Document("$set", fields);
         return Optional.ofNullable(apply(session, liveExpected(expected, topologyRevision), List.of(next), false));
     }
 

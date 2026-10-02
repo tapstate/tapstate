@@ -1,0 +1,22 @@
+{
+  "environment": {
+    "GITHUB_ACTIONS": "true",
+    "GITHUB_EVENT_NAME": "schedule",
+    "GITHUB_REPOSITORY": "tmdbdd/tapstate"
+  },
+  "telemetry_environment": {},
+  "request": {
+    "method": "POST",
+    "url": "https://install.tapstate.dev/e",
+    "payload": {
+      "installation_id": "7f3a1b2c-0000-4444-8888-abcdefabcdef",
+      "version": "0.6.0",
+      "os": "darwin",
+      "arch": "x64",
+      "entrypoint": "cli",
+      "channel": "community",
+      "timestamp": "2026-09-30T00:00:00Z"
+    }
+  },
+  "installation_id_persisted": true
+}

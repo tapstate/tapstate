@@ -59,7 +59,7 @@ class StandaloneExecutionGenerationTest {
         ExecutionFence takeover = successor.beginExecution(PIPELINE).fence();
         assertThat(takeover.claimGeneration()).isEqualTo(2);
         assertThat(takeover.executionGeneration()).isEqualTo(4);
-        assertThat(store.advanceUnderClaim(oldClaim, 7)).isEmpty();
+        assertThat(store.advanceExecution(oldClaim, 7, Set.of("node-a", "node-b"))).isEmpty();
 
         assertThat(store.release(store.read(KEY).orElseThrow().claim())).isTrue();
         ExecutionFence backToStandalone = PipelineActuationOwnership.single(CLUSTER, store)

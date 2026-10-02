@@ -13,6 +13,7 @@ import io.tapstate.adapters.pdk.RegistryConnectorProvisioner;
 import io.tapstate.adapters.pdk.SeedConnectorSweep;
 import io.tapstate.control.core.ApplyService;
 import io.tapstate.control.core.LivePipelines;
+import io.tapstate.control.core.DeploymentProfile;
 import io.tapstate.control.core.AccessTokenService;
 import io.tapstate.control.core.DocumentKeyAdvisories;
 import io.tapstate.control.core.NestSizingAdvisories;
@@ -40,6 +41,8 @@ import io.tapstate.control.core.LoginService;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.PasswordHasher;
 import io.tapstate.control.core.PipelineLifecycleService;
+import io.tapstate.control.core.PipelineDraftService;
+import io.tapstate.control.core.PipelineCatalogService;
 import io.tapstate.control.core.PipelineLayoutService;
 import io.tapstate.control.core.PipelineLogQueryService;
 import io.tapstate.control.core.PipelineChains;
@@ -62,6 +65,7 @@ import io.tapstate.control.core.SourceConnectionResolver;
 import io.tapstate.control.core.SchemaDerivation;
 import io.tapstate.control.core.SourceDraftService;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Value;
 import io.tapstate.control.core.SourceRepresentation;
 import io.tapstate.control.core.SourceSchemaQueryService;
 import io.tapstate.control.core.SessionService;
@@ -321,7 +325,8 @@ class ControlPlaneConfiguration {
     ApplyService applyService(
             ArtifactStore artifactStore, ConnectorCatalogView connectorCatalogView, AuditGate auditGate,
             SchemaStore schemaStore, @Nullable NestSettings nestSettings,
-            SchemaDerivation derivation, LivePipelines livePipelines) {
+            SchemaDerivation derivation, LivePipelines livePipelines,
+            @Value("${tapstate.deployment.profile:on-prem}") String deploymentProfile) {
         // The online apply validates against the live catalog view (the bundled snapshot union the
         // connectors registered so far), so a connector registered at runtime is honoured without a restart.
         // It also reads the schema store, which is what lets it judge a row expression against the columns
@@ -346,7 +351,7 @@ class ControlPlaneConfiguration {
                 PlanAdvisories.all(
                         new NestSizingAdvisories(settings.entriesHeldInMemory()),
                         new DocumentKeyAdvisories()),
-                derivation, livePipelines);
+                derivation, livePipelines, DeploymentProfile.parse(deploymentProfile));
     }
 
     @Bean
@@ -647,6 +652,22 @@ class ControlPlaneConfiguration {
                 : cluster.getId();
         return new CurrentObservationReader(storePort.artifacts(), storePort.workloadClaims(),
                 storePort.observations(), clusterId);
+    }
+
+    @Bean
+    PipelineDraftService pipelineDraftService(
+            StorePort storePort, ArtifactQueryService artifacts, AuditGate auditGate, ApplyService applyService) {
+        return new PipelineDraftService(storePort.drafts(), artifacts, auditGate, applyService);
+    }
+
+    @Bean
+    PipelineCatalogService pipelineCatalogService(
+            ArtifactQueryService artifacts,
+            PipelineDraftService pipelineDrafts,
+            PipelineObservationQueryService observations,
+            StorePort storePort) {
+        return new PipelineCatalogService(
+                artifacts, pipelineDrafts, storePort.desired(), observations);
     }
 
     @Bean

@@ -15,6 +15,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.Set;
 
 /**
  * In-memory {@link WorkloadClaimStore} double holding the durable store's contract, so a test over it
@@ -71,7 +72,12 @@ final class InMemoryWorkloadClaimStore implements WorkloadClaimStore {
         long executionGeneration = current == null
                 ? unclaimedGenerations.getOrDefault(key, 0L) : current.executionGeneration();
         WorkloadClaim acquired = new WorkloadClaim(
-                key, owner, claimGeneration, executionGeneration, topologyRevision, now.plus(ttl));
+                key, owner, claimGeneration, executionGeneration, topologyRevision, now.plus(ttl),
+                current == null ? 0 : current.contextExecutionGeneration(),
+                current == null ? 0 : current.executionClaimGeneration(),
+                current == null ? Set.of() : current.executionNodeIds(),
+                current == null ? 0 : current.failureClaimGeneration(),
+                current != null && current.failureAfterMemberLoss());
         claims.put(key, acquired);
         unclaimedGenerations.remove(key);
         return WorkloadClaimAttempt.acquired(acquired);
@@ -85,7 +91,9 @@ final class InMemoryWorkloadClaimStore implements WorkloadClaimStore {
         }
         return Optional.of(store(new WorkloadClaim(
                 current.key(), current.owner(), current.claimGeneration(), current.executionGeneration(),
-                current.topologyRevision(), now.plus(ttl))));
+                current.topologyRevision(), now.plus(ttl), current.contextExecutionGeneration(),
+                current.executionClaimGeneration(),
+                current.executionNodeIds(), current.failureClaimGeneration(), current.failureAfterMemberLoss())));
     }
 
     @Override
@@ -96,19 +104,41 @@ final class InMemoryWorkloadClaimStore implements WorkloadClaimStore {
         }
         store(new WorkloadClaim(
                 current.key(), current.owner(), current.claimGeneration(), current.executionGeneration(),
-                current.topologyRevision(), now));
+                current.topologyRevision(), now, current.contextExecutionGeneration(),
+                current.executionClaimGeneration(),
+                current.executionNodeIds(), current.failureClaimGeneration(), current.failureAfterMemberLoss()));
         return true;
     }
 
     @Override
-    public synchronized Optional<WorkloadClaim> advanceUnderClaim(WorkloadClaim expected, long topologyRevision) {
+    public synchronized Optional<WorkloadClaim> advanceExecution(
+            WorkloadClaim expected, long topologyRevision, Set<String> executionNodeIds) {
         WorkloadClaim current = live(expected, topologyRevision);
         if (current == null) {
             return Optional.empty();
         }
         return Optional.of(store(new WorkloadClaim(
                 current.key(), current.owner(), current.claimGeneration(), current.executionGeneration() + 1,
-                current.topologyRevision(), current.leaseUntil())));
+                current.topologyRevision(), current.leaseUntil(), current.executionGeneration() + 1,
+                current.claimGeneration(),
+                executionNodeIds, 0, false)));
+    }
+
+    @Override
+    public synchronized Optional<WorkloadClaim> recordExecutionFailure(
+            WorkloadClaim expected, boolean afterMemberLoss) {
+        WorkloadClaim current = live(expected, expected.topologyRevision());
+        if (current == null || current.contextExecutionGeneration() != current.executionGeneration()) {
+            return Optional.empty();
+        }
+        if (current.failureClaimGeneration() != 0) {
+            return Optional.of(current);
+        }
+        return Optional.of(store(new WorkloadClaim(
+                current.key(), current.owner(), current.claimGeneration(), current.executionGeneration(),
+                current.topologyRevision(), current.leaseUntil(), current.contextExecutionGeneration(),
+                current.executionClaimGeneration(),
+                current.executionNodeIds(), current.claimGeneration(), afterMemberLoss)));
     }
 
     @Override

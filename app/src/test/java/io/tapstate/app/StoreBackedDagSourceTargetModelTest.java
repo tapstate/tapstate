@@ -142,7 +142,43 @@ class StoreBackedDagSourceTargetModelTest {
             String output = computed ? "amount" : "total";
             TargetField field = bound.getFirst().fields().stream().filter(f -> f.name().equals(output)).findFirst().orElseThrow();
             assertThat(field.numericType()).isEqualTo(computed ? null : number);
+            assertThat(field.type()).isNull();
         }
+    }
+
+    @Test
+    void aScriptThatWidensADecimalCannotPublishTheSourcesDeclaredRange() {
+        String script = "function process(r, ctx) { r.after.amount = 100000000.00; return r; }";
+        var sourceValue = new java.math.BigDecimal("1.00");
+        var output = io.tapstate.adapters.transform.StatelessTransforms.js(script)
+                .transform(io.tapstate.core.event.Envelope.insert(1L, "orders",
+                        new LinkedHashMap<>(Map.of("id", 1L, "amount", sourceValue)), null))
+                .getFirst().after().get("amount");
+        assertThat(new java.math.BigDecimal(output.toString()))
+                .isGreaterThan(new java.math.BigDecimal("99999999.99"));
+
+        InMemoryStorePort store = seededPipeline();
+        store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", true)),
+                List.of(Step.inline("scripted", FromClause.list(FromRef.literal("orders_src")),
+                        new TransformBody.Js(script), null)), null,
+                new ServeBlock.Inline(null, FromRef.literal("scripted"),
+                        List.of(new SyncElement("sync_1", "orders_dest", null, null, null)), null, null),
+                null, null));
+        var decimal = new io.tapstate.core.common.NumericType(null, true, null, null,
+                new java.math.BigDecimal("-99999999.99"), new java.math.BigDecimal("99999999.99"), 10, 2);
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                new SourceField("id", "INT", io.tapstate.core.common.TapstateType.INT64),
+                new SourceField("amount", "decimal(10,2)", io.tapstate.core.common.TapstateType.DECIMAL,
+                        null, decimal)), List.of("id"), List.of())));
+        List<TargetTable> bound = new ArrayList<>();
+
+        new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+        TargetField amount = bound.getFirst().fields().stream()
+                .filter(field -> field.name().equals("amount")).findFirst().orElseThrow();
+        assertThat(amount.inferredType()).isEqualTo(io.tapstate.core.common.TapstateType.DECIMAL);
+        assertThat(amount.numericType()).isNull();
+        assertThat(amount.type()).isNull();
     }
 
     @Test
@@ -356,6 +392,50 @@ class StoreBackedDagSourceTargetModelTest {
         assertThat(bound).containsExactly(
                 new TargetTable("player_address", List.of(new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))),
                 new TargetTable("ods_orders", List.of(new TargetField("id", "INT", true, io.tapstate.core.common.TapstateType.UNKNOWN)), List.of(new io.tapstate.spi.sink.TargetIndex(List.of("id"), true))));
+    }
+
+    @Test
+    void a_published_wizard_artifact_with_a_qualified_rename_still_binds_its_target_collection() {
+        InMemoryStorePort store = new InMemoryStorePort();
+        store.artifacts().save(new SourceResource("mysql", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("AA_0716")), null, null));
+        store.artifacts().save(new SourceResource("mongo", null, "mongodb", Map.of("uri", "u"),
+                null, null, null, null));
+        store.artifacts().save(new PipelineResource("k2", null, List.of(SourceRef.bare("mysql")), null,
+                null, new ServeBlock.Inline("target", FromRef.literal("mysql.AA_0716"),
+                        List.of(new SyncElement("mongo_k2", "mongo", null,
+                                new RenameSpec(Map.of("mysql.AA_0716", "k2"), null, null, null), null)),
+                        null, null), null, null));
+        store.schemas().save(discovered("mysql", "mysql", new SourceTable("AA_0716",
+                List.of(new SourceField("ID", "INT")), List.of("ID"), List.of())));
+        OpenRingGenerations.forSources(store, "mysql");
+        Map<String, TargetTable> bound = new LinkedHashMap<>();
+
+        new StoreBackedDagSource(store, capturingMapBinder(bound)).dagFor("k2");
+
+        assertThat(bound).containsOnlyKeys("AA_0716");
+        assertThat(bound.get("AA_0716").name()).isEqualTo("k2");
+    }
+
+    @Test
+    void a_legacy_qualified_rename_cannot_choose_between_two_sources_of_the_same_table() {
+        InMemoryStorePort store = new InMemoryStorePort();
+        for (String sourceId : List.of("mysql_a", "mysql_b")) {
+            store.artifacts().save(new SourceResource(sourceId, null, "mysql", Map.of("host", "h"),
+                    SourceMode.CDC, List.of(TableRef.literal("AA_0716")), null, null));
+        }
+        store.artifacts().save(new SourceResource("mongo", null, "mongodb", Map.of("uri", "u"),
+                null, null, null, null));
+        store.artifacts().save(new PipelineResource("ambiguous", null,
+                List.of(SourceRef.bare("mysql_a"), SourceRef.bare("mysql_b")), null, null,
+                new ServeBlock.Inline("target", FromRef.literal("AA_0716"),
+                        List.of(new SyncElement("mongo_k2", "mongo", null,
+                                new RenameSpec(Map.of("mysql_a.AA_0716", "k2"), null, null, null), null)),
+                        null, null), null, null));
+
+        assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("ambiguous"))
+                .isInstanceOf(io.tapstate.core.common.TapstateException.class)
+                .hasMessageContaining("actuation.source-table-ambiguous");
     }
 
     @Test
