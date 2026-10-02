@@ -8,6 +8,7 @@ import io.tapstate.adapters.pdk.ConnectorStateNamespace;
 import io.tapstate.adapters.transform.MapSpec;
 import io.tapstate.adapters.transform.StatelessTransforms;
 import io.tapstate.adapters.transform.UnwindSpec;
+import io.tapstate.control.core.PipelineWriteTargets;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.UnwindWriteKeys;
 import io.tapstate.core.lifecycle.PipelineStateHolding;
@@ -55,6 +56,7 @@ import io.tapstate.spi.store.SourceIndex;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.SrsMeta;
+import io.tapstate.spi.store.StartLoad;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.spi.transform.TransformPort;
 import java.util.ArrayList;
@@ -2430,21 +2432,67 @@ final class StoreBackedDagSource implements DagSource {
                 freshFullLoad);
     }
 
-    /** A CDC-only read and any durable consumer state suppress target preparation. */
+    /**
+     * Whether this start is a new full load, by the same judgement the start verb predicts it with: a
+     * CDC-only read never is, and any durable state this pipeline recorded on a chain it reads makes it a
+     * resume, which suppresses target preparation.
+     */
     private boolean freshFullLoad(PipelineResource pipeline) {
-        if (pipeline.settings() != null
-                && pipeline.settings().readMode() == io.tapstate.core.model.ReadMode.CDC_ONLY) {
-            return false;
+        List<SrsMeta> records = sourceVertices(pipeline).values().stream()
+                .map(vertex -> vertex.resolution().chainId().value())
+                .distinct()
+                .map(chainId -> storePort.meta().read(chainId))
+                .flatMap(Optional::stream)
+                .toList();
+        ReadMode readMode = pipeline.settings() == null ? null : pipeline.settings().readMode();
+        return StartLoad.of(readMode, pipeline.id(), records) == StartLoad.FULL_LOAD;
+    }
+
+    /**
+     * Where each write element of {@code definition} lands: every sync element's tables under the names its
+     * sink binds them by, then the view's collection in the managed store.
+     *
+     * <p>Worked out with the helpers the topology build names its sinks with -- the target models of the
+     * selected tables, the assemblies a nest or a join publishes under its step id, the streams that reach
+     * the serve block and each element's rename rules -- and with none of what that build records along the
+     * way, because the question is asked before a start is accepted and a refused start must leave nothing
+     * behind.
+     *
+     * <p>{@code definition} is the pipeline as stored, not expanded: whether an element is written in the
+     * pipeline itself or comes from a shared definition is part of the answer, and expanding first erases it.
+     */
+    List<PipelineWriteTargets.WriteTarget> writeTargets(PipelineResource definition) {
+        PipelineResource pipeline = PipelineInlining.inline(definition, artifacts());
+        List<PipelineWriteTargets.WriteTarget> written = new ArrayList<>();
+        if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null && !serve.sync().isEmpty()) {
+            Map<String, SourceVertex> vertices = sourceVertices(pipeline);
+            Map<String, String> sourceIdByTable = sourceIdByTable(vertices);
+            Map<String, TargetTable> bySourceTable = targetModelResolver.resolveAll(pipeline);
+            Map<String, TargetTable> targets = new LinkedHashMap<>(bySourceTable);
+            targets.putAll(assembledTargets(
+                    pipeline, bySourceTable, vertices, compiledJoins(pipeline, sourceIdByTable)));
+            Set<String> serveStreams = streamsReaching(pipeline, serve.from(), sourceKeyByTable(vertices),
+                    sourceKeysById(vertices), vertices, stepIds(pipeline));
+            String definedIn = definition.serve() instanceof ServeBlock.Use use ? use.use() : null;
+            for (SyncElement element : serve.sync()) {
+                io.tapstate.core.model.OnFullLoad policy = element.onFullLoad() == null
+                        ? io.tapstate.core.model.OnFullLoad.APPEND : element.onFullLoad();
+                for (TargetTable table : TargetModelResolver.renameAll(
+                        targets, serveStreams, element.rename(), sourceIdByTable).values()) {
+                    written.add(new PipelineWriteTargets.WriteTarget(syncNodeId(element),
+                            PipelineWriteTargets.WriteTarget.Kind.SYNC, element.source(), table.name(),
+                            policy, definedIn));
+                }
+            }
         }
-        return sourceVertices(pipeline).values().stream().noneMatch(vertex ->
-                storePort.meta().read(vertex.resolution().chainId().value())
-                        .map(meta -> meta.consumerOffsets().stream().anyMatch(
-                                consumer -> consumer.pipelineId().equals(pipeline.id())
-                                        && (!consumer.perTableSeq().isEmpty()
-                                                || consumer.sinkAcked() != null
-                                                || !consumer.snapshotCompletedTables().isEmpty()
-                                                || consumer.cdcStartPosition() != null)))
-                        .orElse(false));
+        if (pipeline.view() instanceof ViewBlock.Inline view) {
+            ViewTargetResolver.ViewTarget target = ViewTargetResolver.resolve(view);
+            String definedIn = definition.view() instanceof ViewBlock.Use use ? use.use() : null;
+            written.add(new PipelineWriteTargets.WriteTarget(view.id(),
+                    PipelineWriteTargets.WriteTarget.Kind.VIEW, target.sourceId(), target.collection(),
+                    io.tapstate.core.model.OnFullLoad.APPEND, definedIn));
+        }
+        return List.copyOf(written);
     }
 
     /**

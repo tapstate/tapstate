@@ -28,11 +28,12 @@ public final class PipelineStateInventory {
      * what was dropped. It belongs to the clearing answer alone -- on the other one it would be false --
      * and it is here rather than at a surface because every surface that offers the choice owes it.
      *
-     * <p>It says the position is gone, and stops there. "Reads its whole source again" is the sentence a
-     * reader wants and it is not always true: which tables finished their initial load is recorded on
-     * the chain, not on the pipeline, so a pipeline leaving a chain that others are still reading has
-     * lost its position without that record going anywhere. Saying the stronger thing would be right for
-     * the ordinary pipeline and wrong for exactly the arrangement shared mining exists to produce.
+     * <p>It says the position is gone, and stops there. The next run does load every table it selects
+     * again: which tables a pipeline finished loading is recorded on that pipeline's own record, which
+     * clearing takes away, on a chain others still read as much as on one it reads alone. What that load
+     * does to the rows already in the target is not this sentence's to say, because it depends on the
+     * target's full-load policy and on what the target holds when the run starts -- which is when the
+     * start itself says it.
      */
     public static final String NEXT_RUN_HAS_NO_POSITION =
             "The run after this one has no position to carry on from.";
@@ -64,12 +65,12 @@ public final class PipelineStateInventory {
             PipelineStateHolding.Scope.PIPELINE);
 
     /**
-     * What the shared mining chain itself accumulated -- how far it had read, the seam its tail resumes
-     * from, the schema it saw, and which tables finished their initial load. It belongs to the chain
-     * rather than to any one pipeline on it, so a stop only takes it when the pipeline stopping was the
-     * last one reading that chain. Its label says so, because a description that promised to clear it
-     * unconditionally would be untrue for every pipeline that shares a chain -- which is the arrangement
-     * shared mining exists to produce.
+     * What the shared mining chain itself accumulated -- how far it had read and the schema it saw. It
+     * belongs to the chain rather than to any one pipeline on it, so a stop only takes it when the
+     * pipeline stopping was the last one reading that chain. Its label says so, because a description
+     * that promised to clear it unconditionally would be untrue for every pipeline that shares a chain --
+     * which is the arrangement shared mining exists to produce. Which tables a pipeline finished loading
+     * and the seam its load began at are that pipeline's own, and go with its resume position.
      */
     public static final PipelineStateHolding CHAIN_RECORD = PipelineStateHolding.named(
             "what the shared mining chain had read, once this is the last pipeline reading it",
