@@ -318,7 +318,7 @@ class MongoLatestObservationProtocolIT {
                         .as("reader holds the old descriptor and its first batch before requesting the final chunk")
                         .isTrue();
                 assertThat(fixture.storage.save(current, newScope)).isTrue();
-                int reclaimLimit = Math.toIntExact(3 * chunkCount);
+                int reclaimLimit = Math.toIntExact(4 * chunkCount);
                 ObservationStore.ReclaimResult retired = fixture.storage.reclaimChunks(reclaimLimit);
                 assertThat(retired.scanned()).isEqualTo(chunkCount);
                 assertThat(retired.deleted()).isZero();
@@ -414,7 +414,10 @@ class MongoLatestObservationProtocolIT {
                 assertThat(find.getDocument("projection").keySet()).containsExactlyInAnyOrder(
                         "_id", "formatVersion", "ownerDigest", "revision", "legacyFallback", "legacyResidue",
                         "current.pipelineIncarnationId", "current.executionGeneration",
-                        "pending.pipelineIncarnationId", "pending.executionGeneration");
+                        "pending.pipelineIncarnationId", "pending.executionGeneration",
+                        "continuation.sourceScope", "continuation.target.scope", "continuation.baselineOrigin.scope",
+                        "continuationPending.sourceScope", "continuationPending.target.scope",
+                        "continuationPending.baselineOrigin.scope");
             }
             assertThat(finds.get(2).getDocument("filter").getDocument("_id").get("$gt").isBinary()).isTrue();
         }
