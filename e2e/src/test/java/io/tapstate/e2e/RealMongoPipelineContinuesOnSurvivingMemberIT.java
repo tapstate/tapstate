@@ -113,8 +113,12 @@ class RealMongoPipelineContinuesOnSurvivingMemberIT {
                 long rowsAtTheKill = mongo.count(target, TABLE);
                 mongo.cdc(source, TABLE, CdcOp.INSERT, 1);
 
-                Await.until("a change made after the kill to reach the target", TAKEOVER,
-                        () -> mongo.count(target, TABLE) > rowsAtTheKill,
+                Await.until("a change made after the kill to reach the target and the replacement to be observed",
+                        TAKEOVER,
+                        () -> mongo.count(target, TABLE) > rowsAtTheKill
+                                && survivor.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent()
+                                && survivor.executionGenerationOf(PIPELINE).filter(g -> g == generationBefore + 1)
+                                        .isPresent(),
                         () -> "rows at target = " + mongo.count(target, TABLE) + ", was " + rowsAtTheKill
                                 + " when the member was killed; " + reading(mongo, target, survivor));
 

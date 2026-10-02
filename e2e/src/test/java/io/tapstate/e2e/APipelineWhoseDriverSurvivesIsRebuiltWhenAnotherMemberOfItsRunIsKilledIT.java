@@ -116,8 +116,11 @@ class APipelineWhoseDriverSurvivesIsRebuiltWhenAnotherMemberOfItsRunIsKilledIT {
                 files.cdc(lane.sourceAddress(), TABLE, CdcOp.INSERT, 1);
 
                 Await.until("a change made after the kill to reach " + lane.pipeline() + "'s target, which "
-                                + "only a replaced run can carry", TAKEOVER,
-                        () -> files.count(lane.targetAddress(), TABLE) > rowsAtTheKill,
+                                + "only a replaced run can carry, and the replacement to be observed", TAKEOVER,
+                        () -> files.count(lane.targetAddress(), TABLE) > rowsAtTheKill
+                                && driver.state(lane.pipeline()).filter(PipelineState.RUNNING::equals).isPresent()
+                                && driver.executionGenerationOf(lane.pipeline())
+                                        .filter(g -> g == generationBefore + 1).isPresent(),
                         () -> "rows at target = " + files.count(lane.targetAddress(), TABLE)
                                 + ", was " + rowsAtTheKill + " when " + chosen.victim() + " was killed; the "
                                 + "pipeline is " + driver.state(lane.pipeline()) + " and is driven by "

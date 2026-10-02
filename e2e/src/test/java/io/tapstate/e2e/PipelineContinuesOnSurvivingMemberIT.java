@@ -124,8 +124,11 @@ class PipelineContinuesOnSurvivingMemberIT {
                 files.cdc(sourceAddress, TABLE, CdcOp.INSERT, 1);
 
                 Await.until("a change made after the kill to reach the target, which no reading of the "
-                                + "job's state can stand in for", TAKEOVER,
-                        () -> files.count(targetAddress, TABLE) > rowsAtTheKill,
+                                + "job's state can stand in for, and the replacement to be observed", TAKEOVER,
+                        () -> files.count(targetAddress, TABLE) > rowsAtTheKill
+                                && survivor.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent()
+                                && survivor.executionGenerationOf(PIPELINE).filter(g -> g == generationBefore + 1)
+                                        .isPresent(),
                         () -> "rows at target = " + files.count(targetAddress, TABLE)
                                 + ", was " + rowsAtTheKill + " when the member was killed; the pipeline is "
                                 + survivor.state(PIPELINE) + " and its captures are owned by "
