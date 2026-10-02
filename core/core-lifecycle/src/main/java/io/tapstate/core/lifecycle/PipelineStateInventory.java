@@ -39,6 +39,19 @@ public final class PipelineStateInventory {
             "The run after this one has no position to carry on from.";
 
     /**
+     * What clearing means for the rows already written, which is the part a person reading a clearing stop
+     * does not think of. The rows in targets and views stay, and the new full load that follows copies only
+     * what the source still holds: a row deleted from the source in the meantime is in neither, and stays in
+     * the target. The clearing answer alone says it -- after a stop that keeps the state the run carries on
+     * and replays those deletes -- and it says the start will ask, which is what makes it a fact to act on
+     * rather than a warning to remember.
+     */
+    public static final String KEPT_ROWS_OUTLIVE_THEIR_SOURCE =
+            "Rows already written to targets and views stay. The next run loads afresh and does not see rows "
+                    + "deleted from the source in the meantime, so starting it checks those targets and asks "
+                    + "first.";
+
+    /**
      * What the pipeline's operators had built up: what a nest assembled, the shape it assembled under
      * and the changes it could not assemble, together with the row images and reverse index a join
      * keeps. One holding rather than one per component, because the label speaks of the operators
@@ -137,6 +150,7 @@ public final class PipelineStateInventory {
         holdings.forEach(holding -> lines.add("  - " + holding.label()));
         if (purgeState) {
             lines.add(NEXT_RUN_HAS_NO_POSITION);
+            lines.add(KEPT_ROWS_OUTLIVE_THEIR_SOURCE);
         }
         lines.add(TARGET_UNTOUCHED);
         return List.copyOf(lines);
