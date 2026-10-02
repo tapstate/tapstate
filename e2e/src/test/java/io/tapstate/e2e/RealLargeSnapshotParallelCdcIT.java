@@ -24,6 +24,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -147,7 +148,7 @@ class RealLargeSnapshotParallelCdcIT {
         var admissions = new ExecutionAdmissionStages(report, directCounts);
         try {
             if (report != null) {
-                report.begin(Map.of("purpose", "REAL_PARTIAL_SNAPSHOT_REBUILD_ADMISSION_COUNTS",
+                report.begin(Map.of("purpose", "REAL_PARTIAL_SNAPSHOT_REBUILD_ADMISSION_AND_PHYSICAL_COUNTS",
                                 "application", PipelineBenchmarkLiveRunIT.artifact(jar), "discoveryMode", "none"),
                         PipelineBenchmarkLiveRunIT.environment(), List.of());
             }
@@ -155,7 +156,7 @@ class RealLargeSnapshotParallelCdcIT {
             if (report != null) {
                 report.completeDiagnostic(Map.of("correctness", "REAL_PARTIAL_SNAPSHOT_REBUILT_ONCE_WITH_CONTINUOUS_TOTALS",
                         "performanceAcceptanceEligible", false,
-                        "unverified", List.of("PHYSICAL_MONGO_COMMAND_COUNTS", "ALL_TELEMETRY_SURFACE_IDENTITIES")));
+                        "unverified", List.of("ALL_TELEMETRY_SURFACE_IDENTITIES")));
             }
         } catch (Exception | Error failure) {
             if (report != null) {
@@ -182,15 +183,19 @@ class RealLargeSnapshotParallelCdcIT {
         Map<String, Object> fastMysql = SharedMySql.settings("snapshot_resume_cdc_source");
         seedBulk(bulkMysql);
         seedFast(fastMysql);
-        String storeUri = SharedMongo.replicaSetUrl("snapshot_resume_store");
+        String storeUri = SharedMongo.replicaSetUrl("snapshot_resume_store_"
+                + UUID.randomUUID().toString().replace("-", ""));
         String targetUri = SharedMongo.replicaSetUrl("snapshot_resume_target");
         EndpointAddress target = EndpointAddress.uri(targetUri);
         String jarSha = PipelineBenchmarkLiveRunIT.sha256(jar);
 
-        try (MongoEndpoints mongo = new MongoEndpoints();
+        try (var coordination = new SnapshotCoordinationProfileStages(report, directCounts, BULK_PIPELINE, FAST_PIPELINE);
+                MongoEndpoints mongo = new MongoEndpoints();
                 MongoClient targetClient = MongoClients.create(targetUri);
                 MongoClient storeClient = MongoClients.create(storeUri);
-                BenchmarkForkEnvironment.OwnedBoot boot = snapshotBoot(storeUri, jar, admissions, directCounts)) {
+                BenchmarkForkEnvironment.OwnedBoot boot = snapshotBoot(coordination.openOwned(storeUri,
+                        snapshotTargetReadiness(targetClient.getDatabase(new ConnectionString(targetUri).getDatabase()),
+                                mongo, target, directCounts)), jar, admissions, directCounts)) {
             MongoDatabase database = storeClient.getDatabase(new ConnectionString(storeUri).getDatabase());
             var latest = new MongoObservationStore(storeClient,
                     database.getCollection(MongoStorePort.PIPELINE_OBSERVATION),
@@ -203,6 +208,10 @@ class RealLargeSnapshotParallelCdcIT {
             control.apply(resources(bulkMysql, fastMysql, targetUri));
             control.discoverSchema("bulk_source", "mysql", bulkMysql);
             control.discoverSchema("fast_source", "mysql", fastMysql);
+            admissions.stage("setup-before-parallel-cdc-start", 0, 0);
+            coordination.stage("setup-before-parallel-cdc-start", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts),
+                    boot.admission());
+            coordination.begin("before-bulk-start", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts));
             control.lifecycle(FAST_PIPELINE, LifecycleVerb.START);
             Await.until("real CDC target baseline", Duration.ofMinutes(2),
                     () -> "before".equals(fastStatus(mongo, target)),
@@ -211,6 +220,8 @@ class RealLargeSnapshotParallelCdcIT {
                     () -> control.recordsOut(FAST_PIPELINE).filter(count -> count > 0));
             Instant fastObservedBefore = control.statusObservedAt(FAST_PIPELINE);
             admissions.stage("before-bulk-start", 0, 0);
+            coordination.stage("before-bulk-start", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts), boot.admission());
+            coordination.begin("partial-snapshot-start", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts));
             control.lifecycle(BULK_PIPELINE, LifecycleVerb.START);
             ObservationStore.Stored before = Await.answered("actual partial snapshot delivery with all counters",
                     Duration.ofMinutes(3), () -> latest.readStored(BULK_PIPELINE).filter(value ->
@@ -221,6 +232,8 @@ class RealLargeSnapshotParallelCdcIT {
             assertThat(claimGeneration(database, BULK_PIPELINE)).isEqualTo(oldScope.executionGeneration());
             Document oldSample = actualHistorySample(database, oldScope);
             admissions.stage("partial-snapshot-start", 1, 1);
+            coordination.stage("partial-snapshot-start", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts), boot.admission());
+            coordination.begin("snapshot-pause", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts));
             control.lifecycle(BULK_PIPELINE, LifecycleVerb.PAUSE);
             Await.until("the unfinished snapshot to be actually paused", Duration.ofMinutes(2),
                     () -> control.state(BULK_PIPELINE).filter(PipelineState.PAUSED::equals).isPresent(),
@@ -233,11 +246,17 @@ class RealLargeSnapshotParallelCdcIT {
             assertThat(paused.scope()).contains(oldScope);
             assertThat(claimGeneration(database, BULK_PIPELINE)).isEqualTo(oldScope.executionGeneration());
             admissions.stage("snapshot-pause", 0, 0);
+            coordination.stage("snapshot-pause", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts), boot.admission());
 
+            coordination.begin("parallel-cdc-while-snapshot-paused", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts));
             updateFast(fastMysql, "while_paused");
             awaitFastTargetAndObservation(control, mongo, target, "while_paused", fastBefore, fastObservedBefore);
             long fastPaused = control.recordsOut(FAST_PIPELINE).orElseThrow();
             Instant fastObservedPaused = control.statusObservedAt(FAST_PIPELINE);
+            admissions.stage("parallel-cdc-while-snapshot-paused", 0, 0);
+            coordination.stage("parallel-cdc-while-snapshot-paused", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts),
+                    boot.admission());
+            coordination.begin("partial-snapshot-rebuild-resume", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts));
             control.lifecycle(BULK_PIPELINE, LifecycleVerb.RESUME);
             ObservationStore.Scope resumedScope = new ObservationStore.Scope(oldScope.pipelineIncarnationId(),
                     oldScope.executionGeneration() + 1);
@@ -254,7 +273,10 @@ class RealLargeSnapshotParallelCdcIT {
             Document resumedSample = actualHistorySample(database, resumedScope);
             assertThat(resumedSample.getDate("countingSince")).isEqualTo(oldSample.getDate("countingSince"));
             admissions.stage("partial-snapshot-rebuild-resume", 1, 1);
+            coordination.stage("partial-snapshot-rebuild-resume", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts),
+                    boot.admission());
 
+            coordination.begin("parallel-cdc-after-snapshot-resume", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts));
             updateFast(fastMysql, "after_resume");
             awaitFastTargetAndObservation(control, mongo, target, "after_resume", fastPaused, fastObservedPaused);
             assertThat(bulkTargetRows(targetDatabase)).as("CDC advanced during the resumed partial load")
@@ -274,7 +296,11 @@ class RealLargeSnapshotParallelCdcIT {
             assertThat(points).as("history contains actual samples on both sides of the rebuild")
                     .isGreaterThanOrEqualTo(2);
             assertThat(segments.stream().map(Map.class::cast).map(segment -> segment.get("startReason")))
-                    .doesNotContain("COUNTER_RESET");
+                    .contains("CONTINUATION").doesNotContain("COUNTER_RESET");
+            admissions.stage("parallel-cdc-after-snapshot-resume", 0, 0);
+            coordination.stage("parallel-cdc-after-snapshot-resume", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts),
+                    boot.admission());
+            coordination.begin("snapshot-completed-with-cdc-ticks", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts));
             Await.until("the resumed snapshot to reach its complete physical target", WAIT,
                     () -> bulkTargetRows(targetDatabase) == BULK_ROWS,
                     () -> "targetRows=" + bulkTargetRows(targetDatabase));
@@ -287,9 +313,20 @@ class RealLargeSnapshotParallelCdcIT {
             assertThat(control.errorCount(BULK_PIPELINE)).contains(0L);
             assertThat(control.errorCount(FAST_PIPELINE)).contains(0L);
             admissions.stage("snapshot-completed-with-cdc-ticks", 0, 0);
+            coordination.stage("snapshot-completed-with-cdc-ticks", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts),
+                    boot.admission());
+            coordination.begin("both-stopped", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts));
             control.stop(BULK_PIPELINE, false);
             control.stop(FAST_PIPELINE, false);
+            if (directCounts) {
+                for (String pipeline : List.of(BULK_PIPELINE, FAST_PIPELINE)) {
+                    Await.answered("the physical stop witness retains the actual final scoped observation for " + pipeline,
+                            () -> latest.readStored(pipeline).filter(value -> value.scope().isPresent()
+                                    && value.observation().state() == PipelineState.STOPPED));
+                }
+            }
             admissions.stage("both-stopped", 0, 0);
+            coordination.stage("both-stopped", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts), boot.admission());
             System.out.printf("snapshot-resume-live jarSha=%s generationFrom=%d generationTo=%d"
                             + " pausedTargetRows=%d recordsBefore=%d recordsAfter=%d targetRows=%d"
                             + " publicHistoryPoints=%d counterStart=%s%n", jarSha,
@@ -307,7 +344,11 @@ class RealLargeSnapshotParallelCdcIT {
                         "counterStart", deliveryPoints(before.observation(), "tapstate.pipeline.records")
                                 .getFirst().startTime().toString()));
             }
+            coordination.begin("snapshot-process-shutdown", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts));
             admissions.shutdown("snapshot-process-shutdown");
+            coordination.stage("snapshot-process-shutdown", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts),
+                    boot.admission());
+            coordination.requireComplete();
         }
         assertThat(PipelineBenchmarkLiveRunIT.sha256(jar)).isEqualTo(jarSha);
     }
@@ -327,6 +368,39 @@ class RealLargeSnapshotParallelCdcIT {
 
     private static long bulkTargetRows(MongoDatabase target) {
         return target.getCollection("bulk_orders").countDocuments();
+    }
+
+    private static Map<String, Object> snapshotTargetReadiness(MongoDatabase targetDatabase,
+            MongoEndpoints mongo, EndpointAddress target, boolean enabled) {
+        if (!enabled) { return Map.of(); }
+        String fast = fastStatus(mongo, target);
+        return Map.of(BULK_PIPELINE, Map.of("targetRows", bulkTargetRows(targetDatabase)),
+                FAST_PIPELINE, Map.of("targetRows", targetDatabase.getCollection("fast_orders").countDocuments(),
+                        "targetStatus", fast == null ? "ABSENT" : fast));
+    }
+
+    private static Map<String, Object> snapshotReadiness(MongoObservationStore latest, MongoDatabase targetDatabase,
+            MongoEndpoints mongo, EndpointAddress target, boolean enabled) {
+        if (!enabled) { return Map.of(); }
+        Map<String, Object> readiness = new LinkedHashMap<>();
+        String fast = fastStatus(mongo, target);
+        for (String pipeline : List.of(BULK_PIPELINE, FAST_PIPELINE)) {
+            Map<String, Object> value = new LinkedHashMap<>(Map.of("targetRows", targetDatabase
+                    .getCollection(pipeline.equals(BULK_PIPELINE) ? "bulk_orders" : "fast_orders").countDocuments()));
+            if (pipeline.equals(FAST_PIPELINE)) { value.put("targetStatus", fast == null ? "ABSENT" : fast); }
+            Optional<ObservationStore.Stored> stored = latest.readStored(pipeline);
+            value.put("storedObservationState", stored.isPresent() ? "PRESENT" : "ABSENT");
+            stored.ifPresent(observation -> {
+                value.put("state", observation.observation().state().name());
+                value.put("observedAt", observation.observation().observedAt().toString());
+                observation.scope().ifPresent(scope -> {
+                    value.put("incarnation", scope.pipelineIncarnationId());
+                    value.put("executionGeneration", scope.executionGeneration());
+                });
+            });
+            readiness.put(pipeline, Map.copyOf(value));
+        }
+        return Map.copyOf(readiness);
     }
 
     private static long claimGeneration(MongoDatabase database, String pipeline) {
