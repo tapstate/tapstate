@@ -205,12 +205,7 @@ public final class Engine {
         if (pinned.isEmpty() || pinned.stream().anyMatch(String::isBlank) || dag.memberSelector() != null) {
             throw new IllegalStateException("a qualified native submission needs one nonempty factual member plan");
         }
-        Set<String> visible = member.getCluster().getMembers().stream()
-                .map(current -> current.getAttribute("tapstate.node-id")).filter(Objects::nonNull).collect(Collectors.toSet());
-        if (!visible.containsAll(pinned)) {
-            throw new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", pipelineId), null);
-        }
-        dag.setMemberSelector(current -> pinned.contains(current.getAttribute("tapstate.node-id")));
+        AdmittedMemberPlanMetaSupplier.install(pipelineId, dag, pinned, member.getCluster().getMembers());
         submit(pipelineId, dag, stateDatabases, settings, clusterId, scope);
     }
 

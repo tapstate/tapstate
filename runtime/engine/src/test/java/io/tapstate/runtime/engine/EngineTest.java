@@ -56,6 +56,7 @@ class EngineTest {
     @BeforeEach
     void startMember() {
         Config config = new Config();
+        config.getMemberAttributeConfig().setAttribute("tapstate.node-id", "node-a");
         config.getJetConfig().setEnabled(true).setCooperativeThreadCount(2);
         config.setProperty("hazelcast.phone.home.enabled", "false");
         config.setProperty("hazelcast.shutdownhook.enabled", "false");
@@ -86,6 +87,22 @@ class EngineTest {
         Job job = member.getJet().getJob("orders-pipe");
         assertThat(job).isNotNull();
         awaitStatus(job, JobStatus.RUNNING);
+    }
+
+    @Test
+    void theQualifiedFullMemberPlanRunsOnTheOssEngineWithoutAnIsolatedJobSelector() {
+        Engine engine = new Engine(member);
+        DAG dag = foreverDag();
+        ObservationStore.Scope admitted = new ObservationStore.Scope("inc-orders", 41);
+
+        assertThatCode(() -> engine.submit("orders-pipe", dag, Map.of(), NestSettings.defaults(),
+                "cluster-a", admitted, Set.of("node-a"))).doesNotThrowAnyException();
+
+        Job job = member.getJet().getJob("orders-pipe");
+        awaitStatus(job, JobStatus.RUNNING);
+        assertThat(dag.memberSelector()).isNull();
+        assertThat(job.getConfig().isAutoScaling()).isFalse();
+        assertThat(engine.executionJob("orders-pipe").orElseThrow().scope()).isEqualTo(admitted);
     }
 
     @Test
