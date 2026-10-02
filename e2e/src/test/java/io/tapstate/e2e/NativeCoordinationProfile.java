@@ -35,8 +35,10 @@ import java.util.UUID;
 final class NativeCoordinationProfile implements AutoCloseable {
     enum Family {
         READ, CONTROL, SCHEMA_WRITE, ADVANCE_STANDALONE, ADVANCE_UNDER_CLAIM,
-        ACQUIRE, RENEW, RELEASE, RECORD_EXECUTION_FAILURE
+        ACQUIRE, RENEW, RELEASE, RECORD_EXECUTION_FAILURE, CLAIM_WRITE_GUARD
     }
+
+    enum TransactionScope { UNKNOWN, EXPLICIT_TRANSACTION }
 
     record Limits(long cappedBytes, int maxRecords) {
         static final Limits DEFAULT = new Limits(4L * 1024 * 1024, 2048);
@@ -52,7 +54,8 @@ final class NativeCoordinationProfile implements AutoCloseable {
     record Key(String clusterId, String resourceType, String resourceId) { }
 
     record Operation(Family family, String command, Key key, boolean upsert,
-                     boolean inTransaction, Map<String, Long> serverCounts, Long errorCode) {
+                     TransactionScope transactionScope, Long guardedExecutionGeneration,
+                     Map<String, Long> serverCounts, Long errorCode) {
         Operation { serverCounts = Map.copyOf(serverCounts); }
     }
 
@@ -91,7 +94,11 @@ final class NativeCoordinationProfile implements AutoCloseable {
                             "resourceId", operation.key().resourceId()));
                 }
                 row.put("upsert", operation.upsert());
-                row.put("inTransaction", operation.inTransaction());
+                row.put("transactionScope", operation.transactionScope().name());
+                if (operation.guardedExecutionGeneration() != null) {
+                    row.put("guardedExecutionGeneration", operation.guardedExecutionGeneration());
+                    row.put("guardShape", "STANDALONE_CURRENT_AUTHORITY");
+                }
                 row.put("serverCounts", operation.serverCounts());
                 if (operation.errorCode() != null) { row.put("errorCode", operation.errorCode()); }
                 return row;
@@ -257,13 +264,17 @@ final class NativeCoordinationProfile implements AutoCloseable {
 
     private static Operation classify(Document row, Document command) {
         require(!command.isEmpty(), "required profiled command was empty");
+        if ("update".equals(row.get("op")) && (command.containsKey("q") || command.containsKey("u"))) {
+            return standaloneClaimWriteGuard(row, command);
+        }
         // The first field names the operation; findAndModify also has an update parameter.
         String name = command.keySet().iterator().next();
         if (!(READS.contains(name) || SCHEMA.contains(name) || MUTATIONS.contains(name) || CONTROL.contains(name))) {
             // Individual bulk writes can be profiled as q/u documents instead of the wire command.
             String operation = row.getString("op");
             if (Set.of("insert", "update", "remove").contains(operation)) {
-                throw new AssertionError("unsupported workload mutation command: " + operation);
+                throw new AssertionError("unsupported workload mutation command: " + operation
+                        + "; actual profile=" + row.toJson());
             }
             throw new AssertionError("unsupported profiled command");
         }
@@ -305,13 +316,54 @@ final class NativeCoordinationProfile implements AutoCloseable {
             require(!upsert || family == Family.ADVANCE_STANDALONE || family == Family.ACQUIRE,
                     "unexpected upsert on a guarded workload mutation");
         }
+        return operation(row, command, family, name, key, upsert, null);
+    }
+
+    private static Operation standaloneClaimWriteGuard(Document row, Document command) {
+        String rejection = "unsupported workload mutation command: update";
+        require(command.keySet().equals(Set.of("q", "u", "multi", "upsert")), rejection);
+        require(Boolean.FALSE.equals(command.get("multi")) && Boolean.FALSE.equals(command.get("upsert")), rejection);
+        Document update = document(command.get("u"));
+        require(update.keySet().equals(Set.of("$inc")), rejection);
+        Document increment = document(update.get("$inc"));
+        require(increment.keySet().equals(Set.of("fencedAppends")) && number(increment.get("fencedAppends")) == 1,
+                rejection);
+        Document query = document(command.get("q"));
+        require(query.keySet().equals(Set.of("_id", "executionGeneration", "$or")),
+                "unknown standalone claim write guard query");
+        Document id = document(query.get("_id"));
+        Key key = key(id);
+        require(key.resourceType().equals(WorkloadClaimType.PIPELINE_ACTUATION.name()),
+                "standalone claim write guard names another workload type");
+        long generation = number(query.get("executionGeneration"));
+        require(generation > 0, "standalone claim write guard lacks an admitted generation");
+        List<Document> eligible = List.of(new Document("ownerNodeId", new Document("$exists", false)),
+                new Document("$and", List.of(new Document("leaseUntil", new Document("$type", "date")),
+                        new Document("$expr", new Document("$lte", List.of("$leaseUntil", "$$NOW"))))));
+        require(eligible.equals(query.get("$or")), "standalone claim write guard authority predicate changed");
+        return operation(row, command, Family.CLAIM_WRITE_GUARD, "update", key, false, generation);
+    }
+
+    private static Operation operation(Document row, Document command, Family family, String name, Key key,
+            boolean upsert, Long guardedGeneration) {
         Map<String, Long> counts = new LinkedHashMap<>();
-        for (String field : List.of("nMatched", "nModified", "ninserted", "nInserted", "nreturned", "nReturned")) {
+        for (String field : List.of("nMatched", "nModified", "nUpserted", "ninserted", "nInserted", "nreturned", "nReturned")) {
             if (row.containsKey(field)) { counts.put(field, number(row.get(field))); }
         }
         Long error = row.containsKey("errCode") ? number(row.get("errCode")) : null;
-        boolean transaction = Boolean.FALSE.equals(command.get("autocommit"));
-        return new Operation(family, name, key, upsert, transaction, counts, error);
+        return new Operation(family, name, key, upsert, transactionScope(row, command), guardedGeneration, counts, error);
+    }
+
+    private static TransactionScope transactionScope(Document row, Document command) {
+        boolean commandHasScope = command.containsKey("autocommit");
+        boolean rowHasScope = row.containsKey("autocommit");
+        if (!commandHasScope && !rowHasScope) { return TransactionScope.UNKNOWN; }
+        Object scope = commandHasScope ? command.get("autocommit") : row.get("autocommit");
+        if (commandHasScope && rowHasScope) {
+            require(Objects.equals(scope, row.get("autocommit")), "profiled transaction metadata conflicts");
+        }
+        require(Boolean.FALSE.equals(scope), "unsupported explicit profiled transaction metadata");
+        return TransactionScope.EXPLICIT_TRANSACTION;
     }
 
     private static Family mutation(Document query, Document id, Document set) {

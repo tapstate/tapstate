@@ -116,9 +116,23 @@ final class ExecutionCoordinationProfileStages implements AutoCloseable {
         for (var family : NativeCoordinationProfile.Family.values()) {
             if (family == NativeCoordinationProfile.Family.READ || family == NativeCoordinationProfile.Family.CONTROL
                     || family == NativeCoordinationProfile.Family.SCHEMA_WRITE
-                    || family == NativeCoordinationProfile.Family.ADVANCE_STANDALONE) { continue; }
+                    || family == NativeCoordinationProfile.Family.ADVANCE_STANDALONE
+                    || family == NativeCoordinationProfile.Family.CLAIM_WRITE_GUARD) { continue; }
             assertThat(boundary.count(family)).as("%s native namespace %s operations", action, family).isZero();
         }
+        var guards = boundary.operations().stream()
+                .filter(operation -> operation.family() == NativeCoordinationProfile.Family.CLAIM_WRITE_GUARD).toList();
+        List<Long> guardGenerations = new ArrayList<>();
+        if (before != null) { guardGenerations.add(before.generation()); }
+        if (after != null && !guardGenerations.contains(after.generation())) { guardGenerations.add(after.generation()); }
+        assertThat(guards).allSatisfy(operation -> {
+            assertThat(operation.key()).as("%s exact claim write guard belongs to this pipeline", action).isEqualTo(factualKey);
+            assertThat(operation.command()).isEqualTo("update");
+            assertThat(operation.upsert()).isFalse();
+            assertThat(operation.guardedExecutionGeneration()).isNotNull().isPositive();
+            assertThat(operation.guardedExecutionGeneration())
+                    .as("%s claim write guard uses the factual before or after authority", action).isIn(guardGenerations);
+        });
         var advances = boundary.operations().stream()
                 .filter(operation -> operation.family() == NativeCoordinationProfile.Family.ADVANCE_STANDALONE).toList();
         assertThat(advances).allSatisfy(operation -> {
@@ -142,6 +156,10 @@ final class ExecutionCoordinationProfileStages implements AutoCloseable {
         Map<String, Object> evidence = new LinkedHashMap<>(boundary.evidence());
         evidence.put("pipelineId", pipeline);
         evidence.put("expectedPhysicalAdvanceAttempts", attempts);
+        evidence.put("physicalClaimWriteGuardAttempts", guards.size());
+        evidence.put("claimWriteGuardAttemptsProveCommit", false);
+        evidence.put("claimWriteGuardChangesGeneration", false);
+        evidence.put("claimWriteGuardPermittedGenerations", List.copyOf(guardGenerations));
         evidence.put("authorityBefore", before == null ? Map.of("documentState", "ABSENT") : before.evidence());
         evidence.put("authorityAfter", after == null ? Map.of("documentState", "ABSENT") : after.evidence());
         evidence.put("authoritativeCommittedGenerationIncrement", committedIncrement);
