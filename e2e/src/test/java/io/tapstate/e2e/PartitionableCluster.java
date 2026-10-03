@@ -108,27 +108,26 @@ final class PartitionableCluster implements AutoCloseable {
         Map<String, Integer> memberPorts = new LinkedHashMap<>();
         Map<String, int[]> outbound = outboundRanges(nodeIds);
         Map<String, CuttableLink> links = new LinkedHashMap<>();
-        for (String nodeId : nodeIds) {
-            memberPorts.put(nodeId, RealProcessServer.reservePort());
-        }
-        for (String nodeId : nodeIds) {
-            links.put(nodeId, CuttableLink.open(
-                    RealProcessServer.reservePort(), bindAddress, memberPorts.get(nodeId), outbound));
-        }
-        String seeds = String.join(",", links.values().stream().map(CuttableLink::address).toList());
-
         Map<String, RealProcessServer> servers = new LinkedHashMap<>();
         // Kept per member, because what a member is told is fixed on its command line: a member that
         // comes back has to come back as the same member, on the same port, behind the same link.
         Map<String, IntFunction<List<String>>> launchArguments = new LinkedHashMap<>();
-        for (String nodeId : nodeIds) {
-            int memberPort = memberPorts.get(nodeId);
-            String advertised = links.get(nodeId).address();
-            int[] range = outbound.get(nodeId);
-            launchArguments.put(nodeId, httpPort -> arguments(clusterId, nodeId, memberPort, advertised,
-                    seeds, httpPort, bindAddress, nodeIds.size(), range));
-        }
         try {
+            for (String nodeId : nodeIds) {
+                memberPorts.put(nodeId, RealProcessServer.reservePort());
+            }
+            for (String nodeId : nodeIds) {
+                links.put(nodeId, CuttableLink.open(
+                        RealProcessServer.reservePort(), bindAddress, memberPorts.get(nodeId), outbound));
+            }
+            String seeds = String.join(",", links.values().stream().map(CuttableLink::address).toList());
+            for (String nodeId : nodeIds) {
+                int memberPort = memberPorts.get(nodeId);
+                String advertised = links.get(nodeId).address();
+                int[] range = outbound.get(nodeId);
+                launchArguments.put(nodeId, httpPort -> arguments(clusterId, nodeId, memberPort, advertised,
+                        seeds, httpPort, bindAddress, nodeIds.size(), range));
+            }
             for (String nodeId : nodeIds) {
                 servers.put(nodeId,
                         RealProcessServer.start(storeUri, "0.0.0.0", launchArguments.get(nodeId)));
@@ -137,6 +136,8 @@ final class PartitionableCluster implements AutoCloseable {
             servers.values().forEach(RealProcessServer::close);
             links.values().forEach(CuttableLink::close);
             throw failure;
+        } finally {
+            memberPorts.values().forEach(RealProcessServer::releasePort);
         }
         PartitionableCluster cluster = new PartitionableCluster(
                 nodeIds, servers, links, clusterId, storeUri, launchArguments);

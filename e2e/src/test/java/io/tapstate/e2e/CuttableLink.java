@@ -162,6 +162,7 @@ final class CuttableLink implements AutoCloseable {
         try {
             ServerSocket server = new ServerSocket();
             server.setReuseAddress(true);
+            RealProcessServer.releasePort(port);
             server.bind(new InetSocketAddress(InetAddress.getByName(LOOPBACK), port));
             listener = server;
             Thread thread = new Thread(() -> accept(server), "cuttable-link-" + port);
