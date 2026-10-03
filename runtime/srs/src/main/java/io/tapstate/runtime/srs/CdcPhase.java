@@ -130,6 +130,7 @@ public final class CdcPhase {
 
             @Override
             public void close() {
+                prefix.closing();
                 try {
                     stream.close();
                 } finally {

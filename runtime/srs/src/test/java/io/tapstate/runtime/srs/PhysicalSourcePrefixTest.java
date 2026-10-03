@@ -429,6 +429,26 @@ class PhysicalSourcePrefixTest {
         assertThat(meta.releaseWrites - before).as("store writes the one release made").isEqualTo(1);
     }
 
+    /**
+     * A run cut short while the stream behind the account is being closed stops the account and fails nothing,
+     * whatever it was cut short with: the health it reports on may be shared with the stream replacing it, and
+     * a store call abandoned by the close is no failure of that stream.
+     */
+    @Test
+    void aRunCutShortByItsStreamClosingFailsNothing() {
+        select("pipe", "orders");
+        PhysicalSourcePrefix prefix = shared("orders");
+        prefix.start(at("t0"));
+
+        prefix.closing();
+        prefix.abandon(new TapstateException(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE,
+                Map.of("detail", "the call was abandoned"), null));
+
+        assertThat(health.failure()).isEmpty();
+        assertThatThrownBy(() -> prefix.admitted(Map.of(), "h1")).as("and the account records nothing more")
+                .isInstanceOf(TapstateException.class);
+    }
+
     /** A reader whose generation another reader has taken stops with a code, and writes nothing down. */
     @Test
     void aReaderThatLostItsGenerationStopsWithACode() {

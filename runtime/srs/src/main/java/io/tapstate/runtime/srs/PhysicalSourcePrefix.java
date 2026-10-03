@@ -117,6 +117,8 @@ final class PhysicalSourcePrefix implements AutoCloseable {
     private long recheckAtNanos = System.nanoTime();
     private boolean started;
     private boolean closed;
+    /** Set before the stream behind the account is closed, so whatever that close cuts short fails nothing. */
+    private volatile boolean closing;
     private RuntimeException failure;
 
     private PhysicalSourcePrefix(SrsMetaStore meta, String chainId, long epoch, CaptureHealth health,
@@ -302,7 +304,8 @@ final class PhysicalSourcePrefix implements AutoCloseable {
         if (closed || failure != null) {
             return;
         }
-        boolean closing = cause instanceof CancellationException || Thread.currentThread().isInterrupted();
+        boolean closing = this.closing || cause instanceof CancellationException
+                || Thread.currentThread().isInterrupted();
         failure = cause instanceof RuntimeException runtime
                 ? runtime : new IllegalStateException("a run of chain " + chainId + " was not recorded", cause);
         ACTIVE.remove(this);
@@ -531,6 +534,15 @@ final class PhysicalSourcePrefix implements AutoCloseable {
         if (failure != null) {
             throw failure;
         }
+    }
+
+    /**
+     * Says the stream behind this account is about to be closed. Whatever the close cuts short on the thread the
+     * source hands its runs over on -- a wait interrupted, a store call abandoned -- then stops the account
+     * without failing the health it reports on, which a stream replacing this one may share.
+     */
+    void closing() {
+        closing = true;
     }
 
     /** How many recorded runs are waiting on a confirmation; for the cases. */
