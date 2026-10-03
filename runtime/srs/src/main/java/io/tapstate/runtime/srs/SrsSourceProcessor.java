@@ -463,6 +463,30 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         return placement.place(ProcessorSupplier.of(supplier));
     }
 
+    /**
+     * A source for a table its pipeline reads through a direct tail. It drains only this pipeline's member-local
+     * hand-off -- the rows of its load and every change the direct tail forwards, which carry their own orders
+     * -- for as long as the pipeline runs, and stamps the load's bound with {@code epoch}, the generation the
+     * direct tail's stream took for itself. It never opens the shared ring nor publishes a cursor into the
+     * chain: another pipeline may be filling that ring behind the same name, and a change read off it would be
+     * delivered twice and confirmed in a sequence that is not this tail's, while a cursor this source left
+     * would hold the ring's writer back.
+     */
+    public static ProcessorMetaSupplier directMetaSupplier(
+            String pipelineId, String ringName, String src, long epoch, SourceBoundStamp stamp,
+            SourcePlacement placement) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Objects.requireNonNull(ringName, "ringName");
+        Objects.requireNonNull(src, "src");
+        Objects.requireNonNull(placement, "placement");
+        if (epoch < 0) {
+            throw new IllegalArgumentException("a direct tail's generation is never negative, got " + epoch);
+        }
+        SupplierEx<Processor> supplier =
+                () -> new SrsSourceProcessor(pipelineId, ringName, src, epoch, stamp, null);
+        return placement.place(ProcessorSupplier.of(supplier));
+    }
+
     /** Present only on the source shape that follows a shared ring and publishes its read cursor. */
     private record RingTail(StartFrom start, Long resumeAfter, SrsReadCursorPublisherFactory publisherFactory) {
     }

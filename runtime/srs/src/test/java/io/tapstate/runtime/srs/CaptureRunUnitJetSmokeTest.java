@@ -262,6 +262,10 @@ class CaptureRunUnitJetSmokeTest {
         @Override
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
             cdcStarted = true;
+            // Where the stream begins, said first, as a connector's stream says it: the position it resumes
+            // from, or one of its own for any other start.
+            listener.onStart(Optional.of(start instanceof CaptureStart.Resume resume
+                    ? resume.position() : new SourcePosition("start")));
             for (Envelope e : changes) {
                 listener.onBatch(java.util.List.of(e), Optional.of(new SourcePosition("src-" + e.ts())));
             }
@@ -391,10 +395,7 @@ class CaptureRunUnitJetSmokeTest {
             Map<String, Long> perTable = new LinkedHashMap<>(existing == null ? Map.of() : existing.perTableSeq());
             perTable.put(table, lastReadSeq);
             ChainPosition ack = existing == null ? null : existing.sinkAcked();
-            next.add(new ConsumerOffset(
-                    pipelineId,
-                    perTable,
-                    ack,
+            next.add(rebuilt(existing, pipelineId, perTable, ack,
                     existing == null ? List.of() : existing.snapshotCompletedTables(),
                     existing == null ? null : existing.cdcStartPosition(),
                     existing == null ? 0L : existing.snapshotEpoch()));
@@ -416,10 +417,7 @@ class CaptureRunUnitJetSmokeTest {
                 }
             }
             Map<String, Long> perTable = existing == null ? Map.of() : existing.perTableSeq();
-            next.add(new ConsumerOffset(
-                    pipelineId,
-                    perTable,
-                    position,
+            next.add(rebuilt(existing, pipelineId, perTable, position,
                     existing == null ? List.of() : existing.snapshotCompletedTables(),
                     existing == null ? null : existing.cdcStartPosition(),
                     existing == null ? 0L : existing.snapshotEpoch()));
@@ -441,8 +439,7 @@ class CaptureRunUnitJetSmokeTest {
                     next.add(consumer);
                 }
             }
-            next.add(new ConsumerOffset(
-                    pipelineId,
+            next.add(rebuilt(existing, pipelineId,
                     existing == null ? Map.of() : existing.perTableSeq(),
                     existing == null ? null : existing.sinkAcked(),
                     existing == null ? List.of() : existing.snapshotCompletedTables(),
@@ -492,12 +489,179 @@ class CaptureRunUnitJetSmokeTest {
             if (!completed.contains(table)) {
                 completed.add(table);
             }
-            consumers.add(new ConsumerOffset(pipelineId, mine == null ? Map.of() : mine.perTableSeq(),
+            consumers.add(rebuilt(mine, pipelineId, mine == null ? Map.of() : mine.perTableSeq(),
                     mine == null ? null : mine.sinkAcked(), completed,
                     mine == null ? null : mine.cdcStartPosition(),
                     mine == null ? 0L : mine.snapshotEpoch()));
             records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), consumers,
                     m.schemaHistory(), m.retention(), m.epoch()));
+        }
+
+        /** A consumer rebuilt with the facets a mutator names, its selection and table acks carried across. */
+        private static ConsumerOffset rebuilt(ConsumerOffset existing, String pipelineId, Map<String, Long> perTable,
+                ChainPosition ack, List<String> completed, String cdcStart, long snapshotEpoch) {
+            return new ConsumerOffset(pipelineId, perTable, ack, completed, cdcStart, snapshotEpoch,
+                    existing == null ? null : existing.selectedTables(),
+                    existing == null ? null : existing.selectedTablesEpoch(),
+                    existing == null ? Map.of() : existing.sinkAckedByTable());
+        }
+
+        @Override
+        public synchronized void selectConsumerTables(
+                String miningChainId, String pipelineId, List<String> tables, long epoch) {
+            SrsMeta m = require(miningChainId);
+            List<ConsumerOffset> next = new ArrayList<>();
+            ConsumerOffset existing = null;
+            for (ConsumerOffset c : m.consumerOffsets()) {
+                if (c.pipelineId().equals(pipelineId)) {
+                    existing = c;
+                } else {
+                    next.add(c);
+                }
+            }
+            Map<String, ChainPosition> retained = new LinkedHashMap<>();
+            if (existing != null && existing.selectedTablesEpoch() != null
+                    && existing.selectedTablesEpoch() == epoch) {
+                existing.sinkAckedByTable().forEach((table, position) -> {
+                    if (tables.contains(table)) {
+                        retained.put(table, position);
+                    }
+                });
+            }
+            next.add(new ConsumerOffset(pipelineId,
+                    existing == null ? Map.of() : existing.perTableSeq(),
+                    existing == null ? null : existing.sinkAcked(),
+                    existing == null ? List.of() : existing.snapshotCompletedTables(),
+                    existing == null ? null : existing.cdcStartPosition(),
+                    existing == null ? 0L : existing.snapshotEpoch(),
+                    tables.stream().distinct().sorted().toList(), epoch, retained));
+            records.put(miningChainId, new SrsMeta(
+                    m.miningChainId(), m.sourceRead(), next,
+                    m.schemaHistory(), m.retention(), m.epoch()));
+        }
+
+        /** The chains whose source read offset every table they carry can resume from. */
+        private final java.util.Set<String> trusted = new java.util.HashSet<>();
+        /** What each chain's reader subscribed to. */
+        private final Map<String, PhysicalSelection> selections = new LinkedHashMap<>();
+        /** Tables asked for by pipelines arriving on each chain, until a subscription serves them. */
+        private final Map<String, java.util.Set<String>> requests = new LinkedHashMap<>();
+
+        @Override
+        public synchronized boolean replacePhysicalSelection(
+                String miningChainId, PhysicalSelection current, PhysicalSelection wider) {
+            SrsMeta m = require(miningChainId);
+            if (m.epoch() != wider.epoch() || !current.equals(selections.get(miningChainId))
+                    || !wider.tables().containsAll(requests.getOrDefault(miningChainId, java.util.Set.of()))) {
+                return false;
+            }
+            selections.put(miningChainId, wider);
+            return true;
+        }
+
+        @Override
+        public synchronized List<String> requestedPhysicalTables(String miningChainId) {
+            return requests.getOrDefault(miningChainId, java.util.Set.of()).stream().sorted().toList();
+        }
+
+        @Override
+        public synchronized boolean requestPhysicalTables(String miningChainId, long epoch, List<String> tables) {
+            if (require(miningChainId).epoch() != epoch) {
+                return false;
+            }
+            requests.computeIfAbsent(miningChainId, chain -> new java.util.TreeSet<>()).addAll(tables);
+            return true;
+        }
+
+        @Override
+        public synchronized void clearPhysicalRequests(String miningChainId, List<String> tables) {
+            require(miningChainId);
+            java.util.Set<String> asked = requests.get(miningChainId);
+            if (asked != null) {
+                tables.forEach(asked::remove);
+            }
+        }
+
+        @Override
+        public synchronized Optional<PhysicalSelection> physicalSelection(String miningChainId) {
+            return Optional.ofNullable(selections.get(miningChainId));
+        }
+
+        @Override
+        public synchronized boolean publishPhysicalSelection(String miningChainId, PhysicalSelection selection) {
+            SrsMeta m = require(miningChainId);
+            PhysicalSelection current = selections.get(miningChainId);
+            if (!selection.tables().containsAll(requests.getOrDefault(miningChainId, java.util.Set.of()))) {
+                return false;
+            }
+            if (m.epoch() != selection.epoch() || current != null && current.epoch() >= selection.epoch()) {
+                return current != null && current.equals(selection);
+            }
+            selections.put(miningChainId, selection);
+            return true;
+        }
+
+        @Override
+        public synchronized boolean advancePhysicalSourceReadOffset(
+                String miningChainId, long epoch, ChainPosition position) {
+            SrsMeta m = require(miningChainId);
+            if (m.epoch() != epoch) {
+                return false;
+            }
+            if (ranksAfter(position, m.sourceRead())) {
+                advanceSourceReadOffset(miningChainId, position);
+            }
+            return true;
+        }
+
+        @Override
+        public synchronized boolean physicalPrefixTrusted(String miningChainId) {
+            return trusted.contains(miningChainId);
+        }
+
+        @Override
+        public synchronized boolean establishPhysicalAnchor(String miningChainId, ChainPosition position) {
+            SrsMeta m = require(miningChainId);
+            long epoch = position.order().epoch();
+            if (m.epoch() != epoch) {
+                return false;
+            }
+            ChainPosition stored = m.sourceRead();
+            boolean trustedNow = trusted.contains(miningChainId);
+            if (stored == null || stored.token() == null
+                    || trustedNow && (stored.order() == null || stored.order().epoch() < epoch)) {
+                advanceSourceReadOffset(miningChainId, position);
+                trusted.add(miningChainId);
+                return true;
+            }
+            return trustedNow;
+        }
+
+        @Override
+        public synchronized boolean trustSourceReadOffset(String miningChainId, long epoch) {
+            if (require(miningChainId).epoch() != epoch) {
+                return false;
+            }
+            trusted.add(miningChainId);
+            return true;
+        }
+
+        @Override
+        public synchronized boolean advancePhysicalSinkAcked(
+                String miningChainId, String pipelineId, long epoch, ChainPosition position) {
+            SrsMeta m = require(miningChainId);
+            if (m.epoch() != epoch) {
+                return false;
+            }
+            Optional<ConsumerOffset> existing = m.consumerOffset(pipelineId);
+            if (existing.isPresent() && ranksAfter(position, existing.get().sinkAcked())) {
+                advanceSinkAcked(miningChainId, pipelineId, position);
+            }
+            return true;
+        }
+
+        private static boolean ranksAfter(ChainPosition candidate, ChainPosition stored) {
+            return stored == null || stored.order() == null || stored.order().compareTo(candidate.order()) < 0;
         }
 
         private SrsMeta require(String miningChainId) {

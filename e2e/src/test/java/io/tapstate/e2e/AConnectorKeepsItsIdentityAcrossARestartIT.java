@@ -32,7 +32,9 @@ import org.junit.jupiter.params.provider.EnumSource;
  * stream without rereading its table; this one locks the connector-owned identity the resume depends on.
  *
  * <p>Read out of the store rather than off any product surface, and compared byte for byte: what is being
- * asserted is that the second run did not mint, and only the value itself says that.
+ * asserted is that the second run did not mint, and only the value itself says that. The pipeline reads its
+ * source through a shared change stream, whose reader is handed the notes of the chain it reads rather than
+ * of the pipeline that opened it, so that is where the identity is looked for.
  *
  * <pre>
  *   mvn -pl e2e -am verify -Dapi.version=1.44 \
@@ -69,7 +71,6 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
     void theRunThatComesBackIsTheOneThatMintedTheIdentityNotANewOne(Tiers tier) throws Exception {
         String suffix = tier.name().toLowerCase(java.util.Locale.ROOT);
         String pipelineId = PIPELINE_ID + "_" + suffix;
-        String namespace = "pdk.state." + pipelineId + "." + SOURCE_ID;
         Map<String, Object> mysql = SharedMySql.settings(DATABASE + "_" + suffix);
         seedOneRow(mysql);
 
@@ -78,6 +79,7 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
         byte[] minted;
+        String namespace;
         try (MongoEndpoints mongo = new MongoEndpoints()) {
             try (ServerHandle first = tier.launch(storeUri)) {
                 ControlPlane control = new ControlPlane(first.baseUrl());
@@ -99,6 +101,7 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
                 update(mysql, BEFORE_THE_RESTART);
                 awaitCustomer(mongo, target, BEFORE_THE_RESTART, "a change made before the restart");
 
+                namespace = ChainNotes.namespaceOf(storeUri, pipelineId);
                 Await.until("the connector to have filed the identity it minted",
                         () -> note(storeUri, namespace, SERVER_NAME).isPresent(),
                         () -> "nothing under " + namespace);

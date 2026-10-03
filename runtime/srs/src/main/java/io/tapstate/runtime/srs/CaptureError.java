@@ -67,6 +67,33 @@ public enum CaptureError implements TapstateErrorCode {
     EVENT_TABLE_NOT_SELECTED("capture.event-table-not-selected", Set.of("table")),
 
     /**
+     * Another reader opened a newer generation of the chain while this one was still reading it, so this one
+     * stopped rather than write down positions for a chain it no longer reads. {@code chain} is the chain.
+     */
+    CHAIN_TAKEN_OVER("capture.chain-taken-over", Set.of("chain")),
+
+    /**
+     * The change stream of a chain with no recorded position did not say where it began. Until one of its
+     * changes has landed, where it began is the only position it could be resumed from, so a reader without
+     * one refuses rather than claim a resume it could not make. {@code chain} is the chain.
+     */
+    RESUME_ANCHOR_UNAVAILABLE("capture.resume-anchor-unavailable", Set.of("chain")),
+
+    /**
+     * The chain's recorded position was written before acknowledgements were kept per table, while it carried
+     * several tables, so nothing proves that every table's changes before it landed. {@code chain} is the
+     * chain. Resuming from it could skip a change for good; reading the source again, or setting a position
+     * someone has verified, can not.
+     */
+    SHARED_POSITION_UNVERIFIED("capture.shared-position-unverified", Set.of("chain")),
+
+    /**
+     * A pipeline needs a table the chain's running reader is not subscribed to, and the reader could not take
+     * it on. {@code chain} is the chain.
+     */
+    SHARED_SELECTION_RESTART_REQUIRED("capture.shared-selection-restart-required", Set.of("chain")),
+
+    /**
      * The snapshot read reported no position for its change tail to pick up from, so the run stops.
      * {@code chain} is the mining chain being snapshotted. Carrying on would put the tail somewhere the
      * source never was, and every change made while the snapshot ran would be missed silently — which is

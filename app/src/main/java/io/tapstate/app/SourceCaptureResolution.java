@@ -40,6 +40,14 @@ record SourceCaptureResolution(
         return withTables(source, SourceTableSelection.resolve(source, discovered));
     }
 
+    /**
+     * The source with no tables selected: its connector, settings and chain, for work that reaches the source
+     * as a whole rather than any table of it -- letting go of what its connector set up there.
+     */
+    static SourceCaptureResolution unselected(SourceResource source) {
+        return withTables(source, List.of());
+    }
+
     static Optional<SourceCaptureResolution> forPipeline(
             PipelineResource pipeline, SourceResource source, SourceModel discovered) {
         List<String> tables = PipelineTableSelection.resolve(pipeline, source, discovered);

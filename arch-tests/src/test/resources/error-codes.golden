@@ -51,11 +51,15 @@ boot.node-session-renew-interval-invalid
 boot.node-session-ttl-invalid
 boot.workload-claim-renew-interval-invalid
 boot.workload-claim-ttl-invalid
+capture.chain-taken-over
 capture.claim-lost
 capture.cluster-refused-the-read
 capture.cluster-refused-writes
 capture.event-table-not-selected
 capture.no-ring-to-attach
+capture.resume-anchor-unavailable
+capture.shared-position-unverified
+capture.shared-selection-restart-required
 capture.snapshot-reports-no-seam
 capture.start-from-outside-window
 capture.start-from-unparsable
@@ -112,6 +116,7 @@ cli.workspace-has-no-pipeline
 cli.workspace-not-writable
 cli.workspace-unreadable
 cluster.membership-unreadable
+connector.acknowledge-failed
 connector.ambiguous-connector-class
 connector.ambiguous-registration
 connector.api-level-incompatible
@@ -137,6 +142,7 @@ connector.read-abandoned
 connector.read-failed
 connector.read-timeout
 connector.registration-conflict
+connector.release-failed
 connector.spec-invalid
 connector.spec-not-found
 connector.state-unreadable

@@ -6,28 +6,32 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.spi.capture.CaptureConfig;
+import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.CaptureStart;
+import io.tapstate.spi.capture.SharedNotes;
 import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ConsumerOffset;
-import io.tapstate.spi.store.SrsMeta;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
-import java.util.function.LongSupplier;
-import java.util.function.LongConsumer;
 import java.util.function.Supplier;
 
 /**
@@ -41,9 +45,10 @@ import java.util.function.Supplier;
  * same way and streams straight to the one consumer, with no ring. See {@link #start} for the exact ordering.
  *
  * <p><strong>{@code srs.enabled} decides the buffering and nothing else.</strong> Any tail opens the chain
- * and keeps its durable record, so where a tail resumes from does not depend on the flag: a pipeline that
- * turns the buffering off keeps the position it had, and one that turns it back on finds it still there.
- * The alternative is a second account to move a position between, and the move is the step that loses one.
+ * and keeps its durable record, so a pipeline that turns the buffering off keeps the position it had, and
+ * one that turns it back on finds it still there: a direct tail resumes from the chain's position when it
+ * has none of its own yet, and writes the chain's position as it goes while its pipeline is the only one on
+ * the chain. Beside another pipeline its position is its own -- see {@link #tailStart}.
  *
  * <p>What the flag does decide is where a run with nothing recorded begins, because the two paths read
  * {@code start_from} in different coordinates: a direct tail resolves it against the source's own log,
@@ -223,11 +228,18 @@ public final class CaptureRunUnit {
         }
         state.chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
         // Only the member that runs the tail opens a generation; an attachment reads the one that tail
-        // writes under.
-        ProvisionOutcome provisioned = startTail
-                ? coordinator.provisionSource(
-                        spec.sourceId(), state.chainId, spec.config().streams(), spec.retention())
-                : coordinator.joinSource(spec.sourceId(), state.chainId, spec.config().streams());
+        // writes under. A tail reading the source directly takes a generation of its own for each stream and
+        // leaves the chain's to the shared reader, which writes and is fenced under it.
+        ProvisionOutcome provisioned;
+        if (!startTail) {
+            provisioned = coordinator.joinSource(spec.sourceId(), state.chainId, spec.config().streams());
+        } else if (plan.directTail()) {
+            provisioned = coordinator.provisionDirect(
+                    spec.sourceId(), state.chainId, spec.config().streams(), spec.retention());
+        } else {
+            provisioned = coordinator.provisionSource(
+                    spec.sourceId(), state.chainId, spec.config().streams(), spec.retention());
+        }
         state.merged = provisioned.merged();
         state.epoch = provisioned.epoch();
         state.chainCreated = !state.merged;
@@ -256,6 +268,12 @@ public final class CaptureRunUnit {
         if (plan.sharedRing()) {
             coordinator.attachConsumer(state.chainId, spec.pipelineId());
             state.consumerAttached = true;
+            // Asked before the selection is recorded: a pipeline given back here must not be left on the
+            // record as one the reader waits for, reading nothing.
+            if (!startTail) {
+                askTheReaderToServeIt(state.chainId.value(), state.epoch, tables);
+            }
+            selectConsumerTables(spec, state);
             // A selected table protects its ring before arrival is sampled. If a writer gets there first,
             // the later sample moves arrival past what it wrote; once this registration lands, the writer
             // is constrained until that sample and its cursor are published together. Raising the floor
@@ -266,7 +284,67 @@ public final class CaptureRunUnit {
                     Objects.requireNonNull(state.chainId, "a tail resolves its chain before it runs"),
                     spec.pipelineId());
             state.consumerAttached = true;
+            takeWhereTheChainStandsForIt(state.chainId.value(), spec.pipelineId());
+            selectConsumerTables(spec, state);
         }
+    }
+
+    /**
+     * A pipeline that read the chain through its ring until now, and reads it directly from this run on, takes
+     * where the chain stands for it as its own position -- before its selection says it reads directly.
+     *
+     * <p>Until then every run of the chain waited for it, so the chain's resume point is a place it landed
+     * everything before: later than the last change of its own it landed, which on a quiet table may be so far
+     * back that a source keeping its log for a while no longer reaches it. Once its selection says it reads
+     * directly the shared reader stops waiting for it, and moves the resume point past whatever it still owed;
+     * read after that, the chain's point would skip those changes for it for good.
+     */
+    private void takeWhereTheChainStandsForIt(String chainId, String pipelineId) {
+        Optional<ConsumerOffset> own = meta.read(chainId).flatMap(record -> record.consumerOffset(pipelineId));
+        if (own.isEmpty() || own.get().selectedTables() == null || own.get().selectedTables().isEmpty()) {
+            return;
+        }
+        Optional<String> resumeFrom = meta.resumeOffset(chainId);
+        if (resumeFrom.isEmpty()) {
+            return;
+        }
+        // What it landed is let go of, so its tail picks up at the point taken here rather than behind it; the rest
+        // of its record -- its writers' plan among it -- stays as it is.
+        meta.moveConsumerStart(chainId, pipelineId, resumeFrom.get());
+    }
+
+    /**
+     * Records which tables this pipeline reads from the chain, in the generation it attached under, before
+     * anything of this run can be acknowledged. The chain's durable prefix is released per table and per
+     * consumer, so an acknowledgement that arrived before its reader's selection would be judged against the
+     * selection of a reader that is gone.
+     */
+    private void selectConsumerTables(CaptureRunSpec spec, OpenState state) {
+        meta.selectConsumerTables(state.chainId.value(), spec.pipelineId(), spec.chainSelection(), state.epoch);
+    }
+
+    /**
+     * Asks the chain's reader for every table this source reads, and gives the start back while the reader
+     * that is running does not read them yet: the source is not reading those tables at all, so their rings
+     * would stay empty and the pipeline would run healthy over tables that never change -- and a load of them
+     * would miss every change made before the reader took them on.
+     *
+     * <p>The request goes in first. A reader that has not published yet cannot publish without it, so it is
+     * safe to go on; one that has published before it is found not to serve the tables, and takes them on the
+     * next time it looks. A request the chain did not record, because it had moved to another generation, gives
+     * the start back as well: the reader of that generation never heard it.
+     */
+    private void askTheReaderToServeIt(String chainId, long epoch, List<String> tables) {
+        if (!meta.requestPhysicalTables(chainId, epoch, tables)) {
+            // The chain moved to another generation meanwhile and the ask was not recorded: the reader running
+            // now does not know of it, and published without it.
+            throw new ReaderNotServingYet(chainId, tables);
+        }
+        meta.physicalSelection(chainId)
+                .filter(published -> published.epoch() == epoch && !published.tables().containsAll(tables))
+                .ifPresent(published -> {
+                    throw new ReaderNotServingYet(chainId, tables);
+                });
     }
 
     private Optional<StreamSource<SrsItem>> ringSource(
@@ -293,8 +371,11 @@ public final class CaptureRunUnit {
             return null;
         }
         if (chainId != null) {
-            return SnapshotPhase.open(
-                    port, spec.config(), chainId.value(), spec.pipelineId(), tables, epoch, meta);
+            // Over the notes the tail reads through: the seam a load samples is a position on the stream the
+            // tail goes on to read, and sampling one can be what sets that stream up on the source.
+            CaptureConfig config = plan.sharedRing()
+                    ? spec.config().sharing(sharedNotes(spec, chainId.value())) : spec.config();
+            return SnapshotPhase.open(port, config, chainId.value(), spec.pipelineId(), tables, epoch, meta);
         }
         long snapshotEpoch = spec.snapshotEpoch() > 0
                 ? spec.snapshotEpoch()
@@ -383,117 +464,513 @@ public final class CaptureRunUnit {
         if (!startTail) {
             return Optional.empty();
         }
-        List<String> tables = spec.config().streams();
         if (plan.sharedRing()) {
-            String cid = chainId.value();
-            // The cursors alone, not the whole record: this is read on every run of changes, and the
-            // record also carries a schema history that grows per DDL and is never read here.
-            Supplier<Collection<ConsumerOffset>> consumers = () -> meta.consumerOffsets(cid);
-            // What the acked position can be attributed to decides whether this chain's log can be
-            // cut at all. A chain records one acked position for the whole chain, and the sequence in
-            // it came from whichever table's ring held that change -- on a chain of one table there is
-            // only one ring it could be, so the frontier bounds that log exactly; on a chain of several
-            // there is no way to tell which, and cutting the wrong ring deletes changes that still have
-            // to be replayed. So a multi-table chain keeps everything, and will until an acked position
-            // is recorded per table. That is not a smaller version of this cut, it is a different
-            // record, and it belongs with the work that makes a table recoverable on its own.
-            SrsLogStore log = hz.getUserContext().get(SRS_LOG_USER_CONTEXT_KEY) instanceof SrsLogStore
-                    bound ? bound : null;
-            boolean cuttable = log != null && tables.size() == 1;
-            Map<String, CdcPhase.TableRoute> routes = new LinkedHashMap<>();
-            for (String table : tables) {
-                String ringName = SrsRingbuffer.ringName(cid, table);
-                SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer(ringName)));
-                // One generation across the chain's tables: they are rebuilt together, so a sequence of
-                // one ring is comparable with a sequence of another exactly when both were opened by the
-                // same provisioning.
-                CdcChain chain = new CdcChain(gate, meta, cid, epoch, spec.schemaVer(), spec.captureFence());
-                LongConsumer trim = cuttable ? seq -> log.trim(ringName, seq) : seq -> { };
-                routes.put(table, new CdcPhase.TableRoute(chain, consumers, trim));
-            }
-            CaptureStart minerStart = tailStart(meta, cid, spec.pipelineId(), ownSeam, CaptureStart.present());
-            refuseAnInstantThisBufferWillNeverReach(spec.startFrom(), minerStart, spec.retention());
-            return Optional.of(CdcPhase.run(port, spec.config(), minerStart, routes, health));
+            return Optional.of(openSharedTail(spec, chainId.value(), epoch, ownSeam, health));
         }
         if (plan.directTail()) {
-            // srs.enabled:false: the tail streams straight to the consumer with no shared ring. The ring
-            // is the whole of what the flag decides -- the chain is open and its record is kept either
-            // way -- so this tail begins where that record says, exactly as a buffered one does. Taking
-            // the present here instead is a silent loss: the tail comes up healthy and every change
-            // between where it had reached and now is gone.
-            String directChain = chainId.value();
-            Supplier<Collection<ConsumerOffset>> directConsumers = () -> meta.consumerOffsets(directChain);
-            AtomicLong forwarded = new AtomicLong();
-            AtomicReference<ChainPosition> directLastWritten = new AtomicReference<>();
-            return Optional.of(port.cdc(
-                    spec.config(), tailStart(
-                            meta, directChain, spec.pipelineId(), ownSeam, sourceStart(spec.startFrom())),
-                    health.recording((events, position) -> forwardDirect(
-                            events, position, directChain, epoch, forwarded,
-                            directConsumers, directLastWritten, passthrough))));
+            return Optional.of(openDirectTail(spec, chainId.value(), epoch, ownSeam, health, passthrough));
         }
         return Optional.empty();
+    }
+
+    /**
+     * Opens the chain's one reader: a single subscription over every table any pipeline on the chain reads
+     * through its ring, each change routed to its table's ring, and the chain's durable positions moved only
+     * as the account behind it releases runs everyone has landed. See {@link SharedTail}.
+     */
+    private Subscription openSharedTail(
+            CaptureRunSpec spec, String chainId, long epoch, String ownSeam, CaptureHealth health) {
+        SharedTail tail = new SharedTail(spec, chainId, epoch, health);
+        tail.open(ownSeam);
+        return SourceAcknowledgements.follow(meta, chainId, tail, health);
+    }
+
+    /**
+     * Has the chain reader {@code run} carries take on every table pipelines have since asked it for, by
+     * replacing its subscription within the same generation; answers whether it did. A run that is not the
+     * chain's reader, or whose reader has not opened yet, changes nothing: a reader that opens later reads
+     * every request when it does.
+     *
+     * <p>Throws what stopped a widening. One that failed before the running stream was stopped leaves the
+     * reader reading, and fails nothing: a store that could not be read for a moment is a reason to look again
+     * later, not to fail every pipeline reading the capture. One that leaves nothing reading the chain fails
+     * the run first -- every pipeline reading it would otherwise go on healthy over rings nobody writes.
+     */
+    public boolean widen(CaptureRun run) {
+        Objects.requireNonNull(run, "run");
+        Optional<SharedTail> reader = run.cdcSubscription()
+                .map(tail -> tail instanceof SourceAcknowledgements.Followed followed ? followed.tail() : tail)
+                .filter(SharedTail.class::isInstance)
+                .map(SharedTail.class::cast);
+        if (reader.isEmpty()) {
+            return false;
+        }
+        try {
+            return reader.get().widen();
+        } catch (RuntimeException | Error failure) {
+            if (!reader.get().reading()) {
+                run.health().fail(failure);
+            }
+            throw failure;
+        }
+    }
+
+    /**
+     * The chain's one reader, as the subscription the run that opened it holds.
+     *
+     * <p>What it subscribes to is the union of every recorded selection and every request, this pipeline's
+     * included -- not only the tables of the source that happened to start it. The chain is read once for
+     * everyone on it, so a table another pipeline reads and this one does not still has to reach its ring.
+     * The union is published before the stream starts, and a publication that does not include every table
+     * requested by then is refused and taken again, so no pipeline arriving meanwhile is left unserved. A
+     * reader opened again in a generation that already published -- its claim lost and taken back while a
+     * pipeline on this member still held the chain -- takes up what that generation got to.
+     *
+     * <p>A pipeline arriving later with a table the reader does not read asks for it, and the reader takes it
+     * on in the same generation: it publishes the wider union, then stops its stream and starts another over
+     * that union from where the chain had been released to before it published. A pipeline that sees its table
+     * published loads it after that point, so the new stream begins at or before its seam. What the first
+     * stream had read past that point is read again and handed over twice, which idempotent writes absorb;
+     * what it had not is read by the second. Rings are kept, and so is every reader of them. Everything up to
+     * the publication is done with the first stream still running, so a store that fails a widening for a
+     * moment stops nothing; once the publication stands, only a stream over it may read the chain, and a wider
+     * stream that cannot be started after a second try leaves the reader closed. While the publication is under
+     * way the first stream releases nothing, and one the store took without answering is settled by what the
+     * store holds afterwards.
+     *
+     * <p>Each table's durable log is cut as a run is released, through the last sequence the run reached in
+     * that table: everyone who reads that ring has landed everything up to there, and a sequence is only ever
+     * compared with another of the same ring.
+     */
+    private final class SharedTail implements Subscription {
+
+        /** How many times a publication raced by a newer request is taken again before the start gives up. */
+        private static final int PUBLISH_ATTEMPTS = 8;
+
+        /** A wider selection published without an answer, and where the stream over it begins once it stands. */
+        private record Unsettled(SrsMetaStore.PhysicalSelection wider, CaptureStart start) {
+        }
+
+        private final CaptureRunSpec spec;
+        private final String chainId;
+        private final long epoch;
+        private final CaptureHealth health;
+        private final SharedNotes notes;
+        private SrsMetaStore.PhysicalSelection published;
+        /** The stream running now; read without the lock, so an acknowledgement never waits on a widening. */
+        private final AtomicReference<Subscription> stream = new AtomicReference<>();
+        /** The last position the source was told it may release, for a stream that replaces the one told. */
+        private volatile SourcePosition acknowledged;
+        /** The account of the stream running now. */
+        private PhysicalSourcePrefix account;
+        /** A wider selection whose publication the store has not yet said it took, and where its stream begins. */
+        private Unsettled unsettled;
+        private boolean closed;
+
+        SharedTail(CaptureRunSpec spec, String chainId, long epoch, CaptureHealth health) {
+            this.spec = spec;
+            this.chainId = chainId;
+            this.epoch = epoch;
+            this.health = health;
+            this.notes = sharedNotes(spec, chainId);
+        }
+
+        /** Opens the generation's first subscription, beginning where {@code ownSeam} or the record says. */
+        synchronized void open(String ownSeam) {
+            CaptureStart start = tailStart(meta, chainId, spec.pipelineId(), ownSeam, false, CaptureStart.present());
+            refuseAnInstantThisBufferWillNeverReach(spec.startFrom(), start, spec.retention());
+            for (int attempt = 1; ; attempt++) {
+                List<String> tables = physicalSelection(spec, chainId, epoch);
+                PhysicalSourcePrefix prefix = prefixOver(tables);
+                Optional<SrsMetaStore.PhysicalSelection> before =
+                        meta.physicalSelection(chainId).filter(selection -> selection.epoch() == epoch);
+                SrsMetaStore.PhysicalSelection selection;
+                boolean held;
+                if (before.isEmpty()) {
+                    selection = new SrsMetaStore.PhysicalSelection(epoch, tables);
+                    held = meta.publishPhysicalSelection(chainId, selection);
+                } else if (before.get().tables().containsAll(tables)) {
+                    // What this generation published already serves every table read and asked for.
+                    selection = before.get();
+                    held = true;
+                } else {
+                    selection = new SrsMetaStore.PhysicalSelection(epoch, before.get().revision() + 1, tables);
+                    held = meta.replacePhysicalSelection(chainId, before.get(), selection);
+                }
+                if (held) {
+                    begin(selection, prefix, start);
+                    return;
+                }
+                prefix.close();
+                if (attempt == PUBLISH_ATTEMPTS) {
+                    throw new TapstateException(
+                            CaptureError.SHARED_SELECTION_RESTART_REQUIRED, Map.of("chain", chainId), null);
+                }
+            }
+        }
+
+        /** Replaces the running subscription with one over every table asked for since; see the class. */
+        synchronized boolean widen() {
+            if (closed || stream.get() == null) {
+                return false;
+            }
+            if (unsettled != null) {
+                return settle();
+            }
+            // Every table a pipeline reads through the ring is asked for before its selection is recorded, so a
+            // look that finds nothing asked has nothing to take on -- and nothing to write.
+            if (meta.requestedPhysicalTables(chainId).isEmpty()) {
+                return false;
+            }
+            for (int attempt = 1; ; attempt++) {
+                List<String> tables = physicalSelection(spec, chainId, epoch);
+                if (published.tables().containsAll(tables)) {
+                    meta.clearPhysicalRequests(chainId, tables);
+                    return false;
+                }
+                // Read before the wider selection is published: whatever the running stream releases after this,
+                // the wider one begins at or before the seam of any pipeline that sees its table published.
+                CaptureStart start = tailStart(meta, chainId, spec.pipelineId(), null, false, CaptureStart.present());
+                SrsMetaStore.PhysicalSelection wider =
+                        new SrsMetaStore.PhysicalSelection(epoch, published.revision() + 1, tables);
+                // Nothing is released while the publication is under way: from the moment the store may take it,
+                // a pipeline may find its table published and begin its load past where the running stream, which
+                // does not read that table, would release.
+                account.hold();
+                boolean replaced;
+                try {
+                    replaced = meta.replacePhysicalSelection(chainId, published, wider);
+                } catch (TapstateException unanswered) {
+                    if (unanswered.code() != IoError.STORE_UNAVAILABLE) {
+                        account.unhold();
+                        throw unanswered;
+                    }
+                    // The write may have landed and only its answer been lost: what the store holds says which.
+                    unsettled = new Unsettled(wider, start);
+                    return settle();
+                } catch (RuntimeException | Error failure) {
+                    // Nothing about it is in doubt, and nothing may come back to let the stream go: let it go now.
+                    account.unhold();
+                    throw failure;
+                }
+                if (replaced) {
+                    replaceTheStream(wider, start);
+                    return true;
+                }
+                account.unhold();
+                if (meta.physicalSelection(chainId).filter(published::equals).isEmpty()) {
+                    // Whoever replaced what this reader published owns the chain now.
+                    closed = true;
+                    closeTheStream();
+                    throw new TapstateException(
+                            CaptureError.SHARED_SELECTION_RESTART_REQUIRED, Map.of("chain", chainId), null);
+                }
+                if (attempt == PUBLISH_ATTEMPTS) {
+                    // Raced by a newer request every time: the stream reads on, and a later look tries again.
+                    return false;
+                }
+            }
+        }
+
+        /**
+         * Settles a wider selection whose publication was not answered, by what the store holds now. Holding it,
+         * the store took the publication, and the stream over it starts where it would have. Holding what this
+         * reader published, it did not: the running stream releases again, and a later look widens anew. Holding
+         * anything else, whoever wrote it owns the chain. A store out of reach leaves it to the next look, the
+         * running stream still reading and still releasing nothing -- for as long as the account allows a hold.
+         * A store that answers the read with anything else leaves the outcome unknowable, and the reader closes:
+         * nothing was released since the publication began, so a reader started again begins at or before any
+         * seam a pipeline took after it.
+         */
+        private boolean settle() {
+            Optional<SrsMetaStore.PhysicalSelection> held;
+            try {
+                held = meta.physicalSelection(chainId);
+            } catch (RuntimeException | Error unread) {
+                if (!(unread instanceof TapstateException coded) || coded.code() != IoError.STORE_UNAVAILABLE) {
+                    closed = true;
+                    closeTheStream();
+                }
+                throw unread;
+            }
+            Unsettled pending = unsettled;
+            unsettled = null;
+            if (held.filter(pending.wider()::equals).isPresent()) {
+                replaceTheStream(pending.wider(), pending.start());
+                return true;
+            }
+            account.unhold();
+            if (held.filter(published::equals).isPresent()) {
+                return false;
+            }
+            closed = true;
+            closeTheStream();
+            throw new TapstateException(CaptureError.SHARED_SELECTION_RESTART_REQUIRED, Map.of("chain", chainId), null);
+        }
+
+        /**
+         * Stops the running stream and starts one over {@code wider}, which is published by now: only a stream
+         * over it may read the chain from here, so one that cannot be started is tried once more, and a second
+         * failure leaves the reader closed.
+         */
+        private void replaceTheStream(SrsMetaStore.PhysicalSelection wider, CaptureStart start) {
+            closeTheStream();
+            try {
+                begin(wider, prefixOver(wider.tables()), start);
+            } catch (RuntimeException | Error failure) {
+                if (stream.get() != null) {
+                    // The wider stream runs; what failed came after it had started.
+                    throw failure;
+                }
+                try {
+                    begin(wider, prefixOver(wider.tables()), start);
+                    return;
+                } catch (RuntimeException | Error again) {
+                    failure.addSuppressed(again);
+                }
+                if (stream.get() == null) {
+                    closed = true;
+                }
+                throw failure;
+            }
+        }
+
+        private PhysicalSourcePrefix prefixOver(List<String> tables) {
+            SrsLogStore log = hz.getUserContext().get(SRS_LOG_USER_CONTEXT_KEY) instanceof SrsLogStore
+                    bound ? bound : null;
+            return PhysicalSourcePrefix.shared(meta, chainId, epoch, tables, health, log == null
+                    ? (table, seq) -> { }
+                    : (table, seq) -> log.trim(SrsRingbuffer.ringName(chainId, table), seq));
+        }
+
+        private void begin(SrsMetaStore.PhysicalSelection selection, PhysicalSourcePrefix prefix, CaptureStart start) {
+            published = selection;
+            // The cursors alone, not the whole record: this is read on every run of changes, and the record
+            // also carries a schema history that grows per DDL and is never read here.
+            Supplier<Collection<ConsumerOffset>> consumers = () -> meta.consumerOffsets(chainId);
+            Map<String, CdcPhase.TableRoute> routes = new LinkedHashMap<>();
+            for (String table : selection.tables()) {
+                SrsWriteGate gate = new SrsWriteGate(
+                        new SrsRingbuffer(hz.getRingbuffer(SrsRingbuffer.ringName(chainId, table))));
+                CdcChain chain = new CdcChain(gate, meta, chainId, epoch, spec.schemaVer(), spec.captureFence());
+                routes.put(table, new CdcPhase.TableRoute(chain, consumers));
+            }
+            CaptureConfig physical = spec.config().over(selection.tables()).sharing(notes);
+            Subscription begun = CdcPhase.run(port, physical, start, routes, health, prefix);
+            stream.set(begun);
+            account = prefix;
+            // Told at once where the chain stands, as the stream it replaces was: on a quiet chain that position
+            // may not change again for a long while, and a source never told it keeps its log.
+            SourcePosition told = acknowledged;
+            if (told != null) {
+                begun.acknowledge(told);
+            }
+            try {
+                meta.clearPhysicalRequests(chainId, selection.tables());
+            } catch (TapstateException unwritten) {
+                if (unwritten.code() != IoError.STORE_UNAVAILABLE) {
+                    throw unwritten;
+                }
+                // Left for a later look: a request a published selection already serves holds nobody back.
+            }
+        }
+
+        /** Whether a stream of this reader is running. */
+        synchronized boolean reading() {
+            return !closed && stream.get() != null;
+        }
+
+        private void closeTheStream() {
+            Subscription running = stream.getAndSet(null);
+            if (running != null) {
+                running.close();
+            }
+        }
+
+        /**
+         * Hands {@code durable} to the stream running now. A stream replaced by a wider one is told nothing
+         * more; the one that replaced it is told the last position at once, and the positions from then on,
+         * which only move forward.
+         */
+        @Override
+        public void acknowledge(SourcePosition durable) {
+            acknowledged = durable;
+            Subscription current = stream.get();
+            if (current != null) {
+                current.acknowledge(durable);
+            }
+        }
+
+        @Override
+        public synchronized void close() {
+            closed = true;
+            closeTheStream();
+        }
+    }
+
+    /**
+     * The notes the chain's one change stream keeps, whichever pipeline opens it: the chain's own, carried over
+     * key by key from the notes this pipeline's node kept before there were any, then from every other pipeline
+     * recorded reading the chain through its ring -- under each source of that pipeline that reads the chain, as
+     * the spec names them, and under this pipeline's source id where it names none. Two source resources reached
+     * the same way share a chain, and what one pipeline's reader kept is filed under that pipeline's resource.
+     *
+     * <p>A pipeline recorded reading the chain directly is left out, as is one with nothing recorded yet: a
+     * direct reader's notes are its own, in use, and carrying from them would hand the chain's stream the
+     * replication slot another reader is streaming from.
+     */
+    private SharedNotes sharedNotes(CaptureRunSpec spec, String chainId) {
+        PipelineNode own = spec.config().node();
+        List<PipelineNode> carriedFrom = new ArrayList<>(List.of(own));
+        for (ConsumerOffset consumer : meta.consumerOffsets(chainId)) {
+            if (!consumer.pipelineId().equals(spec.pipelineId())
+                    && consumer.selectedTables() != null && !consumer.selectedTables().isEmpty()) {
+                List<String> sources = spec.chainReaderSources(consumer.pipelineId());
+                if (sources.isEmpty()) {
+                    carriedFrom.add(new PipelineNode(consumer.pipelineId(), own.nodeId()));
+                } else {
+                    sources.forEach(source -> carriedFrom.add(new PipelineNode(consumer.pipelineId(), source)));
+                }
+            }
+        }
+        return new SharedNotes(chainId, carriedFrom);
+    }
+
+    /**
+     * Lets go of what {@code spec}'s source connector set up on the source to read changes, and of the notes
+     * it kept to find that again: the chain's, for a source read through the chain's shared ring, and the
+     * node's own for one read directly. A read with no tail set nothing up. Answers what the source refused
+     * to let go of, for the caller to report.
+     *
+     * <p>For the caller to call when that state is being cleared: a chain's once the last pipeline reading it
+     * clears its own, and a direct reader's whenever its pipeline does. Released while anyone still reads
+     * through them, a stream would go on over a slot that is gone.
+     */
+    public Optional<TapstateException> release(CaptureRunSpec spec) {
+        Objects.requireNonNull(spec, "spec");
+        ConsumptionPlan plan = ConsumptionPlan.of(spec.readMode(), spec.srsEnabled());
+        if (!plan.tail()) {
+            return Optional.empty();
+        }
+        if (!plan.sharedRing()) {
+            return port.release(spec.config());
+        }
+        // Nobody else is on the chain by now, so only this pipeline's own earlier notes can hold what the
+        // chain's notes never took over.
+        String chainId = MiningChainId.resolve(spec.config(), spec.srsKey()).value();
+        return port.release(spec.config().sharing(new SharedNotes(chainId, List.of(spec.config().node()))));
+    }
+
+    /**
+     * The tables the chain's reader subscribes to: this source's own, every table a pipeline on the chain has
+     * recorded selecting through the ring or asked the reader for, and what a reader of this same generation
+     * already published.
+     */
+    private List<String> physicalSelection(CaptureRunSpec spec, String chainId, long epoch) {
+        Set<String> union = new TreeSet<>(spec.config().streams());
+        for (ConsumerOffset consumer : meta.consumerOffsets(chainId)) {
+            if (consumer.selectedTables() != null) {
+                union.addAll(consumer.selectedTables());
+            }
+        }
+        union.addAll(meta.requestedPhysicalTables(chainId));
+        meta.physicalSelection(chainId)
+                .filter(published -> published.epoch() == epoch)
+                .ifPresent(published -> union.addAll(published.tables()));
+        return List.copyOf(union);
+    }
+
+    /**
+     * Opens a direct tail: the source streamed straight to this one pipeline, with no shared ring.
+     *
+     * <p>The ring is the whole of what the flag decides -- the chain is open and its record is kept either
+     * way -- so this tail begins where that record says: its pipeline's own position first, then the chain's.
+     * Taking the present here instead is a silent loss: the tail comes up healthy and every change between
+     * where it had reached and now is gone. Its runs go through an account of their own, owed to this
+     * pipeline alone, so a position is written down only once every change before it landed on every table
+     * the tail reads; and its source is told that pipeline's own position, never one a shared reader moved.
+     */
+    private Subscription openDirectTail(CaptureRunSpec spec, String chainId, long epoch, String ownSeam,
+            CaptureHealth health, Consumer<Envelope> passthrough) {
+        PhysicalSourcePrefix prefix = PhysicalSourcePrefix.direct(meta, chainId, epoch, spec.pipelineId(), health);
+        AtomicLong forwarded = new AtomicLong();
+        Subscription stream;
+        try {
+            stream = port.cdc(spec.config(),
+                    tailStart(meta, chainId, spec.pipelineId(), ownSeam, true, sourceStart(spec.startFrom())),
+                    health.recording(new CaptureListener() {
+                        @Override
+                        public void onStart(Optional<SourcePosition> position) {
+                            prefix.start(position);
+                        }
+
+                        @Override
+                        public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                            forwardDirect(events, position, epoch, forwarded, prefix, passthrough);
+                        }
+                    }));
+        } catch (RuntimeException | Error failure) {
+            prefix.close();
+            throw failure;
+        }
+        return SourceAcknowledgements.followDirect(
+                meta, chainId, spec.pipelineId(), epoch, CdcPhase.closingWith(stream, prefix), health);
     }
 
     /**
      * Forwards one run of changes straight to the consumer and records how far the source has been read.
      *
      * <p>Each change is stamped with its order before it leaves. A direct tail has no ring, and a buffered
-     * change takes its order from the ring's sequence, so the count of changes this run has forwarded
-     * stands in for it: monotonic within the generation the chain opened, and taken afresh whenever a new
-     * one is. Leaving the order off is not the neutral choice it looks like -- every node that ranks
-     * positions drops one carrying none, so an unstamped tail is one nothing downstream can ever confirm,
-     * and an account nothing confirms never moves.
+     * change takes its order from the ring's sequence, so the count of changes this stream has forwarded
+     * stands in for it, under the generation the stream took for itself: no earlier stream numbered under it,
+     * so a confirmation of an earlier one can never stand for a change of this one. Leaving the order off is
+     * not the neutral choice it looks like -- every node that ranks positions drops one carrying none, so an
+     * unstamped tail is one nothing downstream can ever confirm, and an account nothing confirms never moves.
      *
-     * <p><strong>A forwarded count and a ring sequence are not the same quantity.</strong> A chain read
-     * both ways at once therefore has two consumers counting differently, and the only thing ever done
-     * with the two is to take the lower: the chain reads as the slower of them, which re-mines more than
-     * it has to and can never skip. That direction is the one that cannot lose data, which is why the
-     * mismatch is affordable and worth saying out loud.
+     * <p><strong>A forwarded count and a ring sequence are not the same quantity</strong>, and the two are
+     * never ranked against each other: this tail's account answers to its own pipeline's confirmations alone,
+     * and writes the chain's position only while that pipeline is the only one on the chain.
      *
      * <p>The position the source named for the run rides with the change that closes it and no other,
      * exactly as it does through the ring. Carried on the earlier ones it would say of each that the source
      * had already read past the last, and a run interrupted between them would resume past changes never
      * delivered.
      *
-     * <p>The offset then advances, clamped so it never passes what a consumer has durably landed. A direct
+     * <p>The run is then recorded with the tail's account, with the last count it reached in each table, and
+     * the offset moves only once the pipeline's sink has landed everything up to it on every table. A direct
      * tail buffers nothing, so a change it forwarded that no sink wrote is gone with the process; an offset
-     * that had passed it would step over it on the way back, and nothing would ever fetch it again.
+     * that had passed it would step over it on the way back, and nothing would ever fetch it again. A run
+     * carrying no change is recorded when it names a position, for the same reason the shared reader records
+     * one: it may be the only position a quiet source ever names.
      */
-    private void forwardDirect(
+    private static void forwardDirect(
             List<Envelope> events,
             Optional<SourcePosition> position,
-            String miningChainId,
             long epoch,
             AtomicLong forwarded,
-            Supplier<Collection<ConsumerOffset>> consumers,
-            AtomicReference<ChainPosition> lastWritten,
+            PhysicalSourcePrefix prefix,
             Consumer<Envelope> passthrough) {
-        if (events.isEmpty()) {
-            // The source handed over only events carrying no change -- a heartbeat and its like. There is
-            // nothing to forward, and nothing has been read past, so the offset does not move either.
+        String token = position.map(SourcePosition::token).orElse(null);
+        if (events.isEmpty() && token == null) {
             return;
         }
-        int last = events.size() - 1;
-        String token = position.map(SourcePosition::token).orElse(null);
-        long closingSeq = -1;
-        for (int i = 0; i < events.size(); i++) {
-            closingSeq = forwarded.getAndIncrement();
-            passthrough.accept(events.get(i).withPosition(
-                    new ChainPosition(new SourceOrder(epoch, closingSeq), i == last ? token : null)));
-        }
-        ChainPosition read = new ChainPosition(new SourceOrder(epoch, closingSeq), token);
-        SrsDurableFrontier.safeAdvance(read, consumers.get()).ifPresent(safe -> {
-            // Unchanged from the run before means the slowest sink has landed nothing since, so this would
-            // write the record the value it already holds -- a synchronous round trip, on the thread the
-            // source reads on, to say nothing. The pair is compared, not the token alone: a token that
-            // repeats across generations is a different position, and comparing halves would skip it.
-            if (safe.equals(lastWritten.get())) {
-                return;
+        prefix.checkStillRecording();
+        try {
+            int last = events.size() - 1;
+            Map<String, Long> lastSeqByTable = new LinkedHashMap<>();
+            for (int i = 0; i < events.size(); i++) {
+                long seq = forwarded.getAndIncrement();
+                Envelope event = events.get(i);
+                passthrough.accept(event.withPosition(
+                        new ChainPosition(new SourceOrder(epoch, seq), i == last ? token : null)));
+                lastSeqByTable.put(event.src(), seq);
             }
-            meta.advanceSourceReadOffset(miningChainId, safe);
-            lastWritten.set(safe);
-        });
+            prefix.admitted(lastSeqByTable, token);
+        } catch (RuntimeException | Error failure) {
+            // Handed over and not recorded whole: nothing after it may be released past it.
+            prefix.abandon(failure);
+            throw failure;
+        }
     }
 
     private RuntimeException rollbackStartFailure(
@@ -533,10 +1010,19 @@ public final class CaptureRunUnit {
      * <p>Four states, in this order, and the order is the whole of it:
      *
      * <ol>
-     *   <li>a load that just ran here — {@code ownSnapshotSeam} is where it began, and the tail has to
-     *       cover every change since, or a row this load read and the source then changed is left at the
-     *       value the load saw;</li>
-     *   <li>a recorded read offset — the tail ran before and got this far, so it picks up there;</li>
+     *   <li>a recorded resume point — the chain's reader ran before and got this far, so it picks up there.
+     *       That is the last released run that carried a change, or where the stream began: a run carrying no
+     *       change moves how far the source may release, but a source can name it in a form that, resumed
+     *       from, passes over the change that follows. Every change after it is still owed to somebody on
+     *       the chain -- a pipeline stopped with its state kept among them -- so it outranks even a load that
+     *       just ran here: that load's seam was sampled moments ago, and starting there would skip every
+     *       change between where the holder stopped and that seam, for the holder and for good. What this
+     *       run's own load already covered of that stretch is delivered again, which the idempotent sink
+     *       absorbs; a source whose log no longer reaches back that far refuses the start, as it would
+     *       refuse the holder's;</li>
+     *   <li>a load that just ran here, on a chain with nothing recorded — {@code ownSnapshotSeam} is where it
+     *       began, and the tail has to cover every change since, or a row this load read and the source then
+     *       changed is left at the value the load saw;</li>
      *   <li>no read offset but this pipeline's recorded seam — its snapshot ran and the tail has not
      *       advanced past where that snapshot began, so it starts at the seam and the idempotent sink
      *       absorbs the overlap;</li>
@@ -544,12 +1030,19 @@ public final class CaptureRunUnit {
      *       caller resolved for a run that has no position to pick up from.</li>
      * </ol>
      *
-     * <p>This run's own seam outranks the recorded read offset, and the order matters in exactly one
-     * shape: a chain someone else is already mining. That offset moves as they mine, so by the time this
-     * run's load finishes it can name a point later than the seam this load began at — and starting there
-     * skips the changes in between. They are in the shared ring, mined by whoever is already on the
-     * chain, but this run's own reader enters that ring at its own cursor and never looks behind it.
-     * Starting at the earlier of the two only ever costs an overlap the idempotent sink absorbs.
+     * <p>That order is the shared reader's. The resume point cannot have run past this run's own seam while its
+     * load ran: the pipeline is on the chain, with the tables it reads selected and asked of the reader, before
+     * its load samples the seam, so every run handed over after that owes it those tables' changes and is not
+     * released before it lands them, and no direct tail writes its start down as the chain's position.
+     *
+     * <p>A direct tail ({@code seamFirst}) keeps a position of its own, and resumes from it before the chain's:
+     * the seam of a load that just ran here; then the last of its own changes its pipeline landed; then where it
+     * last began, or where a load of it, a write-back, or the chain it read through the ring until it turned to
+     * reading directly last put it; only then the chain's resume point, which a
+     * record written before direct tails kept their own holds; then {@code firstRun}. It serves its own pipeline
+     * alone, and the chain's runs do not wait for that pipeline: a shared reader on the same chain moves the
+     * resume point on its own pipelines' word, past changes this one forwarded and never landed, and beginning
+     * there would skip them for good.
      *
      * <p>Taking the present in any of the first three states is the silent loss this exists to prevent:
      * the tail comes up healthy, and every change between where it had reached and now is simply gone.
@@ -559,21 +1052,34 @@ public final class CaptureRunUnit {
             String miningChainId,
             String pipelineId,
             String ownSnapshotSeam,
+            boolean seamFirst,
             CaptureStart firstRun) {
+        if (seamFirst) {
+            if (ownSnapshotSeam != null) {
+                return CaptureStart.resume(new SourcePosition(ownSnapshotSeam));
+            }
+            Optional<ConsumerOffset> own = meta.read(miningChainId).flatMap(record -> record.consumerOffset(pipelineId));
+            String landed = own.map(ConsumerOffset::sinkAcked).map(ChainPosition::token).orElse(null);
+            if (landed != null) {
+                return CaptureStart.resume(new SourcePosition(landed));
+            }
+            String began = own.map(ConsumerOffset::cdcStartPosition).orElse(null);
+            if (began != null) {
+                return CaptureStart.resume(new SourcePosition(began));
+            }
+        }
+        Optional<String> resumeFrom = meta.resumeOffset(miningChainId);
+        if (resumeFrom.isPresent()) {
+            return CaptureStart.resume(new SourcePosition(resumeFrom.get()));
+        }
         if (ownSnapshotSeam != null) {
             return CaptureStart.resume(new SourcePosition(ownSnapshotSeam));
         }
         return meta.read(miningChainId)
-                .map(record -> {
-                    if (record.sourceReadOffset() != null) {
-                        return CaptureStart.resume(new SourcePosition(record.sourceReadOffset()));
-                    }
-                    return record.consumerOffset(pipelineId)
-                            .map(consumer -> consumer.cdcStartPosition() == null
-                                    ? firstRun
-                                    : CaptureStart.resume(new SourcePosition(consumer.cdcStartPosition())))
-                            .orElse(firstRun);
-                })
+                .flatMap(record -> record.consumerOffset(pipelineId))
+                .map(consumer -> consumer.cdcStartPosition() == null
+                        ? firstRun
+                        : CaptureStart.resume(new SourcePosition(consumer.cdcStartPosition())))
                 .orElse(firstRun);
     }
 

@@ -18,6 +18,7 @@ import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.ServeBlock;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.SyncElement;
@@ -50,6 +51,7 @@ import io.tapstate.spi.sink.TargetField;
 import io.tapstate.spi.sink.TargetIndex;
 import io.tapstate.spi.sink.WriteMode;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceIndex;
 import io.tapstate.spi.store.SourceModel;
@@ -442,8 +444,9 @@ final class StoreBackedDagSource implements DagSource {
         return namespaces;
     }
 
+    /** One selected table of one source; {@code direct} when this pipeline reads that source directly. */
     private record SourceVertex(
-            String pipelineId, String sourceId, String table, SourceCaptureResolution resolution) {
+            String pipelineId, String sourceId, String table, SourceCaptureResolution resolution, boolean direct) {
     }
 
     /**
@@ -569,9 +572,11 @@ final class StoreBackedDagSource implements DagSource {
                 continue;
             }
             SourceCaptureResolution resolution = selected.orElseThrow();
+            boolean direct = pipeline.sources().stream()
+                    .anyMatch(ref -> ref.id().equals(sourceId) && ref instanceof SourceRef.Spec spec && !spec.srs());
             for (String table : resolution.tables()) {
                 String key = resolution.tables().size() == 1 ? sourceId : sourceId + "." + table;
-                vertices.put(key, new SourceVertex(pipeline.id(), sourceId, table, resolution));
+                vertices.put(key, new SourceVertex(pipeline.id(), sourceId, table, resolution, direct));
             }
         }
         return vertices;
@@ -2311,6 +2316,15 @@ final class StoreBackedDagSource implements DagSource {
                     vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.table(), snapshotEpoch,
                     order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement);
         }
+        if (vertex.direct()) {
+            // Read directly, the source reaches this pipeline through its hand-off alone. The shared ring under
+            // the same name is another pipeline's to read, and its generation is not the one the direct tail's
+            // load and changes are ordered in.
+            return SrsSourceProcessor.directMetaSupplier(
+                    vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.table(),
+                    directGeneration(vertex),
+                    order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement);
+        }
         // Where in the ring this run starts. Not the head as such: a ring outlives the runs that read it, so
         // after one run dies the head can sit far below what this pipeline already landed, and starting there
         // hands its target every change the ring still holds again. The record says how far the pipeline is
@@ -2337,6 +2351,18 @@ final class StoreBackedDagSource implements DagSource {
      */
     private long ringGeneration(SourceCaptureResolution resolution) {
         return storePort.meta().read(resolution.chainId().value()).map(SrsMeta::epoch).orElse(0L);
+    }
+
+    /**
+     * The generation the direct tail of {@code vertex}'s source took for its stream, as the pipeline's record on
+     * the chain carries it: the tail selects there, under that generation, before the job is assembled. The
+     * chain's own generation where the record says nothing, as before direct tails took their own.
+     */
+    private long directGeneration(SourceVertex vertex) {
+        return storePort.meta().read(vertex.resolution().chainId().value())
+                .flatMap(record -> record.consumerOffset(vertex.pipelineId()))
+                .map(ConsumerOffset::selectedTablesEpoch)
+                .orElseGet(() -> ringGeneration(vertex.resolution()));
     }
 
     /**

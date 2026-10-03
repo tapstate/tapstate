@@ -44,6 +44,29 @@ class StoreBackedReplayFloorFactoryTest {
         assertThat(floor.of("items")).contains(order(3));
     }
 
+    /**
+     * Two tables of one chain each answer with their own floor. A deletion is weighed by the order it was
+     * read under, a place in its own table's ring; answered with the busier table's floor, a quiet table's
+     * deletion would look safely behind a floor its own ring never reached, and be forgotten while a replay
+     * can still bring back the row it deleted.
+     */
+    @Test
+    void eachTableOfAChainAnswersWithItsOwnFloor() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-shop", null);
+        HazelcastInstance member = memberWith(store);
+        Map<String, String> shop = Map.of("orders", "mc-shop", "customers", "mc-shop");
+
+        SinkAck ack = new StoreBackedSinkAckFactory(shop, "pipe-1").resolve(member);
+        ack.advance("orders", at(7, "w7"));
+        ack.advance("customers", at(2, "w2"));
+
+        ReplayFloor floor = new StoreBackedReplayFloorFactory(shop, "pipe-1").resolve(member);
+
+        assertThat(floor.of("orders")).contains(order(7));
+        assertThat(floor.of("customers")).contains(order(2));
+    }
+
     @Test
     void doesNotTakeAnotherPipelinesConfirmedWritesForItsOwn() {
         InMemorySrsMetaStore store = new InMemorySrsMetaStore();

@@ -23,26 +23,39 @@ class CaptureIdTest {
         assertThat(first).isEqualTo(second);
     }
 
+    /**
+     * Two pipelines reading different tables of one database through the shared ring hold one capture: the
+     * chain is read once, over the union of what they select. Two captures would be two readers moving one
+     * recorded position, each blind to the tables the other has not landed.
+     */
     @Test
-    void streamOrderIsNormalizedButADifferentReadSetIsADifferentCapture() {
-        CaptureConfig one = new CaptureConfig("mysql", Map.of("host", "db.internal"),
+    void aTailThroughTheRingIsOneCaptureWhateverTablesAPipelineSelects() {
+        CaptureConfig both = new CaptureConfig("mysql", Map.of("host", "db.internal"),
                 List.of("orders", "customers"));
-        CaptureConfig reordered = new CaptureConfig("mysql", Map.of("host", "db.internal"),
-                List.of("customers", "orders"));
-        CaptureConfig narrower = new CaptureConfig("mysql", Map.of("host", "db.internal"),
-                List.of("orders"));
-
-        assertThat(CaptureId.of(one, null)).isEqualTo(CaptureId.of(reordered, null));
-        assertThat(CaptureId.of(one, null)).isNotEqualTo(CaptureId.of(narrower, null));
-    }
-
-    @Test
-    void anExplicitMiningKeyStillKeepsDistinctReadContractsApart() {
         CaptureConfig orders = new CaptureConfig("mysql", Map.of("host", "db.internal"), List.of("orders"));
         CaptureConfig customers = new CaptureConfig("mysql", Map.of("host", "db.internal"), List.of("customers"));
 
+        assertThat(CaptureId.of(both, null)).isEqualTo(CaptureId.of(orders, null));
+        assertThat(CaptureId.of(orders, "shared-db")).isEqualTo(CaptureId.of(customers, "shared-db"));
         assertThat(CaptureId.of(orders, "shared-db"))
-                .isNotEqualTo(CaptureId.of(customers, "shared-db"));
+                .as("an explicit mining key still names a chain of its own")
+                .isNotEqualTo(CaptureId.of(orders, null));
+    }
+
+    /** A bounded read reads exactly its streams, so a different read set is a different capture. */
+    @Test
+    void aSnapshotOnlyReadIsNamedByItsStreamsInAnyOrder() {
+        CaptureRunSpec both = snapshotOf(List.of("orders", "customers"));
+        CaptureRunSpec reordered = snapshotOf(List.of("customers", "orders"));
+        CaptureRunSpec narrower = snapshotOf(List.of("orders"));
+
+        assertThat(CaptureId.of(both)).isEqualTo(CaptureId.of(reordered));
+        assertThat(CaptureId.of(both)).isNotEqualTo(CaptureId.of(narrower));
+    }
+
+    private static CaptureRunSpec snapshotOf(List<String> streams) {
+        return new CaptureRunSpec(new CaptureConfig("mysql", Map.of("host", "db.internal"), streams),
+                ReadMode.SNAPSHOT_ONLY, null, true, "source", "pipeline", StartFrom.earliest(), null, 0);
     }
 
     @Test

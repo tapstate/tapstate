@@ -146,13 +146,13 @@ class CaptureOwnershipMovesWhenItsMemberLeavesTest {
         onFirst.startCapture(PIPELINE);
         String chain = runOnTheMemberThatLeaves.get().chainId().orElseThrow().value();
 
-        // A consumer that has confirmed everything it will ever be sent. Without one the frontier has
-        // nothing to be bounded by and the capture records no position at all, which would leave the
-        // assertion below comparing a resume against nothing.
+        // A consumer that has confirmed everything it will ever be sent. Without one nothing the capture
+        // hands over is ever released and it records no position past where it began, which would leave
+        // the assertion below comparing a resume against nothing.
         leaving.feed(change(1));
         await("the chain to be opened by the capture that started", () -> meta.read(chain).isPresent());
         SrsMeta opened = meta.read(chain).orElseThrow();
-        meta.advanceSinkAcked(chain, PIPELINE,
+        meta.advanceTableSinkAcked(chain, PIPELINE, change(1).src(),
                 new ChainPosition(new SourceOrder(opened.epoch(), Long.MAX_VALUE / 2), "src-far"));
 
         leaving.feed(change(2));
@@ -313,6 +313,9 @@ class CaptureOwnershipMovesWhenItsMemberLeavesTest {
 
         @Override
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+            // Where the stream begins, said before anything else, as a connector's stream says it.
+            listener.onStart(java.util.Optional.of(start instanceof CaptureStart.Resume resume
+                    ? resume.position() : new SourcePosition("start")));
             started.set(start);
             running = true;
             daemon = new Thread(() -> {

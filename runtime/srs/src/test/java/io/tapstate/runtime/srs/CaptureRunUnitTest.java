@@ -12,6 +12,7 @@ import com.hazelcast.ringbuffer.Ringbuffer;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
@@ -20,9 +21,11 @@ import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
+import io.tapstate.spi.capture.SharedNotes;
 import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.ResumePoint;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
@@ -34,6 +37,7 @@ import org.junit.jupiter.api.Test;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -684,23 +688,18 @@ class CaptureRunUnitTest {
     }
 
     /**
-     * A pipeline new to a chain begins its tail at the seam its own load sampled, not at the one the
-     * chain was created at.
+     * A pipeline new to a chain another pipeline holds begins its tail where the chain's reader got to, not at
+     * the seam its own load sampled.
      *
-     * <p>The same reckoning as the load above, one field over. A recorded seam says where the snapshot
-     * that recorded it began, and that snapshot belongs to one pipeline. A pipeline new to the chain has
-     * a seam of its own, sampled by its own bounded read moments ago, while the recorded one may be days
-     * old -- and a source keeps its change log for a window and refuses a start from before it. Handed
-     * the chain's, every join to a chain older than that window fails; and where a source answers such a
-     * start with an empty stream instead of a refusal, the pipeline comes up healthy, reports running and
-     * delivers nothing, which is the same shape as a source that has no changes for it.
-     *
-     * <p>Reaching back to the chain's birth buys a joiner nothing either. What a chain shares is the
-     * mining; the initial load is not part of that, so the joiner reads the source in full for itself and
-     * every change before its own seam is already covered by that read.
+     * <p>The chain's position is where the pipeline holding it still owes every change after: stopped with its
+     * state kept, it has landed none of them. A new reader beginning at the seam the joiner's load sampled
+     * moments ago would skip them for the holder for good -- that reader's start is written down as where the
+     * chain stands, and the source is told it may let go of what lies before it. Beginning at the chain's
+     * position costs the joiner only changes its own load already covered, which the idempotent sink absorbs.
+     * A source whose log no longer reaches back that far refuses the start, as it would refuse the holder's.
      */
     @Test
-    void aPipelineNewToAChainBeginsItsTailAtItsOwnSeamNotTheOneTheChainWasCreatedAt() {
+    void aPipelineNewToAHeldChainBeginsItsTailWhereTheChainGotToNotAtItsOwnSeam() {
         InMemoryMeta meta = new InMemoryMeta();
         FakeSource first = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-the-chain-began-at");
         CaptureRun firstRun = runUnit(first, meta)
@@ -708,41 +707,56 @@ class CaptureRunUnitTest {
         String chainId = firstRun.chainId().orElseThrow().value();
         // Stands in for pipe-a's sink confirming the table -- the only thing that ever marks one done.
         meta.markSnapshotComplete(chainId, "pipe-a", "orders");
+        // Stopped with its state kept: its record stays on the chain, owing every change after where it began.
+        firstRun.close();
 
         FakeSource joiner = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-the-joiner-began-at");
         runUnit(joiner, meta)
                 .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-joined"), e -> { });
 
         assertThat(joiner.cdcStart)
-                .as("the joiner's tail begins where its own load began, not where the chain did")
-                .isEqualTo(CaptureStart.resume(new SourcePosition("seam-the-joiner-began-at")));
+                .as("the joiner's tail begins where the chain got to, which pipe-a still owes everything after")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("seam-the-chain-began-at")));
+        assertThat(meta.resumeOffset(chainId)).as("and the chain still resumes from there")
+                .contains("seam-the-chain-began-at");
     }
 
+    /**
+     * On a chain with no position recorded, a run with nothing to load begins at the seam its own pipeline's
+     * load recorded -- never at one another pipeline's load recorded, which says where that load began and
+     * nothing about this pipeline.
+     */
     @Test
-    void aPipelineWhoseCompletedLoadSamplesNoSeamRestartsAtItsOwnSeam() {
+    void aRunWithNothingToLoadOnAChainWithNoPositionBeginsAtItsOwnRecordedSeam() {
         InMemoryMeta meta = new InMemoryMeta();
-        FakeSource first = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-chain-birth");
-        CaptureRun firstRun = runUnit(first, meta)
-                .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-completed-join"), e -> { });
-        String chainId = firstRun.chainId().orElseThrow().value();
-        meta.markSnapshotComplete(chainId, "pipe-a", "orders");
-
-        FakeSource joiner = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-join");
-        runUnit(joiner, meta)
-                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-completed-join"), e -> { });
+        String chainId = MiningChainId.resolve(config(), "chain-own-recorded-seam").value();
+        meta.create(chainId, null);
+        meta.setCdcStart(chainId, "pipe-a", "seam-pipe-a-loaded-from", 1L);
+        meta.setCdcStart(chainId, "pipe-b", "seam-pipe-b-loaded-from", 1L);
         meta.markSnapshotComplete(chainId, "pipe-b", "orders");
 
         FakeSource restarted = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-not-sampled");
         runUnit(restarted, meta)
-                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-completed-join"), e -> { });
+                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-own-recorded-seam"), e -> { });
 
         assertThat(restarted.cdcStart)
-                .as("pipe-b owes no table on restart, so its tail must not adopt pipe-a's older seam")
-                .isEqualTo(CaptureStart.resume(new SourcePosition("seam-join")));
+                .as("pipe-b's own recorded seam, not pipe-a's")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("seam-pipe-b-loaded-from")));
     }
 
+    /**
+     * A reader that took the chain over begins where the chain's previous reader began, not at the present,
+     * even for a pipeline that loads nothing of its own.
+     *
+     * <p>The first reader laid down where its stream began before it handed anything over, and that is the
+     * chain's resume position until one of its runs is released: every change after it may still be owed to
+     * a pipeline on the chain. Beginning the next reader at the present would skip them for everyone, which
+     * is the loss the position exists to prevent. What the next reader must not take is another pipeline's
+     * own snapshot seam as if it were the chain's -- here the two are the same point only because the first
+     * reader began at its own seam.
+     */
     @Test
-    void aCdcOnlyPipelineDoesNotAdoptAnotherPipelinesSnapshotSeam() {
+    void aReaderThatTakesTheChainOverBeginsWhereThePreviousReaderBegan() {
         InMemoryMeta meta = new InMemoryMeta();
         FakeSource loader = new FakeSource(List.of(row(1)), List.of(), "seam-loader");
         runUnit(loader, meta)
@@ -754,8 +768,8 @@ class CaptureRunUnitTest {
 
         assertThat(run.snapshotCount()).as("cdc_only has no load from which to sample a seam").isZero();
         assertThat(cdcOnly.cdcStart)
-                .as("with no shared read or seam of its own, pipe-b uses the start for this run")
-                .isEqualTo(CaptureStart.present());
+                .as("the chain resumes where its reader began, which nothing has released past yet")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("seam-loader")));
     }
 
     /**
@@ -879,6 +893,365 @@ class CaptureRunUnitTest {
     }
 
     /**
+     * A direct tail whose own load just ran begins at that load's seam, even on a chain that records a resume
+     * point. A shared reader on the same chain releases its runs without waiting for a direct tail's pipeline,
+     * so while the load ran it may have moved the resume point past the seam; beginning there would skip, for
+     * this pipeline, every change between the seam and that point -- changes its load did not cover.
+     */
+    @Test
+    void aDirectTailWithALoadOfItsOwnBeginsAtItsSeamNotWhereASharedReaderGotTo() {
+        InMemoryMeta meta = new InMemoryMeta();
+        MiningChainId chainId = MiningChainId.resolve(config(), "chain-direct-seam");
+        meta.create(chainId.value(), null);
+        long epoch = meta.openEpoch(chainId.value());
+        meta.advancePhysicalSourceReadOffset(chainId.value(), epoch,
+                new ChainPosition(new SourceOrder(epoch, 9L), "released-by-the-shared-reader"), true);
+
+        FakeSource port = new FakeSource(List.of(row(1)), List.of(), "seam-the-direct-load-began-at");
+        runUnit(port, meta).start(spec(ReadMode.SNAPSHOT_AND_CDC, false, "chain-direct-seam"), e -> { });
+
+        assertThat(port.cdcStart)
+                .as("the direct tail begins where its own load began")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("seam-the-direct-load-began-at")));
+    }
+
+    /**
+     * A direct tail leaves a position the chain already holds where it is. A pipeline stopped with its state
+     * kept holds the chain where it stopped; a direct tail reads for its own pipeline alone, so where it began
+     * says nothing about where the chain stands for anyone else -- written down as the chain's start, it would
+     * become where the held pipeline resumes, past the changes it still owes.
+     */
+    @Test
+    void aDirectTailLeavesTheChainWhereAHeldPipelineStopped() {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chainId = MiningChainId.resolve(config(), "chain-direct-held").value();
+        meta.create(chainId, null);
+        long heldUnder = meta.openEpoch(chainId);
+        meta.selectConsumerTables(chainId, "holder", List.of("orders"), heldUnder);
+        assertThat(meta.establishPhysicalAnchor(chainId,
+                new ChainPosition(new SourceOrder(heldUnder, -1L), "where-the-holder-stopped"))).isTrue();
+
+        FakeSource port = new FakeSource(List.of(row(1)), List.of(), "seam-the-direct-load-began-at");
+        runUnit(port, meta).start(spec(ReadMode.SNAPSHOT_AND_CDC, false, "chain-direct-held"), e -> { });
+
+        assertThat(port.cdcStart)
+                .isEqualTo(CaptureStart.resume(new SourcePosition("seam-the-direct-load-began-at")));
+        assertThat(meta.resumeOffset(chainId)).as("the held pipeline still resumes where it stopped")
+                .contains("where-the-holder-stopped");
+    }
+
+    /**
+     * A direct tail that starts on a chain another pipeline is on does not write where it began down as the
+     * chain's position, even on a chain that has none yet. Here a buffered pipeline is on the chain with its
+     * load still running: its seam is recorded and its reader has not opened. Had the direct tail's start
+     * become the chain's resume point, that reader would open there rather than at its own seam, and every
+     * change of its tables between the two -- after its load read them, before the direct tail began -- would
+     * never reach it.
+     */
+    @Test
+    void aDirectTailBesideALoadStillRunningLeavesTheChainToThatLoadsReader() {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chainId = MiningChainId.resolve(config(), "chain-direct-beside-a-load").value();
+        meta.create(chainId, null);
+        long loadingUnder = meta.openEpoch(chainId);
+        meta.selectConsumerTables(chainId, "pipe-a", List.of("orders"), loadingUnder);
+        meta.setCdcStart(chainId, "pipe-a", "seam-pipe-a-loaded-from", loadingUnder);
+
+        FakeSource direct = new FakeSource(List.of(row(1)), List.of(), "seam-the-direct-load-began-at");
+        runUnit(direct, meta).start(spec(ReadMode.SNAPSHOT_AND_CDC, false, "chain-direct-beside-a-load"), e -> { });
+
+        assertThat(meta.resumeOffset(chainId)).as("the direct tail's start is not the chain's").isEmpty();
+        assertThat(meta.read(chainId).orElseThrow().consumerOffset("pipe-1").orElseThrow().snapshotEpoch())
+                .as("the direct pipeline's own load keeps the generation it began in").isNotZero();
+
+        FakeSource shared = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-not-sampled");
+        runUnit(shared, meta)
+                .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-direct-beside-a-load"), e -> { });
+
+        assertThat(shared.cdcStart)
+                .as("pipe-a's reader opens where pipe-a's own load began")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("seam-pipe-a-loaded-from")));
+    }
+
+    /**
+     * A direct tail that loads nothing, on a chain another pipeline is on, comes back where it first began.
+     * It does not write its start down as the chain's position, so it writes it down for its own pipeline:
+     * with neither, a restart before anything was released would take the present, and every change in
+     * between would be gone for this pipeline.
+     */
+    @Test
+    void aDirectTailThatLoadsNothingBesideAnotherPipelineComesBackWhereItFirstBegan() {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chainId = MiningChainId.resolve(config(), "chain-direct-cdc-only-beside").value();
+        meta.create(chainId, null);
+        meta.selectConsumerTables(chainId, "pipe-a", List.of("orders"), meta.openEpoch(chainId));
+
+        FakeSource first = new FakeSource(List.of(), List.of());
+        runUnit(first, meta)
+                .start(spec(ReadMode.CDC_ONLY, false, "chain-direct-cdc-only-beside", StartFrom.latest()), e -> { })
+                .close();
+
+        FakeSource second = new FakeSource(List.of(), List.of());
+        runUnit(second, meta)
+                .start(spec(ReadMode.CDC_ONLY, false, "chain-direct-cdc-only-beside", StartFrom.latest()), e -> { });
+
+        assertThat(second.cdcStart)
+                .as("the second run begins where the first one did, not at the present")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("start")));
+        assertThat(meta.resumeOffset(chainId)).as("and the chain itself still records nothing").isEmpty();
+    }
+
+    /**
+     * A pipeline reading the source directly beside one reading it through the shared ring keeps a position of
+     * its own: it comes back from what it landed, and its source is told nothing past that. The shared reader
+     * owes it nothing and moves the chain's position on its own pipelines' word alone -- here past a change the
+     * direct pipeline forwarded and never landed. Resumed from the chain's position, or with its source told
+     * it, the direct pipeline would never read that change again.
+     */
+    @Test
+    void aDirectTailBesideASharedReaderComesBackFromWhatItLandedItself() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRunSpec direct = directSpecOver("pipe-d", "k-beside", "orders");
+        String chainId = MiningChainId.resolve(direct.config(), direct.srsKey()).value();
+        FakeSource directSource = new FakeSource(List.of(), List.of(change(10), change(20)));
+        CaptureRun directRun = runUnit(directSource, meta).start(direct, event -> {
+            if (Integer.valueOf(10).equals(event.after().get("id"))) {
+                meta.advanceTableSinkAcked(chainId, "pipe-d", event.src(), event.position());
+            }
+        });
+        awaitAcked(meta, chainId, "pipe-d", "src-10");
+
+        CaptureRun shared = runUnit(new FakeSource(List.of(), List.of(change(30))), meta)
+                .start(specOver("pipe-s", "k-beside", "orders"), e -> { });
+        long epoch = meta.read(chainId).orElseThrow().epoch();
+        meta.advanceTableSinkAcked(chainId, "pipe-s", "orders", new ChainPosition(new SourceOrder(epoch, 0), "src-30"));
+        awaitSourceRead(meta, chainId, "src-30");
+        ((SourceAcknowledgements.Followed) directRun.cdcSubscription().orElseThrow()).handOverQuietly();
+
+        assertThat(directSource.acknowledged.getLast())
+                .as("what the direct pipeline's source was told it may release")
+                .doesNotContain(new SourcePosition("src-30"))
+                .last().isEqualTo(new SourcePosition("src-10"));
+        shared.close();
+        directRun.close();
+
+        FakeSource again = new FakeSource(List.of(), List.of());
+        runUnit(again, meta).start(direct, e -> { }).close();
+        assertThat(again.cdcStart).as("where the direct pipeline comes back")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("src-10")));
+    }
+
+    /**
+     * A pipeline reading the source directly on another member takes a generation of its own and leaves the
+     * chain's alone. The chain's generation is what the shared reader writes, and is fenced, under: moved on by
+     * a tail that is not reading for the ring, it would stop the reader every pipeline on the ring depends on.
+     */
+    @Test
+    void aDirectTailOnAnotherMemberLeavesTheSharedReadersGenerationAlone() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRun shared = runUnit(new FakeSource(List.of(), List.of(change(30))), meta)
+                .start(specOver("pipe-s", "k-elsewhere", "orders"), e -> { });
+        String chainId = shared.chainId().orElseThrow().value();
+        long epoch = meta.read(chainId).orElseThrow().epoch();
+
+        CaptureRun direct = runUnit(new FakeSource(List.of(), List.of()), meta)
+                .start(directSpecOver("pipe-d", "k-elsewhere", "orders"), e -> { });
+
+        assertThat(meta.read(chainId).orElseThrow().epoch())
+                .as("the generation the shared reader writes under").isEqualTo(epoch);
+        meta.advanceTableSinkAcked(chainId, "pipe-s", "orders", new ChainPosition(new SourceOrder(epoch, 0), "src-30"));
+        awaitSourceRead(meta, chainId, "src-30");
+        assertThat(shared.health().failure()).as("and the shared reader goes on").isEmpty();
+        direct.close();
+        shared.close();
+    }
+
+    /**
+     * A direct tail started again beside another pipeline that keeps the chain open on this member numbers its
+     * changes afresh, under a generation of its own -- so a confirmation of its last stream, landing late,
+     * cannot confirm a change of the new one that sits at the same count.
+     */
+    @Test
+    void aDirectTailStartedAgainIsNotConfirmedByItsLastStream() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRunUnit unit = runUnit(new FakeSource(List.of(), List.of(change(10), change(11))), meta);
+        CaptureRun other = unit.start(directSpecOver("pipe-other", "k-again", "orders"), e -> { });
+        List<Envelope> forwarded = new CopyOnWriteArrayList<>();
+        CaptureRun first = unit.start(directSpecOver("pipe-d", "k-again", "orders"), forwarded::add);
+        String chainId = first.chainId().orElseThrow().value();
+        Envelope neverLanded = forwarded.getLast();
+        first.close();
+
+        CaptureRun again = unit.start(directSpecOver("pipe-d", "k-again", "orders"), e -> { });
+        meta.advanceTableSinkAcked(chainId, "pipe-d", "orders", neverLanded.position());
+        Thread.sleep(10 * PhysicalSourcePrefix.TICK_MILLIS);
+
+        assertThat(meta.read(chainId).orElseThrow().consumerOffset("pipe-d").orElseThrow().sinkAcked())
+                .as("what the pipeline is recorded as having landed: nothing of the new stream has").isNull();
+        again.close();
+        other.close();
+    }
+
+    /**
+     * A direct tail that is the only one on its chain writes the chain's position as it releases, so that a
+     * pipeline turning the buffering on later picks up there -- over every table it reads. That position is one
+     * the shared reader can stand on: everything before it landed for everyone on the chain. Taken for one an
+     * older version wrote, it would refuse to open over several tables for good.
+     */
+    @Test
+    void aPipelineTurningItsBufferOnPicksUpWhereItsDirectTailLeftAChainOfSeveralTables() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRunSpec direct = directSpecOver("pipe-1", "k-turned-on", "orders", "customers");
+        String chainId = MiningChainId.resolve(direct.config(), direct.srsKey()).value();
+        CaptureRun directRun = runUnit(new FakeSource(List.of(), List.of(
+                        Envelope.insert(10, "orders", Map.of("id", 10), Map.of()),
+                        Envelope.insert(11, "customers", Map.of("id", 11), Map.of()))), meta)
+                .start(direct, event -> meta.advanceTableSinkAcked(chainId, "pipe-1", event.src(), event.position()));
+        awaitSourceRead(meta, chainId, "src-11");
+        directRun.close();
+
+        FakeSource buffered = new FakeSource(List.of(), List.of());
+        runUnit(buffered, meta).start(specOver("pipe-1", "k-turned-on", "orders", "customers"), e -> { }).close();
+
+        assertThat(buffered.cdcStart).as("where the buffered reader opens")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("src-11")));
+    }
+
+    /** The same position serves any other pipeline arriving with the buffering on, beside the direct tail. */
+    @Test
+    void anotherPipelineStartsBesideADirectTailThatReleasedAChainOfSeveralTablesAlone() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRunSpec direct = directSpecOver("pipe-d", "k-beside-alone", "orders", "customers");
+        String chainId = MiningChainId.resolve(direct.config(), direct.srsKey()).value();
+        CaptureRun directRun = runUnit(new FakeSource(List.of(), List.of(
+                        Envelope.insert(10, "orders", Map.of("id", 10), Map.of()),
+                        Envelope.insert(11, "customers", Map.of("id", 11), Map.of()))), meta)
+                .start(direct, event -> meta.advanceTableSinkAcked(chainId, "pipe-d", event.src(), event.position()));
+        awaitSourceRead(meta, chainId, "src-11");
+
+        FakeSource sharedSource = new FakeSource(List.of(), List.of());
+        CaptureRun shared = runUnit(sharedSource, meta)
+                .start(specOver("pipe-s", "k-beside-alone", "orders", "customers"), e -> { });
+
+        assertThat(sharedSource.cdcStart).isEqualTo(CaptureStart.resume(new SourcePosition("src-11")));
+        assertThat(shared.health().failure()).isEmpty();
+        shared.close();
+        directRun.close();
+    }
+
+    /**
+     * A direct tail that wrote the chain's position while it was alone stops writing it once another pipeline is
+     * on the chain, and its source is then told what its own pipeline lands -- not the chain's position it wrote
+     * last, which no longer moves. Told that, its source would keep its log from there for as long as the stream
+     * runs.
+     */
+    @Test
+    void aDirectTailIsToldWhatItLandsOnceAnotherPipelineJoinsItsChain() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRunSpec first = directSpecOver("pipe-1", "k-joined", "orders");
+        String chainId = MiningChainId.resolve(first.config(), first.srsKey()).value();
+        List<Envelope> forwarded = new CopyOnWriteArrayList<>();
+        FakeSource source = new FakeSource(List.of(), List.of(change(10), change(11)));
+        CaptureRun run = runUnit(source, meta).start(first, forwarded::add);
+        meta.advanceTableSinkAcked(chainId, "pipe-1", "orders", forwarded.get(0).position());
+        awaitSourceRead(meta, chainId, "src-10");
+
+        CaptureRun joined = runUnit(new FakeSource(List.of(), List.of()), meta)
+                .start(directSpecOver("pipe-2", "k-joined", "orders"), e -> { });
+        meta.advanceTableSinkAcked(chainId, "pipe-1", "orders", forwarded.get(1).position());
+        awaitAcked(meta, chainId, "pipe-1", "src-11");
+        ((SourceAcknowledgements.Followed) run.cdcSubscription().orElseThrow()).handOverQuietly();
+
+        assertThat(meta.read(chainId).orElseThrow().sourceReadOffset())
+                .as("the chain's position, no longer the direct tail's to move").isEqualTo("src-10");
+        assertThat(source.acknowledged.getLast()).as("what its source was told it may release")
+                .last().isEqualTo(new SourcePosition("src-11"));
+        joined.close();
+        run.close();
+    }
+
+    /**
+     * A pipeline that read the chain through its ring and now reads it directly comes back where the chain
+     * stands for it. Every run of the chain waited for it until now, so the chain's resume point is a place it
+     * landed everything before -- later than the last change of its own it landed, here long ago on a quiet
+     * table. Coming back there would read everything since again, from a log the source may no longer keep.
+     */
+    @Test
+    void aPipelineTurningToADirectTailResumesWhereTheChainStandsForItNotAtItsLastChange() {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chainId = MiningChainId.resolve(config(), "chain-turned-direct").value();
+        meta.create(chainId, null);
+        long epoch = meta.openEpoch(chainId);
+        meta.selectConsumerTables(chainId, "pipe-1", List.of("orders"), epoch);
+        meta.advanceSinkAcked(chainId, "pipe-1",
+                new ChainPosition(new SourceOrder(epoch, 3L), "its-last-change-long-ago"));
+        meta.advancePhysicalSourceReadOffset(chainId, epoch,
+                new ChainPosition(new SourceOrder(epoch, 9L), "where-the-chain-stands-for-it"), true);
+
+        FakeSource port = new FakeSource(List.of(), List.of());
+        runUnit(port, meta).start(spec(ReadMode.CDC_ONLY, false, "chain-turned-direct"), e -> { });
+
+        assertThat(port.cdcStart)
+                .isEqualTo(CaptureStart.resume(new SourcePosition("where-the-chain-stands-for-it")));
+    }
+
+    /**
+     * That place is taken before the pipeline is recorded reading directly: from then on the shared reader stops
+     * waiting for it, and releases past the changes it still owed. Here the reader does so the moment the record
+     * changes; a pipeline that had landed nothing of its own would otherwise come back past them.
+     */
+    @Test
+    void aPipelineTurningToADirectTailResumesWhereTheChainHeldForItNotWhereTheReaderWentWithoutIt() {
+        InMemoryMeta meta = new InMemoryMeta() {
+            @Override
+            public synchronized void selectConsumerTables(
+                    String miningChainId, String pipelineId, List<String> tables, long epoch) {
+                super.selectConsumerTables(miningChainId, pipelineId, tables, epoch);
+                if (tables.isEmpty()) {
+                    long chainEpoch = read(miningChainId).orElseThrow().epoch();
+                    advancePhysicalSourceReadOffset(miningChainId, chainEpoch,
+                            new ChainPosition(new SourceOrder(chainEpoch, 12L), "released-without-it"), true);
+                }
+            }
+        };
+        String chainId = MiningChainId.resolve(config(), "chain-turned-direct-owing").value();
+        meta.create(chainId, null);
+        long epoch = meta.openEpoch(chainId);
+        meta.selectConsumerTables(chainId, "pipe-1", List.of("orders"), epoch);
+        meta.advancePhysicalSourceReadOffset(chainId, epoch,
+                new ChainPosition(new SourceOrder(epoch, 9L), "where-the-chain-held-for-it"), true);
+
+        FakeSource port = new FakeSource(List.of(), List.of());
+        runUnit(port, meta).start(spec(ReadMode.CDC_ONLY, false, "chain-turned-direct-owing"), e -> { });
+
+        assertThat(meta.resumeOffset(chainId)).as("the reader went on without it").contains("released-without-it");
+        assertThat(port.cdcStart)
+                .isEqualTo(CaptureStart.resume(new SourcePosition("where-the-chain-held-for-it")));
+    }
+
+    /**
+     * A pipeline that reads the source directly has no place in any of the chain's rings, and attaching that way
+     * drops the cursors a run of it that read through the ring left behind. Nothing advances them any more, and
+     * the shared reader writes each ring no further ahead of its slowest cursor than the ring holds: a cursor
+     * left standing would stop it for every pipeline on the chain.
+     */
+    @Test
+    void aPipelineAttachingDirectlyLeavesNoCursorInTheChainsRings() {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chainId = MiningChainId.resolve(config(), "chain-direct-cursor").value();
+        meta.create(chainId, null);
+        meta.advanceConsumerReadSeq(chainId, "pipe-1", "orders", 500L);
+        meta.startRingAfter(chainId, "pipe-1", "orders", 400L);
+
+        runUnit(new FakeSource(List.of(), List.of()), meta)
+                .start(spec(ReadMode.CDC_ONLY, false, "chain-direct-cursor"), e -> { }).close();
+
+        assertThat(meta.read(chainId).orElseThrow().consumerOffset("pipe-1").orElseThrow().perTableSeq())
+                .as("the direct pipeline's cursors in the chain's rings").isEmpty();
+        assertThat(meta.ringDoneThrough(chainId, "pipe-1")).isEmpty();
+    }
+
+    /**
      * A direct tail -- {@code srs.enabled:false} -- begins where the durable record says, exactly as a
      * shared-ring tail does.
      *
@@ -918,21 +1291,19 @@ class CaptureRunUnitTest {
      * keeps. That account is the whole point of keeping the chain when the ring is off: without it the run
      * after this one has nothing to start from and takes the present, losing everything in between.
      *
-     * <p>The offset only ever moves to a position a consumer has durably landed. Reading is not writing,
-     * and an offset that ran ahead of the sink would skip, on the way back, changes no sink ever took. A
-     * sink confirmation is therefore stood in for here, high enough that the clamp is not what this case
-     * measures; the case below measures the clamp itself.
+     * <p>The offset only ever moves to a position the pipeline's sink has durably landed. Reading is not
+     * writing, and an offset that ran ahead of the sink would skip, on the way back, changes no sink ever
+     * took. The sink here lands each change as it is handed over, confirming it by the order it arrived
+     * with, which is what a real sink downstream of the tail does a moment later.
      */
     @Test
     void aDirectTailRecordsHowFarTheSourceHasBeenReadOnceASinkHasLandedIt() {
         InMemoryMeta meta = new InMemoryMeta();
         MiningChainId chainId = MiningChainId.resolve(config(), "chain-direct-offset");
-        meta.create(chainId.value(), null);
-        meta.advanceSinkAcked(chainId.value(), "pipe-1",
-                new ChainPosition(new SourceOrder(Long.MAX_VALUE, Long.MAX_VALUE), "landed"));
 
         FakeSource port = new FakeSource(List.of(), List.of(change(10), change(11)));
-        runUnit(port, meta).start(spec(ReadMode.CDC_ONLY, false, "chain-direct-offset"), e -> { });
+        runUnit(port, meta).start(spec(ReadMode.CDC_ONLY, false, "chain-direct-offset"),
+                event -> meta.advanceTableSinkAcked(chainId.value(), "pipe-1", event.src(), event.position()));
 
         assertThat(meta.read(chainId.value()).orElseThrow().sourceReadOffset())
                 .as("the direct tail wrote down where it read to, in the account a buffered tail also keeps")
@@ -940,7 +1311,8 @@ class CaptureRunUnitTest {
     }
 
     /**
-     * The case above with its stand-in removed: no consumer has landed anything, so nothing is written down.
+     * The case above with the sink removed: nothing has landed, so nothing read is written down -- the chain
+     * holds no offset, and the pipeline's own record holds where its stream began, for its restart.
      *
      * <p>The two are one rule seen from both sides, and only together do they discriminate. An offset is a
      * claim that everything below it is safely out of the source's reach -- true only once a sink has taken
@@ -949,16 +1321,19 @@ class CaptureRunUnitTest {
      * and fails here, which is the only place that difference is visible.
      */
     @Test
-    void aDirectTailRecordsNothingWhileNoSinkHasLandedAnything() {
+    void aDirectTailRecordsNothingReadWhileNoSinkHasLandedAnything() {
         InMemoryMeta meta = new InMemoryMeta();
         MiningChainId chainId = MiningChainId.resolve(config(), "chain-direct-unacked");
 
         FakeSource port = new FakeSource(List.of(), List.of(change(10), change(11)));
         runUnit(port, meta).start(spec(ReadMode.CDC_ONLY, false, "chain-direct-unacked"), e -> { });
 
-        assertThat(meta.read(chainId.value()).orElseThrow().sourceReadOffset())
+        SrsMeta record = meta.read(chainId.value()).orElseThrow();
+        assertThat(record.sourceReadOffset())
                 .as("read is not written: an offset ahead of the sink would skip changes on the way back")
                 .isNull();
+        assertThat(record.consumerOffset("pipe-1").orElseThrow().cdcStartPosition())
+                .as("where the pipeline's own stream began").isEqualTo("start");
     }
 
     /**
@@ -971,6 +1346,111 @@ class CaptureRunUnitTest {
      * instead -- monotonic within the generation, exactly like the ring's, and taken afresh with each new
      * generation the chain opens.
      */
+    /**
+     * A direct tail over two tables writes a position down only once its pipeline has landed every change
+     * before it on both: a confirmation on one table does not stand for a change of the other. The later
+     * table lands as it is handed over here, and the earlier one not at all, so the only way the position can
+     * move before the earlier one lands is by taking one table's word for the other's.
+     */
+    @Test
+    void aDirectTailOverTwoTablesMovesOnlyPastWhatBothHaveLanded() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRunSpec spec = new CaptureRunSpec(configOver("orders", "customers"), ReadMode.CDC_ONLY,
+                "chain-direct-two", false, "src-1", "pipe-1", StartFrom.latest(), null, 0L);
+        String chainId = MiningChainId.resolve(spec.config(), spec.srsKey()).value();
+        Envelope order = Envelope.insert(10, "orders", Map.of("id", 10), Map.of());
+        Envelope customer = Envelope.insert(11, "customers", Map.of("id", 11), Map.of());
+        List<Envelope> forwarded = new CopyOnWriteArrayList<>();
+
+        runUnit(new FakeSource(List.of(), List.of(order, customer)), meta).start(spec, event -> {
+            forwarded.add(event);
+            if (event.src().equals("customers")) {
+                meta.advanceTableSinkAcked(chainId, "pipe-1", event.src(), event.position());
+            }
+        });
+
+        assertThat(meta.read(chainId).orElseThrow().sourceReadOffset())
+                .as("customers landed, orders before it did not").isNull();
+        Envelope landedLast = forwarded.getFirst();
+        meta.advanceTableSinkAcked(chainId, "pipe-1", landedLast.src(), landedLast.position());
+        awaitSourceRead(meta, chainId, "src-11");
+    }
+
+    /**
+     * A run carrying no change still says where the source now is, and a direct tail writes that down once
+     * everything before it has landed -- a source whose captured tables fell quiet is released as the rest of
+     * its log moves on. Behind a change not landed yet, it waits its turn.
+     */
+    @Test
+    void aDirectTailMovesOnToWhereAQuietSourceIsOnceEverythingBeforeItLanded() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chainId = MiningChainId.resolve(config(), "chain-direct-quiet").value();
+        List<Envelope> forwarded = new CopyOnWriteArrayList<>();
+
+        runUnit(new FakeSource(List.of(), List.of(change(10))).withHeartbeatAt("hb-12"), meta)
+                .start(spec(ReadMode.CDC_ONLY, false, "chain-direct-quiet"), forwarded::add);
+
+        assertThat(meta.read(chainId).orElseThrow().sourceReadOffset())
+                .as("the change before the quiet run has not landed").isNull();
+        Envelope change = forwarded.getFirst();
+        meta.advanceTableSinkAcked(chainId, "pipe-1", change.src(), change.position());
+        awaitSourceRead(meta, chainId, "hb-12");
+    }
+
+    /**
+     * A restart resumes from the last run that carried a change, not from a quiet run released after it. A
+     * run carrying no change says how far the source has been read, and a source may say that in the form it
+     * keeps for "the last change I handed over": PostgreSQL names the end of the last commit, which is where
+     * the next transaction's first change begins, and a stream resumed there passes over that change as one
+     * already read. The quiet run still moves the position the source is told it may release.
+     */
+    @Test
+    void aRestartResumesFromTheLastChangeNotFromAQuietRunReleasedAfterIt() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRunSpec spec = specOver("pipe-1", "k-quiet-resume", "orders");
+        CaptureRun first = runUnit(new FakeSource(List.of(), List.of(change(10))).withHeartbeatAt("hb-12"), meta)
+                .start(spec, e -> { });
+        String chainId = first.chainId().orElseThrow().value();
+        try {
+            long epoch = meta.read(chainId).orElseThrow().epoch();
+            meta.advanceTableSinkAcked(chainId, "pipe-1", "orders",
+                    new ChainPosition(new SourceOrder(epoch, 0), "src-10"));
+            awaitSourceRead(meta, chainId, "hb-12");
+        } finally {
+            first.close();
+        }
+
+        FakeSource next = new FakeSource(List.of(), List.of());
+        CaptureRun again = runUnit(next, meta).start(spec, e -> { });
+        try {
+            assertThat(next.cdcStart)
+                    .as("where the next run resumes: the last change, not the quiet run behind it")
+                    .isEqualTo(CaptureStart.resume(new SourcePosition("src-10")));
+        } finally {
+            again.close();
+        }
+    }
+
+    /** The same for a tail reading its source directly, which writes its positions down through a path of its own. */
+    @Test
+    void aDirectTailResumesFromTheLastChangeNotFromAQuietRunReleasedAfterIt() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chainId = MiningChainId.resolve(config(), "chain-direct-quiet-resume").value();
+        List<Envelope> forwarded = new CopyOnWriteArrayList<>();
+        runUnit(new FakeSource(List.of(), List.of(change(10))).withHeartbeatAt("hb-12"), meta)
+                .start(spec(ReadMode.CDC_ONLY, false, "chain-direct-quiet-resume"), forwarded::add);
+        Envelope change = forwarded.getFirst();
+        meta.advanceTableSinkAcked(chainId, "pipe-1", change.src(), change.position());
+        awaitSourceRead(meta, chainId, "hb-12");
+
+        FakeSource next = new FakeSource(List.of(), List.of());
+        runUnit(next, meta).start(spec(ReadMode.CDC_ONLY, false, "chain-direct-quiet-resume"), e -> { });
+
+        assertThat(next.cdcStart)
+                .as("where the next run resumes: the last change, not the quiet run behind it")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("src-10")));
+    }
+
     @Test
     void aDirectTailStampsEachChangeWithAnOrderSoASinkCanRankIt() {
         InMemoryMeta meta = new InMemoryMeta();
@@ -980,10 +1460,12 @@ class CaptureRunUnitTest {
         CaptureRun run = runUnit(port, meta)
                 .start(spec(ReadMode.CDC_ONLY, false, "chain-direct-order"), passthrough::add);
 
-        long epoch = meta.read(run.chainId().orElseThrow().value()).orElseThrow().epoch();
+        long chains = meta.read(run.chainId().orElseThrow().value()).orElseThrow().epoch();
+        long own = passthrough.getFirst().position().order().epoch();
+        assertThat(own).as("a generation of the stream's own, past the chain's").isGreaterThan(chains);
         assertThat(passthrough).extracting(e -> e.position().order())
-                .as("each change is ordered within the generation the chain opened for this run")
-                .containsExactly(new SourceOrder(epoch, 0L), new SourceOrder(epoch, 1L));
+                .as("each change is ordered within the generation this stream took")
+                .containsExactly(new SourceOrder(own, 0L), new SourceOrder(own, 1L));
         assertThat(passthrough).extracting(e -> e.position().token())
                 .as("the token the source named for a run rides with the change that closes it")
                 .containsExactly("src-10", "src-11");
@@ -1146,8 +1628,8 @@ class CaptureRunUnitTest {
                     meta.read(chainId).orElseThrow().epoch(), 0L);
             Thread beforeArrival = new Thread(() -> {
                 try {
-                    CdcPhase.run(new FakeSource(List.of(), beforeArrivalChanges), config(), chain,
-                            () -> meta.consumerOffsets(chainId), new CaptureHealth());
+                    writeThroughTheRing(new FakeSource(List.of(), beforeArrivalChanges), chain,
+                            () -> meta.consumerOffsets(chainId));
                 } catch (Throwable failure) {
                     beforeArrivalFailure.set(failure);
                 }
@@ -1177,8 +1659,8 @@ class CaptureRunUnitTest {
             }
             afterArrival = new Thread(() -> {
                 try {
-                    CdcPhase.run(new FakeSource(List.of(), afterArrivalChanges), config(), chain,
-                            () -> meta.consumerOffsets(chainId), new CaptureHealth());
+                    writeThroughTheRing(new FakeSource(List.of(), afterArrivalChanges), chain,
+                            () -> meta.consumerOffsets(chainId));
                 } catch (Throwable failure) {
                     afterArrivalFailure.set(failure);
                 }
@@ -1300,6 +1782,658 @@ class CaptureRunUnitTest {
                 .containsExactlyInAnyOrderEntriesOf(Map.of("orders", -1L, "customers", -1L));
     }
 
+    /**
+     * One pipeline reads orders and customers from one source. The source hands over an orders change and
+     * then a customers change, and customers lands first: the chain's source read offset stays where the
+     * stream began until orders has landed as well, and then moves past both. Moved on customers' word, a
+     * restart would resume past the orders change, and the source would never send it again.
+     */
+    @Test
+    void aQuietTablesConfirmationDoesNotMoveTheChainPastAnotherTablesChange() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        List<Envelope> changes = List.of(
+                Envelope.insert(1, "orders", Map.of("id", 1), Map.of()),
+                Envelope.insert(2, "customers", Map.of("id", 2), Map.of()));
+        CaptureRun run = runUnit(new FakeSource(List.of(), changes), meta)
+                .start(specOver("pipe-1", "k-quiet-table", "orders", "customers"), e -> { });
+        try {
+            String chainId = run.chainId().orElseThrow().value();
+            long epoch = meta.read(chainId).orElseThrow().epoch();
+
+            meta.advanceTableSinkAcked(chainId, "pipe-1", "customers",
+                    new ChainPosition(new SourceOrder(epoch, 0), "src-2"));
+            Thread.sleep(3 * PhysicalSourcePrefix.TICK_MILLIS);
+            assertThat(meta.read(chainId).orElseThrow().sourceReadOffset())
+                    .as("the orders change before it has not landed").isEqualTo("start");
+
+            meta.advanceTableSinkAcked(chainId, "pipe-1", "orders",
+                    new ChainPosition(new SourceOrder(epoch, 0), "src-1"));
+            awaitSourceRead(meta, chainId, "src-2");
+        } finally {
+            run.close();
+        }
+    }
+
+    /** The chain's reader opens over every table recorded as selected on the chain, not only its own source's. */
+    @Test
+    void aReaderOpensOverEveryTableSelectedOnTheChain() {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chainId = MiningChainId.resolve(configOver("orders"), "k-union").value();
+        meta.create(chainId, null);
+        long earlier = meta.openEpoch(chainId);
+        meta.selectConsumerTables(chainId, "pipe-2", List.of("customers"), earlier);
+        FakeSource source = new FakeSource(List.of(), List.of());
+
+        CaptureRun run = runUnit(source, meta).start(specOver("pipe-1", "k-union", "orders"), e -> { });
+
+        assertThat(source.cdcStreams).containsExactly(List.of("customers", "orders"));
+        assertThat(meta.physicalSelection(chainId).orElseThrow().tables()).containsExactly("customers", "orders");
+        run.close();
+    }
+
+    /**
+     * A pipeline arriving on a chain whose running reader does not read its table is given back, with the
+     * table asked for and nothing recorded that would make the reader wait for it. The reader then takes the
+     * table on in the same generation -- its first stream stopped, a wider one begun from where the chain was
+     * released to -- and the pipeline attaches.
+     */
+    @Test
+    void aReaderTakesOnATableAPipelineArrivingLaterAsksFor() {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource source = new FakeSource(List.of(), List.of());
+        CaptureRunUnit unit = runUnit(source, meta);
+        CaptureRun owner = unit.start(specOver("pipe-1", "k-widen", "orders"), e -> { });
+        String chainId = owner.chainId().orElseThrow().value();
+        long epoch = meta.read(chainId).orElseThrow().epoch();
+        CaptureRunSpec arriving = specOver("pipe-2", "k-widen", "customers");
+
+        assertThatThrownBy(() -> unit.start(arriving, e -> { }, false)).isInstanceOf(ReaderNotServingYet.class);
+        assertThat(meta.requestedPhysicalTables(chainId)).containsExactly("customers");
+        assertThat(meta.read(chainId).orElseThrow().consumerOffset("pipe-2"))
+                .as("nothing on the record waits for a pipeline that was given back").isEmpty();
+
+        assertThat(unit.widen(owner)).isTrue();
+        assertThat(source.cdcClosed).as("the first stream stopped before the wider one began").isTrue();
+        assertThat(source.cdcStreams).containsExactly(List.of("orders"), List.of("customers", "orders"));
+        assertThat(source.cdcStart).as("the wider stream picks up where the chain was released to")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("start")));
+        assertThat(meta.physicalSelection(chainId))
+                .contains(new SrsMetaStore.PhysicalSelection(epoch, 2L, List.of("customers", "orders")));
+        assertThat(meta.requestedPhysicalTables(chainId)).isEmpty();
+
+        CaptureRun joined = unit.start(arriving, e -> { }, false);
+        assertThat(joined.chainId()).isEqualTo(owner.chainId());
+        assertThat(unit.widen(owner)).as("nothing more to take on").isFalse();
+        joined.close();
+        owner.close();
+    }
+
+    /**
+     * A table asked for while the reader is being widened leaves the wider selection out of date before it is
+     * published, and the publication is refused. The reader takes the newer request on in the same widening,
+     * its first stream still running until a publication stands and stopped once, then.
+     */
+    @Test
+    void aTableAskedForWhileTheReaderIsWideningIsTakenOnInTheSameWidening() {
+        java.util.concurrent.atomic.AtomicBoolean raced = new java.util.concurrent.atomic.AtomicBoolean();
+        InMemoryMeta meta = new InMemoryMeta() {
+            @Override
+            public synchronized boolean replacePhysicalSelection(
+                    String miningChainId, PhysicalSelection current, PhysicalSelection wider) {
+                if (raced.compareAndSet(false, true)) {
+                    requestPhysicalTables(miningChainId, wider.epoch(), List.of("payments"));
+                }
+                return super.replacePhysicalSelection(miningChainId, current, wider);
+            }
+        };
+        FakeSource source = new FakeSource(List.of(), List.of());
+        CaptureRunUnit unit = runUnit(source, meta);
+        CaptureRun owner = unit.start(specOver("pipe-1", "k-widen-race", "orders"), e -> { });
+        String chainId = owner.chainId().orElseThrow().value();
+        meta.requestPhysicalTables(chainId, meta.read(chainId).orElseThrow().epoch(), List.of("customers"));
+
+        assertThat(unit.widen(owner)).isTrue();
+        assertThat(source.cdcStreams)
+                .containsExactly(List.of("orders"), List.of("customers", "orders", "payments"));
+        assertThat(meta.requestedPhysicalTables(chainId)).isEmpty();
+        owner.close();
+    }
+
+    /**
+     * A widening the store cannot take for a moment leaves the reader reading what it read. The wider selection
+     * is published before the running stream is stopped, so a failure up to there has stopped nothing, and a
+     * later look takes the table on.
+     */
+    @Test
+    void aWideningTheStoreCannotTakeForAMomentLeavesTheReaderReading() {
+        java.util.concurrent.atomic.AtomicBoolean unwritable = new java.util.concurrent.atomic.AtomicBoolean();
+        InMemoryMeta meta = new InMemoryMeta() {
+            @Override
+            public synchronized boolean replacePhysicalSelection(
+                    String miningChainId, PhysicalSelection current, PhysicalSelection wider) {
+                if (unwritable.get()) {
+                    throw new TapstateException(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE,
+                            Map.of("detail", "the primary is being elected"), null);
+                }
+                return super.replacePhysicalSelection(miningChainId, current, wider);
+            }
+        };
+        FakeSource source = new FakeSource(List.of(), List.of());
+        CaptureRunUnit unit = runUnit(source, meta);
+        CaptureRun owner = unit.start(specOver("pipe-1", "k-widen-blip", "orders"), e -> { });
+        String chainId = owner.chainId().orElseThrow().value();
+        meta.requestPhysicalTables(chainId, meta.read(chainId).orElseThrow().epoch(), List.of("customers"));
+        unwritable.set(true);
+
+        org.assertj.core.api.Assertions.catchThrowable(() -> unit.widen(owner));
+
+        assertThat(source.cdcClosed).as("the stream it was reading is still running").isFalse();
+        assertThat(owner.health().failure()).as("and nothing failed the run").isEmpty();
+        unwritable.set(false);
+        assertThat(unit.widen(owner)).as("a later look takes the table on").isTrue();
+        assertThat(source.cdcStreams).containsExactly(List.of("orders"), List.of("customers", "orders"));
+        owner.close();
+    }
+
+    /**
+     * A widening the store took but whose answer was lost -- the write landed, the reply did not -- is settled by
+     * what the store holds: the wider selection is published, so the stream over it starts, from where the chain
+     * stood before the publication. Left reading the narrower stream, the reader would go on releasing runs that
+     * owe nothing to a pipeline that found its table published and began its load, past changes it still needs.
+     */
+    @Test
+    void aWideningWhoseAnswerWasLostIsSettledByWhatTheStoreHolds() {
+        java.util.concurrent.atomic.AtomicBoolean loseTheAnswer = new java.util.concurrent.atomic.AtomicBoolean();
+        InMemoryMeta meta = new InMemoryMeta() {
+            @Override
+            public synchronized boolean replacePhysicalSelection(
+                    String miningChainId, PhysicalSelection current, PhysicalSelection wider) {
+                boolean applied = super.replacePhysicalSelection(miningChainId, current, wider);
+                if (applied && loseTheAnswer.compareAndSet(true, false)) {
+                    throw new TapstateException(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE,
+                            Map.of("detail", "the answer was lost"), null);
+                }
+                return applied;
+            }
+        };
+        FakeSource source = new FakeSource(List.of(), List.of());
+        CaptureRunUnit unit = runUnit(source, meta);
+        CaptureRun owner = unit.start(specOver("pipe-1", "k-widen-lost", "orders"), e -> { });
+        String chainId = owner.chainId().orElseThrow().value();
+        meta.requestPhysicalTables(chainId, meta.read(chainId).orElseThrow().epoch(), List.of("customers"));
+        loseTheAnswer.set(true);
+
+        assertThat(unit.widen(owner)).as("the widening, settled").isTrue();
+
+        assertThat(source.cdcStreams).containsExactly(List.of("orders"), List.of("customers", "orders"));
+        assertThat(source.cdcStart).isEqualTo(CaptureStart.resume(new SourcePosition("start")));
+        assertThat(unit.widen(owner)).as("and nothing is left to take on").isFalse();
+        assertThat(owner.health().failure()).isEmpty();
+        owner.close();
+    }
+
+    /**
+     * Where the store cannot yet say whether it took the widening, the running stream reads on and releases
+     * nothing until a later look can: a pipeline may already have found the wider selection published and begun
+     * its load past where the running stream would release. Settled, the wider stream starts from where the
+     * chain stood before the publication.
+     */
+    @Test
+    void aWideningWhoseOutcomeCannotBeReadYetReleasesNothingUntilItIsSettled() throws Exception {
+        java.util.concurrent.atomic.AtomicBoolean loseTheAnswer = new java.util.concurrent.atomic.AtomicBoolean();
+        java.util.concurrent.atomic.AtomicBoolean unreadable = new java.util.concurrent.atomic.AtomicBoolean();
+        InMemoryMeta meta = new InMemoryMeta() {
+            @Override
+            public synchronized boolean replacePhysicalSelection(
+                    String miningChainId, PhysicalSelection current, PhysicalSelection wider) {
+                boolean applied = super.replacePhysicalSelection(miningChainId, current, wider);
+                if (applied && loseTheAnswer.compareAndSet(true, false)) {
+                    // The store goes away with the answer, and stays away for a while.
+                    unreadable.set(true);
+                    throw new TapstateException(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE,
+                            Map.of("detail", "the answer was lost"), null);
+                }
+                return applied;
+            }
+
+            @Override
+            public synchronized Optional<PhysicalSelection> physicalSelection(String miningChainId) {
+                if (unreadable.get()) {
+                    throw new TapstateException(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE,
+                            Map.of("detail", "the primary is being elected"), null);
+                }
+                return super.physicalSelection(miningChainId);
+            }
+        };
+        FakeSource source = new FakeSource(List.of(), List.of(change(10)));
+        CaptureRunUnit unit = runUnit(source, meta);
+        CaptureRun owner = unit.start(specOver("pipe-1", "k-widen-unknown", "orders"), e -> { });
+        String chainId = owner.chainId().orElseThrow().value();
+        long epoch = meta.read(chainId).orElseThrow().epoch();
+        meta.requestPhysicalTables(chainId, epoch, List.of("customers"));
+        loseTheAnswer.set(true);
+
+        org.assertj.core.api.Assertions.catchThrowable(() -> unit.widen(owner));
+        assertThat(meta.selections.get(chainId).tables()).as("what the store took").contains("customers");
+        meta.advanceTableSinkAcked(chainId, "pipe-1", "orders", new ChainPosition(new SourceOrder(epoch, 0), null));
+        Thread.sleep(10 * PhysicalSourcePrefix.TICK_MILLIS);
+
+        assertThat(meta.read(chainId).orElseThrow().sourceReadOffset())
+                .as("what the running stream released while the outcome was unknown").isEqualTo("start");
+        assertThat(source.cdcClosed).as("the stream it was reading still runs").isFalse();
+        assertThat(owner.health().failure()).isEmpty();
+
+        unreadable.set(false);
+        assertThat(unit.widen(owner)).as("a later look settles it").isTrue();
+        assertThat(source.cdcStreams).containsExactly(List.of("orders"), List.of("customers", "orders"));
+        assertThat(source.cdcStart).as("from where the chain stood before the publication")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("start")));
+        owner.close();
+    }
+
+    /** A widening the store did not take, its answer lost too, lets the running stream release again at once. */
+    @Test
+    void aWideningTheStoreDidNotTakeLetsTheRunningStreamReleaseAgain() throws Exception {
+        java.util.concurrent.atomic.AtomicBoolean unwritable = new java.util.concurrent.atomic.AtomicBoolean();
+        InMemoryMeta meta = new InMemoryMeta() {
+            @Override
+            public synchronized boolean replacePhysicalSelection(
+                    String miningChainId, PhysicalSelection current, PhysicalSelection wider) {
+                if (unwritable.get()) {
+                    throw new TapstateException(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE,
+                            Map.of("detail", "the primary is being elected"), null);
+                }
+                return super.replacePhysicalSelection(miningChainId, current, wider);
+            }
+        };
+        FakeSource source = new FakeSource(List.of(), List.of(change(10)));
+        CaptureRunUnit unit = runUnit(source, meta);
+        CaptureRun owner = unit.start(specOver("pipe-1", "k-widen-untaken", "orders"), e -> { });
+        String chainId = owner.chainId().orElseThrow().value();
+        long epoch = meta.read(chainId).orElseThrow().epoch();
+        meta.requestPhysicalTables(chainId, epoch, List.of("customers"));
+        unwritable.set(true);
+
+        org.assertj.core.api.Assertions.catchThrowable(() -> unit.widen(owner));
+        meta.advanceTableSinkAcked(chainId, "pipe-1", "orders", new ChainPosition(new SourceOrder(epoch, 0), null));
+
+        awaitSourceRead(meta, chainId, "src-10");
+        assertThat(owner.health().failure()).isEmpty();
+        owner.close();
+    }
+
+    /**
+     * A publication that fails any other way than with the store unreachable lets the running stream release
+     * again at once: nothing about it is in doubt, and a look that finds nothing left to take on would never come
+     * back to let the stream go.
+     */
+    @Test
+    void aWideningWhosePublicationFailsOtherwiseLetsTheRunningStreamReleaseAgain() throws Exception {
+        java.util.concurrent.atomic.AtomicBoolean broken = new java.util.concurrent.atomic.AtomicBoolean();
+        InMemoryMeta meta = new InMemoryMeta() {
+            @Override
+            public synchronized boolean replacePhysicalSelection(
+                    String miningChainId, PhysicalSelection current, PhysicalSelection wider) {
+                if (broken.get()) {
+                    throw new IllegalStateException("a store double that breaks");
+                }
+                return super.replacePhysicalSelection(miningChainId, current, wider);
+            }
+        };
+        FakeSource source = new FakeSource(List.of(), List.of(change(10)));
+        CaptureRunUnit unit = runUnit(source, meta);
+        CaptureRun owner = unit.start(specOver("pipe-1", "k-widen-broken", "orders"), e -> { });
+        String chainId = owner.chainId().orElseThrow().value();
+        long epoch = meta.read(chainId).orElseThrow().epoch();
+        meta.requestPhysicalTables(chainId, epoch, List.of("customers"));
+        broken.set(true);
+
+        org.assertj.core.api.Assertions.catchThrowable(() -> unit.widen(owner));
+        meta.advanceTableSinkAcked(chainId, "pipe-1", "orders", new ChainPosition(new SourceOrder(epoch, 0), null));
+
+        awaitSourceRead(meta, chainId, "src-10");
+        owner.close();
+    }
+
+    /**
+     * Where the store answers the read that would settle a publication with something other than being out of
+     * reach, the outcome cannot be learned at all: the reader closes and the run fails, rather than read on with
+     * nothing written down. Nothing was released since the publication began, so a reader started again begins
+     * at or before any seam taken after it.
+     */
+    @Test
+    void aWideningWhoseOutcomeTheStoreCannotTellClosesTheReader() throws Exception {
+        java.util.concurrent.atomic.AtomicBoolean loseTheAnswer = new java.util.concurrent.atomic.AtomicBoolean();
+        java.util.concurrent.atomic.AtomicBoolean unreadable = new java.util.concurrent.atomic.AtomicBoolean();
+        InMemoryMeta meta = new InMemoryMeta() {
+            @Override
+            public synchronized boolean replacePhysicalSelection(
+                    String miningChainId, PhysicalSelection current, PhysicalSelection wider) {
+                boolean applied = super.replacePhysicalSelection(miningChainId, current, wider);
+                if (applied && loseTheAnswer.compareAndSet(true, false)) {
+                    unreadable.set(true);
+                    throw new TapstateException(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE,
+                            Map.of("detail", "the answer was lost"), null);
+                }
+                return applied;
+            }
+
+            @Override
+            public synchronized Optional<PhysicalSelection> physicalSelection(String miningChainId) {
+                if (unreadable.get()) {
+                    throw new TapstateException(io.tapstate.spi.store.IoError.DOCUMENT_UNREADABLE,
+                            Map.of("id", miningChainId, "field", "physicalCapture"), null);
+                }
+                return super.physicalSelection(miningChainId);
+            }
+        };
+        FakeSource source = new FakeSource(List.of(), List.of(change(10)));
+        CaptureRunUnit unit = runUnit(source, meta);
+        CaptureRun owner = unit.start(specOver("pipe-1", "k-widen-untellable", "orders"), e -> { });
+        String chainId = owner.chainId().orElseThrow().value();
+        long epoch = meta.read(chainId).orElseThrow().epoch();
+        meta.requestPhysicalTables(chainId, epoch, List.of("customers"));
+        loseTheAnswer.set(true);
+
+        org.assertj.core.api.Assertions.catchThrowable(() -> unit.widen(owner));
+        meta.advanceTableSinkAcked(chainId, "pipe-1", "orders", new ChainPosition(new SourceOrder(epoch, 0), null));
+        Thread.sleep(5 * PhysicalSourcePrefix.TICK_MILLIS);
+
+        assertThat(source.cdcClosed).as("the reader closed").isTrue();
+        assertThat(owner.health().failure()).as("and the run says so").isPresent();
+        assertThat(meta.read(chainId).orElseThrow().sourceReadOffset())
+                .as("nothing released since the publication began").isEqualTo("start");
+        owner.close();
+    }
+
+    /**
+     * A widening whose wider stream cannot be started leaves nothing reading the chain, and
+     * the run says so rather than going on healthy over rings nobody writes.
+     */
+    @Test
+    void aWideningWhoseWiderStreamCannotStartFailsTheRun() {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource source = new FakeSource(List.of(), List.of()).refusingStreamsAfter(1);
+        CaptureRunUnit unit = runUnit(source, meta);
+        CaptureRun owner = unit.start(specOver("pipe-1", "k-widen-refused", "orders"), e -> { });
+        String chainId = owner.chainId().orElseThrow().value();
+        meta.requestPhysicalTables(chainId, meta.read(chainId).orElseThrow().epoch(), List.of("customers"));
+
+        assertThatThrownBy(() -> unit.widen(owner)).hasMessageContaining("refused stream");
+
+        assertThat(owner.health().failure()).as("nothing reads the chain now, and the run says so").isPresent();
+        assertThat(unit.widen(owner)).as("and it is not widened again").isFalse();
+        owner.close();
+    }
+
+    /**
+     * A reader opened again in a generation it already widened -- its claim lost and taken back while a
+     * pipeline on this member still reads the chain -- takes up the subscription that generation got to,
+     * rather than asking for a first one and being refused for ever.
+     */
+    @Test
+    void aReaderOpenedAgainInAGenerationItWidenedTakesUpWhereThatGenerationGotTo() {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource source = new FakeSource(List.of(), List.of());
+        CaptureRunUnit unit = runUnit(source, meta);
+        CaptureRun owner = unit.start(specOver("pipe-1", "k-reopen", "orders"), e -> { });
+        String chainId = owner.chainId().orElseThrow().value();
+        long epoch = meta.read(chainId).orElseThrow().epoch();
+        meta.requestPhysicalTables(chainId, epoch, List.of("customers"));
+        assertThat(unit.widen(owner)).isTrue();
+        CaptureRun reading = unit.start(specOver("pipe-2", "k-reopen", "customers"), e -> { }, false);
+        owner.close();
+
+        CaptureRun reopened = unit.start(specOver("pipe-1", "k-reopen", "orders"), e -> { });
+
+        assertThat(meta.read(chainId).orElseThrow().epoch()).as("the same generation").isEqualTo(epoch);
+        assertThat(source.cdcStreams.getLast()).containsExactly("customers", "orders");
+        reopened.close();
+        reading.close();
+    }
+
+    /**
+     * A pipeline whose ask for a table reaches a chain that has meanwhile moved to another generation is given
+     * back. The ask was not recorded, and the reader that now runs published without it: going on would leave
+     * the pipeline healthy over a ring nobody writes.
+     */
+    @Test
+    void aPipelineWhoseAskReachesAChainThatMovedOnIsGivenBack() {
+        java.util.concurrent.atomic.AtomicBoolean takenOver = new java.util.concurrent.atomic.AtomicBoolean();
+        InMemoryMeta meta = new InMemoryMeta() {
+            @Override
+            public synchronized boolean requestPhysicalTables(String miningChainId, long epoch, List<String> tables) {
+                if (takenOver.compareAndSet(false, true)) {
+                    // A takeover on another member: its generation opens, and its reader publishes what the
+                    // chain's pipelines had selected by then.
+                    long next = openEpoch(miningChainId);
+                    publishPhysicalSelection(miningChainId, new PhysicalSelection(next, List.of("orders")));
+                }
+                return super.requestPhysicalTables(miningChainId, epoch, tables);
+            }
+        };
+        CaptureRun owner = runUnit(new FakeSource(List.of(), List.of()), meta)
+                .start(specOver("pipe-1", "k-moved-on", "orders"), e -> { });
+        String chainId = owner.chainId().orElseThrow().value();
+        CaptureRunUnit elsewhere = runUnit(new FakeSource(List.of(), List.of()), meta);
+
+        assertThatThrownBy(() -> elsewhere.start(specOver("pipe-2", "k-moved-on", "customers"), e -> { }, false))
+                .isInstanceOf(ReaderNotServingYet.class);
+        assertThat(meta.read(chainId).orElseThrow().consumerOffset("pipe-2"))
+                .as("nothing on the record waits for a pipeline that was given back").isEmpty();
+        owner.close();
+    }
+
+    /**
+     * The stream that replaces a widened one is told how far its source may release at once, not only once that
+     * position next changes: on a chain that has gone quiet it may not change for a long time, and a source
+     * that never hears it keeps its log.
+     */
+    @Test
+    void theStreamThatReplacesAWidenedOneIsToldWhereTheChainStands() {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource source = new FakeSource(List.of(), List.of());
+        CaptureRunUnit unit = runUnit(source, meta);
+        CaptureRun owner = unit.start(specOver("pipe-1", "k-widen-told", "orders"), e -> { });
+        String chainId = owner.chainId().orElseThrow().value();
+        assertThat(source.acknowledged.getFirst()).as("the first stream was told where the chain stands")
+                .containsExactly(new SourcePosition("start"));
+        meta.requestPhysicalTables(chainId, meta.read(chainId).orElseThrow().epoch(), List.of("customers"));
+
+        assertThat(unit.widen(owner)).isTrue();
+
+        assertThat(source.acknowledged).hasSize(2);
+        assertThat(source.acknowledged.get(1)).as("and so is the stream that replaced it")
+                .containsExactly(new SourcePosition("start"));
+        owner.close();
+    }
+
+    /**
+     * A reader that looks for tables to take on and finds none asked for writes nothing. It looks every few
+     * seconds for every capture its member owns, so a write per look is a write per capture per interval, for
+     * as long as the member runs.
+     */
+    @Test
+    void aLookThatFindsNothingAskedForWritesNothing() {
+        java.util.concurrent.atomic.AtomicInteger clears = new java.util.concurrent.atomic.AtomicInteger();
+        InMemoryMeta meta = new InMemoryMeta() {
+            @Override
+            public synchronized void clearPhysicalRequests(String miningChainId, List<String> tables) {
+                clears.incrementAndGet();
+                super.clearPhysicalRequests(miningChainId, tables);
+            }
+        };
+        CaptureRunUnit unit = runUnit(new FakeSource(List.of(), List.of()), meta);
+        CaptureRun owner = unit.start(specOver("pipe-1", "k-widen-idle", "orders"), e -> { });
+        int afterOpening = clears.get();
+
+        assertThat(unit.widen(owner)).isFalse();
+        assertThat(unit.widen(owner)).isFalse();
+
+        assertThat(clears.get() - afterOpening).as("writes made by two looks that found nothing asked").isZero();
+        owner.close();
+    }
+
+    /**
+     * A reader that starts again reads its chain from where it was released to, so a pipeline already on the
+     * chain is owed what the new reader mines again before that pipeline's own run comes back -- written into
+     * the ring above the place the pipeline had. Coming back, the pipeline keeps that place rather than
+     * arriving afresh at the ring's end, which would step over every change mined again in between.
+     */
+    @Test
+    void aPipelineComingBackToAReaderThatStartedAgainReadsWhatItMinedAgain() {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chainId = MiningChainId.ofKey("k-mined-again").value();
+        meta.create(chainId, null);
+        long before = meta.openEpoch(chainId);
+        meta.establishPhysicalAnchor(chainId, new ChainPosition(new SourceOrder(before, -1L), "released-to"));
+        meta.selectConsumerTables(chainId, "pipe-back", List.of("customers"), before);
+        meta.startRingAfter(chainId, "pipe-back", "customers", -1L);
+        Envelope minedAgain = Envelope.insert(10L, "customers", Map.of("id", 10), Map.of());
+
+        CaptureRun reader = runUnit(new FakeSource(List.of(), List.of(minedAgain)), meta)
+                .start(specOver("pipe-owner", "k-mined-again", "orders"), e -> { });
+        assertThat(meta.read(chainId).orElseThrow().epoch()).as("a reader of a generation of its own")
+                .isGreaterThan(before);
+        assertThat(hz.getRingbuffer(SrsRingbuffer.ringName(chainId, "customers")).tailSequence())
+                .as("the change mined again is in the ring before the pipeline comes back").isZero();
+
+        CaptureRun back = runUnit(new FakeSource(List.of(), List.of()), meta)
+                .start(specOver("pipe-back", "k-mined-again", "customers"), e -> { }, false);
+
+        assertThat(meta.ringDoneThrough(chainId, "pipe-back"))
+                .as("its place is still below the change mined again, so its run reads it")
+                .containsEntry("customers", -1L);
+        back.close();
+        reader.close();
+    }
+
+    /**
+     * The chain's one change stream keeps the chain's notes whichever pipeline opens it -- the load that
+     * samples its seam as well as the tail -- carried over first from the opening pipeline's own node and
+     * then from that of every other pipeline recorded reading the chain through its ring. A pipeline recorded
+     * reading it directly is left out: its notes name the slot its own reader streams from.
+     */
+    @Test
+    void aSharedReaderAndTheLoadBeforeItKeepTheChainsNotes() {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chainId = MiningChainId.ofKey("chain-notes").value();
+        meta.create(chainId, null);
+        meta.selectConsumerTables(chainId, "reads-the-ring", List.of("orders"), 1L);
+        meta.selectConsumerTables(chainId, "reads-directly", List.of(), 1L);
+        FakeSource source = new FakeSource(List.of(row(1)), List.of());
+
+        runUnit(source, meta).start(specFor("pipe-1", ReadMode.SNAPSHOT_AND_CDC, "chain-notes"), e -> { })
+                .close();
+
+        assertThat(source.opened).as("the load, then the tail").hasSizeGreaterThanOrEqualTo(2)
+                .allSatisfy(config -> {
+                    assertThat(config.sharedNotes()).isNotNull();
+                    assertThat(config.sharedNotes().sharedBy()).isEqualTo(chainId);
+                    assertThat(config.sharedNotes().carriedFrom()).containsExactly(
+                            new PipelineNode("pipe-1", "src-1"), new PipelineNode("reads-the-ring", "src-1"));
+                    assertThat(config.node()).as("still read on this pipeline's behalf")
+                            .isEqualTo(new PipelineNode("pipe-1", "src-1"));
+                });
+    }
+
+    /** A pipeline reading its source directly keeps its node's own notes: its slot is nobody else's. */
+    @Test
+    void aDirectReaderKeepsItsNodesOwnNotes() {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource source = new FakeSource(List.of(), List.of());
+
+        runUnit(source, meta).start(spec(ReadMode.CDC_ONLY, false, "chain-direct-notes"), e -> { }).close();
+
+        assertThat(source.opened).singleElement().satisfies(config -> {
+            assertThat(config.sharedNotes()).isNull();
+            assertThat(config.node()).isEqualTo(new PipelineNode("pipe-1", "src-1"));
+        });
+    }
+
+    /**
+     * Letting go of a source reaches the notes its reads kept: the chain's for a pipeline reading through the
+     * ring -- carried from its own earlier notes alone, as nobody else is left on the chain -- and the node's
+     * own for one reading directly. A read with no tail set nothing up, and is let go of without a word to
+     * the source.
+     */
+    @Test
+    void aSourceIsLetGoOfThroughTheNotesItsReadsKept() {
+        FakeSource source = new FakeSource(List.of(), List.of());
+        CaptureRunUnit unit = runUnit(source, new InMemoryMeta());
+
+        unit.release(spec(ReadMode.CDC_ONLY, true, "chain-released"));
+        unit.release(spec(ReadMode.CDC_ONLY, false, "chain-released"));
+        unit.release(spec(ReadMode.SNAPSHOT_ONLY, true, "chain-released"));
+
+        assertThat(source.released).hasSize(2);
+        assertThat(source.released.get(0).sharedNotes()).isEqualTo(new SharedNotes(
+                MiningChainId.ofKey("chain-released").value(), List.of(new PipelineNode("pipe-1", "src-1"))));
+        assertThat(source.released.get(1).sharedNotes()).isNull();
+        assertThat(source.released.get(1).node()).isEqualTo(new PipelineNode("pipe-1", "src-1"));
+    }
+
+    /**
+     * Writes {@code source}'s changes into {@code chain}'s ring for {@code config()}'s table, bounded by
+     * {@code consumers}, through a reader whose account is kept in a store of its own -- the cases using this
+     * read the ring, not what the chain lets go of -- and stops the reader once its source has handed
+     * everything over.
+     */
+    private static void writeThroughTheRing(
+            CapturePort source, CdcChain chain, Supplier<Collection<ConsumerOffset>> consumers) {
+        InMemoryMeta account = new InMemoryMeta();
+        account.create(chain.miningChainId(), null);
+        long epoch = account.openEpoch(chain.miningChainId());
+        CaptureHealth health = new CaptureHealth();
+        PhysicalSourcePrefix prefix = PhysicalSourcePrefix.shared(
+                account, chain.miningChainId(), epoch, List.of("orders"), health, (table, seq) -> { });
+        CdcPhase.run(source, config(), CaptureStart.present(),
+                Map.of("orders", new CdcPhase.TableRoute(chain, consumers)), health, prefix).close();
+    }
+
+    private static CaptureConfig configOver(String... tables) {
+        return new CaptureConfig("mysql", Map.of("host", "h"), List.of(tables));
+    }
+
+    /** A cdc-only run of {@code pipelineId} over {@code tables}, on the chain keyed {@code srsKey}. */
+    private static CaptureRunSpec specOver(String pipelineId, String srsKey, String... tables) {
+        return new CaptureRunSpec(configOver(tables), ReadMode.CDC_ONLY, srsKey, true, "src-" + pipelineId,
+                pipelineId, StartFrom.latest(), null, 0L);
+    }
+
+    /** A cdc-only run of {@code pipelineId} reading {@code tables} directly, on the chain keyed {@code srsKey}. */
+    private static CaptureRunSpec directSpecOver(String pipelineId, String srsKey, String... tables) {
+        return new CaptureRunSpec(configOver(tables), ReadMode.CDC_ONLY, srsKey, false, "src-" + pipelineId,
+                pipelineId, StartFrom.latest(), null, 0L);
+    }
+
+    private static void awaitAcked(InMemoryMeta meta, String chainId, String pipelineId, String expected)
+            throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (true) {
+            ChainPosition acked = meta.read(chainId).flatMap(record -> record.consumerOffset(pipelineId))
+                    .map(ConsumerOffset::sinkAcked).orElse(null);
+            if (acked != null && expected.equals(acked.token())) {
+                return;
+            }
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError(pipelineId + " never landed " + expected + ", it holds " + acked);
+            }
+            Thread.sleep(PhysicalSourcePrefix.TICK_MILLIS / 2);
+        }
+    }
+
+    private static void awaitSourceRead(InMemoryMeta meta, String chainId, String expected) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (!expected.equals(meta.read(chainId).orElseThrow().sourceReadOffset())) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("the chain never recorded " + expected + ", it holds "
+                        + meta.read(chainId).orElseThrow().sourceReadOffset());
+            }
+            Thread.sleep(PhysicalSourcePrefix.TICK_MILLIS / 2);
+        }
+    }
+
     @Test
     void theReadCursorPublisherResolvesTheStoreMemberSideAndAdvancesTheConsumerCursor() {
         InMemoryMeta meta = new InMemoryMeta();
@@ -1394,26 +2528,27 @@ class CaptureRunUnitTest {
      * a chain with 500 DDLs behind it reads at 6.4 ms where the cursors alone read at 0.5 ms.
      *
      * <p>So this pins two things at once, and the second is the one that would rot silently: a run reads
-     * the cursors once rather than once per bound, and the number of whole-record fetches does not move
-     * when the number of runs does.
+     * the cursors a fixed number of times -- once to bound the ring before it writes, once for the reader's
+     * account after, because a consumer arriving in between is owed the run and only a reading taken after
+     * the write can see it -- and the number of whole-record fetches does not move when the number of runs
+     * does.
      */
     @Test
-    void aRunOfChangesReadsTheCursorsOnceAndNeverFetchesTheWholeRecord() {
+    void aRunOfChangesReadsOnlyTheCursorsAndNeverTheWholeRecord() {
         InMemoryMeta few = new InMemoryMeta();
         runUnit(new FakeSource(List.of(), List.of(change(10), change(11))), few)
-                .start(spec(ReadMode.CDC_ONLY, true, "chain-reads-few"), e -> { });
+                .start(spec(ReadMode.CDC_ONLY, true, "chain-reads-few"), e -> { }).close();
         InMemoryMeta many = new InMemoryMeta();
         runUnit(new FakeSource(List.of(), List.of(
                         change(10), change(11), change(12), change(13), change(14),
                         change(15), change(16), change(17))),
                 many)
-                .start(spec(ReadMode.CDC_ONLY, true, "chain-reads-many"), e -> { });
+                .start(spec(ReadMode.CDC_ONLY, true, "chain-reads-many"), e -> { }).close();
 
-        // One cursor read per run of changes -- not two, which is what asking for each bound separately
-        // costs when both come from the same record.
+        // Two cursor reads per run of changes, whatever the record holds.
         assertThat(many.cursorReads - few.cursorReads)
-                .as("cursor reads scale one-for-one with runs of changes")
-                .isEqualTo(6);
+                .as("cursor reads scale with runs of changes, two apiece")
+                .isEqualTo(12);
         // And the whole record is fetched only by the start path, the same number of times either way:
         // six more runs of changes fetch it not once more.
         assertThat(many.wholeRecordReads)
@@ -1460,11 +2595,23 @@ class CaptureRunUnitTest {
         /** The position this source samples before its bounded read -- where a tail of it must join. */
         private final String seam;
         private Throwable cdcError;
+        /** Where a run carrying no change says the source is, handed over after the changes; null for none. */
+        private String heartbeat;
         boolean cdcStarted;
         int cdcStarts;
         /** Where the run asked this source to begin -- the whole of what a resume is observable as. */
         CaptureStart cdcStart;
         boolean cdcClosed;
+        /** The tables each stream opened over this source subscribed to, in the order they were opened. */
+        final List<List<String>> cdcStreams = new CopyOnWriteArrayList<>();
+        /** The config every read over this source was opened with -- loads and streams -- in order. */
+        final List<CaptureConfig> opened = new CopyOnWriteArrayList<>();
+        /** The config every release of this source was asked with, in order. */
+        final List<CaptureConfig> released = new CopyOnWriteArrayList<>();
+        /** What each stream opened over this source was told it may release, one list per stream, in order. */
+        final List<List<SourcePosition>> acknowledged = new CopyOnWriteArrayList<>();
+        /** How many streams this source opens before it refuses the next one. */
+        private int streamsBeforeRefusing = Integer.MAX_VALUE;
 
         FakeSource(List<Envelope> snapshotRows, List<Envelope> changes) {
             this(snapshotRows, changes, "seam-0");
@@ -1483,8 +2630,27 @@ class CaptureRunUnitTest {
             return this;
         }
 
+        /** Has this source's stream end its changes with a run that carries none, naming {@code token}. */
+        FakeSource withHeartbeatAt(String token) {
+            this.heartbeat = token;
+            return this;
+        }
+
+        /** Has this source refuse every stream after the first {@code streams} it opens. */
+        FakeSource refusingStreamsAfter(int streams) {
+            this.streamsBeforeRefusing = streams;
+            return this;
+        }
+
+        @Override
+        public Optional<TapstateException> release(CaptureConfig config) {
+            released.add(config);
+            return Optional.empty();
+        }
+
         @Override
         public CaptureBatch snapshot(CaptureConfig config) {
+            opened.add(config);
             // A bounded read yields the rows of the streams it selected and no others; an empty selection
             // is every stream the source exposes. The snapshot phase reads one table at a time, so a double
             // that ignored the selection would answer each of those reads with the whole source.
@@ -1498,14 +2664,38 @@ class CaptureRunUnitTest {
             cdcStarted = true;
             cdcStarts++;
             cdcStart = start;
+            cdcStreams.add(List.copyOf(config.streams()));
+            opened.add(config);
+            if (cdcStarts > streamsBeforeRefusing) {
+                throw new IllegalStateException("the source refused stream " + cdcStarts);
+            }
+            List<SourcePosition> told = new CopyOnWriteArrayList<>();
+            acknowledged.add(told);
             if (cdcError != null) {
                 listener.onError(cdcError);
                 return () -> cdcClosed = true;
             }
+            // Where the stream begins, said first, as a connector's stream says it: the position it resumes
+            // from, or one of its own for any other start.
+            listener.onStart(Optional.of(start instanceof CaptureStart.Resume resume
+                    ? resume.position() : new SourcePosition("start")));
             for (Envelope e : changes) {
                 listener.onBatch(java.util.List.of(e), Optional.of(new SourcePosition("src-" + e.ts())));
             }
-            return () -> cdcClosed = true;
+            if (heartbeat != null) {
+                listener.onBatch(List.of(), Optional.of(new SourcePosition(heartbeat)));
+            }
+            return new Subscription() {
+                @Override
+                public void acknowledge(SourcePosition durable) {
+                    told.add(durable);
+                }
+
+                @Override
+                public void close() {
+                    cdcClosed = true;
+                }
+            };
         }
 
         @Override
@@ -1595,9 +2785,11 @@ class CaptureRunUnitTest {
      * clobbering its sink-ack — enough to exercise the run unit's provision, cdc-start, offset and cursor
      * wiring without a store backend.
      */
-    private static final class InMemoryMeta implements SrsMetaStore {
+    static class InMemoryMeta implements SrsMetaStore {
         /** Per chain and pipeline, how far each table's ring is done with -- kept once, never raised here. */
         final Map<String, Map<String, Long>> ringDone = new LinkedHashMap<>();
+        /** Per chain, where a restart resumes when that is not the read offset itself. */
+        private final Map<String, ResumePoint> resumeFrom = new LinkedHashMap<>();
         private volatile String pausedPipeline;
         private volatile CountDownLatch registrationReached;
         private volatile CountDownLatch allowRegistration;
@@ -1635,7 +2827,7 @@ class CaptureRunUnitTest {
         }
 
         @Override
-        public void detachConsumer(String miningChainId, String pipelineId) {
+        public synchronized void detachConsumer(String miningChainId, String pipelineId) {
             SrsMeta m = records.get(miningChainId);
             if (m == null) {
                 return;
@@ -1648,7 +2840,11 @@ class CaptureRunUnitTest {
         }
 
         final List<String> created = new ArrayList<>();
-        /** How often the whole record was fetched, and how often the cursors alone were. */
+        /**
+         * How often the whole record was fetched, and how often the cursors alone were -- counted apart from
+         * the reads the shared re-check thread makes on its own schedule, which say nothing about what a run
+         * of changes costs the thread reading the source.
+         */
         int wholeRecordReads;
         int cursorReads;
         private final Map<String, SrsMeta> records = new LinkedHashMap<>();
@@ -1661,7 +2857,9 @@ class CaptureRunUnitTest {
 
         @Override
         public synchronized List<ConsumerOffset> consumerOffsets(String miningChainId) {
-            cursorReads++;
+            if (!Thread.currentThread().getName().equals("tapstate-physical-prefix")) {
+                cursorReads++;
+            }
             Optional<SrsMeta> record = read(miningChainId);
             // This double answers the narrow read out of the same map, so the line above counted a whole
             // record fetch that a real store would not have made. Take it back off: what this counter is
@@ -1671,7 +2869,7 @@ class CaptureRunUnitTest {
         }
 
         @Override
-        public void create(String miningChainId, String retention) {
+        public synchronized void create(String miningChainId, String retention) {
             if (records.containsKey(miningChainId)) {
                 throw new IllegalStateException("mining chain already seeded: " + miningChainId);
             }
@@ -1686,15 +2884,41 @@ class CaptureRunUnitTest {
         }
 
         @Override
-        public void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
-            SrsMeta m = require(miningChainId);
-            records.put(miningChainId, new SrsMeta(
-                    m.miningChainId(), position, m.consumerOffsets(),
-                    m.schemaHistory(), m.retention(), m.epoch()));
+        public synchronized void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
+            advanceSourceReadOffset(miningChainId, position, true);
         }
 
         @Override
-        public void upsertConsumerOffset(String miningChainId, ConsumerOffset offset) {
+        public synchronized void advanceSourceReadOffset(
+                String miningChainId, ChainPosition position, boolean resumable) {
+            SrsMeta m = require(miningChainId);
+            if (!resumable && !resumeFrom.containsKey(miningChainId) && m.sourceReadOffset() != null) {
+                // A record from before the resume point was kept apart resumes from its read offset; it keeps it.
+                resumeFrom.put(miningChainId, new ResumePoint(m.sourceRead(), m.sourceReadAt()));
+            }
+            records.put(miningChainId, new SrsMeta(
+                    m.miningChainId(), position, m.consumerOffsets(),
+                    m.schemaHistory(), m.retention(), m.epoch()));
+            if (resumable && position.token() != null) {
+                resumeFrom.put(miningChainId, new ResumePoint(position, null));
+            }
+        }
+
+        @Override
+        public synchronized void advanceDirectSourceReadOffset(
+                String miningChainId, ChainPosition position, boolean resumable) {
+            advanceSourceReadOffset(miningChainId, position, resumable);
+            trusted.add(miningChainId);
+        }
+
+        @Override
+        public synchronized java.util.Optional<ResumePoint> resumePoint(String miningChainId) {
+            ResumePoint resume = resumeFrom.get(miningChainId);
+            return resume != null ? java.util.Optional.of(resume) : SrsMetaStore.super.resumePoint(miningChainId);
+        }
+
+        @Override
+        public synchronized void upsertConsumerOffset(String miningChainId, ConsumerOffset offset) {
             SrsMeta m = require(miningChainId);
             List<ConsumerOffset> next = new ArrayList<>(m.consumerOffsets());
             next.removeIf(c -> c.pipelineId().equals(offset.pipelineId()));
@@ -1730,10 +2954,7 @@ class CaptureRunUnitTest {
             Map<String, Long> perTable = new LinkedHashMap<>(existing == null ? Map.of() : existing.perTableSeq());
             perTable.merge(table, lastReadSeq, Math::max);
             ChainPosition ack = existing == null ? null : existing.sinkAcked();
-            next.add(new ConsumerOffset(
-                    pipelineId,
-                    perTable,
-                    ack,
+            next.add(rebuilt(existing, pipelineId, perTable, ack,
                     existing == null ? List.of() : existing.snapshotCompletedTables(),
                     existing == null ? null : existing.cdcStartPosition(),
                     existing == null ? 0L : existing.snapshotEpoch()));
@@ -1743,7 +2964,7 @@ class CaptureRunUnitTest {
         }
 
         @Override
-        public void advanceSinkAcked(String miningChainId, String pipelineId, ChainPosition position) {
+        public synchronized void advanceSinkAcked(String miningChainId, String pipelineId, ChainPosition position) {
             SrsMeta m = require(miningChainId);
             List<ConsumerOffset> next = new ArrayList<>();
             ConsumerOffset existing = null;
@@ -1755,10 +2976,7 @@ class CaptureRunUnitTest {
                 }
             }
             Map<String, Long> perTable = existing == null ? Map.of() : existing.perTableSeq();
-            next.add(new ConsumerOffset(
-                    pipelineId,
-                    perTable,
-                    position,
+            next.add(rebuilt(existing, pipelineId, perTable, position,
                     existing == null ? List.of() : existing.snapshotCompletedTables(),
                     existing == null ? null : existing.cdcStartPosition(),
                     existing == null ? 0L : existing.snapshotEpoch()));
@@ -1768,7 +2986,7 @@ class CaptureRunUnitTest {
         }
 
         @Override
-        public void setCdcStart(
+        public synchronized void setCdcStart(
                 String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch) {
             SrsMeta m = require(miningChainId);
             List<ConsumerOffset> next = new ArrayList<>();
@@ -1780,8 +2998,7 @@ class CaptureRunUnitTest {
                     next.add(consumer);
                 }
             }
-            next.add(new ConsumerOffset(
-                    pipelineId,
+            next.add(rebuilt(existing, pipelineId,
                     existing == null ? Map.of() : existing.perTableSeq(),
                     existing == null ? null : existing.sinkAcked(),
                     existing == null ? List.of() : existing.snapshotCompletedTables(),
@@ -1793,9 +3010,10 @@ class CaptureRunUnitTest {
         }
 
         @Override
-        public long openEpoch(String miningChainId) {
+        public synchronized long openEpoch(String miningChainId) {
             SrsMeta m = require(miningChainId);
-            long opened = m.epoch() + 1;
+            long opened = Math.max(m.epoch(), epochsOpened.getOrDefault(miningChainId, 0L)) + 1;
+            epochsOpened.put(miningChainId, opened);
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), m.consumerOffsets(),
                     m.schemaHistory(), m.retention(), opened));
@@ -1803,7 +3021,18 @@ class CaptureRunUnitTest {
         }
 
         @Override
-        public void appendSchemaVersion(String miningChainId, SchemaVersion version) {
+        public synchronized long openDirectEpoch(String miningChainId) {
+            SrsMeta m = require(miningChainId);
+            long opened = Math.max(m.epoch(), epochsOpened.getOrDefault(miningChainId, 0L)) + 1;
+            epochsOpened.put(miningChainId, opened);
+            return opened;
+        }
+
+        /** Per chain, the highest generation opened on it, shared or direct. */
+        private final Map<String, Long> epochsOpened = new LinkedHashMap<>();
+
+        @Override
+        public synchronized void appendSchemaVersion(String miningChainId, SchemaVersion version) {
             SrsMeta m = require(miningChainId);
             List<SchemaVersion> next = new ArrayList<>(m.schemaHistory());
             next.add(version);
@@ -1813,7 +3042,7 @@ class CaptureRunUnitTest {
         }
 
         @Override
-        public void markSnapshotComplete(String miningChainId, String pipelineId, String table) {
+        public synchronized void markSnapshotComplete(String miningChainId, String pipelineId, String table) {
             SrsMeta m = require(miningChainId);
             // Per pipeline, not per chain: the mark says this pipeline's sink took the table, and the
             // pipelines sharing a chain each write somewhere of their own.
@@ -1831,12 +3060,266 @@ class CaptureRunUnitTest {
             if (!completed.contains(table)) {
                 completed.add(table);
             }
-            consumers.add(new ConsumerOffset(pipelineId, mine == null ? Map.of() : mine.perTableSeq(),
+            consumers.add(rebuilt(mine, pipelineId, mine == null ? Map.of() : mine.perTableSeq(),
                     mine == null ? null : mine.sinkAcked(), completed,
                     mine == null ? null : mine.cdcStartPosition(),
                     mine == null ? 0L : mine.snapshotEpoch()));
             records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), consumers,
                     m.schemaHistory(), m.retention(), m.epoch()));
+        }
+
+        /** A consumer rebuilt with the facets a mutator names, its selection and table acks carried across. */
+        private static ConsumerOffset rebuilt(ConsumerOffset existing, String pipelineId, Map<String, Long> perTable,
+                ChainPosition ack, List<String> completed, String cdcStart, long snapshotEpoch) {
+            return new ConsumerOffset(pipelineId, perTable, ack, completed, cdcStart, snapshotEpoch,
+                    existing == null ? null : existing.selectedTables(),
+                    existing == null ? null : existing.selectedTablesEpoch(),
+                    existing == null ? Map.of() : existing.sinkAckedByTable());
+        }
+
+        @Override
+        public synchronized void selectConsumerTables(
+                String miningChainId, String pipelineId, List<String> tables, long epoch) {
+            SrsMeta m = require(miningChainId);
+            List<String> selected = tables.stream().distinct().sorted().toList();
+            List<ConsumerOffset> next = new ArrayList<>();
+            ConsumerOffset existing = null;
+            for (ConsumerOffset c : m.consumerOffsets()) {
+                if (c.pipelineId().equals(pipelineId)) {
+                    existing = c;
+                } else {
+                    next.add(c);
+                }
+            }
+            Map<String, ChainPosition> retained = new LinkedHashMap<>();
+            if (existing != null && existing.selectedTablesEpoch() != null
+                    && existing.selectedTablesEpoch() == epoch) {
+                existing.sinkAckedByTable().forEach((table, position) -> {
+                    if (selected.contains(table)) {
+                        retained.put(table, position);
+                    }
+                });
+            }
+            if (selected.isEmpty()) {
+                // A pipeline that selects nothing has no place in any ring.
+                ringDone.remove(miningChainId + "/" + pipelineId);
+            }
+            next.add(new ConsumerOffset(pipelineId,
+                    existing == null || selected.isEmpty() ? Map.of() : existing.perTableSeq(),
+                    existing == null ? null : existing.sinkAcked(),
+                    existing == null ? List.of() : existing.snapshotCompletedTables(),
+                    existing == null ? null : existing.cdcStartPosition(),
+                    existing == null ? 0L : existing.snapshotEpoch(),
+                    selected, epoch, retained));
+            records.put(miningChainId, new SrsMeta(
+                    m.miningChainId(), m.sourceRead(), next,
+                    m.schemaHistory(), m.retention(), m.epoch()));
+        }
+
+        @Override
+        public synchronized void advanceTableSinkAcked(
+                String miningChainId, String pipelineId, String table, ChainPosition position) {
+            SrsMeta m = require(miningChainId);
+            List<ConsumerOffset> next = new ArrayList<>();
+            ConsumerOffset existing = null;
+            for (ConsumerOffset c : m.consumerOffsets()) {
+                if (c.pipelineId().equals(pipelineId)) {
+                    existing = c;
+                } else {
+                    next.add(c);
+                }
+            }
+            ChainPosition prior = existing == null ? null : existing.sinkAckedByTable().get(table);
+            if (prior != null && prior.order().compareTo(position.order()) >= 0) {
+                return;
+            }
+            Map<String, ChainPosition> acks =
+                    new LinkedHashMap<>(existing == null ? Map.of() : existing.sinkAckedByTable());
+            acks.put(table, position);
+            next.add(new ConsumerOffset(pipelineId,
+                    existing == null ? Map.of() : existing.perTableSeq(),
+                    existing == null ? null : existing.sinkAcked(),
+                    existing == null ? List.of() : existing.snapshotCompletedTables(),
+                    existing == null ? null : existing.cdcStartPosition(),
+                    existing == null ? 0L : existing.snapshotEpoch(),
+                    existing == null ? null : existing.selectedTables(),
+                    existing == null ? null : existing.selectedTablesEpoch(),
+                    acks));
+            records.put(miningChainId, new SrsMeta(
+                    m.miningChainId(), m.sourceRead(), next,
+                    m.schemaHistory(), m.retention(), m.epoch()));
+            // Only a sequence of the ring this pipeline is positioned in says where a run of it carries on.
+            boolean itsRing = existing == null || existing.selectedTables() == null
+                    || existing.selects(table) && existing.selectedTablesEpoch() == position.order().epoch();
+            if (position.order().seq() >= 0 && itsRing) {
+                ringDone.computeIfAbsent(miningChainId + "/" + pipelineId, key -> new LinkedHashMap<>())
+                        .merge(table, position.order().seq(), Math::max);
+            }
+        }
+
+        /** The chains whose source read offset every table they carry can resume from. */
+        final java.util.Set<String> trusted = new java.util.HashSet<>();
+        /** What each chain's reader subscribed to. */
+        final Map<String, PhysicalSelection> selections = new LinkedHashMap<>();
+        /** Tables asked for by pipelines arriving on each chain, until a subscription serves them. */
+        private final Map<String, java.util.Set<String>> requests = new LinkedHashMap<>();
+        /** Every generation-fenced release of the source read offset, in the order they landed. */
+        final List<ChainPosition> releasedSourceReads = new ArrayList<>();
+        /** How many writes the reader's releases have made, whichever call made them. */
+        int releaseWrites;
+
+        @Override
+        public synchronized boolean replacePhysicalSelection(
+                String miningChainId, PhysicalSelection current, PhysicalSelection wider) {
+            SrsMeta m = require(miningChainId);
+            if (m.epoch() != wider.epoch() || !current.equals(selections.get(miningChainId))
+                    || !wider.tables().containsAll(requests.getOrDefault(miningChainId, java.util.Set.of()))) {
+                return false;
+            }
+            selections.put(miningChainId, wider);
+            return true;
+        }
+
+        @Override
+        public synchronized List<String> requestedPhysicalTables(String miningChainId) {
+            return requests.getOrDefault(miningChainId, java.util.Set.of()).stream().sorted().toList();
+        }
+
+        @Override
+        public synchronized boolean requestPhysicalTables(String miningChainId, long epoch, List<String> tables) {
+            if (require(miningChainId).epoch() != epoch) {
+                return false;
+            }
+            requests.computeIfAbsent(miningChainId, chain -> new java.util.TreeSet<>()).addAll(tables);
+            return true;
+        }
+
+        @Override
+        public synchronized void clearPhysicalRequests(String miningChainId, List<String> tables) {
+            require(miningChainId);
+            java.util.Set<String> asked = requests.get(miningChainId);
+            if (asked != null) {
+                tables.forEach(asked::remove);
+            }
+        }
+
+        @Override
+        public synchronized Optional<PhysicalSelection> physicalSelection(String miningChainId) {
+            return Optional.ofNullable(selections.get(miningChainId));
+        }
+
+        @Override
+        public synchronized boolean publishPhysicalSelection(String miningChainId, PhysicalSelection selection) {
+            SrsMeta m = require(miningChainId);
+            PhysicalSelection current = selections.get(miningChainId);
+            if (!selection.tables().containsAll(requests.getOrDefault(miningChainId, java.util.Set.of()))) {
+                return false;
+            }
+            if (m.epoch() != selection.epoch() || current != null && current.epoch() >= selection.epoch()) {
+                return current != null && current.equals(selection);
+            }
+            selections.put(miningChainId, selection);
+            return true;
+        }
+
+        @Override
+        public synchronized boolean advancePhysicalSourceReadOffset(
+                String miningChainId, long epoch, ChainPosition position) {
+            return advancePhysicalSourceReadOffset(miningChainId, epoch, position, true);
+        }
+
+        @Override
+        public synchronized boolean advancePhysicalSourceReadOffset(
+                String miningChainId, long epoch, ChainPosition position, boolean resumable) {
+            releaseWrites++;
+            SrsMeta m = require(miningChainId);
+            if (m.epoch() != epoch) {
+                return false;
+            }
+            if (ranksAfter(position, m.sourceRead())) {
+                if (!resumable && !resumeFrom.containsKey(miningChainId) && m.sourceReadOffset() != null) {
+                    // A record from before the resume point was kept apart resumes from its read offset; it keeps it.
+                    resumeFrom.put(miningChainId, new ResumePoint(m.sourceRead(), m.sourceReadAt()));
+                }
+                releasedSourceReads.add(position);
+                records.put(miningChainId, new SrsMeta(m.miningChainId(), position, m.consumerOffsets(),
+                        m.schemaHistory(), m.retention(), m.epoch()));
+                if (resumable && position.token() != null) {
+                    resumeFrom.put(miningChainId, new ResumePoint(position, null));
+                }
+            }
+            return true;
+        }
+
+        @Override
+        public synchronized boolean physicalPrefixTrusted(String miningChainId) {
+            return trusted.contains(miningChainId);
+        }
+
+        @Override
+        public synchronized boolean establishPhysicalAnchor(String miningChainId, ChainPosition position) {
+            SrsMeta m = require(miningChainId);
+            long epoch = position.order().epoch();
+            if (m.epoch() != epoch) {
+                return false;
+            }
+            ChainPosition stored = m.sourceRead();
+            boolean trustedNow = trusted.contains(miningChainId);
+            if (stored == null || stored.token() == null
+                    || trustedNow && (stored.order() == null || stored.order().epoch() < epoch)) {
+                records.put(miningChainId, new SrsMeta(m.miningChainId(), position, m.consumerOffsets(),
+                        m.schemaHistory(), m.retention(), m.epoch()));
+                resumeFrom.put(miningChainId, new ResumePoint(position, null));
+                trusted.add(miningChainId);
+                return true;
+            }
+            return trustedNow;
+        }
+
+        @Override
+        public synchronized boolean trustSourceReadOffset(String miningChainId, long epoch) {
+            if (require(miningChainId).epoch() != epoch) {
+                return false;
+            }
+            trusted.add(miningChainId);
+            return true;
+        }
+
+        @Override
+        public synchronized boolean advancePhysicalSinkAcked(
+                String miningChainId, String pipelineId, long epoch, ChainPosition position) {
+            releaseWrites++;
+            SrsMeta m = require(miningChainId);
+            if (m.epoch() != epoch) {
+                return false;
+            }
+            Optional<ConsumerOffset> existing = m.consumerOffset(pipelineId);
+            if (existing.isPresent() && ranksAfter(position, existing.get().sinkAcked())) {
+                advanceSinkAcked(miningChainId, pipelineId, position);
+            }
+            return true;
+        }
+
+        @Override
+        public synchronized boolean advancePhysicalRelease(String miningChainId, long epoch,
+                Map<String, ChainPosition> acknowledged, ChainPosition resumeAt, ChainPosition position) {
+            int writes = releaseWrites;
+            if (require(miningChainId).epoch() != epoch) {
+                releaseWrites = writes + 1;
+                return false;
+            }
+            acknowledged.forEach((pipeline, landed) -> advancePhysicalSinkAcked(miningChainId, pipeline, epoch, landed));
+            if (resumeAt != null && !resumeAt.equals(position)) {
+                advancePhysicalSourceReadOffset(miningChainId, epoch, resumeAt, true);
+            }
+            advancePhysicalSourceReadOffset(miningChainId, epoch, position, position.equals(resumeAt));
+            // One act, however many facets it moved.
+            releaseWrites = writes + 1;
+            return true;
+        }
+
+        private static boolean ranksAfter(ChainPosition candidate, ChainPosition stored) {
+            return stored == null || stored.order() == null || stored.order().compareTo(candidate.order()) < 0;
         }
 
         private SrsMeta require(String miningChainId) {

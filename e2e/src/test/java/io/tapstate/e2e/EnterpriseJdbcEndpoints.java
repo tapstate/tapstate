@@ -1,7 +1,6 @@
 package io.tapstate.e2e;
 
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -30,7 +29,7 @@ abstract class EnterpriseJdbcEndpoints implements Endpoints {
 
     Connection connect(EndpointAddress address) throws SQLException {
         String user = address.settings().containsKey("user") ? address.text("user") : address.text("username");
-        return DriverManager.getConnection(url(address), user, address.text("password"));
+        return JdbcConnections.open(url(address), user, address.text("password"));
     }
 
     private boolean exists(Connection connection, EndpointAddress address, String table) throws SQLException {

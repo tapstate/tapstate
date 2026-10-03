@@ -7,6 +7,7 @@ import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.ResumePoint;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
 
@@ -24,9 +25,17 @@ import java.util.TreeSet;
 /**
  * Reads where a pipeline picks up from, and moves it.
  *
- * <p>What it moves is the chain's own read offset, because that is what a run actually starts from. The
- * per-pipeline acked position is reported beside it and never written: it records what a sink confirmed,
- * and no request can make that true.
+ * <p>What it reports and moves is the chain's resume point, because that is what a run actually starts from.
+ * The chain's read offset can stand past it -- a read carries on through runs that carried no change -- and
+ * how far that got is how far the source may release its log, not where the next run begins; a write-back
+ * moves the two together. The per-pipeline acked position is reported beside it and never written: it
+ * records what a sink confirmed, and no request can make that true.
+ *
+ * <p>A pipeline reading the chain's source directly resumes from a position of its own before the chain's --
+ * the last of its changes it landed, else where it last began -- and that is what is reported and moved for
+ * it. The chain's position belongs to the shared reader, which moves it on the word of the pipelines reading
+ * through the ring alone; moved for a pipeline that does not read through it, it would move where those
+ * pipelines resume.
  *
  * <p>Everything the request could be refused for is decided before anything is written. A write-back that
  * names two chains and is going to be refused for the second must not have moved the first — half of one
@@ -96,8 +105,15 @@ public final class PipelinePositionService {
         return auditGate.dispatch(
                 ControlOperations.PIPELINE_SET_POSITION, new AuditContext(caller, pipelineId), () -> {
                     moves.forEach((chainId, token) -> {
-                        releaseTheAcksThatWouldOutrankIt(chainId);
-                        meta.rewindSourceReadOffset(chainId, token);
+                        Optional<ConsumerOffset> direct = meta.read(chainId)
+                                .flatMap(record -> record.consumerOffset(pipelineId))
+                                .filter(PipelinePositionService::readsDirectly);
+                        if (direct.isPresent()) {
+                            moveItsOwnPosition(chainId, direct.get(), token);
+                        } else {
+                            releaseTheAcksThatWouldOutrankIt(chainId);
+                            meta.rewindSourceReadOffset(chainId, token);
+                        }
                     });
                     return read(pipelineId);
                 });
@@ -123,15 +139,36 @@ public final class PipelinePositionService {
      */
     private void releaseTheAcksThatWouldOutrankIt(String chainId) {
         for (ConsumerOffset offset : meta.read(chainId).map(SrsMeta::consumerOffsets).orElse(List.of())) {
-            if (offset.sinkAcked() != null) {
-                // Rewritten rather than deleted: the read cursor and the tables whose initial load this
-                // pipeline finished are answers about work that did happen, and moving the tail says
-                // nothing about either.
-                meta.upsertConsumerOffset(chainId, new ConsumerOffset(offset.pipelineId(),
-                        offset.perTableSeq(), null, offset.snapshotCompletedTables(),
-                        offset.cdcStartPosition(), offset.snapshotEpoch()));
+            // A pipeline reading directly resumes from its own position, which this move is not about.
+            if (offset.sinkAcked() != null && !readsDirectly(offset)) {
+                // Only the acknowledgements go: the read cursor, the tables whose initial load this pipeline
+                // finished and its writers' plan are answers about work that did happen, and moving the tail
+                // says nothing about any of them. A record rewritten whole would lose the writers' plan, and a
+                // pipeline with several writers could not start again.
+                meta.releaseSinkAcknowledgements(chainId, offset.pipelineId());
             }
         }
+    }
+
+    /**
+     * Moves where a pipeline reading the chain's source directly resumes: its own recorded start becomes
+     * {@code token}, and what it landed is let go of, so its next run picks up there. Its load's generation,
+     * its finished loads, its selection and its writers' plan stay. Alone on the chain, its position is the
+     * chain's as well, and the chain is moved with it: a pipeline turning the buffering on later picks up where
+     * the chain says.
+     */
+    private void moveItsOwnPosition(String chainId, ConsumerOffset offset, String token) {
+        meta.moveConsumerStart(chainId, offset.pipelineId(), token);
+        boolean alone = meta.read(chainId).map(record -> record.consumerOffsets().stream()
+                .allMatch(consumer -> consumer.pipelineId().equals(offset.pipelineId()))).orElse(true);
+        if (alone) {
+            meta.rewindSourceReadOffset(chainId, token);
+        }
+    }
+
+    /** Whether the pipeline reads the chain through a direct tail of its own: it selects nothing from the ring. */
+    private static boolean readsDirectly(ConsumerOffset offset) {
+        return offset.selectedTables() != null && offset.selectedTables().isEmpty();
     }
 
     /** The stored chain the request names, or a coded refusal naming the ones this pipeline does read. */
@@ -236,6 +273,7 @@ public final class PipelinePositionService {
     /** One chain's reading: where it resumes, when that was written, this pipeline's ack, and who shares it. */
     private PipelinePosition.Chain report(String pipelineId, PipelineChains.Chain chain) {
         Optional<SrsMeta> record = meta.read(chain.chainId());
+        Optional<ResumePoint> resume = meta.resumePoint(chain.chainId());
         Optional<ConsumerOffset> mine = record.stream()
                 .flatMap(found -> found.consumerOffsets().stream())
                 .filter(offset -> offset.pipelineId().equals(pipelineId))
@@ -246,12 +284,17 @@ public final class PipelinePositionService {
                 shared.add(offset.pipelineId());
             }
         }));
+        // A pipeline reading directly resumes from its own position while it has one; when that was written
+        // is not recorded.
+        Optional<PipelinePosition.Point> own = mine.filter(PipelinePositionService::readsDirectly)
+                .flatMap(offset -> Optional.ofNullable(pointOf(offset.sinkAcked()))
+                        .or(() -> Optional.ofNullable(offset.cdcStartPosition()).map(PipelinePosition.Point::at)));
         return new PipelinePosition.Chain(
                 chain.chainId(),
                 chain.sourceId(),
                 chain.tables(),
-                pointOf(record.map(SrsMeta::sourceRead).orElse(null)),
-                record.map(SrsMeta::sourceReadAt).map(Instant::toString).orElse(null),
+                own.orElseGet(() -> pointOf(resume.map(ResumePoint::position).orElse(null))),
+                own.isPresent() ? null : resume.map(ResumePoint::recordedAt).map(Instant::toString).orElse(null),
                 pointOf(mine.map(ConsumerOffset::sinkAcked).orElse(null)),
                 List.copyOf(shared));
     }

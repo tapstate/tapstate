@@ -38,7 +38,6 @@ import io.tapstate.runtime.engine.FrontierOrders;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.SnapshotBuffer;
-import io.tapstate.runtime.srs.SrsDurableFrontier;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.SrsItem;
@@ -61,6 +60,7 @@ import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.SrsMetaStore;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -71,6 +71,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.UnaryOperator;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -348,32 +349,22 @@ class CaptureToSinkAckFrontierTest {
     }
 
     /**
-     * A pipeline reading its source directly still counts when the chain works out what it may forget.
+     * A pipeline reading its source directly, beside one reading it through the shared ring, comes back from
+     * what it landed itself rather than from where the chain got to.
      *
-     * <p>Turning the shared buffer off changes where a pipeline reads from. It must not change whether the
-     * chain knows it is there: the frontier is the slowest consumer's acked position, and a consumer the
-     * frontier cannot see is one it will pass -- taking the record past changes that pipeline has not
-     * landed, which is the loss that leaves nothing behind to find.
+     * <p>Turning the shared buffer off changes where a pipeline reads from, and with it whose word moves its
+     * position. The chain's position is the shared reader's, released on the word of the pipelines reading
+     * through the ring; the directly-read pipeline is owed nothing by it. So a direct pipeline keeps a position
+     * of its own, and resuming from the chain's instead would step over every change it forwarded and had not
+     * landed when it stopped -- the loss that leaves nothing behind to find.
      *
-     * <p>Two consumers, and that is not decoration. With one, a frontier that has lost sight of it takes a
-     * minimum over nothing and returns nothing at all -- the same answer as a frontier that is correctly
-     * held back, so the case would pass either way. It takes a second, faster consumer for "the slow one
-     * was ignored" and "the slow one held it" to be different values.
-     *
-     * <p>The faster one is moved ahead by hand rather than by racing it. What is under test is whether the
-     * direct pipeline is in the set the minimum is taken over, and a race that happened to leave them level
-     * would make the two readings equal again -- passing, and saying nothing.
-     *
-     * <p>No mutation stands behind this one, and the reason is worth more than a mutation would be: there
-     * is no branch to break. What puts a pipeline in that set is the acknowledgement wiring, and the wiring
-     * walks the pipeline's sources and resolves each one's chain without ever reading the buffering switch.
-     * A direct pipeline is not admitted by a special case; it is admitted because nothing asks. So this is
-     * a guard against that distinction being introduced rather than a witness of it being absent -- and it
-     * is not a vacuous one: it reddens the day anyone adds the branch, which is the day it would matter.
+     * <p>The chain is moved far ahead by hand rather than by racing the buffered pipeline: what is under test
+     * is which of the two positions the direct pipeline comes back from, and a race that left them level would
+     * make the two readings equal -- passing, and saying nothing.
      */
     @Test
-    @DisplayName("a directly-read pipeline is still one of the consumers the frontier waits for")
-    void aDirectlyReadPipelineStillCountsInTheChainsFrontier() {
+    @DisplayName("a directly-read pipeline comes back from what it landed, not from where the chain got to")
+    void aDirectlyReadPipelineComesBackFromWhatItLandedNotFromWhereTheChainGotTo() {
         InMemoryStorePort store = seedStoreWithADirectPeer();
         GatedSource gatedSource = new GatedSource();
         LifecycleActuator actuator = wireRuntime(store, gatedSource, UnaryOperator.identity());
@@ -386,39 +377,28 @@ class CaptureToSinkAckFrontierTest {
         actuator.start(DIRECT_PIPELINE);
         try {
             // Fed until the chain knows both of them, rather than until two changes have arrived
-            // somewhere. A start returns before the pipeline it started is reading, and the directly-read
-            // one reads the source live -- so a change made before it attached is not late for it, it is
-            // before its beginning and it never sees one. Nothing else says when that attach finished,
-            // which is why this keeps making changes rather than waiting for one.
+            // somewhere. A start returns before the pipeline it started is reading, and nothing says when
+            // that attach finished. A real source read live never hands a reader a change made before it
+            // attached, so this keeps making changes rather than waiting for one; the fake source here
+            // replays its whole log to each subscription, and the wait does not lean on that.
             awaitBothConsumersAcked(gatedSource, meta, chainId);
+            assertThat(meta.read(chainId).orElseThrow().consumerOffset(DIRECT_PIPELINE).orElseThrow().perTableSeq())
+                    .as("cursors the directly-read pipeline's job published into the chain's rings: it reads its "
+                            + "own hand-off alone, and a cursor it left would hold the shared reader back")
+                    .isEmpty();
+            actuator.stop(DIRECT_PIPELINE, false);
+            ChainPosition landed = directAckedPosition(meta, chainId);
+            assertThat(landed).as("what the direct pipeline landed before it stopped").isNotNull();
 
-            assertThat(meta.consumerOffsets(chainId))
-                    .as("the consumers the chain knows about: the switch decides where a pipeline reads "
-                            + "from, not whether the chain can see it")
-                    .extracting(ConsumerOffset::pipelineId)
-                    .containsExactlyInAnyOrder(PIPELINE, DIRECT_PIPELINE);
+            // The chain races far ahead, as the shared reader moves it on its own pipelines' word.
+            meta.advanceSourceReadOffset(chainId, new ChainPosition(
+                    new SourceOrder(landed.order().epoch() + 1_000, 0), "src-far"));
 
-            ChainPosition acked = directAckedPosition(meta, chainId);
-            assertThat(acked).as("the direct pipeline's own acked position").isNotNull();
+            actuator.start(DIRECT_PIPELINE);
 
-            // The other one races ahead. By hand, because what is under test is membership of the set the
-            // minimum is taken over -- and a race that left them level would make both readings equal.
-            ChainPosition farAhead = new ChainPosition(
-                    new SourceOrder(acked.order().epoch(), acked.order().seq() + 1_000), "src-far");
-            meta.advanceSinkAcked(chainId, PIPELINE, farAhead);
-
-            // One reading of the record, so the set the minimum is taken over and the value it is
-            // compared against come from the same moment. The wait above ends as soon as the direct
-            // pipeline has acked once, which is while it may still be acking: taken from two readings,
-            // this would compare a minimum over the later one against a position read from the earlier,
-            // and differ for that reason alone.
-            List<ConsumerOffset> offsets = meta.consumerOffsets(chainId);
-            assertThat(SrsDurableFrontier.safeAdvance(farAhead, offsets))
-                    .as("what the chain may forget once one consumer has run far ahead: the direct one is "
-                            + "still in the minimum, so the answer is where it got to and not where the "
-                            + "fast one did. Left out of the set, this is the fast one's position and the "
-                            + "record moves past changes the direct pipeline has not landed")
-                    .contains(directAckedIn(offsets));
+            assertThat(gatedSource.startOf(DIRECT_PIPELINE))
+                    .as("where the direct pipeline's stream begins once it is back")
+                    .isEqualTo(CaptureStart.resume(new SourcePosition(landed.token())));
         } finally {
             actuator.stop(DIRECT_PIPELINE, true);
             actuator.stop(PIPELINE, true);
@@ -555,16 +535,33 @@ class CaptureToSinkAckFrontierTest {
     /**
      * A fake connector whose cdc stream is driven on demand: {@code cdc} starts a daemon that emits each fed
      * change to the listener, so the test can release changes one at a time while the pipeline runs live.
+     *
+     * <p>Its change log is whatever the case feeds it. Each subscription reads all of it on its own -- every
+     * change fed before it opened, then every one fed while it is open -- and is stopped by its own close alone,
+     * as two readers of one source each read its whole log. A queue and a running flag shared by every
+     * subscription instead handed each change to whichever reader polled first, and let one reader's close stop
+     * the other's delivery for good: a pipeline reading the source directly, opened before the buffered
+     * pipeline's reader was closed and opened again, then never saw another change.
      */
     private static final class GatedSource implements CapturePort {
 
-        private final LinkedBlockingQueue<Envelope> pending = new LinkedBlockingQueue<>();
-        private volatile boolean running;
+        private final List<Envelope> fed = new ArrayList<>();
+        private final List<LinkedBlockingQueue<Envelope>> open = new ArrayList<>();
         private volatile boolean cdcClosed;
-        private Thread daemon;
 
-        void feed(Envelope change) {
-            pending.add(change);
+        synchronized void feed(Envelope change) {
+            fed.add(change);
+            open.forEach(subscription -> subscription.add(change));
+        }
+
+        private synchronized LinkedBlockingQueue<Envelope> subscribe() {
+            LinkedBlockingQueue<Envelope> pending = new LinkedBlockingQueue<>(fed);
+            open.add(pending);
+            return pending;
+        }
+
+        private synchronized void unsubscribe(LinkedBlockingQueue<Envelope> pending) {
+            open.remove(pending);
         }
 
         @Override
@@ -572,11 +569,23 @@ class CaptureToSinkAckFrontierTest {
             return new FakeBatch();
         }
 
+        /** Where the last stream opened for each pipeline began. */
+        private final java.util.Map<String, CaptureStart> starts = new java.util.concurrent.ConcurrentHashMap<>();
+
+        CaptureStart startOf(String pipelineId) {
+            return starts.get(pipelineId);
+        }
+
         @Override
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
-            running = true;
-            daemon = new Thread(() -> {
-                while (running) {
+            starts.put(config.node().pipelineId(), start);
+            // Where the stream begins, said before anything else, as a connector's stream says it.
+            listener.onStart(java.util.Optional.of(start instanceof CaptureStart.Resume resume
+                    ? resume.position() : new SourcePosition("start")));
+            LinkedBlockingQueue<Envelope> pending = subscribe();
+            AtomicBoolean running = new AtomicBoolean(true);
+            Thread daemon = new Thread(() -> {
+                while (running.get()) {
                     try {
                         Envelope change = pending.poll(25, TimeUnit.MILLISECONDS);
                         if (change != null) {
@@ -591,7 +600,8 @@ class CaptureToSinkAckFrontierTest {
             daemon.setDaemon(true);
             daemon.start();
             return () -> {
-                running = false;
+                running.set(false);
+                unsubscribe(pending);
                 cdcClosed = true;
                 daemon.interrupt();
             };

@@ -73,8 +73,9 @@ class MongoSinkAcknowledgementFenceIT {
             store.advanceSinkWriterAcked(CHAIN, PIPELINE, "writer-2", TABLE, position(1), fence);
             store.markSinkWriterSnapshotComplete(CHAIN, PIPELINE, "writer-2", TABLE, fence);
             assertThat(store.read(CHAIN).orElseThrow().snapshotCompletedTables(PIPELINE)).containsExactly(TABLE);
-            assertThat(store.read(CHAIN).orElseThrow().consumerOffset(PIPELINE).orElseThrow().sinkAcked())
-                    .isEqualTo(position(1));
+            var consumer = store.read(CHAIN).orElseThrow().consumerOffset(PIPELINE).orElseThrow();
+            assertThat(consumer.sinkAckedByTable()).containsEntry(TABLE, position(1));
+            assertThat(consumer.sinkAcked()).as("a writer's word never moves the chain-level position").isNull();
             assertThat(store.ringDoneThrough(CHAIN, PIPELINE)).containsEntry(TABLE, 1L);
         });
     }

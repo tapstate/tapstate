@@ -2,7 +2,9 @@ package io.tapstate.adapters.pdk;
 
 import io.tapdata.entity.utils.cache.KVMap;
 import io.tapstate.spi.store.KeyedStateStore;
+import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * The scratch map a connector reaches through its driving context, held under a namespace of its own so
@@ -26,15 +28,39 @@ import java.util.Objects;
  * {@code putIfAbsent}) returns a detached snapshot with mutable lists, maps and byte arrays. Editing
  * that snapshot changes no stored state until {@code put} is called with it. Reads always consult the
  * store so another connector's writes are visible; no per-open object cache hides them.
+ *
+ * <p>A map can carry notes over from namespaces that kept them before, key by key: a key its own namespace
+ * does not hold is looked for in each of those in turn, and the first value found is written into its own
+ * namespace and read from there from then on. Nothing is copied wholesale -- the store cannot list a
+ * namespace, and a note nobody asks for is one nobody needs. Those namespaces are other nodes' own notes, and
+ * are never written to: a key removed here is removed here and marked removed under a key of its own, and a
+ * cleared map marks itself cleared, so that nothing comes back from where it was carried from while every other
+ * node keeps what it kept. The key itself is left absent rather than written over, so that claiming it again
+ * stays one act of the store's.
  */
 final class DurableStateMap implements KVMap<Object> {
 
+    /** What a mark holds: only whether one is there is ever read. */
+    private static final byte[] MARK = new byte[0];
+
+    /** The key a cleared map that carries notes over keeps, saying nothing is to be carried over any more. */
+    private static final String CARRYING_ENDED = "__tapstate.carried-over.ended__";
+
+    /** The prefix of the key a map that carries notes over keeps for each key forgotten here. */
+    private static final String FORGOTTEN = "__tapstate.carried-over.forgotten__.";
+
     private final KeyedStateStore store;
     private final String namespace;
+    private final List<String> carriedFrom;
 
     DurableStateMap(KeyedStateStore store, String namespace) {
+        this(store, namespace, List.of());
+    }
+
+    DurableStateMap(KeyedStateStore store, String namespace, List<String> carriedFrom) {
         this.store = Objects.requireNonNull(store, "store");
         this.namespace = Objects.requireNonNull(namespace, "namespace");
+        this.carriedFrom = List.copyOf(Objects.requireNonNull(carriedFrom, "carriedFrom"));
     }
 
     @Override
@@ -46,7 +72,7 @@ final class DurableStateMap implements KVMap<Object> {
     @Override
     public void put(String key, Object value) {
         if (value == null) {
-            store.delete(namespace, key);
+            forget(key);
             return;
         }
         store.save(namespace, key, ConnectorStateCodec.encode(value));
@@ -58,6 +84,10 @@ final class DurableStateMap implements KVMap<Object> {
             // Nothing to claim the key with; report what is there without touching it.
             return get(key);
         }
+        Object present = get(key);
+        if (present != null) {
+            return present;
+        }
         return store.saveIfAbsent(namespace, key, ConnectorStateCodec.encode(value))
                 .map(ConnectorStateCodec::decode)
                 .orElse(null);
@@ -65,25 +95,77 @@ final class DurableStateMap implements KVMap<Object> {
 
     @Override
     public Object get(String key) {
-        return store.load(namespace, key).map(ConnectorStateCodec::decode).orElse(null);
+        Optional<byte[]> own = store.load(namespace, key);
+        if (own.isPresent()) {
+            return ConnectorStateCodec.decode(own.get());
+        }
+        if (carriedFrom.isEmpty() || store.load(namespace, CARRYING_ENDED).isPresent() || forgotten(key)) {
+            return null;
+        }
+        for (String earlier : carriedFrom) {
+            Optional<byte[]> kept = store.load(earlier, key);
+            if (kept.isPresent()) {
+                // Written here before it is read from here, so whoever opens these notes next finds it
+                // without looking back; a concurrent carrier or claimer that got there first wins.
+                Optional<byte[]> first = store.saveIfAbsent(namespace, key, kept.get());
+                if (first.isPresent()) {
+                    return ConnectorStateCodec.decode(first.get());
+                }
+                if (forgotten(key) || store.load(namespace, CARRYING_ENDED).isPresent()) {
+                    // Forgotten here, or the notes cleared, while it was being carried over: the forgetting stands.
+                    // Only what this carried is taken back -- a note another opening wrote since is its own. The
+                    // store has no conditional delete, so a write landing between the look and the delete is
+                    // still lost, and until the delete another opening reading the key sees what was carried;
+                    // both windows are a read and a write wide.
+                    Optional<byte[]> now = store.load(namespace, key);
+                    if (now.isPresent() && java.util.Arrays.equals(now.get(), kept.get())) {
+                        store.delete(namespace, key);
+                        return null;
+                    }
+                    return now.map(ConnectorStateCodec::decode).orElse(null);
+                }
+                return ConnectorStateCodec.decode(kept.get());
+            }
+        }
+        return null;
     }
 
     @Override
     public Object remove(String key) {
         Object previous = get(key);
-        store.delete(namespace, key);
+        forget(key);
         return previous;
+    }
+
+    /**
+     * Removes {@code key} here. Where notes are carried over it is marked removed as well, so no later read
+     * brings it back from where it was carried from, and that namespace -- another node's own -- is left alone.
+     * Marked before it is removed, so no read in between finds it gone with nothing to keep it from coming back.
+     */
+    private void forget(String key) {
+        if (!carriedFrom.isEmpty()) {
+            store.save(namespace, FORGOTTEN + key, MARK);
+        }
+        store.delete(namespace, key);
+    }
+
+    private boolean forgotten(String key) {
+        return store.load(namespace, FORGOTTEN + key).isPresent();
     }
 
     @Override
     public void clear() {
         // Naming the namespace is the only bulk operation the store has, and it is the one that fits:
-        // there is no way to list the keys, and nothing here needs one.
+        // there is no way to list the keys, and nothing here needs one. What notes were carried from is
+        // another node's and stays; the mark left here is what keeps it from being carried over again.
         store.dropNamespace(namespace);
+        if (!carriedFrom.isEmpty()) {
+            store.save(namespace, CARRYING_ENDED, MARK);
+        }
     }
 
     @Override
     public void reset() {
-        store.dropNamespace(namespace);
+        clear();
     }
 }

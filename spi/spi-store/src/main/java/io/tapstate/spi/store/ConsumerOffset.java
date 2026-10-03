@@ -14,8 +14,23 @@ import java.util.Map;
  * durably acked to the pipeline's sink (stable across a restart; the quantity a source-read-offset advance
  * is bounded by) — and the snapshot state: {@code snapshotCompletedTables}, the tables whose initial load
  * this pipeline's sink has confirmed, plus {@code cdcStartPosition} and {@code snapshotEpoch}, the seam and
- * generation at which this pipeline's load began. The acked position is absent until the pipeline's sink
- * first acks a change.
+ * generation at which this pipeline's load began -- or, with generation zero, where a direct tail that loads
+ * nothing first began on a chain other pipelines are on. The acked position is absent until the pipeline's
+ * sink first acks a change.
+ *
+ * <p><strong>On a chain carrying several tables, {@code sinkAcked} is the chain's contiguous prefix, not the
+ * latest acknowledgement.</strong> One source log feeds every table of the chain, and the tables land
+ * independently: a quiet table's change can be written while an earlier change of another table is still in
+ * flight. So what each table's sink confirmed is kept in {@code sinkAckedByTable}, in that table's own ring
+ * generation and sequence, and {@code sinkAcked} moves only once every change up to a point of the source log
+ * has landed for every table this pipeline selects. A table's sequence never ranks another table's change.
+ *
+ * <p>{@code selectedTables} is the tables this pipeline currently reads through the chain's shared ring,
+ * across every source of the pipeline that reads it, and {@code selectedTablesEpoch} the ring generation the
+ * selection was made in. A pipeline reading the chain only through a direct tail of its own selects nothing
+ * from the ring, which is an empty selection: the chain's reader owes it nothing. Both are absent on a record
+ * written before selections were recorded; such a consumer is treated as selecting every table, which is the
+ * reading that can only hold the chain back, never let it skip.
  *
  * <p>The acked position is a pair, and both halves are needed for different reasons. The token is what
  * a read resumes from and the only half a connector understands. The order is the engine's own record of
@@ -55,7 +70,10 @@ public record ConsumerOffset(
         ChainPosition sinkAcked,
         List<String> snapshotCompletedTables,
         String cdcStartPosition,
-        long snapshotEpoch) {
+        long snapshotEpoch,
+        List<String> selectedTables,
+        Long selectedTablesEpoch,
+        Map<String, ChainPosition> sinkAckedByTable) {
 
     public ConsumerOffset {
         if (pipelineId == null || pipelineId.isBlank()) {
@@ -71,8 +89,45 @@ public record ConsumerOffset(
             throw new IllegalArgumentException(
                     "consumer offset snapshotEpoch must not be negative, got " + snapshotEpoch);
         }
+        if ((selectedTables == null) != (selectedTablesEpoch == null)) {
+            throw new IllegalArgumentException(
+                    "consumer offset selectedTables and selectedTablesEpoch are recorded together");
+        }
+        if (selectedTablesEpoch != null && selectedTablesEpoch < 1) {
+            throw new IllegalArgumentException(
+                    "consumer offset selectedTablesEpoch must be positive, got " + selectedTablesEpoch);
+        }
+        if (selectedTables != null && selectedTables.stream().anyMatch(table -> table == null || table.isBlank())) {
+            throw new IllegalArgumentException("consumer offset selectedTables must name every table");
+        }
+        if (sinkAckedByTable == null) {
+            throw new IllegalArgumentException("consumer offset sinkAckedByTable must be set");
+        }
+        sinkAckedByTable.forEach((table, position) -> {
+            if (table == null || table.isBlank() || position == null || position.order() == null) {
+                throw new IllegalArgumentException(
+                        "consumer offset table acknowledgements need a named table and an ordered position");
+            }
+        });
         perTableSeq = Collections.unmodifiableMap(new LinkedHashMap<>(perTableSeq));
         snapshotCompletedTables = List.copyOf(snapshotCompletedTables);
+        selectedTables = selectedTables == null ? null : List.copyOf(selectedTables);
+        sinkAckedByTable = Collections.unmodifiableMap(new LinkedHashMap<>(sinkAckedByTable));
+    }
+
+    /**
+     * A consumer whose selection and table acknowledgements were not recorded: the shape of every record
+     * written before either existed, and of a caller that has neither to give.
+     */
+    public ConsumerOffset(
+            String pipelineId,
+            Map<String, Long> perTableSeq,
+            ChainPosition sinkAcked,
+            List<String> snapshotCompletedTables,
+            String cdcStartPosition,
+            long snapshotEpoch) {
+        this(pipelineId, perTableSeq, sinkAcked, snapshotCompletedTables, cdcStartPosition, snapshotEpoch,
+                null, null, Map.of());
     }
 
     /** A cursor with completion state but no snapshot seam recorded yet. */
@@ -92,5 +147,20 @@ public record ConsumerOffset(
     /** The acked token, or null when the sink has acked nothing yet — what a read resumes from. */
     public String sinkAckedSrcpos() {
         return sinkAcked == null ? null : sinkAcked.token();
+    }
+
+    /**
+     * Whether this pipeline reads {@code table} through the chain's shared ring. A consumer whose selection
+     * was never recorded answers yes for every table: it may read any of them, and treating it as reading
+     * none would let the chain move past a change it still owes.
+     */
+    public boolean selects(String table) {
+        return selectedTables == null || selectedTables.contains(table);
+    }
+
+    /** The same consumer with {@code position} as its chain-level acknowledgement, everything else kept. */
+    public ConsumerOffset withSinkAcked(ChainPosition position) {
+        return new ConsumerOffset(pipelineId, perTableSeq, position, snapshotCompletedTables, cdcStartPosition,
+                snapshotEpoch, selectedTables, selectedTablesEpoch, sinkAckedByTable);
     }
 }

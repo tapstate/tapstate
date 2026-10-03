@@ -13,6 +13,22 @@ import java.util.Optional;
 public interface CaptureListener {
 
     /**
+     * Called once, before the first run of changes, with the position the stream actually begins at: the
+     * connector's own start boundary, rendered the way every later position is.
+     *
+     * <p>A reader that keeps changes only in a volatile buffer needs this to be recoverable at all. Until a
+     * change has been durably landed, the only position it can resume from is one that sits before every
+     * change it is about to be handed, and the source is the only party that can name one. A recipient that
+     * needs it records it before it accepts anything else from the stream.
+     *
+     * <p>Empty when the source named no start position. That is a statement about the source rather than a
+     * gap: a recipient that needs a start position refuses the stream instead of inventing one, because an
+     * invented one resumes somewhere nothing was ever read from. The default ignores the call.
+     */
+    default void onStart(Optional<SourcePosition> position) {
+    }
+
+    /**
      * Called once per run of changes the source hands over, with the position it reported for that run.
      *
      * <p><strong>The run is the source's own, and it is delivered whole.</strong> A source reads a batch
@@ -40,5 +56,29 @@ public interface CaptureListener {
      * ignores it. Delivered at most once, after which the stream has ended.
      */
     default void onError(Throwable error) {
+    }
+
+    /**
+     * Called when a position the stream's subscription was {@linkplain Subscription#acknowledge told is
+     * durable} has been handed to the source, and the source took it without complaint.
+     *
+     * <p>That is all it says. A source gives no sign that it acted on a position, and some pass one over in
+     * silence, so this is not evidence that anything was released -- only the source's own readings are.
+     * What it does show is the other half: that positions are still reaching the source at all, which is
+     * the reading that goes quiet when they stop. Not fatal either way; the default ignores the call.
+     */
+    default void onAcknowledged(SourcePosition position) {
+    }
+
+    /**
+     * Called when an acknowledged position could not be handed to the source: it could not be read back
+     * into the source's own form, or the source threw when it was given it.
+     *
+     * <p>Not fatal, and not {@link #onError}: the stream carries on, and the port tries again at its next
+     * interval. A position not handed over costs the source some log it could already have let go of, for
+     * a while longer; ending the stream over that would turn a delay in the source's housekeeping into an
+     * outage. The default ignores the call.
+     */
+    default void onAcknowledgeFailed(Throwable failure) {
     }
 }

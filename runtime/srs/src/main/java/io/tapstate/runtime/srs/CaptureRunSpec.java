@@ -5,6 +5,8 @@ import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.spi.store.WorkloadClaimFence;
 
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -23,6 +25,11 @@ import java.util.Objects;
  *       generation assigned to a bounded read that has no change chain of its own.</li>
  *   <li>{@code captureFence} — the cluster claim generation a durable append must still match, or null on
  *       the unchanged single-member path.</li>
+ *   <li>{@code selectedChainTables} — every table this pipeline reads from the chain through its shared ring,
+ *       across all of its sources that read it, or null for a caller that knows only this source's streams.</li>
+ *   <li>{@code chainReaderSources} — for each other pipeline that reads this source's chain through its shared
+ *       ring, the ids of its sources that do, or null for a caller that does not know them: the nodes whose
+ *       notes the chain's one stream may carry over.</li>
  * </ul>
  *
  * <p>No connector position is carried here. Both a run's seam and its per-change positions are the
@@ -43,7 +50,44 @@ public record CaptureRunSpec(
         String retention,
         long schemaVer,
         long snapshotEpoch,
-        WorkloadClaimFence captureFence) {
+        WorkloadClaimFence captureFence,
+        List<String> selectedChainTables,
+        Map<String, List<String>> chainReaderSources) {
+
+    /** A run whose spec says nothing of the other pipelines reading the chain. */
+    public CaptureRunSpec(
+            CaptureConfig config,
+            ReadMode readMode,
+            String srsKey,
+            boolean srsEnabled,
+            String sourceId,
+            String pipelineId,
+            StartFrom startFrom,
+            String retention,
+            long schemaVer,
+            long snapshotEpoch,
+            WorkloadClaimFence captureFence,
+            List<String> selectedChainTables) {
+        this(config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
+                startFrom, retention, schemaVer, snapshotEpoch, captureFence, selectedChainTables, null);
+    }
+
+    /** A run whose pipeline reads nothing else from the chain than what this source's streams name. */
+    public CaptureRunSpec(
+            CaptureConfig config,
+            ReadMode readMode,
+            String srsKey,
+            boolean srsEnabled,
+            String sourceId,
+            String pipelineId,
+            StartFrom startFrom,
+            String retention,
+            long schemaVer,
+            long snapshotEpoch,
+            WorkloadClaimFence captureFence) {
+        this(config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
+                startFrom, retention, schemaVer, snapshotEpoch, captureFence, null);
+    }
 
     /**
      * The ordinary construction used by callers that do not allocate a chainless snapshot generation.
@@ -87,7 +131,48 @@ public record CaptureRunSpec(
     public CaptureRunSpec withCaptureFence(WorkloadClaimFence fence) {
         return new CaptureRunSpec(
                 config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
-                startFrom, retention, schemaVer, snapshotEpoch, fence);
+                startFrom, retention, schemaVer, snapshotEpoch, fence, selectedChainTables, chainReaderSources);
+    }
+
+    /** The same run, with {@code tables} as everything its pipeline reads from the chain. */
+    public CaptureRunSpec withChainSelection(List<String> tables) {
+        return new CaptureRunSpec(
+                config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
+                startFrom, retention, schemaVer, snapshotEpoch, captureFence, List.copyOf(tables),
+                chainReaderSources);
+    }
+
+    /**
+     * The same run, knowing which sources of each other pipeline read the chain through its shared ring: the
+     * chain's stream carries notes over from those nodes, which a pipeline reading the chain through another
+     * source resource than this one files under that resource and nowhere else.
+     */
+    public CaptureRunSpec withChainReaderSources(Map<String, List<String>> readers) {
+        return new CaptureRunSpec(
+                config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
+                startFrom, retention, schemaVer, snapshotEpoch, captureFence, selectedChainTables, readers);
+    }
+
+    /**
+     * The sources of {@code otherPipeline} that read this run's chain through its shared ring, as far as the
+     * caller knew them; empty where it did not.
+     */
+    public List<String> chainReaderSources(String otherPipeline) {
+        return chainReaderSources == null ? List.of() : chainReaderSources.getOrDefault(otherPipeline, List.of());
+    }
+
+    /**
+     * Every table this run's pipeline reads from the chain through its shared ring: the chain-wide selection
+     * when the caller gave one, otherwise this source's own streams -- or nothing, for a source read through a
+     * direct tail, which never touches the ring. What a chain may release is decided by who reads which table,
+     * so recording one source's share as the pipeline's whole selection would let the chain move past a change
+     * of a table the pipeline's other source still owes.
+     */
+    public List<String> chainSelection() {
+        if (selectedChainTables != null) {
+            return selectedChainTables;
+        }
+        return srsEnabled ? config.streams() : List.of();
     }
 
     public CaptureRunSpec {
@@ -99,6 +184,12 @@ public record CaptureRunSpec(
         if (snapshotEpoch < 0) {
             throw new IllegalArgumentException(
                     "a chainless snapshot generation must not be negative, got " + snapshotEpoch);
+        }
+        selectedChainTables = selectedChainTables == null ? null : List.copyOf(selectedChainTables);
+        if (chainReaderSources != null) {
+            Map<String, List<String>> readers = new java.util.LinkedHashMap<>();
+            chainReaderSources.forEach((pipeline, sources) -> readers.put(pipeline, List.copyOf(sources)));
+            chainReaderSources = java.util.Collections.unmodifiableMap(readers);
         }
         // The connector doing this read files notes it has to find again on a later drive, and which node
         // they belong to is the pair named right here. Scoped from those two rather than accepted on the

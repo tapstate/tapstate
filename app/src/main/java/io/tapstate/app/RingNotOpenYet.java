@@ -15,7 +15,11 @@ import io.tapstate.runtime.srs.CaptureId;
 final class RingNotOpenYet extends RuntimeException {
 
     RingNotOpenYet(CaptureId captureId) {
-        super("capture " + captureId.value() + " is held by another member that has not opened its ring yet",
-                null, false, false);
+        this("capture " + captureId.value() + " is held by another member that has not opened its ring yet");
+    }
+
+    /** The same give-back, for a wait that clears on its own for another reason, named in {@code why}. */
+    RingNotOpenYet(String why) {
+        super(why, null, false, false);
     }
 }

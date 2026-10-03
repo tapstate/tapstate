@@ -95,9 +95,14 @@ class ASinkCheckpointBelongsToTheRunThatWroteItIT {
                 () -> String.valueOf(control.state(PIPELINE)));
     }
 
+    /**
+     * The sink's own durable checkpoint: what it confirmed landing on the table. The pipeline's chain-level
+     * position beside it is released by the chain's reader rather than written by the sink.
+     */
     private static boolean hasCheckpoint(MongoDatabase database) {
         Document consumer = consumer(database);
-        return consumer != null && consumer.containsKey("sinkAckedEpoch") && consumer.containsKey("sinkAckedSeq");
+        return consumer != null && consumer.get("sinkAckedByTable") instanceof Document landed
+                && landed.containsKey(TABLE);
     }
 
     private static Document consumer(MongoDatabase database) {

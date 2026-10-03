@@ -1,5 +1,6 @@
 package io.tapstate.runtime.srs;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.PayloadBytes;
 import io.tapstate.spi.capture.CaptureListener;
@@ -11,6 +12,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -33,10 +35,23 @@ import java.util.concurrent.atomic.AtomicReference;
  * <p>The payload those rows carried is measured at that same point and off those same events, so the two
  * readings cannot come to cover different arrivals. How many rows arrived and how much data they were are
  * different questions: a table of wide rows and a table of narrow ones answer the first identically.
+ *
+ * <p>It also says whether the source is still being told how far it may release its change log, and that is
+ * a reading, never a failure: a release that has not happened yet costs the source some log for a while
+ * longer and nothing else.
  */
 public final class CaptureHealth {
 
     private final AtomicReference<Throwable> failure = new AtomicReference<>();
+
+    /** Acknowledgements that have failed since the last one that went through. */
+    private final AtomicLong acknowledgeFailures = new AtomicLong();
+
+    /** The code the last failed acknowledgement carried; null before any failed, or when it carried none. */
+    private final AtomicReference<String> lastAcknowledgeFailureCode = new AtomicReference<>();
+
+    /** When a position last went through to the source; null before the first. */
+    private final AtomicReference<Instant> lastAcknowledgedAt = new AtomicReference<>();
 
     /**
      * Rows received, by source table and then by the op's wire symbol. Concurrent on both levels because it
@@ -71,6 +86,37 @@ public final class CaptureHealth {
      */
     public void fail(Throwable error) {
         failure.compareAndSet(null, error);
+    }
+
+    /**
+     * How many acknowledgements in a row have failed to reach the source: each failure counts one more, and
+     * the next one that goes through puts it back to nought. A count that keeps climbing says the source is
+     * not being released at all.
+     *
+     * <p><strong>Never a failure of the run.</strong> {@link #failure()} is shared by every pipeline reading
+     * the capture and fails all of them, which a late release does not warrant: what it costs is the source
+     * keeping some log a while longer, so it is counted here and nothing is failed.
+     */
+    public long consecutiveAcknowledgeFailures() {
+        return acknowledgeFailures.get();
+    }
+
+    /**
+     * The error code the last failed acknowledgement carried, or empty before any has failed or when the last
+     * one carried none. Kept after a later success: it says what the last failure was, and the count beside
+     * it says whether failures are still happening.
+     */
+    public Optional<String> lastAcknowledgeFailureCode() {
+        return Optional.ofNullable(lastAcknowledgeFailureCode.get());
+    }
+
+    /**
+     * When a position was last handed to the source and taken without complaint, or empty before the first.
+     * Not proof that the source released anything -- a source gives no such sign -- but a time that stops
+     * moving says positions have stopped reaching it.
+     */
+    public Optional<Instant> lastAcknowledgedAt() {
+        return Optional.ofNullable(lastAcknowledgedAt.get());
     }
 
     /** When the counting behind {@link #receivedRows()} began. */
@@ -112,6 +158,22 @@ public final class CaptureHealth {
         bytesReceived.merge(event.src(), PayloadBytes.of(event), Long::sum);
     }
 
+    /** Records a position that went through to the source: the run of failures is over, and when it ended. */
+    private void acknowledged() {
+        acknowledgeFailures.set(0);
+        lastAcknowledgedAt.set(Instant.now());
+    }
+
+    /**
+     * Records a position that did not reach the source, and the code it failed with when it carries one --
+     * whether the source refused it, or the position could not even be read to be handed over.
+     */
+    void acknowledgeFailed(Throwable acknowledgeFailure) {
+        acknowledgeFailures.incrementAndGet();
+        lastAcknowledgeFailureCode.set(
+                acknowledgeFailure instanceof TapstateException coded ? coded.code().code() : null);
+    }
+
     /**
      * Wraps a batch handler as a listener that counts what arrives on this health and records a stream
      * failure on it through {@link #fail}.
@@ -122,15 +184,36 @@ public final class CaptureHealth {
      * Counting happens before the batch is handed on, because arriving is what is being counted: a handler
      * that throws has still been given the rows, and the source will hand them over again.
      *
+     * <p>What became of an acknowledged position is read off here too, and handed on. A failed one is never
+     * recorded through {@link #fail}: that would fail every pipeline reading the capture over a release that is
+     * only late.
+     *
      * <p>Public so that a caller outside this package can obtain the seam, never so that it can bypass it:
      * counting a row is package-private and has no other way in, so every arrival still goes through here.
      */
     public CaptureListener recording(CaptureListener onBatch) {
         return new CaptureListener() {
             @Override
+            public void onStart(Optional<SourcePosition> position) {
+                onBatch.onStart(position);
+            }
+
+            @Override
             public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
                 events.forEach(CaptureHealth.this::received);
                 onBatch.onBatch(events, position);
+            }
+
+            @Override
+            public void onAcknowledged(SourcePosition position) {
+                acknowledged();
+                onBatch.onAcknowledged(position);
+            }
+
+            @Override
+            public void onAcknowledgeFailed(Throwable acknowledgeFailure) {
+                acknowledgeFailed(acknowledgeFailure);
+                onBatch.onAcknowledgeFailed(acknowledgeFailure);
             }
 
             @Override

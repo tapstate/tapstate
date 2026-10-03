@@ -209,7 +209,7 @@ public final class SnapshotPhase {
      * narrows each bounded read to one table when that read opens.
      */
     private static CaptureConfig readOf(CaptureConfig config, List<String> tables) {
-        return new CaptureConfig(config.connectorId(), config.settings(), tables, config.node());
+        return config.over(tables);
     }
 
     /**

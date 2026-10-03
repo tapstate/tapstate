@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import com.hazelcast.core.HazelcastInstance;
+import io.tapstate.adapters.pdk.ConnectorError;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.FromClause;
@@ -15,11 +16,13 @@ import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.runtime.srs.CaptureError;
+import io.tapstate.runtime.srs.CaptureHandoff;
 import io.tapstate.runtime.srs.CaptureHealth;
 import io.tapstate.runtime.srs.CaptureRun;
 import io.tapstate.runtime.srs.CaptureRunSpec;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.MiningChainId;
+import io.tapstate.runtime.srs.ReaderNotServingYet;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.spi.capture.CaptureBatch;
@@ -33,6 +36,7 @@ import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
@@ -126,6 +130,61 @@ class CaptureOwnershipTest {
         nodeB.tailWhatNobodyTails();
         assertThat(tails).as("taken over once the load is through").hasValue(2);
 
+        nodeB.stopCapture("q", false);
+        nodeA.close();
+        nodeB.close();
+    }
+
+    /**
+     * A member taking a capture over opens its tail with every table the pipeline it opens it for reads from
+     * the chain, over all of that pipeline's sources there -- not with the tables of the one source the
+     * pipeline happened to join through. Opened with those, the chain's record would say the pipeline reads
+     * that one source's tables alone: the reader would stop reading the others for it, and nothing would wait
+     * for them.
+     */
+    @Test
+    void aTailTakenOverSelectsEveryTableItsPipelineReadsFromTheChain() {
+        SourceResource customers = new SourceResource(
+                "customers-source", null, "mysql", Map.of("host", "db.internal"), SourceMode.CDC,
+                List.of(TableRef.literal("customers")), null, null);
+        InMemoryArtifactStore artifacts = artifactsWith(ReadMode.CDC_ONLY, "p");
+        artifacts.save(customers);
+        artifacts.save(new PipelineResource(
+                "q", null, List.of(SourceRef.spec("orders-source", true), SourceRef.spec("customers-source", true)),
+                null, null,
+                new ServeBlock.Inline(
+                        null, FromClause.list(FromRef.literal("orders-source"), FromRef.literal("customers-source")),
+                        List.of(new SyncElement("sync", "target", null, null, null)), null, null),
+                new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        MemoryClaims raw = new MemoryClaims();
+        ClusterMembershipGate gate = eligibleGate();
+        CaptureAttacher holding = (spec, handoff, startTail) -> {
+            if (startTail) {
+                opensTheRing(store);
+            }
+            return run(() -> { });
+        };
+        StoreBackedPipelineCaptureCoordinator nodeA =
+                managed(store, holding, gate, raw, new WorkloadOwner("node-a", "boot-a"));
+        nodeA.startCapture("p");
+
+        AtomicReference<List<String>> takenOverWith = new AtomicReference<>();
+        CaptureAttacher joining = (spec, handoff, startTail) -> {
+            if (startTail) {
+                takenOverWith.set(spec.chainSelection());
+            }
+            return run(() -> { });
+        };
+        StoreBackedPipelineCaptureCoordinator nodeB =
+                managed(store, joining, gate, raw, new WorkloadOwner("node-b", "boot-b"));
+        nodeB.startCapture("q");
+        nodeA.stopCapture("p", false);
+
+        nodeB.tailWhatNobodyTails();
+
+        assertThat(takenOverWith.get()).as("the chain's tables of both of q's sources")
+                .containsExactlyInAnyOrder("customers", "orders");
         nodeB.stopCapture("q", false);
         nodeA.close();
         nodeB.close();
@@ -325,6 +384,33 @@ class CaptureOwnershipTest {
         coordinator.stopCapture("q", false);
     }
 
+    /**
+     * A source that refuses to be told how far it may release is counted on the shared tail's health and fails
+     * no pipeline reading the capture. What a missed acknowledgement costs is the source keeping some change
+     * log a while longer; failing the tail over it would stop every pipeline on the chain over a delay.
+     */
+    @Test
+    void aSourceRefusingAnAcknowledgementFailsNoPipelineOnTheSharedCapture() {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith(ReadMode.SNAPSHOT_AND_CDC, "p", "q"));
+        CaptureHealth tailHealth = new CaptureHealth();
+        CaptureAttacher attacher = (spec, handoff, startTail) -> new CaptureRun(Optional.empty(), false, 0L,
+                Optional.empty(), Optional.of(() -> { }), startTail ? tailHealth : new CaptureHealth());
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, attacher, new SrsCoordinator(store.meta()), new SnapshotBuffer());
+        coordinator.startCapture("p");
+        coordinator.startCapture("q");
+
+        CaptureListener source = tailHealth.recording((events, position) -> { });
+        source.onAcknowledgeFailed(new TapstateException(ConnectorError.ACKNOWLEDGE_FAILED,
+                Map.of("connector", "postgres", "detail", "the slot is in use"), null));
+
+        assertThat(tailHealth.consecutiveAcknowledgeFailures()).as("counted on the tail").isEqualTo(1);
+        assertThat(coordinator.captureFailure("p")).as("the pipeline whose start runs the tail").isEmpty();
+        assertThat(coordinator.captureFailure("q")).as("and the one reading it").isEmpty();
+        coordinator.stopCapture("p", false);
+        coordinator.stopCapture("q", false);
+    }
+
     @Test
     void aFailedSnapshotOnlyLoadDoesNotFailAnotherPipelineOnTheSameCapture() {
         InMemoryStorePort store = new InMemoryStorePort(artifactsWith(ReadMode.SNAPSHOT_ONLY, "p", "q"));
@@ -476,6 +562,94 @@ class CaptureOwnershipTest {
                 .as("one tail, on the member holding the capture, and the pipeline driven by the other "
                         + "member attached there rather than left with nothing")
                 .containsExactly("node-a p opened the tail", "node-b q attached");
+    }
+
+    /**
+     * A pipeline on another member that reads a table the chain's reader does not read yet is given back
+     * rather than started over a ring that would stay empty. The member running the reader has it take the
+     * table on when it next looks, and the given-back pipeline's next start attaches.
+     */
+    @Test
+    void aPipelineOnAnotherMemberIsGivenBackUntilTheReaderTakesItsTableOn() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(TWO_TABLE_SOURCE);
+        artifacts.save(pipelineServing("p", "orders-source.orders"));
+        artifacts.save(pipelineServing("q", "orders-source.customers"));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        MemoryClaims claims = new MemoryClaims();
+        Reader reader = new Reader();
+        StoreBackedPipelineCaptureCoordinator a = reader.member("node-a", store, claims);
+        StoreBackedPipelineCaptureCoordinator b = reader.member("node-b", store, claims);
+
+        a.startCapture("p");
+        assertThatThrownBy(() -> b.startCapture("q"))
+                .as("the reader reads orders only, so customers' ring would never fill")
+                .isInstanceOf(RingNotOpenYet.class);
+        assertThat(reader.asked).containsExactly("customers");
+
+        a.widenTheReadersHere();
+        b.startCapture("q");
+
+        assertThat(reader.read).containsExactlyInAnyOrder("orders", "customers");
+        assertThat(reader.events).containsExactly(
+                "node-a p opened the tail", "node-b q given back", "node-a took on [customers]",
+                "node-b q attached");
+        b.stopCapture("q", false);
+        a.stopCapture("p", false);
+    }
+
+    /**
+     * A look for tables to take on that fails is the reader's to judge, not the member's: a store that cannot
+     * be read for a moment before anything was stopped leaves the reader reading, and failing it here would fail
+     * every pipeline reading the capture over a stream that is healthy.
+     */
+    @Test
+    void aLookForTablesThatFailsFailsNoPipelineOnTheMembersSay() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(TWO_TABLE_SOURCE);
+        artifacts.save(pipelineServing("p", "orders-source.orders"));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        Reader reader = new Reader();
+        StoreBackedPipelineCaptureCoordinator a = reader.member("node-a", store, new MemoryClaims());
+        a.startCapture("p");
+        reader.lookFails = new TapstateException(IoError.STORE_UNAVAILABLE,
+                Map.of("detail", "the primary is being elected"), null);
+
+        a.widenTheReadersHere();
+
+        assertThat(a.captureFailure("p")).as("the pipeline reading the capture").isEmpty();
+        a.stopCapture("p", false);
+    }
+
+    /**
+     * A reader taking a table on -- which can mean stopping a stream and starting another -- does so without
+     * holding the member: a stop, a start or a look at whether a pipeline runs is not kept waiting behind it.
+     */
+    @Test
+    void aWideningUnderWayDoesNotHoldTheMemberBack() throws Exception {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(TWO_TABLE_SOURCE);
+        artifacts.save(pipelineServing("p", "orders-source.orders"));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        Reader reader = new Reader();
+        StoreBackedPipelineCaptureCoordinator a = reader.member("node-a", store, new MemoryClaims());
+        a.startCapture("p");
+        reader.looking = new java.util.concurrent.CountDownLatch(1);
+
+        Thread look = new Thread(a::widenTheReadersHere, "widening");
+        look.start();
+        try {
+            assertThat(reader.looking.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                    .as("the reader is taking a table on").isTrue();
+            java.util.concurrent.CompletableFuture<Boolean> running =
+                    java.util.concurrent.CompletableFuture.supplyAsync(() -> a.isActive("p"));
+            assertThat(running.get(3, java.util.concurrent.TimeUnit.SECONDS))
+                    .as("whether the pipeline runs, answered meanwhile").isTrue();
+        } finally {
+            reader.lookMayFinish.countDown();
+            look.join(10_000);
+        }
+        a.stopCapture("p", false);
     }
 
     /**
@@ -996,6 +1170,76 @@ class CaptureOwnershipTest {
             chains.attachConsumer(chain, spec.pipelineId());
             return new CaptureRun(Optional.of(chain), !startTail, 0, Optional.empty(), Optional.of(subscription),
                     new CaptureHealth());
+        }
+    }
+
+    /**
+     * The chain's one reader as every member sees it: the tables it reads, the ones pipelines asked it for,
+     * and what happened, in order. Members attach to it or are given back, exactly as they would to a real
+     * reader, and the member running it has it take on what was asked when it is told to widen.
+     */
+    private static final class Reader {
+        final Set<String> read = new java.util.LinkedHashSet<>();
+        final Set<String> asked = new java.util.LinkedHashSet<>();
+        final List<String> events = new ArrayList<>();
+        /** What a look for tables to take on throws, when set. */
+        volatile RuntimeException lookFails;
+        /** When set, a look counts this down and then waits for {@link #lookMayFinish}. */
+        volatile java.util.concurrent.CountDownLatch looking;
+        final java.util.concurrent.CountDownLatch lookMayFinish = new java.util.concurrent.CountDownLatch(1);
+
+        StoreBackedPipelineCaptureCoordinator member(String node, InMemoryStorePort store, MemoryClaims claims) {
+            ClusterMembershipGate gate = eligibleGate();
+            CaptureOwnership ownership = new CaptureOwnership(
+                    "cluster-a", Member.owner(node), gate, new ClusterWorkloadClaims(claims, gate), TTL);
+            SrsCoordinator chains = new SrsCoordinator(store.meta());
+            CaptureAttacher attacher = new CaptureAttacher() {
+                @Override
+                public CaptureRun start(CaptureRunSpec spec, CaptureHandoff handoff, boolean startTail) {
+                    MiningChainId chain = MiningChainId.resolve(spec.config(), spec.srsKey());
+                    List<String> tables = spec.config().streams();
+                    if (startTail) {
+                        chains.provisionSource(spec.sourceId(), chain, tables, spec.retention());
+                        read.addAll(tables);
+                        events.add(node + " " + spec.pipelineId() + " opened the tail");
+                    } else if (!read.containsAll(tables)) {
+                        asked.addAll(tables);
+                        events.add(node + " " + spec.pipelineId() + " given back");
+                        throw new ReaderNotServingYet(chain.value(), tables);
+                    } else {
+                        chains.joinSource(spec.sourceId(), chain, tables);
+                        events.add(node + " " + spec.pipelineId() + " attached");
+                    }
+                    chains.attachConsumer(chain, spec.pipelineId());
+                    return new CaptureRun(Optional.of(chain), !startTail, 0, Optional.empty(),
+                            Optional.of(() -> { }), new CaptureHealth());
+                }
+
+                @Override
+                public boolean widen(CaptureRun run) {
+                    java.util.concurrent.CountDownLatch entered = looking;
+                    if (entered != null) {
+                        entered.countDown();
+                        try {
+                            lookMayFinish.await(10, java.util.concurrent.TimeUnit.SECONDS);
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                    if (lookFails != null) {
+                        throw lookFails;
+                    }
+                    if (read.containsAll(asked)) {
+                        return false;
+                    }
+                    List<String> takenOn = asked.stream().filter(table -> !read.contains(table)).toList();
+                    read.addAll(takenOn);
+                    events.add(node + " took on " + takenOn);
+                    return true;
+                }
+            };
+            return new StoreBackedPipelineCaptureCoordinator(
+                    store, attacher, chains, new SnapshotBuffer(), ownership, RENEW);
         }
     }
 

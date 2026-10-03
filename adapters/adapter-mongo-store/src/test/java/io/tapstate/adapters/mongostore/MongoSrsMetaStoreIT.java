@@ -13,9 +13,12 @@ import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.ResumePoint;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
+import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.testsupport.RequiresDocker;
+import org.bson.BsonDocument;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.MongoDBContainer;
@@ -23,12 +26,15 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -89,6 +95,591 @@ class MongoSrsMetaStoreIT {
 
     @Container
     private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
+
+    /**
+     * A stream of a tail reading its source directly takes a generation above every one opened on the chain,
+     * shared or direct, and the chain's own generation stays the shared reader's -- which, opened later, goes
+     * past the direct tail's in turn.
+     */
+    @Test
+    void aDirectStreamsGenerationIsAboveEveryOneOpenedAndNeverTheChainsOwn() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long shared = store.openEpoch(CHAIN);
+            long direct = store.openDirectEpoch(CHAIN);
+            long again = store.openDirectEpoch(CHAIN);
+
+            assertThat(direct).isGreaterThan(shared);
+            assertThat(again).as("a second stream of a direct tail").isGreaterThan(direct);
+            assertThat(store.read(CHAIN).orElseThrow().epoch()).as("the chain's own generation").isEqualTo(shared);
+            long takenOver = store.openEpoch(CHAIN);
+            assertThat(takenOver).isGreaterThan(again);
+            assertThat(store.read(CHAIN).orElseThrow().epoch()).isEqualTo(takenOver);
+        });
+    }
+
+    /** A record written before direct tails took generations of their own opens past its own generation. */
+    @Test
+    void aRecordFromBeforeDirectGenerationsOpensPastItsOwnGeneration() {
+        withCollection((store, collection) -> {
+            store.create(CHAIN, null);
+            collection.updateOne(new Document("_id", CHAIN), new Document("$set", new Document("epoch", 7L)));
+
+            assertThat(store.openDirectEpoch(CHAIN)).isEqualTo(8L);
+            assertThat(store.read(CHAIN).orElseThrow().epoch()).isEqualTo(7L);
+            assertThat(store.openEpoch(CHAIN)).isEqualTo(9L);
+        });
+    }
+
+    /**
+     * The highest generation opened on a chain counts a direct stream's as well as the chain's own, and a
+     * record written before direct streams had generations of their own answers its own generation.
+     */
+    @Test
+    void theHighestGenerationOpenedCountsADirectStreamsAsWellAsTheChainsOwn() {
+        withCollection((store, collection) -> {
+            assertThat(store.highestGenerationOpened(CHAIN)).as("no record").isZero();
+            store.create(CHAIN, null);
+            collection.updateOne(new Document("_id", CHAIN), new Document("$set", new Document("epoch", 7L)));
+            assertThat(store.highestGenerationOpened(CHAIN)).isEqualTo(7L);
+
+            long direct = store.openDirectEpoch(CHAIN);
+
+            assertThat(store.read(CHAIN).orElseThrow().epoch()).isEqualTo(7L);
+            assertThat(store.highestGenerationOpened(CHAIN)).isEqualTo(direct);
+        });
+    }
+
+    /** A pipeline that selects nothing -- one reading the source directly -- keeps no place in any ring. */
+    @Test
+    void aPipelineSelectingNothingKeepsNoPlaceInAnyRing() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            store.advanceConsumerReadSeq(CHAIN, "pipe", "orders", 500);
+            store.startRingAfter(CHAIN, "pipe", "customers", 40);
+
+            store.selectConsumerTables(CHAIN, "pipe", List.of(), epoch);
+
+            ConsumerOffset after = store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow();
+            assertThat(after.selectedTables()).isEmpty();
+            assertThat(after.perTableSeq()).as("its read cursors").isEmpty();
+            assertThat(store.ringDoneThrough(CHAIN, "pipe")).as("where it was done in each ring").isEmpty();
+        });
+    }
+
+    /**
+     * Moving where a consumer's own run begins, or letting go of what it landed, touches nothing else on its
+     * record: its writers' plan and progress, its selection, finished loads and read cursors stay. A pipeline with
+     * two writers that finished a load therefore still prepares them afterwards; replaced whole, the record lost
+     * the plan, and with two writers and a finished load the store could no longer tell them apart.
+     */
+    @Test
+    void aConsumersPositionMovesWithoutTouchingItsWritersPlan() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            store.selectConsumerTables(CHAIN, "pipe", List.of("orders"), epoch);
+            store.advanceConsumerReadSeq(CHAIN, "pipe", "orders", 12);
+            Map<String, List<String>> plan = Map.of("orders", List.of("target-a", "target-b"));
+            store.configureSinkWriters(CHAIN, "pipe", plan);
+            store.markSinkWriterSnapshotComplete(CHAIN, "pipe", "target-a", "orders");
+            store.markSinkWriterSnapshotComplete(CHAIN, "pipe", "target-b", "orders");
+            store.advanceSinkAcked(CHAIN, "pipe", new ChainPosition(new SourceOrder(epoch, 9), "t9"));
+            store.advanceTableSinkAcked(CHAIN, "pipe", "orders", new ChainPosition(new SourceOrder(epoch, 9), "t9"));
+
+            store.moveConsumerStart(CHAIN, "pipe", "moved-here");
+
+            ConsumerOffset moved = store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow();
+            assertThat(moved.cdcStartPosition()).isEqualTo("moved-here");
+            assertThat(moved.sinkAcked()).isNull();
+            assertThat(moved.sinkAckedByTable()).isEmpty();
+            assertThat(moved.selectedTables()).containsExactly("orders");
+            assertThat(moved.perTableSeq()).containsEntry("orders", 12L);
+            assertThat(moved.snapshotCompletedTables()).containsExactly("orders");
+            org.assertj.core.api.Assertions.assertThatCode(() -> store.configureSinkWriters(CHAIN, "pipe", plan))
+                    .as("its two writers, prepared again").doesNotThrowAnyException();
+
+            store.advanceSinkAcked(CHAIN, "pipe", new ChainPosition(new SourceOrder(epoch, 11), "t11"));
+            store.releaseSinkAcknowledgements(CHAIN, "pipe");
+
+            ConsumerOffset released = store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow();
+            assertThat(released.sinkAcked()).isNull();
+            assertThat(released.cdcStartPosition()).as("where its run begins, left as it was").isEqualTo("moved-here");
+            org.assertj.core.api.Assertions.assertThatCode(() -> store.configureSinkWriters(CHAIN, "pipe", plan))
+                    .doesNotThrowAnyException();
+        });
+    }
+
+    /** One consumer's acknowledged position, read as it stands durably; nothing for a consumer with none. */
+    @Test
+    void aConsumersAcknowledgedPositionIsReadDurably() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            ChainPosition landed = new ChainPosition(new SourceOrder(3, 9), "t9");
+            store.advanceSinkAcked(CHAIN, "direct", landed);
+
+            assertThat(store.durableSinkAcked(CHAIN, "direct")).contains(landed);
+            assertThat(store.durableSinkAcked(CHAIN, "nobody")).isEmpty();
+        });
+    }
+
+    @Test
+    void tableAcksPersistIndependentlyAndOnlyTheirOwnRingGenerationPositionsARun() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long first = store.openEpoch(CHAIN);
+            store.selectConsumerTables(CHAIN, "pipe", List.of("orders", "customers"), first);
+
+            store.advanceTableSinkAcked(CHAIN, "pipe", "customers",
+                    new ChainPosition(new SourceOrder(first, 0), "t2"));
+            store.advanceTableSinkAcked(CHAIN, "pipe", "orders",
+                    new ChainPosition(new SourceOrder(first, 4), "t1"));
+            store.advanceTableSinkAcked(CHAIN, "pipe", "customers",
+                    new ChainPosition(new SourceOrder(first, 0), "stale"));
+
+            ConsumerOffset persisted = store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow();
+            assertThat(persisted.sinkAcked())
+                    .as("a table's acknowledgement says nothing about how far the chain's source log landed")
+                    .isNull();
+            assertThat(persisted.sinkAckedByTable()).containsExactlyInAnyOrderEntriesOf(Map.of(
+                    "orders", new ChainPosition(new SourceOrder(first, 4), "t1"),
+                    "customers", new ChainPosition(new SourceOrder(first, 0), "t2")));
+            assertThat(persisted.selectedTables()).containsExactly("customers", "orders");
+            assertThat(persisted.selectedTablesEpoch()).isEqualTo(first);
+            assertThat(store.ringDoneThrough(CHAIN, "pipe"))
+                    .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 4L, "customers", 0L));
+
+            long second = store.openEpoch(CHAIN);
+            store.selectConsumerTables(CHAIN, "pipe", List.of("orders"), second);
+            store.advanceTableSinkAcked(CHAIN, "pipe", "orders",
+                    new ChainPosition(new SourceOrder(first, 99), "old-run"));
+            assertThat(store.ringDoneThrough(CHAIN, "pipe"))
+                    .as("a sequence of a replaced ring generation does not say where this run carries on")
+                    .containsEntry("orders", 4L);
+
+            store.advanceTableSinkAcked(CHAIN, "pipe", "orders",
+                    new ChainPosition(new SourceOrder(second, 5), "replayed"));
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow().sinkAckedByTable())
+                    .as("a confirmation of the current generation outranks any of an earlier one")
+                    .containsEntry("orders", new ChainPosition(new SourceOrder(second, 5), "replayed"));
+            assertThat(store.ringDoneThrough(CHAIN, "pipe")).containsEntry("orders", 5L);
+        });
+    }
+
+    /**
+     * A reader that took the chain over writes under a generation of its own, while a pipeline already on the
+     * chain keeps the selection it made under the old one and carries on reading. Its confirmations are the
+     * only thing that lets the new reader release anything, so they are kept -- and the ring it is positioned
+     * in is still its old selection's, so they do not move that.
+     */
+    @Test
+    void aTakeoverStillHearsWhatThePipelinesAlreadyOnTheChainConfirm() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long joined = store.openEpoch(CHAIN);
+            store.selectConsumerTables(CHAIN, "pipe", List.of("orders"), joined);
+            store.advanceConsumerReadSeq(CHAIN, "pipe", "orders", -1L);
+            long takenOver = store.openEpoch(CHAIN);
+
+            store.advanceTableSinkAcked(CHAIN, "pipe", "orders",
+                    new ChainPosition(new SourceOrder(takenOver, 12), "t12"));
+
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow().sinkAckedByTable())
+                    .containsExactly(Map.entry("orders", new ChainPosition(new SourceOrder(takenOver, 12), "t12")));
+            assertThat(store.ringDoneThrough(CHAIN, "pipe")).doesNotContainKey("orders");
+        });
+    }
+
+    /** A pipeline reading the chain only through a direct tail records no ring position from its own count. */
+    @Test
+    void aDirectTailsConfirmationIsKeptWithoutPositioningAnyRing() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            store.selectConsumerTables(CHAIN, "direct", List.of(), epoch);
+
+            store.advanceTableSinkAcked(CHAIN, "direct", "orders",
+                    new ChainPosition(new SourceOrder(epoch, 40), "t40"));
+
+            ConsumerOffset persisted = store.read(CHAIN).orElseThrow().consumerOffset("direct").orElseThrow();
+            assertThat(persisted.selectedTables()).as("it reads nothing through the ring").isEmpty();
+            assertThat(persisted.sinkAckedByTable())
+                    .containsExactly(Map.entry("orders", new ChainPosition(new SourceOrder(epoch, 40), "t40")));
+            assertThat(store.ringDoneThrough(CHAIN, "direct")).isEmpty();
+        });
+    }
+
+    @Test
+    void aGenerationPublishesOneSubscriptionAndALaterGenerationReplacesIt() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long first = store.openEpoch(CHAIN);
+            assertThat(store.physicalSelection(CHAIN)).isEmpty();
+
+            assertThat(store.publishPhysicalSelection(CHAIN,
+                    new SrsMetaStore.PhysicalSelection(first, List.of("orders", "customers")))).isTrue();
+            assertThat(store.publishPhysicalSelection(CHAIN,
+                    new SrsMetaStore.PhysicalSelection(first, List.of("customers", "orders"))))
+                    .as("the same tables published again are the same subscription").isTrue();
+            assertThat(store.publishPhysicalSelection(CHAIN,
+                    new SrsMetaStore.PhysicalSelection(first, List.of("orders"))))
+                    .as("a second, different subscription in one generation belongs to nobody").isFalse();
+            assertThat(store.physicalSelection(CHAIN)).contains(
+                    new SrsMetaStore.PhysicalSelection(first, 1L, List.of("customers", "orders")));
+
+            assertThat(store.publishPhysicalSelection(CHAIN,
+                    new SrsMetaStore.PhysicalSelection(first + 1, List.of("orders"))))
+                    .as("a generation the chain has not opened publishes nothing").isFalse();
+            long second = store.openEpoch(CHAIN);
+            assertThat(store.publishPhysicalSelection(CHAIN,
+                    new SrsMetaStore.PhysicalSelection(second, List.of("orders")))).isTrue();
+            assertThat(store.physicalSelection(CHAIN))
+                    .contains(new SrsMetaStore.PhysicalSelection(second, 1L, List.of("orders")));
+        });
+    }
+
+    /**
+     * A table asked for before the reader publishes is served by that very publication -- one that leaves it
+     * out is refused -- and one asked for afterwards by the wider subscription that replaces it.
+     */
+    @Test
+    void aSubscriptionServesEveryTableAskedForAndAWiderOneReplacesIt() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            assertThat(store.requestPhysicalTables(CHAIN, epoch + 1, List.of("orders")))
+                    .as("a generation the chain has not opened asks nothing").isFalse();
+            assertThat(store.requestPhysicalTables(CHAIN, epoch, List.of("customers"))).isTrue();
+
+            assertThat(store.publishPhysicalSelection(CHAIN,
+                    new SrsMetaStore.PhysicalSelection(epoch, List.of("orders"))))
+                    .as("a subscription leaving out a table asked for is refused").isFalse();
+            SrsMetaStore.PhysicalSelection first =
+                    new SrsMetaStore.PhysicalSelection(epoch, List.of("customers", "orders"));
+            assertThat(store.publishPhysicalSelection(CHAIN, first)).isTrue();
+            store.clearPhysicalRequests(CHAIN, first.tables());
+            assertThat(store.requestedPhysicalTables(CHAIN)).isEmpty();
+
+            assertThat(store.requestPhysicalTables(CHAIN, epoch, List.of("items"))).isTrue();
+            assertThat(store.replacePhysicalSelection(CHAIN, first,
+                    new SrsMetaStore.PhysicalSelection(epoch, 2L, List.of("customers", "orders"))))
+                    .as("a replacement still leaving a request out is refused").isFalse();
+            SrsMetaStore.PhysicalSelection wider =
+                    new SrsMetaStore.PhysicalSelection(epoch, 2L, List.of("customers", "items", "orders"));
+            assertThat(store.replacePhysicalSelection(CHAIN, first, wider)).isTrue();
+            assertThat(store.physicalSelection(CHAIN)).contains(wider);
+            assertThat(store.replacePhysicalSelection(CHAIN, first,
+                    new SrsMetaStore.PhysicalSelection(epoch, 2L, List.of("customers", "items", "orders", "x"))))
+                    .as("a replacement of a subscription no longer published replaces nothing").isFalse();
+            assertThat(store.requestedPhysicalTables(CHAIN)).containsExactly("items");
+            store.clearPhysicalRequests(CHAIN, List.of("items"));
+            assertThat(store.requestedPhysicalTables(CHAIN)).isEmpty();
+        });
+    }
+
+    @Test
+    void anAnchorLaysDownWhereAStreamBeganWithoutProvingAnOffsetNobodyTrusted() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long first = store.openEpoch(CHAIN);
+            ChainPosition started = new ChainPosition(new SourceOrder(first, -1L), "start-1");
+
+            assertThat(store.physicalPrefixTrusted(CHAIN)).isFalse();
+            assertThat(store.establishPhysicalAnchor(CHAIN, started)).isTrue();
+            assertThat(store.read(CHAIN).orElseThrow().sourceRead()).isEqualTo(started);
+            assertThat(store.physicalPrefixTrusted(CHAIN)).isTrue();
+
+            assertThat(store.advancePhysicalSourceReadOffset(CHAIN, first,
+                    new ChainPosition(new SourceOrder(first, 3), "released-3"))).isTrue();
+            assertThat(store.establishPhysicalAnchor(CHAIN, new ChainPosition(new SourceOrder(first, -1L), "again")))
+                    .as("the same generation keeps what its reader already released").isTrue();
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("released-3");
+
+            long second = store.openEpoch(CHAIN);
+            ChainPosition resumed = new ChainPosition(new SourceOrder(second, -1L), "start-2");
+            assertThat(store.establishPhysicalAnchor(CHAIN, resumed)).isTrue();
+            assertThat(store.read(CHAIN).orElseThrow().sourceRead())
+                    .as("a new stream of a trusted chain begins where it began").isEqualTo(resumed);
+            assertThat(store.establishPhysicalAnchor(CHAIN,
+                    new ChainPosition(new SourceOrder(first, -1L), "stale")))
+                    .as("a stream of a replaced generation anchors nothing").isFalse();
+        });
+    }
+
+    /**
+     * A released run that carried no change moves the read offset -- how far the source may release -- and
+     * leaves where a restart resumes at the last run that carried one. Where a stream began, a position put
+     * there by hand and a released change are all resume points; a record written before the two were kept
+     * apart resumes from its read offset.
+     */
+    @Test
+    void aQuietReleaseMovesTheReadOffsetButNotWhereARestartResumes() {
+        withCollection((store, collection) -> {
+            store.create(CHAIN, null);
+            assertThat(store.resumeOffset(CHAIN)).isEmpty();
+            long epoch = store.openEpoch(CHAIN);
+            store.establishPhysicalAnchor(CHAIN, new ChainPosition(new SourceOrder(epoch, -1L), "start"));
+            assertThat(store.resumeOffset(CHAIN)).as("where the stream began").contains("start");
+
+            assertThat(store.advancePhysicalSourceReadOffset(CHAIN, epoch,
+                    new ChainPosition(new SourceOrder(epoch, 0), "change-0"), true)).isTrue();
+            assertThat(store.advancePhysicalSourceReadOffset(CHAIN, epoch,
+                    new ChainPosition(new SourceOrder(epoch, 1), "quiet-1"), false)).isTrue();
+
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("quiet-1");
+            assertThat(store.durableSourceRead(CHAIN).map(ChainPosition::token)).contains("quiet-1");
+            assertThat(store.resumeOffset(CHAIN)).as("the last released change").contains("change-0");
+
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(epoch, 2), "direct-quiet-2"), false);
+            assertThat(store.resumeOffset(CHAIN)).contains("change-0");
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(epoch, 3), "direct-change-3"), true);
+            assertThat(store.resumeOffset(CHAIN)).contains("direct-change-3");
+
+            store.rewindSourceReadOffset(CHAIN, "by-hand");
+            assertThat(store.resumeOffset(CHAIN)).as("a position put there by hand").contains("by-hand");
+
+            // A record from before the resume point was kept apart carries the read offset alone.
+            collection.updateOne(new Document("_id", CHAIN), new Document("$unset",
+                    new Document(MongoSrsMetaStore.SOURCE_RESUME_OFFSET, "")));
+            assertThat(store.resumeOffset(CHAIN)).as("it resumes from its read offset").contains("by-hand");
+        });
+    }
+
+    /**
+     * A record written before the two were kept apart resumes from its read offset, which only a change ever
+     * moved. The first run carrying no change, shared or direct, keeps it as the resume point before moving
+     * the read offset on -- a fallback to the moved offset would make the quiet position where a restart
+     * begins.
+     */
+    @Test
+    void aRecordFromBeforeTheSplitKeepsItsResumePointAcrossItsFirstQuietRelease() {
+        SteppedClock clock = new SteppedClock(WRITTEN_AT);
+        withCollection(clock, (store, collection) -> {
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            ChainPosition legacy = new ChainPosition(new SourceOrder(epoch, 4), "legacy-change");
+            store.advanceSourceReadOffset(CHAIN, legacy);
+            Document unset = new Document(MongoSrsMetaStore.SOURCE_RESUME_OFFSET, "")
+                    .append(MongoSrsMetaStore.SOURCE_RESUME_EPOCH, "")
+                    .append(MongoSrsMetaStore.SOURCE_RESUME_SEQ, "")
+                    .append(MongoSrsMetaStore.SOURCE_RESUME_AT, "");
+            collection.updateOne(new Document("_id", CHAIN), new Document("$unset", unset));
+
+            clock.advance(Duration.ofMinutes(1));
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(epoch, 5), "direct-quiet"), false);
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("direct-quiet");
+            assertThat(store.resumePoint(CHAIN)).as("a direct tail's quiet run")
+                    .contains(new ResumePoint(legacy, WRITTEN_AT));
+
+            String shared = CHAIN + "-shared";
+            store.create(shared, null);
+            long sharedEpoch = store.openEpoch(shared);
+            ChainPosition sharedLegacy = new ChainPosition(new SourceOrder(sharedEpoch, 9), "legacy-shared-change");
+            store.advanceSourceReadOffset(shared, sharedLegacy);
+            collection.updateOne(new Document("_id", shared), new Document("$unset", unset));
+            clock.advance(Duration.ofMinutes(1));
+            assertThat(store.advancePhysicalSourceReadOffset(shared, sharedEpoch,
+                    new ChainPosition(new SourceOrder(sharedEpoch, 10), "shared-quiet"), false)).isTrue();
+            assertThat(store.read(shared).orElseThrow().sourceReadOffset()).isEqualTo("shared-quiet");
+            assertThat(store.resumePoint(shared)).as("the shared reader's quiet run")
+                    .contains(new ResumePoint(sharedLegacy, WRITTEN_AT.plus(Duration.ofMinutes(1))));
+        });
+    }
+
+    /**
+     * The resume point keeps the order it was reached at and when it was written, apart from the read
+     * offset's: a quiet release stamps the read offset and leaves the resume point's stamp alone, so the age
+     * it reports is that of where a restart would begin. A point put there by hand has no order to keep.
+     */
+    @Test
+    void theResumePointKeepsItsOwnOrderAndTimeAcrossAQuietRelease() {
+        SteppedClock clock = new SteppedClock(WRITTEN_AT);
+        withCollection(clock, (store, collection) -> {
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            ChainPosition change = new ChainPosition(new SourceOrder(epoch, 0), "change-0");
+            store.advancePhysicalSourceReadOffset(CHAIN, epoch, change, true);
+            clock.advance(Duration.ofHours(1));
+            store.advancePhysicalSourceReadOffset(CHAIN, epoch,
+                    new ChainPosition(new SourceOrder(epoch, 1), "quiet-1"), false);
+
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadAt())
+                    .isEqualTo(WRITTEN_AT.plus(Duration.ofHours(1)));
+            assertThat(store.resumePoint(CHAIN)).contains(new ResumePoint(change, WRITTEN_AT));
+
+            clock.advance(Duration.ofHours(1));
+            store.rewindSourceReadOffset(CHAIN, "by-hand");
+            assertThat(store.resumePoint(CHAIN)).as("put there by hand: no order, stamped when it was put")
+                    .contains(new ResumePoint(
+                            new ChainPosition(null, "by-hand"), WRITTEN_AT.plus(Duration.ofHours(2))));
+
+            // A record from before the resume point was kept apart: its read offset, with its order and stamp.
+            clock.advance(Duration.ofHours(1));
+            ChainPosition later = new ChainPosition(new SourceOrder(epoch, 5), "change-5");
+            store.advanceSourceReadOffset(CHAIN, later, true);
+            collection.updateOne(new Document("_id", CHAIN), new Document("$unset",
+                    new Document(MongoSrsMetaStore.SOURCE_RESUME_OFFSET, "")
+                            .append(MongoSrsMetaStore.SOURCE_RESUME_EPOCH, "")
+                            .append(MongoSrsMetaStore.SOURCE_RESUME_SEQ, "")
+                            .append(MongoSrsMetaStore.SOURCE_RESUME_AT, "")));
+            assertThat(store.resumePoint(CHAIN))
+                    .contains(new ResumePoint(later, WRITTEN_AT.plus(Duration.ofHours(3))));
+        });
+    }
+
+    @Test
+    void anOffsetFromBeforeTrustExistedIsNotAnchoredOverUntilItIsTrusted() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long first = store.openEpoch(CHAIN);
+            ChainPosition legacy = new ChainPosition(new SourceOrder(first, 7), "legacy");
+            store.advanceSourceReadOffset(CHAIN, legacy);
+            long second = store.openEpoch(CHAIN);
+
+            assertThat(store.establishPhysicalAnchor(CHAIN,
+                    new ChainPosition(new SourceOrder(second, -1L), "start"))).isFalse();
+            assertThat(store.read(CHAIN).orElseThrow().sourceRead()).isEqualTo(legacy);
+            assertThat(store.physicalPrefixTrusted(CHAIN)).isFalse();
+
+            assertThat(store.trustSourceReadOffset(CHAIN, first)).as("only in the chain's own generation").isFalse();
+            assertThat(store.physicalPrefixTrusted(CHAIN)).isFalse();
+            assertThat(store.trustSourceReadOffset(CHAIN, second)).isTrue();
+            assertThat(store.read(CHAIN).orElseThrow().sourceRead()).as("trusting moves nothing").isEqualTo(legacy);
+            assertThat(store.establishPhysicalAnchor(CHAIN,
+                    new ChainPosition(new SourceOrder(second, -1L), "start"))).isTrue();
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("start");
+        });
+    }
+
+    /**
+     * A direct tail alone on its chain writes the chain's offset as one everyone on it landed, and marks it so
+     * in the same write -- but only where the write moves it: an offset it does not pass is left as unproven as
+     * it was.
+     */
+    @Test
+    void anOffsetADirectTailReleasesAloneIsTrustedWhereItMovesIt() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long shared = store.openEpoch(CHAIN);
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(shared, 9), "legacy-ahead"));
+
+            store.advanceDirectSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(shared, 2), "behind"), true);
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("legacy-ahead");
+            assertThat(store.physicalPrefixTrusted(CHAIN)).as("a write that moved nothing").isFalse();
+
+            long direct = store.openDirectEpoch(CHAIN);
+            store.advanceDirectSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(direct, 0), "released"), true);
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("released");
+            assertThat(store.resumeOffset(CHAIN)).contains("released");
+            assertThat(store.physicalPrefixTrusted(CHAIN)).isTrue();
+        });
+    }
+
+    @Test
+    void aPositionPutThereByHandIsTrusted() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.openEpoch(CHAIN);
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(1, 9), "legacy"));
+
+            store.rewindSourceReadOffset(CHAIN, "verified");
+
+            assertThat(store.physicalPrefixTrusted(CHAIN)).isTrue();
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("verified");
+        });
+    }
+
+    @Test
+    void aReleaseLandsOnlyWhileItsReaderHoldsTheGeneration() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long first = store.openEpoch(CHAIN);
+            store.selectConsumerTables(CHAIN, "pipe", List.of("orders"), first);
+            ChainPosition released = new ChainPosition(new SourceOrder(first, 4), "t4");
+
+            assertThat(store.advancePhysicalSourceReadOffset(CHAIN, first, released)).isTrue();
+            assertThat(store.advancePhysicalSinkAcked(CHAIN, "pipe", first, released)).isTrue();
+            assertThat(store.advancePhysicalSourceReadOffset(CHAIN, first,
+                    new ChainPosition(new SourceOrder(first, 2), "t2"))).as("behind, but still current").isTrue();
+            assertThat(store.read(CHAIN).orElseThrow().sourceRead()).isEqualTo(released);
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow().sinkAcked())
+                    .isEqualTo(released);
+
+            long second = store.openEpoch(CHAIN);
+            ChainPosition late = new ChainPosition(new SourceOrder(first, 9), "t9");
+            assertThat(store.advancePhysicalSourceReadOffset(CHAIN, first, late)).isFalse();
+            assertThat(store.advancePhysicalSinkAcked(CHAIN, "pipe", first, late)).isFalse();
+            assertThat(store.read(CHAIN).orElseThrow().sourceRead()).isEqualTo(released);
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow().sinkAcked())
+                    .isEqualTo(released);
+
+            assertThat(store.advancePhysicalSinkAcked(CHAIN, "gone", second,
+                    new ChainPosition(new SourceOrder(second, 1), "t1"))).isTrue();
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("gone"))
+                    .as("a pipeline that left is not brought back by a release").isEmpty();
+        });
+    }
+
+    /**
+     * A release written in one go lands as the separate calls would have: every pipeline's acknowledgement,
+     * the resume point at the last change and the read offset at the quiet run after it -- only while its
+     * reader holds the generation, never for a pipeline that left, and never backwards.
+     */
+    @Test
+    void aReleaseWrittenInOneGoLandsAsTheSeparateCallsWould() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long first = store.openEpoch(CHAIN);
+            store.selectConsumerTables(CHAIN, "pipe", List.of("orders"), first);
+            store.selectConsumerTables(CHAIN, "other", List.of("customers"), first);
+            ChainPosition change = new ChainPosition(new SourceOrder(first, 4), "t4");
+            ChainPosition quiet = new ChainPosition(new SourceOrder(first, 5), "h5");
+
+            assertThat(store.advancePhysicalRelease(CHAIN, first,
+                    Map.of("pipe", change, "other", change, "gone", change), change, quiet)).isTrue();
+            SrsMeta written = store.read(CHAIN).orElseThrow();
+            assertThat(written.sourceRead()).isEqualTo(quiet);
+            assertThat(store.resumeOffset(CHAIN)).contains("t4");
+            assertThat(written.consumerOffset("pipe").orElseThrow().sinkAcked()).isEqualTo(change);
+            assertThat(written.consumerOffset("other").orElseThrow().sinkAcked()).isEqualTo(change);
+            assertThat(written.consumerOffset("gone")).as("a pipeline that left is not brought back").isEmpty();
+
+            ChainPosition behind = new ChainPosition(new SourceOrder(first, 2), "t2");
+            assertThat(store.advancePhysicalRelease(CHAIN, first, Map.of("pipe", behind), behind, behind))
+                    .as("behind, but still current").isTrue();
+            assertThat(store.read(CHAIN).orElseThrow().sourceRead()).isEqualTo(quiet);
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow().sinkAcked())
+                    .isEqualTo(change);
+
+            store.openEpoch(CHAIN);
+            ChainPosition late = new ChainPosition(new SourceOrder(first, 9), "t9");
+            assertThat(store.advancePhysicalRelease(CHAIN, first, Map.of("pipe", late), late, late)).isFalse();
+            assertThat(store.read(CHAIN).orElseThrow().sourceRead()).isEqualTo(quiet);
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow().sinkAcked())
+                    .as("nothing of a release from a generation that was taken is written").isEqualTo(change);
+        });
+    }
+
+    @Test
+    void aSelectionInTheSameGenerationKeepsTheAcknowledgementsOfTheTablesItKeeps() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            store.selectConsumerTables(CHAIN, "pipe", List.of("orders", "customers"), epoch);
+            store.advanceTableSinkAcked(CHAIN, "pipe", "orders", new ChainPosition(new SourceOrder(epoch, 3), "t3"));
+            store.advanceTableSinkAcked(CHAIN, "pipe", "customers",
+                    new ChainPosition(new SourceOrder(epoch, 2), "t2"));
+
+            store.selectConsumerTables(CHAIN, "pipe", List.of("orders"), epoch);
+
+            ConsumerOffset persisted = store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow();
+            assertThat(persisted.selectedTables()).containsExactly("orders");
+            assertThat(persisted.sinkAckedByTable())
+                    .as("the table it keeps keeps what it confirmed; the one it dropped is no longer waited on")
+                    .containsExactly(Map.entry("orders", new ChainPosition(new SourceOrder(epoch, 3), "t3")));
+        });
+    }
 
     @Test
     void createSeedsAnEmptyRecordAndReadReturnsIt() {
@@ -357,13 +948,16 @@ class MongoSrsMetaStoreIT {
                     CHAIN, "p1", "sink-0", "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
 
             assertThat(store.ringDoneThrough(CHAIN, "p1")).isEmpty();
-            assertThat(onlyConsumer(store).sinkAcked()).isNull();
+            assertThat(onlyConsumer(store).sinkAckedByTable()).isEmpty();
 
             store.advanceSinkWriterAcked(
                     CHAIN, "p1", "sink-1", "orders", new ChainPosition(new SourceOrder(1, 50), "t50"));
 
             assertThat(store.ringDoneThrough(CHAIN, "p1")).containsEntry("orders", 50L);
-            assertThat(onlyConsumer(store).sinkAckedSrcpos()).isEqualTo("t50");
+            assertThat(onlyConsumer(store).sinkAckedByTable())
+                    .containsEntry("orders", new ChainPosition(new SourceOrder(1, 50), "t50"));
+            assertThat(onlyConsumer(store).sinkAcked())
+                    .as("what one table landed never moves the chain-level position").isNull();
 
             store.markSinkWriterSnapshotComplete(CHAIN, "p1", "sink-0", "orders");
             assertThat(store.read(CHAIN).orElseThrow().snapshotCompletedTables("p1")).isEmpty();
@@ -405,7 +999,8 @@ class MongoSrsMetaStoreIT {
                     CHAIN, "p1", "slow", "orders", new ChainPosition(new SourceOrder(2, 50), "t2-50"));
 
             assertThat(store.ringDoneThrough(CHAIN, "p1")).containsEntry("orders", 50L);
-            assertThat(onlyConsumer(store).sinkAckedSrcpos()).isEqualTo("t2-50");
+            assertThat(onlyConsumer(store).sinkAckedByTable())
+                    .containsEntry("orders", new ChainPosition(new SourceOrder(2, 50), "t2-50"));
         });
     }
 
@@ -427,7 +1022,7 @@ class MongoSrsMetaStoreIT {
     }
 
     @Test
-    void legacyAggregateProgressCanSeedItsOnlySinkWriter() {
+    void legacyAggregateProgressDoesNotStopItsOnlySinkWriter() {
         withStore(store -> {
             store.create(CHAIN, null);
             store.advanceSinkAcked(
@@ -438,7 +1033,10 @@ class MongoSrsMetaStoreIT {
                     CHAIN, "p1", "only", "orders", new ChainPosition(new SourceOrder(1, 101), "t101"));
 
             assertThat(store.ringDoneThrough(CHAIN, "p1")).containsEntry("orders", 101L);
-            assertThat(onlyConsumer(store).sinkAckedSrcpos()).isEqualTo("t101");
+            assertThat(onlyConsumer(store).sinkAckedByTable())
+                    .containsEntry("orders", new ChainPosition(new SourceOrder(1, 101), "t101"));
+            // The chain-level position is the chain reader's to release; a writer's word leaves it alone.
+            assertThat(onlyConsumer(store).sinkAckedSrcpos()).isEqualTo("t100");
         });
     }
 
@@ -864,6 +1462,46 @@ class MongoSrsMetaStoreIT {
             assertThat(store.read(CHAIN).orElseThrow().consumerOffsets()).isEmpty();
             assertThat(store.read("never_seeded")).isEmpty();
         });
+    }
+
+    /**
+     * The position a source may be told to release up to is read with a majority read concern: a write only
+     * the old primary had, rolled back in a failover, must never reach a source that would then have let go
+     * of what the rolled-back record asks for again.
+     */
+    @Test
+    void theDurablePositionIsReadWithAMajorityReadConcern() {
+        List<BsonDocument> finds = new CopyOnWriteArrayList<>();
+        CommandListener recordFinds = new CommandListener() {
+            @Override
+            public void commandStarted(CommandStartedEvent event) {
+                if ("find".equals(event.getCommandName())) {
+                    finds.add(event.getCommand().clone());
+                }
+            }
+        };
+        MongoClientSettings settings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl()))
+                .addCommandListener(recordFinds)
+                .build();
+        try (MongoClient client = MongoClients.create(settings)) {
+            MongoCollection<Document> roots = client.getDatabase("tapstate").getCollection("srs_meta");
+            MongoCollection<Document> consumers = client.getDatabase("tapstate").getCollection("srs_consumer_offsets");
+            roots.drop();
+            consumers.drop();
+            MongoSrsMetaStore store = new MongoSrsMetaStore(client, roots, consumers);
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            ChainPosition released = new ChainPosition(new SourceOrder(epoch, 3), "t3");
+            store.advanceSourceReadOffset(CHAIN, released);
+            finds.clear();
+
+            assertThat(store.durableSourceRead(CHAIN)).contains(released);
+
+            assertThat(finds).hasSize(1);
+            assertThat(finds.getFirst().getDocument("readConcern").getString("level").getValue())
+                    .isEqualTo("majority");
+        }
     }
 
     @Test
@@ -1307,6 +1945,34 @@ class MongoSrsMetaStoreIT {
     /** The same again, handing over the collection too, for a case that has to write a raw document. */
     private static void withCollection(CollectionTest test) {
         withCollection(Clock.systemUTC(), test);
+    }
+
+    /** A clock a case moves on by hand, so the writes it stamps can be told apart. */
+    private static final class SteppedClock extends Clock {
+        private Instant now;
+
+        SteppedClock(Instant start) {
+            this.now = start;
+        }
+
+        void advance(Duration by) {
+            now = now.plus(by);
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return this;
+        }
+
+        @Override
+        public Instant instant() {
+            return now;
+        }
     }
 
     private static void withCollection(Clock clock, CollectionTest test) {

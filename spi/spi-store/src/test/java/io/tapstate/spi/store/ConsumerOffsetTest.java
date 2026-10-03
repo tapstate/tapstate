@@ -15,6 +15,51 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class ConsumerOffsetTest {
 
     @Test
+    void aSelectionAndItsGenerationAreRecordedTogetherOrNotAtAll() {
+        assertThatThrownBy(() -> new ConsumerOffset("p", Map.of(), null, List.of(), null, 0L,
+                List.of("orders"), null, Map.of()))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new ConsumerOffset("p", Map.of(), null, List.of(), null, 0L,
+                null, 3L, Map.of()))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new ConsumerOffset("p", Map.of(), null, List.of(), null, 0L,
+                List.of("orders"), 0L, Map.of()))
+                .as("a selection is made in an open generation, and generations begin at one")
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void aTableAcknowledgementNeedsTheOrderItSatAt() {
+        // The order is what the chain's prefix is released on; a token alone can be ranked against nothing.
+        assertThatThrownBy(() -> new ConsumerOffset("p", Map.of(), null, List.of(), null, 0L,
+                List.of("orders"), 1L, Map.of("orders", new ChainPosition(null, "t1"))))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void aConsumerWhoseSelectionWasNeverRecordedIsReadAsSelectingEveryTable() {
+        ConsumerOffset legacy = new ConsumerOffset("p", Map.of(), null, List.of(), null, 0L);
+        ConsumerOffset selecting = new ConsumerOffset("p", Map.of(), null, List.of(), null, 0L,
+                List.of("orders"), 2L, Map.of());
+        // Read the other way, a consumer that attached before selections were recorded would let the chain
+        // move past a change of a table it still reads.
+        assertThat(legacy.selects("customers")).isTrue();
+        assertThat(selecting.selects("orders")).isTrue();
+        assertThat(selecting.selects("customers")).isFalse();
+    }
+
+    @Test
+    void settingTheChainAcknowledgementKeepsEverythingElse() {
+        ChainPosition table = new ChainPosition(new SourceOrder(2, 4), "t4");
+        ConsumerOffset offset = new ConsumerOffset("p", Map.of("orders", 4L), null, List.of("orders"), "seam", 2L,
+                List.of("orders"), 2L, Map.of("orders", table));
+        ChainPosition chain = new ChainPosition(new SourceOrder(2, 1), "b1");
+
+        assertThat(offset.withSinkAcked(chain)).isEqualTo(new ConsumerOffset("p", Map.of("orders", 4L), chain,
+                List.of("orders"), "seam", 2L, List.of("orders"), 2L, Map.of("orders", table)));
+    }
+
+    @Test
     void holdsThePipelineCursorAndAckedPosition() {
         ConsumerOffset offset = new ConsumerOffset("orders-pipeline", Map.of("orders", 42L, "items", 7L), new ChainPosition(new SourceOrder(1, 100), "gtid:aaa-1:100"));
         assertThat(offset.pipelineId()).isEqualTo("orders-pipeline");

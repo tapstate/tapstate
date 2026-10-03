@@ -119,11 +119,13 @@ class DurableSinkAcknowledgementFenceIT {
                 if (snapshot) {
                     assertThat(meta.read(CHAIN).orElseThrow().snapshotCompletedTables(PIPELINE))
                             .containsExactlyInAnyOrder(TABLE, "items");
-                    assertThat(ackedBy(meta).token()).isEqualTo("w0");
+                    assertThat(ackedBy(meta)).as("a snapshot row records no position, only the mark").isNull();
                 } else {
                     assertThat(ackedBy(meta)).isEqualTo(position(2));
                     assertThat(meta.ringDoneThrough(CHAIN, PIPELINE)).containsEntry(TABLE, 2L);
-                    assertThat(meta.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("w2");
+                    assertThat(meta.read(CHAIN).orElseThrow().sourceReadOffset())
+                            .as("a sink never moves the chain's read offset; the chain's reader releases it")
+                            .isNull();
                 }
             }
         }
@@ -240,8 +242,10 @@ class DurableSinkAcknowledgementFenceIT {
         return new ChainPosition(new SourceOrder(1, seq), "w" + seq);
     }
 
+    /** What the pipeline's sinks have landed on {@code orders}: the acknowledgement a sink writes. */
     private static ChainPosition ackedBy(MongoSrsMetaStore store) {
-        return store.read(CHAIN).orElseThrow().consumerOffset(PIPELINE).orElseThrow().sinkAcked();
+        return store.read(CHAIN).orElseThrow().consumerOffset(PIPELINE).orElseThrow()
+                .sinkAckedByTable().get(TABLE);
     }
 
     private static void holdNextWrite(MongoClient admin, Duration hold) {

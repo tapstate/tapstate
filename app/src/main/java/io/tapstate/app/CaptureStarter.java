@@ -1,8 +1,11 @@
 package io.tapstate.app;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.srs.CaptureHandoff;
 import io.tapstate.runtime.srs.CaptureRun;
 import io.tapstate.runtime.srs.CaptureRunSpec;
+
+import java.util.Optional;
 
 /**
  * The seam by which a test coordinator starts one source run and gets back a live handle. Production uses
@@ -16,4 +19,13 @@ interface CaptureStarter {
      * each table's load is in. The run may be handed back while its load is still being read.
      */
     CaptureRun start(CaptureRunSpec spec, CaptureHandoff handoff);
+
+    /**
+     * Lets go of what {@code spec}'s source connector set up on the source to read changes, and of the notes it
+     * kept to find it again, answering what the source refused to let go of. The default sets nothing up, so
+     * it has nothing to let go of.
+     */
+    default Optional<TapstateException> release(CaptureRunSpec spec) {
+        return Optional.empty();
+    }
 }

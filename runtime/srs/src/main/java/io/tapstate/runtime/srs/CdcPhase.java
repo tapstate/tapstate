@@ -3,10 +3,9 @@ package io.tapstate.runtime.srs;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.capture.CaptureConfig;
+import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.CaptureStart;
-import io.tapstate.core.event.ChainPosition;
-import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ConsumerOffset;
@@ -21,11 +20,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.concurrent.CancellationException;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.Function;
-import java.util.function.LongConsumer;
-import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
 /**
@@ -36,9 +32,8 @@ import java.util.function.Supplier;
  *
  * <p>The per-event source position is threaded at this seam: the event envelope carries no position slot,
  * so each change is stamped with the position the source reported for it. Most changes carry none — a
- * source names one position for a run of changes — and the durable read offset therefore advances at
- * those boundaries rather than on every change, which is exactly where the claim "everything up to here
- * has been read" is true.
+ * source names one position for a run of changes — and each run is handed, with that position, to the
+ * reader's account, which alone writes a position down once everyone the run was owed to has landed it.
  *
  * <p>Where a tail begins is the caller's to say, and it says it: {@link CaptureStart#present()} for a run
  * asked to take only new changes, a recorded position for one picking up where it left off.
@@ -82,103 +77,79 @@ public final class CdcPhase {
     }
 
     /**
-     * Starts the cdc stream and returns the subscription that stops it. Each change event is projected to
-     * a ring item carrying the position the source reported for it and appended through the headroom gate, which
-     * refuses a write that would overwrite a change the slowest consumer has not read.
+     * Starts the chain's reader: one connector subscription over every table it subscribes to, each change
+     * routed to its table's ring, and the chain's durable positions moved only by {@code prefix} -- which
+     * releases a run of changes once everyone it was owed to has landed it, and never on the strength of one
+     * table's confirmation alone. The subscription it returns closes the account with the stream.
      *
-     * @param consumers the chain's consumer cursors, which bound both how far the ring may be written
-     *                  ahead of its slowest reader and how far the durable read offset may advance
+     * <p>Where the stream began is handed to the account before anything else, and a run that carried no
+     * change but named a position is recorded like any other: behind every run before it, it is what moves
+     * a quiet chain.
      */
-    public static Subscription run(
-            CapturePort port,
-            CaptureConfig config,
-            CdcChain chain,
-            Supplier<Collection<ConsumerOffset>> consumers,
-            CaptureHealth health) {
-        Objects.requireNonNull(port, "port");
-        Objects.requireNonNull(config, "config");
-        Objects.requireNonNull(chain, "chain");
-        Objects.requireNonNull(consumers, "consumers");
-        Objects.requireNonNull(health, "health");
-        return run(port, config, CaptureStart.present(), chain, consumers, health);
-    }
-
-    /** As above, beginning where {@code start} says rather than always at the source's present moment. */
-    public static Subscription run(
-            CapturePort port,
-            CaptureConfig config,
-            CaptureStart start,
-            CdcChain chain,
-            Supplier<Collection<ConsumerOffset>> consumers,
-            CaptureHealth health) {
-        Objects.requireNonNull(port, "port");
-        Objects.requireNonNull(config, "config");
-        Objects.requireNonNull(start, "start");
-        Objects.requireNonNull(chain, "chain");
-        Objects.requireNonNull(consumers, "consumers");
-        Objects.requireNonNull(health, "health");
-        // One chain serves every table this subscription sees, so the route resolves to it whatever the
-        // change names -- the same run-writing path the multi-table entry point takes.
-        // No ring name and no log reach this entry point, so there is nothing here that could name what
-        // to cut. The caller that owns both wires a real cut through the other entry point.
-        TableRoute route = new TableRoute(chain, consumers, seq -> { });
-        AtomicReference<ChainPosition> lastWritten = new AtomicReference<>();
-        return port.cdc(config, start, health.recording(
-                (events, position) -> writeBatch(events, position, table -> route, lastWritten)));
-    }
-
-    /** Starts one connector subscription and routes each event to the ring for its source table. */
-    public static Subscription run(
-            CapturePort port,
-            CaptureConfig config,
-            Map<String, TableRoute> routes,
-            CaptureHealth health) {
-        return run(port, config, CaptureStart.present(), routes, health);
-    }
-
-    /**
-     * As above, beginning where {@code start} says. One subscription serves every table of the chain, so
-     * the start is the chain's — the tail is one log read, not one per table.
-     */
-    public static Subscription run(
+    static Subscription run(
             CapturePort port,
             CaptureConfig config,
             CaptureStart start,
             Map<String, TableRoute> routes,
-            CaptureHealth health) {
+            CaptureHealth health,
+            PhysicalSourcePrefix prefix) {
         Objects.requireNonNull(port, "port");
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(start, "start");
         Objects.requireNonNull(routes, "routes");
         Objects.requireNonNull(health, "health");
+        Objects.requireNonNull(prefix, "prefix");
         Map<String, TableRoute> routeSnapshot = Map.copyOf(routes);
-        // The last position actually persisted, for the life of this subscription. It is what lets a run
-        // that resolves the same frontier as the one before it write nothing: see writeBatch.
-        AtomicReference<ChainPosition> lastWritten = new AtomicReference<>();
-        return port.cdc(config, start, health.recording(
-                (events, position) -> writeBatch(events, position, routeSnapshot::get, lastWritten)));
+        Subscription stream;
+        try {
+            stream = port.cdc(config, start, health.recording(new CaptureListener() {
+                @Override
+                public void onStart(Optional<SourcePosition> position) {
+                    prefix.start(position);
+                }
+
+                @Override
+                public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                    writeReleased(events, position, routeSnapshot::get, prefix);
+                }
+            }));
+        } catch (RuntimeException | Error failure) {
+            prefix.close();
+            throw failure;
+        }
+        return closingWith(stream, prefix);
+    }
+
+    /** {@code stream}, closing {@code prefix} with it and handing every acknowledgement straight through. */
+    static Subscription closingWith(Subscription stream, PhysicalSourcePrefix prefix) {
+        return new Subscription() {
+            @Override
+            public void acknowledge(SourcePosition durable) {
+                stream.acknowledge(durable);
+            }
+
+            @Override
+            public void close() {
+                prefix.closing();
+                try {
+                    stream.close();
+                } finally {
+                    prefix.close();
+                }
+            }
+        };
     }
 
     /**
-     * One table's wiring: its ring, the slowest consumer's cursor in it, the chain's consumer offsets, and
-     * a cut of the durable log behind it.
-     *
-     * <p>{@code trimThrough} is handed the sequence every consumer has durably landed, and drops the log
-     * at or below it -- a change every consumer has landed has no replay value left, and without the cut
-     * the log grows without bound. <strong>Whether that sequence can be attributed to this ring at all is
-     * the caller's to know</strong>, not this phase's: a chain carrying several tables records one acked
-     * position for the whole chain, and its sequence came from whichever ring held that change. A caller
-     * that cannot attribute it passes a cut that does nothing, and says why where it does so.
+     * One table's wiring: its ring and the chain's consumer offsets, whose cursors in that ring bound how far
+     * ahead of its slowest reader it may be written. What the chain may let go of, and how far each table's
+     * durable log may be cut, is the reader's account to decide, not this route's.
      */
-    public record TableRoute(
-            CdcChain chain,
-            Supplier<Collection<ConsumerOffset>> consumers,
-            LongConsumer trimThrough) {
+    public record TableRoute(CdcChain chain, Supplier<Collection<ConsumerOffset>> consumers) {
 
         public TableRoute {
             Objects.requireNonNull(chain, "chain");
             Objects.requireNonNull(consumers, "consumers");
-            Objects.requireNonNull(trimThrough, "trimThrough");
         }
     }
 
@@ -203,25 +174,54 @@ public final class CdcPhase {
     }
 
     /**
-     * Projects one run of changes to ring items, admits each table's share of the run into that table's
-     * ring in one act, and advances the durable read offset once, to the position the source named for the
-     * run.
+     * Writes one run of changes into the rings and hands it to the chain reader's account, which alone decides
+     * when the position the source named for it may be written down.
      *
-     * <p>The run is split by table because the rings are per table, and each table's share stays in the
-     * order the source read it. <strong>Every change is routed before any of them is written</strong>: a
-     * change naming a table this chain does not carry fails the whole run, and failing it after half of it
-     * is in the ring would leave the source read offset unable to describe what happened.
+     * <p>The account is asked whether it is still recording before anything is written, so a reader that can no
+     * longer write its positions down writes no more changes either. A run that carried no change but named a
+     * position is recorded too, with nothing owed: a source that reports where a transaction ends only after
+     * it has handed the transaction's changes over names that position on exactly such a run. One that named
+     * nothing and carried nothing tells nobody anything, and is let go.
+     *
+     * <p>A run that fails part way -- refused by its routing, by a ring, or by the account -- has still been
+     * handed over: the source has moved on past it, and a connector that catches what its consumer throws reads
+     * on. Released behind it, a later run would carry the chain past whatever of it never reached a ring or the
+     * account. So the failure stops the account before it goes back to the source.
      */
-    private static void writeBatch(
+    private static void writeReleased(
             List<Envelope> events,
             Optional<SourcePosition> position,
             Function<String, TableRoute> routes,
-            AtomicReference<ChainPosition> lastWritten) {
-        if (events.isEmpty()) {
-            // The source handed over only events that carry no change -- a heartbeat and its like. There is
-            // nothing to write, and nothing has been read past, so the offset does not move either.
+            PhysicalSourcePrefix prefix) {
+        String token = position.map(SourcePosition::token).orElse(null);
+        if (events.isEmpty() && token == null) {
             return;
         }
+        prefix.checkStillRecording();
+        try {
+            // Routed before anything is written: a change naming a table this reader does not carry fails the
+            // run whole, before any of it is written or recorded.
+            Map<String, List<SrsItem>> byTable = events.isEmpty() ? Map.of() : byTable(events, position, routes);
+            Map<String, Long> lastSeqByTable = new LinkedHashMap<>();
+            for (Map.Entry<String, List<SrsItem>> entry : byTable.entrySet()) {
+                lastSeqByTable.put(entry.getKey(),
+                        admit(routes.apply(entry.getKey()), entry.getKey(), entry.getValue()).lastSeq());
+            }
+            prefix.admitted(lastSeqByTable, token);
+        } catch (RuntimeException | Error failure) {
+            prefix.abandon(failure);
+            throw failure;
+        }
+    }
+
+    /**
+     * Projects one run of changes to ring items split by table, each table's share in the order the source
+     * read it. Every change is routed before any of them is written: a change naming a table this chain does
+     * not carry fails the whole run, and failing it after half of it is in the ring would leave the source
+     * read offset unable to describe what happened.
+     */
+    private static Map<String, List<SrsItem>> byTable(
+            List<Envelope> events, Optional<SourcePosition> position, Function<String, TableRoute> routes) {
         int last = events.size() - 1;
         Map<String, List<SrsItem>> byTable = new LinkedHashMap<>();
         for (int i = 0; i < events.size(); i++) {
@@ -239,46 +239,7 @@ public final class CdcPhase {
                     pos, event.op(), event.ts(), event.before(), event.after(), route.chain().schemaVer(),
                     route.chain().captureFence()));
         }
-        String closingTable = events.get(last).src();
-        long closingSeq = -1;
-        Collection<ConsumerOffset> closingOffsets = List.of();
-        for (Map.Entry<String, List<SrsItem>> entry : byTable.entrySet()) {
-            Admitted admitted = admit(routes.apply(entry.getKey()), entry.getKey(), entry.getValue());
-            if (entry.getKey().equals(closingTable)) {
-                closingSeq = admitted.lastSeq();
-                // The cursors the admission read, rather than a second reading of them. They are the same
-                // record, and a reading taken a moment earlier can only be behind -- which clamps the
-                // advance shorter, never further, so the bound it enforces still holds.
-                closingOffsets = admitted.offsets();
-            }
-        }
-        // The run is in the rings; advance the durable read offset to the position that closes it, clamped
-        // so it never passes the slowest consumer's sink-acked position -- a change only ever in the
-        // volatile ring must stay re-minable from the source until a sink has durably landed it.
-        // The sequence the ring just assigned, paired with the generation it is running under, is what
-        // ranks this position against the consumers' acked ones: a token says nothing about order.
-        TableRoute closing = routes.apply(closingTable);
-        CdcChain chain = closing.chain();
-        ChainPosition read = new ChainPosition(new SourceOrder(chain.epoch(), closingSeq),
-                position.map(SourcePosition::token).orElse(null));
-        SrsDurableFrontier.safeAdvance(read, closingOffsets).ifPresent(safe -> {
-            // A backpressured or idle chain resolves the same frontier run after run: the advance is
-            // clamped to the slowest sink's acked position, and that does not move while the sink is not
-            // landing anything. Persisting it again writes the value the record already holds, and cutting
-            // to it again cuts what is already gone. Neither is wrong, and on a real endpoint both are a
-            // synchronous round trip on the thread the source reads on, so the run pays to say nothing.
-            if (safe.equals(lastWritten.get())) {
-                return;
-            }
-            chain.meta().advanceSourceReadOffset(chain.miningChainId(), safe);
-            lastWritten.set(safe);
-            // The same frontier bounds what the log still has to keep: every consumer has durably landed
-            // the change at that sequence, so nothing will ever replay it or anything before it. The cut
-            // rides the frontier rather than running on its own clock because this is the only moment the
-            // frontier is known to have moved -- and it costs one more call on a path that already makes
-            // one, rather than one per change.
-            closing.trimThrough().accept(safe.order().seq());
-        });
+        return byTable;
     }
 
     /**
