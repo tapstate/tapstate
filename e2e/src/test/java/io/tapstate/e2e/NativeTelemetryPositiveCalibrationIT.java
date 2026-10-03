@@ -193,11 +193,11 @@ class NativeTelemetryPositiveCalibrationIT {
             }
             if (fork != null) {
                 try { fork.close(); } catch (Exception | Error failure) {
-                    if (cleanup == null) { cleanup = failure; } else { cleanup.addSuppressed(failure); }
+                    if (cleanup == null) { cleanup = failure; } else if (cleanup != failure) { cleanup.addSuppressed(failure); }
                 }
             }
             if (cleanup != null) {
-                if (primary != null) { primary.addSuppressed(cleanup); }
+                if (primary != null) { if (primary != cleanup) { primary.addSuppressed(cleanup); } }
                 else {
                     try { report.fail(cleanup); } catch (RuntimeException reporting) { cleanup.addSuppressed(reporting); }
                     if (cleanup instanceof Exception exception) { throw exception; }
