@@ -56,7 +56,7 @@ class PreviewDocumentStorageTest {
         Map<String, Object> document = Map.of("values", new int[] {3, 5, 8});
 
         Map<String, Object> restored = PreviewDocumentStorage.decode(PreviewDocumentStorage.encode(document));
-        assertThat(restored.get("values")).isEqualTo(List.of(3L, 5L, 8L));
+        assertThat(restored).containsEntry("values", List.of(3L, 5L, 8L));
 
         Map<Object, Object> invalid = Map.of(7, "not-a-field-name");
         @SuppressWarnings("unchecked")
@@ -88,6 +88,19 @@ class PreviewDocumentStorageTest {
         expected.remove("byte_array");
         assertThat(restored).containsAllEntriesOf(expected);
         assertThat(((ConvertedValue) restored.get("byte_array")).value()).isEqualTo(new byte[] {1, 2});
+    }
+
+    @Test
+    void roundTripsJsonCarrierValuesAndCountsEncodedUtf8Bytes() {
+        Map<String, Object> value = Map.of("name", "customer", "active", true);
+        Map<String, Object> document = Map.of("payload", new ConvertedValue(value, "JSON"));
+
+        String encoded = PreviewDocumentStorage.encode(document);
+        Map<String, Object> restored = PreviewDocumentStorage.decode(encoded);
+
+        assertThat(restored).containsEntry("payload", new ConvertedValue(value, "JSON"));
+        assertThat(PreviewDocumentStorage.encodedSize(encoded))
+                .isEqualTo(encoded.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
     }
 
     @Test
