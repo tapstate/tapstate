@@ -60,16 +60,20 @@ class OverviewQueriesDoNotScanTheHistoryIT {
     @EnumSource(Tiers.class)
     void aRoundOfOverviewReadsExaminesNoHistoryWorthOfDocuments(Tiers tier, @TempDir Path directory)
             throws Exception {
-        String storeUri = storeUri("overview_history", tier);
-        try (ServerHandle server = tier.launch(storeUri);
+        String storeUri = storeUri(OverviewMongoScanProfile.databaseStem(tier), tier);
+        try (OverviewMongoScanProfile diagnostic = OverviewMongoScanProfile.openIfRequested(tier, storeUri);
+                ServerHandle server = diagnostic == null ? tier.launch(storeUri) : diagnostic.launch();
                 MongoClient client = MongoClients.create(storeUri)) {
             RunningPipeline running = RunningPipeline.started(server, directory);
             ControlPlane control = running.control();
             String pipelineId = running.pipelineId();
 
-            Round empty = round(control, pipelineId, client);
+            if (diagnostic != null) { diagnostic.begin(pipelineId, FULL_HISTORY, READS_PER_ROUND); }
+            Round empty = diagnostic == null ? round(control, pipelineId, client)
+                    : diagnostic.round("empty", () -> round(control, pipelineId, client), Round::examined, Round::millis);
             layDownAFullHistory(client, storeUri, pipelineId);
-            Round full = round(control, pipelineId, client);
+            Round full = diagnostic == null ? round(control, pipelineId, client)
+                    : diagnostic.round("full", () -> round(control, pipelineId, client), Round::examined, Round::millis);
 
             // The evidence line: printed, not asserted, and both rounds on purpose - a number alone does
             // not say whether it is large.
@@ -78,11 +82,19 @@ class OverviewQueriesDoNotScanTheHistoryIT {
                     tier, READS_PER_ROUND, empty.examined(), empty.millis(), FULL_HISTORY, full.examined(),
                     full.millis());
 
-            assertThat(full.examined())
-                    .as("documents and index keys the server examined for a round of overview reads over "
-                            + "%d samples; one scan of the history per round would examine every one of them",
-                            FULL_HISTORY)
-                    .isLessThan(FULL_HISTORY);
+            try {
+                assertThat(full.examined())
+                        .as("documents and index keys the server examined for a round of overview reads over "
+                                + "%d samples; one scan of the history per round would examine every one of them",
+                                FULL_HISTORY)
+                        .isLessThan(FULL_HISTORY);
+            } catch (AssertionError failure) {
+                if (diagnostic != null) {
+                    try { diagnostic.failed(failure); }
+                    catch (RuntimeException | Error reporting) { if (failure != reporting) { failure.addSuppressed(reporting); } }
+                }
+                throw failure;
+            }
         }
     }
 
