@@ -33,19 +33,21 @@ import java.util.Optional;
  * does not hold is looked for in each of those in turn, and the first value found is written into its own
  * namespace and read from there from then on. Nothing is copied wholesale -- the store cannot list a
  * namespace, and a note nobody asks for is one nobody needs. Those namespaces are other nodes' own notes, and
- * are never written to: a key removed here is marked removed here, and a cleared map marks itself cleared, so
- * that nothing comes back from where it was carried from while every other node keeps what it kept.
+ * are never written to: a key removed here is removed here and marked removed under a key of its own, and a
+ * cleared map marks itself cleared, so that nothing comes back from where it was carried from while every other
+ * node keeps what it kept. The key itself is left absent rather than written over, so that claiming it again
+ * stays one act of the store's.
  */
 final class DurableStateMap implements KVMap<Object> {
 
-    /**
-     * What a key forgotten in a map that carries notes over holds: nothing the codec produces, which always
-     * writes a version first, so it is never read back as a value.
-     */
-    private static final byte[] FORGOTTEN = new byte[0];
+    /** What a mark holds: only whether one is there is ever read. */
+    private static final byte[] MARK = new byte[0];
 
     /** The key a cleared map that carries notes over keeps, saying nothing is to be carried over any more. */
     private static final String CARRYING_ENDED = "__tapstate.carried-over.ended__";
+
+    /** The prefix of the key a map that carries notes over keeps for each key forgotten here. */
+    private static final String FORGOTTEN = "__tapstate.carried-over.forgotten__.";
 
     private final KeyedStateStore store;
     private final String namespace;
@@ -82,14 +84,9 @@ final class DurableStateMap implements KVMap<Object> {
             // Nothing to claim the key with; report what is there without touching it.
             return get(key);
         }
-        if (store.load(namespace, key).filter(DurableStateMap::forgotten).isPresent()) {
-            // Forgotten here, so absent: claimed by writing over the mark.
-            store.save(namespace, key, ConnectorStateCodec.encode(value));
-            return null;
-        }
-        Object carried = get(key);
-        if (carried != null) {
-            return carried;
+        Object present = get(key);
+        if (present != null) {
+            return present;
         }
         return store.saveIfAbsent(namespace, key, ConnectorStateCodec.encode(value))
                 .map(ConnectorStateCodec::decode)
@@ -100,19 +97,26 @@ final class DurableStateMap implements KVMap<Object> {
     public Object get(String key) {
         Optional<byte[]> own = store.load(namespace, key);
         if (own.isPresent()) {
-            return forgotten(own.get()) ? null : ConnectorStateCodec.decode(own.get());
+            return ConnectorStateCodec.decode(own.get());
         }
-        if (carriedFrom.isEmpty() || store.load(namespace, CARRYING_ENDED).isPresent()) {
+        if (carriedFrom.isEmpty() || store.load(namespace, CARRYING_ENDED).isPresent() || forgotten(key)) {
             return null;
         }
         for (String earlier : carriedFrom) {
             Optional<byte[]> kept = store.load(earlier, key);
             if (kept.isPresent()) {
                 // Written here before it is read from here, so whoever opens these notes next finds it
-                // without looking back; a concurrent carrier that got there first wins, and so does its value.
-                return store.saveIfAbsent(namespace, key, kept.get())
-                        .map(ConnectorStateCodec::decode)
-                        .orElseGet(() -> ConnectorStateCodec.decode(kept.get()));
+                // without looking back; a concurrent carrier or claimer that got there first wins.
+                Optional<byte[]> first = store.saveIfAbsent(namespace, key, kept.get());
+                if (first.isPresent()) {
+                    return ConnectorStateCodec.decode(first.get());
+                }
+                if (forgotten(key)) {
+                    // Forgotten here while it was being carried over: the forgetting stands.
+                    store.delete(namespace, key);
+                    return null;
+                }
+                return ConnectorStateCodec.decode(kept.get());
             }
         }
         return null;
@@ -126,19 +130,19 @@ final class DurableStateMap implements KVMap<Object> {
     }
 
     /**
-     * Removes {@code key} here. Where notes are carried over it is marked removed instead, so no later read
+     * Removes {@code key} here. Where notes are carried over it is marked removed as well, so no later read
      * brings it back from where it was carried from, and that namespace -- another node's own -- is left alone.
+     * Marked before it is removed, so no read in between finds it gone with nothing to keep it from coming back.
      */
     private void forget(String key) {
-        if (carriedFrom.isEmpty()) {
-            store.delete(namespace, key);
-        } else {
-            store.save(namespace, key, FORGOTTEN);
+        if (!carriedFrom.isEmpty()) {
+            store.save(namespace, FORGOTTEN + key, MARK);
         }
+        store.delete(namespace, key);
     }
 
-    private static boolean forgotten(byte[] stored) {
-        return stored.length == 0;
+    private boolean forgotten(String key) {
+        return store.load(namespace, FORGOTTEN + key).isPresent();
     }
 
     @Override
@@ -148,7 +152,7 @@ final class DurableStateMap implements KVMap<Object> {
         // another node's and stays; the mark left here is what keeps it from being carried over again.
         store.dropNamespace(namespace);
         if (!carriedFrom.isEmpty()) {
-            store.save(namespace, CARRYING_ENDED, FORGOTTEN);
+            store.save(namespace, CARRYING_ENDED, MARK);
         }
     }
 
