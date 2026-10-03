@@ -32,10 +32,20 @@ import java.util.Optional;
  * <p>A map can carry notes over from namespaces that kept them before, key by key: a key its own namespace
  * does not hold is looked for in each of those in turn, and the first value found is written into its own
  * namespace and read from there from then on. Nothing is copied wholesale -- the store cannot list a
- * namespace, and a note nobody asks for is one nobody needs. A key removed here is removed from those too,
- * so that it cannot come back from where it was carried from.
+ * namespace, and a note nobody asks for is one nobody needs. Those namespaces are other nodes' own notes, and
+ * are never written to: a key removed here is marked removed here, and a cleared map marks itself cleared, so
+ * that nothing comes back from where it was carried from while every other node keeps what it kept.
  */
 final class DurableStateMap implements KVMap<Object> {
+
+    /**
+     * What a key forgotten in a map that carries notes over holds: nothing the codec produces, which always
+     * writes a version first, so it is never read back as a value.
+     */
+    private static final byte[] FORGOTTEN = new byte[0];
+
+    /** The key a cleared map that carries notes over keeps, saying nothing is to be carried over any more. */
+    private static final String CARRYING_ENDED = "__tapstate.carried-over.ended__";
 
     private final KeyedStateStore store;
     private final String namespace;
@@ -72,6 +82,11 @@ final class DurableStateMap implements KVMap<Object> {
             // Nothing to claim the key with; report what is there without touching it.
             return get(key);
         }
+        if (store.load(namespace, key).filter(DurableStateMap::forgotten).isPresent()) {
+            // Forgotten here, so absent: claimed by writing over the mark.
+            store.save(namespace, key, ConnectorStateCodec.encode(value));
+            return null;
+        }
         Object carried = get(key);
         if (carried != null) {
             return carried;
@@ -85,7 +100,10 @@ final class DurableStateMap implements KVMap<Object> {
     public Object get(String key) {
         Optional<byte[]> own = store.load(namespace, key);
         if (own.isPresent()) {
-            return ConnectorStateCodec.decode(own.get());
+            return forgotten(own.get()) ? null : ConnectorStateCodec.decode(own.get());
+        }
+        if (carriedFrom.isEmpty() || store.load(namespace, CARRYING_ENDED).isPresent()) {
+            return null;
         }
         for (String earlier : carriedFrom) {
             Optional<byte[]> kept = store.load(earlier, key);
@@ -107,19 +125,31 @@ final class DurableStateMap implements KVMap<Object> {
         return previous;
     }
 
-    /** Deletes {@code key} here and wherever it could be carried from, so no later read brings it back. */
+    /**
+     * Removes {@code key} here. Where notes are carried over it is marked removed instead, so no later read
+     * brings it back from where it was carried from, and that namespace -- another node's own -- is left alone.
+     */
     private void forget(String key) {
-        store.delete(namespace, key);
-        carriedFrom.forEach(earlier -> store.delete(earlier, key));
+        if (carriedFrom.isEmpty()) {
+            store.delete(namespace, key);
+        } else {
+            store.save(namespace, key, FORGOTTEN);
+        }
+    }
+
+    private static boolean forgotten(byte[] stored) {
+        return stored.length == 0;
     }
 
     @Override
     public void clear() {
         // Naming the namespace is the only bulk operation the store has, and it is the one that fits:
-        // there is no way to list the keys, and nothing here needs one. What was carried from goes with
-        // it, or a key cleared here would come back from there on the next read.
+        // there is no way to list the keys, and nothing here needs one. What notes were carried from is
+        // another node's and stays; the mark left here is what keeps it from being carried over again.
         store.dropNamespace(namespace);
-        carriedFrom.forEach(store::dropNamespace);
+        if (!carriedFrom.isEmpty()) {
+            store.save(namespace, CARRYING_ENDED, FORGOTTEN);
+        }
     }
 
     @Override

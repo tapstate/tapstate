@@ -453,6 +453,66 @@ class StoreBackedPipelineCaptureCoordinatorTest {
 
     // ---- handle lifecycle ------------------------------------------------------------------------
 
+    /**
+     * A chain's one stream carries notes over from every other pipeline recorded reading the chain through its
+     * ring under that pipeline's own source, which need not be the source the opening pipeline reads it by. Two
+     * source resources reached the same way share one chain; a slot the other pipeline's reader created before
+     * the chain kept notes of its own is filed under that pipeline's source, and looked for anywhere else it is
+     * not found: the stream would create a new slot at the present, and the old one would hold the log for ever.
+     */
+    @Test
+    void aChainsStreamCarriesNotesFromAnotherPipelineUnderThatPipelinesOwnSource() {
+        SourceResource opening = cdcSource("res_a", "orders", null);
+        SourceResource other = cdcSource("res_b", "orders", null);
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(opening);
+        artifacts.save(other);
+        artifacts.save(pipeline("pa", "res_a"));
+        artifacts.save(pipeline("pb", "res_b"));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        String chainId = SourceCaptureResolution.of(opening).chainId().value();
+        assertThat(SourceCaptureResolution.of(other).chainId().value()).as("one chain").isEqualTo(chainId);
+        store.meta().create(chainId, null);
+        store.meta().selectConsumerTables(chainId, "pb", List.of("orders"), store.meta().openEpoch(chainId));
+        List<CaptureConfig> streams = new ArrayList<>();
+        CapturePort port = new CapturePort() {
+            @Override
+            public CaptureBatch snapshot(CaptureConfig config) {
+                throw new AssertionError("a change-only pipeline loads nothing");
+            }
+
+            @Override
+            public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+                streams.add(config);
+                return () -> { };
+            }
+
+            @Override
+            public ConnectionReport testConnection(CaptureConfig config) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public DiscoveredSchema discoverSchema(CaptureConfig config) {
+                throw new UnsupportedOperationException();
+            }
+        };
+        HazelcastInstance member = mock(HazelcastInstance.class);
+        when(member.getUserContext()).thenReturn(new java.util.concurrent.ConcurrentHashMap<>());
+        when(member.getRingbuffer(any())).thenReturn(mock(com.hazelcast.ringbuffer.Ringbuffer.class));
+        SrsCoordinator chains = new SrsCoordinator(store.meta());
+        CaptureRunUnit runs = new CaptureRunUnit(port, chains, store.meta(), member);
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, runs::begin, chains, new SnapshotBuffer());
+
+        coordinator.startCapture("pa");
+
+        assertThat(streams).singleElement().satisfies(stream -> assertThat(stream.sharedNotes().carriedFrom())
+                .as("where the chain's notes are carried from")
+                .containsExactly(new PipelineNode("pa", "res_a"), new PipelineNode("pb", "res_b")));
+        coordinator.stopCapture("pa", false);
+    }
+
     @Test
     void fifteenPipelinesResumingOnePostgresBacklogOpenOneSharedCdcTail() {
         List<String> tableNames = java.util.stream.IntStream.range(0, 27)

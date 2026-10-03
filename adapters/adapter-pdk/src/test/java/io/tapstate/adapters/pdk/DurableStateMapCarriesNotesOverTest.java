@@ -80,6 +80,47 @@ class DurableStateMapCarriesNotesOverTest {
         assertThat(notes.get("id")).isNull();
     }
 
+    /**
+     * Forgetting a key here leaves the namespaces it could be carried from as they are: they are other pipelines'
+     * own notes, which those pipelines may still read. What keeps the key from being carried back is a mark kept
+     * here, and the key can be written here again.
+     */
+    @Test
+    void forgettingAKeyHereLeavesTheNamespacesItCouldBeCarriedFromAlone() {
+        earlier(OPENER).put("slot", "old-slot");
+        earlier(OTHER).put("id", "old-id");
+        DurableStateMap notes = carrying();
+
+        notes.remove("slot");
+        notes.put("id", null);
+
+        assertThat(earlier(OPENER).get("slot")).as("the opening pipeline's own note").isEqualTo("old-slot");
+        assertThat(earlier(OTHER).get("id")).as("another pipeline's own note").isEqualTo("old-id");
+        assertThat(notes.get("slot")).as("not carried back here").isNull();
+        assertThat(carrying().get("id")).as("nor once the notes are opened again").isNull();
+        assertThat(notes.putIfAbsent("slot", "new-slot")).as("a key forgotten here is free to claim").isNull();
+        assertThat(notes.get("slot")).isEqualTo("new-slot");
+    }
+
+    /** Clearing the notes here leaves other pipelines' notes, and nothing is carried back afterwards. */
+    @Test
+    void clearingTheNotesHereLeavesTheNamespacesTheyCarriedFromAlone() {
+        earlier(OPENER).put("slot", "old-slot");
+        earlier(OTHER).put("unrelated", "theirs");
+        DurableStateMap notes = carrying();
+        notes.put("id", "chain-id");
+
+        notes.clear();
+
+        assertThat(earlier(OTHER).get("unrelated")).as("a note another pipeline kept for itself").isEqualTo("theirs");
+        assertThat(earlier(OPENER).get("slot")).isEqualTo("old-slot");
+        assertThat(notes.get("slot")).as("nothing is carried back after a clear").isNull();
+        assertThat(carrying().get("slot")).as("nor once the notes are opened again").isNull();
+        assertThat(notes.get("id")).isNull();
+        notes.put("id", "again");
+        assertThat(notes.get("id")).isEqualTo("again");
+    }
+
     private DurableStateMap carrying() {
         return new DurableStateMap(store, HERE, List.of(OPENER, OTHER));
     }

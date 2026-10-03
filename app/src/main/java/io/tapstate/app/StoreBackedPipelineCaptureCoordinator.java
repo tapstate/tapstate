@@ -22,10 +22,12 @@ import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.StartFrom;
 import io.tapstate.spi.capture.CapturePlan;
 import io.tapstate.spi.store.ArtifactStore;
-import io.tapstate.spi.store.SrsMeta;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
+import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.StorePort;
+import io.tapstate.spi.store.StoredArtifactRecord;
 import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.core.lifecycle.TableSnapshot;
@@ -371,7 +373,69 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             releaseUnopened(permits, failure);
             throw failure;
         }
-        return withChainSelections(plans);
+        return withChainReaders(withChainSelections(plans), pipelineId, captured);
+    }
+
+    /**
+     * Gives every source that reads a chain through its shared ring the sources of each other pipeline that
+     * read the same chain that way. The chain's one stream carries the notes it keeps over from those
+     * pipelines' nodes, and two source resources reached the same way share a chain: what a reader kept before
+     * the chain had notes of its own is filed under the resource its pipeline read the chain by, which need not
+     * be this pipeline's. A pipeline that cannot be read is left out, as one with nothing to carry.
+     */
+    private static List<SourcePlan> withChainReaders(
+            List<SourcePlan> plans, String pipelineId, ArtifactStore captured) {
+        Map<MiningChainId, Map<String, List<String>>> readers = new LinkedHashMap<>();
+        List<SourcePlan> known = new ArrayList<>(plans.size());
+        for (SourcePlan plan : plans) {
+            CaptureRunSpec spec = plan.spec();
+            if (!ConsumptionPlan.of(spec.readMode(), spec.srsEnabled()).sharedRing()) {
+                known.add(plan);
+                continue;
+            }
+            MiningChainId chain = MiningChainId.resolve(spec.config(), spec.srsKey());
+            Map<String, List<String>> onChain =
+                    readers.computeIfAbsent(chain, ignored -> ringReadersOf(chain, pipelineId, captured));
+            known.add(new SourcePlan(plan.sourceId(), plan.discovered(), plan.resolution(),
+                    spec.withChainReaderSources(onChain), plan.captureId()));
+        }
+        return known;
+    }
+
+    /** For each pipeline other than {@code pipelineId}, its sources that read {@code chain} through its ring. */
+    private static Map<String, List<String>> ringReadersOf(
+            MiningChainId chain, String pipelineId, ArtifactStore captured) {
+        Map<String, List<String>> readers = new LinkedHashMap<>();
+        for (StoredArtifactRecord row : captured.listStored("pipeline")) {
+            if (!row.readable() || row.id().equals(pipelineId)) {
+                continue;
+            }
+            Optional<PipelineResource> other = readable(captured, row.id(), PipelineResource.class);
+            if (other.isEmpty()) {
+                continue;
+            }
+            for (SourceRef ref : other.get().sources()) {
+                if (!(ref instanceof SourceRef.Spec declared) || !declared.srs()) {
+                    continue;
+                }
+                readable(captured, ref.id(), SourceResource.class)
+                        .filter(source -> SourceCaptureResolution.unselected(source).chainId().equals(chain))
+                        .ifPresent(source -> readers.computeIfAbsent(row.id(), id -> new ArrayList<>()).add(ref.id()));
+            }
+        }
+        return readers;
+    }
+
+    /** The stored resource of that id and kind, or empty when there is none or it cannot be read. */
+    private static <T> Optional<T> readable(ArtifactStore artifacts, String id, Class<T> kind) {
+        try {
+            return artifacts.get(id).filter(kind::isInstance).map(kind::cast);
+        } catch (TapstateException unreadable) {
+            if (unreadable.code() != IoError.DOCUMENT_UNREADABLE) {
+                throw unreadable;
+            }
+            return Optional.empty();
+        }
     }
 
     /**
@@ -475,7 +539,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                     joinedWith.config(), ReadMode.CDC_ONLY, joinedWith.srsKey(), joinedWith.srsEnabled(),
                     joinedWith.sourceId(), joinedWith.pipelineId(), joinedWith.startFrom(),
                     joinedWith.retention(), joinedWith.schemaVer(), joinedWith.snapshotEpoch(),
-                    null, joinedWith.selectedChainTables());
+                    null, joinedWith.selectedChainTables(), joinedWith.chainReaderSources());
             this.tailPassthrough = passthrough;
         }
     }

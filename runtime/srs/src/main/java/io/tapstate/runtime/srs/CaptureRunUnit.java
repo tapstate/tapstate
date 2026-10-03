@@ -714,8 +714,10 @@ public final class CaptureRunUnit {
 
     /**
      * The notes the chain's one change stream keeps, whichever pipeline opens it: the chain's own, carried over
-     * key by key from the notes this pipeline's node kept before there were any, then from the node of the
-     * same source in every other pipeline recorded reading the chain through its ring.
+     * key by key from the notes this pipeline's node kept before there were any, then from every other pipeline
+     * recorded reading the chain through its ring -- under each source of that pipeline that reads the chain, as
+     * the spec names them, and under this pipeline's source id where it names none. Two source resources reached
+     * the same way share a chain, and what one pipeline's reader kept is filed under that pipeline's resource.
      *
      * <p>A pipeline recorded reading the chain directly is left out, as is one with nothing recorded yet: a
      * direct reader's notes are its own, in use, and carrying from them would hand the chain's stream the
@@ -727,7 +729,12 @@ public final class CaptureRunUnit {
         for (ConsumerOffset consumer : meta.consumerOffsets(chainId)) {
             if (!consumer.pipelineId().equals(spec.pipelineId())
                     && consumer.selectedTables() != null && !consumer.selectedTables().isEmpty()) {
-                carriedFrom.add(new PipelineNode(consumer.pipelineId(), own.nodeId()));
+                List<String> sources = spec.chainReaderSources(consumer.pipelineId());
+                if (sources.isEmpty()) {
+                    carriedFrom.add(new PipelineNode(consumer.pipelineId(), own.nodeId()));
+                } else {
+                    sources.forEach(source -> carriedFrom.add(new PipelineNode(consumer.pipelineId(), source)));
+                }
             }
         }
         return new SharedNotes(chainId, carriedFrom);
