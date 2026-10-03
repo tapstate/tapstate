@@ -105,7 +105,10 @@ The stop confirmation lists the slot among what a clearing takes.
 **A pipeline reading several tables may stop at its first start** with `capture.shared-position-unverified`.
 An earlier version recorded one position for all of a source's tables without proof that every table's
 changes before it had landed. Either rerun it with `restart <pipeline> --rerun`, which reads the source
-again, or set a position you have checked with `position <pipeline> -f <file>` and start it.
+again, or set a position you have checked with `position <pipeline> -f <file>` and start it. A pipeline
+reading the same source directly (`srs.enabled: false`) keeps that recorded position in place. Clear its
+state too (`stop <pipeline>`) before the rerun and start it again afterwards, or stop it with its state
+kept (`stop <pipeline> --keep-state`) while you set the position.
 
 **Earlier versions left slots behind.** They never dropped a slot when a pipeline's state was cleared, and
 pipelines sharing a source could each create one. After the upgrade a source keeps using one slot; the
