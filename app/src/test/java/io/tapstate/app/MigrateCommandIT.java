@@ -60,7 +60,7 @@ class MigrateCommandIT {
         Output output = run("migrate", "--status", uriArgument(database));
 
         assertThat(output.exitCode).isZero();
-        assertThat(output.out).contains("installed: 0").contains("supported: 11")
+        assertThat(output.out).contains("installed: 0").contains("supported: 16")
                 .contains("V1BaselineIndexes").contains("V2StructuredArtifacts")
                 .contains("V3RecordedSrsSwitches")
                 .contains("V4DiscardInventedPositions")
@@ -68,7 +68,10 @@ class MigrateCommandIT {
                 .contains("V7RepairBlankPipelines").contains("V8DiscardViewSchemaPolicies")
                 .contains("V9RateHistoryIndexes")
                 .contains("V10SrsConsumerOffsetIndexes")
-                .contains("V11RateHistoryKeysetIndex");
+                .contains("V11RateHistoryKeysetIndex")
+                .contains("V12PipelineEventIndexes").contains("V13HistoryRollupIndexes")
+                .contains("V14LatestObservationChunkIndexes").contains("V15StopReservationShape")
+                .contains("V16DurableRebuildHandoff");
         assertThat(collectionNames(database))
                 .as("the command is read-only; it must not bring the store part way forward while "
                         + "reporting on it")

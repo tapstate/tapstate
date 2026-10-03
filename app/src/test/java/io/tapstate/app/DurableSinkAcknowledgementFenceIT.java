@@ -94,7 +94,7 @@ class DurableSinkAcknowledgementFenceIT {
                         ? Map.of(TABLE, List.of("writer-1"), "items", List.of("writer-1"))
                         : Map.of(TABLE, List.of("writer-1"));
                 StoreBackedSinkAckFactory durable = new StoreBackedSinkAckFactory(
-                        Map.of(TABLE, CHAIN, "items", CHAIN), PIPELINE, meta);
+                        snapshot ? Map.of(TABLE, CHAIN, "items", CHAIN) : Map.of(TABLE, CHAIN), PIPELINE, meta);
                 durable.prepareWriterPlan(plan);
                 SinkAckFactory writer = durable.forWriter("writer-1", List.copyOf(plan.keySet()), plan);
                 SinkAck ack = FencedSinkAckFactory.heldTo(writer, execution)
@@ -119,7 +119,11 @@ class DurableSinkAcknowledgementFenceIT {
                 if (snapshot) {
                     assertThat(meta.read(CHAIN).orElseThrow().snapshotCompletedTables(PIPELINE))
                             .containsExactlyInAnyOrder(TABLE, "items");
-                    assertThat(ackedBy(meta).token()).isEqualTo("w0");
+                    assertThat(meta.read(CHAIN).orElseThrow().consumerOffset(PIPELINE).orElseThrow().sinkAckedByTable())
+                            .containsExactlyInAnyOrderEntriesOf(Map.of(
+                                    TABLE, new ChainPosition(snapshotPosition.order(), "w0"),
+                                    "items", new ChainPosition(snapshotPosition.order(), "w0")));
+                    assertThat(ackedBy(meta)).as("multiple tables do not publish an unsupported scalar frontier").isNull();
                 } else {
                     assertThat(ackedBy(meta)).isEqualTo(position(2));
                     assertThat(meta.ringDoneThrough(CHAIN, PIPELINE)).containsEntry(TABLE, 2L);
