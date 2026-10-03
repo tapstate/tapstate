@@ -237,8 +237,9 @@ final class ConvergenceDriver {
                     // Every later pass while the checkpoint stays FAILED publishes null and the publisher
                     // carries the stored reason forward — durably, so it survives a process restart too.
                     failure = PipelineFailures.of(pipelineId, result.failure().orElse(null));
-                    LOG.warn("Pipeline {} entered FAILED [{}]: its data-plane job died", pipelineId,
-                            failure.code(), result.failure().orElse(null));
+                    if (telemetryWork == null || observationScopes == null) {
+                        logFailure(pipelineId, failure, result.failure().orElse(null));
+                    }
                 }
                 offerEvents(pipelineId, result, failure);
                 publish(pipelineId, failure, result, permit).ifPresent(published -> {
@@ -315,6 +316,10 @@ final class ConvergenceDriver {
         export.forgetPipelinesOutside(pipelineIds);
     }
 
+    static void logFailure(String pipelineId, ObservationFailure failure, Throwable cause) {
+        LOG.warn("Pipeline {} entered FAILED [{}]: its data-plane job died", pipelineId, failure.code(), cause);
+    }
+
     private void offerEvents(String pipelineId, ConvergeResult result, ObservationFailure failure) {
         if (telemetryWork == null || observationScopes == null || result == null) {
             return;
@@ -382,19 +387,22 @@ final class ConvergenceDriver {
     private Optional<io.tapstate.core.lifecycle.Observation> publish(String pipelineId, ObservationFailure failure,
             ConvergeResult result, PipelineActuationOwnership.Permit permit) {
         if (telemetryWork != null) {
+            TelemetryDispatcher.FailureLog diagnostic = observationScopes != null && failure != null
+                    && result != null && result.status() == ConvergeStatus.FAILED
+                    ? new TelemetryDispatcher.FailureLog(pipelineId, failure, result.failure().orElse(null)) : null;
             Optional<io.tapstate.spi.store.ObservationStore.Scope> scope = observationScopes == null
                     ? Optional.empty() : observationScopes.current(pipelineId);
             if (observationScopes != null && scope.isEmpty()) {
                 if (permit != null && permit.granted()) {
                     telemetryWork.offerScopeRecovery(pipelineId, result, failure,
                             ObservationScopeRecovery.Owner.of(permit.claim()),
-                            () -> stillOwner(pipelineId, permit));
+                            () -> stillOwner(pipelineId, permit), diagnostic);
                 }
                 return Optional.empty();
             }
             var capturedScope = scope.orElse(null);
             telemetryWork.offerQualifiedPreparation(pipelineId, failure, capturedScope,
-                    () -> publicationQualification(pipelineId, capturedScope, permit));
+                    () -> publicationQualification(pipelineId, capturedScope, permit), diagnostic);
             return Optional.empty();
         }
         if (observationScopes == null) {

@@ -688,6 +688,7 @@ final class ObservationScopeRegistry {
         private final long revision;
         private final ObservationScopeRecovery.Owner owner;
         private RecoverySignal firstFailure;
+        private TelemetryDispatcher.FailureLog failureLog;
         private RecoverySignal transition;
         private boolean failurePrepared;
         private ObservationPublisher.Prepared prepared;
@@ -712,6 +713,11 @@ final class ObservationScopeRegistry {
 
     Optional<RestoreTicket> restoration(String pipelineId, ConvergeResult result, ObservationFailure failure,
             ObservationScopeRecovery.Owner owner) {
+        return restoration(pipelineId, result, failure, owner, null);
+    }
+
+    Optional<RestoreTicket> restoration(String pipelineId, ConvergeResult result, ObservationFailure failure,
+            ObservationScopeRecovery.Owner owner, TelemetryDispatcher.FailureLog diagnostic) {
         Entry entry = entries.computeIfAbsent(Objects.requireNonNull(pipelineId, "pipelineId"), id -> new Entry());
         synchronized (entry) {
             if (entry.current != null) {
@@ -730,6 +736,7 @@ final class ObservationScopeRegistry {
                 RecoverySignal signal = new RecoverySignal(result, failure);
                 if (failure != null && ticket.firstFailure == null) {
                     ticket.firstFailure = signal;
+                    ticket.failureLog = diagnostic;
                 }
                 if (result.transitionFrom().isPresent()) {
                     ticket.transition = signal;
@@ -783,6 +790,14 @@ final class ObservationScopeRegistry {
             boolean first = !ticket.failurePrepared;
             ticket.failurePrepared = true;
             return new FailureAttempt(ticket.firstFailure.failure(), first);
+        }
+    }
+
+    Optional<TelemetryDispatcher.FailureLog> restorationFailureLog(RestoreTicket ticket, CheckpointDoc checkpoint) {
+        synchronized (ticket.entry) {
+            return valid(ticket) && ticket.firstFailure != null
+                    && ticket.firstFailure.result().checkpoint().filter(checkpoint::equals).isPresent()
+                    ? Optional.ofNullable(ticket.failureLog) : Optional.empty();
         }
     }
 

@@ -735,6 +735,252 @@ class ConvergenceDriverTest {
     }
 
     @Test
+    void aColdRestoredFailureLogsOnceUnderItsQualifiedScope() throws Exception {
+        requireColdFailureLog(false);
+    }
+
+    @Test
+    void aScopeRestoredBetweenInitialLogBindingAndPublicationStillScopesTheFailure() throws Exception {
+        requireColdFailureLog(true);
+    }
+
+    @Test
+    void aColdFailureOfferedAfterScopeRegistrationKeepsItsCauseAndScopedWarning() throws Exception {
+        requireColdFailureLog(false, true);
+    }
+
+    private void requireColdFailureLog(boolean restoreDuringConvergence) throws Exception {
+        requireColdFailureLog(restoreDuringConvergence, false);
+    }
+
+    private void requireColdFailureLog(boolean restoreDuringConvergence, boolean restoreDuringOffer) throws Exception {
+        String pipeline = "orders";
+        String cluster = "cluster-a";
+        var generations = new InMemoryWorkloadClaimStore();
+        long generation = generations.advanceStandalone(cluster, pipeline).orElseThrow();
+        var resources = new InMemoryArtifactStore();
+        resources.save(new io.tapstate.core.model.PipelineResource(pipeline, null, List.of(),
+                null, null, null, null, null));
+        var incarnation = new java.util.concurrent.atomic.AtomicReference<String>();
+        io.tapstate.spi.store.ArtifactStore artifacts = new io.tapstate.spi.store.ArtifactStore() {
+            @Override public void saveAll(List<io.tapstate.core.model.Resource> values) { resources.saveAll(values); }
+            @Override public Optional<io.tapstate.core.model.Resource> get(String id) { return resources.get(id); }
+            @Override public List<io.tapstate.core.model.Resource> list() { return resources.list(); }
+            @Override public Optional<String> pipelineIncarnationId(String id) {
+                return pipeline.equals(id) ? Optional.ofNullable(incarnation.get()) : Optional.empty();
+            }
+            @Override public Optional<String> ensurePipelineIncarnationId(String id, String candidate) {
+                if (!pipeline.equals(id) || resources.get(id).isEmpty()) { return Optional.empty(); }
+                incarnation.compareAndSet(null, candidate);
+                return Optional.of(incarnation.get());
+            }
+        };
+        var scope = new ObservationStore.Scope(artifacts.ensurePipelineIncarnationId(
+                pipeline, java.util.UUID.randomUUID().toString()).orElseThrow(), generation);
+        var stored = new java.util.concurrent.atomic.AtomicReference<ObservationStore.Stored>();
+        CountDownLatch coldReadEntered = new CountDownLatch(1);
+        CountDownLatch releaseColdRead = new CountDownLatch(1);
+        AtomicBoolean blockFirstColdRead = new AtomicBoolean(true);
+        var coldWorkerContext = new java.util.concurrent.atomic.AtomicReference<PipelineLogContext>();
+        var idleWorkerContext = new java.util.concurrent.atomic.AtomicReference<PipelineLogContext>();
+        AtomicBoolean probeColdContext = new AtomicBoolean();
+        List<PipelineLogContext> contextsAtWorkerWrites = new CopyOnWriteArrayList<>();
+        ObservationStore latest = new ObservationStore() {
+            @Override public void save(Observation observation) { throw new AssertionError("unscoped write"); }
+            @Override public boolean saveScoped(Observation observation, Scope owner) {
+                if (Thread.currentThread().getName().startsWith("tapstate-telemetry-latest-")) {
+                    contextsAtWorkerWrites.add(PipelineLogContext.capture());
+                }
+                stored.set(new Stored(observation, Optional.of(owner)));
+                return true;
+            }
+            @Override public Optional<Observation> read(String id) {
+                return readStored(id).map(Stored::observation);
+            }
+            @Override public Optional<Stored> readStored(String id) {
+                if (!pipeline.equals(id)) { return Optional.empty(); }
+                if (Thread.currentThread().getName().startsWith("tapstate-telemetry-latest-")
+                        && probeColdContext.compareAndSet(true, false)) {
+                    idleWorkerContext.set(PipelineLogContext.capture());
+                }
+                if (Thread.currentThread().getName().startsWith("tapstate-telemetry-latest-")
+                        && blockFirstColdRead.compareAndSet(true, false)) {
+                    coldWorkerContext.set(PipelineLogContext.capture());
+                    coldReadEntered.countDown();
+                    try {
+                        if (!releaseColdRead.await(5, TimeUnit.SECONDS)) {
+                            throw new AssertionError("cold identity read was not released");
+                        }
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError(interrupted);
+                    }
+                }
+                return Optional.ofNullable(stored.get());
+            }
+            @Override public void delete(String id) { stored.set(null); }
+        };
+        desired.save(new DesiredState(pipeline, RUNNING, "rev-1"));
+        state.create(pipeline, StateJson.of(RUNNING), T0);
+        new ObservationPublisher(state, latest).publishScoped(pipeline, null, scope).orElseThrow();
+        ObservationScopeRegistry scopes = restoreDuringOffer
+                ? org.mockito.Mockito.spy(new ObservationScopeRegistry()) : new ObservationScopeRegistry();
+        assertThat(scopes.current(pipeline)).isEmpty();
+        if (restoreDuringOffer) {
+            org.mockito.Mockito.doAnswer(invocation -> {
+                // The driver already read an absent scope. Finish the actual neutral recovery before ticket admission.
+                releaseColdRead.countDown();
+                long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                while (scopes.current(pipeline).isEmpty() && System.nanoTime() - until < 0) {
+                    TimeUnit.MILLISECONDS.sleep(5);
+                }
+                assertThat(scopes.current(pipeline)).contains(scope);
+                return invocation.callRealMethod();
+            }).when(scopes).restoration(org.mockito.ArgumentMatchers.eq(pipeline),
+                    org.mockito.ArgumentMatchers.any(io.tapstate.runtime.scheduler.ConvergeResult.class),
+                    org.mockito.ArgumentMatchers.any(ObservationFailure.class),
+                    org.mockito.ArgumentMatchers.nullable(ObservationScopeRecovery.Owner.class),
+                    org.mockito.ArgumentMatchers.any(TelemetryDispatcher.FailureLog.class));
+        }
+        ObservationPublisher publisher = new ObservationPublisher(state, latest);
+        var recovery = new ObservationScopeRecovery(artifacts, generations, latest, state, cluster);
+        FailingActuator actuator = new FailingActuator();
+        var cause = new io.tapstate.core.common.TapstateException(io.tapstate.runtime.engine.EngineError.JOB_FAILED,
+                Map.of("pipeline", pipeline, "cause", "cold sink failure"), new java.io.IOException("native cause"));
+        actuator.failWith(cause);
+        LifecycleActuator failureGate = new LifecycleActuator() {
+            @Override public void start(String id) { actuator.start(id); }
+            @Override public void pause(String id) { actuator.pause(id); }
+            @Override public void resume(String id) { actuator.resume(id); }
+            @Override public void stop(String id, boolean purgeState) { actuator.stop(id, purgeState); }
+            @Override public Optional<Throwable> failure(String id) {
+                if (restoreDuringConvergence) {
+                    // The tick already bound its absent scope. Resolve the real stored owner before it publishes.
+                    releaseColdRead.countDown();
+                    long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                    while (scopes.current(pipeline).isEmpty() && System.nanoTime() - until < 0) {
+                        try { TimeUnit.MILLISECONDS.sleep(5); }
+                        catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                            throw new AssertionError(interrupted);
+                        }
+                    }
+                    assertThat(scopes.current(pipeline)).contains(scope);
+                }
+                return actuator.failure(id);
+            }
+            @Override public Optional<Throwable> lost(String id) { return actuator.lost(id); }
+            @Override public boolean isCarryingAJob(String id) { return actuator.isCarryingAJob(id); }
+        };
+        var loop = new PipelineConverger(desired, state, failureGate, Clock.fixed(T0.plusSeconds(1), ZoneOffset.UTC));
+        RingBufferLogSink sink = new RingBufferLogSink(8, 8);
+        Logger driverLogger = (Logger) LoggerFactory.getLogger(ConvergenceDriver.class);
+        Logger telemetryLogger = (Logger) LoggerFactory.getLogger(TelemetryDispatcher.class);
+        PipelineLogAppender appender = new PipelineLogAppender(sink, new io.tapstate.core.logging.SecretRedactor());
+        appender.setContext(driverLogger.getLoggerContext());
+        appender.start();
+        driverLogger.addAppender(appender);
+        telemetryLogger.addAppender(appender);
+        PipelineLogContext original = PipelineLogContext.capture();
+        MDC.put(io.tapstate.core.logging.PipelineAttribution.MDC_KEY, "caller");
+        MDC.put(io.tapstate.core.logging.PipelineAttribution.INCARNATION_MDC_KEY, "caller-incarnation");
+        MDC.put(io.tapstate.core.logging.PipelineAttribution.EXECUTION_MDC_KEY, "1");
+        PipelineLogContext caller = PipelineLogContext.capture();
+        try (TelemetryDispatcher telemetry = new TelemetryDispatcher(publisher, null, MetricsExport.none(),
+                scopes, null, recovery, 1, 4)) {
+            var restoredDriver = new ConvergenceDriver(loop, desired, publisher, null, MetricsExport.none(),
+                    () -> true, PipelineActuationOwnership.single(), LifecycleWorkDispatcher.inline(), scopes, telemetry);
+            if (restoreDuringConvergence || restoreDuringOffer) {
+                telemetry.offerScopeRecovery(pipeline, null, null, () -> true);
+                assertThat(coldReadEntered.await(5, TimeUnit.SECONDS)).isTrue();
+            }
+            restoredDriver.reconcile();
+            assertThat(coldReadEntered.await(5, TimeUnit.SECONDS)).isTrue();
+            if (!restoreDuringConvergence && !restoreDuringOffer) {
+                assertThat(scopes.current(pipeline)).as("cold store reads stay off convergence").isEmpty();
+            }
+            assertThat(state.read(pipeline).orElseThrow().stateJson()).isEqualTo(StateJson.of(FAILED));
+            assertThat(PipelineLogContext.capture()).as("convergence restores the caller MDC").isEqualTo(caller);
+            releaseColdRead.countDown();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while ((scopes.current(pipeline).isEmpty()
+                    || stored.get().observation().state() != FAILED
+                    || stored.get().observation().failure() == null
+                    || telemetry.health().get(TelemetryDispatcher.Sink.LATEST).successes() == 0
+                    || telemetry.health().get(TelemetryDispatcher.Sink.LATEST).inFlight() != 0)
+                    && System.nanoTime() - deadline < 0) {
+                TimeUnit.MILLISECONDS.sleep(5);
+            }
+            assertThat(scopes.current(pipeline)).contains(scope);
+            assertThat(stored.get().scope()).contains(scope);
+            assertThat(stored.get().observation().state()).isEqualTo(FAILED);
+            assertThat(stored.get().observation().failure())
+                    .as("the real FAILED result retains its original cause through cold handoff").isNotNull();
+            assertThat(stored.get().observation().failure().code()).isEqualTo(cause.code().code());
+            assertThat(stored.get().observation().failure().params())
+                    .containsEntry("cause", "cold sink failure");
+            assertThat(stored.get().observation().metrics()).containsEntry("errors." + cause.code().code(), 1L);
+            long published = telemetry.health().get(TelemetryDispatcher.Sink.LATEST).successes();
+            restoredDriver.reconcile();
+            restoredDriver.reconcile();
+            deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while ((telemetry.health().get(TelemetryDispatcher.Sink.LATEST).successes() <= published
+                    || telemetry.health().get(TelemetryDispatcher.Sink.LATEST).inFlight() != 0
+                    || telemetry.health().get(TelemetryDispatcher.Sink.LATEST).queueDepth() != 0)
+                    && System.nanoTime() - deadline < 0) {
+                TimeUnit.MILLISECONDS.sleep(5);
+            }
+            assertThat(telemetry.health().get(TelemetryDispatcher.Sink.LATEST).successes()).isGreaterThan(published);
+            var logScope = new io.tapstate.core.logging.LogSink.Scope(scope.pipelineIncarnationId(), generation);
+            List<LogLine> failureLines = sink.tail(pipeline, logScope).stream()
+                    .filter(line -> "WARN".equals(line.level()) && line.message().contains("entered FAILED"))
+                    .toList();
+            assertThat(failureLines).as("one actual cold failure belongs to the restored execution; legacy=%s",
+                    sink.tail(pipeline)).hasSize(1);
+            assertThat(failureLines.getFirst().message()).contains(cause.code().code(), "cold sink failure",
+                    "TapstateException", "java.io.IOException: native cause");
+            assertThat(sink.tail(pipeline)).as("an identified cold failure is never attributed as legacy").isEmpty();
+            assertThat(contextsAtWorkerWrites).isNotEmpty();
+            assertThat(contextsAtWorkerWrites.getFirst()).as("the initial cold commit restores its entry MDC")
+                    .isEqualTo(coldWorkerContext.get());
+            PipelineLogContext scopedPreparation = new PipelineLogContext(
+                    pipeline, scope.pipelineIncarnationId(), Long.toString(generation));
+            assertThat(contextsAtWorkerWrites.subList(1, contextsAtWorkerWrites.size()))
+                    .as("normal warm preparation deliberately scopes its complete save")
+                    .isNotEmpty().containsOnly(scopedPreparation);
+            assertThat(PipelineLogContext.capture()).as("later ticks restore the caller MDC").isEqualTo(caller);
+
+            // Reuse the same idle worker for a fresh cold request after every warm wrapper has exited.
+            scopes.forgetIncarnation(pipeline, scope.pipelineIncarnationId());
+            probeColdContext.set(true);
+            long beforeProbe = telemetry.health().get(TelemetryDispatcher.Sink.LATEST).successes();
+            telemetry.offerScopeRecovery(pipeline, null, null, () -> true);
+            deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while ((scopes.current(pipeline).isEmpty()
+                    || telemetry.health().get(TelemetryDispatcher.Sink.LATEST).successes() <= beforeProbe
+                    || telemetry.health().get(TelemetryDispatcher.Sink.LATEST).inFlight() != 0)
+                    && System.nanoTime() - deadline < 0) {
+                TimeUnit.MILLISECONDS.sleep(5);
+            }
+            assertThat(scopes.current(pipeline)).contains(scope);
+            assertThat(idleWorkerContext.get()).as("warm preparation leaves no MDC on the reused cold worker")
+                    .isEqualTo(coldWorkerContext.get());
+            assertThat(contextsAtWorkerWrites.getLast()).as("the fresh cold commit preserves its entry MDC")
+                    .isEqualTo(coldWorkerContext.get());
+            assertThat(sink.tail(pipeline, logScope).stream().filter(line -> "WARN".equals(line.level())
+                    && line.message().contains("entered FAILED"))).hasSize(1);
+            assertThat(generations.currentGeneration(cluster, pipeline)).hasValue(generation);
+            assertThat(stored.get().observation().metrics()).containsEntry("errors." + cause.code().code(), 1L);
+        } finally {
+            releaseColdRead.countDown();
+            original.restore();
+            driverLogger.detachAppender(appender);
+            telemetryLogger.detachAppender(appender);
+            appender.stop();
+        }
+    }
+
+    @Test
     void aPipelineWhoseJobDiedIsDrivenToFailedAndLogged() {
         // A job that dies on its own does not throw into the reconcile pass — the converge side moves the
         // pipeline to FAILED and returns it. The driver must log that, so a dead job is no longer the

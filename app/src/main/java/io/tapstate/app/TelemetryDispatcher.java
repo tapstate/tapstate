@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.core.lifecycle.Observation;
+import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.MetricAttributes;
 import io.tapstate.core.lifecycle.StateJson;
@@ -57,6 +58,33 @@ final class TelemetryDispatcher implements AutoCloseable {
 
     enum PublicationQualification {
         CURRENT, RETRY, STALE
+    }
+
+    /** One diagnostic retained only by its bounded preparation or recovery request. */
+    static final class FailureLog {
+        private final String pipelineId;
+        private final ObservationFailure failure;
+        private final Throwable cause;
+        private final AtomicBoolean emitted = new AtomicBoolean();
+
+        FailureLog(String pipelineId, ObservationFailure failure, Throwable cause) {
+            this.pipelineId = Objects.requireNonNull(pipelineId, "pipelineId");
+            this.failure = Objects.requireNonNull(failure, "failure");
+            this.cause = cause;
+        }
+
+        void emit(ObservationStore.Scope scope, BooleanSupplier current) {
+            if (scope == null || emitted.get() || !current.getAsBoolean()
+                    || !emitted.compareAndSet(false, true)) { return; }
+            PipelineLogContext previous = PipelineLogContext.capture();
+            MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, pipelineId);
+            PipelineLogContext.bindScope(scope);
+            try {
+                ConvergenceDriver.logFailure(pipelineId, failure, cause);
+            } finally {
+                previous.restore();
+            }
+        }
     }
 
     private enum PreparationOutcome {
@@ -305,9 +333,18 @@ final class TelemetryDispatcher implements AutoCloseable {
             implements Frame {
     }
 
+    private record RecoveryQualification(CheckpointDoc checkpoint, ObservationScopeRecovery.Owner ownerVersion,
+            BooleanSupplier owner) { }
+
     /** Captures publication authority and the one observed cause without collecting native metrics. */
     private record PreparationFrame(String pipelineId, ObservationFailure failure, ObservationStore.Scope scope,
-            Supplier<PublicationQualification> owner, Instant requestedAt) implements Frame {
+            Supplier<PublicationQualification> owner, Instant requestedAt, FailureLog diagnostic,
+            RecoveryQualification recovery) implements Frame {
+        private PreparationFrame(String pipelineId, ObservationFailure failure, ObservationStore.Scope scope,
+                Supplier<PublicationQualification> owner, Instant requestedAt, FailureLog diagnostic) {
+            this(pipelineId, failure, scope, owner, requestedAt, diagnostic, null);
+        }
+
         private PreparationFrame {
             Objects.requireNonNull(pipelineId, "pipelineId");
             Objects.requireNonNull(owner, "owner");
@@ -316,7 +353,8 @@ final class TelemetryDispatcher implements AutoCloseable {
 
         private PreparationFrame replacing(PreparationFrame previous) {
             return previous.failure() != null && Objects.equals(scope, previous.scope())
-                    ? new PreparationFrame(pipelineId, previous.failure(), scope, owner, requestedAt) : this;
+                    ? new PreparationFrame(pipelineId, previous.failure(), scope, owner, requestedAt,
+                            previous.diagnostic(), previous.recovery()) : this;
         }
     }
 
@@ -718,7 +756,12 @@ final class TelemetryDispatcher implements AutoCloseable {
 
     void offerQualifiedPreparation(String pipelineId, ObservationFailure failure, ObservationStore.Scope scope,
             Supplier<PublicationQualification> owner) {
-        PreparationFrame request = new PreparationFrame(pipelineId, failure, scope, owner, Instant.now());
+        offerQualifiedPreparation(pipelineId, failure, scope, owner, null);
+    }
+
+    void offerQualifiedPreparation(String pipelineId, ObservationFailure failure, ObservationStore.Scope scope,
+            Supplier<PublicationQualification> owner, FailureLog diagnostic) {
+        PreparationFrame request = new PreparationFrame(pipelineId, failure, scope, owner, Instant.now(), diagnostic);
         if (closed.get()) {
             return;
         }
@@ -749,6 +792,22 @@ final class TelemetryDispatcher implements AutoCloseable {
         }
     }
 
+    /** Cold fallback reads occur only on the existing latest worker, after the request was admitted. */
+    private BooleanSupplier preparationCurrent(PreparationFrame request) {
+        if (request.recovery() == null) { return () -> eligible(request); }
+        RecoveryQualification expected = request.recovery();
+        var qualified = scopeRecovery.resolve(request.pipelineId()).orElse(null);
+        if (qualified == null || !qualified.scope().equals(request.scope())
+                || !qualified.checkpoint().equals(expected.checkpoint())
+                || !scopeRecovery.matchesOwner(request.pipelineId(), qualified, expected.ownerVersion())
+                || !expected.owner().getAsBoolean()
+                || !stillCurrent(request.pipelineId(), qualified.scope())
+                || !scopeRecovery.unchanged(request.pipelineId(), qualified)) { return null; }
+        return () -> eligible(request) && expected.owner().getAsBoolean()
+                && stillCurrent(request.pipelineId(), qualified.scope())
+                && scopeRecovery.unchanged(request.pipelineId(), qualified);
+    }
+
     private PreparationOutcome prepareAndCommitOwned(PreparationFrame request, Stats.Operation operation) {
         PublicationQualification before = qualification(request);
         if (before != PublicationQualification.CURRENT) {
@@ -757,11 +816,15 @@ final class TelemetryDispatcher implements AutoCloseable {
             }
             return before == PublicationQualification.RETRY ? PreparationOutcome.RETRY : PreparationOutcome.SKIPPED;
         }
-        BooleanSupplier current = () -> eligible(request);
+        BooleanSupplier current = preparationCurrent(request);
+        if (current == null) { return PreparationOutcome.SKIPPED; }
         if (continuations != null && !continuations.prepareHandoff(request.pipelineId(), request.scope(), current)) {
             return eligible(request) ? PreparationOutcome.RETRY : PreparationOutcome.SKIPPED;
         }
-        Runnable captured = () -> operation.failureCaptured = true;
+        Runnable captured = () -> {
+            operation.failureCaptured = true;
+            if (request.diagnostic() != null) { request.diagnostic().emit(request.scope(), current); }
+        };
         var prepared = request.scope() == null
                 ? publisher.prepare(request.pipelineId(), request.failure(), current, captured)
                 : publisher.prepareScoped(request.pipelineId(), request.failure(), request.scope(), current, captured);
@@ -985,11 +1048,29 @@ final class TelemetryDispatcher implements AutoCloseable {
 
     void offerScopeRecovery(String pipelineId, ConvergeResult result, ObservationFailure failure,
             ObservationScopeRecovery.Owner ownerVersion, BooleanSupplier owner) {
+        offerScopeRecovery(pipelineId, result, failure, ownerVersion, owner, null);
+    }
+
+    void offerScopeRecovery(String pipelineId, ConvergeResult result, ObservationFailure failure,
+            ObservationScopeRecovery.Owner ownerVersion, BooleanSupplier owner, FailureLog diagnostic) {
         if (closed.get() || scopes == null || scopeRecovery == null) {
             return;
         }
-        scopes.restoration(pipelineId, result, failure, ownerVersion).ifPresent(ticket ->
-                offerLatest(pipelineId, new RecoveryFrame(ticket, Objects.requireNonNull(owner, "owner"))));
+        Objects.requireNonNull(owner, "owner");
+        var ticket = scopes.restoration(pipelineId, result, failure, ownerVersion, diagnostic);
+        if (ticket.isPresent()) {
+            offerLatest(pipelineId, new RecoveryFrame(ticket.orElseThrow(), owner));
+        } else if (result != null && failure != null
+                && result.status() == io.tapstate.runtime.scheduler.ConvergeStatus.FAILED
+                && result.checkpoint().isPresent()) {
+            // A prior recovery may have registered a scope after the scheduler read it as absent.
+            // This local scope is only a candidate; the worker qualifies the original checkpoint and authority.
+            scopes.current(pipelineId).ifPresent(candidate -> offerLatest(pipelineId,
+                    new PreparationFrame(pipelineId, failure, candidate,
+                            () -> owner.getAsBoolean() ? PublicationQualification.CURRENT : PublicationQualification.STALE,
+                            Instant.now(), diagnostic,
+                            new RecoveryQualification(result.checkpoint().orElseThrow(), ownerVersion, owner))));
+        }
     }
 
     private boolean recover(String pipelineId, RecoveryFrame frame, Stats.Operation operation) {
@@ -1018,6 +1099,8 @@ final class TelemetryDispatcher implements AutoCloseable {
                 && scopeRecovery.matchesOwner(pipelineId, qualified, ticket.owner())
                 && scopeRecovery.unchanged(pipelineId, qualified);
         operation.scope = qualified.scope();
+        scopes.restorationFailureLog(ticket, qualified.checkpoint())
+                .ifPresent(diagnostic -> diagnostic.emit(qualified.scope(), current));
         var prepared = scopes.restorationPrepared(ticket, qualified).orElse(null);
         if (prepared == null) {
             var attempt = scopes.restorationFailure(ticket, qualified.checkpoint());
@@ -1078,6 +1161,8 @@ final class TelemetryDispatcher implements AutoCloseable {
         var attempt = scopes.restorationFailure(ticket, target.checkpoint());
         // The owner and physical job remain the guard after adoption invalidates the old recovery ticket.
         BooleanSupplier current = () -> frame.owner().getAsBoolean() && target.current().getAsBoolean();
+        scopes.restorationFailureLog(ticket, target.checkpoint()).ifPresent(diagnostic ->
+                diagnostic.emit(target.target().scope(), () -> scopes.awaiting(ticket) && current.getAsBoolean()));
         var raw = publisher.prepareScoped(id, attempt != null && attempt.first() ? attempt.failure() : null,
                 target.target().scope(), current).orElse(null);
         if (raw == null || !scopes.awaiting(ticket) || !current.getAsBoolean()
