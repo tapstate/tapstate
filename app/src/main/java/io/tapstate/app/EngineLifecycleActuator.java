@@ -240,8 +240,13 @@ final class EngineLifecycleActuator implements LifecycleActuator {
             } catch (RuntimeException cleanup) {
                 failure.addSuppressed(cleanup);
             }
-            if (observationScope != null && (replacement != null || !(failure instanceof TapstateException))) {
-                observationScopes.discard(pipelineId, observationScope);
+            if (observationScope != null) {
+                if (replacement != null || !(failure instanceof TapstateException)) {
+                    observationScopes.discard(pipelineId, observationScope);
+                } else if (execution.fence().claimGeneration() == 0 || execution.admittedClaim().isPresent()) {
+                    observationScopes.rememberFailedAdmission(pipelineId, observationScope,
+                            execution.admittedClaim().map(ObservationScopeRecovery.Owner::of).orElse(null));
+                }
             }
             // A coded build refusal after ordinary admission belongs to the real allocated scope.
             // Its FAILED checkpoint and current authority are qualified on the telemetry worker.

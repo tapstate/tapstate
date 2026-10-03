@@ -251,13 +251,29 @@ final class PipelineActuationOwnership {
     }
 
     /** Whether a run may be submitted, and its durable generation identity. */
-    record Execution(boolean allowed, ExecutionFence fence, Set<String> executionNodeIds) {
+    record Execution(boolean allowed, ExecutionFence fence, Set<String> executionNodeIds,
+            Optional<WorkloadClaim> admittedClaim) {
 
         Execution {
             executionNodeIds = Set.copyOf(executionNodeIds);
+            Objects.requireNonNull(admittedClaim, "admittedClaim");
             if (allowed && fence == null) {
                 throw new IllegalArgumentException("an allowed execution requires a fence");
             }
+            if (admittedClaim.isPresent()) {
+                WorkloadClaim claim = admittedClaim.orElseThrow();
+                if (!allowed || claim.key().type() != WorkloadClaimType.PIPELINE_ACTUATION
+                        || !claim.key().resourceId().equals(fence.pipelineId())
+                        || claim.claimGeneration() != fence.claimGeneration()
+                        || claim.executionGeneration() != fence.executionGeneration()
+                        || !claim.executionNodeIds().equals(executionNodeIds)) {
+                    throw new IllegalArgumentException("an admission receipt must match its factual execution fence");
+                }
+            }
+        }
+
+        Execution(boolean allowed, ExecutionFence fence, Set<String> executionNodeIds) {
+            this(allowed, fence, executionNodeIds, Optional.empty());
         }
 
         Execution(boolean allowed, ExecutionFence fence) { this(allowed, fence, Set.of()); }
@@ -431,7 +447,8 @@ final class PipelineActuationOwnership {
         // submitted because a member went away, into a cluster that is still settling from it. Clearing
         // the moment here would make the very next death of this run read as the pipeline's own.
         return new Execution(true, new ExecutionFence(
-                pipelineId, state.claim.claimGeneration(), state.claim.executionGeneration()), runMembers);
+                pipelineId, state.claim.claimGeneration(), state.claim.executionGeneration()), runMembers,
+                Optional.of(state.claim));
     }
 
     private static TapstateException generationUnavailable(String pipelineId, Throwable cause) {

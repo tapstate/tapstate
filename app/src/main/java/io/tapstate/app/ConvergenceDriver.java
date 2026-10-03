@@ -401,11 +401,16 @@ final class ConvergenceDriver {
                 return Optional.empty();
             }
             var capturedScope = scope.orElse(null);
+            var admission = observationScopes != null && capturedScope != null
+                    && result != null && result.status() == ConvergeStatus.FAILED
+                    ? observationScopes.failedAdmission(pipelineId, capturedScope).orElse(null) : null;
             telemetryWork.offerQualifiedPreparation(pipelineId, failure, capturedScope,
-                    () -> publicationQualification(pipelineId, capturedScope, permit), diagnostic,
+                    () -> admission == null ? publicationQualification(pipelineId, capturedScope, permit)
+                            : admissionQualification(pipelineId, capturedScope, admission), diagnostic,
                     result != null && result.status() == ConvergeStatus.FAILED
                             ? result.checkpoint().orElse(null) : null,
-                    permit == null ? null : ObservationScopeRecovery.Owner.of(permit.claim()));
+                    admission != null ? admission.owner()
+                            : permit == null ? null : ObservationScopeRecovery.Owner.of(permit.claim()));
             return Optional.empty();
         }
         if (observationScopes == null) {
@@ -413,6 +418,23 @@ final class ConvergenceDriver {
         }
         return observationScopes.current(pipelineId)
                 .flatMap(scope -> publisher.publishScoped(pipelineId, failure, scope));
+    }
+
+    private TelemetryDispatcher.PublicationQualification admissionQualification(String pipelineId,
+            io.tapstate.spi.store.ObservationStore.Scope scope, ObservationScopeRegistry.FailedAdmission admission) {
+        if (!businessEligible.getAsBoolean() || !admission.scope().equals(scope)
+                || !observationScopes.currentFailedAdmission(pipelineId, admission)) {
+            return TelemetryDispatcher.PublicationQualification.STALE;
+        }
+        PipelineActuationOwnership.Permit current = actuation.permit(pipelineId);
+        if (!businessEligible.getAsBoolean() || !observationScopes.currentFailedAdmission(pipelineId, admission)) {
+            return TelemetryDispatcher.PublicationQualification.STALE;
+        }
+        if (current.retry()) { return TelemetryDispatcher.PublicationQualification.RETRY; }
+        if (!current.granted()) { return TelemetryDispatcher.PublicationQualification.STALE; }
+        // Lease time can renew; the original admitted owner and both generations cannot change.
+        return java.util.Objects.equals(admission.owner(), ObservationScopeRecovery.Owner.of(current.claim()))
+                ? TelemetryDispatcher.PublicationQualification.CURRENT : TelemetryDispatcher.PublicationQualification.STALE;
     }
 
     private TelemetryDispatcher.PublicationQualification publicationQualification(String pipelineId,

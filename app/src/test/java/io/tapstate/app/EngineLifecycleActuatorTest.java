@@ -133,8 +133,37 @@ class EngineLifecycleActuatorTest {
         requireAllocatedBuildFailurePublication(publishNewBeforeRefusal, loseOwner, retryOnce, false);
     }
 
+    @Test
+    void aClaimedBuildFailurePublishesUnderItsActualCommittedAdmission() throws Exception {
+        requireAllocatedBuildFailurePublication(false, false, false, false, true, false);
+    }
+
+    @Test
+    void aReacquiredClaimCannotAuthorizeThePreviousBuildFailure() throws Exception {
+        requireAllocatedBuildFailurePublication(false, false, false, false, true, true);
+    }
+
     private void requireAllocatedBuildFailurePublication(boolean publishNewBeforeRefusal, boolean loseOwner,
             boolean retryOnce, boolean continuationRetry) throws Exception {
+        requireAllocatedBuildFailurePublication(publishNewBeforeRefusal, loseOwner, retryOnce, continuationRetry,
+                false, false);
+    }
+
+    @Test
+    void aRegistryLifetimeChangeCannotAuthorizeACapturedBuildFailure() throws Exception {
+        requireAllocatedBuildFailurePublication(false, false, false, false, true, false, true);
+    }
+
+    private void requireAllocatedBuildFailurePublication(boolean publishNewBeforeRefusal, boolean loseOwner,
+            boolean retryOnce, boolean continuationRetry, boolean claimed, boolean replaceClaimBeforePublish)
+            throws Exception {
+        requireAllocatedBuildFailurePublication(publishNewBeforeRefusal, loseOwner, retryOnce, continuationRetry,
+                claimed, replaceClaimBeforePublish, false);
+    }
+
+    private void requireAllocatedBuildFailurePublication(boolean publishNewBeforeRefusal, boolean loseOwner,
+            boolean retryOnce, boolean continuationRetry, boolean claimed, boolean replaceClaimBeforePublish,
+            boolean invalidateAdmissionReceipt) throws Exception {
         var artifacts = new InMemoryArtifactStore();
         String sourceId = "admitted_source";
         artifacts.save(new SourceResource(sourceId, null, "mysql", Map.of("host", "controlled"), SourceMode.CDC,
@@ -171,7 +200,25 @@ class EngineLifecycleActuatorTest {
             }
         };
         var generations = new InMemoryWorkloadClaimStore();
-        var owner = org.mockito.Mockito.spy(PipelineActuationOwnership.single("single", generations));
+        String clusterId = claimed ? "cluster-a" : "single";
+        var ownershipClock = new java.util.concurrent.atomic.AtomicLong();
+        ClusterProperties properties = new ClusterProperties();
+        properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
+        var membership = new ClusterMembershipGate(properties);
+        membership.install(new ClusterMembership(clusterId, 7, Set.of("node-a", "node-b", "node-c")));
+        assertThat(membership.canCommit(Set.of("node-a", "node-b"))).isTrue();
+        var claims = new ClusterWorkloadClaims(generations, membership);
+        var owner = org.mockito.Mockito.spy(claimed ? new PipelineActuationOwnership(clusterId,
+                new WorkloadOwner("node-a", "boot-a"), membership, claims,
+                Duration.ofSeconds(30), Duration.ofSeconds(10), ownershipClock::get)
+                : PipelineActuationOwnership.single(clusterId, generations));
+        var claimKey = new WorkloadClaimKey(clusterId, WorkloadClaimType.PIPELINE_ACTUATION, PIPE);
+        var beforeAdmission = new AtomicReference<WorkloadClaim>();
+        if (claimed) {
+            assertThat(owner.permit(PIPE).granted()).isTrue();
+            beforeAdmission.set(generations.read(claimKey).orElseThrow().claim());
+            assertThat(beforeAdmission.get().executionGeneration()).isZero();
+        }
         var eligible = new java.util.concurrent.atomic.AtomicBoolean(true);
         var ownerEntered = new java.util.concurrent.CountDownLatch(1);
         var releaseOwner = new java.util.concurrent.CountDownLatch(1);
@@ -204,6 +251,61 @@ class EngineLifecycleActuatorTest {
         var admittedScope = new AtomicReference<ObservationStore.Scope>();
         var buildRefusal = new AtomicReference<TapstateException>();
         var buildCalls = new java.util.concurrent.atomic.AtomicInteger();
+        var actualAdmission = new AtomicReference<WorkloadClaim>();
+        var reacquiredClaim = new AtomicReference<WorkloadClaim>();
+        var switchClaim = new java.util.concurrent.atomic.AtomicBoolean(replaceClaimBeforePublish || invalidateAdmissionReceipt);
+        var receiptInvalidated = new java.util.concurrent.atomic.AtomicBoolean();
+        var restoredBaseline = new AtomicReference<ObservationStore.Stored>();
+        if (replaceClaimBeforePublish || invalidateAdmissionReceipt) {
+            org.mockito.Mockito.doAnswer(invocation -> {
+                PipelineActuationOwnership.Permit observed = (PipelineActuationOwnership.Permit) invocation.callRealMethod();
+                if (actualAdmission.get() != null && store.state().read(PIPE)
+                        .filter(checkpoint -> StateJson.parse(checkpoint.stateJson()) == PipelineState.FAILED).isPresent()
+                        && switchClaim.compareAndSet(true, false)) {
+                    // The permit was really granted before the lease changed; its delayed caller must be fenced.
+                    assertThat(observed.granted()).isTrue();
+                    if (invalidateAdmissionReceipt) {
+                        var captured = scopes.failedAdmission(PIPE, admittedScope.get()).orElseThrow();
+                        assertThat(captured.owner()).isEqualTo(ObservationScopeRecovery.Owner.of(actualAdmission.get()));
+                        CheckpointDoc checkpoint = store.state().read(PIPE).orElseThrow();
+                        // This baseline observes the actual FAILED checkpoint and supplies no invented native facts.
+                        publisher.publishScoped(PIPE, null, admittedScope.get()).orElseThrow();
+                        var saved = latest.readStored(PIPE).orElseThrow();
+                        assertThat(saved.observation().state()).isEqualTo(PipelineState.FAILED);
+                        assertThat(saved.observation().failure()).isNull();
+                        restoredBaseline.set(saved);
+                        scopes.discard(PIPE, admittedScope.get());
+                        assertThat(scopes.current(PIPE)).isEmpty();
+                        assertThat(scopes.failedAdmission(PIPE, admittedScope.get())).isEmpty();
+                        var currentOwner = ObservationScopeRecovery.Owner.of(actualAdmission.get());
+                        var cold = new ObservationScopeRecovery(identityArtifacts, generations, latest, store.state(), clusterId);
+                        var qualified = cold.resolve(PIPE).orElseThrow();
+                        assertThat(qualified.scope()).isEqualTo(admittedScope.get());
+                        assertThat(qualified.checkpoint()).isEqualTo(checkpoint);
+                        assertThat(cold.matchesOwner(PIPE, qualified, currentOwner)).isTrue();
+                        assertThat(cold.unchanged(PIPE, qualified)).isTrue();
+                        var ticket = scopes.restoration(PIPE, null, null, currentOwner).orElseThrow();
+                        assertThat(scopes.restore(ticket, qualified.stored())).isTrue();
+                        scopes.restored(ticket);
+                        assertThat(scopes.failedAdmission(PIPE, admittedScope.get())).isEmpty();
+                        assertThat(scopes.current(PIPE)).contains(admittedScope.get());
+                        assertThat(store.state().read(PIPE)).contains(checkpoint);
+                        assertThat(generations.read(claimKey).orElseThrow().claim()).isEqualTo(actualAdmission.get());
+                        receiptInvalidated.set(true);
+                        return observed;
+                    }
+                    WorkloadClaim held = generations.read(claimKey).orElseThrow().claim();
+                    assertThat(generations.release(held)).isTrue();
+                    var takeover = claims.acquire(claimKey, new WorkloadOwner("node-a", "boot-b"),
+                            membership.committed().revision(), Duration.ofSeconds(30)).orElseThrow();
+                    assertThat(takeover.acquired()).isTrue();
+                    reacquiredClaim.set(takeover.claim());
+                    // End the old holder's cached-grant interval before its next worker-side permission probe.
+                    ownershipClock.set(Duration.ofSeconds(11).toNanos());
+                }
+                return observed;
+            }).when(owner).permit(org.mockito.ArgumentMatchers.eq(PIPE));
+        }
         DagSource rejecting = new DagSource() {
             @Override public DAG dagFor(String id) { return actualBuilder.dagFor(id); }
             @Override public List<io.tapstate.core.lifecycle.PipelineStateHolding> stateHeldBy(String id) {
@@ -216,9 +318,18 @@ class EngineLifecycleActuatorTest {
                         actual.cursorWriterToken(), fence -> {
                             buildCalls.incrementAndGet();
                             assertThat(fence).isNotNull();
-                            assertThat(generations.currentGeneration("single", PIPE)).hasValue(fence.executionGeneration());
+                            assertThat(generations.currentGeneration(clusterId, PIPE)).hasValue(fence.executionGeneration());
                             admittedScope.set(scopes.current(PIPE).orElseThrow());
                             assertThat(admittedScope.get().executionGeneration()).isEqualTo(fence.executionGeneration());
+                            if (claimed) {
+                                WorkloadClaim committed = generations.read(claimKey).orElseThrow().claim();
+                                actualAdmission.set(committed);
+                                assertThat(committed.executionGeneration()).isEqualTo(fence.executionGeneration());
+                                assertThat(committed.claimGeneration()).isEqualTo(fence.claimGeneration());
+                                assertThat(committed.owner()).isEqualTo(beforeAdmission.get().owner());
+                                assertThat(committed.executionNodeIds()).containsExactlyInAnyOrder("node-a", "node-b");
+                                assertThat(committed.contextExecutionGeneration()).isEqualTo(committed.executionGeneration());
+                            }
                             assertThat(StateJson.parse(store.state().read(PIPE).orElseThrow().stateJson()))
                                     .isEqualTo(PipelineState.NEW);
                             if (publishNewBeforeRefusal) {
@@ -237,7 +348,7 @@ class EngineLifecycleActuatorTest {
         var actuator = new EngineLifecycleActuator(engine, rejecting, capture, teardown(), owner,
                 new PipelineIncarnationService(identityArtifacts), scopes);
         var loop = new PipelineConverger(store.desired(), store.state(), actuator, Clock.systemUTC());
-        var recovery = new ObservationScopeRecovery(identityArtifacts, generations, latest, store.state(), "single");
+        var recovery = new ObservationScopeRecovery(identityArtifacts, generations, latest, store.state(), clusterId);
         var sink = new io.tapstate.core.logging.RingBufferLogSink(8, 8);
         var logger = (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(ConvergenceDriver.class);
         var appender = new PipelineLogAppender(sink, new io.tapstate.core.logging.SecretRedactor());
@@ -257,9 +368,26 @@ class EngineLifecycleActuatorTest {
             assertThat(buildRefusal.get().code()).isEqualTo(ActuationError.JOIN_SQL_INVALID);
             assertThat(buildCalls.get()).isEqualTo(1);
             assertThat(admittedScope.get().pipelineIncarnationId()).isEqualTo(identity.get());
-            assertThat(generations.currentGeneration("single", PIPE)).hasValue(admittedScope.get().executionGeneration());
+            assertThat(generations.currentGeneration(clusterId, PIPE)).hasValue(admittedScope.get().executionGeneration());
             assertThat(engine.executionJob(PIPE)).as("a real admitted generation is not a fabricated native Job").isEmpty();
             assertThat(member.getJet().getJob(PIPE)).isNull();
+            if (claimed) {
+                assertThat(actualAdmission.get()).isNotNull();
+                assertThat(actualAdmission.get().executionGeneration())
+                        .isEqualTo(beforeAdmission.get().executionGeneration() + 1);
+                assertThat(actualAdmission.get().claimGeneration()).isEqualTo(beforeAdmission.get().claimGeneration());
+                if (replaceClaimBeforePublish) {
+                    assertThat(reacquiredClaim.get()).as("the real old lease was released and acquired by a new boot").isNotNull();
+                    assertThat(reacquiredClaim.get().owner()).isEqualTo(new WorkloadOwner("node-a", "boot-b"));
+                    assertThat(reacquiredClaim.get().claimGeneration()).isEqualTo(actualAdmission.get().claimGeneration() + 1);
+                    assertThat(reacquiredClaim.get().executionGeneration()).isEqualTo(actualAdmission.get().executionGeneration());
+                }
+            }
+            if (invalidateAdmissionReceipt) {
+                assertThat(receiptInvalidated.get()).as("the real scope was discarded and restored during the permit probe").isTrue();
+                // Drain already admitted callbacks before comparing the factual restored baseline.
+                telemetry.close();
+            }
             if (loseOwner) {
                 assertThat(ownerEntered.await(5, TimeUnit.SECONDS)).isTrue();
                 eligible.set(false); releaseOwner.countDown();
@@ -287,7 +415,9 @@ class EngineLifecycleActuatorTest {
             long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
             while (System.nanoTime() - until < 0) {
                 var saved = latest.readStored(PIPE);
-                boolean done = loseOwner ? telemetry.health().get(TelemetryDispatcher.Sink.LATEST).inFlight() == 0
+                var health = telemetry.health().get(TelemetryDispatcher.Sink.LATEST);
+                boolean done = loseOwner || replaceClaimBeforePublish || invalidateAdmissionReceipt
+                        ? health.queueDepth() == 0 && health.inFlight() == 0
                         : saved.filter(row -> row.scope().filter(admittedScope.get()::equals).isPresent()
                                 && row.observation().state() == PipelineState.FAILED
                                 && row.observation().failure() != null).isPresent();
@@ -296,8 +426,14 @@ class EngineLifecycleActuatorTest {
             }
             var logScope = new io.tapstate.core.logging.LogSink.Scope(admittedScope.get().pipelineIncarnationId(),
                     admittedScope.get().executionGeneration());
-            if (loseOwner) {
-                assertThat(latest.readStored(PIPE)).as("the released owner cannot publish its old failure").isEmpty();
+            if (loseOwner || replaceClaimBeforePublish || invalidateAdmissionReceipt) {
+                if (invalidateAdmissionReceipt) {
+                    assertThat(restoredBaseline.get()).isNotNull();
+                    assertThat(latest.readStored(PIPE)).as("the retired receipt cannot overwrite the factual restored baseline")
+                            .contains(restoredBaseline.get());
+                } else {
+                    assertThat(latest.readStored(PIPE)).as("the released owner cannot publish its old failure").isEmpty();
+                }
                 assertThat(sink.tail(PIPE, logScope)).isEmpty();
             } else {
                 var saved = latest.readStored(PIPE);
@@ -329,7 +465,7 @@ class EngineLifecycleActuatorTest {
                         && line.message().contains("entered FAILED"))).hasSize(1);
                 assertThat(store.state().read(PIPE)).contains(failed);
                 assertThat(buildCalls.get()).isEqualTo(1);
-                assertThat(generations.currentGeneration("single", PIPE)).hasValue(admittedScope.get().executionGeneration());
+                assertThat(generations.currentGeneration(clusterId, PIPE)).hasValue(admittedScope.get().executionGeneration());
             }
             assertThat(PipelineLogContext.capture()).isEqualTo(context);
         } finally {

@@ -38,6 +38,7 @@ final class ObservationScopeRegistry {
         private MetricContinuation active;
         private MetricContinuation restored;
         private long revision;
+        private FailedAdmission failedAdmission;
         private RestoreTicket restore;
         private ColdRebuildTicket coldRebuild;
         private ContinuationTicket continuationTicket;
@@ -56,6 +57,11 @@ final class ObservationScopeRegistry {
     }
 
     private final ConcurrentHashMap<String, Entry> entries = new ConcurrentHashMap<>();
+
+    /** The original admission that actually refused to build, never a native submission identity. */
+    record FailedAdmission(ObservationStore.Scope scope, ObservationScopeRecovery.Owner owner) {
+        FailedAdmission { Objects.requireNonNull(scope, "scope"); }
+    }
 
     record RecoverySignal(ConvergeResult result, ObservationFailure failure) { }
     record FailureAttempt(ObservationFailure failure, boolean first) { }
@@ -339,7 +345,7 @@ final class ObservationScopeRegistry {
                 return new TargetPreparation(PreparationStatus.UNKNOWN);
             }
             entry.revision++; entry.restore = null; entry.coldRebuild = null;
-            entry.current = ticket.target.scope(); entry.actualTarget = ticket.target;
+            entry.current = ticket.target.scope(); entry.actualTarget = ticket.target; entry.failedAdmission = null;
             entry.continuationKey = ticket.key;
             entry.pending = null; entry.pendingFrom = null; entry.restored = null; entry.last = null;
             entry.folder = CardinalityBudget.folder();
@@ -500,6 +506,7 @@ final class ObservationScopeRegistry {
             entry.unknownProven = false; entry.privateReceipt = null; entry.durableReceipt = null;
             entry.pending = null; entry.pendingFrom = null; entry.active = null; entry.restored = null; entry.last = null;
             entry.epochs = new MetricProducerEpochs(); entry.folder = CardinalityBudget.folder(); entry.current = scope;
+            entry.failedAdmission = null;
         }
         return scope;
     }
@@ -897,6 +904,7 @@ final class ObservationScopeRegistry {
                 clearStagedColdRebuild(entry);
             }
             entry.current = stored.scope().orElseThrow();
+            entry.failedAdmission = null;
             entry.restored = ticket.baseline == null
                     ? MetricContinuation.capture(stored.observation()).boundedBy(entry.folder) : ticket.baseline;
             entry.last = null;
@@ -947,6 +955,7 @@ final class ObservationScopeRegistry {
                 return scope;
             }
             entry.revision++;
+            entry.failedAdmission = null;
             clearActiveContinuation(entry);
             if (entry.sourceSnapshot != null && entry.sourceSnapshot.sourceScope() != null
                     && !entry.sourceSnapshot.sourceScope().pipelineIncarnationId().equals(incarnation)) {
@@ -970,6 +979,36 @@ final class ObservationScopeRegistry {
             entry.current = scope;
         }
         return scope;
+    }
+
+    void rememberFailedAdmission(String pipelineId, ObservationStore.Scope scope,
+            ObservationScopeRecovery.Owner owner) {
+        Objects.requireNonNull(scope, "scope");
+        if (owner != null && (!pipelineId.equals(owner.key().resourceId())
+                || owner.key().type() != io.tapstate.spi.store.WorkloadClaimType.PIPELINE_ACTUATION
+                || owner.executionGeneration() != scope.executionGeneration())) {
+            throw new IllegalArgumentException("a failed admission receipt must match its pipeline and scope");
+        }
+        Entry entry = entries.get(pipelineId);
+        if (entry == null) { return; }
+        synchronized (entry) {
+            if (entries.get(pipelineId) != entry || !scope.equals(entry.current)) { return; }
+            entry.failedAdmission = new FailedAdmission(scope, owner);
+        }
+    }
+
+    Optional<FailedAdmission> failedAdmission(String pipelineId, ObservationStore.Scope scope) {
+        Entry entry = entries.get(pipelineId);
+        if (entry == null) { return Optional.empty(); }
+        synchronized (entry) {
+            return entries.get(pipelineId) == entry
+                    && entry.failedAdmission != null && entry.failedAdmission.scope().equals(scope)
+                    && scope.equals(entry.current) ? Optional.of(entry.failedAdmission) : Optional.empty();
+        }
+    }
+
+    boolean currentFailedAdmission(String pipelineId, FailedAdmission expected) {
+        return expected != null && failedAdmission(pipelineId, expected.scope()).orElse(null) == expected;
     }
 
     Optional<ObservationStore.Scope> current(String pipelineId) {
@@ -1003,6 +1042,7 @@ final class ObservationScopeRegistry {
             entry.restored = null;
             // Keep the entry object: a concurrent begin may already hold it after computeIfAbsent.
             entry.current = null;
+            entry.failedAdmission = null;
             entry.last = null;
             entry.pendingFrom = null;
             entry.pending = null;
@@ -1154,12 +1194,14 @@ final class ObservationScopeRegistry {
         synchronized (entry) {
             if (entry.current == null) {
                 entry.revision++;
+                entry.failedAdmission = null;
                 clearActiveContinuation(entry);
                 entry.restore = null;
                 entry.coldRebuild = null;
             }
             if (scope.equals(entry.current)) {
                 entry.revision++;
+                entry.failedAdmission = null;
                 clearActiveContinuation(entry);
                 entry.restore = null;
                 entry.coldRebuild = null;
