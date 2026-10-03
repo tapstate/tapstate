@@ -27,9 +27,9 @@ class OrdinaryResumeMetricContinuityTest {
     void aQuietPauseAndSameScopeResumeRetainEveryActualSettlementAndTheOriginalStart() {
         var scopes = new ObservationScopeRegistry();
         var scope = scopes.begin(PIPELINE, "inc-a", 1);
-        scopes.continueFrame(frame(1, PipelineState.RUNNING, START, 12_128, 13_000), scope);
+        var settled = scopes.continueFrame(frame(1, PipelineState.RUNNING, START, 12_128, 13_000), scope);
         var quiet = scopes.continueFrame(frame(2, PipelineState.PAUSED, START, null, 13_001), scope);
-        assertThat(points(quiet, "out")).isEmpty();
+        assertThat(points(quiet, "out")).containsExactlyElementsOf(points(settled, "out"));
 
         var resumed = scopes.continueFrame(frame(3, PipelineState.RUNNING, START.plusSeconds(3), 129, 13_002), scope);
         assertThat(value(resumed, "out")).isEqualTo(12_257);
