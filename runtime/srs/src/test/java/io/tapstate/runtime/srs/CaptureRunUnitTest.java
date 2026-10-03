@@ -1615,8 +1615,8 @@ class CaptureRunUnitTest {
 
     /**
      * A table asked for while the reader is being widened leaves the wider selection out of date before it is
-     * published, and the publication is refused. The reader takes the newer request on in the same widening:
-     * its stream is already stopped by then, so the retry has none to stop again.
+     * published, and the publication is refused. The reader takes the newer request on in the same widening,
+     * its first stream still running until a publication stands and stopped once, then.
      */
     @Test
     void aTableAskedForWhileTheReaderIsWideningIsTakenOnInTheSameWidening() {
@@ -1641,6 +1641,170 @@ class CaptureRunUnitTest {
         assertThat(source.cdcStreams)
                 .containsExactly(List.of("orders"), List.of("customers", "orders", "payments"));
         assertThat(meta.requestedPhysicalTables(chainId)).isEmpty();
+        owner.close();
+    }
+
+    /**
+     * A widening the store cannot take for a moment leaves the reader reading what it read. The wider selection
+     * is published before the running stream is stopped, so a failure up to there has stopped nothing, and a
+     * later look takes the table on.
+     */
+    @Test
+    void aWideningTheStoreCannotTakeForAMomentLeavesTheReaderReading() {
+        java.util.concurrent.atomic.AtomicBoolean unwritable = new java.util.concurrent.atomic.AtomicBoolean();
+        InMemoryMeta meta = new InMemoryMeta() {
+            @Override
+            public synchronized boolean replacePhysicalSelection(
+                    String miningChainId, PhysicalSelection current, PhysicalSelection wider) {
+                if (unwritable.get()) {
+                    throw new TapstateException(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE,
+                            Map.of("detail", "the primary is being elected"), null);
+                }
+                return super.replacePhysicalSelection(miningChainId, current, wider);
+            }
+        };
+        FakeSource source = new FakeSource(List.of(), List.of());
+        CaptureRunUnit unit = runUnit(source, meta);
+        CaptureRun owner = unit.start(specOver("pipe-1", "k-widen-blip", "orders"), e -> { });
+        String chainId = owner.chainId().orElseThrow().value();
+        meta.requestPhysicalTables(chainId, meta.read(chainId).orElseThrow().epoch(), List.of("customers"));
+        unwritable.set(true);
+
+        org.assertj.core.api.Assertions.catchThrowable(() -> unit.widen(owner));
+
+        assertThat(source.cdcClosed).as("the stream it was reading is still running").isFalse();
+        assertThat(owner.health().failure()).as("and nothing failed the run").isEmpty();
+        unwritable.set(false);
+        assertThat(unit.widen(owner)).as("a later look takes the table on").isTrue();
+        assertThat(source.cdcStreams).containsExactly(List.of("orders"), List.of("customers", "orders"));
+        owner.close();
+    }
+
+    /**
+     * A widening whose wider stream cannot be started leaves nothing reading the chain, and
+     * the run says so rather than going on healthy over rings nobody writes.
+     */
+    @Test
+    void aWideningWhoseWiderStreamCannotStartFailsTheRun() {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource source = new FakeSource(List.of(), List.of()).refusingStreamsAfter(1);
+        CaptureRunUnit unit = runUnit(source, meta);
+        CaptureRun owner = unit.start(specOver("pipe-1", "k-widen-refused", "orders"), e -> { });
+        String chainId = owner.chainId().orElseThrow().value();
+        meta.requestPhysicalTables(chainId, meta.read(chainId).orElseThrow().epoch(), List.of("customers"));
+
+        assertThatThrownBy(() -> unit.widen(owner)).hasMessageContaining("refused stream");
+
+        assertThat(owner.health().failure()).as("nothing reads the chain now, and the run says so").isPresent();
+        assertThat(unit.widen(owner)).as("and it is not widened again").isFalse();
+        owner.close();
+    }
+
+    /**
+     * A reader opened again in a generation it already widened -- its claim lost and taken back while a
+     * pipeline on this member still reads the chain -- takes up the subscription that generation got to,
+     * rather than asking for a first one and being refused for ever.
+     */
+    @Test
+    void aReaderOpenedAgainInAGenerationItWidenedTakesUpWhereThatGenerationGotTo() {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource source = new FakeSource(List.of(), List.of());
+        CaptureRunUnit unit = runUnit(source, meta);
+        CaptureRun owner = unit.start(specOver("pipe-1", "k-reopen", "orders"), e -> { });
+        String chainId = owner.chainId().orElseThrow().value();
+        long epoch = meta.read(chainId).orElseThrow().epoch();
+        meta.requestPhysicalTables(chainId, epoch, List.of("customers"));
+        assertThat(unit.widen(owner)).isTrue();
+        CaptureRun reading = unit.start(specOver("pipe-2", "k-reopen", "customers"), e -> { }, false);
+        owner.close();
+
+        CaptureRun reopened = unit.start(specOver("pipe-1", "k-reopen", "orders"), e -> { });
+
+        assertThat(meta.read(chainId).orElseThrow().epoch()).as("the same generation").isEqualTo(epoch);
+        assertThat(source.cdcStreams.getLast()).containsExactly("customers", "orders");
+        reopened.close();
+        reading.close();
+    }
+
+    /**
+     * A pipeline whose ask for a table reaches a chain that has meanwhile moved to another generation is given
+     * back. The ask was not recorded, and the reader that now runs published without it: going on would leave
+     * the pipeline healthy over a ring nobody writes.
+     */
+    @Test
+    void aPipelineWhoseAskReachesAChainThatMovedOnIsGivenBack() {
+        java.util.concurrent.atomic.AtomicBoolean takenOver = new java.util.concurrent.atomic.AtomicBoolean();
+        InMemoryMeta meta = new InMemoryMeta() {
+            @Override
+            public synchronized boolean requestPhysicalTables(String miningChainId, long epoch, List<String> tables) {
+                if (takenOver.compareAndSet(false, true)) {
+                    // A takeover on another member: its generation opens, and its reader publishes what the
+                    // chain's pipelines had selected by then.
+                    long next = openEpoch(miningChainId);
+                    publishPhysicalSelection(miningChainId, new PhysicalSelection(next, List.of("orders")));
+                }
+                return super.requestPhysicalTables(miningChainId, epoch, tables);
+            }
+        };
+        CaptureRun owner = runUnit(new FakeSource(List.of(), List.of()), meta)
+                .start(specOver("pipe-1", "k-moved-on", "orders"), e -> { });
+        String chainId = owner.chainId().orElseThrow().value();
+        CaptureRunUnit elsewhere = runUnit(new FakeSource(List.of(), List.of()), meta);
+
+        assertThatThrownBy(() -> elsewhere.start(specOver("pipe-2", "k-moved-on", "customers"), e -> { }, false))
+                .isInstanceOf(ReaderNotServingYet.class);
+        assertThat(meta.read(chainId).orElseThrow().consumerOffset("pipe-2"))
+                .as("nothing on the record waits for a pipeline that was given back").isEmpty();
+        owner.close();
+    }
+
+    /**
+     * The stream that replaces a widened one is told how far its source may release at once, not only once that
+     * position next changes: on a chain that has gone quiet it may not change for a long time, and a source
+     * that never hears it keeps its log.
+     */
+    @Test
+    void theStreamThatReplacesAWidenedOneIsToldWhereTheChainStands() {
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource source = new FakeSource(List.of(), List.of());
+        CaptureRunUnit unit = runUnit(source, meta);
+        CaptureRun owner = unit.start(specOver("pipe-1", "k-widen-told", "orders"), e -> { });
+        String chainId = owner.chainId().orElseThrow().value();
+        assertThat(source.acknowledged.getFirst()).as("the first stream was told where the chain stands")
+                .containsExactly(new SourcePosition("start"));
+        meta.requestPhysicalTables(chainId, meta.read(chainId).orElseThrow().epoch(), List.of("customers"));
+
+        assertThat(unit.widen(owner)).isTrue();
+
+        assertThat(source.acknowledged).hasSize(2);
+        assertThat(source.acknowledged.get(1)).as("and so is the stream that replaced it")
+                .containsExactly(new SourcePosition("start"));
+        owner.close();
+    }
+
+    /**
+     * A reader that looks for tables to take on and finds none asked for writes nothing. It looks every few
+     * seconds for every capture its member owns, so a write per look is a write per capture per interval, for
+     * as long as the member runs.
+     */
+    @Test
+    void aLookThatFindsNothingAskedForWritesNothing() {
+        java.util.concurrent.atomic.AtomicInteger clears = new java.util.concurrent.atomic.AtomicInteger();
+        InMemoryMeta meta = new InMemoryMeta() {
+            @Override
+            public synchronized void clearPhysicalRequests(String miningChainId, List<String> tables) {
+                clears.incrementAndGet();
+                super.clearPhysicalRequests(miningChainId, tables);
+            }
+        };
+        CaptureRunUnit unit = runUnit(new FakeSource(List.of(), List.of()), meta);
+        CaptureRun owner = unit.start(specOver("pipe-1", "k-widen-idle", "orders"), e -> { });
+        int afterOpening = clears.get();
+
+        assertThat(unit.widen(owner)).isFalse();
+        assertThat(unit.widen(owner)).isFalse();
+
+        assertThat(clears.get() - afterOpening).as("writes made by two looks that found nothing asked").isZero();
         owner.close();
     }
 
@@ -1956,6 +2120,10 @@ class CaptureRunUnitTest {
         final List<CaptureConfig> opened = new CopyOnWriteArrayList<>();
         /** The config every release of this source was asked with, in order. */
         final List<CaptureConfig> released = new CopyOnWriteArrayList<>();
+        /** What each stream opened over this source was told it may release, one list per stream, in order. */
+        final List<List<SourcePosition>> acknowledged = new CopyOnWriteArrayList<>();
+        /** How many streams this source opens before it refuses the next one. */
+        private int streamsBeforeRefusing = Integer.MAX_VALUE;
 
         FakeSource(List<Envelope> snapshotRows, List<Envelope> changes) {
             this(snapshotRows, changes, "seam-0");
@@ -1977,6 +2145,12 @@ class CaptureRunUnitTest {
         /** Has this source's stream end its changes with a run that carries none, naming {@code token}. */
         FakeSource withHeartbeatAt(String token) {
             this.heartbeat = token;
+            return this;
+        }
+
+        /** Has this source refuse every stream after the first {@code streams} it opens. */
+        FakeSource refusingStreamsAfter(int streams) {
+            this.streamsBeforeRefusing = streams;
             return this;
         }
 
@@ -2004,6 +2178,11 @@ class CaptureRunUnitTest {
             cdcStart = start;
             cdcStreams.add(List.copyOf(config.streams()));
             opened.add(config);
+            if (cdcStarts > streamsBeforeRefusing) {
+                throw new IllegalStateException("the source refused stream " + cdcStarts);
+            }
+            List<SourcePosition> told = new CopyOnWriteArrayList<>();
+            acknowledged.add(told);
             if (cdcError != null) {
                 listener.onError(cdcError);
                 return () -> cdcClosed = true;
@@ -2018,7 +2197,17 @@ class CaptureRunUnitTest {
             if (heartbeat != null) {
                 listener.onBatch(List.of(), Optional.of(new SourcePosition(heartbeat)));
             }
-            return () -> cdcClosed = true;
+            return new Subscription() {
+                @Override
+                public void acknowledge(SourcePosition durable) {
+                    told.add(durable);
+                }
+
+                @Override
+                public void close() {
+                    cdcClosed = true;
+                }
+            };
         }
 
         @Override

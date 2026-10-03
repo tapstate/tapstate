@@ -78,10 +78,11 @@ public interface SrsMetaStore {
     }
 
     /**
-     * Replaces the subscription published in a generation with a wider one of the same generation, once the
-     * stream it described has stopped: only while {@code current} is still exactly what is published and
-     * {@code wider} includes every table requested. Answers whether it did. A mutate on an unseeded chain is a
-     * caller ordering error.
+     * Replaces the subscription published in a generation with a wider one of the same generation: only while
+     * {@code current} is still exactly what is published and {@code wider} includes every table requested.
+     * Answers whether it did. The reader replaces the stream {@code current} described once this lands,
+     * beginning the new one from where the chain had been released to before it called. A mutate on an
+     * unseeded chain is a caller ordering error.
      */
     default boolean replacePhysicalSelection(
             String miningChainId, PhysicalSelection current, PhysicalSelection wider) {

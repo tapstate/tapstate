@@ -112,7 +112,9 @@ public final class SrsCoordinator {
      * {@link #provisionSource} does.
      *
      * <p>A chain with no generation open is one nobody has started mining, and joining it is an ordering
-     * error of the caller's rather than something to answer with a generation made up here.
+     * error of the caller's rather than something to answer with a generation made up here. A chain this member
+     * joined before is joined again under the generation running now, which a reader that took the chain over
+     * since may have opened.
      */
     public synchronized ProvisionOutcome joinSource(String sourceId, MiningChainId chainId, List<String> streams) {
         Objects.requireNonNull(sourceId, "sourceId");
@@ -127,6 +129,14 @@ public final class SrsCoordinator {
             }
             state = new ChainState(chainId, running, false);
             chains.put(chainId.value(), state);
+        } else if (!state.minedHere) {
+            // Taken over since this member joined: what a pipeline joining now asks of the reader is recorded
+            // under the generation the new reader writes under, and under no other. The pipelines that joined
+            // before keep the generation they read under.
+            long running = meta.read(chainId.value()).map(SrsMeta::epoch).orElse(0L);
+            if (running > state.epoch) {
+                state.epoch = running;
+            }
         }
         state.sources.add(sourceId);
         state.tables.addAll(streams);

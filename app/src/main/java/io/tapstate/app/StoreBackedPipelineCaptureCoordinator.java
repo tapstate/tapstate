@@ -584,8 +584,9 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      * and the reader here takes it on at once rather than the next time it looks: a pipeline started beside
      * the reader it reads waits for nothing.
      *
-     * <p>A reader that cannot be widened has stopped its stream already, and every pipeline reading it would
-     * go on healthy over a ring nobody writes; so its failure is recorded on the run they all read.
+     * <p>What a widening that fails costs is the reader's to judge, and it judges it: one that stopped nothing
+     * leaves the reader reading, and one that left nothing reading the chain fails the run every pipeline on it
+     * reads. Either way the failure gives this start back.
      */
     private void serveFromTheReaderHere(OwnedCapture owned, CaptureRunSpec spec) {
         if (!spec.srsEnabled() || spec.readMode() == ReadMode.SNAPSHOT_ONLY) {
@@ -597,12 +598,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             return;
         }
         storePort.meta().requestPhysicalTables(chain, epoch, spec.config().streams());
-        try {
-            captureAttacher.widen(owned.run);
-        } catch (RuntimeException | Error failure) {
-            owned.run.health().fail(failure);
-            throw failure;
-        }
+        captureAttacher.widen(owned.run);
     }
 
     /**
@@ -633,17 +629,25 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      * Has every chain reader this member runs take on what pipelines on other members asked it for. Those
      * pipelines are given back until it has, so this runs on the member's own schedule rather than on any
      * start of its own; one reader that cannot be widened does not keep the others from being looked at.
+     *
+     * <p>Not under this member's lock. Taking a table on can mean stopping a stream and starting another, and
+     * every start, stop and look at a pipeline here would wait behind it. A reader closed meanwhile is not
+     * widened: the reader orders the two itself. What a widening that fails costs is the reader's to judge, as
+     * at {@link #serveFromTheReaderHere}; here it is logged, and the next look tries again.
      */
-    synchronized void widenTheReadersHere() {
-        for (Map.Entry<CaptureId, OwnedCapture> owned : ownedCaptures.entrySet()) {
-            try {
-                captureAttacher.widen(owned.getValue().run);
-            } catch (RuntimeException failure) {
-                owned.getValue().run.health().fail(failure);
-                LOG.warn("Could not have the reader of capture {} take on the tables asked of it",
-                        owned.getKey().value(), failure);
-            }
+    void widenTheReadersHere() {
+        Map<CaptureId, CaptureRun> readers = new LinkedHashMap<>();
+        synchronized (this) {
+            ownedCaptures.forEach((captureId, owned) -> readers.put(captureId, owned.run));
         }
+        readers.forEach((captureId, run) -> {
+            try {
+                captureAttacher.widen(run);
+            } catch (RuntimeException failure) {
+                LOG.warn("Could not have the reader of capture {} take on the tables asked of it",
+                        captureId.value(), failure);
+            }
+        });
     }
 
     private void lookForRequestsToWidenFor() {

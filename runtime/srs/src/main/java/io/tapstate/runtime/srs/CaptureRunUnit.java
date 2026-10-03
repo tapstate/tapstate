@@ -15,6 +15,7 @@ import io.tapstate.spi.capture.SharedNotes;
 import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
 
@@ -297,10 +298,15 @@ public final class CaptureRunUnit {
      *
      * <p>The request goes in first. A reader that has not published yet cannot publish without it, so it is
      * safe to go on; one that has published before it is found not to serve the tables, and takes them on the
-     * next time it looks.
+     * next time it looks. A request the chain did not record, because it had moved to another generation, gives
+     * the start back as well: the reader of that generation never heard it.
      */
     private void askTheReaderToServeIt(String chainId, long epoch, List<String> tables) {
-        meta.requestPhysicalTables(chainId, epoch, tables);
+        if (!meta.requestPhysicalTables(chainId, epoch, tables)) {
+            // The chain moved to another generation meanwhile and the ask was not recorded: the reader running
+            // now does not know of it, and published without it.
+            throw new ReaderNotServingYet(chainId, tables);
+        }
         meta.physicalSelection(chainId)
                 .filter(published -> published.epoch() == epoch && !published.tables().containsAll(tables))
                 .ifPresent(published -> {
@@ -451,14 +457,29 @@ public final class CaptureRunUnit {
      * replacing its subscription within the same generation; answers whether it did. A run that is not the
      * chain's reader, or whose reader has not opened yet, changes nothing: a reader that opens later reads
      * every request when it does.
+     *
+     * <p>Throws what stopped a widening. One that failed before the running stream was stopped leaves the
+     * reader reading, and fails nothing: a store that could not be read for a moment is a reason to look again
+     * later, not to fail every pipeline reading the capture. One that leaves nothing reading the chain fails
+     * the run first -- every pipeline reading it would otherwise go on healthy over rings nobody writes.
      */
     public boolean widen(CaptureRun run) {
         Objects.requireNonNull(run, "run");
-        return run.cdcSubscription()
+        Optional<SharedTail> reader = run.cdcSubscription()
                 .map(tail -> tail instanceof SourceAcknowledgements.Followed followed ? followed.tail() : tail)
                 .filter(SharedTail.class::isInstance)
-                .map(tail -> ((SharedTail) tail).widen())
-                .orElse(false);
+                .map(SharedTail.class::cast);
+        if (reader.isEmpty()) {
+            return false;
+        }
+        try {
+            return reader.get().widen();
+        } catch (RuntimeException | Error failure) {
+            if (!reader.get().reading()) {
+                run.health().fail(failure);
+            }
+            throw failure;
+        }
     }
 
     /**
@@ -468,13 +489,19 @@ public final class CaptureRunUnit {
      * included -- not only the tables of the source that happened to start it. The chain is read once for
      * everyone on it, so a table another pipeline reads and this one does not still has to reach its ring.
      * The union is published before the stream starts, and a publication that does not include every table
-     * requested by then is refused and taken again, so no pipeline arriving meanwhile is left unserved.
+     * requested by then is refused and taken again, so no pipeline arriving meanwhile is left unserved. A
+     * reader opened again in a generation that already published -- its claim lost and taken back while a
+     * pipeline on this member still held the chain -- takes up what that generation got to.
      *
      * <p>A pipeline arriving later with a table the reader does not read asks for it, and the reader takes it
-     * on by stopping its stream and starting another over the wider union, in the same generation, from
-     * where the chain has been released to. What the first stream had read past that point is read again
-     * and handed over twice, which idempotent writes absorb; what it had not is read by the second. Rings
-     * are kept, and so is every reader of them.
+     * on in the same generation: it publishes the wider union, then stops its stream and starts another over
+     * that union from where the chain had been released to before it published. A pipeline that sees its table
+     * published loads it after that point, so the new stream begins at or before its seam. What the first
+     * stream had read past that point is read again and handed over twice, which idempotent writes absorb;
+     * what it had not is read by the second. Rings are kept, and so is every reader of them. Everything up to
+     * the publication is done with the first stream still running, so a store that fails a widening for a
+     * moment stops nothing; once the publication stands, only a stream over it may read the chain, and a wider
+     * stream that cannot be started after a second try leaves the reader closed.
      *
      * <p>Each table's durable log is cut as a run is released, through the last sequence the run reached in
      * that table: everyone who reads that ring has landed everything up to there, and a sequence is only ever
@@ -493,6 +520,8 @@ public final class CaptureRunUnit {
         private SrsMetaStore.PhysicalSelection published;
         /** The stream running now; read without the lock, so an acknowledgement never waits on a widening. */
         private final AtomicReference<Subscription> stream = new AtomicReference<>();
+        /** The last position the source was told it may release, for a stream that replaces the one told. */
+        private volatile SourcePosition acknowledged;
         private boolean closed;
 
         SharedTail(CaptureRunSpec spec, String chainId, long epoch, CaptureHealth health) {
@@ -510,8 +539,22 @@ public final class CaptureRunUnit {
             for (int attempt = 1; ; attempt++) {
                 List<String> tables = physicalSelection(spec, chainId, epoch);
                 PhysicalSourcePrefix prefix = prefixOver(tables);
-                SrsMetaStore.PhysicalSelection selection = new SrsMetaStore.PhysicalSelection(epoch, tables);
-                if (meta.publishPhysicalSelection(chainId, selection)) {
+                Optional<SrsMetaStore.PhysicalSelection> before =
+                        meta.physicalSelection(chainId).filter(selection -> selection.epoch() == epoch);
+                SrsMetaStore.PhysicalSelection selection;
+                boolean held;
+                if (before.isEmpty()) {
+                    selection = new SrsMetaStore.PhysicalSelection(epoch, tables);
+                    held = meta.publishPhysicalSelection(chainId, selection);
+                } else if (before.get().tables().containsAll(tables)) {
+                    // What this generation published already serves every table read and asked for.
+                    selection = before.get();
+                    held = true;
+                } else {
+                    selection = new SrsMetaStore.PhysicalSelection(epoch, before.get().revision() + 1, tables);
+                    held = meta.replacePhysicalSelection(chainId, before.get(), selection);
+                }
+                if (held) {
                     begin(selection, prefix, start);
                     return;
                 }
@@ -528,33 +571,64 @@ public final class CaptureRunUnit {
             if (closed || stream.get() == null) {
                 return false;
             }
+            // Every table a pipeline reads through the ring is asked for before its selection is recorded, so a
+            // look that finds nothing asked has nothing to take on -- and nothing to write.
+            if (meta.requestedPhysicalTables(chainId).isEmpty()) {
+                return false;
+            }
             for (int attempt = 1; ; attempt++) {
                 List<String> tables = physicalSelection(spec, chainId, epoch);
                 if (published.tables().containsAll(tables)) {
                     meta.clearPhysicalRequests(chainId, tables);
                     return false;
                 }
-                // Stopped on the first attempt; a retry after a refused publication finds nothing left to stop.
-                Subscription running = stream.getAndSet(null);
-                if (running != null) {
-                    running.close();
-                }
-                PhysicalSourcePrefix prefix = prefixOver(tables);
+                // Read before the wider selection is published: whatever the running stream releases after this,
+                // the wider one begins at or before the seam of any pipeline that sees its table published.
+                CaptureStart start = tailStart(meta, chainId, spec.pipelineId(), null, false, CaptureStart.present());
                 SrsMetaStore.PhysicalSelection wider =
                         new SrsMetaStore.PhysicalSelection(epoch, published.revision() + 1, tables);
                 if (meta.replacePhysicalSelection(chainId, published, wider)) {
-                    begin(wider, prefix,
-                            tailStart(meta, chainId, spec.pipelineId(), null, false, CaptureStart.present()));
+                    replaceTheStream(wider, start);
                     return true;
                 }
-                prefix.close();
-                if (attempt == PUBLISH_ATTEMPTS
-                        || meta.physicalSelection(chainId).filter(published::equals).isEmpty()) {
-                    // Nothing reads the chain for this generation now; whoever replaced what it published owns it.
+                if (meta.physicalSelection(chainId).filter(published::equals).isEmpty()) {
+                    // Whoever replaced what this reader published owns the chain now.
                     closed = true;
+                    closeTheStream();
                     throw new TapstateException(
                             CaptureError.SHARED_SELECTION_RESTART_REQUIRED, Map.of("chain", chainId), null);
                 }
+                if (attempt == PUBLISH_ATTEMPTS) {
+                    // Raced by a newer request every time: the stream reads on, and a later look tries again.
+                    return false;
+                }
+            }
+        }
+
+        /**
+         * Stops the running stream and starts one over {@code wider}, which is published by now: only a stream
+         * over it may read the chain from here, so one that cannot be started is tried once more, and a second
+         * failure leaves the reader closed.
+         */
+        private void replaceTheStream(SrsMetaStore.PhysicalSelection wider, CaptureStart start) {
+            closeTheStream();
+            try {
+                begin(wider, prefixOver(wider.tables()), start);
+            } catch (RuntimeException | Error failure) {
+                if (stream.get() != null) {
+                    // The wider stream runs; what failed came after it had started.
+                    throw failure;
+                }
+                try {
+                    begin(wider, prefixOver(wider.tables()), start);
+                    return;
+                } catch (RuntimeException | Error again) {
+                    failure.addSuppressed(again);
+                }
+                if (stream.get() == null) {
+                    closed = true;
+                }
+                throw failure;
             }
         }
 
@@ -579,16 +653,44 @@ public final class CaptureRunUnit {
                 routes.put(table, new CdcPhase.TableRoute(chain, consumers));
             }
             CaptureConfig physical = spec.config().over(selection.tables()).sharing(notes);
-            stream.set(CdcPhase.run(port, physical, start, routes, health, prefix));
-            meta.clearPhysicalRequests(chainId, selection.tables());
+            Subscription begun = CdcPhase.run(port, physical, start, routes, health, prefix);
+            stream.set(begun);
+            // Told at once where the chain stands, as the stream it replaces was: on a quiet chain that position
+            // may not change again for a long while, and a source never told it keeps its log.
+            SourcePosition told = acknowledged;
+            if (told != null) {
+                begun.acknowledge(told);
+            }
+            try {
+                meta.clearPhysicalRequests(chainId, selection.tables());
+            } catch (TapstateException unwritten) {
+                if (unwritten.code() != IoError.STORE_UNAVAILABLE) {
+                    throw unwritten;
+                }
+                // Left for a later look: a request a published selection already serves holds nobody back.
+            }
+        }
+
+        /** Whether a stream of this reader is running. */
+        synchronized boolean reading() {
+            return !closed && stream.get() != null;
+        }
+
+        private void closeTheStream() {
+            Subscription running = stream.getAndSet(null);
+            if (running != null) {
+                running.close();
+            }
         }
 
         /**
          * Hands {@code durable} to the stream running now. A stream replaced by a wider one is told nothing
-         * more; the one that replaced it is told the positions from then on, which only move forward.
+         * more; the one that replaced it is told the last position at once, and the positions from then on,
+         * which only move forward.
          */
         @Override
         public void acknowledge(SourcePosition durable) {
+            acknowledged = durable;
             Subscription current = stream.get();
             if (current != null) {
                 current.acknowledge(durable);
@@ -598,10 +700,7 @@ public final class CaptureRunUnit {
         @Override
         public synchronized void close() {
             closed = true;
-            Subscription current = stream.get();
-            if (current != null) {
-                current.close();
-            }
+            closeTheStream();
         }
     }
 

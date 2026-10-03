@@ -36,6 +36,7 @@ import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
@@ -598,6 +599,60 @@ class CaptureOwnershipTest {
     }
 
     /**
+     * A look for tables to take on that fails is the reader's to judge, not the member's: a store that cannot
+     * be read for a moment before anything was stopped leaves the reader reading, and failing it here would fail
+     * every pipeline reading the capture over a stream that is healthy.
+     */
+    @Test
+    void aLookForTablesThatFailsFailsNoPipelineOnTheMembersSay() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(TWO_TABLE_SOURCE);
+        artifacts.save(pipelineServing("p", "orders-source.orders"));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        Reader reader = new Reader();
+        StoreBackedPipelineCaptureCoordinator a = reader.member("node-a", store, new MemoryClaims());
+        a.startCapture("p");
+        reader.lookFails = new TapstateException(IoError.STORE_UNAVAILABLE,
+                Map.of("detail", "the primary is being elected"), null);
+
+        a.widenTheReadersHere();
+
+        assertThat(a.captureFailure("p")).as("the pipeline reading the capture").isEmpty();
+        a.stopCapture("p", false);
+    }
+
+    /**
+     * A reader taking a table on -- which can mean stopping a stream and starting another -- does so without
+     * holding the member: a stop, a start or a look at whether a pipeline runs is not kept waiting behind it.
+     */
+    @Test
+    void aWideningUnderWayDoesNotHoldTheMemberBack() throws Exception {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(TWO_TABLE_SOURCE);
+        artifacts.save(pipelineServing("p", "orders-source.orders"));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        Reader reader = new Reader();
+        StoreBackedPipelineCaptureCoordinator a = reader.member("node-a", store, new MemoryClaims());
+        a.startCapture("p");
+        reader.looking = new java.util.concurrent.CountDownLatch(1);
+
+        Thread look = new Thread(a::widenTheReadersHere, "widening");
+        look.start();
+        try {
+            assertThat(reader.looking.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                    .as("the reader is taking a table on").isTrue();
+            java.util.concurrent.CompletableFuture<Boolean> running =
+                    java.util.concurrent.CompletableFuture.supplyAsync(() -> a.isActive("p"));
+            assertThat(running.get(3, java.util.concurrent.TimeUnit.SECONDS))
+                    .as("whether the pipeline runs, answered meanwhile").isTrue();
+        } finally {
+            reader.lookMayFinish.countDown();
+            look.join(10_000);
+        }
+        a.stopCapture("p", false);
+    }
+
+    /**
      * Clearing the state of the last pipeline one member runs leaves the chain to a pipeline on another.
      *
      * <p>A member's own release answers for the pipelines it runs and for no others. A pipeline another
@@ -1127,6 +1182,11 @@ class CaptureOwnershipTest {
         final Set<String> read = new java.util.LinkedHashSet<>();
         final Set<String> asked = new java.util.LinkedHashSet<>();
         final List<String> events = new ArrayList<>();
+        /** What a look for tables to take on throws, when set. */
+        volatile RuntimeException lookFails;
+        /** When set, a look counts this down and then waits for {@link #lookMayFinish}. */
+        volatile java.util.concurrent.CountDownLatch looking;
+        final java.util.concurrent.CountDownLatch lookMayFinish = new java.util.concurrent.CountDownLatch(1);
 
         StoreBackedPipelineCaptureCoordinator member(String node, InMemoryStorePort store, MemoryClaims claims) {
             ClusterMembershipGate gate = eligibleGate();
@@ -1157,6 +1217,18 @@ class CaptureOwnershipTest {
 
                 @Override
                 public boolean widen(CaptureRun run) {
+                    java.util.concurrent.CountDownLatch entered = looking;
+                    if (entered != null) {
+                        entered.countDown();
+                        try {
+                            lookMayFinish.await(10, java.util.concurrent.TimeUnit.SECONDS);
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                    if (lookFails != null) {
+                        throw lookFails;
+                    }
                     if (read.containsAll(asked)) {
                         return false;
                     }

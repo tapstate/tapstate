@@ -159,6 +159,27 @@ class SrsCoordinatorTest {
                 .isEqualTo(mined.epoch());
     }
 
+    /**
+     * A pipeline joining after the chain's reader was taken over joins the generation the new reader writes
+     * under, even while a pipeline that joined before the takeover still holds the chain on this member: what
+     * it asks of the reader is recorded only under the generation running, so an ask made under the one before
+     * is never recorded, and every start would be given back until it was refused.
+     */
+    @Test
+    void aPipelineJoiningAfterATakeoverJoinsTheGenerationNowRunning() {
+        FakeMeta meta = new FakeMeta();
+        long before = new SrsCoordinator(meta).provisionSource("src-a", CHAIN, List.of("orders"), "7d").epoch();
+        SrsCoordinator here = new SrsCoordinator(meta);
+        here.joinSource("src-a", CHAIN, List.of("orders"));
+        here.attachConsumer(CHAIN, "p-before");
+
+        long after = new SrsCoordinator(meta).provisionSource("src-a", CHAIN, List.of("orders"), "7d").epoch();
+
+        assertThat(after).isGreaterThan(before);
+        assertThat(here.joinSource("src-a", CHAIN, List.of("customers")).epoch())
+                .as("the generation the reader now writes under").isEqualTo(after);
+    }
+
     @Test
     void joiningAChainWithNoGenerationOpenIsAnOrderingError() {
         SrsCoordinator here = new SrsCoordinator(new FakeMeta());
