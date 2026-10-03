@@ -247,6 +247,13 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     }
 
     @Override
+    public synchronized void advanceDirectSourceReadOffset(
+            String miningChainId, ChainPosition position, boolean resumable) {
+        advanceSourceReadOffset(miningChainId, position, resumable);
+        trusted.add(miningChainId);
+    }
+
+    @Override
     public synchronized void upsertConsumerOffset(String miningChainId, ConsumerOffset offset) {
         SrsMeta m = require(miningChainId);
         // A rewritten record carries no per-table acks, as the real store's replacement carries none.

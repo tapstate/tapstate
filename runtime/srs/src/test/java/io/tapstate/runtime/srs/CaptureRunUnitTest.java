@@ -1093,6 +1093,143 @@ class CaptureRunUnitTest {
     }
 
     /**
+     * A direct tail that is the only one on its chain writes the chain's position as it releases, so that a
+     * pipeline turning the buffering on later picks up there -- over every table it reads. That position is one
+     * the shared reader can stand on: everything before it landed for everyone on the chain. Taken for one an
+     * older version wrote, it would refuse to open over several tables for good.
+     */
+    @Test
+    void aPipelineTurningItsBufferOnPicksUpWhereItsDirectTailLeftAChainOfSeveralTables() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRunSpec direct = directSpecOver("pipe-1", "k-turned-on", "orders", "customers");
+        String chainId = MiningChainId.resolve(direct.config(), direct.srsKey()).value();
+        CaptureRun directRun = runUnit(new FakeSource(List.of(), List.of(
+                        Envelope.insert(10, "orders", Map.of("id", 10), Map.of()),
+                        Envelope.insert(11, "customers", Map.of("id", 11), Map.of()))), meta)
+                .start(direct, event -> meta.advanceTableSinkAcked(chainId, "pipe-1", event.src(), event.position()));
+        awaitSourceRead(meta, chainId, "src-11");
+        directRun.close();
+
+        FakeSource buffered = new FakeSource(List.of(), List.of());
+        runUnit(buffered, meta).start(specOver("pipe-1", "k-turned-on", "orders", "customers"), e -> { }).close();
+
+        assertThat(buffered.cdcStart).as("where the buffered reader opens")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("src-11")));
+    }
+
+    /** The same position serves any other pipeline arriving with the buffering on, beside the direct tail. */
+    @Test
+    void anotherPipelineStartsBesideADirectTailThatReleasedAChainOfSeveralTablesAlone() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRunSpec direct = directSpecOver("pipe-d", "k-beside-alone", "orders", "customers");
+        String chainId = MiningChainId.resolve(direct.config(), direct.srsKey()).value();
+        CaptureRun directRun = runUnit(new FakeSource(List.of(), List.of(
+                        Envelope.insert(10, "orders", Map.of("id", 10), Map.of()),
+                        Envelope.insert(11, "customers", Map.of("id", 11), Map.of()))), meta)
+                .start(direct, event -> meta.advanceTableSinkAcked(chainId, "pipe-d", event.src(), event.position()));
+        awaitSourceRead(meta, chainId, "src-11");
+
+        FakeSource sharedSource = new FakeSource(List.of(), List.of());
+        CaptureRun shared = runUnit(sharedSource, meta)
+                .start(specOver("pipe-s", "k-beside-alone", "orders", "customers"), e -> { });
+
+        assertThat(sharedSource.cdcStart).isEqualTo(CaptureStart.resume(new SourcePosition("src-11")));
+        assertThat(shared.health().failure()).isEmpty();
+        shared.close();
+        directRun.close();
+    }
+
+    /**
+     * A direct tail that wrote the chain's position while it was alone stops writing it once another pipeline is
+     * on the chain, and its source is then told what its own pipeline lands -- not the chain's position it wrote
+     * last, which no longer moves. Told that, its source would keep its log from there for as long as the stream
+     * runs.
+     */
+    @Test
+    void aDirectTailIsToldWhatItLandsOnceAnotherPipelineJoinsItsChain() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRunSpec first = directSpecOver("pipe-1", "k-joined", "orders");
+        String chainId = MiningChainId.resolve(first.config(), first.srsKey()).value();
+        List<Envelope> forwarded = new CopyOnWriteArrayList<>();
+        FakeSource source = new FakeSource(List.of(), List.of(change(10), change(11)));
+        CaptureRun run = runUnit(source, meta).start(first, forwarded::add);
+        meta.advanceTableSinkAcked(chainId, "pipe-1", "orders", forwarded.get(0).position());
+        awaitSourceRead(meta, chainId, "src-10");
+
+        CaptureRun joined = runUnit(new FakeSource(List.of(), List.of()), meta)
+                .start(directSpecOver("pipe-2", "k-joined", "orders"), e -> { });
+        meta.advanceTableSinkAcked(chainId, "pipe-1", "orders", forwarded.get(1).position());
+        awaitAcked(meta, chainId, "pipe-1", "src-11");
+        ((SourceAcknowledgements.Followed) run.cdcSubscription().orElseThrow()).handOverQuietly();
+
+        assertThat(meta.read(chainId).orElseThrow().sourceReadOffset())
+                .as("the chain's position, no longer the direct tail's to move").isEqualTo("src-10");
+        assertThat(source.acknowledged.getLast()).as("what its source was told it may release")
+                .last().isEqualTo(new SourcePosition("src-11"));
+        joined.close();
+        run.close();
+    }
+
+    /**
+     * A pipeline that read the chain through its ring and now reads it directly comes back where the chain
+     * stands for it. Every run of the chain waited for it until now, so the chain's resume point is a place it
+     * landed everything before -- later than the last change of its own it landed, here long ago on a quiet
+     * table. Coming back there would read everything since again, from a log the source may no longer keep.
+     */
+    @Test
+    void aPipelineTurningToADirectTailResumesWhereTheChainStandsForItNotAtItsLastChange() {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chainId = MiningChainId.resolve(config(), "chain-turned-direct").value();
+        meta.create(chainId, null);
+        long epoch = meta.openEpoch(chainId);
+        meta.selectConsumerTables(chainId, "pipe-1", List.of("orders"), epoch);
+        meta.advanceSinkAcked(chainId, "pipe-1",
+                new ChainPosition(new SourceOrder(epoch, 3L), "its-last-change-long-ago"));
+        meta.advancePhysicalSourceReadOffset(chainId, epoch,
+                new ChainPosition(new SourceOrder(epoch, 9L), "where-the-chain-stands-for-it"), true);
+
+        FakeSource port = new FakeSource(List.of(), List.of());
+        runUnit(port, meta).start(spec(ReadMode.CDC_ONLY, false, "chain-turned-direct"), e -> { });
+
+        assertThat(port.cdcStart)
+                .isEqualTo(CaptureStart.resume(new SourcePosition("where-the-chain-stands-for-it")));
+    }
+
+    /**
+     * That place is taken before the pipeline is recorded reading directly: from then on the shared reader stops
+     * waiting for it, and releases past the changes it still owed. Here the reader does so the moment the record
+     * changes; a pipeline that had landed nothing of its own would otherwise come back past them.
+     */
+    @Test
+    void aPipelineTurningToADirectTailResumesWhereTheChainHeldForItNotWhereTheReaderWentWithoutIt() {
+        InMemoryMeta meta = new InMemoryMeta() {
+            @Override
+            public synchronized void selectConsumerTables(
+                    String miningChainId, String pipelineId, List<String> tables, long epoch) {
+                super.selectConsumerTables(miningChainId, pipelineId, tables, epoch);
+                if (tables.isEmpty()) {
+                    long chainEpoch = read(miningChainId).orElseThrow().epoch();
+                    advancePhysicalSourceReadOffset(miningChainId, chainEpoch,
+                            new ChainPosition(new SourceOrder(chainEpoch, 12L), "released-without-it"), true);
+                }
+            }
+        };
+        String chainId = MiningChainId.resolve(config(), "chain-turned-direct-owing").value();
+        meta.create(chainId, null);
+        long epoch = meta.openEpoch(chainId);
+        meta.selectConsumerTables(chainId, "pipe-1", List.of("orders"), epoch);
+        meta.advancePhysicalSourceReadOffset(chainId, epoch,
+                new ChainPosition(new SourceOrder(epoch, 9L), "where-the-chain-held-for-it"), true);
+
+        FakeSource port = new FakeSource(List.of(), List.of());
+        runUnit(port, meta).start(spec(ReadMode.CDC_ONLY, false, "chain-turned-direct-owing"), e -> { });
+
+        assertThat(meta.resumeOffset(chainId)).as("the reader went on without it").contains("released-without-it");
+        assertThat(port.cdcStart)
+                .isEqualTo(CaptureStart.resume(new SourcePosition("where-the-chain-held-for-it")));
+    }
+
+    /**
      * A pipeline that reads the source directly has no place in any of the chain's rings, and attaching that way
      * drops the cursors a run of it that read through the ring left behind. Nothing advances them any more, and
      * the shared reader writes each ring no further ahead of its slowest cursor than the ring holds: a cursor
@@ -2554,6 +2691,13 @@ class CaptureRunUnitTest {
             if (resumable && position.token() != null) {
                 resumeFrom.put(miningChainId, new ResumePoint(position, null));
             }
+        }
+
+        @Override
+        public synchronized void advanceDirectSourceReadOffset(
+                String miningChainId, ChainPosition position, boolean resumable) {
+            advanceSourceReadOffset(miningChainId, position, resumable);
+            trusted.add(miningChainId);
         }
 
         @Override

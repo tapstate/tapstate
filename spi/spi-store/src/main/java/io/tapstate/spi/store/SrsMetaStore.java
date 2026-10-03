@@ -227,6 +227,18 @@ public interface SrsMetaStore {
     }
 
     /**
+     * Advances the source read offset as {@link #advanceSourceReadOffset(String, ChainPosition, boolean)} does,
+     * for a tail reading its source directly while its pipeline is the only one on the chain, and marks the
+     * offset {@linkplain #physicalPrefixTrusted trusted} where it moves it: that tail released it once its
+     * pipeline had landed every change up to it on every table it reads, and that pipeline is everyone on the
+     * chain. A pipeline turning the shared ring on later picks up there, over however many tables it reads. The
+     * default leaves the mark off, as a store without the notion does.
+     */
+    default void advanceDirectSourceReadOffset(String miningChainId, ChainPosition position, boolean resumable) {
+        advanceSourceReadOffset(miningChainId, position, resumable);
+    }
+
+    /**
      * Where a restart of the chain's reader resumes, and when that was written down: the position of the last
      * released run that carried a change, where the stream began, or a position put there by hand --
      * whichever was recorded last. Empty for a chain with no offset or no record. The default answers the
@@ -271,8 +283,8 @@ public interface SrsMetaStore {
      * Whether the chain's source read offset is one every table it carries can resume from.
      *
      * <p>An offset is trusted once it was laid down as where a stream began, released by the chain's reader
-     * across every table it reads, adopted from a chain that provably carried a single table, or put there
-     * by hand. One written before any of those existed is not: while a chain carried several tables, one
+     * across every table it reads, released by a direct tail while its pipeline was the only one on the chain,
+     * adopted from a chain that provably carried a single table, or put there by hand. One written before any of those existed is not: while a chain carried several tables, one
      * table's acknowledgement could move it past another table's change that had not landed, and nothing
      * recorded says whether that happened. False for a chain with no record, and what a store without the
      * notion answers.

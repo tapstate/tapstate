@@ -284,8 +284,35 @@ public final class CaptureRunUnit {
                     Objects.requireNonNull(state.chainId, "a tail resolves its chain before it runs"),
                     spec.pipelineId());
             state.consumerAttached = true;
+            takeWhereTheChainStandsForIt(state.chainId.value(), spec.pipelineId());
             selectConsumerTables(spec, state);
         }
+    }
+
+    /**
+     * A pipeline that read the chain through its ring until now, and reads it directly from this run on, takes
+     * where the chain stands for it as its own position -- before its selection says it reads directly.
+     *
+     * <p>Until then every run of the chain waited for it, so the chain's resume point is a place it landed
+     * everything before: later than the last change of its own it landed, which on a quiet table may be so far
+     * back that a source keeping its log for a while no longer reaches it. Once its selection says it reads
+     * directly the shared reader stops waiting for it, and moves the resume point past whatever it still owed;
+     * read after that, the chain's point would skip those changes for it for good.
+     */
+    private void takeWhereTheChainStandsForIt(String chainId, String pipelineId) {
+        Optional<ConsumerOffset> own = meta.read(chainId).flatMap(record -> record.consumerOffset(pipelineId));
+        if (own.isEmpty() || own.get().selectedTables() == null || own.get().selectedTables().isEmpty()) {
+            return;
+        }
+        Optional<String> resumeFrom = meta.resumeOffset(chainId);
+        if (resumeFrom.isEmpty()) {
+            return;
+        }
+        ConsumerOffset offset = own.get();
+        // What it landed is let go of, so its tail picks up at the point taken here rather than behind it.
+        meta.upsertConsumerOffset(chainId, new ConsumerOffset(offset.pipelineId(), offset.perTableSeq(), null,
+                offset.snapshotCompletedTables(), resumeFrom.get(), offset.snapshotEpoch(), offset.selectedTables(),
+                offset.selectedTablesEpoch(), offset.sinkAckedByTable()));
     }
 
     /**
@@ -941,7 +968,8 @@ public final class CaptureRunUnit {
      *
      * <p>A direct tail ({@code seamFirst}) keeps a position of its own, and resumes from it before the chain's:
      * the seam of a load that just ran here; then the last of its own changes its pipeline landed; then where it
-     * last began, or where a load of it or a write-back last put it; only then the chain's resume point, which a
+     * last began, or where a load of it, a write-back, or the chain it read through the ring until it turned to
+     * reading directly last put it; only then the chain's resume point, which a
      * record written before direct tails kept their own holds; then {@code firstRun}. It serves its own pipeline
      * alone, and the chain's runs do not wait for that pipeline: a shared reader on the same chain moves the
      * resume point on its own pipelines' word, past changes this one forwarded and never landed, and beginning

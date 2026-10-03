@@ -490,6 +490,30 @@ class MongoSrsMetaStoreIT {
         });
     }
 
+    /**
+     * A direct tail alone on its chain writes the chain's offset as one everyone on it landed, and marks it so
+     * in the same write -- but only where the write moves it: an offset it does not pass is left as unproven as
+     * it was.
+     */
+    @Test
+    void anOffsetADirectTailReleasesAloneIsTrustedWhereItMovesIt() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long shared = store.openEpoch(CHAIN);
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(shared, 9), "legacy-ahead"));
+
+            store.advanceDirectSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(shared, 2), "behind"), true);
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("legacy-ahead");
+            assertThat(store.physicalPrefixTrusted(CHAIN)).as("a write that moved nothing").isFalse();
+
+            long direct = store.openDirectEpoch(CHAIN);
+            store.advanceDirectSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(direct, 0), "released"), true);
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("released");
+            assertThat(store.resumeOffset(CHAIN)).contains("released");
+            assertThat(store.physicalPrefixTrusted(CHAIN)).isTrue();
+        });
+    }
+
     @Test
     void aPositionPutThereByHandIsTrusted() {
         withStore(store -> {

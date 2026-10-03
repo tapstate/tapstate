@@ -303,11 +303,26 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
 
     @Override
     public void advanceSourceReadOffset(String miningChainId, ChainPosition position, boolean resumable) {
+        advanceSourceRead(miningChainId, position, resumable, false);
+    }
+
+    @Override
+    public void advanceDirectSourceReadOffset(String miningChainId, ChainPosition position, boolean resumable) {
+        advanceSourceRead(miningChainId, position, resumable, true);
+    }
+
+    private void advanceSourceRead(String miningChainId, ChainPosition position, boolean resumable, boolean trusted) {
         Objects.requireNonNull(miningChainId, "miningChainId");
         Objects.requireNonNull(position, POSITION);
         Objects.requireNonNull(position.order(), POSITION_ORDER);
         if (!resumable) {
             keepTheResumePointOfARecordFromBefore(miningChainId);
+        }
+        // The mark rides in the same write as the offset, so an offset is never made to look proven by a write
+        // that did not move it.
+        Document fields = sourceReadFields(position, Instant.now(clock), resumable);
+        if (trusted) {
+            fields.append(PHYSICAL_PREFIX_TRUSTED, true);
         }
         // Two updates, and the split is the guard. The first carries the ordering condition in its own
         // filter, so the comparison and the write are one atomic act: a read-then-write would let a second
@@ -315,7 +330,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         // exists to stop. It matches nothing when the recorded position already ranks at or after this one.
         long matched = writeChainWithConsumerMigration(miningChainId, () -> collection.updateOne(
                 sourceReadAdvanceFilter(miningChainId, position.order()),
-                new Document("$set", sourceReadFields(position, Instant.now(clock), resumable))).getMatchedCount());
+                new Document("$set", fields)).getMatchedCount());
         if (matched > 0) {
             return;
         }

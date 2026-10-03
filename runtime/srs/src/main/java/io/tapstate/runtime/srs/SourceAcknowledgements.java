@@ -35,10 +35,10 @@ import java.util.function.Supplier;
  * nothing else, so it is counted on the run's health as a failed acknowledgement and never fails the run.
  *
  * <p>A tail reading its source directly for one pipeline is told that pipeline's own position instead: where
- * the last of its changes that landed sat, or the chain's offset where its own stream wrote that, as it does
- * while its pipeline is the only one on the chain -- runs that carried no change included. The chain's offset
- * moved by anybody else says nothing about what this pipeline landed: beside a shared reader it is that
- * reader's, released on its own pipelines' word.
+ * the last of its changes that landed sat, or the chain's offset where its own stream wrote that -- as it does
+ * while its pipeline is the only one on the chain, runs that carried no change included -- whichever its stream
+ * reached later. The chain's offset moved by anybody else says nothing about what this pipeline landed: beside
+ * a shared reader it is that reader's, released on its own pipelines' word.
  */
 final class SourceAcknowledgements {
 
@@ -78,12 +78,20 @@ final class SourceAcknowledgements {
     static Subscription followDirect(SrsMetaStore meta, String chainId, String pipelineId, long epoch,
             Subscription tail, CaptureHealth health) {
         return follow(() -> {
-            Optional<ChainPosition> chain = meta.durableSourceRead(chainId);
-            if (chain.isPresent() && chain.get().order() != null && chain.get().order().epoch() == epoch) {
-                // Written by this very stream, while its pipeline was the only one on the chain.
-                return chain;
+            Optional<ChainPosition> own = meta.durableSinkAcked(chainId, pipelineId);
+            Optional<ChainPosition> chain = meta.durableSourceRead(chainId)
+                    .filter(read -> read.order() != null && read.order().epoch() == epoch);
+            if (chain.isEmpty()) {
+                return own;
             }
-            return meta.durableSinkAcked(chainId, pipelineId);
+            // The chain's offset was written by this very stream, while its pipeline was the only one on the
+            // chain; once another arrived it stopped moving, and what the pipeline lands goes on moving its own.
+            // Both are counted by this stream alone, so the later of the two is how far it has gone.
+            if (own.isPresent() && own.get().order() != null && own.get().order().epoch() == epoch
+                    && own.get().order().seq() > chain.get().order().seq()) {
+                return own;
+            }
+            return chain;
         }, tail, health);
     }
 

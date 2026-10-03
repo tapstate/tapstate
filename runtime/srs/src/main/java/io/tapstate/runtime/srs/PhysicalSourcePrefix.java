@@ -540,14 +540,15 @@ final class PhysicalSourcePrefix implements AutoCloseable {
                 meta.advanceSinkAcked(chainId, directPipeline, landed);
             }
             // The chain's position only while its pipeline is the only one on the chain: it then stands for
-            // nobody else, and a pipeline that turns the buffering on later picks up there. Beside another, it
-            // is the shared reader's to move, and a direct tail's positions -- in a generation and a count of
-            // its own -- would only be ranked against that reader's by accident.
+            // nobody else, and a pipeline that turns the buffering on later picks up there -- so it is written as
+            // one everyone on the chain landed. Beside another, it is the shared reader's to move, and a direct
+            // tail's positions -- in a generation and a count of its own -- would only be ranked against that
+            // reader's by accident.
             if (current.size() == 1 && current.containsKey(directPipeline)) {
                 if (resumeAt != null && !resumeAt.equals(position)) {
-                    meta.advanceSourceReadOffset(chainId, resumeAt, true);
+                    meta.advanceDirectSourceReadOffset(chainId, resumeAt, true);
                 }
-                meta.advanceSourceReadOffset(chainId, position, position.equals(resumeAt));
+                meta.advanceDirectSourceReadOffset(chainId, position, position.equals(resumeAt));
             }
             return;
         }
