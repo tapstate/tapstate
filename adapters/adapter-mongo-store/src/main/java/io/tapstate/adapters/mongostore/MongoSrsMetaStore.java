@@ -855,6 +855,11 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                     .append(SELECTED_TABLES_EPOCH, epoch)
                     .append(SINK_ACKED_BY_TABLE, retained))
                     .append("$setOnInsert", consumerIdentity(miningChainId, pipelineId));
+            if (selected.isEmpty()) {
+                // A pipeline that selects nothing has no place in any ring; a cursor nothing advances any more
+                // would hold the chain's reader back.
+                update.append("$unset", new Document("perTableSeq", "").append(PER_TABLE_RING_DONE, ""));
+            }
             consumers.updateOne(session, key, update, new UpdateOptions().upsert(true));
         });
     }

@@ -382,6 +382,10 @@ class CaptureToSinkAckFrontierTest {
             // attached, so this keeps making changes rather than waiting for one; the fake source here
             // replays its whole log to each subscription, and the wait does not lean on that.
             awaitBothConsumersAcked(gatedSource, meta, chainId);
+            assertThat(meta.read(chainId).orElseThrow().consumerOffset(DIRECT_PIPELINE).orElseThrow().perTableSeq())
+                    .as("cursors the directly-read pipeline's job published into the chain's rings: it reads its "
+                            + "own hand-off alone, and a cursor it left would hold the shared reader back")
+                    .isEmpty();
             actuator.stop(DIRECT_PIPELINE, false);
             ChainPosition landed = directAckedPosition(meta, chainId);
             assertThat(landed).as("what the direct pipeline landed before it stopped").isNotNull();

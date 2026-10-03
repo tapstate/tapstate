@@ -309,8 +309,15 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
                 }
             });
         }
+        if (selected.isEmpty()) {
+            // A pipeline that selects nothing has no place in any ring.
+            Map<String, Map<String, Long>> rings = ringDone.get(miningChainId);
+            if (rings != null) {
+                rings.remove(pipelineId);
+            }
+        }
         next.add(new ConsumerOffset(pipelineId,
-                existing == null ? Map.of() : existing.perTableSeq(),
+                existing == null || selected.isEmpty() ? Map.of() : existing.perTableSeq(),
                 existing == null ? null : existing.sinkAcked(),
                 completedOf(existing),
                 existing == null ? null : existing.cdcStartPosition(),

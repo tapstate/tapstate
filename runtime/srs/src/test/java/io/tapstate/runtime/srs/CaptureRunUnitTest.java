@@ -1093,6 +1093,28 @@ class CaptureRunUnitTest {
     }
 
     /**
+     * A pipeline that reads the source directly has no place in any of the chain's rings, and attaching that way
+     * drops the cursors a run of it that read through the ring left behind. Nothing advances them any more, and
+     * the shared reader writes each ring no further ahead of its slowest cursor than the ring holds: a cursor
+     * left standing would stop it for every pipeline on the chain.
+     */
+    @Test
+    void aPipelineAttachingDirectlyLeavesNoCursorInTheChainsRings() {
+        InMemoryMeta meta = new InMemoryMeta();
+        String chainId = MiningChainId.resolve(config(), "chain-direct-cursor").value();
+        meta.create(chainId, null);
+        meta.advanceConsumerReadSeq(chainId, "pipe-1", "orders", 500L);
+        meta.startRingAfter(chainId, "pipe-1", "orders", 400L);
+
+        runUnit(new FakeSource(List.of(), List.of()), meta)
+                .start(spec(ReadMode.CDC_ONLY, false, "chain-direct-cursor"), e -> { }).close();
+
+        assertThat(meta.read(chainId).orElseThrow().consumerOffset("pipe-1").orElseThrow().perTableSeq())
+                .as("the direct pipeline's cursors in the chain's rings").isEmpty();
+        assertThat(meta.ringDoneThrough(chainId, "pipe-1")).isEmpty();
+    }
+
+    /**
      * A direct tail -- {@code srs.enabled:false} -- begins where the durable record says, exactly as a
      * shared-ring tail does.
      *
@@ -2723,8 +2745,12 @@ class CaptureRunUnitTest {
                     }
                 });
             }
+            if (selected.isEmpty()) {
+                // A pipeline that selects nothing has no place in any ring.
+                ringDone.remove(miningChainId + "/" + pipelineId);
+            }
             next.add(new ConsumerOffset(pipelineId,
-                    existing == null ? Map.of() : existing.perTableSeq(),
+                    existing == null || selected.isEmpty() ? Map.of() : existing.perTableSeq(),
                     existing == null ? null : existing.sinkAcked(),
                     existing == null ? List.of() : existing.snapshotCompletedTables(),
                     existing == null ? null : existing.cdcStartPosition(),

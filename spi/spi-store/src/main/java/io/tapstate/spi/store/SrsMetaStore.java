@@ -491,7 +491,9 @@ public interface SrsMetaStore {
      * back for an acknowledgement that is never coming. A table acknowledgement survives only for a table that
      * stays selected in the same generation; any other one belongs to a reader that is gone, and its sequence
      * says nothing about the ring this generation writes. The read cursor and the ring completion are left as
-     * they are. A mutate on an unseeded chain is a caller ordering error.
+     * they are -- except for an empty selection: a pipeline that selects nothing has no place in any ring, and
+     * a cursor nothing advances any more would hold the chain's reader back, so both go with it. A mutate on an
+     * unseeded chain is a caller ordering error.
      */
     default void selectConsumerTables(String miningChainId, String pipelineId, List<String> tables, long epoch) {
         throw new UnsupportedOperationException("this store does not record consumer table selections");

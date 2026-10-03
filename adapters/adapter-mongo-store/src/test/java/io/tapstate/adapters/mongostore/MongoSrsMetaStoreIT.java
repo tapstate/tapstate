@@ -131,6 +131,24 @@ class MongoSrsMetaStoreIT {
         });
     }
 
+    /** A pipeline that selects nothing -- one reading the source directly -- keeps no place in any ring. */
+    @Test
+    void aPipelineSelectingNothingKeepsNoPlaceInAnyRing() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            store.advanceConsumerReadSeq(CHAIN, "pipe", "orders", 500);
+            store.startRingAfter(CHAIN, "pipe", "customers", 40);
+
+            store.selectConsumerTables(CHAIN, "pipe", List.of(), epoch);
+
+            ConsumerOffset after = store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow();
+            assertThat(after.selectedTables()).isEmpty();
+            assertThat(after.perTableSeq()).as("its read cursors").isEmpty();
+            assertThat(store.ringDoneThrough(CHAIN, "pipe")).as("where it was done in each ring").isEmpty();
+        });
+    }
+
     /** One consumer's acknowledged position, read as it stands durably; nothing for a consumer with none. */
     @Test
     void aConsumersAcknowledgedPositionIsReadDurably() {
