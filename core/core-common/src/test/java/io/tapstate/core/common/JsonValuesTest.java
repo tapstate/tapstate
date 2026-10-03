@@ -55,4 +55,33 @@ class JsonValuesTest {
         assertThatThrownBy(() -> JsonValues.encodedSize(Double.NaN, 100))
                 .isInstanceOf(IllegalArgumentException.class);
     }
+
+    @Test
+    void handlesEveryJsonScalarAndStringEscapeInNormalizationAndSizeMeasurement() {
+        String escaped = "\"\\\b\f\n\r\t\u0001é€";
+        Object value = new Object[] {null, false, 'x', new boolean[] {true, false}, escaped,
+                "\uD83D\uDE00", "\uD800"};
+
+        assertThat(JsonValues.normalize(value)).isEqualTo(java.util.Arrays.asList(
+                null, false, "x", List.of(true, false), escaped, "\uD83D\uDE00", "\uD800"));
+        String json = io.tapstate.core.common.JsonWriter.write(JsonValues.normalize(value));
+        assertThat(JsonValues.encodedSize(value, Long.MAX_VALUE))
+                .isEqualTo(json.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
+        assertThat(JsonValues.encodedSize(Map.of(), 0)).isEqualTo(1);
+        assertThat(JsonValues.encodedSize(List.of(), 0)).isEqualTo(1);
+        assertThat(JsonValues.encodedSize(new byte[0], 2)).isEqualTo(3);
+    }
+
+    @Test
+    void boundsMeasurementDepthAndPreservesSaturatedLongLimit() {
+        Object nested = "leaf";
+        for (int index = 0; index < 130; index++) {
+            nested = List.of(nested);
+        }
+        Object tooDeep = nested;
+        assertThatThrownBy(() -> JsonValues.encodedSize(tooDeep, Long.MAX_VALUE))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThat(JsonValues.encodedSize("x", Long.MAX_VALUE)).isEqualTo(3);
+        assertThat(JsonValues.encodedSize("x", 0)).isEqualTo(1);
+    }
 }

@@ -65,6 +65,22 @@ class PdkTargetPreviewRendererTest {
     }
 
     @Test
+    void unresolvedMongoTargetFallsBackToLogicalJson() {
+        PdkTargetPreviewRenderer renderer = new PdkTargetPreviewRenderer(id -> {
+            throw new io.tapstate.core.common.TapstateException(
+                    ConnectorError.CLASS_NOT_FOUND, Map.of("connector", id, "class", "missing"), null);
+        });
+        SourceResource target = new SourceResource(
+                "mongo_target", null, "mongodb", Map.of(), null, null, null, null);
+
+        PdkTargetPreviewRenderer.Result result = renderer.render(
+                target, List.of(Map.of("name", new ConvertedValue("orders", "string"))), () -> { });
+
+        assertThat(result.format()).isEqualTo(PdkTargetPreviewRenderer.LOGICAL_JSON);
+        assertThat(result.documents()).containsExactly(Map.of("name", "orders"));
+    }
+
+    @Test
     void logicalJsonNormalizesPortableValuesAndNestedContainers() {
         PdkTargetPreviewRenderer renderer = new PdkTargetPreviewRenderer(id -> {
             throw new AssertionError("logical rendering must not resolve a connector");

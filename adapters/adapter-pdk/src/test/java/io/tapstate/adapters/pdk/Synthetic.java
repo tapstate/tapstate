@@ -1654,4 +1654,29 @@ final class Synthetic {
                 + "}";
         return SyntheticJar.compileToJar(dir, "synthetic.ExactTupleQuery", source);
     }
+
+    static Path boundedQuerySource(Path dir, String mode) {
+        String query = switch (mode) {
+            case "throw" -> "throw new IllegalStateException(\"query failed\");";
+            case "null-result" -> "consumer.accept(null);";
+            case "empty-results" -> "io.tapdata.pdk.apis.entity.FilterResults r = "
+                    + "new io.tapdata.pdk.apis.entity.FilterResults(); consumer.accept(r);";
+            case "null-row" -> "java.util.List<java.util.Map<String,Object>> rows = new java.util.ArrayList<>(); "
+                    + "rows.add(null); io.tapdata.pdk.apis.entity.FilterResults r = "
+                    + "new io.tapdata.pdk.apis.entity.FilterResults(); r.setResults(rows); consumer.accept(r);";
+            case "null-field" -> "java.util.Map<String,Object> row = new java.util.LinkedHashMap<>(); "
+                    + "row.put(null, 1); io.tapdata.pdk.apis.entity.FilterResults r = "
+                    + "new io.tapdata.pdk.apis.entity.FilterResults(); r.setResults(java.util.List.of(row)); "
+                    + "consumer.accept(r);";
+            case "reported-error" -> "io.tapdata.pdk.apis.entity.FilterResults r = "
+                    + "new io.tapdata.pdk.apis.entity.FilterResults(); "
+                    + "r.setError(new IllegalStateException(\"reported query failure\")); consumer.accept(r);";
+            default -> throw new IllegalArgumentException("unsupported bounded query mode: " + mode);
+        };
+        String register = "functions.supportQueryByAdvanceFilter((context, filter, table, consumer) -> {"
+                + query + "});";
+        String className = "BoundedQuery" + mode.replace('-', '_');
+        return SyntheticJar.compileToJar(dir, "synthetic." + className,
+                source(className, "", register));
+    }
 }

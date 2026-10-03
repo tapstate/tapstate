@@ -46,4 +46,30 @@ class BoundedSnapshotQueryRequestTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("limit");
     }
+
+    @Test
+    void requestCopiesInputsAndRejectsInvalidBoundsOrDuplicateFieldNames() {
+        Map<String, Object> settings = new LinkedHashMap<>();
+        settings.put("batch", 10);
+        List<String> order = new java.util.ArrayList<>(List.of("id"));
+        BoundedSnapshotQueryRequest request = new BoundedSnapshotQueryRequest("source", "mysql", settings,
+                new TableSchema("orders", List.of(new FieldSchema("id", "int"))), order,
+                new BoundedSnapshotQueryRequest.AllRows(), List.of("id"), 1, Instant.now().plusSeconds(1));
+        settings.put("batch", 20);
+        order.add("changed");
+        assertThat(request.settings()).containsEntry("batch", 10);
+        assertThat(request.stableOrder()).containsExactly("id");
+
+        assertThatThrownBy(() -> new BoundedSnapshotQueryRequest(" ", "mysql", Map.of(), request.table(),
+                List.of(), request.selection(), List.of(), 1, Instant.now().plusSeconds(1)))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("sourceId");
+        assertThatThrownBy(() -> new BoundedSnapshotQueryRequest("source", "mysql", Map.of(), request.table(),
+                List.of("id", "id"), request.selection(), List.of(), 1, Instant.now().plusSeconds(1)))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("duplicate");
+        assertThatThrownBy(() -> new BoundedSnapshotQueryRequest("source", "mysql", Map.of(), request.table(),
+                List.of(), request.selection(), List.of(), 1, 0, Instant.now().plusSeconds(1)))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("maxBytes");
+        assertThatThrownBy(() -> new BoundedSnapshotQueryRequest.ExactTuples(List.of(Map.of())))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("at least one");
+    }
 }

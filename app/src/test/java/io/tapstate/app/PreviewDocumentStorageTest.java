@@ -6,11 +6,15 @@ import io.tapstate.core.event.ConvertedValue;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
+import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class PreviewDocumentStorageTest {
 
@@ -45,5 +49,43 @@ class PreviewDocumentStorageTest {
 
         assertThat(restored.get("path/with~tokens"))
                 .isEqualTo(new ConvertedValue("value", "declared-type"));
+    }
+
+    @Test
+    void restoresScalarAndBinaryCarrierTypesFromPrivateMetadata() {
+        Map<String, Object> document = new LinkedHashMap<>();
+        document.put("double", new ConvertedValue(1.25d, "DOUBLE"));
+        document.put("decimal", new ConvertedValue(new BigDecimal("1234567890.012300"), "DECIMAL"));
+        document.put("integer", new ConvertedValue(new BigInteger("12345678901234567890"), "BIGINT"));
+        document.put("int", new ConvertedValue(12, "INT"));
+        document.put("long", new ConvertedValue(13L, "LONG"));
+        document.put("short", new ConvertedValue((short) 14, "SHORT"));
+        document.put("byte", new ConvertedValue((byte) 15, "BYTE"));
+        document.put("float", new ConvertedValue(1.5f, "FLOAT"));
+        document.put("date", new ConvertedValue(new Date(1_700_000_000_000L), "DATE"));
+        document.put("byte_array", new ConvertedValue(new byte[] {1, 2}, "BINARY"));
+        document.put("boolean", new ConvertedValue(true, "BOOLEAN"));
+        document.put("character", new ConvertedValue('x', "CHAR"));
+
+        Map<String, Object> restored = PreviewDocumentStorage.decode(PreviewDocumentStorage.encode(document));
+
+        Map<String, Object> expected = new LinkedHashMap<>(document);
+        expected.remove("byte_array");
+        assertThat(restored).containsAllEntriesOf(expected);
+        assertThat(((ConvertedValue) restored.get("byte_array")).value()).isEqualTo(new byte[] {1, 2});
+    }
+
+    @Test
+    void rejectsMalformedStoredEnvelopesAndTypeMetadata() {
+        assertThatThrownBy(() -> PreviewDocumentStorage.decode("{}"))
+                .isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> PreviewDocumentStorage.decode("{\"document\":{},\"carriers\":[null]}"))
+                .isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> PreviewDocumentStorage.decode(
+                "{\"document\":{\"x\":1},\"carriers\":[{\"path\":\"/x\",\"kind\":\"mystery\"}]}"))
+                .isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> PreviewDocumentStorage.decode(
+                "{\"document\":{\"x\":1},\"carriers\":[{\"path\":\"/x\",\"kind\":\"integer\"}]}"))
+                .isInstanceOf(IllegalStateException.class);
     }
 }

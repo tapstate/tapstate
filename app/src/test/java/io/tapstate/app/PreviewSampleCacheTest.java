@@ -81,6 +81,40 @@ class PreviewSampleCacheTest {
         }
     }
 
+    @Test
+    void skipsUnrepeatableOrNonSnapshotRowsAndPrunesOrphanedIndexes() {
+        HazelcastProperties properties = new HazelcastProperties();
+        properties.setClusterName("preview-cache-prune-" + UUID.randomUUID());
+        properties.setMemberPort(0);
+        Config config = HazelcastConfiguration.memberConfig(properties);
+        config.getNetworkConfig().setPort(0).setPortAutoIncrement(false);
+        HazelcastInstance member = Hazelcast.newHazelcastInstance(config);
+        try {
+            PreviewSampleCache cache = new PreviewSampleCache(member);
+            BoundedSnapshotQueryRequest request = request();
+            Instant sampledAt = Instant.now();
+            BoundedSnapshotQueryResult unstable = new BoundedSnapshotQueryResult(
+                    List.of(Envelope.read(1, "source.orders", Map.of("id", 1), Map.of())),
+                    true, false, false, 1, sampledAt);
+            cache.put("principal", "pipeline", "unstable", "connector-v1", request, unstable);
+            BoundedSnapshotQueryResult changeEvent = new BoundedSnapshotQueryResult(
+                    List.of(Envelope.delete(1, "source.orders", Map.of("id", 2), Map.of())),
+                    true, false, true, 1, sampledAt);
+            cache.put("principal", "pipeline", "change-event", "connector-v1", request, changeEvent);
+            assertThat(cache.get("principal", "pipeline", "unstable", "connector-v1", request)).isNull();
+            assertThat(cache.get("principal", "pipeline", "change-event", "connector-v1", request)).isNull();
+
+            member.<String, Long>getMap(PreviewSampleCache.INDEX_MAP_NAME)
+                    .put("orphan", System.currentTimeMillis());
+            cache.put("principal", "pipeline", "stable", "connector-v1", request, result(3, sampledAt));
+            assertThat(member.<String, Long>getMap(PreviewSampleCache.INDEX_MAP_NAME).containsKey("orphan"))
+                    .isFalse();
+            assertThat(cache.get("missing", "pipeline", "stable", "connector-v1", request)).isNull();
+        } finally {
+            member.shutdown();
+        }
+    }
+
     private static BoundedSnapshotQueryRequest request() {
         return new BoundedSnapshotQueryRequest("source", "csv", Map.of(),
                 new TableSchema("orders", List.of(new FieldSchema("id", "integer"))),

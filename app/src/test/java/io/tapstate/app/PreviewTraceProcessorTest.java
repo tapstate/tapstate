@@ -116,6 +116,54 @@ class PreviewTraceProcessorTest {
         }
     }
 
+    @Test
+    void tracesDeleteRowsArraysAndBoundedIterableAndDepthPointers() throws Exception {
+        String mapName = "preview-trace-shapes-" + UUID.randomUUID();
+        HazelcastInstance member = member();
+        try {
+            Map<String, Object> deep = new LinkedHashMap<>();
+            Map<String, Object> cursor = deep;
+            for (int index = 0; index < 36; index++) {
+                Map<String, Object> child = new LinkedHashMap<>();
+                cursor.put("level", child);
+                cursor = child;
+            }
+            Map<String, Object> before = new LinkedHashMap<>();
+            before.put("array", new int[] {1, 2});
+            before.put("items", java.util.stream.IntStream.range(0, 12).boxed().toList());
+            before.put("deep", deep);
+            PreviewTraceProcessor processor = processor("delete", mapName);
+            var collectPointers = PreviewTraceProcessor.class.getDeclaredMethod(
+                    "collectPointers", Object.class, String.class, int.class);
+            collectPointers.setAccessible(true);
+            collectPointers.invoke(processor, Map.of(7, "ignored non-string pointer"), "/invalid", 0);
+            TestInbox inbox = new TestInbox();
+            inbox.add(Envelope.delete(18L, "orders", before, null).withRemoved(java.util.Set.of("stale")));
+            processor.process(0, inbox);
+            processor.close();
+
+            Map<String, String> rows = member.getMap(mapName);
+            Map<String, Object> sample = object(rows.get("sample:delete:00"));
+            assertThat(sample).containsKey("before").containsEntry("removed", List.of("stale"));
+            Map<String, Object> summary = object(rows.get("summary:delete"));
+            assertThat(summary).containsEntry("pointerPatternsComplete", false);
+            List<String> pointers = ((List<?>) summary.get("pointerPatterns"))
+                    .stream().map(String.class::cast).toList();
+            assertThat(pointers).contains("/array/*", "/items/*", "/deep/level");
+
+            PreviewTraceProcessor input = inputProcessor("input-delete", mapName, "source-a");
+            TestInbox inputInbox = new TestInbox();
+            inputInbox.add(Envelope.delete(19L, "orders", before, null));
+            input.process(0, inputInbox);
+            input.close();
+            assertThat(member.<String, String>getMap(mapName).keySet())
+                    .doesNotContain("sample:input-delete:00")
+                    .contains("summary:input-delete" + (char) 0 + "input" + (char) 0 + "source-a");
+        } finally {
+            member.shutdown();
+        }
+    }
+
     private static HazelcastInstance member() {
         Config config = new Config();
         config.setClusterName("preview-trace-test-" + UUID.randomUUID());

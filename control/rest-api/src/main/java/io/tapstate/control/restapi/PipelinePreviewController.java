@@ -48,6 +48,20 @@ class PipelinePreviewController {
             throw MalformedRequest.rejecting("preview request exceeds the 4 MiB limit", null);
         }
         byte[] bytes = readBounded(request.getInputStream(), MAX_REQUEST_BYTES);
+        PipelinePreviewCommand command = parse(decodeRequest(bytes, json));
+        PipelinePreviewSession stream = previews.open(AuthenticatedCaller.subject(), command);
+        StreamingResponseBody response = output -> {
+            try (stream) {
+                writeEvents(json, output, stream);
+            }
+        };
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CACHE_CONTROL, "no-store")
+                .contentType(MediaType.parseMediaType("application/x-ndjson"))
+                .body(response);
+    }
+
+    static Map<?, ?> decodeRequest(byte[] bytes, ObjectMapper json) {
         Object decoded;
         try {
             decoded = json.readValue(bytes, Object.class);
@@ -62,17 +76,7 @@ class PipelinePreviewController {
         } else {
             throw MalformedRequest.rejecting("preview request body must be a JSON object", null);
         }
-        PipelinePreviewCommand command = parse(body);
-        PipelinePreviewSession stream = previews.open(AuthenticatedCaller.subject(), command);
-        StreamingResponseBody response = output -> {
-            try (stream) {
-                writeEvents(output, stream);
-            }
-        };
-        return ResponseEntity.ok()
-                .header(HttpHeaders.CACHE_CONTROL, "no-store")
-                .contentType(MediaType.parseMediaType("application/x-ndjson"))
-                .body(response);
+        return body;
     }
 
     static byte[] readBounded(InputStream input, int maxBytes) throws IOException {
@@ -153,7 +157,7 @@ class PipelinePreviewController {
         }
     }
 
-    private void writeEvents(OutputStream output, PipelinePreviewSession stream) throws IOException {
+    static void writeEvents(ObjectMapper json, OutputStream output, PipelinePreviewSession stream) throws IOException {
         try {
             PipelinePreviewEvent event;
             while ((event = stream.next()) != null) {

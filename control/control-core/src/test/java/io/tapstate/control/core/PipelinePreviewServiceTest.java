@@ -149,6 +149,79 @@ class PipelinePreviewServiceTest {
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
+    @Test
+    void validatesCommandBoundsAndHandlesTerminalOrPrematureExecutionEvents() throws Exception {
+        Fixture fixture = fixture();
+        PipelinePreviewService service = new PipelinePreviewService(candidateCompiler(fixture.resources()),
+                request -> new io.tapstate.runtime.probe.PipelinePreviewStream() {
+                    private boolean sent;
+
+                    @Override
+                    public boolean sampleCacheHit() {
+                        return false;
+                    }
+
+                    @Override
+                    public io.tapstate.runtime.probe.PipelinePreviewEvent next() {
+                        if (sent) {
+                            return null;
+                        }
+                        sent = true;
+                        return new io.tapstate.runtime.probe.PipelinePreviewEvent(request.runId(),
+                                request.candidateHash(), 0, "run.failed", FIXED_CLOCK.instant(), Map.of());
+                    }
+
+                    @Override
+                    public void cancel() {
+                    }
+                }, FIXED_CLOCK);
+
+        assertThatThrownBy(() -> service.open("author", new PipelinePreviewCommand(
+                "pipeline", "view_out", 0, null, List.of(new ArtifactDraft("candidate", "content")))))
+                .isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> service.open("author", new PipelinePreviewCommand(
+                "pipeline", "view_out", 1, "x".repeat(129), List.of(new ArtifactDraft("candidate", "content")))))
+                .isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> PipelinePreviewService.requireDrafts(null)).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> PipelinePreviewService.requireDrafts(List.of())).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> PipelinePreviewService.requireDrafts(java.util.Arrays.asList((ArtifactDraft) null)))
+                .isInstanceOf(TapstateException.class);
+
+        PipelinePreviewSession session = service.open("author", new PipelinePreviewCommand(
+                "pipeline", "view_out", 1, null, List.of(new ArtifactDraft("candidate", "content"))));
+        assertThat(session.next().kind()).isEqualTo("run.accepted");
+        assertThat(session.next().kind()).isEqualTo("compile.completed");
+        assertThat(session.next().kind()).isEqualTo("run.failed");
+        assertThat(session.next()).isNull();
+    }
+
+    @Test
+    void rejectsAnExecutionStreamThatEndsWithoutItsTerminalEvent() throws Exception {
+        Fixture fixture = fixture();
+        PipelinePreviewService service = new PipelinePreviewService(candidateCompiler(fixture.resources()),
+                request -> new io.tapstate.runtime.probe.PipelinePreviewStream() {
+                    @Override
+                    public boolean sampleCacheHit() {
+                        return false;
+                    }
+
+                    @Override
+                    public io.tapstate.runtime.probe.PipelinePreviewEvent next() {
+                        return null;
+                    }
+
+                    @Override
+                    public void cancel() {
+                    }
+                }, FIXED_CLOCK);
+        PipelinePreviewSession session = service.open("author", new PipelinePreviewCommand(
+                "pipeline", "view_out", 1, null, List.of(new ArtifactDraft("candidate", "content"))));
+        session.next();
+        session.next();
+        assertThatThrownBy(session::next).isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("without a terminal event");
+    }
+
     private static Fixture fixture() {
         SourceResource source = new SourceResource("source", null, "test", Map.of(), SourceMode.CDC,
                 null, null, null);

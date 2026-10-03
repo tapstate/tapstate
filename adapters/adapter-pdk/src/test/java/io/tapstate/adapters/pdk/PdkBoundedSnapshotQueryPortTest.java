@@ -124,6 +124,32 @@ class PdkBoundedSnapshotQueryPortTest {
                 .isEqualTo(ConnectorError.DISCOVER_FAILED);
     }
 
+    @Test
+    void containsQueryCallbackFailuresAndAcceptsAnEmptyCallback(@TempDir Path dir) {
+        for (String mode : List.of("throw", "null-result", "reported-error", "null-row", "null-field")) {
+            Path jar = Synthetic.boundedQuerySource(dir.resolve(mode), mode);
+            ConnectorRef ref = new ConnectorRef(List.of(jar), "synthetic.BoundedQuery" + mode.replace('-', '_'),
+                    "2.0.8", null);
+            PdkBoundedSnapshotQueryPort port = new PdkBoundedSnapshotQueryPort(connectorId -> ref);
+            assertThatThrownBy(() -> port.query(new BoundedSnapshotQueryRequest(
+                    "source-1", "connector-1", Map.of(), new TableSchema("t1", List.of()), List.of(),
+                    new AllRows(), List.of(), 1, Instant.now().plusSeconds(5))))
+                    .isInstanceOf(TapstateException.class)
+                    .extracting(failure -> ((TapstateException) failure).code())
+                    .isEqualTo(ConnectorError.READ_FAILED);
+        }
+
+        Path jar = Synthetic.boundedQuerySource(dir.resolve("empty-results"), "empty-results");
+        ConnectorRef ref = new ConnectorRef(List.of(jar), "synthetic.BoundedQueryempty_results", "2.0.8", null);
+        BoundedSnapshotQueryResult empty = new PdkBoundedSnapshotQueryPort(connectorId -> ref).query(
+                new BoundedSnapshotQueryRequest("source-1", "connector-1", Map.of(),
+                        new TableSchema("t1", List.of()), List.of(), new AllRows(), List.of(), 1,
+                        Instant.now().plusSeconds(5)));
+        assertThat(empty.rows()).isEmpty();
+        assertThat(empty.complete()).isTrue();
+        assertThat(empty.queryCount()).isEqualTo(1);
+    }
+
     private static PdkBoundedSnapshotQueryPort port(Path jar) {
         ConnectorRef ref = new ConnectorRef(List.of(jar), "synthetic.ExactTupleQuery", "2.0.8", null);
         return new PdkBoundedSnapshotQueryPort(connectorId -> ref);

@@ -51,4 +51,20 @@ class EventJsonValuesTest {
         assertThatThrownBy(() -> EventJsonValues.encodedSize("value", -1))
                 .isInstanceOf(IllegalArgumentException.class);
     }
+
+    @Test
+    void measuresArraysAndScalarCarriersAndRejectsInvalidNestedKeys() {
+        Object value = new Object[] {new ConvertedValue('z', "char"), new char[] {'a', '\n'},
+                new Bytes((byte) 2, new byte[] {1, 2, 3}), Instant.parse("2026-02-01T00:00:00Z")};
+        Object normalized = EventJsonValues.normalize(value);
+        String json = io.tapstate.core.common.JsonWriter.write(normalized);
+        assertThat(EventJsonValues.encodedSize(value, Long.MAX_VALUE))
+                .isEqualTo(json.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
+        assertThat(EventJsonValues.encodedSize("large", 0)).isEqualTo(1);
+        assertThat(EventJsonValues.encodedSize(Map.of("x", "y"), 2)).isEqualTo(3);
+        assertThatThrownBy(() -> EventJsonValues.normalize(Map.of("outer", Map.of(2, "bad"))))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> EventJsonValues.encodedSize(new Object(), Long.MAX_VALUE))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
 }

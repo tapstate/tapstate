@@ -3,12 +3,20 @@ package io.tapstate.control.restapi;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.control.core.PipelinePreviewCommand;
 import io.tapstate.control.core.ArtifactDraft;
+import io.tapstate.control.core.PipelinePreviewEvent;
+import io.tapstate.control.core.PipelinePreviewSession;
+import tools.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayOutputStream;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -31,6 +39,22 @@ class PipelinePreviewControllerTest {
                 .isInstanceOf(TapstateException.class)
                 .extracting(failure -> ((TapstateException) failure).code().code())
                 .isEqualTo("control.malformed-request");
+    }
+
+    @Test
+    void decodesOnlyJsonObjectsAndWrapsMalformedOrNonObjectBodies() {
+        ObjectMapper json = new ObjectMapper();
+        Map<?, ?> decoded = PipelinePreviewController.decodeRequest(
+                "{\"pipelineId\":\"orders\"}".getBytes(java.nio.charset.StandardCharsets.UTF_8), json);
+        assertThat(decoded.get("pipelineId")).isEqualTo("orders");
+        assertThat(PipelinePreviewController.decodeRequest(
+                "null".getBytes(java.nio.charset.StandardCharsets.UTF_8), json)).isNull();
+        assertThatThrownBy(() -> PipelinePreviewController.decodeRequest(
+                "[]".getBytes(java.nio.charset.StandardCharsets.UTF_8), json))
+                .isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> PipelinePreviewController.decodeRequest(
+                "{".getBytes(java.nio.charset.StandardCharsets.UTF_8), json))
+                .isInstanceOf(TapstateException.class);
     }
 
     @Test
@@ -68,5 +92,74 @@ class PipelinePreviewControllerTest {
                 List.of("bad")))).isInstanceOf(TapstateException.class);
         assertThatThrownBy(() -> PipelinePreviewController.parse(Map.of("pipelineId", "orders", "drafts",
                 List.of(Map.of("content", "ok", "unexpected", true))))).isInstanceOf(TapstateException.class);
+    }
+
+    @Test
+    void streamsUntilTerminalEventAndCancelsOnDisconnectOrInterrupt() throws IOException {
+        ObjectMapper json = new ObjectMapper();
+        PipelinePreviewEvent progress = event("sample.completed");
+        PipelinePreviewEvent terminal = event("run.completed");
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        TestSession complete = new TestSession(progress, terminal, event("ignored"));
+        PipelinePreviewController.writeEvents(json, output, complete);
+        assertThat(output.toString(java.nio.charset.StandardCharsets.UTF_8).split("\\n"))
+                .hasSize(2).anyMatch(line -> line.contains("sample.completed"))
+                .anyMatch(line -> line.contains("run.completed"));
+        assertThat(complete.cancelled).isFalse();
+
+        TestSession disconnected = new TestSession(progress);
+        assertThatThrownBy(() -> PipelinePreviewController.writeEvents(json, new OutputStream() {
+            @Override
+            public void write(int value) {
+                // Accept serialized bytes so the disconnect occurs at the streaming flush boundary.
+            }
+
+            @Override
+            public void flush() throws IOException {
+                throw new IOException("client disconnected");
+            }
+        }, disconnected)).isInstanceOf(IOException.class);
+        assertThat(disconnected.cancelled.get()).isTrue();
+
+        TestSession interrupted = new TestSession();
+        interrupted.interruptNext = true;
+        assertThatThrownBy(() -> PipelinePreviewController.writeEvents(json, new ByteArrayOutputStream(), interrupted))
+                .isInstanceOf(IOException.class).hasMessageContaining("interrupted");
+        assertThat(interrupted.cancelled.get()).isTrue();
+        Thread.interrupted();
+    }
+
+    private static PipelinePreviewEvent event(String kind) {
+        return new PipelinePreviewEvent("run", "candidate", 0, kind, Instant.parse("2026-10-04T00:00:00Z"),
+                Map.of("ok", true));
+    }
+
+    private static final class TestSession implements PipelinePreviewSession {
+        private final ArrayDeque<PipelinePreviewEvent> events = new ArrayDeque<>();
+        private final AtomicBoolean cancelled = new AtomicBoolean();
+        private boolean interruptNext;
+
+        private TestSession(PipelinePreviewEvent... events) {
+            this.events.addAll(List.of(events));
+        }
+
+        @Override
+        public PipelinePreviewEvent next() throws InterruptedException {
+            if (interruptNext) {
+                interruptNext = false;
+                throw new InterruptedException("test interruption");
+            }
+            return events.poll();
+        }
+
+        @Override
+        public boolean sampleCacheHit() {
+            return false;
+        }
+
+        @Override
+        public void cancel() {
+            cancelled.set(true);
+        }
     }
 }
