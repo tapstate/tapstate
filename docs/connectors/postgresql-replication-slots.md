@@ -19,7 +19,10 @@ holds it back, and when it drops it.
   not landed yet holds the slot before it, however far other pipelines reading other tables have got -
   so a restart is always sent every change that has not landed somewhere.
 - **A quiet source still moves on.** When the tables you capture stop changing but the database keeps
-  writing elsewhere, the slot follows the head of the log rather than staying at the last change.
+  writing elsewhere, the slot follows the head of the log rather than staying at the last change. A
+  pipeline that reads the source directly (`srs.enabled: false`) moves its own slot past each change it
+  lands, but follows the head of the log through quiet periods only while no other pipeline reads the
+  same source.
 - **Expect it within about half a minute.** Tapstate reads the confirmed position every few seconds, hands
   it to the connector at most every few seconds, and PostgreSQL shows it once the reader next reports back.
   `pg_stat_replication.flush_lag` stays in seconds while pipelines keep up.
