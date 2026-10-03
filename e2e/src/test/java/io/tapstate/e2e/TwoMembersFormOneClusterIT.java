@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.tapstate.testsupport.DockerGate;
 import java.util.List;
+import java.util.UUID;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -36,7 +37,7 @@ class TwoMembersFormOneClusterIT {
 
     @Test
     void twoProcessesFindEachOtherAndBothAnswerTheSameMembership() {
-        String store = SharedMongo.replicaSetUrl("e2e_two_members");
+        String store = SharedMongo.replicaSetUrl("e2e_cluster_membership_" + UUID.randomUUID());
 
         try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-two-members")) {
             List<String> asAsees = cluster.awaitBothMembers();
