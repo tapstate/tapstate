@@ -64,7 +64,11 @@ class PipelinePreviewController {
         }
         PipelinePreviewCommand command = parse(body);
         PipelinePreviewSession stream = previews.open(AuthenticatedCaller.subject(), command);
-        StreamingResponseBody response = output -> writeEvents(output, stream);
+        StreamingResponseBody response = output -> {
+            try (stream) {
+                writeEvents(output, stream);
+            }
+        };
         return ResponseEntity.ok()
                 .header(HttpHeaders.CACHE_CONTROL, "no-store")
                 .contentType(MediaType.parseMediaType("application/x-ndjson"))
@@ -150,7 +154,7 @@ class PipelinePreviewController {
     }
 
     private void writeEvents(OutputStream output, PipelinePreviewSession stream) throws IOException {
-        try (stream) {
+        try {
             PipelinePreviewEvent event;
             while ((event = stream.next()) != null) {
                 json.writeValue(output, event);
