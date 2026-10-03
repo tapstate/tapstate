@@ -435,8 +435,9 @@ public final class CaptureRunUnit {
         MiningChainId other = spec.srsEnabled()
                 ? MiningChainId.forChannel(spec.config(), spec.srsKey(), spec.pipelineId(), spec.sourceId())
                 : MiningChainId.resolve(spec.config(), spec.srsKey());
-        boolean switched = meta.read(other.value()).flatMap(record -> record.consumerOffset(spec.consumerId()))
-                .map(CaptureRunUnit::hasRecoveryState).orElse(false);
+        boolean switched = meta.read(other.value()).map(record -> record.consumerOffsets().stream()
+                .anyMatch(offset -> (offset.pipelineId().equals(spec.consumerId())
+                        || offset.pipelineId().equals(spec.pipelineId())) && hasRecoveryState(offset))).orElse(false);
         boolean unsafeCheckpoint = plan.sharedRing() && retained.filter(record ->
                 record.sourceRead() != null && !record.sourceReadDurable()).isPresent();
         SharedTail localTail = sharedTails.get(chain.value());

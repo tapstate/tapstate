@@ -1031,6 +1031,62 @@ class MongoSrsMetaStoreIT {
     }
 
     @Test
+    void wideningATableSelectionKeepsConfirmedTablesAndLeavesTheAddedTableUnconfirmed() {
+        withCollection((store, collection) -> {
+            String consumer = SrsConsumerId.of("pipeline", "source").value();
+            store.create(CHAIN, null);
+            store.configureSinkWriters(CHAIN, consumer,
+                    Map.of("alpha", List.of("sink"), "beta", List.of("sink")), ConsumerProgressKind.SRS);
+            ChainPosition snapshot = new ChainPosition(new SourceOrder(1, SourceOrder.SNAPSHOT_SEQ), "seam");
+            for (String table : List.of("alpha", "beta")) {
+                store.advanceSinkWriterAcked(CHAIN, consumer, "sink", table, snapshot);
+                store.markSinkWriterSnapshotComplete(CHAIN, consumer, "sink", table);
+            }
+            store.startRingAfter(CHAIN, consumer, "gamma", 40);
+
+            store.configureSinkWriters(CHAIN, consumer,
+                    Map.of("alpha", List.of("sink"), "beta", List.of("sink"), "gamma", List.of("sink")),
+                    ConsumerProgressKind.SRS);
+
+            ConsumerOffset offset = store.read(CHAIN).orElseThrow().consumerOffset(consumer).orElseThrow();
+            assertThat(offset.snapshotCompletedTables()).containsExactlyInAnyOrder("alpha", "beta");
+            assertThat(offset.sinkAckedByTable()).containsExactlyInAnyOrderEntriesOf(
+                    Map.of("alpha", snapshot, "beta", snapshot));
+            assertThat(store.ringDoneThrough(CHAIN, consumer)).containsEntry("gamma", 40L);
+            Document gamma = collection.find(new Document("miningChainId", CHAIN).append("pipelineId", consumer))
+                    .first().get("sinkWriterProgress", Document.class)
+                    .get("sink", Document.class).get("gamma", Document.class);
+            assertThat(gamma).containsEntry("ringDone", 40L)
+                    .doesNotContainKeys("sinkAckedEpoch", "sinkAckedSeq", "snapshotComplete");
+            store.markSinkWriterSnapshotComplete(CHAIN, consumer, "sink", "gamma");
+            assertThat(store.read(CHAIN).orElseThrow().snapshotCompletedTables(consumer))
+                    .containsExactlyInAnyOrder("alpha", "beta", "gamma");
+        });
+    }
+
+    @Test
+    void aWriterPlanDoesNotTreatLegacyReadingOrItsSeamAsConfirmedSourceNodeProgress() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.advanceConsumerReadSeq(CHAIN, "pipeline", "orders", 7);
+            store.setCdcStart(CHAIN, "pipeline", "old-seam", 1);
+            ConsumerOffset legacy = store.read(CHAIN).orElseThrow().consumerOffset("pipeline").orElseThrow();
+            String consumer = SrsConsumerId.of("pipeline", "source").value();
+
+            store.configureSinkWriters(CHAIN, consumer, Map.of("orders", List.of("sink")), ConsumerProgressKind.SRS);
+
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("pipeline")).contains(legacy);
+            ConsumerOffset configured = store.read(CHAIN).orElseThrow().consumerOffset(consumer).orElseThrow();
+            assertThat(configured.perTableSeq()).isEmpty();
+            assertThat(configured.sinkAcked()).isNull();
+            assertThat(configured.sinkAckedByTable()).isEmpty();
+            assertThat(configured.cdcStartPosition()).isNull();
+            assertThat(configured.snapshotCompletedTables()).isEmpty();
+            assertThat(store.ringDoneThrough(CHAIN, consumer)).isEmpty();
+        });
+    }
+
+    @Test
     void partialWriterConfirmationCannotSeedANewWriterBeforeTheAggregateExists() {
         withStore(store -> {
             store.create(CHAIN, null);

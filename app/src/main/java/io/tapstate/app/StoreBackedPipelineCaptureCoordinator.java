@@ -1047,8 +1047,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         if (capturesStopped) {
             snapshotBuffer.release(pipelineId);
         }
-        // Source nodes on one physical chain hold separate memberships. Release every node once, then
-        // decide whether the shared record can be removed after the final membership leaves.
+        // A whole-pipeline stop releases all of its source and legacy memberships atomically, then
+        // decides whether the shared record can be removed after the final membership leaves.
         for (Map.Entry<MiningChainId, Set<String>> entry : consumersByChain.entrySet()) {
             MiningChainId chainId = entry.getKey();
             // Whether this pipeline was the last one on the chain, which decides how much of the chain's
@@ -1056,15 +1056,13 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             // it: a consumer attaching in between would make a second reading stale, and the two answers
             // would then disagree about a record one of them is about to delete.
             boolean chainClosed = false;
-            for (String consumerId : entry.getValue()) {
-                try {
-                    chainClosed = srsCoordinator.releaseConsumer(chainId, consumerId) || chainClosed;
-                } catch (RuntimeException failure) {
-                    if (firstFailure == null) {
-                        firstFailure = failure;
-                    } else {
-                        firstFailure.addSuppressed(failure);
-                    }
+            try {
+                chainClosed = srsCoordinator.releasePipelineConsumers(chainId, pipelineId);
+            } catch (RuntimeException failure) {
+                if (firstFailure == null) {
+                    firstFailure = failure;
+                } else {
+                    firstFailure.addSuppressed(failure);
                 }
             }
             if (!purgeState) {

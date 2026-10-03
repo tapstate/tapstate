@@ -2154,6 +2154,29 @@ class CaptureRunUnitTest {
         }
     }
 
+    @Test
+    void anIndependentChannelRefusesLegacyProgressStillStoredUnderTheSharedChain() {
+        for (ReadMode mode : List.of(ReadMode.SNAPSHOT_AND_CDC, ReadMode.CDC_ONLY)) {
+            InMemoryMeta meta = new InMemoryMeta();
+            CaptureRunSpec direct = spec(mode, false, "legacy-shared-" + mode.name(), StartFrom.latest())
+                    .withConsumerId(SrsConsumerId.of("pipe-1", "src-1").value());
+            String shared = MiningChainId.resolve(direct.config(), direct.srsKey()).value();
+            meta.create(shared, null);
+            meta.advanceConsumerReadSeq(shared, direct.pipelineId(), "orders", 7);
+            meta.setCdcStart(shared, direct.pipelineId(), "legacy-seam", 1);
+            SrsMeta retained = meta.read(shared).orElseThrow();
+            FakeSource source = new FakeSource(List.of(), List.of());
+
+            TapstateException failure = catchThrowableOfType(
+                    () -> runUnit(source, meta).start(direct, event -> { }), TapstateException.class);
+
+            assertThat(failure.code()).isEqualTo(CaptureError.RECOVERY_PROGRESS_UNPROVEN);
+            assertThat(source.cdcStarted).isFalse();
+            assertThat(meta.read(shared)).contains(retained);
+            assertThat(meta.read(direct.miningChainId().value())).isEmpty();
+        }
+    }
+
     /**
      * The control on the case above: an instant this buffer will still cover is taken, not refused. Mining
      * begins now, so a moment at or after that is reachable by waiting rather than unreachable, and an

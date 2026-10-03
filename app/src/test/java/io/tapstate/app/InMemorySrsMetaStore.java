@@ -449,9 +449,8 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         String owningPipeline = SrsConsumerId.pipelineOf(pipelineId);
         ConsumerOffset legacy = SrsConsumerId.sourceOf(pipelineId).isPresent()
                 ? meta.consumerOffset(owningPipeline).orElse(null) : null;
-        if (legacy != null && (legacy.sinkAcked() != null || legacy.cdcStartPosition() != null
-                || !legacy.snapshotCompletedTables().isEmpty()
-                || legacy.perTableSeq().values().stream().anyMatch(sequence -> sequence >= 0))) {
+        if (legacy != null && (legacy.sinkAcked() != null || !legacy.sinkAckedByTable().isEmpty()
+                || !legacy.snapshotCompletedTables().isEmpty())) {
             long writerCount = writerIdsByTable.values().stream().flatMap(List::stream).distinct().count();
             if (writerCount > 1) {
                 throw new TapstateException(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS,

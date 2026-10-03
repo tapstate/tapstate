@@ -2467,16 +2467,23 @@ final class StoreBackedDagSource implements DagSource {
             return false;
         }
         return sourceVertices(pipeline).values().stream().noneMatch(vertex ->
-                storePort.meta().read(vertex.resolution().chainId().value())
-                        .map(meta -> meta.consumerOffsets().stream().anyMatch(
-                                consumer -> (consumer.pipelineId().equals(vertex.consumerId())
-                                                || consumer.pipelineId().equals(pipeline.id()))
-                                        && (!consumer.perTableSeq().isEmpty()
-                                                || consumer.sinkAcked() != null
-                                                || !consumer.sinkAckedByTable().isEmpty()
-                                                || !consumer.snapshotCompletedTables().isEmpty()
-                                                || consumer.cdcStartPosition() != null)))
-                        .orElse(false));
+                List.of(vertex.resolution().chainId().value(),
+                                vertex.resolution().scopedTo(pipeline.id(), true).chainId().value())
+                        .stream().distinct().anyMatch(chain -> hasRetainedConsumerProgress(vertex, chain)));
+    }
+
+    /** Legacy direct captures used the shared chain; their state must also suppress target clearing. */
+    private boolean hasRetainedConsumerProgress(SourceVertex vertex, String chain) {
+        return storePort.meta().read(chain)
+                .map(meta -> meta.consumerOffsets().stream().anyMatch(
+                        consumer -> (consumer.pipelineId().equals(vertex.consumerId())
+                                        || consumer.pipelineId().equals(vertex.pipelineId()))
+                                && (!consumer.perTableSeq().isEmpty()
+                                        || consumer.sinkAcked() != null
+                                        || !consumer.sinkAckedByTable().isEmpty()
+                                        || !consumer.snapshotCompletedTables().isEmpty()
+                                        || consumer.cdcStartPosition() != null)))
+                .orElse(false);
     }
 
     /**

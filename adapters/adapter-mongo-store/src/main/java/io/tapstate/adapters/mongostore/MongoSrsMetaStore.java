@@ -588,13 +588,12 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         if (legacy == null) {
             return;
         }
+        Document progress = nestedDocument(legacy, SINK_WRITER_PROGRESS, pipeline, false);
+        // Read cursors and a snapshot seam do not prove any downstream effect. Capture admission
+        // validates their recovery meaning; a writer plan must not turn them into confirmed progress.
         boolean retained = sinkAckedFrom(legacy) != null || !snapshotCompletedFrom(legacy).isEmpty()
-                || legacy.getString("cdcStartPosition") != null;
-        if (!retained) {
-            Document read = nestedDocument(legacy, "perTableSeq", pipeline, false);
-            retained = read != null && read.values().stream()
-                    .anyMatch(value -> value instanceof Number sequence && sequence.longValue() >= 0);
-        }
+                || !confirmedByTable(legacy, pipeline).isEmpty()
+                || progress != null && hasWriterConfirmation(progress, pipeline);
         if (!retained) {
             return;
         }
@@ -824,8 +823,12 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         }
         if (priorPlan != null && hasAggregateProgress) {
             for (Map.Entry<String, List<String>> entry : normalizedPlan.entrySet()) {
-                List<String> previous = writerIds(priorPlan.get(entry.getKey()), pipelineId, entry.getKey());
-                if (!previous.containsAll(entry.getValue())) {
+                String table = entry.getKey();
+                List<String> previous = writerIds(priorPlan.get(table), pipelineId, table);
+                boolean established = priorPlan.containsKey(table) || tableAcks.containsKey(table)
+                        || completed.contains(table) || hasWriterConfirmation(progress, pipelineId, table);
+                // A newly selected table has no effects to inherit from the old table selection.
+                if (established && !previous.containsAll(entry.getValue())) {
                     throw new TapstateException(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS,
                             Map.of("pipeline", pipelineId), null);
                 }
@@ -858,12 +861,19 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     private static boolean hasWriterConfirmation(Document progress, String consumerId) {
+        return hasWriterConfirmation(progress, consumerId, null);
+    }
+
+    private static boolean hasWriterConfirmation(Document progress, String consumerId, String selectedTable) {
         for (String writerId : progress.keySet()) {
             Document tables = nestedDocument(progress, writerId, consumerId, false);
             if (tables == null) {
                 throw unreadableConsumer(consumerId, SINK_WRITER_PROGRESS);
             }
             for (String table : tables.keySet()) {
+                if (selectedTable != null && !selectedTable.equals(table)) {
+                    continue;
+                }
                 Document writer = nestedDocument(tables, table, consumerId, false);
                 if (writer == null) {
                     throw unreadableConsumer(consumerId, SINK_WRITER_PROGRESS);
