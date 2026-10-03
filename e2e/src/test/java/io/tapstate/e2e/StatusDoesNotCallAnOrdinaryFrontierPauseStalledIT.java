@@ -3,11 +3,17 @@ package io.tapstate.e2e;
 import com.mongodb.ConnectionString;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
+import io.tapstate.adapters.mongostore.MongoArtifactStore;
 import io.tapstate.adapters.mongostore.MongoObservationStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.adapters.mongostore.SystemCollections;
+import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.model.canonical.CanonicalHash;
+import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.testsupport.DockerGate;
+import org.bson.Document;
 
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -22,7 +28,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>The observation is the exact shape reported by the first-run path: a live pipeline that has moved
  * eleven records, with two chains sampled as pinned for 9 ms and 196 ms. It is stored through the
- * production observation adapter, then read through a running server and a separate CLI process. The
+ * production observation adapter under a canonical pre-identity pipeline resource, then read through a
+ * running server and a separate CLI process. This upgrade read does not claim a current execution. The
  * publisher is deliberately outside this case: measuring the pinned duration is already its own contract;
  * this case is about the classification applied after that measurement reaches the observation face.
  *
@@ -73,6 +80,22 @@ class StatusDoesNotCallAnOrdinaryFrontierPauseStalledIT {
             throw new AssertionError("the store URL names no database: " + storeUri);
         }
         try (MongoClient client = MongoClients.create(connection)) {
+            // A pre-identity resource owns this legacy read; creating a new artifact would assign an incarnation.
+            var pipeline = new DslParser().parse(Workspaces.pipelineYaml(
+                    PIPELINE, "ordinary_orders_source", "ordinary_orders_target", "orders"));
+            var artifactsCollection = SystemCollections.ARTIFACTS.on(client.getDatabase(database));
+            artifactsCollection.insertOne(new Document("_id", pipeline.id())
+                    .append("kind", pipeline.kind())
+                    .append("body", new Document(new CanonicalWriter().tree(pipeline)))
+                    .append("contentHash", CanonicalHash.of(pipeline)));
+            var artifacts = new MongoArtifactStore(client, artifactsCollection);
+            assertThat(artifacts.get(PIPELINE)).as("the canonical upgrade-era pipeline binds through the production reader")
+                    .get().satisfies(stored -> {
+                        assertThat(new CanonicalWriter().tree(stored)).isEqualTo(new CanonicalWriter().tree(pipeline));
+                        assertThat(CanonicalHash.of(stored)).isEqualTo(CanonicalHash.of(pipeline));
+                    });
+            assertThat(artifacts.pipelineIncarnationId(PIPELINE))
+                    .as("this legacy resource has not been assigned a system incarnation").isEmpty();
             MongoObservationStore observations = new MongoObservationStore(client.getDatabase(database)
                     .getCollection(MongoStorePort.PIPELINE_OBSERVATION));
             observations.save(new Observation(
@@ -86,6 +109,8 @@ class StatusDoesNotCallAnOrdinaryFrontierPauseStalledIT {
                     Map.of(),
                     null,
                     Instant.now()));
+            assertThat(observations.readStored(PIPELINE).orElseThrow().scope())
+                    .as("the existing projection input is a legacy observation").isEmpty();
         }
     }
 }
