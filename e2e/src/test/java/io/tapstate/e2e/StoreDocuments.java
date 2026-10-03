@@ -4,12 +4,20 @@ import com.mongodb.ConnectionString;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
+import io.tapstate.adapters.mongostore.MongoObservationStore;
 import io.tapstate.adapters.mongostore.MongoRateHistoryStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.WorkloadClaimType;
 import org.bson.Document;
+import org.bson.types.Binary;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
+import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
@@ -54,6 +62,41 @@ final class StoreDocuments implements AutoCloseable {
     /** Whether {@code collection} holds a document under {@code id}. */
     boolean holds(String collection, String id) {
         return database.getCollection(collection).find(new Document("_id", id)).first() != null;
+    }
+
+    /** The readable logical latest, including a committed manifest's bounded payload. */
+    Optional<ObservationStore.Stored> observationOf(String pipelineId) {
+        return new MongoObservationStore(client, database.getCollection(MongoStorePort.PIPELINE_OBSERVATION),
+                database.getCollection(MongoStorePort.PIPELINE_OBSERVATION_CHUNKS)).readStored(pipelineId);
+    }
+
+    /** Whether the physical current descriptor names this exact executed scope. */
+    boolean holdsObservationCurrent(String pipelineId, ObservationStore.Scope scope) {
+        return database.getCollection(MongoStorePort.PIPELINE_OBSERVATION).find(
+                new Document("_id", observationManifestKey(pipelineId))
+                        .append("current.pipelineIncarnationId", scope.pipelineIncarnationId())
+                        .append("current.executionGeneration", scope.executionGeneration()))
+                .projection(new Document("_id", 1)).first() != null;
+    }
+
+    /** Whether a physical latest descriptor still references this incarnation. */
+    boolean holdsObservationIncarnation(String pipelineId, String incarnationId) {
+        List<Document> owners = List.of("current", "pending", "continuation.sourceScope", "continuation.target.scope",
+                "continuation.baselineOrigin.scope", "continuationPending.sourceScope",
+                "continuationPending.target.scope", "continuationPending.baselineOrigin.scope").stream()
+                .map(field -> new Document(field + ".pipelineIncarnationId", incarnationId)).toList();
+        return database.getCollection(MongoStorePort.PIPELINE_OBSERVATION).find(
+                new Document("_id", observationManifestKey(pipelineId)).append("$or", owners))
+                .projection(new Document("_id", 1)).first() != null;
+    }
+
+    /** The binary key is SHA-256 of the exact UTF-8 pipeline id. */
+    private static Binary observationManifestKey(String pipelineId) {
+        try {
+            return new Binary(MessageDigest.getInstance("SHA-256").digest(pipelineId.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new AssertionError("the JDK has no SHA-256 implementation", impossible);
+        }
     }
 
     /**

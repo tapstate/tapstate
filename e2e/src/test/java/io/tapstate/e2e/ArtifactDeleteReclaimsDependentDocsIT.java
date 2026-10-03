@@ -1,6 +1,7 @@
 package io.tapstate.e2e;
 
 import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.DockerGate;
 
 import org.junit.jupiter.api.BeforeAll;
@@ -61,15 +62,31 @@ class ArtifactDeleteReclaimsDependentDocsIT {
                     "the bookkeeping of " + pipelineId + " to exist",
                     () -> documents.holds(MongoStorePort.PIPELINE_DESIRED, pipelineId)
                             && documents.holds(MongoStorePort.PIPELINE_STATE, pipelineId)
-                            && documents.holds(MongoStorePort.PIPELINE_OBSERVATION, pipelineId),
+                            && documents.observationOf(pipelineId).filter(saved ->
+                                    pipelineId.equals(saved.observation().pipelineId())
+                                            && saved.observation().state() == PipelineState.RUNNING
+                                            && saved.scope().filter(scope ->
+                                                    documents.holdsObservationCurrent(pipelineId, scope)).isPresent())
+                                    .isPresent(),
                     () -> "desired=" + documents.holds(MongoStorePort.PIPELINE_DESIRED, pipelineId)
                             + " state=" + documents.holds(MongoStorePort.PIPELINE_STATE, pipelineId)
-                            + " observation=" + documents.holds(MongoStorePort.PIPELINE_OBSERVATION, pipelineId));
+                            + " observation=" + documents.observationOf(pipelineId)
+                                    .map(saved -> saved.observation().state() + "/" + saved.scope()));
+            var observed = documents.observationOf(pipelineId).orElseThrow();
+            var scope = observed.scope().orElseThrow();
+            assertThat(observed.observation().pipelineId()).isEqualTo(pipelineId);
+            assertThat(observed.observation().state()).isEqualTo(PipelineState.RUNNING);
+            assertThat(documents.holdsObservationCurrent(pipelineId, scope))
+                    .as("the real readable observation has a matching physical current descriptor").isTrue();
             assertThat(documents.ids(MongoStorePort.PIPELINE_DESIRED))
                     .as("the set a converger reconciles from, before the removal")
                     .contains(pipelineId);
 
             running.stopAndSettle();
+            var stopped = documents.observationOf(pipelineId).orElseThrow();
+            assertThat(stopped.observation().state()).isEqualTo(PipelineState.STOPPED);
+            assertThat(stopped.scope()).as("STOP retains the observation's factual cleanup scope").contains(scope);
+            assertThat(documents.holdsObservationCurrent(pipelineId, scope)).isTrue();
             control.deleteArtifact(pipelineId, control.contentHash(pipelineId));
 
             assertThat(control.artifact(pipelineId))
@@ -83,11 +100,22 @@ class ArtifactDeleteReclaimsDependentDocsIT {
                     .as("the checkpoint document")
                     .isFalse();
             assertThat(documents.holds(MongoStorePort.PIPELINE_OBSERVATION, pipelineId))
-                    .as("the observation document")
+                    .as("the legacy observation residue")
                     .isFalse();
             assertThat(documents.ids(MongoStorePort.PIPELINE_DESIRED))
                     .as("the reconciliation set no longer names it, which is the reclaim's whole purpose")
                     .doesNotContain(pipelineId);
+            // Telemetry cleanup is asynchronous and removes only the deleted incarnation's descriptors.
+            Await.until(
+                    "the deleted observation incarnation to leave latest storage",
+                    () -> documents.observationOf(pipelineId).isEmpty()
+                            && !documents.holdsObservationIncarnation(pipelineId, scope.pipelineIncarnationId()),
+                    () -> "observation=" + documents.observationOf(pipelineId)
+                            + " old incarnation retained=" + documents.holdsObservationIncarnation(
+                                    pipelineId, scope.pipelineIncarnationId()));
+            assertThat(documents.observationOf(pipelineId)).as("the logical latest observation").isEmpty();
+            assertThat(documents.holdsObservationIncarnation(pipelineId, scope.pipelineIncarnationId()))
+                    .as("the deleted incarnation's physical current, pending and continuation descriptors").isFalse();
             // The visible half. Read as a refusal rather than an absence on purpose: the product answers
             // its own "no such pipeline" code here, which is a different statement from "applied, nothing
             // published yet" - and a case that accepted either would pass while the status face served the
