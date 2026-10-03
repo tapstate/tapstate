@@ -16,27 +16,31 @@ import java.util.stream.Stream;
 
 import static java.util.Map.entry;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Counts the sleeps in this module's own sources and holds the count to an exact, named allowlist.
  *
- * <p>A fixed-duration sleep is the wrong tool everywhere in an end-to-end harness: long enough to be
+ * <p>A fixed-duration sleep is the wrong tool for waiting on an end-to-end outcome: long enough to be
  * reliable, it wastes that long on every green run, and it is never quite reliable anyway. Nearly every
  * sanctioned use is a poll interval inside a condition loop - the executor's bounded await, the server
  * launcher's bounded readiness wait, the synthetic connector's change-stream tail, and one bounded read
  * of its own target per witness class - where the loop's condition, not the sleep, decides what happens
- * next. Everything else is a settle: a guess about how long some unobservable thing takes, checked by
- * nothing. One such guess already shipped here and papered over a real product gap for weeks.
+ * next. An outcome wait without an observable condition is a settle: a guess about how long some
+ * unobservable thing takes, checked by nothing. One such guess already shipped here and papered over
+ * a real product gap for weeks.
  *
  * <p>The allowlist names each sanctioned call site exactly. A new sleep anywhere in this module -
  * including one more in an allowlisted file - fails this gate and must either become a bounded wait
  * on an observable condition, or argue its way onto the allowlist in review, visibly.
  *
- * <p>One entry is admitted knowingly and is not a poll interval: the throttle witness spaces its quiet
- * phase's changes apart by a fixed gap, to produce the input the case is about rather than to wait for
- * an outcome. The gate counts per file and that file's three call sites share one helper, so admitting
- * the two polls admits the gap with them. It is named here rather than left to look like a poll: a
- * stimulus whose duration has to exceed a collection window is still a duration nothing checks.
+ * <p>Controlled source-input schedules are admitted explicitly as stimulus, not readiness waits. The
+ * throttle witness spaces quiet-phase changes apart; the benchmark fixture uses each frozen phase's
+ * source-batch interval; the sidecar preflight emits all twenty caller-selected writes at a 250 ms
+ * cadence on every fork. Readiness follows from separate observed target or listener conditions, never
+ * from the time spent pacing. The throttle's two polls and stimulus share one helper, while the
+ * benchmark fixture has separate pacing and target-poll calls; the exact per-file count includes both.
+ * Naming a schedule does not authorize a settle or an additional sleep in that file.
  *
  * <p>This scan found a sleep the day it was written that a plain text search over the same tree had
  * just missed, so the two are not interchangeable: the gate reads every source itself.
@@ -67,7 +71,7 @@ class FixedSleepGateTest {
      * {@code other/E2eExecutor.java} would satisfy the entry the moment the sanctioned one stopped
      * needing it, and the gate would be green over a sleep nobody allowed.
      */
-    private static final Map<String, Long> POLL_PRIMITIVES = Map.ofEntries(
+    private static final Map<String, Long> NAMED_SLEEP_PRIMITIVES = Map.ofEntries(
             // The harness's own four: the specification runner's bounded await, the direct-drive await
             // every bespoke witness shares, the launcher's readiness wait, the synthetic connector's tail.
             entry("test/java/io/tapstate/e2e/Await.java", 1L),
@@ -78,6 +82,22 @@ class FixedSleepGateTest {
             // have a 60-second deadline. Enablement uses the remaining query budget; LSN reads use
             // five-second query timeouts. Both waits observe readiness.
             entry("test/java/io/tapstate/e2e/SqlServerEndpoints.java", 2L),
+            // issuePhase preserves the frozen SQL batch cadence; awaitTargets polls the actual row
+            // count/checksum within TARGET_WAIT. Source pacing never qualifies target readiness.
+            entry("test/java/io/tapstate/e2e/BenchmarkForkEnvironment.java", 2L),
+            // awaitWarmup issues all twenty preflight changes at 250 ms cadence on every fork, then
+            // separately waits for the actual listener's warmupSeen condition within its deadline.
+            entry("test/java/io/tapstate/e2e/BenchmarkTerminalCapture.java", 1L),
+            // The child measurement barrier polls output.ready and child.isAlive for at most ten seconds.
+            entry("test/java/io/tapstate/e2e/BenchmarkProcessProbeTest.java", 1L),
+            // Five bounded polls: advancing/quiescent actual records.out, a post-boundary observedAt,
+            // measured marker ACK coverage, and final source-token ACK coverage. The quiet window
+            // rechecks actual counters; neither source pacing nor elapsed time proves delivery.
+            entry("test/java/io/tapstate/e2e/RealBenchmarkForkDriver.java", 5L),
+            // These named positive stages poll actual authority-bound native receipts plus a fresh
+            // scrape within WAIT and MAX_RECORDS; missing or undecoded evidence cannot qualify.
+            entry("test/java/io/tapstate/e2e/NativeTelemetryPositiveCalibrationIT.java", 1L),
+            entry("test/java/io/tapstate/e2e/NativeFailureAccountResetIT.java", 1L),
             // One bounded read of its own target per witness class, each a poll inside a deadline loop.
             entry("test/java/io/tapstate/e2e/LosslessNumericTypeIsAcceptedIT.java", 1L),
             entry("test/java/io/tapstate/e2e/RealMysqlToMongoSnapshotIT.java", 1L),
@@ -131,11 +151,34 @@ class FixedSleepGateTest {
 
     @Test
     void everyFixedSleepInThisModuleIsANamedPollPrimitive() {
-        assertThat(sleepsUnder(Path.of("src")))
-                .as("every Thread.sleep in the e2e module must be a named poll primitive inside a "
-                        + "bounded condition loop; a new one is a settle - wait on an observable "
-                        + "condition instead")
-                .containsExactlyInAnyOrderEntriesOf(POLL_PRIMITIVES);
+        requireNamedSleeps(Path.of("src"), NAMED_SLEEP_PRIMITIVES);
+    }
+
+    private static void requireNamedSleeps(Path root, Map<String, Long> admitted) {
+        assertThat(sleepsUnder(root))
+                .as("every fixed sleep must be a named bounded observable poll or reviewed source-input "
+                        + "schedule; an outcome wait without a condition is a settle")
+                .containsExactlyInAnyOrderEntriesOf(admitted);
+    }
+
+    @Test
+    void anUnlistedSleepOrAnExtraCallInANamedPrimitiveStillFails(@TempDir Path root) throws IOException {
+        String path = "test/java/io/tapstate/e2e/BenchmarkTerminalCapture.java";
+        Map<String, Long> admitted = Map.of(path, NAMED_SLEEP_PRIMITIVES.get(path));
+        Path named = root.resolve(path);
+        Files.createDirectories(named.getParent());
+        String call = "Thread." + "sleep(";
+        Files.writeString(named, "class Named { void schedule() throws Exception { " + call + "1); } }");
+        requireNamedSleeps(root, admitted);
+
+        Path unlisted = root.resolve("Unlisted.java");
+        Files.writeString(unlisted, "class Unlisted { void settle() throws Exception { " + call + "2200); } }");
+        assertThatThrownBy(() -> requireNamedSleeps(root, admitted)).isInstanceOf(AssertionError.class);
+        Files.delete(unlisted);
+
+        Files.writeString(named, "class Named { void schedule() throws Exception { " + call + "1); "
+                + call + "2200); } }");
+        assertThatThrownBy(() -> requireNamedSleeps(root, admitted)).isInstanceOf(AssertionError.class);
     }
 
     /**

@@ -372,7 +372,11 @@ class AStoreOrExporterFailureDoesNotStopDataIT {
                                 + ", actual=" + control.state(PIPELINE));
                 assertThat(control.state(PIPELINE)).contains(PipelineState.RUNNING);
                 Instant afterDelivery = control.statusObservedAt(PIPELINE);
-                Thread.sleep(2_200);
+                int failuresAfterDelivery = logOccurrences(server.output(), "Could not write latest observation");
+                Await.until("another actual latest write failure after target CDC delivery", Duration.ofSeconds(20),
+                        () -> logOccurrences(server.output(), "Could not write latest observation") > failuresAfterDelivery,
+                        () -> "failures=" + logOccurrences(server.output(), "Could not write latest observation")
+                                + ", statusObservedAt=" + control.statusObservedAt(PIPELINE));
                 assertThat(control.statusObservedAt(PIPELINE)).isEqualTo(afterDelivery);
                 assertThat(afterDelivery).isEqualTo(frozen);
             } finally {
