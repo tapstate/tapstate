@@ -166,6 +166,44 @@ final class ControlPlane {
         return warningsOf(response.body());
     }
 
+    /** One unsaved candidate resource carried by a Pipeline preview request. */
+    record PreviewDraft(String source, String content) {}
+
+    /**
+     * Runs the candidate preview over its NDJSON face and keeps each wire event as the object it arrived as.
+     * The harness reads the complete response only because it is a bounded test sample; the browser client
+     * exercises the same endpoint incrementally.
+     */
+    List<Map<String, Object>> preview(
+            String pipelineId, String outputId, int rootLimit, String sampleId, List<PreviewDraft> drafts) {
+        List<Map<String, String>> encodedDrafts = drafts.stream()
+                .map(draft -> Map.of("source", draft.source(), "content", draft.content()))
+                .toList();
+        Map<String, Object> request = new LinkedHashMap<>();
+        request.put("pipelineId", pipelineId);
+        request.put("outputId", outputId);
+        request.put("rootLimit", rootLimit);
+        request.put("sampleId", sampleId);
+        request.put("drafts", encodedDrafts);
+        HttpResponse<String> response = send(authed("/api/artifacts:preview", JsonWriter.write(request)));
+        expect(response, 200, "preview Pipeline " + pipelineId);
+        String contentType = response.headers().firstValue("content-type").orElse("");
+        if (!contentType.startsWith("application/x-ndjson")) {
+            throw new AssertionError("Pipeline preview was not NDJSON: " + contentType);
+        }
+        List<Map<String, Object>> events = new ArrayList<>();
+        for (String line : response.body().lines().filter(value -> !value.isBlank()).toList()) {
+            if (!(JsonReader.parse(line) instanceof Map<?, ?> event)) {
+                throw new AssertionError("a Pipeline preview event was not an object: " + line);
+            }
+            events.add(asObject(event));
+        }
+        if (events.isEmpty()) {
+            throw new AssertionError("Pipeline preview returned no events");
+        }
+        return List.copyOf(events);
+    }
+
     /**
      * One advisory finding an apply carried: something worth telling the author about a batch that was
      * applied rather than refused. A refusal travels in its own shape and its own status, so a caller

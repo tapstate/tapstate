@@ -53,6 +53,7 @@ import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.PipelinePositionService;
 import io.tapstate.control.core.PipelineProjectionService;
 import io.tapstate.control.core.PipelineRepresentation;
+import io.tapstate.control.core.PipelinePreviewService;
 import io.tapstate.control.core.PipelineViewService;
 import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
@@ -77,6 +78,7 @@ import io.tapstate.core.logging.RingBufferLogSink;
 import io.tapstate.core.logging.SecretRedactor;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.probe.ConnectionProbe;
+import io.tapstate.runtime.probe.PipelinePreviewProbe;
 import io.tapstate.runtime.probe.DataBrowserCollectionsProbe;
 import io.tapstate.runtime.probe.DataBrowserFindProbe;
 import io.tapstate.runtime.probe.DataBrowserStatsProbe;
@@ -594,6 +596,12 @@ class ControlPlaneConfiguration {
     PipelineDraftService pipelineDraftService(
             StorePort storePort, ArtifactQueryService artifacts, AuditGate auditGate, ApplyService applyService) {
         return new PipelineDraftService(storePort.drafts(), artifacts, auditGate, applyService);
+    }
+
+    @Bean
+    PipelinePreviewService pipelinePreviewService(
+            ApplyService applyService, PipelinePreviewProbe probe, Clock clock) {
+        return new PipelinePreviewService(applyService, probe, clock);
     }
 
     @Bean

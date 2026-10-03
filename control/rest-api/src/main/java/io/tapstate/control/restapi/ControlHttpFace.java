@@ -45,6 +45,7 @@ import tools.jackson.databind.DeserializationFeature;
         PipelineViewController.class,
         PipelineLayoutController.class,
         PipelineDraftController.class,
+        PipelinePreviewController.class,
         SourceDraftController.class,
         DerivedSchemaController.class,
         ApiExceptionHandler.class})

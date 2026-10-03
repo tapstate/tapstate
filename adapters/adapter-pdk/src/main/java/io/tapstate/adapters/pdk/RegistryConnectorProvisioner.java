@@ -49,6 +49,11 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
                 introspected.spec());
     }
 
+    @Override
+    public String cacheIdentity(String connectorId) {
+        return resolveRegistration(connectorId).contentHash();
+    }
+
     /** The single registration for the id, refusing with a code when none or more than one matches. */
     private ConnectorRegistration resolveRegistration(String connectorId) {
         List<ConnectorRegistration> matches = registry.list().stream()

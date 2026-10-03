@@ -6,9 +6,11 @@ import io.tapstate.control.core.SourceProjectionService;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalWriter;
+import io.tapstate.runtime.probe.PipelinePreviewProbe;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.testsupport.RequiresDocker;
+import io.tapstate.runtime.probe.PipelinePreviewProbe;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -17,6 +19,7 @@ import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
@@ -391,5 +394,12 @@ class ControlPlaneAssemblyIT {
     @EnableAutoConfiguration
     @Import({StoreConfiguration.class, ControlPlaneConfiguration.class})
     static class AssemblyApp {
+
+        @Bean
+        PipelinePreviewProbe unusedPreviewProbe() {
+            return request -> {
+                throw new AssertionError("this control-plane assembly test does not execute a Pipeline preview");
+            };
+        }
     }
 }

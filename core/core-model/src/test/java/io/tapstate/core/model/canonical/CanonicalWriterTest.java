@@ -677,6 +677,22 @@ class CanonicalWriterTest {
                     """);
         }
 
+        @Test
+        void writesCollectionValuedMapLiteralsAsYamlSequences() {
+            TransformResource transform = new TransformResource("expand_items", null,
+                    new TransformBody.MapProjection(Map.of(
+                            "items", FieldRule.literal(List.of("first-item", "second-item")))), null);
+
+            assertThat(writer.write(transform)).isEqualTo("""
+                    version: tapstate/v1
+                    kind: transform
+                    id: expand_items
+                    type: map
+                    fields:
+                      items: [first-item, second-item]
+                    """);
+        }
+
         private LinkedHashMap<String, FieldRule> orderedFields() {
             LinkedHashMap<String, FieldRule> fields = new LinkedHashMap<>();
             fields.put("ssn", FieldRule.drop());

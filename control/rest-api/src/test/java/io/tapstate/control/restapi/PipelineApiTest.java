@@ -441,6 +441,46 @@ class PipelineApiTest {
     }
 
     @Test
+    void candidatePreviewCompilesUnsavedEditorStateWithoutChangingTheStoredDraft() {
+        String token = machineToken(Scope.WRITE);
+        String draft = """
+                {"pipelineId":"candidate-preview","mode":"wizard","name":"Stored orders",
+                 "wizard":{"root":{"id":"orders","sourceId":"crm","table":"orders",
+                   "key":["id"],"preTransforms":[]},"related":[],"transforms":[],
+                   "output":{"kind":"atlas","config":{"sourceId":"atlas","table":"orders_output"}}}}
+                """;
+        client().post().uri("/api/pipelines/candidate-preview/draft")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(draft).retrieve().toBodilessEntity();
+        Map<String, Object> candidate = Map.of(
+                "pipelineId", "candidate-preview", "mode", "wizard", "name", "Unsaved candidate",
+                "wizard", Map.of("root", Map.of("id", "orders", "sourceId", "crm", "table", "orders",
+                                "key", List.of("id"), "preTransforms", List.of()),
+                        "related", List.of(), "transforms", List.of(),
+                        "output", Map.of("kind", "atlas",
+                                "config", Map.of("sourceId", "atlas", "table", "candidate_output"))));
+
+        ResponseEntity<Map> preview = client().post().uri("/api/pipelines/candidate-preview/draft:preview")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(Map.of("revision", 1, "candidate", candidate))
+                .retrieve().toEntity(Map.class);
+        ResponseEntity<Map> stored = client().get().uri("/api/pipelines/candidate-preview/draft")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token).retrieve().toEntity(Map.class);
+
+        assertThat(preview.getBody()).containsEntry("pipelineId", "candidate-preview").containsKey("dsl");
+        assertThat((String) preview.getBody().get("dsl")).contains("candidate_output");
+        assertThat(stored.getBody()).containsEntry("name", "Stored orders").containsEntry("revision", 1);
+        ApiError malformedCandidate = client().post().uri("/api/pipelines/candidate-preview/draft:preview")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(Map.of("candidate", List.of()))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(malformedCandidate.code()).isEqualTo("control.malformed-request");
+    }
+
+    @Test
     void rebaseRequiresARevisionAndAnExplicitArtifactHashValue() {
         String token = machineToken(Scope.WRITE);
         String draft = """
@@ -978,6 +1018,7 @@ class PipelineApiTest {
                 .containsExactlyInAnyOrder(
                         "pipeline.list", "pipeline.catalog", "pipeline.get", "pipeline.layout.get", "pipeline.layout.update", "pipeline.create",
                         "pipeline.update",
+                        "pipeline.preview",
                         "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
                         "pipeline.status", "pipeline.metrics", "pipeline.snapshot", "pipeline.logs",
                         "pipeline.metrics.history", "pipeline.explain",
@@ -1087,7 +1128,8 @@ class PipelineApiTest {
     @EnableAutoConfiguration
     @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceProjectionServiceTestConfiguration.class,
             PipelinePositionTestConfiguration.class, ClusterTopologyTestConfiguration.class,
-            DerivedSchemaTestConfiguration.class, ObservabilityTestConfiguration.class})
+            DerivedSchemaTestConfiguration.class, ObservabilityTestConfiguration.class,
+            PipelinePreviewTestConfiguration.class})
     static class TestApp {
 
         @Bean

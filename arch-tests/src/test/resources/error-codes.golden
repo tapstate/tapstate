@@ -14,6 +14,7 @@ actuation.join-source-not-declared
 actuation.join-sql-invalid
 actuation.not-a-pipeline
 actuation.pipeline-not-found
+actuation.preview-refused
 actuation.schema-sync-while-running
 actuation.source-schema-not-discovered
 actuation.source-table-ambiguous
@@ -149,6 +150,7 @@ control.bootstrap-closed
 control.bootstrap-forbidden
 control.forbidden
 control.malformed-request
+control.preview-overloaded
 control.schema-derivation-incomplete
 control.unauthenticated
 control.unreachable
