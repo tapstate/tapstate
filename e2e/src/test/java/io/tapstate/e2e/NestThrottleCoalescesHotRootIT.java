@@ -221,7 +221,15 @@ class NestThrottleCoalescesHotRootIT {
      */
     private long awaitSettledSends(ControlPlane control) {
         long deadline = System.nanoTime() + TIMEOUT.toNanos();
-        long last = recordCount(control);
+        // Target delivery can precede the first asynchronous observation; only a real count starts the comparison.
+        var first = control.recordCount(pipelineId);
+        while (first.isEmpty() && System.nanoTime() - deadline < 0) {
+            sleep(SETTLE_POLL);
+            first = control.recordCount(pipelineId);
+        }
+        long last = first.orElseThrow(() -> new AssertionError(
+                "no record count was published within the settlement deadline for " + pipelineId
+                        + "; metrics: " + control.metrics(pipelineId)));
         long steadyFor = 0;
         while (System.nanoTime() - deadline < 0) {
             sleep(SETTLE_POLL);
