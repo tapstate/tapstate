@@ -83,9 +83,11 @@ class ARestartedServerKeepsCarryingIT {
             ControlPlane control = new ControlPlane(second.baseUrl());
             control.login("e2e", "e2e-password");
 
-            assertThat(control.state(running.pipelineId()))
+            assertThat(Await.answered(
+                            "the restarted pipeline to publish an observation",
+                            () -> control.state(running.pipelineId())))
                     .as("the pipeline the restarted server adopted from the store it read")
-                    .contains(PipelineState.RUNNING);
+                    .isEqualTo(PipelineState.RUNNING);
             if (tier == Tiers.REAL_PROCESS) {
                 running.delayTargetVisibility(SLOW_TARGET_VISIBILITY);
             }

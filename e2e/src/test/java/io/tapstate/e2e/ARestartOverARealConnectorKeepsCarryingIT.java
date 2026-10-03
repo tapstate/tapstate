@@ -96,9 +96,11 @@ class ARestartOverARealConnectorKeepsCarryingIT {
                 ControlPlane control = new ControlPlane(second.baseUrl());
                 control.login("e2e", "e2e-password");
 
-                assertThat(control.state(PIPELINE_ID))
+                assertThat(Await.answered(
+                                "the restarted pipeline to publish an observation",
+                                () -> control.state(PIPELINE_ID)))
                         .as("the pipeline the restarted server adopted from the store it read")
-                        .contains(PipelineState.RUNNING);
+                        .isEqualTo(PipelineState.RUNNING);
                 assertThat(customer(mongo, target))
                         .as("the target before the last change is made - the wait below has to be earned")
                         .isEqualTo(BEFORE_THE_RESTART);
