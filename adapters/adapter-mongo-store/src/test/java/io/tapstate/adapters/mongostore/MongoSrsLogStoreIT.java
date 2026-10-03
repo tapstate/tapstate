@@ -5,10 +5,14 @@ import com.mongodb.MongoClientSettings;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
+import com.mongodb.event.CommandListener;
+import com.mongodb.event.CommandStartedEvent;
 import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.SrsLogBatch;
+import io.tapstate.spi.store.SrsLogBounds;
 import io.tapstate.spi.store.SrsLogRecord;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimFence;
@@ -26,12 +30,14 @@ import java.math.BigDecimal;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.function.BiConsumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -75,6 +81,24 @@ class MongoSrsLogStoreIT {
             assertThat(read.before()).containsEntry("amount", "10.00");
             assertThat(read.after()).containsEntry("amount", "12.50");
             assertThat(read.schemaVer()).isEqualTo(3L);
+        });
+    }
+
+    @Test
+    void replacingARecordDoesNotKeepImagesOrGenerationThatTheReplacementLacks() {
+        withStoreCollection((store, collection) -> {
+            store.store(RING, 40L, new SrsLogRecord("first", Op.UPDATE, 1L,
+                    Map.of("id", 1, "priority", "Low"), Map.of("id", 1, "priority", "High"), 0L, 7L));
+            store.store(RING, 40L, new SrsLogRecord("replacement", Op.INSERT, 2L,
+                    null, Map.of("id", 2), 0L));
+
+            SrsLogRecord replaced = store.load(RING, 40L).orElseThrow();
+            assertThat(replaced.before()).isNull();
+            assertThat(replaced.after()).containsExactlyEntriesOf(Map.of("id", 2));
+            assertThat(replaced.epoch()).isZero();
+            Document stored = collection.find(new Document("_id", new Document("ring", RING).append("seq", 40L)))
+                    .first();
+            assertThat(stored).doesNotContainKeys("before", "epoch");
         });
     }
 
@@ -171,6 +195,137 @@ class MongoSrsLogStoreIT {
                             + "another table's consumers have not read")
                     .isPresent();
         });
+    }
+
+    @Test
+    void aCompletelyTrimmedLogKeepsItsSequenceIdentityAfterTheClientRestarts() {
+        String databaseName = "tapstate_log_restart_" + System.nanoTime();
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getConnectionString())) {
+            MongoSrsLogStore store = new MongoSrsLogStore(client.getDatabase(databaseName).getCollection("srs_log"));
+            store.storeAll(RING, 10L, List.of(
+                    new SrsLogRecord("low", Op.UPDATE, 1L, null, Map.of("priority", "Low"), 0L, 7L),
+                    new SrsLogRecord("high", Op.UPDATE, 2L, null, Map.of("priority", "High"), 0L, 7L)));
+            store.trim(RING, 11L);
+
+            assertThat(store.readBatch(RING, 10L, 10).records()).isEmpty();
+        }
+
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getConnectionString())) {
+            MongoSrsLogStore recovered = new MongoSrsLogStore(client.getDatabase(databaseName).getCollection("srs_log"));
+
+            assertThat(recovered.bounds(RING)).isEqualTo(new SrsLogBounds(11L, 11L));
+            assertThat(recovered.largestSequence(RING)).isEqualTo(11L);
+            recovered.store(RING, recovered.largestSequence(RING) + 1L,
+                    new SrsLogRecord("next", Op.UPDATE, 3L, null, Map.of("priority", "Medium"), 0L, 8L));
+            assertThat(recovered.readBatch(RING, 12L, 10).records().keySet()).containsExactly(12L);
+            assertThat(recovered.bounds(RING)).isEqualTo(new SrsLogBounds(12L, 11L));
+        }
+    }
+
+    @Test
+    void aBatchedReadKeepsAnActualGapAndDoesNotReachIntoTheNextRing() {
+        withStoreCollection((store, collection) -> {
+            store.storeAll(RING, 10L, List.of(
+                    new SrsLogRecord("low", Op.UPDATE, 1L, null, Map.of("priority", "Low"), 0L, 7L),
+                    new SrsLogRecord("high", Op.UPDATE, 2L, null, Map.of("priority", "High"), 0L, 7L),
+                    new SrsLogRecord("mail", Op.INSERT, 3L, null, Map.of("id", 3), 0L, 7L)));
+            store.store(OTHER, 11L, new SrsLogRecord("other", Op.INSERT, 3L, null, Map.of("id", 9), 0L, 7L));
+            // This models an isolated damaged log, not a permitted retirement of the consumer's history.
+            collection.deleteOne(new Document("_id", new Document("ring", RING).append("seq", 11L)));
+
+            SrsLogBatch batch = store.readBatch(RING, 10L, 3);
+
+            assertThat(batch.bounds()).isEqualTo(new SrsLogBounds(12L, -1L));
+            assertThat(batch.records().keySet()).containsExactly(10L, 12L);
+            assertThat(batch.records().get(12L).srcToken()).isEqualTo("mail");
+            assertThat(store.readBatch(RING, 10L, 2).records().keySet()).containsExactly(10L);
+        });
+    }
+
+    @Test
+    void aLegacyRecordKeepsAnUnknownGenerationAndCanStillBeReadExactly() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getConnectionString())) {
+            MongoCollection<Document> collection = client.getDatabase("tapstate_log_legacy_" + System.nanoTime())
+                    .getCollection("srs_log");
+            collection.insertOne(new Document("_id", new Document("ring", RING).append("seq", 9L))
+                    .append("op", "u").append("ts", 1L).append("schemaVer", 0L)
+                    .append("after", new Document("priority", "High")));
+            MongoSrsLogStore store = new MongoSrsLogStore(collection);
+
+            assertThat(store.bounds(RING)).isEqualTo(new SrsLogBounds(9L, -1L));
+            assertThat(store.readBatch(RING, 9L, 1).records().get(9L).epoch()).isZero();
+            store.trim(RING, 9L);
+            assertThat(store.bounds(RING)).isEqualTo(new SrsLogBounds(9L, 9L));
+        }
+    }
+
+    @Test
+    void theOriginalGenerationSurvivesAClientRestart() {
+        String databaseName = "tapstate_log_epoch_" + System.nanoTime();
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getConnectionString())) {
+            new MongoSrsLogStore(client.getDatabase(databaseName).getCollection("srs_log"))
+                    .store(RING, 40L,
+                            new SrsLogRecord("high", Op.UPDATE, 2L, null, Map.of("priority", "High"), 0L, 7L));
+        }
+
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getConnectionString())) {
+            MongoSrsLogStore recovered = new MongoSrsLogStore(client.getDatabase(databaseName).getCollection("srs_log"));
+
+            assertThat(recovered.readBatch(RING, 40L, 1).records().get(40L).epoch()).isEqualTo(7L);
+        }
+    }
+
+    @Test
+    void aFailedFencedBatchPublishesNeitherItsPrefixNorItsBounds() {
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            var database = client.getDatabase("tapstate_log_atomic_" + System.nanoTime());
+            var claimsCollection = database.getCollection("workload_claims");
+            MongoWorkloadClaimStore claims = new MongoWorkloadClaimStore(claimsCollection);
+            WorkloadClaim claim = claims.acquire(
+                    new WorkloadClaimKey("cluster-a", WorkloadClaimType.CAPTURE, "capture-orders"),
+                    new WorkloadOwner("node-a", "boot-a"), 7, Duration.ofSeconds(30)).claim();
+            WorkloadClaimFence fence = WorkloadClaimFence.from(claim);
+            MongoSrsLogStore store = new MongoSrsLogStore(client, database.getCollection("srs_log"), claimsCollection);
+            store.store(RING, 0L, new SrsLogRecord("baseline", Op.INSERT, 0L, null, Map.of("id", 0), 0L, fence, 7L));
+            database.runCommand(new Document("collMod", "srs_log")
+                    .append("validator", new Document("after.id", new Document("$ne", 2))));
+
+            assertThatThrownBy(() -> store.storeAll(RING, 1L, List.of(
+                            new SrsLogRecord("one", Op.INSERT, 1L, null, Map.of("id", 1), 0L, fence, 7L),
+                            new SrsLogRecord("two", Op.INSERT, 2L, null, Map.of("id", 2), 0L, fence, 7L))))
+                    .isInstanceOf(TapstateException.class);
+
+            assertThat(store.load(RING, 1L)).isEmpty();
+            assertThat(store.load(RING, 2L)).isEmpty();
+            assertThat(store.bounds(RING)).isEqualTo(new SrsLogBounds(0L, -1L));
+        }
+    }
+
+    @Test
+    void oneFencedCaptureBatchWritesItsBoundsInTheSameBulkAndTransaction() {
+        CommandCounts counts = new CommandCounts();
+        try (MongoClient client = MongoClients.create(MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl()))
+                .addCommandListener(counts).build())) {
+            var database = client.getDatabase("tapstate_log_batch_" + System.nanoTime());
+            var claimsCollection = database.getCollection("workload_claims");
+            WorkloadClaim claim = new MongoWorkloadClaimStore(claimsCollection).acquire(
+                    new WorkloadClaimKey("cluster-a", WorkloadClaimType.CAPTURE, "capture-orders"),
+                    new WorkloadOwner("node-a", "boot-a"), 7, Duration.ofSeconds(30)).claim();
+            WorkloadClaimFence fence = WorkloadClaimFence.from(claim);
+            MongoSrsLogStore store = new MongoSrsLogStore(client, database.getCollection("srs_log"), claimsCollection);
+            List<SrsLogRecord> records = java.util.stream.IntStream.range(0, 128)
+                    .mapToObj(i -> new SrsLogRecord("p" + i, Op.INSERT, i, null, Map.of("id", i), 0L, fence, 7L))
+                    .toList();
+            counts.reset();
+
+            store.storeAll(RING, 0L, records);
+
+            assertThat(counts.transactionCommits.get()).isEqualTo(1);
+            assertThat(counts.updateCommands.get()).isEqualTo(2);
+            assertThat(counts.largestUpdateBatch.get()).isEqualTo(129);
+            assertThat(store.bounds(RING)).isEqualTo(new SrsLogBounds(127L, -1L));
+        }
     }
 
     @Test
@@ -335,11 +490,37 @@ class MongoSrsLogStoreIT {
     }
 
     private static void withStore(Consumer<MongoSrsLogStore> body) {
+        withStoreCollection((store, collection) -> body.accept(store));
+    }
+
+    private static void withStoreCollection(BiConsumer<MongoSrsLogStore, MongoCollection<Document>> body) {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getConnectionString())) {
             MongoCollection<Document> collection = client
                     .getDatabase("tapstate_test")
                     .getCollection("srs_log_" + System.nanoTime());
-            body.accept(new MongoSrsLogStore(collection));
+            body.accept(new MongoSrsLogStore(collection), collection);
+        }
+    }
+
+    private static final class CommandCounts implements CommandListener {
+        private final AtomicInteger transactionCommits = new AtomicInteger();
+        private final AtomicInteger updateCommands = new AtomicInteger();
+        private final AtomicInteger largestUpdateBatch = new AtomicInteger();
+
+        @Override
+        public void commandStarted(CommandStartedEvent event) {
+            if (event.getCommandName().equals("commitTransaction")) {
+                transactionCommits.incrementAndGet();
+            } else if (event.getCommandName().equals("update")) {
+                updateCommands.incrementAndGet();
+                largestUpdateBatch.accumulateAndGet(event.getCommand().getArray("updates").size(), Math::max);
+            }
+        }
+
+        private void reset() {
+            transactionCommits.set(0);
+            updateCommands.set(0);
+            largestUpdateBatch.set(0);
         }
     }
 }

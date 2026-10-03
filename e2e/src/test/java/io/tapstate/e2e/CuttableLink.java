@@ -7,6 +7,7 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -59,6 +60,7 @@ final class CuttableLink implements AutoCloseable {
     private final AtomicInteger unattributed = new AtomicInteger();
     private volatile boolean closed;
     private volatile ServerSocket listener;
+    private volatile Thread acceptThread;
 
     /** One connection through here, remembered by who dialled it so a cut can pick it out. */
     private record Held(Socket inbound, Socket outbound, String dialler) { }
@@ -151,6 +153,18 @@ final class CuttableLink implements AutoCloseable {
                 // Closing a listener that is already gone is not a failure.
             }
         }
+        // A blocked accept can retain the socket after close returns. Wait for it to release the port.
+        Thread accepting = acceptThread;
+        if (accepting != null) {
+            try {
+                if (!accepting.join(Duration.ofSeconds(10))) {
+                    throw new AssertionError("the cuttable link listener did not stop on " + address());
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("interrupted while closing the cuttable link on " + address(), e);
+            }
+        }
         for (Held held : live) {
             closeQuietly(held.inbound());
             closeQuietly(held.outbound());
@@ -162,10 +176,12 @@ final class CuttableLink implements AutoCloseable {
         try {
             ServerSocket server = new ServerSocket();
             server.setReuseAddress(true);
+            RealProcessServer.releasePort(port);
             server.bind(new InetSocketAddress(InetAddress.getByName(LOOPBACK), port));
             listener = server;
             Thread thread = new Thread(() -> accept(server), "cuttable-link-" + port);
             thread.setDaemon(true);
+            acceptThread = thread;
             thread.start();
         } catch (IOException e) {
             throw new AssertionError("could not open a cuttable link on " + address(), e);

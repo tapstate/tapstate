@@ -23,6 +23,8 @@ import java.util.Objects;
  *       generation assigned to a bounded read that has no change chain of its own.</li>
  *   <li>{@code captureFence} — the cluster claim generation a durable append must still match, or null on
  *       the unchanged single-member path.</li>
+ *   <li>{@code consumerId} — this source node's independent progress record; compatibility callers default
+ *       to the pipeline id. The pipeline id still names the job and snapshot handoff.</li>
  * </ul>
  *
  * <p>No connector position is carried here. Both a run's seam and its per-change positions are the
@@ -43,7 +45,25 @@ public record CaptureRunSpec(
         String retention,
         long schemaVer,
         long snapshotEpoch,
-        WorkloadClaimFence captureFence) {
+        WorkloadClaimFence captureFence,
+        String consumerId) {
+
+    /** Compatibility construction for a caller whose pipeline has one consumption record. */
+    public CaptureRunSpec(
+            CaptureConfig config,
+            ReadMode readMode,
+            String srsKey,
+            boolean srsEnabled,
+            String sourceId,
+            String pipelineId,
+            StartFrom startFrom,
+            String retention,
+            long schemaVer,
+            long snapshotEpoch,
+            WorkloadClaimFence captureFence) {
+        this(config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
+                startFrom, retention, schemaVer, snapshotEpoch, captureFence, pipelineId);
+    }
 
     /**
      * The ordinary construction used by callers that do not allocate a chainless snapshot generation.
@@ -87,7 +107,19 @@ public record CaptureRunSpec(
     public CaptureRunSpec withCaptureFence(WorkloadClaimFence fence) {
         return new CaptureRunSpec(
                 config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
-                startFrom, retention, schemaVer, snapshotEpoch, fence);
+                startFrom, retention, schemaVer, snapshotEpoch, fence, consumerId);
+    }
+
+    /** The same run using {@code id} as this source node's independent progress record. */
+    public CaptureRunSpec withConsumerId(String id) {
+        return new CaptureRunSpec(config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
+                startFrom, retention, schemaVer, snapshotEpoch, captureFence, id);
+    }
+
+    /** Shared capture state follows the physical source; direct recovery state follows its own channel. */
+    public MiningChainId miningChainId() {
+        return srsEnabled ? MiningChainId.resolve(config, srsKey)
+                : MiningChainId.forChannel(config, srsKey, pipelineId, sourceId);
     }
 
     public CaptureRunSpec {
@@ -96,6 +128,10 @@ public record CaptureRunSpec(
         Objects.requireNonNull(sourceId, "sourceId");
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(startFrom, "startFrom");
+        consumerId = consumerId == null ? pipelineId : consumerId;
+        if (consumerId.isBlank()) {
+            throw new IllegalArgumentException("a source consumer id must be non-blank");
+        }
         if (snapshotEpoch < 0) {
             throw new IllegalArgumentException(
                     "a chainless snapshot generation must not be negative, got " + snapshotEpoch);

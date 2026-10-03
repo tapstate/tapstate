@@ -43,6 +43,7 @@ public final class SrsItemSerializer implements StreamSerializer<SrsItem> {
         writeRow(out, item.after());
         out.writeLong(item.schemaVer());
         writeFence(out, item.captureFence());
+        out.writeLong(item.epoch());
     }
 
     @Override
@@ -54,7 +55,14 @@ public final class SrsItemSerializer implements StreamSerializer<SrsItem> {
         Map<String, Object> before = readRow(in);
         Map<String, Object> after = readRow(in);
         long schemaVer = in.readLong();
-        return new SrsItem(srcPos, op, ts, before, after, schemaVer, readFence(in));
+        WorkloadClaimFence fence = readFence(in);
+        long epoch;
+        try {
+            epoch = in.readLong();
+        } catch (java.io.EOFException legacy) {
+            epoch = 0L;
+        }
+        return new SrsItem(srcPos, op, ts, before, after, schemaVer, fence, epoch);
     }
 
     private static void writeFence(ObjectDataOutput out, WorkloadClaimFence fence) throws IOException {

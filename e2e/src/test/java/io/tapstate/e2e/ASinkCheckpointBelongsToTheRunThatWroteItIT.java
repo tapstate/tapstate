@@ -7,6 +7,7 @@ import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.testsupport.DockerGate;
 import java.nio.file.Files;
@@ -102,7 +103,7 @@ class ASinkCheckpointBelongsToTheRunThatWroteItIT {
 
     private static Document consumer(MongoDatabase database) {
         return database.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS)
-                .find(new Document("pipelineId", PIPELINE)).first();
+                .find(new Document("pipelineId", SrsConsumerId.of(PIPELINE, SOURCE).value())).first();
     }
 
     private static Document assertFenceMatchesCurrentRun(MongoDatabase database, String clusterId) {

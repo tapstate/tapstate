@@ -11,6 +11,7 @@ import io.tapstate.runtime.engine.ReplayFloor;
 import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.spi.store.SrsMetaStore;
+import io.tapstate.spi.store.ConsumerOffset;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -26,6 +27,19 @@ import org.junit.jupiter.api.Test;
 class StoreBackedReplayFloorFactoryTest {
 
     private static final Map<String, String> CHAINS = Map.of("orders", "mc-orders", "items", "mc-items");
+
+    @Test
+    void anOldAggregateAcrossIndependentTablesIsNotAReplayFloor() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("crm", null);
+        store.upsertConsumerOffset("crm", new ConsumerOffset("pipe",
+                Map.of("support_case", 2L, "emailmessage", 1_000L), at(1_000, "mail-after-high")));
+        ReplayFloor floor = new StoreBackedReplayFloorFactory(
+                Map.of("support_case", "crm", "emailmessage", "crm"), "pipe").resolve(memberWith(store));
+
+        assertThat(floor.of("support_case")).isEmpty();
+        assertThat(floor.of("emailmessage")).isEmpty();
+    }
 
     @Test
     void readsBackTheVeryPositionTheSinkSideWroteForThatChain() {

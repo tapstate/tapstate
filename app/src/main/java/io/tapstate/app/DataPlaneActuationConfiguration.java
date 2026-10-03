@@ -188,6 +188,7 @@ class DataPlaneActuationConfiguration {
             ClusterProperties clusterProperties) {
         // Begun rather than started: a run comes back as soon as its load is open, and the load is read while
         // the pipeline's job takes it. Read to the end first, it would have to fit on the heap whole.
+        // The attacher's widening path invokes the handler installed on the runtime's shared reader.
         CaptureAttacher attacher = captureRunUnit::begin;
         if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
             return new StoreBackedPipelineCaptureCoordinator(

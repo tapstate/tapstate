@@ -5,3 +5,16 @@ Status failure code observed by CI: connector.write-failed
 Exact captured assertion value: Optional[connector.write-failed]
 The full status response was not printed by the failing test.
 Earlier local runs of this same case passed its engine.job-failed assertion.
+
+Issue 526: independent table orders cannot establish a source-wide resume frontier.
+Case: MongoSrsMetaStoreIT#aLaterQuietTableConfirmationDoesNotSkipAnUnconfirmedRootChange
+Golden inputs, using the current ChainPosition and SourceOrder model:
+  support_case confirmation: {"order":{"epoch":1,"seq":2},"token":"after-low"}
+  emailmessage confirmation: {"order":{"epoch":1,"seq":0},"token":"after-email"}
+  per-table confirmed ring cursors: {"support_case":2,"emailmessage":0}
+Source chronology: after-low, unconfirmed priority High, after-email.
+Observed sourceReadOffset from the real Mongo store: after-email.
+Required sourceReadOffset: before-batch or after-low.
+The existing table-aware acknowledgement contract identifies sequence spaces as independent.
+The persisted CDC item carries an opaque source token and no source-wide order.
+A snapshot-seam fallback cannot cover CDC-only pipelines without a recorded seam.

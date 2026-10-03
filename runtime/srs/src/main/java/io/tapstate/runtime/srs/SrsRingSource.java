@@ -59,6 +59,17 @@ public final class SrsRingSource {
                 .stream("srs-source-" + ringName, ctx -> {
                     Ringbuffer<SrsItem> rb = ctx.hazelcastInstance().getRingbuffer(ringName);
                     SrsRingbuffer ring = new SrsRingbuffer(rb);
+                    Object persisted = ctx.hazelcastInstance().getUserContext()
+                            .get(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY);
+                    if (persisted instanceof io.tapstate.spi.store.SrsLogStore log) {
+                        var cursor = publisherFactory.resolve(ctx.hazelcastInstance());
+                        var recovery = publisherFactory.recoverySequence(ctx.hazelcastInstance());
+                        return recovery.isPresent()
+                                ? SrsRingReader.resumingAfter(ring, recovery.getAsLong(),
+                                        publisherFactory.confirmedPosition(ctx.hazelcastInstance()).orElse(null),
+                                        cursor, ringName, log)
+                                : SrsRingReader.from(ring, start, cursor, retention, ringName, log);
+                    }
                     return SrsRingReader.from(
                             ring, start, publisherFactory.resolve(ctx.hazelcastInstance()), retention);
                 })

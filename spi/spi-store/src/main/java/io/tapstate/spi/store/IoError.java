@@ -66,6 +66,9 @@ public enum IoError implements TapstateErrorCode {
      */
     SINK_WRITER_PROGRESS_AMBIGUOUS("io.sink-writer-progress-ambiguous", Set.of("pipeline")),
 
+    /** Legacy pipeline-level progress cannot establish this source node's confirmed recovery cursor. */
+    SRS_PROGRESS_UNPROVEN("io.srs-progress-unproven", Set.of("pipeline")),
+
     /**
      * A document a store operation had to write is larger than the store will accept. {@code id} is
      * the document's id, or {@code unknown} where the failing call did not name one.

@@ -932,7 +932,9 @@ class CaptureOwnershipTest {
         if (store.meta().read(CHAIN).isEmpty()) {
             store.meta().create(CHAIN, null);
         }
-        store.meta().openEpoch(CHAIN);
+        store.meta().requestCaptureTables(CHAIN, SourceCaptureResolution.of(SOURCE).tables());
+        long epoch = store.meta().openEpoch(CHAIN);
+        store.meta().publishCaptureTables(CHAIN, epoch, store.meta().captureTables(CHAIN));
     }
 
     private static List<String> consumersOn(InMemoryStorePort store) {
@@ -956,6 +958,7 @@ class CaptureOwnershipTest {
         private final String node;
         private final List<String> starts;
         private final SrsCoordinator chains;
+        private final InMemoryStorePort store;
         private final StoreBackedPipelineCaptureCoordinator captures;
         private final AtomicInteger tailsClosed = new AtomicInteger();
 
@@ -968,6 +971,7 @@ class CaptureOwnershipTest {
                 List<String> starts) {
             this.node = node;
             this.starts = starts;
+            this.store = store;
             this.chains = new SrsCoordinator(store.meta());
             ClusterMembershipGate gate = eligibleGate();
             CaptureOwnership ownership = new CaptureOwnership(
@@ -987,13 +991,14 @@ class CaptureOwnershipTest {
                 return new CaptureRun(Optional.empty(), false, 0, Optional.empty(), Optional.of(subscription),
                         new CaptureHealth());
             }
-            MiningChainId chain = MiningChainId.resolve(spec.config(), spec.srsKey());
+            MiningChainId chain = spec.miningChainId();
             if (startTail) {
-                chains.provisionSource(spec.sourceId(), chain, spec.config().streams(), spec.retention());
+                long epoch = chains.provisionSource(spec.sourceId(), chain, spec.config().streams(), spec.retention()).epoch();
+                store.meta().publishCaptureTables(chain.value(), epoch, store.meta().captureTables(chain.value()));
             } else {
                 chains.joinSource(spec.sourceId(), chain, spec.config().streams());
             }
-            chains.attachConsumer(chain, spec.pipelineId());
+            chains.attachConsumer(chain, spec.consumerId());
             return new CaptureRun(Optional.of(chain), !startTail, 0, Optional.empty(), Optional.of(subscription),
                     new CaptureHealth());
         }

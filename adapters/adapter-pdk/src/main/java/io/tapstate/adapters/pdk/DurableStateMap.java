@@ -1,8 +1,13 @@
 package io.tapstate.adapters.pdk;
 
 import io.tapdata.entity.utils.cache.KVMap;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.KeyedStateStore;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * The scratch map a connector reaches through its driving context, held under a namespace of its own so
@@ -26,15 +31,33 @@ import java.util.Objects;
  * {@code putIfAbsent}) returns a detached snapshot with mutable lists, maps and byte arrays. Editing
  * that snapshot changes no stored state until {@code put} is called with it. Reads always consult the
  * store so another connector's writes are visible; no per-open object cache hides them.
+ *
+ * <p>A physical capture can carry existing notes from its known earlier nodes, one requested key at a
+ * time. Conflicting or unreadable values are refused before any carry. Current shared values remain
+ * authoritative. Removal and clearing publish durable migration markers before deleting shared values,
+ * so earlier private state remains intact and cannot resurrect notes the connector explicitly expired.
  */
 final class DurableStateMap implements KVMap<Object> {
 
     private final KeyedStateStore store;
     private final String namespace;
+    private final List<String> carriedFrom;
+    private final String migrationNamespace;
+    private static final byte[] BLOCKED = {1};
+    private static final String CLEARED = "cleared";
 
     DurableStateMap(KeyedStateStore store, String namespace) {
+        this(store, namespace, List.of(), false);
+    }
+
+    DurableStateMap(KeyedStateStore store, String namespace, List<String> carriedFrom, boolean shared) {
         this.store = Objects.requireNonNull(store, "store");
         this.namespace = Objects.requireNonNull(namespace, "namespace");
+        this.carriedFrom = List.copyOf(Objects.requireNonNull(carriedFrom, "carriedFrom"));
+        this.migrationNamespace = shared ? "pdk.notes-migration." + namespace : null;
+        if (!shared && !carriedFrom.isEmpty()) {
+            throw new IllegalArgumentException("only a shared capture can carry earlier connector notes");
+        }
     }
 
     @Override
@@ -46,7 +69,7 @@ final class DurableStateMap implements KVMap<Object> {
     @Override
     public void put(String key, Object value) {
         if (value == null) {
-            store.delete(namespace, key);
+            forget(key);
             return;
         }
         store.save(namespace, key, ConnectorStateCodec.encode(value));
@@ -58,6 +81,12 @@ final class DurableStateMap implements KVMap<Object> {
             // Nothing to claim the key with; report what is there without touching it.
             return get(key);
         }
+        if (!carriedFrom.isEmpty()) {
+            Object carried = get(key);
+            if (carried != null) {
+                return carried;
+            }
+        }
         return store.saveIfAbsent(namespace, key, ConnectorStateCodec.encode(value))
                 .map(ConnectorStateCodec::decode)
                 .orElse(null);
@@ -65,25 +94,77 @@ final class DurableStateMap implements KVMap<Object> {
 
     @Override
     public Object get(String key) {
-        return store.load(namespace, key).map(ConnectorStateCodec::decode).orElse(null);
+        Optional<byte[]> own = store.load(namespace, key);
+        if (own.isPresent()) {
+            return ConnectorStateCodec.decode(own.get());
+        }
+        if (carriedFrom.isEmpty() || blocked(CLEARED) || blocked(removedKey(key))) {
+            return null;
+        }
+        byte[] candidate = null;
+        for (String earlier : carriedFrom) {
+            Optional<byte[]> kept = store.load(earlier, key);
+            if (kept.isEmpty()) {
+                continue;
+            }
+            if (candidate != null && !Arrays.equals(candidate, kept.get())) {
+                throw new TapstateException(ConnectorError.STATE_UNREADABLE, Map.of("detail",
+                        "earlier connector notes disagree for key '" + key
+                                + "'; restore verified notes for this physical capture before resuming"), null);
+            }
+            candidate = kept.get();
+        }
+        if (candidate == null) {
+            return null;
+        }
+        Object decoded = ConnectorStateCodec.decode(candidate);
+        return store.saveIfAbsent(namespace, key, candidate)
+                .map(ConnectorStateCodec::decode).orElse(decoded);
     }
 
     @Override
     public Object remove(String key) {
         Object previous = get(key);
-        store.delete(namespace, key);
+        forget(key);
         return previous;
+    }
+
+    private static String removedKey(String key) {
+        return "removed:" + key;
+    }
+
+    private boolean blocked(String key) {
+        Optional<byte[]> marker = store.load(migrationNamespace, key);
+        if (marker.isEmpty()) {
+            return false;
+        }
+        if (!Arrays.equals(BLOCKED, marker.get())) {
+            throw new TapstateException(ConnectorError.STATE_UNREADABLE,
+                    Map.of("detail", "the shared connector-note migration marker is unreadable"), null);
+        }
+        return true;
+    }
+
+    /** Keep earlier nodes intact while preventing an explicitly removed shared note from returning. */
+    private void forget(String key) {
+        if (migrationNamespace != null) {
+            store.save(migrationNamespace, removedKey(key), BLOCKED);
+        }
+        store.delete(namespace, key);
     }
 
     @Override
     public void clear() {
         // Naming the namespace is the only bulk operation the store has, and it is the one that fits:
         // there is no way to list the keys, and nothing here needs one.
+        if (migrationNamespace != null) {
+            store.save(migrationNamespace, CLEARED, BLOCKED);
+        }
         store.dropNamespace(namespace);
     }
 
     @Override
     public void reset() {
-        store.dropNamespace(namespace);
+        clear();
     }
 }
