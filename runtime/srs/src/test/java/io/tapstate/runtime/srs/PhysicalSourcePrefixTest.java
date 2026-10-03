@@ -329,6 +329,162 @@ class PhysicalSourcePrefixTest {
     }
 
     /**
+     * A store that keeps refusing a release is not waited on for good: it reports a write it will never take in
+     * the same words as an outage, and an account waiting on it would freeze the chain's positions while every
+     * pipeline on it reads as healthy. Refused for the whole bound, counted from the first refusal, the account
+     * stops and says why; refused for less, it is still written again on a later turn.
+     */
+    @Test
+    void aReleaseTheStoreKeepsRefusingStopsTheAccountOnceTheBoundIsPassed() {
+        java.util.concurrent.atomic.AtomicLong now = new java.util.concurrent.atomic.AtomicLong();
+        TapstateException refusal = new TapstateException(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE,
+                Map.of("detail", "Document failed validation"), null);
+        meta = new CaptureRunUnitTest.InMemoryMeta() {
+            @Override
+            public synchronized boolean advancePhysicalSourceReadOffset(
+                    String miningChainId, long epoch, ChainPosition position, boolean resumable) {
+                throw refusal;
+            }
+        };
+        meta.create(CHAIN, null);
+        epoch = meta.openEpoch(CHAIN);
+        select("pipe", "orders");
+        PhysicalSourcePrefix prefix = PhysicalSourcePrefix.shared(
+                meta, CHAIN, epoch, List.of("orders"), health, (table, seq) -> { }, now::get);
+        opened.add(prefix);
+        prefix.start(at("t0"));
+        prefix.admitted(Map.of("orders", 0L), "t1");
+        ack("pipe", "orders", 0);
+
+        prefix.tick();
+        now.addAndGet(TimeUnit.MILLISECONDS.toNanos(PhysicalSourcePrefix.UNWRITTEN_BOUND_MILLIS) - 1);
+        prefix.tick();
+        assertThat(health.failure()).as("refused for less than the bound").isEmpty();
+
+        now.addAndGet(1);
+        Throwable thrown = org.assertj.core.api.Assertions.catchThrowable(prefix::tick);
+        Throwable failure = thrown != null ? thrown : health.failure()
+                .orElseThrow(() -> new AssertionError("refused for the whole bound and still waiting"));
+        assertThat(failure).isSameAs(refusal);
+        assertThat(health.failure()).containsSame(refusal);
+        assertThatThrownBy(() -> prefix.admitted(Map.of(), "h2")).as("and the account records nothing more")
+                .isSameAs(refusal);
+    }
+
+    /**
+     * The bound runs from the first refusal in a row: a release the store takes in between ends the row, and the
+     * refusals after it are timed afresh -- a store that comes back and steps down again is waited out again.
+     */
+    @Test
+    void refusalsAreTimedFromTheFirstInARowNotTheFirstEver() {
+        java.util.concurrent.atomic.AtomicLong now = new java.util.concurrent.atomic.AtomicLong();
+        java.util.concurrent.atomic.AtomicBoolean unwritable = new java.util.concurrent.atomic.AtomicBoolean(true);
+        meta = new CaptureRunUnitTest.InMemoryMeta() {
+            @Override
+            public synchronized boolean advancePhysicalSourceReadOffset(
+                    String miningChainId, long epoch, ChainPosition position, boolean resumable) {
+                if (unwritable.get()) {
+                    throw new TapstateException(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE,
+                            Map.of("detail", "the primary stepped down"), null);
+                }
+                return super.advancePhysicalSourceReadOffset(miningChainId, epoch, position, resumable);
+            }
+        };
+        meta.create(CHAIN, null);
+        epoch = meta.openEpoch(CHAIN);
+        select("pipe", "orders");
+        long bound = TimeUnit.MILLISECONDS.toNanos(PhysicalSourcePrefix.UNWRITTEN_BOUND_MILLIS);
+        PhysicalSourcePrefix prefix = PhysicalSourcePrefix.shared(
+                meta, CHAIN, epoch, List.of("orders"), health, (table, seq) -> { }, now::get);
+        opened.add(prefix);
+        prefix.start(at("t0"));
+        prefix.admitted(Map.of("orders", 0L), "t1");
+        ack("pipe", "orders", 0);
+        prefix.tick();
+
+        now.addAndGet(bound - 1);
+        unwritable.set(false);
+        prefix.tick();
+        assertThat(sourceRead()).isEqualTo("t1");
+
+        unwritable.set(true);
+        prefix.admitted(Map.of("orders", 1L), "t2");
+        ack("pipe", "orders", 1);
+        prefix.tick();
+        now.addAndGet(bound / 2);
+        org.assertj.core.api.Assertions.assertThatCode(prefix::tick)
+                .as("refused for half the bound since the release that landed").doesNotThrowAnyException();
+        assertThat(health.failure()).isEmpty();
+    }
+
+    /**
+     * A re-check the shared thread cannot make while the stream behind the account is being closed fails nothing
+     * either. The store here answers the shared thread with a record it cannot read, which fails the run on any
+     * other day.
+     */
+    @Test
+    void aReCheckThatFailsWhileItsStreamClosesFailsNothing() throws Exception {
+        AtomicInteger failedReCheckReads = new AtomicInteger();
+        java.util.concurrent.atomic.AtomicBoolean unreadable = new java.util.concurrent.atomic.AtomicBoolean();
+        meta = new CaptureRunUnitTest.InMemoryMeta() {
+            @Override
+            public List<ConsumerOffset> consumerOffsets(String miningChainId) {
+                if (unreadable.get() && Thread.currentThread().getName().equals("tapstate-physical-prefix")) {
+                    failedReCheckReads.incrementAndGet();
+                    throw new TapstateException(io.tapstate.spi.store.IoError.DOCUMENT_UNREADABLE,
+                            Map.of("id", miningChainId, "field", "consumerOffsets"), null);
+                }
+                return super.consumerOffsets(miningChainId);
+            }
+        };
+        meta.create(CHAIN, null);
+        epoch = meta.openEpoch(CHAIN);
+        select("pipe", "orders");
+        PhysicalSourcePrefix prefix = shared("orders");
+        prefix.start(at("t0"));
+        prefix.admitted(Map.of("orders", 0L), "t1");
+
+        prefix.closing();
+        unreadable.set(true);
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (failedReCheckReads.get() < 2 && System.nanoTime() < deadline) {
+            Thread.sleep(PhysicalSourcePrefix.TICK_MILLIS);
+        }
+
+        assertThat(failedReCheckReads.get()).as("re-checks the shared thread made and failed").isGreaterThanOrEqualTo(2);
+        assertThat(health.failure()).isEmpty();
+    }
+
+    /**
+     * A release that cannot be written while the stream behind the account is being closed fails nothing either:
+     * the account stops, and the health it reports on -- which the stream replacing this one may share -- stays
+     * as it was.
+     */
+    @Test
+    void aReleaseThatCannotBeWrittenWhileItsStreamClosesFailsNothing() {
+        meta = new CaptureRunUnitTest.InMemoryMeta() {
+            @Override
+            public synchronized boolean advancePhysicalSourceReadOffset(
+                    String miningChainId, long epoch, ChainPosition position, boolean resumable) {
+                throw new TapstateException(io.tapstate.spi.store.IoError.DOCUMENT_TOO_LARGE,
+                        Map.of("id", miningChainId), null);
+            }
+        };
+        meta.create(CHAIN, null);
+        epoch = meta.openEpoch(CHAIN);
+        select("pipe", "orders");
+        PhysicalSourcePrefix prefix = shared("orders");
+        prefix.start(at("t0"));
+        prefix.admitted(Map.of("orders", 0L), "t1");
+
+        prefix.closing();
+        ack("pipe", "orders", 0);
+        org.assertj.core.api.Assertions.catchThrowable(prefix::tick);
+
+        assertThat(health.failure()).isEmpty();
+    }
+
+    /**
      * The shared re-check reads the store without holding the account, so a slow read never holds back the
      * thread a source hands its runs over on. Here the re-check's read is held open until the source has
      * handed over another run.
@@ -541,6 +697,28 @@ class PhysicalSourcePrefixTest {
         prefix.tick();
 
         assertThat(sourceRead()).isEqualTo("t1");
+    }
+
+    /**
+     * A pipeline that stopped selecting what a run owed it -- one that now reads the chain through a direct tail
+     * of its own -- is no longer waited for, and the run is released without it. Its own position is not moved
+     * to the run either: nothing said it landed that run, and a direct tail resumes from its own position.
+     */
+    @Test
+    void aPipelineThatStoppedSelectingWhatARunOwedItIsNotAcknowledgedForIt() {
+        select("pipe", "orders");
+        select("switching", "orders");
+        PhysicalSourcePrefix prefix = shared("orders");
+        prefix.start(at("t0"));
+        prefix.admitted(Map.of("orders", 0L), "t1");
+        ack("pipe", "orders", 0);
+
+        select("switching");
+        prefix.tick();
+
+        assertThat(sourceRead()).isEqualTo("t1");
+        assertThat(consumer("pipe").sinkAcked().token()).isEqualTo("t1");
+        assertThat(consumer("switching").sinkAcked()).as("it never landed t1").isNull();
     }
 
     /** A pipeline the chain no longer records owes nothing, and is not brought back by the release. */

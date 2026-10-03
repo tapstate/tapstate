@@ -24,6 +24,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
+import java.util.function.LongSupplier;
 
 /**
  * One reader's bounded account of the runs of changes it has handed on from its source, and the only thing
@@ -86,8 +87,23 @@ final class PhysicalSourcePrefix implements AutoCloseable {
      */
     static final long MAX_RECHECK_MILLIS = 32 * TICK_MILLIS;
 
+    /**
+     * How long a run of releases the store refuses is written again before the account stops, counted from the
+     * first refusal in a row; a release that lands ends the run.
+     *
+     * <p>A store that cannot take a write for a moment -- a primary stepping down, a dropped connection -- is
+     * waited out a turn at a time, because every write a release makes only moves forward. A store that keeps
+     * refusing has to be said out loud: it reports a write it will never take in the same words as an outage,
+     * and waiting on it for good would freeze the chain's positions, its source's acknowledgement and its logs'
+     * cutting while the pipelines read as healthy. Its size is the workload claim's default lease: once the
+     * store has refused for as long as this member's work could have been handed to another, waiting longer
+     * cannot be the right answer.
+     */
+    static final long UNWRITTEN_BOUND_MILLIS = 30_000;
+
     private static final long TICK_NANOS = TimeUnit.MILLISECONDS.toNanos(TICK_MILLIS);
     private static final long MAX_RECHECK_NANOS = TimeUnit.MILLISECONDS.toNanos(MAX_RECHECK_MILLIS);
+    private static final long UNWRITTEN_BOUND_NANOS = TimeUnit.MILLISECONDS.toNanos(UNWRITTEN_BOUND_MILLIS);
 
     private static final Set<PhysicalSourcePrefix> ACTIVE = ConcurrentHashMap.newKeySet();
     private static final ScheduledExecutorService TICKER = Executors.newSingleThreadScheduledExecutor(task -> {
@@ -109,12 +125,17 @@ final class PhysicalSourcePrefix implements AutoCloseable {
     private final String directPipeline;
     /** Cuts one table's durable log through a sequence; does nothing where there is no log to cut. */
     private final BiConsumer<String, Long> trimThrough;
+    /** The clock a run of refused releases is timed on. */
+    private final LongSupplier nanoTime;
     private final Deque<Batch> pending = new ArrayDeque<>();
     private long nextBatch;
     /** How many runs have been recorded; a re-check whose read was taken before the latest one is not used. */
     private long recorded;
     private long recheckEveryNanos = TICK_NANOS;
     private long recheckAtNanos = System.nanoTime();
+    /** Whether the last release written was refused by the store, and since when releases have been. */
+    private boolean refused;
+    private long refusedSinceNanos;
     private boolean started;
     private boolean closed;
     /** Set before the stream behind the account is closed, so whatever that close cuts short fails nothing. */
@@ -122,12 +143,13 @@ final class PhysicalSourcePrefix implements AutoCloseable {
     private RuntimeException failure;
 
     private PhysicalSourcePrefix(SrsMetaStore meta, String chainId, long epoch, CaptureHealth health,
-            String directPipeline, BiConsumer<String, Long> trimThrough) {
+            String directPipeline, BiConsumer<String, Long> trimThrough, LongSupplier nanoTime) {
         this.meta = Objects.requireNonNull(meta, "meta");
         this.chainId = Objects.requireNonNull(chainId, "chainId");
         this.health = Objects.requireNonNull(health, "health");
         this.directPipeline = directPipeline;
         this.trimThrough = Objects.requireNonNull(trimThrough, "trimThrough");
+        this.nanoTime = Objects.requireNonNull(nanoTime, "nanoTime");
         if (epoch < 1) {
             throw new IllegalArgumentException("a reader's account belongs to an opened generation, got " + epoch);
         }
@@ -145,7 +167,14 @@ final class PhysicalSourcePrefix implements AutoCloseable {
      */
     static PhysicalSourcePrefix shared(SrsMetaStore meta, String chainId, long epoch, List<String> tables,
             CaptureHealth health, BiConsumer<String, Long> trimThrough) {
-        PhysicalSourcePrefix prefix = new PhysicalSourcePrefix(meta, chainId, epoch, health, null, trimThrough);
+        return shared(meta, chainId, epoch, tables, health, trimThrough, System::nanoTime);
+    }
+
+    /** {@link #shared(SrsMetaStore, String, long, List, CaptureHealth, BiConsumer)} on a clock of the caller's. */
+    static PhysicalSourcePrefix shared(SrsMetaStore meta, String chainId, long epoch, List<String> tables,
+            CaptureHealth health, BiConsumer<String, Long> trimThrough, LongSupplier nanoTime) {
+        PhysicalSourcePrefix prefix =
+                new PhysicalSourcePrefix(meta, chainId, epoch, health, null, trimThrough, nanoTime);
         SrsMeta stored = meta.read(chainId)
                 .orElseThrow(() -> new IllegalStateException("a reader opened over a chain with no record: " + chainId));
         if (stored.epoch() != epoch) {
@@ -166,7 +195,7 @@ final class PhysicalSourcePrefix implements AutoCloseable {
     static PhysicalSourcePrefix direct(SrsMetaStore meta, String chainId, long epoch, String pipelineId,
             CaptureHealth health) {
         PhysicalSourcePrefix prefix = new PhysicalSourcePrefix(meta, chainId, epoch, health,
-                Objects.requireNonNull(pipelineId, "pipelineId"), (table, seq) -> { });
+                Objects.requireNonNull(pipelineId, "pipelineId"), (table, seq) -> { }, System::nanoTime);
         prefix.open(meta.read(chainId)
                 .orElseThrow(() -> new IllegalStateException("a reader opened over a chain with no record: " + chainId)));
         return prefix;
@@ -360,7 +389,9 @@ final class PhysicalSourcePrefix implements AutoCloseable {
                 tick();
             }
         } catch (RuntimeException error) {
-            health.fail(error);
+            if (!closing) {
+                health.fail(error);
+            }
         }
     }
 
@@ -383,7 +414,8 @@ final class PhysicalSourcePrefix implements AutoCloseable {
     /**
      * Releases what the confirmations allow, answering whether it released anything, and stops the account for
      * good on the first failure: whichever thread noticed it, every later call on the account throws the same
-     * failure rather than carry on over a chain it can no longer write down, and the run says it stopped.
+     * failure rather than carry on over a chain it can no longer write down, and the run says it stopped -- unless
+     * the stream behind the account is being closed, which is no failure of the stream that may replace it.
      */
     private boolean releaseOrStop(Collection<ConsumerOffset> consumers) {
         try {
@@ -391,7 +423,9 @@ final class PhysicalSourcePrefix implements AutoCloseable {
         } catch (RuntimeException error) {
             failure = error;
             ACTIVE.remove(this);
-            health.fail(error);
+            if (!closing) {
+                health.fail(error);
+            }
             throw error;
         }
     }
@@ -399,7 +433,8 @@ final class PhysicalSourcePrefix implements AutoCloseable {
     /**
      * Releases runs in order while they are confirmed. A store that cannot take a release this turn leaves the
      * run where it is, for the next turn to write again: every write a release makes only ever moves forward,
-     * so writing it a second time, after a failure part way through, lands where the first would have.
+     * so writing it a second time, after a failure part way through, lands where the first would have. A store
+     * that has refused releases for {@link #UNWRITTEN_BOUND_MILLIS} in a row stops the account with its refusal.
      */
     private boolean release(Collection<ConsumerOffset> consumers) {
         Map<String, ConsumerOffset> current = new LinkedHashMap<>();
@@ -413,8 +448,9 @@ final class PhysicalSourcePrefix implements AutoCloseable {
             if (first.position().token() != null) {
                 try {
                     write(first, current);
+                    refused = false;
                 } catch (TapstateException unwritten) {
-                    if (unwritten.code() == IoError.STORE_UNAVAILABLE) {
+                    if (unwritten.code() == IoError.STORE_UNAVAILABLE && !refusedForTheWholeBound()) {
                         return released;
                     }
                     throw unwritten;
@@ -424,6 +460,16 @@ final class PhysicalSourcePrefix implements AutoCloseable {
             released = true;
         }
         return released;
+    }
+
+    /** Counts one more refused release, answering whether the refusals in a row now span the whole bound. */
+    private boolean refusedForTheWholeBound() {
+        long now = nanoTime.getAsLong();
+        if (!refused) {
+            refused = true;
+            refusedSinceNanos = now;
+        }
+        return now - refusedSinceNanos >= UNWRITTEN_BOUND_NANOS;
     }
 
     /**
@@ -506,10 +552,15 @@ final class PhysicalSourcePrefix implements AutoCloseable {
             return;
         }
         // One write for the whole release, however many pipelines it was owed to: it is made on the thread the
-        // source hands its runs over on.
+        // source hands its runs over on. A pipeline is acknowledged only where its confirmation released the
+        // entry -- it still selects every table the entry owed it. One that stopped selecting them, as a
+        // pipeline turning to a direct tail of its own does, was let go of rather than heard from, and moving
+        // its position here would say it landed changes nobody saw it land.
         Map<String, ChainPosition> acknowledged = new LinkedHashMap<>();
         batch.landedAt().forEach((pipeline, landed) -> {
-            if (current.containsKey(pipeline)) {
+            ConsumerOffset consumer = current.get(pipeline);
+            if (consumer != null
+                    && batch.owed().getOrDefault(pipeline, Map.of()).keySet().stream().allMatch(consumer::selects)) {
                 acknowledged.put(pipeline, landed);
             }
         });
