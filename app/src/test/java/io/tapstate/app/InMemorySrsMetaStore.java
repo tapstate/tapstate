@@ -30,6 +30,8 @@ import java.util.Set;
 final class InMemorySrsMetaStore implements SrsMetaStore {
 
     private final Map<String, SrsMeta> records = new LinkedHashMap<>();
+    /** Per chain, the highest generation opened on it, shared or direct. */
+    private final Map<String, Long> epochsOpened = new LinkedHashMap<>();
     /** Per chain, per pipeline: the ring sequence of the last change each table's sink confirmed. */
     private final Map<String, Map<String, Map<String, Long>>> ringDone = new LinkedHashMap<>();
     /** The chains whose source read offset every table they carry can resume from. */
@@ -453,10 +455,19 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     @Override
     public synchronized long openEpoch(String miningChainId) {
         SrsMeta m = require(miningChainId);
-        long opened = m.epoch() + 1;
+        long opened = Math.max(m.epoch(), epochsOpened.getOrDefault(miningChainId, 0L)) + 1;
+        epochsOpened.put(miningChainId, opened);
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), m.sourceRead(), m.consumerOffsets(),
                 m.schemaHistory(), m.retention(), opened));
+        return opened;
+    }
+
+    @Override
+    public synchronized long openDirectEpoch(String miningChainId) {
+        SrsMeta m = require(miningChainId);
+        long opened = Math.max(m.epoch(), epochsOpened.getOrDefault(miningChainId, 0L)) + 1;
+        epochsOpened.put(miningChainId, opened);
         return opened;
     }
 

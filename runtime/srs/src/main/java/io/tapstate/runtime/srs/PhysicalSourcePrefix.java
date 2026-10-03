@@ -66,8 +66,10 @@ import java.util.function.BiConsumer;
  * still released.
  *
  * <p>A direct tail -- a read with the shared ring switched off -- uses the same account with one consumer:
- * the pipeline it streams to. It has no rings to cut and no other readers to fence against, so a release
- * writes that pipeline's acknowledgement and advances the chain's offset the way a direct tail always has.
+ * the pipeline it streams to, under a generation the stream took for itself. It has no rings to cut and no
+ * other readers to fence against. A release writes that pipeline's acknowledgement -- its own position, which
+ * its restart resumes from and its source is told -- and moves the chain's offset only while that pipeline is
+ * the only one on the chain.
  */
 final class PhysicalSourcePrefix implements AutoCloseable {
 
@@ -203,14 +205,10 @@ final class PhysicalSourcePrefix implements AutoCloseable {
      * before the first release would come back at the present, with every change it had been handed gone --
      * so the shared reader refuses. A direct tail carries on as it always has.
      *
-     * <p>A direct tail writes where it began down as the chain's position only on a chain that holds no offset
-     * yet and that no other pipeline is on. It reads for its own pipeline alone and begins where that
-     * pipeline's own load did, so its start says nothing about where the chain stands for anybody else.
-     * Written over a position a pipeline stopped with its state kept still holds, it would become where that
-     * pipeline resumes, past the changes it is owed. Written beside a pipeline whose load is still running, it
-     * would become where that pipeline's reader opens, past the changes made after that load read its rows.
-     * Beside another pipeline, a direct tail with no load of its own writes its start down for its own
-     * pipeline instead, where only its own restart reads it.
+     * <p>A direct tail writes where it began down for its own pipeline, and never as the chain's position: it
+     * reads for that pipeline alone, so its start says nothing about where the chain stands for anybody else,
+     * and its own restart picks up there until a change of its has landed. A start a load of it, or a
+     * write-back, already recorded stays as it is.
      */
     synchronized void start(Optional<SourcePosition> position) {
         checkOpen();
@@ -227,21 +225,13 @@ final class PhysicalSourcePrefix implements AutoCloseable {
             return;
         }
         if (directPipeline != null) {
-            Optional<SrsMeta> record = meta.read(chainId);
-            if (record.map(SrsMeta::sourceReadOffset).isPresent()) {
-                return;
+            if (meta.read(chainId).flatMap(record -> record.consumerOffset(directPipeline))
+                    .map(ConsumerOffset::cdcStartPosition).isEmpty()) {
+                meta.setCdcStart(chainId, directPipeline, token, 0L);
             }
-            if (record.isPresent() && record.get().consumerOffsets().stream()
-                    .anyMatch(consumer -> !directPipeline.equals(consumer.pipelineId()))) {
-                // A start a load already recorded is that load's seam, and stays as it is.
-                if (record.get().consumerOffset(directPipeline).map(ConsumerOffset::cdcStartPosition).isEmpty()) {
-                    meta.setCdcStart(chainId, directPipeline, token, 0L);
-                }
-                return;
-            }
+            return;
         }
-        boolean anchored = meta.establishPhysicalAnchor(chainId, new ChainPosition(new SourceOrder(epoch, -1L), token));
-        if (!anchored && directPipeline == null) {
+        if (!meta.establishPhysicalAnchor(chainId, new ChainPosition(new SourceOrder(epoch, -1L), token))) {
             throw lostOrUnverified();
         }
     }
@@ -494,26 +484,22 @@ final class PhysicalSourcePrefix implements AutoCloseable {
         ChainPosition position = batch.position();
         ChainPosition resumeAt = batch.resumeAt();
         if (directPipeline != null) {
+            // Its own pipeline's position first: it is what a restart of this tail resumes from, and what its
+            // source may be told to release up to.
             ChainPosition landed = batch.landedAt().get(directPipeline);
             if (landed != null) {
                 meta.advanceSinkAcked(chainId, directPipeline, landed);
             }
-            ConsumerOffset own = current.get(directPipeline);
-            List<ConsumerOffset> withThisEntry = current.values().stream()
-                    .map(consumer -> consumer == own ? consumer.withSinkAcked(position) : consumer)
-                    .toList();
-            // A position held back to another consumer's is that consumer's run, not this one: nothing says it
-            // carried a change, so it is not made a resume point.
-            SrsDurableFrontier.safeAdvance(position, own == null ? List.of() : withThisEntry).ifPresent(safe -> {
-                if (!safe.equals(position) || resumeAt == null) {
-                    meta.advanceSourceReadOffset(chainId, safe, false);
-                    return;
-                }
-                if (!resumeAt.equals(position)) {
+            // The chain's position only while its pipeline is the only one on the chain: it then stands for
+            // nobody else, and a pipeline that turns the buffering on later picks up there. Beside another, it
+            // is the shared reader's to move, and a direct tail's positions -- in a generation and a count of
+            // its own -- would only be ranked against that reader's by accident.
+            if (current.size() == 1 && current.containsKey(directPipeline)) {
+                if (resumeAt != null && !resumeAt.equals(position)) {
                     meta.advanceSourceReadOffset(chainId, resumeAt, true);
                 }
-                meta.advanceSourceReadOffset(chainId, position, resumeAt.equals(position));
-            });
+                meta.advanceSourceReadOffset(chainId, position, position.equals(resumeAt));
+            }
             return;
         }
         // One write for the whole release, however many pipelines it was owed to: it is made on the thread the

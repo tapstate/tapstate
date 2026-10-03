@@ -13,6 +13,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 /**
  * Tells the source of every tail this process runs how far it may release its change log.
@@ -32,6 +33,12 @@ import java.util.concurrent.TimeUnit;
  *
  * <p>A read that fails is tried again at the next interval. It costs the source some log for a while longer and
  * nothing else, so it is counted on the run's health as a failed acknowledgement and never fails the run.
+ *
+ * <p>A tail reading its source directly for one pipeline is told that pipeline's own position instead: where
+ * the last of its changes that landed sat, or the chain's offset where its own stream wrote that, as it does
+ * while its pipeline is the only one on the chain -- runs that carried no change included. The chain's offset
+ * moved by anybody else says nothing about what this pipeline landed: beside a shared reader it is that
+ * reader's, released on its own pipelines' word.
  */
 final class SourceAcknowledgements {
 
@@ -60,35 +67,55 @@ final class SourceAcknowledgements {
      * {@code tail} -- closing it stops the following as well as the tail.
      */
     static Subscription follow(SrsMetaStore meta, String chainId, Subscription tail, CaptureHealth health) {
-        Followed followed = new Followed(meta, chainId, tail, health);
+        return follow(() -> meta.durableSourceRead(chainId), tail, health);
+    }
+
+    /**
+     * Starts following {@code tail}, a tail reading {@code chainId}'s source directly for {@code pipelineId}
+     * alone, under generation {@code epoch}: hands it that pipeline's own durable position now, and every
+     * interval after.
+     */
+    static Subscription followDirect(SrsMetaStore meta, String chainId, String pipelineId, long epoch,
+            Subscription tail, CaptureHealth health) {
+        return follow(() -> {
+            Optional<ChainPosition> chain = meta.durableSourceRead(chainId);
+            if (chain.isPresent() && chain.get().order() != null && chain.get().order().epoch() == epoch) {
+                // Written by this very stream, while its pipeline was the only one on the chain.
+                return chain;
+            }
+            return meta.durableSinkAcked(chainId, pipelineId);
+        }, tail, health);
+    }
+
+    private static Subscription follow(Supplier<Optional<ChainPosition>> durable, Subscription tail,
+            CaptureHealth health) {
+        Followed followed = new Followed(durable, tail, health);
         FOLLOWED.add(followed);
         followed.handOverQuietly();
         return followed;
     }
 
-    /** One tail being told its chain's durable position. */
+    /** One tail being told its durable position. */
     static final class Followed implements Subscription {
 
-        private final SrsMetaStore meta;
-        private final String chainId;
+        private final Supplier<Optional<ChainPosition>> durablePosition;
         private final Subscription tail;
         private final CaptureHealth health;
         private ChainPosition handed;
         private volatile boolean closed;
 
-        private Followed(SrsMetaStore meta, String chainId, Subscription tail, CaptureHealth health) {
-            this.meta = Objects.requireNonNull(meta, "meta");
-            this.chainId = Objects.requireNonNull(chainId, "chainId");
+        private Followed(Supplier<Optional<ChainPosition>> durablePosition, Subscription tail, CaptureHealth health) {
+            this.durablePosition = Objects.requireNonNull(durablePosition, "durablePosition");
             this.tail = Objects.requireNonNull(tail, "tail");
             this.health = Objects.requireNonNull(health, "health");
         }
 
-        /** Reads the chain's durable position once, and hands it over when it is one the tail was not handed. */
+        /** Reads the durable position once, and hands it over when it is one the tail was not handed. */
         private synchronized void handOver() {
             if (closed) {
                 return;
             }
-            Optional<ChainPosition> durable = meta.durableSourceRead(chainId);
+            Optional<ChainPosition> durable = durablePosition.get();
             if (durable.isEmpty() || durable.get().token() == null || durable.get().equals(handed)) {
                 return;
             }

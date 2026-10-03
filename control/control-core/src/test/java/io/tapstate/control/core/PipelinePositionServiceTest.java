@@ -126,6 +126,31 @@ class PipelinePositionServiceTest {
         assertThat(chain.recordedAt()).isEqualTo("2026-09-03T10:12:44Z");
     }
 
+    /**
+     * A pipeline reading the chain's source directly resumes from a position of its own -- what it landed, or
+     * where it began -- and the reading reports that one. The chain's own position belongs to the shared reader,
+     * which moves it on the word of the pipelines reading through the ring alone.
+     */
+    @Test
+    void reportsWhereAPipelineReadingDirectlyResumesRatherThanWhereTheChainDoes() {
+        onOneChain("orders_direct");
+        meta.put(new SrsMeta(CHAIN, new ChainPosition(new SourceOrder(4L, 70L), "mysql-bin.000009:1"),
+                List.of(direct("orders_direct", new ChainPosition(new SourceOrder(5L, 3L), "mysql-bin.000004:100"),
+                                "mysql-bin.000004:1"),
+                        new ConsumerOffset("orders_sync", Map.of(), null)),
+                List.of(), null, 4L, WRITTEN_AT));
+
+        assertThat(service.read("orders_direct").chains().getFirst().resumeFrom())
+                .as("what it landed").isEqualTo(new PipelinePosition.Point("mysql-bin.000004:100", 5L, 3L));
+
+        meta.put(new SrsMeta(CHAIN, new ChainPosition(new SourceOrder(4L, 70L), "mysql-bin.000009:1"),
+                List.of(direct("orders_direct", null, "mysql-bin.000004:1")), List.of(), null, 4L, WRITTEN_AT));
+
+        assertThat(service.read("orders_direct").chains().getFirst().resumeFrom())
+                .as("where it began, while it has landed nothing")
+                .isEqualTo(PipelinePosition.Point.at("mysql-bin.000004:1"));
+    }
+
     // ------------------------------------------------------------ writing back
 
     @Test
@@ -180,6 +205,40 @@ class PipelinePositionServiceTest {
         assertThat(mine.snapshotCompletedTables()).containsExactly("orders");
         assertThat(mine.cdcStartPosition()).isEqualTo("mysql-bin.000003:1");
         assertThat(mine.snapshotEpoch()).isEqualTo(2L);
+    }
+
+    /**
+     * Writing back where a pipeline reading directly resumes moves its own position and nobody else's: the
+     * chain's position, and what the pipelines reading through the ring landed, stay as they were.
+     */
+    @Test
+    void movesOnlyItsOwnPositionForAPipelineReadingDirectly() {
+        onOneChain("orders_direct");
+        chains.put("orders_sync", List.of(new PipelineChains.Chain(CHAIN, "shop_db", List.of("orders"))));
+        artifacts.put(pipeline("orders_sync", "shop_db"));
+        atRest("orders_direct");
+        atRest("orders_sync");
+        ChainPosition theirs = new ChainPosition(new SourceOrder(4L, 60L), "mysql-bin.000008:1");
+        meta.put(new SrsMeta(CHAIN, new ChainPosition(new SourceOrder(4L, 70L), "mysql-bin.000009:1"),
+                List.of(direct("orders_direct", new ChainPosition(new SourceOrder(5L, 3L), "mysql-bin.000004:100"),
+                                "mysql-bin.000004:1"),
+                        new ConsumerOffset("orders_sync", Map.of(), theirs)),
+                List.of(), null, 4L, WRITTEN_AT));
+
+        PipelinePosition after = service.writeBack("alice", "orders_direct",
+                new PipelinePosition("orders_direct",
+                        List.of(PipelinePosition.Chain.resumingAt(CHAIN, "mysql-bin.000002:4"))));
+
+        assertThat(meta.rewinds).as("the chain's own position is the shared reader's").isEmpty();
+        assertThat(after.chains().getFirst().resumeFrom().token()).isEqualTo("mysql-bin.000002:4");
+        List<ConsumerOffset> consumers = meta.read(CHAIN).orElseThrow().consumerOffsets();
+        ConsumerOffset mine = consumers.stream()
+                .filter(offset -> offset.pipelineId().equals("orders_direct")).findFirst().orElseThrow();
+        assertThat(mine.sinkAcked()).isNull();
+        assertThat(mine.cdcStartPosition()).isEqualTo("mysql-bin.000002:4");
+        assertThat(mine.selectedTables()).as("still read directly").isEmpty();
+        assertThat(consumers.stream().filter(offset -> offset.pipelineId().equals("orders_sync")).findFirst()
+                .orElseThrow().sinkAcked()).as("what the other pipeline landed").isEqualTo(theirs);
     }
 
     @Test
@@ -331,6 +390,11 @@ class PipelinePositionServiceTest {
                 new PipelineChains.Chain(CHAIN, "shop_db", List.of("orders", "items"))));
         artifacts.put(source("shop_db"));
         artifacts.put(pipeline(pipelineId, "shop_db"));
+    }
+
+    /** A pipeline recorded reading the chain through a direct tail of its own: it selects nothing from the ring. */
+    private static ConsumerOffset direct(String pipelineId, ChainPosition landed, String began) {
+        return new ConsumerOffset(pipelineId, Map.of(), landed, List.of(), began, 0L, List.of(), 5L, Map.of());
     }
 
     private static SrsMeta seeded(String token) {

@@ -124,6 +124,13 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     static final String SOURCE_RESUME_SEQ = "sourceResumeSeq";
     static final String SOURCE_RESUME_AT = "sourceResumeAt";
 
+    /**
+     * The highest generation opened on the chain, by its shared reader or by a stream of a tail reading its
+     * source directly. Absent on a record written before direct tails took generations of their own, which
+     * reads as the chain's own generation.
+     */
+    static final String EPOCHS_OPENED = "epochsOpened";
+
     /** The generation, revision and tables of the one subscription the chain's reader holds on its source. */
     static final String PHYSICAL_CAPTURE_EPOCH = "physicalCaptureEpoch";
     static final String PHYSICAL_CAPTURE_REVISION = "physicalCaptureRevision";
@@ -1409,17 +1416,51 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     @Override
     public long openEpoch(String miningChainId) {
         Objects.requireNonNull(miningChainId, "miningChainId");
-        // An atomic increment read back after the write: two members opening the same chain must take two
+        // An atomic advance read back after the write: two members opening the same chain must take two
         // different generations, so the counter is advanced by the store rather than read, added to and
-        // written back. It touches only epoch, leaving every pinned pipeline snapshot generation where it is.
+        // written back. It moves past every generation a direct tail took as well, and touches nothing else,
+        // leaving every pinned pipeline snapshot generation where it is.
         Document updated = writeChainWithConsumerMigration(miningChainId, () -> collection.findOneAndUpdate(
                 new Document("_id", miningChainId),
-                new Document("$inc", new Document("epoch", 1L)),
+                List.of(new Document("$set", new Document(EPOCHS_OPENED, nextGeneration())),
+                        new Document("$set", new Document("epoch", "$" + EPOCHS_OPENED))),
                 new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER)));
         if (updated == null) {
             throw unseededChain(miningChainId);
         }
         return readEpoch(updated, "epoch");
+    }
+
+    @Override
+    public long openDirectEpoch(String miningChainId) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        // The same advance, with the chain's own generation left where it is: that one is the shared reader's.
+        Document updated = writeChainWithConsumerMigration(miningChainId, () -> collection.findOneAndUpdate(
+                new Document("_id", miningChainId),
+                List.of(new Document("$set", new Document(EPOCHS_OPENED, nextGeneration()))),
+                new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER)));
+        if (updated == null) {
+            throw unseededChain(miningChainId);
+        }
+        return readEpoch(updated, EPOCHS_OPENED);
+    }
+
+    /** One past the highest generation the record says was opened, shared or direct. */
+    private static Document nextGeneration() {
+        return new Document("$add", List.of(new Document("$max", List.of(
+                new Document("$ifNull", List.of("$epoch", 0L)),
+                new Document("$ifNull", List.of("$" + EPOCHS_OPENED, 0L)))), 1L));
+    }
+
+    @Override
+    public Optional<ChainPosition> durableSinkAcked(String miningChainId, String pipelineId) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(pipelineId, PIPELINE_ID);
+        Document consumer = StoreIo.call(() -> consumers.withReadConcern(ReadConcern.MAJORITY)
+                .find(consumerKey(miningChainId, pipelineId))
+                .projection(Projections.include("sinkAckedEpoch", "sinkAckedSeq", "sinkAckedSrcpos"))
+                .first());
+        return consumer == null ? Optional.empty() : Optional.ofNullable(sinkAckedFrom(consumer));
     }
 
     /**

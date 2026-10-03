@@ -17,23 +17,18 @@ import java.util.Optional;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * The persisted source read offset never moves backwards.
+ * The persisted source read offset never moves backwards, and a tail reading its source directly stops
+ * writing it once another pipeline is on the chain.
  *
  * <p>The offset is written down as the source's own token, but it is <em>ranked</em> by the order the
- * engine assigned as it read -- the pair (generation, sequence). A direct tail's account writes it clamped
- * so it never passes the lowest position any consumer on the chain has durably landed, and that clamp is
- * where a rewind comes from: the minimum it resolves to falls as soon as a consumer further behind joins the
- * chain, while nothing about the falling is visible at the time.
+ * engine assigned as it read -- the pair (generation, sequence). A direct tail numbers only its own changes,
+ * under a generation of its own; its positions mean nothing against another pipeline's, and a direct tail
+ * that went on writing the chain's offset beside one ranked the two by accident -- falling back as soon as a
+ * pipeline further behind joined, while nothing about the falling was visible at the time. So it writes the
+ * chain's offset only while its pipeline is the only one on the chain, and its own position always.
  *
- * <p>Nothing about a rewind announces itself: the write succeeds, the run keeps going, and the loss
- * shows up only on the next restart, which resumes from the earlier position and re-mines -- or, once the
- * source has aged past it, cannot.
- *
- * <p>What stops it is the store's own guarantee that this value only ever moves forward. The guarantee
- * is on the store rather than on its callers because the caller resolving the rewinding candidate is
- * behaving correctly: clamping to the slowest sink is exactly what keeps unlanded changes re-minable. The
- * fake here honours that contract, as any implementation must; the real one is held to it against a live
- * database by {@code MongoSrsMetaStoreIT}.
+ * <p>The store's own guarantee that this value only ever moves forward still stands behind every writer; the
+ * real one is held to it against a live database by {@code MongoSrsMetaStoreIT}.
  */
 class SourceReadOffsetOnlyMovesForwardTest {
 
@@ -41,7 +36,7 @@ class SourceReadOffsetOnlyMovesForwardTest {
     private static final long GENERATION = 1L;
 
     @Test
-    void doesNotRewindWhenASlowerConsumerJoinsAndDropsTheClamp() {
+    void aDirectTailLeavesTheChainsOffsetAloneOnceAnotherPipelineJoins() {
         AdvanceOnlyMeta meta = new AdvanceOnlyMeta();
         PhysicalSourcePrefix account = PhysicalSourcePrefix.direct(meta, CHAIN, GENERATION, "p1", new CaptureHealth());
         try {
@@ -51,8 +46,8 @@ class SourceReadOffsetOnlyMovesForwardTest {
             }
             assertThat(meta.current()).isEqualTo("s5");
 
-            // A second pipeline joins the chain and its sink is further behind. The clamp now resolves to
-            // its position, which is a place this chain has already read past.
+            // A second pipeline joins the chain and its sink is further behind: its position is a place this
+            // chain has already read past, and counted in another sequence than this tail's.
             meta.consumers.add(new ConsumerOffset(
                     "p2", Map.of("orders", 1L), new ChainPosition(new SourceOrder(GENERATION, 1), "s2")));
             landAndRecord(meta, account, 6);
@@ -61,12 +56,9 @@ class SourceReadOffsetOnlyMovesForwardTest {
         }
 
         assertThat(meta.advances)
-                .as("the clamp resolved backwards once the slower consumer joined, so the guarantee was asked")
-                .endsWith("s2");
-        assertThat(meta.current())
-                .as("persisted offset after the slower consumer joined; every advance in order was %s",
-                        meta.advances)
-                .isEqualTo("s5");
+                .as("the chain's offset, written while the direct pipeline was the only one on the chain")
+                .containsExactly("s1", "s2", "s3", "s4", "s5");
+        assertThat(meta.current()).isEqualTo("s5");
     }
 
     /**
@@ -154,7 +146,7 @@ class SourceReadOffsetOnlyMovesForwardTest {
         @Override
         public void setCdcStart(
                 String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch) {
-            throw new UnsupportedOperationException();
+            // Where the direct pipeline's own stream began; not what is under test.
         }
 
         @Override

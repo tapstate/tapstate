@@ -45,9 +45,10 @@ import java.util.function.Supplier;
  * same way and streams straight to the one consumer, with no ring. See {@link #start} for the exact ordering.
  *
  * <p><strong>{@code srs.enabled} decides the buffering and nothing else.</strong> Any tail opens the chain
- * and keeps its durable record, so where a tail resumes from does not depend on the flag: a pipeline that
- * turns the buffering off keeps the position it had, and one that turns it back on finds it still there.
- * The alternative is a second account to move a position between, and the move is the step that loses one.
+ * and keeps its durable record, so a pipeline that turns the buffering off keeps the position it had, and
+ * one that turns it back on finds it still there: a direct tail resumes from the chain's position when it
+ * has none of its own yet, and writes the chain's position as it goes while its pipeline is the only one on
+ * the chain. Beside another pipeline its position is its own -- see {@link #tailStart}.
  *
  * <p>What the flag does decide is where a run with nothing recorded begins, because the two paths read
  * {@code start_from} in different coordinates: a direct tail resolves it against the source's own log,
@@ -227,11 +228,18 @@ public final class CaptureRunUnit {
         }
         state.chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
         // Only the member that runs the tail opens a generation; an attachment reads the one that tail
-        // writes under.
-        ProvisionOutcome provisioned = startTail
-                ? coordinator.provisionSource(
-                        spec.sourceId(), state.chainId, spec.config().streams(), spec.retention())
-                : coordinator.joinSource(spec.sourceId(), state.chainId, spec.config().streams());
+        // writes under. A tail reading the source directly takes a generation of its own for each stream and
+        // leaves the chain's to the shared reader, which writes and is fenced under it.
+        ProvisionOutcome provisioned;
+        if (!startTail) {
+            provisioned = coordinator.joinSource(spec.sourceId(), state.chainId, spec.config().streams());
+        } else if (plan.directTail()) {
+            provisioned = coordinator.provisionDirect(
+                    spec.sourceId(), state.chainId, spec.config().streams(), spec.retention());
+        } else {
+            provisioned = coordinator.provisionSource(
+                    spec.sourceId(), state.chainId, spec.config().streams(), spec.retention());
+        }
         state.merged = provisioned.merged();
         state.epoch = provisioned.epoch();
         state.chainCreated = !state.merged;
@@ -773,10 +781,11 @@ public final class CaptureRunUnit {
      * Opens a direct tail: the source streamed straight to this one pipeline, with no shared ring.
      *
      * <p>The ring is the whole of what the flag decides -- the chain is open and its record is kept either
-     * way -- so this tail begins where that record says, exactly as a buffered one does. Taking the present
-     * here instead is a silent loss: the tail comes up healthy and every change between where it had reached
-     * and now is gone. Its runs go through an account of their own, owed to this pipeline alone, so a
-     * position is written down only once every change before it landed on every table the tail reads.
+     * way -- so this tail begins where that record says: its pipeline's own position first, then the chain's.
+     * Taking the present here instead is a silent loss: the tail comes up healthy and every change between
+     * where it had reached and now is gone. Its runs go through an account of their own, owed to this
+     * pipeline alone, so a position is written down only once every change before it landed on every table
+     * the tail reads; and its source is told that pipeline's own position, never one a shared reader moved.
      */
     private Subscription openDirectTail(CaptureRunSpec spec, String chainId, long epoch, String ownSeam,
             CaptureHealth health, Consumer<Envelope> passthrough) {
@@ -801,24 +810,23 @@ public final class CaptureRunUnit {
             prefix.close();
             throw failure;
         }
-        return SourceAcknowledgements.follow(meta, chainId, CdcPhase.closingWith(stream, prefix), health);
+        return SourceAcknowledgements.followDirect(
+                meta, chainId, spec.pipelineId(), epoch, CdcPhase.closingWith(stream, prefix), health);
     }
 
     /**
      * Forwards one run of changes straight to the consumer and records how far the source has been read.
      *
      * <p>Each change is stamped with its order before it leaves. A direct tail has no ring, and a buffered
-     * change takes its order from the ring's sequence, so the count of changes this run has forwarded
-     * stands in for it: monotonic within the generation the chain opened, and taken afresh whenever a new
-     * one is. Leaving the order off is not the neutral choice it looks like -- every node that ranks
-     * positions drops one carrying none, so an unstamped tail is one nothing downstream can ever confirm,
-     * and an account nothing confirms never moves.
+     * change takes its order from the ring's sequence, so the count of changes this stream has forwarded
+     * stands in for it, under the generation the stream took for itself: no earlier stream numbered under it,
+     * so a confirmation of an earlier one can never stand for a change of this one. Leaving the order off is
+     * not the neutral choice it looks like -- every node that ranks positions drops one carrying none, so an
+     * unstamped tail is one nothing downstream can ever confirm, and an account nothing confirms never moves.
      *
-     * <p><strong>A forwarded count and a ring sequence are not the same quantity.</strong> A chain read
-     * both ways at once therefore has two consumers counting differently, and the only thing ever done
-     * with the two is to take the lower: the chain reads as the slower of them, which re-mines more than
-     * it has to and can never skip. That direction is the one that cannot lose data, which is why the
-     * mismatch is affordable and worth saying out loud.
+     * <p><strong>A forwarded count and a ring sequence are not the same quantity</strong>, and the two are
+     * never ranked against each other: this tail's account answers to its own pipeline's confirmations alone,
+     * and writes the chain's position only while that pipeline is the only one on the chain.
      *
      * <p>The position the source named for the run rides with the change that closes it and no other,
      * exactly as it does through the ring. Carried on the earlier ones it would say of each that the source
@@ -914,8 +922,7 @@ public final class CaptureRunUnit {
      *       changed is left at the value the load saw;</li>
      *   <li>no read offset but this pipeline's recorded seam — its snapshot ran and the tail has not
      *       advanced past where that snapshot began, so it starts at the seam and the idempotent sink
-     *       absorbs the overlap. A direct tail that loads nothing records where it began here too, when
-     *       another pipeline is on the chain and its start is therefore not written down as the chain's;</li>
+     *       absorbs the overlap;</li>
      *   <li>none of those — nothing has read this chain, so {@code firstRun} decides: the start the
      *       caller resolved for a run that has no position to pick up from.</li>
      * </ol>
@@ -923,13 +930,15 @@ public final class CaptureRunUnit {
      * <p>That order is the shared reader's. The resume point cannot have run past this run's own seam while its
      * load ran: the pipeline is on the chain, with the tables it reads selected and asked of the reader, before
      * its load samples the seam, so every run handed over after that owes it those tables' changes and is not
-     * released before it lands them, and a direct tail starting beside it does not write its start down as the
-     * chain's position.
+     * released before it lands them, and no direct tail writes its start down as the chain's position.
      *
-     * <p>A direct tail ({@code seamFirst}) puts its own seam first instead. It serves its own pipeline alone,
-     * and the chain's runs do not wait for that pipeline: a shared reader on the same chain may have moved the
-     * resume point past the seam while the load ran, and beginning there would skip, for this pipeline, the
-     * changes in between, which its load did not cover.
+     * <p>A direct tail ({@code seamFirst}) keeps a position of its own, and resumes from it before the chain's:
+     * the seam of a load that just ran here; then the last of its own changes its pipeline landed; then where it
+     * last began, or where a load of it or a write-back last put it; only then the chain's resume point, which a
+     * record written before direct tails kept their own holds; then {@code firstRun}. It serves its own pipeline
+     * alone, and the chain's runs do not wait for that pipeline: a shared reader on the same chain moves the
+     * resume point on its own pipelines' word, past changes this one forwarded and never landed, and beginning
+     * there would skip them for good.
      *
      * <p>Taking the present in any of the first three states is the silent loss this exists to prevent:
      * the tail comes up healthy, and every change between where it had reached and now is simply gone.
@@ -941,8 +950,19 @@ public final class CaptureRunUnit {
             String ownSnapshotSeam,
             boolean seamFirst,
             CaptureStart firstRun) {
-        if (seamFirst && ownSnapshotSeam != null) {
-            return CaptureStart.resume(new SourcePosition(ownSnapshotSeam));
+        if (seamFirst) {
+            if (ownSnapshotSeam != null) {
+                return CaptureStart.resume(new SourcePosition(ownSnapshotSeam));
+            }
+            Optional<ConsumerOffset> own = meta.read(miningChainId).flatMap(record -> record.consumerOffset(pipelineId));
+            String landed = own.map(ConsumerOffset::sinkAcked).map(ChainPosition::token).orElse(null);
+            if (landed != null) {
+                return CaptureStart.resume(new SourcePosition(landed));
+            }
+            String began = own.map(ConsumerOffset::cdcStartPosition).orElse(null);
+            if (began != null) {
+                return CaptureStart.resume(new SourcePosition(began));
+            }
         }
         Optional<String> resumeFrom = meta.resumeOffset(miningChainId);
         if (resumeFrom.isPresent()) {

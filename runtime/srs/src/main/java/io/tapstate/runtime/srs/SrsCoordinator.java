@@ -99,6 +99,38 @@ public final class SrsCoordinator {
     }
 
     /**
+     * Opens the chain for a tail that reads its source directly, for one pipeline, and takes that stream a
+     * generation of its own -- above every generation opened on the chain before, and never the chain's own.
+     *
+     * <p>The chain's own generation is the one its shared reader writes, and is fenced, under, and the one a
+     * member joining the chain reads under. A direct tail writes nothing anybody else reads in it: it numbers
+     * the changes it forwards to its one pipeline, and needs only that no earlier stream of it numbered under
+     * the same generation, so that a confirmation of an earlier stream can never stand for a change of this
+     * one. Taking the chain's next generation instead stopped a shared reader on another member, and merging
+     * onto the one running here handed a restarted direct tail the generation its last stream had numbered
+     * under. The chain is seeded when it has no record, and this member keeps it open for as long as the
+     * pipeline is on it, neither mining it nor joined to it.
+     */
+    public synchronized ProvisionOutcome provisionDirect(
+            String sourceId, MiningChainId chainId, List<String> streams, String retention) {
+        Objects.requireNonNull(sourceId, "sourceId");
+        Objects.requireNonNull(chainId, "chainId");
+        Objects.requireNonNull(streams, "streams");
+        ChainState state = chains.get(chainId.value());
+        boolean merged = state != null;
+        if (state == null) {
+            if (meta.read(chainId.value()).isEmpty()) {
+                meta.create(chainId.value(), retention);
+            }
+            state = new ChainState(chainId, 0L, false);
+            chains.put(chainId.value(), state);
+        }
+        state.sources.add(sourceId);
+        state.tables.addAll(streams);
+        return new ProvisionOutcome(chainId, merged, List.copyOf(state.tables), meta.openDirectEpoch(chainId.value()));
+    }
+
+    /**
      * Joins a chain for a source read here while this member does not mine it: another member runs the
      * tail, and pipelines driven here read the ring that tail writes. Returns the chain's table set after
      * this source and the generation to read under, and always answers as a merge -- the chain was open
@@ -136,6 +168,10 @@ public final class SrsCoordinator {
             long running = meta.read(chainId.value()).map(SrsMeta::epoch).orElse(0L);
             if (running > state.epoch) {
                 state.epoch = running;
+            }
+            if (state.epoch < 1) {
+                throw new IllegalStateException(
+                        "mining chain has no ring generation open to join: " + chainId.value());
             }
         }
         state.sources.add(sourceId);
@@ -254,8 +290,9 @@ public final class SrsCoordinator {
     /**
      * One mining chain's single-node coordination state: its member sources, unioned tables, consumers, and
      * the ring generation this member reads under -- the one it opened where it mines the chain, the one
-     * already running where it joined a chain another member mines. The generation is held here so every
-     * source that merges onto the chain reads under the one already running rather than taking its own.
+     * already running where it joined a chain another member mines, and none where it only keeps the chain
+     * open for tails that read the source directly. The generation is held here so every source that merges
+     * onto the chain reads under the one already running rather than taking its own.
      */
     private static final class ChainState {
         private final MiningChainId chainId;

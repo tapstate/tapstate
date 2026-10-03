@@ -1002,6 +1002,97 @@ class CaptureRunUnitTest {
     }
 
     /**
+     * A pipeline reading the source directly beside one reading it through the shared ring keeps a position of
+     * its own: it comes back from what it landed, and its source is told nothing past that. The shared reader
+     * owes it nothing and moves the chain's position on its own pipelines' word alone -- here past a change the
+     * direct pipeline forwarded and never landed. Resumed from the chain's position, or with its source told
+     * it, the direct pipeline would never read that change again.
+     */
+    @Test
+    void aDirectTailBesideASharedReaderComesBackFromWhatItLandedItself() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRunSpec direct = directSpecOver("pipe-d", "k-beside", "orders");
+        String chainId = MiningChainId.resolve(direct.config(), direct.srsKey()).value();
+        FakeSource directSource = new FakeSource(List.of(), List.of(change(10), change(20)));
+        CaptureRun directRun = runUnit(directSource, meta).start(direct, event -> {
+            if (Integer.valueOf(10).equals(event.after().get("id"))) {
+                meta.advanceTableSinkAcked(chainId, "pipe-d", event.src(), event.position());
+            }
+        });
+        awaitAcked(meta, chainId, "pipe-d", "src-10");
+
+        CaptureRun shared = runUnit(new FakeSource(List.of(), List.of(change(30))), meta)
+                .start(specOver("pipe-s", "k-beside", "orders"), e -> { });
+        long epoch = meta.read(chainId).orElseThrow().epoch();
+        meta.advanceTableSinkAcked(chainId, "pipe-s", "orders", new ChainPosition(new SourceOrder(epoch, 0), "src-30"));
+        awaitSourceRead(meta, chainId, "src-30");
+        ((SourceAcknowledgements.Followed) directRun.cdcSubscription().orElseThrow()).handOverQuietly();
+
+        assertThat(directSource.acknowledged.getLast())
+                .as("what the direct pipeline's source was told it may release")
+                .doesNotContain(new SourcePosition("src-30"))
+                .last().isEqualTo(new SourcePosition("src-10"));
+        shared.close();
+        directRun.close();
+
+        FakeSource again = new FakeSource(List.of(), List.of());
+        runUnit(again, meta).start(direct, e -> { }).close();
+        assertThat(again.cdcStart).as("where the direct pipeline comes back")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("src-10")));
+    }
+
+    /**
+     * A pipeline reading the source directly on another member takes a generation of its own and leaves the
+     * chain's alone. The chain's generation is what the shared reader writes, and is fenced, under: moved on by
+     * a tail that is not reading for the ring, it would stop the reader every pipeline on the ring depends on.
+     */
+    @Test
+    void aDirectTailOnAnotherMemberLeavesTheSharedReadersGenerationAlone() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRun shared = runUnit(new FakeSource(List.of(), List.of(change(30))), meta)
+                .start(specOver("pipe-s", "k-elsewhere", "orders"), e -> { });
+        String chainId = shared.chainId().orElseThrow().value();
+        long epoch = meta.read(chainId).orElseThrow().epoch();
+
+        CaptureRun direct = runUnit(new FakeSource(List.of(), List.of()), meta)
+                .start(directSpecOver("pipe-d", "k-elsewhere", "orders"), e -> { });
+
+        assertThat(meta.read(chainId).orElseThrow().epoch())
+                .as("the generation the shared reader writes under").isEqualTo(epoch);
+        meta.advanceTableSinkAcked(chainId, "pipe-s", "orders", new ChainPosition(new SourceOrder(epoch, 0), "src-30"));
+        awaitSourceRead(meta, chainId, "src-30");
+        assertThat(shared.health().failure()).as("and the shared reader goes on").isEmpty();
+        direct.close();
+        shared.close();
+    }
+
+    /**
+     * A direct tail started again beside another pipeline that keeps the chain open on this member numbers its
+     * changes afresh, under a generation of its own -- so a confirmation of its last stream, landing late,
+     * cannot confirm a change of the new one that sits at the same count.
+     */
+    @Test
+    void aDirectTailStartedAgainIsNotConfirmedByItsLastStream() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRunUnit unit = runUnit(new FakeSource(List.of(), List.of(change(10), change(11))), meta);
+        CaptureRun other = unit.start(directSpecOver("pipe-other", "k-again", "orders"), e -> { });
+        List<Envelope> forwarded = new CopyOnWriteArrayList<>();
+        CaptureRun first = unit.start(directSpecOver("pipe-d", "k-again", "orders"), forwarded::add);
+        String chainId = first.chainId().orElseThrow().value();
+        Envelope neverLanded = forwarded.getLast();
+        first.close();
+
+        CaptureRun again = unit.start(directSpecOver("pipe-d", "k-again", "orders"), e -> { });
+        meta.advanceTableSinkAcked(chainId, "pipe-d", "orders", neverLanded.position());
+        Thread.sleep(10 * PhysicalSourcePrefix.TICK_MILLIS);
+
+        assertThat(meta.read(chainId).orElseThrow().consumerOffset("pipe-d").orElseThrow().sinkAcked())
+                .as("what the pipeline is recorded as having landed: nothing of the new stream has").isNull();
+        again.close();
+        other.close();
+    }
+
+    /**
      * A direct tail -- {@code srs.enabled:false} -- begins where the durable record says, exactly as a
      * shared-ring tail does.
      *
@@ -1061,8 +1152,8 @@ class CaptureRunUnitTest {
     }
 
     /**
-     * The case above with the sink removed: nothing has landed, so nothing read is written down -- the
-     * offset stays where the stream began.
+     * The case above with the sink removed: nothing has landed, so nothing read is written down -- the chain
+     * holds no offset, and the pipeline's own record holds where its stream began, for its restart.
      *
      * <p>The two are one rule seen from both sides, and only together do they discriminate. An offset is a
      * claim that everything below it is safely out of the source's reach -- true only once a sink has taken
@@ -1078,9 +1169,12 @@ class CaptureRunUnitTest {
         FakeSource port = new FakeSource(List.of(), List.of(change(10), change(11)));
         runUnit(port, meta).start(spec(ReadMode.CDC_ONLY, false, "chain-direct-unacked"), e -> { });
 
-        assertThat(meta.read(chainId.value()).orElseThrow().sourceReadOffset())
+        SrsMeta record = meta.read(chainId.value()).orElseThrow();
+        assertThat(record.sourceReadOffset())
                 .as("read is not written: an offset ahead of the sink would skip changes on the way back")
-                .isEqualTo("start");
+                .isNull();
+        assertThat(record.consumerOffset("pipe-1").orElseThrow().cdcStartPosition())
+                .as("where the pipeline's own stream began").isEqualTo("start");
     }
 
     /**
@@ -1117,7 +1211,7 @@ class CaptureRunUnitTest {
         });
 
         assertThat(meta.read(chainId).orElseThrow().sourceReadOffset())
-                .as("customers landed, orders before it did not").isEqualTo("start");
+                .as("customers landed, orders before it did not").isNull();
         Envelope landedLast = forwarded.getFirst();
         meta.advanceTableSinkAcked(chainId, "pipe-1", landedLast.src(), landedLast.position());
         awaitSourceRead(meta, chainId, "src-11");
@@ -1138,7 +1232,7 @@ class CaptureRunUnitTest {
                 .start(spec(ReadMode.CDC_ONLY, false, "chain-direct-quiet"), forwarded::add);
 
         assertThat(meta.read(chainId).orElseThrow().sourceReadOffset())
-                .as("the change before the quiet run has not landed").isEqualTo("start");
+                .as("the change before the quiet run has not landed").isNull();
         Envelope change = forwarded.getFirst();
         meta.advanceTableSinkAcked(chainId, "pipe-1", change.src(), change.position());
         awaitSourceRead(meta, chainId, "hb-12");
@@ -1207,10 +1301,12 @@ class CaptureRunUnitTest {
         CaptureRun run = runUnit(port, meta)
                 .start(spec(ReadMode.CDC_ONLY, false, "chain-direct-order"), passthrough::add);
 
-        long epoch = meta.read(run.chainId().orElseThrow().value()).orElseThrow().epoch();
+        long chains = meta.read(run.chainId().orElseThrow().value()).orElseThrow().epoch();
+        long own = passthrough.getFirst().position().order().epoch();
+        assertThat(own).as("a generation of the stream's own, past the chain's").isGreaterThan(chains);
         assertThat(passthrough).extracting(e -> e.position().order())
-                .as("each change is ordered within the generation the chain opened for this run")
-                .containsExactly(new SourceOrder(epoch, 0L), new SourceOrder(epoch, 1L));
+                .as("each change is ordered within the generation this stream took")
+                .containsExactly(new SourceOrder(own, 0L), new SourceOrder(own, 1L));
         assertThat(passthrough).extracting(e -> e.position().token())
                 .as("the token the source named for a run rides with the change that closes it")
                 .containsExactly("src-10", "src-11");
@@ -1935,6 +2031,28 @@ class CaptureRunUnitTest {
                 pipelineId, StartFrom.latest(), null, 0L);
     }
 
+    /** A cdc-only run of {@code pipelineId} reading {@code tables} directly, on the chain keyed {@code srsKey}. */
+    private static CaptureRunSpec directSpecOver(String pipelineId, String srsKey, String... tables) {
+        return new CaptureRunSpec(configOver(tables), ReadMode.CDC_ONLY, srsKey, false, "src-" + pipelineId,
+                pipelineId, StartFrom.latest(), null, 0L);
+    }
+
+    private static void awaitAcked(InMemoryMeta meta, String chainId, String pipelineId, String expected)
+            throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (true) {
+            ChainPosition acked = meta.read(chainId).flatMap(record -> record.consumerOffset(pipelineId))
+                    .map(ConsumerOffset::sinkAcked).orElse(null);
+            if (acked != null && expected.equals(acked.token())) {
+                return;
+            }
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError(pipelineId + " never landed " + expected + ", it holds " + acked);
+            }
+            Thread.sleep(PhysicalSourcePrefix.TICK_MILLIS / 2);
+        }
+    }
+
     private static void awaitSourceRead(InMemoryMeta meta, String chainId, String expected) throws Exception {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
         while (!expected.equals(meta.read(chainId).orElseThrow().sourceReadOffset())) {
@@ -2517,12 +2635,24 @@ class CaptureRunUnitTest {
         @Override
         public synchronized long openEpoch(String miningChainId) {
             SrsMeta m = require(miningChainId);
-            long opened = m.epoch() + 1;
+            long opened = Math.max(m.epoch(), epochsOpened.getOrDefault(miningChainId, 0L)) + 1;
+            epochsOpened.put(miningChainId, opened);
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), m.consumerOffsets(),
                     m.schemaHistory(), m.retention(), opened));
             return opened;
         }
+
+        @Override
+        public synchronized long openDirectEpoch(String miningChainId) {
+            SrsMeta m = require(miningChainId);
+            long opened = Math.max(m.epoch(), epochsOpened.getOrDefault(miningChainId, 0L)) + 1;
+            epochsOpened.put(miningChainId, opened);
+            return opened;
+        }
+
+        /** Per chain, the highest generation opened on it, shared or direct. */
+        private final Map<String, Long> epochsOpened = new LinkedHashMap<>();
 
         @Override
         public synchronized void appendSchemaVersion(String miningChainId, SchemaVersion version) {

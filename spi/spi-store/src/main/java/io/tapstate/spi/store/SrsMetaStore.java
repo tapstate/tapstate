@@ -258,6 +258,16 @@ public interface SrsMetaStore {
     }
 
     /**
+     * One consumer's acknowledged position as it stands durably, or empty when there is none: read, like
+     * {@link #durableSourceRead}, so that only a write a majority of the store's members has taken is seen.
+     * It is what a tail reading its source directly for that one pipeline may tell its source to release up
+     * to. The default reads the record as {@link #read} does.
+     */
+    default Optional<ChainPosition> durableSinkAcked(String miningChainId, String pipelineId) {
+        return read(miningChainId).flatMap(meta -> meta.consumerOffset(pipelineId)).map(ConsumerOffset::sinkAcked);
+    }
+
+    /**
      * Whether the chain's source read offset is one every table it carries can resume from.
      *
      * <p>An offset is trusted once it was laid down as where a stream began, released by the chain's reader
@@ -555,8 +565,9 @@ public interface SrsMetaStore {
      * and a rerun that then took the current generation would overwrite changes the earlier one had already
      * applied.
      *
-     * <p>Generation zero says no snapshot began: the position is where a direct tail that loads nothing first
-     * began, on a chain other pipelines are on, so that its own restart picks up there.
+     * <p>Generation zero says no snapshot began: the position is where a tail reading the source directly for
+     * this pipeline began, or where a write-back put it, so that its own restart picks up there until a change
+     * of its has landed.
      */
     void setCdcStart(String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch);
 
@@ -573,6 +584,19 @@ public interface SrsMetaStore {
      * a caller ordering error.
      */
     long openEpoch(String miningChainId);
+
+    /**
+     * Takes a generation for one stream of a tail that reads the chain's source directly, for one pipeline,
+     * and returns it -- above every generation opened on the chain before, shared or direct, and never made
+     * the chain's own. The chain's own generation is the one its shared reader writes, and is fenced, under;
+     * a direct tail numbers only its own changes, and needs a generation no earlier stream of it numbered
+     * under, so that a confirmation of an earlier stream can never stand for one of the new.
+     *
+     * <p>The default opens the chain's next generation, which is what a store that keeps one counter can do.
+     */
+    default long openDirectEpoch(String miningChainId) {
+        return openEpoch(miningChainId);
+    }
 
     /**
      * Appends a version to the chain's schema history — the version just appended is always recorded. A

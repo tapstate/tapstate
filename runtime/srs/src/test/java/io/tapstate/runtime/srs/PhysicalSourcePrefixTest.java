@@ -638,7 +638,8 @@ class PhysicalSourcePrefixTest {
 
         ack("direct", "orders", 2);
         prefix.tick();
-        assertThat(sourceRead()).as("customers has not landed").isEqualTo("t0");
+        assertThat(sourceRead()).as("customers has not landed").isNull();
+        assertThat(consumer("direct").cdcStartPosition()).as("where its own stream began").isEqualTo("t0");
 
         ack("direct", "customers", 1);
         prefix.tick();
