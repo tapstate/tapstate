@@ -648,6 +648,10 @@ public final class CaptureRunUnit {
                     // The write may have landed and only its answer been lost: what the store holds says which.
                     unsettled = new Unsettled(wider, start);
                     return settle();
+                } catch (RuntimeException | Error failure) {
+                    // Nothing about it is in doubt, and nothing may come back to let the stream go: let it go now.
+                    account.unhold();
+                    throw failure;
                 }
                 if (replaced) {
                     replaceTheStream(wider, start);
@@ -672,11 +676,23 @@ public final class CaptureRunUnit {
          * Settles a wider selection whose publication was not answered, by what the store holds now. Holding it,
          * the store took the publication, and the stream over it starts where it would have. Holding what this
          * reader published, it did not: the running stream releases again, and a later look widens anew. Holding
-         * anything else, whoever wrote it owns the chain. A store that cannot say yet leaves it to the next look,
-         * the running stream still reading and still releasing nothing.
+         * anything else, whoever wrote it owns the chain. A store out of reach leaves it to the next look, the
+         * running stream still reading and still releasing nothing -- for as long as the account allows a hold.
+         * A store that answers the read with anything else leaves the outcome unknowable, and the reader closes:
+         * nothing was released since the publication began, so a reader started again begins at or before any
+         * seam a pipeline took after it.
          */
         private boolean settle() {
-            Optional<SrsMetaStore.PhysicalSelection> held = meta.physicalSelection(chainId);
+            Optional<SrsMetaStore.PhysicalSelection> held;
+            try {
+                held = meta.physicalSelection(chainId);
+            } catch (RuntimeException | Error unread) {
+                if (!(unread instanceof TapstateException coded) || coded.code() != IoError.STORE_UNAVAILABLE) {
+                    closed = true;
+                    closeTheStream();
+                }
+                throw unread;
+            }
             Unsettled pending = unsettled;
             unsettled = null;
             if (held.filter(pending.wider()::equals).isPresent()) {

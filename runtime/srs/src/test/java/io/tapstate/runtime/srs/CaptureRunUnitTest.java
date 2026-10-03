@@ -2063,6 +2063,90 @@ class CaptureRunUnitTest {
     }
 
     /**
+     * A publication that fails any other way than with the store unreachable lets the running stream release
+     * again at once: nothing about it is in doubt, and a look that finds nothing left to take on would never come
+     * back to let the stream go.
+     */
+    @Test
+    void aWideningWhosePublicationFailsOtherwiseLetsTheRunningStreamReleaseAgain() throws Exception {
+        java.util.concurrent.atomic.AtomicBoolean broken = new java.util.concurrent.atomic.AtomicBoolean();
+        InMemoryMeta meta = new InMemoryMeta() {
+            @Override
+            public synchronized boolean replacePhysicalSelection(
+                    String miningChainId, PhysicalSelection current, PhysicalSelection wider) {
+                if (broken.get()) {
+                    throw new IllegalStateException("a store double that breaks");
+                }
+                return super.replacePhysicalSelection(miningChainId, current, wider);
+            }
+        };
+        FakeSource source = new FakeSource(List.of(), List.of(change(10)));
+        CaptureRunUnit unit = runUnit(source, meta);
+        CaptureRun owner = unit.start(specOver("pipe-1", "k-widen-broken", "orders"), e -> { });
+        String chainId = owner.chainId().orElseThrow().value();
+        long epoch = meta.read(chainId).orElseThrow().epoch();
+        meta.requestPhysicalTables(chainId, epoch, List.of("customers"));
+        broken.set(true);
+
+        org.assertj.core.api.Assertions.catchThrowable(() -> unit.widen(owner));
+        meta.advanceTableSinkAcked(chainId, "pipe-1", "orders", new ChainPosition(new SourceOrder(epoch, 0), null));
+
+        awaitSourceRead(meta, chainId, "src-10");
+        owner.close();
+    }
+
+    /**
+     * Where the store answers the read that would settle a publication with something other than being out of
+     * reach, the outcome cannot be learned at all: the reader closes and the run fails, rather than read on with
+     * nothing written down. Nothing was released since the publication began, so a reader started again begins
+     * at or before any seam taken after it.
+     */
+    @Test
+    void aWideningWhoseOutcomeTheStoreCannotTellClosesTheReader() throws Exception {
+        java.util.concurrent.atomic.AtomicBoolean loseTheAnswer = new java.util.concurrent.atomic.AtomicBoolean();
+        java.util.concurrent.atomic.AtomicBoolean unreadable = new java.util.concurrent.atomic.AtomicBoolean();
+        InMemoryMeta meta = new InMemoryMeta() {
+            @Override
+            public synchronized boolean replacePhysicalSelection(
+                    String miningChainId, PhysicalSelection current, PhysicalSelection wider) {
+                boolean applied = super.replacePhysicalSelection(miningChainId, current, wider);
+                if (applied && loseTheAnswer.compareAndSet(true, false)) {
+                    unreadable.set(true);
+                    throw new TapstateException(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE,
+                            Map.of("detail", "the answer was lost"), null);
+                }
+                return applied;
+            }
+
+            @Override
+            public synchronized Optional<PhysicalSelection> physicalSelection(String miningChainId) {
+                if (unreadable.get()) {
+                    throw new TapstateException(io.tapstate.spi.store.IoError.DOCUMENT_UNREADABLE,
+                            Map.of("id", miningChainId, "field", "physicalCapture"), null);
+                }
+                return super.physicalSelection(miningChainId);
+            }
+        };
+        FakeSource source = new FakeSource(List.of(), List.of(change(10)));
+        CaptureRunUnit unit = runUnit(source, meta);
+        CaptureRun owner = unit.start(specOver("pipe-1", "k-widen-untellable", "orders"), e -> { });
+        String chainId = owner.chainId().orElseThrow().value();
+        long epoch = meta.read(chainId).orElseThrow().epoch();
+        meta.requestPhysicalTables(chainId, epoch, List.of("customers"));
+        loseTheAnswer.set(true);
+
+        org.assertj.core.api.Assertions.catchThrowable(() -> unit.widen(owner));
+        meta.advanceTableSinkAcked(chainId, "pipe-1", "orders", new ChainPosition(new SourceOrder(epoch, 0), null));
+        Thread.sleep(5 * PhysicalSourcePrefix.TICK_MILLIS);
+
+        assertThat(source.cdcClosed).as("the reader closed").isTrue();
+        assertThat(owner.health().failure()).as("and the run says so").isPresent();
+        assertThat(meta.read(chainId).orElseThrow().sourceReadOffset())
+                .as("nothing released since the publication began").isEqualTo("start");
+        owner.close();
+    }
+
+    /**
      * A widening whose wider stream cannot be started leaves nothing reading the chain, and
      * the run says so rather than going on healthy over rings nobody writes.
      */

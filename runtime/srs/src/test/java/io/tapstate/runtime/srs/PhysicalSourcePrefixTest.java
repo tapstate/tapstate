@@ -456,6 +456,35 @@ class PhysicalSourcePrefixTest {
     }
 
     /**
+     * Releases held for a publication nobody settles are not held for good: an account held for the whole bound
+     * stops and fails the run, which the reader has to be started again to get past. Held for less, it waits.
+     */
+    @Test
+    void aHoldNobodyLiftsStopsTheAccountOnceTheBoundIsPassed() {
+        java.util.concurrent.atomic.AtomicLong now = new java.util.concurrent.atomic.AtomicLong();
+        select("pipe", "orders");
+        PhysicalSourcePrefix prefix = PhysicalSourcePrefix.shared(
+                meta, CHAIN, epoch, List.of("orders"), health, (table, seq) -> { }, now::get);
+        opened.add(prefix);
+        prefix.start(at("t0"));
+        prefix.admitted(Map.of("orders", 0L), "t1");
+        prefix.hold();
+        ack("pipe", "orders", 0);
+
+        now.addAndGet(TimeUnit.MILLISECONDS.toNanos(PhysicalSourcePrefix.UNWRITTEN_BOUND_MILLIS) - 1);
+        prefix.tick();
+        assertThat(sourceRead()).as("nothing released while held").isEqualTo("t0");
+        assertThat(health.failure()).as("held for less than the bound").isEmpty();
+
+        now.addAndGet(1);
+        org.assertj.core.api.Assertions.catchThrowable(prefix::tick);
+
+        assertThat(health.failure()).hasValueSatisfying(failure -> assertThat(((TapstateException) failure).code())
+                .isEqualTo(CaptureError.SHARED_SELECTION_RESTART_REQUIRED));
+        assertThat(sourceRead()).isEqualTo("t0");
+    }
+
+    /**
      * A release that cannot be written while the stream behind the account is being closed fails nothing either:
      * the account stops, and the health it reports on -- which the stream replacing this one may share -- stays
      * as it was.
@@ -719,6 +748,26 @@ class PhysicalSourcePrefixTest {
         assertThat(sourceRead()).isEqualTo("t1");
         assertThat(consumer("pipe").sinkAcked().token()).isEqualTo("t1");
         assertThat(consumer("switching").sinkAcked()).as("it never landed t1").isNull();
+    }
+
+    /**
+     * A pipeline that stopped reading one of a run's tables, and still reads the other, confirmed every table it
+     * still reads before the run was released: it is acknowledged for the run, so what it landed does not stay
+     * behind for as long as its table is quiet.
+     */
+    @Test
+    void aPipelineThatNarrowedItsSelectionIsStillAcknowledgedForWhatItReads() {
+        select("pipe", "orders", "customers");
+        PhysicalSourcePrefix prefix = shared("customers", "orders");
+        prefix.start(at("t0"));
+        prefix.admitted(Map.of("orders", 0L, "customers", 0L), "t1");
+
+        select("pipe", "orders");
+        ack("pipe", "orders", 0);
+        prefix.tick();
+
+        assertThat(sourceRead()).isEqualTo("t1");
+        assertThat(consumer("pipe").sinkAcked().token()).isEqualTo("t1");
     }
 
     /** A pipeline the chain no longer records owes nothing, and is not brought back by the release. */

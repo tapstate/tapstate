@@ -136,8 +136,9 @@ final class PhysicalSourcePrefix implements AutoCloseable {
     /** Whether the last release written was refused by the store, and since when releases have been. */
     private boolean refused;
     private long refusedSinceNanos;
-    /** Whether releases are held: the runs are recorded and nothing is written down. */
+    /** Whether releases are held: the runs are recorded and nothing is written down. Since when, if they are. */
     private boolean held;
+    private long heldSinceNanos;
     private boolean started;
     private boolean closed;
     /** Set before the stream behind the account is closed, so whatever that close cuts short fails nothing. */
@@ -359,7 +360,19 @@ final class PhysicalSourcePrefix implements AutoCloseable {
     void tick() {
         long seen;
         synchronized (this) {
-            if (closed || failure != null || pending.isEmpty()) {
+            if (closed || failure != null) {
+                return;
+            }
+            if (held && nanoTime.getAsLong() - heldSinceNanos >= UNWRITTEN_BOUND_NANOS) {
+                failure = new TapstateException(
+                        CaptureError.SHARED_SELECTION_RESTART_REQUIRED, Map.of("chain", chainId), null);
+                ACTIVE.remove(this);
+                if (!closing) {
+                    health.fail(failure);
+                }
+                return;
+            }
+            if (pending.isEmpty()) {
                 return;
             }
             seen = recorded;
@@ -559,14 +572,14 @@ final class PhysicalSourcePrefix implements AutoCloseable {
         }
         // One write for the whole release, however many pipelines it was owed to: it is made on the thread the
         // source hands its runs over on. A pipeline is acknowledged only where its confirmation released the
-        // entry -- it still selects every table the entry owed it. One that stopped selecting them, as a
-        // pipeline turning to a direct tail of its own does, was let go of rather than heard from, and moving
-        // its position here would say it landed changes nobody saw it land.
+        // entry -- it still selects a table the entry owed it, and confirmed every such table. One that stopped
+        // selecting all of them, as a pipeline turning to a direct tail of its own does, was let go of rather
+        // than heard from, and moving its position here would say it landed changes nobody saw it land.
         Map<String, ChainPosition> acknowledged = new LinkedHashMap<>();
         batch.landedAt().forEach((pipeline, landed) -> {
             ConsumerOffset consumer = current.get(pipeline);
             if (consumer != null
-                    && batch.owed().getOrDefault(pipeline, Map.of()).keySet().stream().allMatch(consumer::selects)) {
+                    && batch.owed().getOrDefault(pipeline, Map.of()).keySet().stream().anyMatch(consumer::selects)) {
                 acknowledged.put(pipeline, landed);
             }
         });
@@ -607,9 +620,17 @@ final class PhysicalSourcePrefix implements AutoCloseable {
      * is written down. For a reader publishing a wider selection: from the moment the store may take it, a
      * pipeline may find its table published and begin its load, and a release by the stream that does not read
      * that table yet would carry the chain past changes the load did not cover.
+     *
+     * <p>A hold nobody lifts within {@link #UNWRITTEN_BOUND_MILLIS} stops the account and fails the run: the reader
+     * could not settle what it published, and every pipeline on the chain is better started again than left
+     * reading while nothing is written down. Nothing was released since the hold began, so a reader started again
+     * begins at or before every seam a pipeline took after the publication.
      */
     synchronized void hold() {
-        held = true;
+        if (!held) {
+            held = true;
+            heldSinceNanos = nanoTime.getAsLong();
+        }
     }
 
     /** Lets the releases {@link #hold} held be written again, from the next re-check on. */
