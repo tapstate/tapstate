@@ -749,11 +749,21 @@ class ConvergenceDriverTest {
         requireColdFailureLog(false, true);
     }
 
+    @Test
+    void aFailureJoiningAnAlreadyPreparedColdTicketKeepsItsCauseAndScopedWarning() throws Exception {
+        requireColdFailureLog(false, false, true);
+    }
+
     private void requireColdFailureLog(boolean restoreDuringConvergence) throws Exception {
         requireColdFailureLog(restoreDuringConvergence, false);
     }
 
     private void requireColdFailureLog(boolean restoreDuringConvergence, boolean restoreDuringOffer) throws Exception {
+        requireColdFailureLog(restoreDuringConvergence, restoreDuringOffer, false);
+    }
+
+    private void requireColdFailureLog(boolean restoreDuringConvergence, boolean restoreDuringOffer,
+            boolean failureAfterNeutralPreparation) throws Exception {
         String pipeline = "orders";
         String cluster = "cluster-a";
         var generations = new InMemoryWorkloadClaimStore();
@@ -780,6 +790,9 @@ class ConvergenceDriverTest {
         var stored = new java.util.concurrent.atomic.AtomicReference<ObservationStore.Stored>();
         CountDownLatch coldReadEntered = new CountDownLatch(1);
         CountDownLatch releaseColdRead = new CountDownLatch(1);
+        CountDownLatch neutralSaveEntered = new CountDownLatch(1);
+        CountDownLatch releaseNeutralSave = new CountDownLatch(1);
+        AtomicBoolean blockNeutralSave = new AtomicBoolean(failureAfterNeutralPreparation);
         AtomicBoolean blockFirstColdRead = new AtomicBoolean(true);
         var coldWorkerContext = new java.util.concurrent.atomic.AtomicReference<PipelineLogContext>();
         var idleWorkerContext = new java.util.concurrent.atomic.AtomicReference<PipelineLogContext>();
@@ -790,6 +803,20 @@ class ConvergenceDriverTest {
             @Override public boolean saveScoped(Observation observation, Scope owner) {
                 if (Thread.currentThread().getName().startsWith("tapstate-telemetry-latest-")) {
                     contextsAtWorkerWrites.add(PipelineLogContext.capture());
+                    if (blockNeutralSave.compareAndSet(true, false)) {
+                        assertThat(observation.state()).as("the neutral worker prepared the real FAILED checkpoint")
+                                .isEqualTo(FAILED);
+                        assertThat(observation.failure()).as("the cause has not joined the cold ticket yet").isNull();
+                        neutralSaveEntered.countDown();
+                        try {
+                            if (!releaseNeutralSave.await(5, TimeUnit.SECONDS)) {
+                                throw new AssertionError("prepared neutral cold save was not released");
+                            }
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                            throw new AssertionError(interrupted);
+                        }
+                    }
                 }
                 stored.set(new Stored(observation, Optional.of(owner)));
                 return true;
@@ -823,13 +850,36 @@ class ConvergenceDriverTest {
         desired.save(new DesiredState(pipeline, RUNNING, "rev-1"));
         state.create(pipeline, StateJson.of(RUNNING), T0);
         new ObservationPublisher(state, latest).publishScoped(pipeline, null, scope).orElseThrow();
-        ObservationScopeRegistry scopes = restoreDuringOffer
+        ObservationScopeRegistry scopes = restoreDuringOffer || failureAfterNeutralPreparation
                 ? org.mockito.Mockito.spy(new ObservationScopeRegistry()) : new ObservationScopeRegistry();
         assertThat(scopes.current(pipeline)).isEmpty();
-        if (restoreDuringOffer) {
+        if (restoreDuringOffer || failureAfterNeutralPreparation) {
             org.mockito.Mockito.doAnswer(invocation -> {
-                // The driver already read an absent scope. Finish the actual neutral recovery before ticket admission.
                 releaseColdRead.countDown();
+                if (failureAfterNeutralPreparation) {
+                    // The real worker cached its neutral preparation and entered its scoped save before this cause.
+                    assertThat(neutralSaveEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                    assertThat(scopes.current(pipeline)).isEmpty();
+                    var ticket = org.mockito.ArgumentCaptor.forClass(ObservationScopeRegistry.RestoreTicket.class);
+                    var qualified = org.mockito.ArgumentCaptor.forClass(ObservationScopeRecovery.Qualified.class);
+                    var prepared = org.mockito.ArgumentCaptor.forClass(ObservationPublisher.Prepared.class);
+                    org.mockito.Mockito.verify(scopes).rememberRestoration(
+                            ticket.capture(), qualified.capture(), prepared.capture());
+                    assertThat(qualified.getValue().scope()).isEqualTo(scope);
+                    var failed = ((io.tapstate.runtime.scheduler.ConvergeResult) invocation.getArgument(1))
+                            .checkpoint().orElseThrow();
+                    assertThat(qualified.getValue().checkpoint()).isEqualTo(failed);
+                    assertThat(scopes.restorationPrepared(ticket.getValue(), qualified.getValue()))
+                            .as("the actual neutral frame was cached before the driver admitted its cause")
+                            .contains(prepared.getValue());
+                    assertThat(prepared.getValue().observation().failure()).isNull();
+                    Optional<?> admitted = (Optional<?>) invocation.callRealMethod();
+                    assertThat(admitted).as("the real cause joins while the existing cold ticket is still pending")
+                            .isPresent();
+                    releaseNeutralSave.countDown();
+                    return admitted;
+                }
+                // The driver already read an absent scope. Finish the actual neutral recovery before ticket admission.
                 long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
                 while (scopes.current(pipeline).isEmpty() && System.nanoTime() - until < 0) {
                     TimeUnit.MILLISECONDS.sleep(5);
@@ -890,13 +940,13 @@ class ConvergenceDriverTest {
                 scopes, null, recovery, 1, 4)) {
             var restoredDriver = new ConvergenceDriver(loop, desired, publisher, null, MetricsExport.none(),
                     () -> true, PipelineActuationOwnership.single(), LifecycleWorkDispatcher.inline(), scopes, telemetry);
-            if (restoreDuringConvergence || restoreDuringOffer) {
+            if (restoreDuringConvergence || restoreDuringOffer || failureAfterNeutralPreparation) {
                 telemetry.offerScopeRecovery(pipeline, null, null, () -> true);
                 assertThat(coldReadEntered.await(5, TimeUnit.SECONDS)).isTrue();
             }
             restoredDriver.reconcile();
             assertThat(coldReadEntered.await(5, TimeUnit.SECONDS)).isTrue();
-            if (!restoreDuringConvergence && !restoreDuringOffer) {
+            if (!restoreDuringConvergence && !restoreDuringOffer && !failureAfterNeutralPreparation) {
                 assertThat(scopes.current(pipeline)).as("cold store reads stay off convergence").isEmpty();
             }
             assertThat(state.read(pipeline).orElseThrow().stateJson()).isEqualTo(StateJson.of(FAILED));
@@ -945,9 +995,14 @@ class ConvergenceDriverTest {
                     .isEqualTo(coldWorkerContext.get());
             PipelineLogContext scopedPreparation = new PipelineLogContext(
                     pipeline, scope.pipelineIncarnationId(), Long.toString(generation));
-            assertThat(contextsAtWorkerWrites.subList(1, contextsAtWorkerWrites.size()))
-                    .as("normal warm preparation deliberately scopes its complete save")
-                    .isNotEmpty().containsOnly(scopedPreparation);
+            if (!failureAfterNeutralPreparation) {
+                assertThat(contextsAtWorkerWrites.subList(1, contextsAtWorkerWrites.size()))
+                        .as("normal warm preparation deliberately scopes its complete save")
+                        .isNotEmpty().containsOnly(scopedPreparation);
+            } else {
+                // A legitimate cold retry can precede the ordinary scoped ticks in this ordering.
+                assertThat(contextsAtWorkerWrites).contains(scopedPreparation);
+            }
             assertThat(PipelineLogContext.capture()).as("later ticks restore the caller MDC").isEqualTo(caller);
 
             // Reuse the same idle worker for a fresh cold request after every warm wrapper has exited.
@@ -973,6 +1028,7 @@ class ConvergenceDriverTest {
             assertThat(stored.get().observation().metrics()).containsEntry("errors." + cause.code().code(), 1L);
         } finally {
             releaseColdRead.countDown();
+            releaseNeutralSave.countDown();
             original.restore();
             driverLogger.detachAppender(appender);
             telemetryLogger.detachAppender(appender);

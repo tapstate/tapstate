@@ -1089,13 +1089,16 @@ final class TelemetryDispatcher implements AutoCloseable {
                 return recoverContinuation(pipelineId, frame, operation, continued.orElseThrow());
             }
         }
+        var version = scopes.beginRestorationDelivery(ticket);
+        if (version.isEmpty()) { return false; }
+        long deliveryVersion = version.orElseThrow();
         var qualified = scopeRecovery.resolve(pipelineId).orElse(null);
-        if (qualified == null || !scopes.awaiting(ticket) || !frame.owner().getAsBoolean()
+        if (qualified == null || !scopes.awaiting(ticket, deliveryVersion) || !frame.owner().getAsBoolean()
                 || !scopeRecovery.matchesOwner(pipelineId, qualified, ticket.owner())
                 || !scopeRecovery.unchanged(pipelineId, qualified)) {
             return false;
         }
-        BooleanSupplier current = () -> scopes.awaiting(ticket) && frame.owner().getAsBoolean()
+        BooleanSupplier current = () -> scopes.awaiting(ticket, deliveryVersion) && frame.owner().getAsBoolean()
                 && scopeRecovery.matchesOwner(pipelineId, qualified, ticket.owner())
                 && scopeRecovery.unchanged(pipelineId, qualified);
         operation.scope = qualified.scope();
@@ -1120,7 +1123,7 @@ final class TelemetryDispatcher implements AutoCloseable {
             }
         }
         if (prepared == null || prepared.observation().state() != StateJson.parse(qualified.checkpoint().stateJson())
-                || !scopes.awaiting(ticket) || !frame.owner().getAsBoolean()
+                || !scopes.awaiting(ticket, deliveryVersion) || !frame.owner().getAsBoolean()
                 || !scopeRecovery.unchanged(pipelineId, qualified)) {
             return false;
         }
@@ -1135,7 +1138,7 @@ final class TelemetryDispatcher implements AutoCloseable {
         }
         // No local scope exists during a slow/failed write. A late callback cannot open publication
         // after its owner, authority, checkpoint or registry ticket has changed.
-        if (!scopes.awaiting(ticket) || !frame.owner().getAsBoolean()
+        if (!scopes.awaiting(ticket, deliveryVersion) || !frame.owner().getAsBoolean()
                 || !scopeRecovery.unchanged(pipelineId, qualified)
                 || !scopes.restore(ticket, qualified.stored())) {
             return false;

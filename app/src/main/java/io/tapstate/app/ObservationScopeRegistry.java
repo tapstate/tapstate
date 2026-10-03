@@ -23,6 +23,7 @@ import java.util.Map;
 import java.util.LinkedHashMap;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BooleanSupplier;
 
@@ -691,6 +692,8 @@ final class ObservationScopeRegistry {
         private TelemetryDispatcher.FailureLog failureLog;
         private RecoverySignal transition;
         private boolean failurePrepared;
+        private long deliveryVersion;
+        private long preparingVersion = -1;
         private ObservationPublisher.Prepared prepared;
         private ObservationStore.Scope preparedScope;
         private CheckpointDoc preparedFor;
@@ -737,6 +740,8 @@ final class ObservationScopeRegistry {
                 if (failure != null && ticket.firstFailure == null) {
                     ticket.firstFailure = signal;
                     ticket.failureLog = diagnostic;
+                    ticket.deliveryVersion++;
+                    ticket.prepared = null;
                 }
                 if (result.transitionFrom().isPresent()) {
                     ticket.transition = signal;
@@ -750,6 +755,24 @@ final class ObservationScopeRegistry {
         synchronized (ticket.entry) {
             return valid(ticket) && ticket.entry.current == null;
         }
+    }
+
+    OptionalLong beginRestorationDelivery(RestoreTicket ticket) {
+        synchronized (ticket.entry) {
+            if (!valid(ticket) || ticket.entry.current != null) { return OptionalLong.empty(); }
+            ticket.preparingVersion = ticket.deliveryVersion;
+            return OptionalLong.of(ticket.deliveryVersion);
+        }
+    }
+
+    boolean awaiting(RestoreTicket ticket, long deliveryVersion) {
+        synchronized (ticket.entry) {
+            return valid(ticket) && ticket.entry.current == null && ticket.deliveryVersion == deliveryVersion;
+        }
+    }
+
+    private static boolean deliveryUnchanged(RestoreTicket ticket) {
+        return ticket.preparingVersion < 0 || ticket.preparingVersion == ticket.deliveryVersion;
     }
 
     void rememberRestorationFailure(RestoreTicket ticket, ObservationStore.Scope scope, Instant occurredAt,
@@ -804,7 +827,7 @@ final class ObservationScopeRegistry {
     Optional<ObservationPublisher.Prepared> restorationPrepared(RestoreTicket ticket,
             ObservationScopeRecovery.Qualified qualified) {
         synchronized (ticket.entry) {
-            return valid(ticket) && qualified.scope().equals(ticket.preparedScope)
+            return valid(ticket) && deliveryUnchanged(ticket) && qualified.scope().equals(ticket.preparedScope)
                     && qualified.checkpoint().equals(ticket.preparedFor)
                     ? Optional.ofNullable(ticket.prepared) : Optional.empty();
         }
@@ -813,7 +836,7 @@ final class ObservationScopeRegistry {
     boolean rememberRestoration(RestoreTicket ticket, ObservationScopeRecovery.Qualified qualified,
             ObservationPublisher.Prepared prepared) {
         synchronized (ticket.entry) {
-            if (!valid(ticket) || ticket.entry.current != null) {
+            if (!valid(ticket) || !deliveryUnchanged(ticket) || ticket.entry.current != null) {
                 return false;
             }
             ticket.prepared = prepared;
@@ -829,7 +852,7 @@ final class ObservationScopeRegistry {
 
     void retryRestoration(RestoreTicket ticket) {
         synchronized (ticket.entry) {
-            if (valid(ticket)) {
+            if (valid(ticket) && deliveryUnchanged(ticket)) {
                 ticket.prepared = null;
             }
         }
@@ -865,7 +888,7 @@ final class ObservationScopeRegistry {
 
     boolean restore(RestoreTicket ticket, ObservationStore.Stored stored) {
         synchronized (ticket.entry) {
-            if (!valid(ticket) || ticket.entry.current != null || stored.scope().isEmpty()
+            if (!valid(ticket) || !deliveryUnchanged(ticket) || ticket.entry.current != null || stored.scope().isEmpty()
                     || !ticket.pipelineId.equals(stored.observation().pipelineId())) {
                 return false;
             }
