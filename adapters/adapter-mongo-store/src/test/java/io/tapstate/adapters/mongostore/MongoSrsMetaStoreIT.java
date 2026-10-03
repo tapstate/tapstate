@@ -96,6 +96,54 @@ class MongoSrsMetaStoreIT {
     @Container
     private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
 
+    /**
+     * A stream of a tail reading its source directly takes a generation above every one opened on the chain,
+     * shared or direct, and the chain's own generation stays the shared reader's -- which, opened later, goes
+     * past the direct tail's in turn.
+     */
+    @Test
+    void aDirectStreamsGenerationIsAboveEveryOneOpenedAndNeverTheChainsOwn() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long shared = store.openEpoch(CHAIN);
+            long direct = store.openDirectEpoch(CHAIN);
+            long again = store.openDirectEpoch(CHAIN);
+
+            assertThat(direct).isGreaterThan(shared);
+            assertThat(again).as("a second stream of a direct tail").isGreaterThan(direct);
+            assertThat(store.read(CHAIN).orElseThrow().epoch()).as("the chain's own generation").isEqualTo(shared);
+            long takenOver = store.openEpoch(CHAIN);
+            assertThat(takenOver).isGreaterThan(again);
+            assertThat(store.read(CHAIN).orElseThrow().epoch()).isEqualTo(takenOver);
+        });
+    }
+
+    /** A record written before direct tails took generations of their own opens past its own generation. */
+    @Test
+    void aRecordFromBeforeDirectGenerationsOpensPastItsOwnGeneration() {
+        withCollection((store, collection) -> {
+            store.create(CHAIN, null);
+            collection.updateOne(new Document("_id", CHAIN), new Document("$set", new Document("epoch", 7L)));
+
+            assertThat(store.openDirectEpoch(CHAIN)).isEqualTo(8L);
+            assertThat(store.read(CHAIN).orElseThrow().epoch()).isEqualTo(7L);
+            assertThat(store.openEpoch(CHAIN)).isEqualTo(9L);
+        });
+    }
+
+    /** One consumer's acknowledged position, read as it stands durably; nothing for a consumer with none. */
+    @Test
+    void aConsumersAcknowledgedPositionIsReadDurably() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            ChainPosition landed = new ChainPosition(new SourceOrder(3, 9), "t9");
+            store.advanceSinkAcked(CHAIN, "direct", landed);
+
+            assertThat(store.durableSinkAcked(CHAIN, "direct")).contains(landed);
+            assertThat(store.durableSinkAcked(CHAIN, "nobody")).isEmpty();
+        });
+    }
+
     @Test
     void tableAcksPersistIndependentlyAndOnlyTheirOwnRingGenerationPositionsARun() {
         withStore(store -> {
