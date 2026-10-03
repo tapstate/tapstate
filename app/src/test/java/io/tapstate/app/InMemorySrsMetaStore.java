@@ -267,6 +267,30 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
                 m.schemaHistory(), m.retention(), m.epoch()));
     }
 
+    @Override
+    public synchronized void releaseSinkAcknowledgements(String miningChainId, String pipelineId) {
+        letGoOfWhatItLanded(miningChainId, pipelineId, false, null);
+    }
+
+    @Override
+    public synchronized void moveConsumerStart(String miningChainId, String pipelineId, String cdcStartPosition) {
+        letGoOfWhatItLanded(miningChainId, pipelineId, true, cdcStartPosition);
+    }
+
+    /** Path-scoped, as the real store's is: the acknowledgements go; the writers, ring places and the rest stay. */
+    private void letGoOfWhatItLanded(String miningChainId, String pipelineId, boolean moveStart, String start) {
+        SrsMeta m = require(miningChainId);
+        List<ConsumerOffset> next = new ArrayList<>();
+        for (ConsumerOffset c : m.consumerOffsets()) {
+            next.add(!c.pipelineId().equals(pipelineId) ? c : new ConsumerOffset(c.pipelineId(), c.perTableSeq(),
+                    null, c.snapshotCompletedTables(), moveStart ? start : c.cdcStartPosition(), c.snapshotEpoch(),
+                    c.selectedTables(), c.selectedTablesEpoch(), Map.of()));
+        }
+        records.put(miningChainId, new SrsMeta(
+                m.miningChainId(), m.sourceRead(), next,
+                m.schemaHistory(), m.retention(), m.epoch()));
+    }
+
     /**
      * The tables {@code existing} was already recorded as having loaded, or none for a consumer with no
      * record yet.

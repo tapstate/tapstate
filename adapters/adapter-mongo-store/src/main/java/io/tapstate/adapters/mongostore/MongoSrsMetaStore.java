@@ -702,6 +702,35 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     @Override
+    public void releaseSinkAcknowledgements(String miningChainId, String pipelineId) {
+        letGoOfWhatItLanded(miningChainId, pipelineId, new Document());
+    }
+
+    @Override
+    public void moveConsumerStart(String miningChainId, String pipelineId, String cdcStartPosition) {
+        Objects.requireNonNull(cdcStartPosition, "cdcStartPosition");
+        letGoOfWhatItLanded(miningChainId, pipelineId, new Document("cdcStartPosition", cdcStartPosition));
+    }
+
+    /**
+     * One path-scoped write to a consumer's document: {@code set}, and every acknowledgement it holds unset.
+     * Nothing else is touched -- in particular not its sink writers' plan, progress and fence, which a replaced
+     * document would lose. No document, no write.
+     */
+    private void letGoOfWhatItLanded(String miningChainId, String pipelineId, Document set) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(pipelineId, PIPELINE_ID);
+        migrateLegacyConsumers(miningChainId, true);
+        Document update = new Document("$unset", new Document("sinkAckedEpoch", "").append("sinkAckedSeq", "")
+                .append("sinkAckedSrcpos", "").append(SINK_ACKED_BY_TABLE, ""));
+        if (!set.isEmpty()) {
+            update.append("$set", set);
+        }
+        writeConsumer(miningChainId, session -> consumers.updateOne(session,
+                consumerKey(miningChainId, pipelineId), update));
+    }
+
+    @Override
     public void advanceConsumerReadSeq(String miningChainId, String pipelineId, String table, long lastReadSeq) {
         updateConsumer(miningChainId, pipelineId, consumerReadSeqUpdate(pipelineId, table, lastReadSeq));
     }

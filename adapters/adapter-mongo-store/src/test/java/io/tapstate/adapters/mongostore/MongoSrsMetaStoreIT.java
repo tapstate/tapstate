@@ -168,6 +168,49 @@ class MongoSrsMetaStoreIT {
         });
     }
 
+    /**
+     * Moving where a consumer's own run begins, or letting go of what it landed, touches nothing else on its
+     * record: its writers' plan and progress, its selection, finished loads and read cursors stay. A pipeline with
+     * two writers that finished a load therefore still prepares them afterwards; replaced whole, the record lost
+     * the plan, and with two writers and a finished load the store could no longer tell them apart.
+     */
+    @Test
+    void aConsumersPositionMovesWithoutTouchingItsWritersPlan() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            store.selectConsumerTables(CHAIN, "pipe", List.of("orders"), epoch);
+            store.advanceConsumerReadSeq(CHAIN, "pipe", "orders", 12);
+            Map<String, List<String>> plan = Map.of("orders", List.of("target-a", "target-b"));
+            store.configureSinkWriters(CHAIN, "pipe", plan);
+            store.markSinkWriterSnapshotComplete(CHAIN, "pipe", "target-a", "orders");
+            store.markSinkWriterSnapshotComplete(CHAIN, "pipe", "target-b", "orders");
+            store.advanceSinkAcked(CHAIN, "pipe", new ChainPosition(new SourceOrder(epoch, 9), "t9"));
+            store.advanceTableSinkAcked(CHAIN, "pipe", "orders", new ChainPosition(new SourceOrder(epoch, 9), "t9"));
+
+            store.moveConsumerStart(CHAIN, "pipe", "moved-here");
+
+            ConsumerOffset moved = store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow();
+            assertThat(moved.cdcStartPosition()).isEqualTo("moved-here");
+            assertThat(moved.sinkAcked()).isNull();
+            assertThat(moved.sinkAckedByTable()).isEmpty();
+            assertThat(moved.selectedTables()).containsExactly("orders");
+            assertThat(moved.perTableSeq()).containsEntry("orders", 12L);
+            assertThat(moved.snapshotCompletedTables()).containsExactly("orders");
+            org.assertj.core.api.Assertions.assertThatCode(() -> store.configureSinkWriters(CHAIN, "pipe", plan))
+                    .as("its two writers, prepared again").doesNotThrowAnyException();
+
+            store.advanceSinkAcked(CHAIN, "pipe", new ChainPosition(new SourceOrder(epoch, 11), "t11"));
+            store.releaseSinkAcknowledgements(CHAIN, "pipe");
+
+            ConsumerOffset released = store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow();
+            assertThat(released.sinkAcked()).isNull();
+            assertThat(released.cdcStartPosition()).as("where its run begins, left as it was").isEqualTo("moved-here");
+            org.assertj.core.api.Assertions.assertThatCode(() -> store.configureSinkWriters(CHAIN, "pipe", plan))
+                    .doesNotThrowAnyException();
+        });
+    }
+
     /** One consumer's acknowledged position, read as it stands durably; nothing for a consumer with none. */
     @Test
     void aConsumersAcknowledgedPositionIsReadDurably() {

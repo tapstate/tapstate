@@ -3,6 +3,7 @@ package io.tapstate.spi.store;
 import io.tapstate.core.event.ChainPosition;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 
 /**
@@ -328,6 +329,38 @@ public interface SrsMetaStore {
      * mutate on an unseeded chain is a caller ordering error.
      */
     void upsertConsumerOffset(String miningChainId, ConsumerOffset offset);
+
+    /**
+     * Lets go of everything one consumer is recorded as having landed -- its chain-level acknowledgement and its
+     * per-table ones -- and leaves the rest of its record as it is: its read cursors, its selection, its finished
+     * loads, where its own run begins, and its sink writers' plan and progress. Does nothing for a consumer the
+     * chain does not record.
+     *
+     * <p>For a position moved by hand: what a pipeline landed must not outrank the move, while the work its
+     * writers did still happened. Rewriting the record whole drops the writer plan instead, and a pipeline with
+     * several writers that finished a load cannot prepare its writers again. The default rewrites the record from
+     * a read of it, which is all a store keeping nothing beside these fields has to do.
+     */
+    default void releaseSinkAcknowledgements(String miningChainId, String pipelineId) {
+        read(miningChainId).flatMap(meta -> meta.consumerOffset(pipelineId)).ifPresent(offset ->
+                upsertConsumerOffset(miningChainId, new ConsumerOffset(offset.pipelineId(), offset.perTableSeq(),
+                        null, offset.snapshotCompletedTables(), offset.cdcStartPosition(), offset.snapshotEpoch(),
+                        offset.selectedTables(), offset.selectedTablesEpoch(), Map.of())));
+    }
+
+    /**
+     * Makes {@code cdcStartPosition} where one consumer's own run begins and lets go of what it is recorded as
+     * having landed, as {@link #releaseSinkAcknowledgements} does; everything else on its record stays. For a
+     * position a pipeline reading directly is moved to -- by hand, or as it turns from the shared ring to a direct
+     * tail of its own. The default rewrites the record from a read of it.
+     */
+    default void moveConsumerStart(String miningChainId, String pipelineId, String cdcStartPosition) {
+        Objects.requireNonNull(cdcStartPosition, "cdcStartPosition");
+        read(miningChainId).flatMap(meta -> meta.consumerOffset(pipelineId)).ifPresent(offset ->
+                upsertConsumerOffset(miningChainId, new ConsumerOffset(offset.pipelineId(), offset.perTableSeq(),
+                        null, offset.snapshotCompletedTables(), cdcStartPosition, offset.snapshotEpoch(),
+                        offset.selectedTables(), offset.selectedTablesEpoch(), Map.of())));
+    }
 
     /**
      * Advances one consumer pipeline's read cursor into one table's change ring — a scoped raise of that

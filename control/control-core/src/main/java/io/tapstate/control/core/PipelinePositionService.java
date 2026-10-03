@@ -141,12 +141,11 @@ public final class PipelinePositionService {
         for (ConsumerOffset offset : meta.read(chainId).map(SrsMeta::consumerOffsets).orElse(List.of())) {
             // A pipeline reading directly resumes from its own position, which this move is not about.
             if (offset.sinkAcked() != null && !readsDirectly(offset)) {
-                // Rewritten rather than deleted: the read cursor and the tables whose initial load this
-                // pipeline finished are answers about work that did happen, and moving the tail says
-                // nothing about either.
-                meta.upsertConsumerOffset(chainId, new ConsumerOffset(offset.pipelineId(),
-                        offset.perTableSeq(), null, offset.snapshotCompletedTables(),
-                        offset.cdcStartPosition(), offset.snapshotEpoch()));
+                // Only the acknowledgements go: the read cursor, the tables whose initial load this pipeline
+                // finished and its writers' plan are answers about work that did happen, and moving the tail
+                // says nothing about any of them. A record rewritten whole would lose the writers' plan, and a
+                // pipeline with several writers could not start again.
+                meta.releaseSinkAcknowledgements(chainId, offset.pipelineId());
             }
         }
     }
@@ -154,13 +153,12 @@ public final class PipelinePositionService {
     /**
      * Moves where a pipeline reading the chain's source directly resumes: its own recorded start becomes
      * {@code token}, and what it landed is let go of, so its next run picks up there. Its load's generation,
-     * its finished loads and its selection stay. Alone on the chain, its position is the chain's as well, and
-     * the chain is moved with it: a pipeline turning the buffering on later picks up where the chain says.
+     * its finished loads, its selection and its writers' plan stay. Alone on the chain, its position is the
+     * chain's as well, and the chain is moved with it: a pipeline turning the buffering on later picks up where
+     * the chain says.
      */
     private void moveItsOwnPosition(String chainId, ConsumerOffset offset, String token) {
-        meta.upsertConsumerOffset(chainId, new ConsumerOffset(offset.pipelineId(), offset.perTableSeq(), null,
-                offset.snapshotCompletedTables(), token, offset.snapshotEpoch(), offset.selectedTables(),
-                offset.selectedTablesEpoch(), Map.of()));
+        meta.moveConsumerStart(chainId, offset.pipelineId(), token);
         boolean alone = meta.read(chainId).map(record -> record.consumerOffsets().stream()
                 .allMatch(consumer -> consumer.pipelineId().equals(offset.pipelineId()))).orElse(true);
         if (alone) {

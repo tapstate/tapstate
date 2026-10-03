@@ -497,12 +497,35 @@ class PipelinePositionServiceTest {
             throw new UnsupportedOperationException("create");
         }
 
+        /**
+         * A position move never rewrites a consumer's record whole: a real store's replacement drops the sink
+         * writers' plan beside it, and a pipeline with several writers that finished a load could then not start.
+         */
         @Override
         public void upsertConsumerOffset(String miningChainId, ConsumerOffset offset) {
+            throw new UnsupportedOperationException("upsertConsumerOffset: a consumer record rewritten whole");
+        }
+
+        @Override
+        public void releaseSinkAcknowledgements(String miningChainId, String pipelineId) {
+            rewrite(miningChainId, pipelineId, offset -> offset.cdcStartPosition());
+        }
+
+        @Override
+        public void moveConsumerStart(String miningChainId, String pipelineId, String cdcStartPosition) {
+            rewrite(miningChainId, pipelineId, offset -> cdcStartPosition);
+        }
+
+        /** What a path-scoped write leaves: the acknowledgements gone, the start as given, the rest as it was. */
+        private void rewrite(String miningChainId, String pipelineId,
+                java.util.function.Function<ConsumerOffset, String> start) {
             SrsMeta held = records.get(miningChainId);
             List<ConsumerOffset> next = new ArrayList<>();
             for (ConsumerOffset existing : held.consumerOffsets()) {
-                next.add(existing.pipelineId().equals(offset.pipelineId()) ? offset : existing);
+                next.add(!existing.pipelineId().equals(pipelineId) ? existing : new ConsumerOffset(
+                        existing.pipelineId(), existing.perTableSeq(), null, existing.snapshotCompletedTables(),
+                        start.apply(existing), existing.snapshotEpoch(), existing.selectedTables(),
+                        existing.selectedTablesEpoch(), Map.of()));
             }
             records.put(miningChainId, new SrsMeta(miningChainId, held.sourceRead(), next,
                     held.schemaHistory(), held.retention(), held.epoch(), held.sourceReadAt()));

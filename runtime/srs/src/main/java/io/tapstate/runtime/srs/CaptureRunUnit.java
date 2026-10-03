@@ -308,11 +308,9 @@ public final class CaptureRunUnit {
         if (resumeFrom.isEmpty()) {
             return;
         }
-        ConsumerOffset offset = own.get();
-        // What it landed is let go of, so its tail picks up at the point taken here rather than behind it.
-        meta.upsertConsumerOffset(chainId, new ConsumerOffset(offset.pipelineId(), offset.perTableSeq(), null,
-                offset.snapshotCompletedTables(), resumeFrom.get(), offset.snapshotEpoch(), offset.selectedTables(),
-                offset.selectedTablesEpoch(), offset.sinkAckedByTable()));
+        // What it landed is let go of, so its tail picks up at the point taken here rather than behind it; the rest
+        // of its record -- its writers' plan among it -- stays as it is.
+        meta.moveConsumerStart(chainId, pipelineId, resumeFrom.get());
     }
 
     /**
