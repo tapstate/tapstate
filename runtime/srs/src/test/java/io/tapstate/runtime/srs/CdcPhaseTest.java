@@ -45,6 +45,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -839,6 +840,108 @@ class CdcPhaseTest {
                     assertThat(exception.code()).isEqualTo(CaptureError.EVENT_TABLE_NOT_SELECTED);
                     assertThat(exception.args()).containsEntry("table", "customers");
                 });
+    }
+
+    /**
+     * A run that reached one table's ring and then could not be recorded with the account stops the account,
+     * so nothing handed over after it is released past it.
+     *
+     * <p>Here the run carries an orders change and a customers change; the orders change is written into its
+     * ring, and reading the cursors to admit the customers change fails for a moment. The account never hears
+     * of that run. A connector that goes on delivering after its consumer threw then hands over a customers
+     * change on its own, which the pipeline lands -- and released on that word, the chain's position would sit
+     * past the orders change nobody confirmed, which a restart would then never read again.
+     */
+    @Test
+    void aRunThatReachedARingButWasNeverRecordedStopsTheAccount() {
+        CaptureRunUnitTest.InMemoryMeta account = new CaptureRunUnitTest.InMemoryMeta();
+        String chainId = "account-unrecorded";
+        account.create(chainId, null);
+        long epoch = account.openEpoch(chainId);
+        account.selectConsumerTables(chainId, "pipe", List.of("customers", "orders"), epoch);
+        CaptureHealth health = new CaptureHealth();
+        PhysicalSourcePrefix prefix = PhysicalSourcePrefix.shared(
+                account, chainId, epoch, List.of("customers", "orders"), health, (table, seq) -> { });
+        Supplier<Collection<ConsumerOffset>> cursors = () -> account.consumerOffsets(chainId);
+        AtomicBoolean blip = new AtomicBoolean(true);
+        Supplier<Collection<ConsumerOffset>> blipping = () -> {
+            if (blip.getAndSet(false)) {
+                throw new TapstateException(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE,
+                        Map.of("detail", "the primary is being elected"), null);
+            }
+            return cursors.get();
+        };
+        Map<String, CdcPhase.TableRoute> routes = new java.util.LinkedHashMap<>();
+        routes.put("orders", new CdcPhase.TableRoute(new CdcChain(new SrsWriteGate(new SrsRingbuffer(
+                hz.getRingbuffer("srs.chain.unrecorded.orders"))), new RecordingMeta(), chainId, epoch, 0L), cursors));
+        routes.put("customers", new CdcPhase.TableRoute(new CdcChain(new SrsWriteGate(new SrsRingbuffer(
+                hz.getRingbuffer("srs.chain.unrecorded.customers"))), new RecordingMeta(), chainId, epoch, 0L),
+                blipping));
+        Envelope order = Envelope.insert(1, "orders", Map.of("id", 1), Map.of());
+        Envelope customer = Envelope.insert(2, "customers", Map.of("id", 2), Map.of());
+        Envelope laterCustomer = Envelope.insert(3, "customers", Map.of("id", 3), Map.of());
+        CarryingOnPort port = new CarryingOnPort(
+                List.of(List.of(order, customer), List.of(laterCustomer)), List.of("w1", "w2"));
+
+        Subscription reader = CdcPhase.run(port, config(), CaptureStart.present(), routes, health, prefix);
+        try {
+            assertThat(hz.<SrsItem>getRingbuffer("srs.chain.unrecorded.orders").tailSequence())
+                    .as("the orders change of the run that failed is in its ring").isZero();
+            account.advanceTableSinkAcked(chainId, "pipe", "customers",
+                    new ChainPosition(new SourceOrder(epoch, 0), null));
+            org.assertj.core.api.Assertions.catchThrowable(prefix::tick);
+
+            assertThat(account.read(chainId).orElseThrow().sourceReadOffset())
+                    .as("nothing is released past the orders change nobody confirmed")
+                    .isEqualTo("w0");
+            assertThat(health.failure()).as("and the run says it stopped recording").isPresent();
+        } finally {
+            reader.close();
+        }
+    }
+
+    /**
+     * A source that goes on delivering after its consumer threw, the way a connector that catches what its
+     * consumer throws and reads on does: each delivery is handed over with its own position.
+     */
+    private static final class CarryingOnPort implements CapturePort {
+        private final List<List<Envelope>> deliveries;
+        private final List<String> positions;
+        final List<Throwable> thrown = new CopyOnWriteArrayList<>();
+
+        CarryingOnPort(List<List<Envelope>> deliveries, List<String> positions) {
+            this.deliveries = deliveries;
+            this.positions = positions;
+        }
+
+        @Override
+        public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+            listener.onStart(Optional.of(new SourcePosition("w0")));
+            for (int delivery = 0; delivery < deliveries.size(); delivery++) {
+                try {
+                    listener.onBatch(deliveries.get(delivery),
+                            Optional.of(new SourcePosition(positions.get(delivery))));
+                } catch (RuntimeException failure) {
+                    thrown.add(failure);
+                }
+            }
+            return () -> { };
+        }
+
+        @Override
+        public CaptureBatch snapshot(CaptureConfig config) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public ConnectionReport testConnection(CaptureConfig config) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public DiscoveredSchema discoverSchema(CaptureConfig config) {
+            throw new UnsupportedOperationException();
+        }
     }
 
     /**

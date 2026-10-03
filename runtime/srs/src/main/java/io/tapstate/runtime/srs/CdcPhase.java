@@ -181,6 +181,11 @@ public final class CdcPhase {
      * position is recorded too, with nothing owed: a source that reports where a transaction ends only after
      * it has handed the transaction's changes over names that position on exactly such a run. One that named
      * nothing and carried nothing tells nobody anything, and is let go.
+     *
+     * <p>A run that fails part way -- refused by its routing, by a ring, or by the account -- has still been
+     * handed over: the source has moved on past it, and a connector that catches what its consumer throws reads
+     * on. Released behind it, a later run would carry the chain past whatever of it never reached a ring or the
+     * account. So the failure stops the account before it goes back to the source.
      */
     private static void writeReleased(
             List<Envelope> events,
@@ -191,16 +196,21 @@ public final class CdcPhase {
         if (events.isEmpty() && token == null) {
             return;
         }
-        // Routed before anything is written: a change naming a table this reader does not carry fails the
-        // run whole, before any of it is written or recorded.
-        Map<String, List<SrsItem>> byTable = events.isEmpty() ? Map.of() : byTable(events, position, routes);
         prefix.checkStillRecording();
-        Map<String, Long> lastSeqByTable = new LinkedHashMap<>();
-        for (Map.Entry<String, List<SrsItem>> entry : byTable.entrySet()) {
-            lastSeqByTable.put(entry.getKey(),
-                    admit(routes.apply(entry.getKey()), entry.getKey(), entry.getValue()).lastSeq());
+        try {
+            // Routed before anything is written: a change naming a table this reader does not carry fails the
+            // run whole, before any of it is written or recorded.
+            Map<String, List<SrsItem>> byTable = events.isEmpty() ? Map.of() : byTable(events, position, routes);
+            Map<String, Long> lastSeqByTable = new LinkedHashMap<>();
+            for (Map.Entry<String, List<SrsItem>> entry : byTable.entrySet()) {
+                lastSeqByTable.put(entry.getKey(),
+                        admit(routes.apply(entry.getKey()), entry.getKey(), entry.getValue()).lastSeq());
+            }
+            prefix.admitted(lastSeqByTable, token);
+        } catch (RuntimeException | Error failure) {
+            prefix.abandon(failure);
+            throw failure;
         }
-        prefix.admitted(lastSeqByTable, token);
     }
 
     /**

@@ -77,6 +77,16 @@ final class PhysicalSourcePrefix implements AutoCloseable {
     /** How often the shared thread re-checks the confirmations of every open account. */
     static final long TICK_MILLIS = 100;
 
+    /**
+     * The longest the shared thread leaves an account between two re-checks while nothing it waits for moves.
+     * Each re-check that releases nothing doubles the wait, up to this; one that releases something, or a run
+     * the source hands over that does, puts it back to a tick.
+     */
+    static final long MAX_RECHECK_MILLIS = 32 * TICK_MILLIS;
+
+    private static final long TICK_NANOS = TimeUnit.MILLISECONDS.toNanos(TICK_MILLIS);
+    private static final long MAX_RECHECK_NANOS = TimeUnit.MILLISECONDS.toNanos(MAX_RECHECK_MILLIS);
+
     private static final Set<PhysicalSourcePrefix> ACTIVE = ConcurrentHashMap.newKeySet();
     private static final ScheduledExecutorService TICKER = Executors.newSingleThreadScheduledExecutor(task -> {
         Thread thread = new Thread(task, "tapstate-physical-prefix");
@@ -99,6 +109,10 @@ final class PhysicalSourcePrefix implements AutoCloseable {
     private final BiConsumer<String, Long> trimThrough;
     private final Deque<Batch> pending = new ArrayDeque<>();
     private long nextBatch;
+    /** How many runs have been recorded; a re-check whose read was taken before the latest one is not used. */
+    private long recorded;
+    private long recheckEveryNanos = TICK_NANOS;
+    private long recheckAtNanos = System.nanoTime();
     private boolean started;
     private boolean closed;
     private RuntimeException failure;
@@ -273,6 +287,7 @@ final class PhysicalSourcePrefix implements AutoCloseable {
             owed.put(directPipeline, Map.copyOf(lastSeqByTable));
         }
         Batch run = Batch.of(new ChainPosition(new SourceOrder(epoch, nextBatch++), token), lastSeqByTable, owed);
+        recorded++;
         Batch last = pending.peekLast();
         if (last != null && (pending.size() >= MAX_PENDING_BATCHES || run.quiet() && last.quiet())) {
             pending.removeLast();
@@ -280,7 +295,30 @@ final class PhysicalSourcePrefix implements AutoCloseable {
         } else {
             pending.addLast(run);
         }
-        releaseOrStop(consumers);
+        // Just looked, so the shared thread need not look again before its next turn would have come.
+        recheckAtNanos = System.nanoTime() + recheckEveryNanos;
+        if (releaseOrStop(consumers)) {
+            recheckSoon();
+        }
+    }
+
+    /**
+     * Stops the account because a run the source handed over was not recorded whole: whatever comes after it
+     * must not be released past it, so nothing more is recorded or released, and the run says it stopped. A
+     * run cut short by its stream being closed stops the account the same way and fails nothing: the stream
+     * is going away, and the health it reports on may be shared with the stream that replaces it.
+     */
+    synchronized void abandon(Throwable cause) {
+        if (closed || failure != null) {
+            return;
+        }
+        boolean closing = cause instanceof CancellationException || Thread.currentThread().isInterrupted();
+        failure = cause instanceof RuntimeException runtime
+                ? runtime : new IllegalStateException("a run of chain " + chainId + " was not recorded", cause);
+        ACTIVE.remove(this);
+        if (!closing) {
+            health.fail(cause);
+        }
     }
 
     /**
@@ -288,10 +326,19 @@ final class PhysicalSourcePrefix implements AutoCloseable {
      * quiet. A store that cannot be read this turn is asked again on the next: nothing can be released on
      * confirmations nobody could read, so skipping a turn is the safe direction, and stopping every pipeline on
      * the source over one failed read is not.
+     *
+     * <p>The read is made without holding the account, so a slow store never holds back the thread the source
+     * hands its runs over on. A run recorded while it was being read may be owed to a pipeline that read does
+     * not know of yet, and a release on it would take that pipeline for one that left; so a read overtaken by
+     * a run is not used, and the run that overtook it was released on a read of its own.
      */
-    synchronized void tick() {
-        if (closed || failure != null || pending.isEmpty()) {
-            return;
+    void tick() {
+        long seen;
+        synchronized (this) {
+            if (closed || failure != null || pending.isEmpty()) {
+                return;
+            }
+            seen = recorded;
         }
         Collection<ConsumerOffset> consumers;
         try {
@@ -302,45 +349,88 @@ final class PhysicalSourcePrefix implements AutoCloseable {
             }
             throw unread;
         }
-        releaseOrStop(consumers);
+        synchronized (this) {
+            if (closed || failure != null || pending.isEmpty() || recorded != seen) {
+                return;
+            }
+            if (releaseOrStop(consumers)) {
+                recheckSoon();
+            } else {
+                recheckLater();
+            }
+        }
     }
 
     private void tickSafely() {
         try {
-            tick();
+            if (dueForRecheck()) {
+                tick();
+            }
         } catch (RuntimeException error) {
             health.fail(error);
         }
     }
 
+    private synchronized boolean dueForRecheck() {
+        return System.nanoTime() - recheckAtNanos >= 0;
+    }
+
+    /** Something moved: the shared thread looks again on its next tick. */
+    private void recheckSoon() {
+        recheckEveryNanos = TICK_NANOS;
+        recheckAtNanos = System.nanoTime();
+    }
+
+    /** Nothing moved: the shared thread waits twice as long as last time, up to {@link #MAX_RECHECK_MILLIS}. */
+    private void recheckLater() {
+        recheckEveryNanos = Math.min(recheckEveryNanos * 2, MAX_RECHECK_NANOS);
+        recheckAtNanos = System.nanoTime() + recheckEveryNanos;
+    }
+
     /**
-     * Releases what the confirmations allow, and stops the account for good on the first failure: whichever
-     * thread noticed it, every later call on the account throws the same failure rather than carry on over a
-     * chain it can no longer write down.
+     * Releases what the confirmations allow, answering whether it released anything, and stops the account for
+     * good on the first failure: whichever thread noticed it, every later call on the account throws the same
+     * failure rather than carry on over a chain it can no longer write down, and the run says it stopped.
      */
-    private void releaseOrStop(Collection<ConsumerOffset> consumers) {
+    private boolean releaseOrStop(Collection<ConsumerOffset> consumers) {
         try {
-            release(consumers);
+            return release(consumers);
         } catch (RuntimeException error) {
             failure = error;
             ACTIVE.remove(this);
+            health.fail(error);
             throw error;
         }
     }
 
-    private void release(Collection<ConsumerOffset> consumers) {
+    /**
+     * Releases runs in order while they are confirmed. A store that cannot take a release this turn leaves the
+     * run where it is, for the next turn to write again: every write a release makes only ever moves forward,
+     * so writing it a second time, after a failure part way through, lands where the first would have.
+     */
+    private boolean release(Collection<ConsumerOffset> consumers) {
         Map<String, ConsumerOffset> current = new LinkedHashMap<>();
         consumers.forEach(consumer -> current.put(consumer.pipelineId(), consumer));
+        boolean released = false;
         while (!pending.isEmpty()) {
             Batch first = pending.peekFirst();
             if (!confirmed(first, current)) {
-                return;
+                return released;
             }
             if (first.position().token() != null) {
-                write(first, current);
+                try {
+                    write(first, current);
+                } catch (TapstateException unwritten) {
+                    if (unwritten.code() == IoError.STORE_UNAVAILABLE) {
+                        return released;
+                    }
+                    throw unwritten;
+                }
             }
             pending.removeFirst();
+            released = true;
         }
+        return released;
     }
 
     /**
@@ -426,17 +516,15 @@ final class PhysicalSourcePrefix implements AutoCloseable {
             });
             return;
         }
-        for (Map.Entry<String, ChainPosition> landed : batch.landedAt().entrySet()) {
-            if (current.containsKey(landed.getKey())
-                    && !meta.advancePhysicalSinkAcked(chainId, landed.getKey(), epoch, landed.getValue())) {
-                throw lostOrUnverified();
+        // One write for the whole release, however many pipelines it was owed to: it is made on the thread the
+        // source hands its runs over on.
+        Map<String, ChainPosition> acknowledged = new LinkedHashMap<>();
+        batch.landedAt().forEach((pipeline, landed) -> {
+            if (current.containsKey(pipeline)) {
+                acknowledged.put(pipeline, landed);
             }
-        }
-        if (resumeAt != null && !resumeAt.equals(position)
-                && !meta.advancePhysicalSourceReadOffset(chainId, epoch, resumeAt, true)) {
-            throw lostOrUnverified();
-        }
-        if (!meta.advancePhysicalSourceReadOffset(chainId, epoch, position, position.equals(resumeAt))) {
+        });
+        if (!meta.advancePhysicalRelease(chainId, epoch, acknowledged, resumeAt, position)) {
             throw lostOrUnverified();
         }
         batch.lastSeqByTable().forEach(trimThrough);

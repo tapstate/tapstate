@@ -2465,6 +2465,8 @@ class CaptureRunUnitTest {
         private final Map<String, java.util.Set<String>> requests = new LinkedHashMap<>();
         /** Every generation-fenced release of the source read offset, in the order they landed. */
         final List<ChainPosition> releasedSourceReads = new ArrayList<>();
+        /** How many writes the reader's releases have made, whichever call made them. */
+        int releaseWrites;
 
         @Override
         public synchronized boolean replacePhysicalSelection(
@@ -2529,6 +2531,7 @@ class CaptureRunUnitTest {
         @Override
         public synchronized boolean advancePhysicalSourceReadOffset(
                 String miningChainId, long epoch, ChainPosition position, boolean resumable) {
+            releaseWrites++;
             SrsMeta m = require(miningChainId);
             if (m.epoch() != epoch) {
                 return false;
@@ -2585,6 +2588,7 @@ class CaptureRunUnitTest {
         @Override
         public synchronized boolean advancePhysicalSinkAcked(
                 String miningChainId, String pipelineId, long epoch, ChainPosition position) {
+            releaseWrites++;
             SrsMeta m = require(miningChainId);
             if (m.epoch() != epoch) {
                 return false;
@@ -2593,6 +2597,24 @@ class CaptureRunUnitTest {
             if (existing.isPresent() && ranksAfter(position, existing.get().sinkAcked())) {
                 advanceSinkAcked(miningChainId, pipelineId, position);
             }
+            return true;
+        }
+
+        @Override
+        public synchronized boolean advancePhysicalRelease(String miningChainId, long epoch,
+                Map<String, ChainPosition> acknowledged, ChainPosition resumeAt, ChainPosition position) {
+            int writes = releaseWrites;
+            if (require(miningChainId).epoch() != epoch) {
+                releaseWrites = writes + 1;
+                return false;
+            }
+            acknowledged.forEach((pipeline, landed) -> advancePhysicalSinkAcked(miningChainId, pipeline, epoch, landed));
+            if (resumeAt != null && !resumeAt.equals(position)) {
+                advancePhysicalSourceReadOffset(miningChainId, epoch, resumeAt, true);
+            }
+            advancePhysicalSourceReadOffset(miningChainId, epoch, position, position.equals(resumeAt));
+            // One act, however many facets it moved.
+            releaseWrites = writes + 1;
             return true;
         }
 

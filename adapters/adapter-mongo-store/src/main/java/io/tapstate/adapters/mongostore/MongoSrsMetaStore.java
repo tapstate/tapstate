@@ -7,10 +7,12 @@ import com.mongodb.ReadConcern;
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
+import com.mongodb.client.model.BulkWriteOptions;
 import com.mongodb.client.model.FindOneAndUpdateOptions;
 import com.mongodb.client.model.Projections;
 import com.mongodb.client.model.ReplaceOptions;
 import com.mongodb.client.model.ReturnDocument;
+import com.mongodb.client.model.UpdateOneModel;
 import com.mongodb.client.model.UpdateOptions;
 import com.mongodb.client.result.UpdateResult;
 import io.tapstate.core.common.TapstateException;
@@ -710,6 +712,70 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                                 sinkAckedAdvanceFilter(miningChainId, pipelineId, position.order()),
                                 sinkAckedUpdate(pipelineId, position));
                     }
+                    return null;
+                });
+            }
+        });
+        if (!current.get()) {
+            requireSeeded(miningChainId);
+        }
+        return current.get();
+    }
+
+    /**
+     * One transaction for the whole release: the generation fence on the chain record, every consumer's
+     * acknowledgement in one batch, and the chain's resume point and read offset. The per-call forms cost a
+     * transaction, and a read of the legacy cursors, for each consumer; a release is written on the thread the
+     * source hands its runs over on, so that cost was paid by every run, times the consumers on the chain.
+     */
+    @Override
+    public boolean advancePhysicalRelease(String miningChainId, long epoch,
+            Map<String, ChainPosition> acknowledged, ChainPosition resumeAt, ChainPosition position) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(acknowledged, "acknowledged");
+        requireRelease(epoch, position);
+        acknowledged.values().forEach(landed -> requireRelease(epoch, landed));
+        boolean resumeFirst = resumeAt != null && !resumeAt.equals(position);
+        if (resumeFirst) {
+            requireRelease(epoch, resumeAt);
+        }
+        boolean resumable = position.equals(resumeAt);
+        if (!resumable && !resumeFirst) {
+            keepTheResumePointOfARecordFromBefore(miningChainId);
+        }
+        if (!acknowledged.isEmpty()) {
+            migrateLegacyConsumers(miningChainId, true);
+        }
+        Instant now = Instant.now(clock);
+        AtomicBoolean current = new AtomicBoolean();
+        writeChainWithConsumerMigration(miningChainId, () -> {
+            try (ClientSession session = client.startSession()) {
+                return session.withTransaction(() -> {
+                    // The fence is a write to the chain record, so a newer generation opened concurrently
+                    // conflicts with this transaction instead of passing unseen between check and write.
+                    UpdateResult fenced = collection.updateOne(session,
+                            new Document("_id", miningChainId).append("epoch", epoch),
+                            new Document("$inc", new Document(CONSUMER_WRITE_REVISION, 1L)));
+                    current.set(fenced.getMatchedCount() == 1);
+                    if (!current.get()) {
+                        return null;
+                    }
+                    if (!acknowledged.isEmpty()) {
+                        // No upsert: a pipeline that left the chain is not recreated by a release.
+                        List<UpdateOneModel<Document>> advances = new ArrayList<>(acknowledged.size());
+                        acknowledged.forEach((pipelineId, landed) -> advances.add(new UpdateOneModel<>(
+                                sinkAckedAdvanceFilter(miningChainId, pipelineId, landed.order()),
+                                sinkAckedUpdate(pipelineId, landed))));
+                        consumers.bulkWrite(session, advances, new BulkWriteOptions().ordered(false));
+                    }
+                    if (resumeFirst) {
+                        collection.updateOne(session,
+                                sourceReadAdvanceFilter(miningChainId, resumeAt.order()).append("epoch", epoch),
+                                new Document("$set", sourceReadFields(resumeAt, now, true)));
+                    }
+                    collection.updateOne(session,
+                            sourceReadAdvanceFilter(miningChainId, position.order()).append("epoch", epoch),
+                            new Document("$set", sourceReadFields(position, now, resumable)));
                     return null;
                 });
             }

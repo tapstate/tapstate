@@ -15,6 +15,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -282,6 +283,150 @@ class PhysicalSourcePrefixTest {
         prefix.tick();
         assertThat(sourceRead()).isEqualTo("t1");
         assertThat(health.failure()).isEmpty();
+    }
+
+    /**
+     * A store that cannot take a release for a moment does not stop the reader either: the run stays where it
+     * is and a later turn writes it down. Every write a release makes only ever moves forward, so writing one
+     * again after a failure part way through it lands where it would have landed the first time.
+     */
+    @Test
+    void aReleaseTheStoreCannotTakeForAMomentIsWrittenOnALaterTurn() {
+        java.util.concurrent.atomic.AtomicBoolean unwritable = new java.util.concurrent.atomic.AtomicBoolean();
+        meta = new CaptureRunUnitTest.InMemoryMeta() {
+            @Override
+            public synchronized boolean advancePhysicalSourceReadOffset(
+                    String miningChainId, long epoch, ChainPosition position, boolean resumable) {
+                if (unwritable.get()) {
+                    throw new TapstateException(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE,
+                            Map.of("detail", "the primary stepped down"), null);
+                }
+                return super.advancePhysicalSourceReadOffset(miningChainId, epoch, position, resumable);
+            }
+        };
+        meta.create(CHAIN, null);
+        epoch = meta.openEpoch(CHAIN);
+        select("pipe", "orders");
+        PhysicalSourcePrefix prefix = shared("orders");
+        prefix.start(at("t0"));
+        prefix.admitted(Map.of("orders", 0L), "t1");
+
+        unwritable.set(true);
+        ack("pipe", "orders", 0);
+        org.assertj.core.api.Assertions.assertThatCode(prefix::tick)
+                .as("a release the store could not take is tried again rather than ending the reader")
+                .doesNotThrowAnyException();
+        org.assertj.core.api.Assertions.assertThatCode(() -> prefix.admitted(Map.of(), "h2"))
+                .as("and the source goes on handing runs over meanwhile")
+                .doesNotThrowAnyException();
+        assertThat(sourceRead()).isEqualTo("t0");
+
+        unwritable.set(false);
+        prefix.tick();
+        assertThat(sourceRead()).isEqualTo("h2");
+        assertThat(meta.resumeOffset(CHAIN)).contains("t1");
+        assertThat(health.failure()).isEmpty();
+    }
+
+    /**
+     * The shared re-check reads the store without holding the account, so a slow read never holds back the
+     * thread a source hands its runs over on. Here the re-check's read is held open until the source has
+     * handed over another run.
+     */
+    @Test
+    void aSlowReCheckDoesNotHoldBackTheSource() throws Exception {
+        java.util.concurrent.CountDownLatch reading = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch letItFinish = new java.util.concurrent.CountDownLatch(1);
+        meta = new CaptureRunUnitTest.InMemoryMeta() {
+            @Override
+            public List<ConsumerOffset> consumerOffsets(String miningChainId) {
+                if (Thread.currentThread().getName().equals("tapstate-physical-prefix")) {
+                    reading.countDown();
+                    try {
+                        letItFinish.await(10, TimeUnit.SECONDS);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+                return super.consumerOffsets(miningChainId);
+            }
+        };
+        meta.create(CHAIN, null);
+        epoch = meta.openEpoch(CHAIN);
+        select("pipe", "orders");
+        PhysicalSourcePrefix prefix = shared("orders");
+        prefix.start(at("t0"));
+        prefix.admitted(Map.of("orders", 0L), "t1");
+        try {
+            assertThat(reading.await(5, TimeUnit.SECONDS)).as("the shared re-check is reading the store").isTrue();
+            CompletableFuture<Void> handedOver = CompletableFuture.runAsync(() -> prefix.admitted(Map.of(), "h2"));
+            org.assertj.core.api.Assertions.assertThatCode(() -> handedOver.get(3, TimeUnit.SECONDS))
+                    .as("the source hands its next run over while the re-check is still reading")
+                    .doesNotThrowAnyException();
+        } finally {
+            letItFinish.countDown();
+        }
+    }
+
+    /**
+     * While nothing it waits for moves, an account is re-checked less and less often, rather than ten times a
+     * second for as long as a pipeline stays paused. Counted over three seconds with a run nobody confirms:
+     * re-checked every tick that is some thirty reads, and backing off it is a handful.
+     */
+    @Test
+    void anAccountNothingMovesIsReCheckedLessAndLessOften() throws Exception {
+        AtomicInteger reCheckReads = new AtomicInteger();
+        meta = new CaptureRunUnitTest.InMemoryMeta() {
+            @Override
+            public List<ConsumerOffset> consumerOffsets(String miningChainId) {
+                if (Thread.currentThread().getName().equals("tapstate-physical-prefix")) {
+                    reCheckReads.incrementAndGet();
+                }
+                return super.consumerOffsets(miningChainId);
+            }
+        };
+        meta.create(CHAIN, null);
+        epoch = meta.openEpoch(CHAIN);
+        select("paused", "orders");
+        PhysicalSourcePrefix prefix = shared("orders");
+        prefix.start(at("t0"));
+        prefix.admitted(Map.of("orders", 0L), "t1");
+
+        Thread.sleep(3_000);
+
+        assertThat(reCheckReads.get()).as("re-check reads of an account nothing moved in three seconds")
+                .isLessThanOrEqualTo(10);
+        ack("paused", "orders", 0);
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (!"t1".equals(sourceRead()) && System.nanoTime() < deadline) {
+            Thread.sleep(PhysicalSourcePrefix.TICK_MILLIS);
+        }
+        assertThat(sourceRead()).as("a confirmation landing after the back-off is still acted on").isEqualTo("t1");
+    }
+
+    /**
+     * Releasing a run costs the store one write, however many pipelines the run was owed to: the release is
+     * made on the thread the source hands its runs over on, and a write per pipeline there is a cost every run
+     * pays that grows with the chain. Three pipelines here, one release.
+     */
+    @Test
+    void aReleaseIsOneStoreWriteHoweverManyPipelinesItWasOwedTo() {
+        select("first", "orders");
+        select("second", "orders");
+        select("third", "orders");
+        PhysicalSourcePrefix prefix = shared("orders");
+        prefix.start(at("t0"));
+        prefix.admitted(Map.of("orders", 0L), "t1");
+        ack("first", "orders", 0);
+        ack("second", "orders", 0);
+        ack("third", "orders", 0);
+        int before = meta.releaseWrites;
+
+        prefix.tick();
+
+        assertThat(sourceRead()).isEqualTo("t1");
+        assertThat(consumer("third").sinkAcked().token()).isEqualTo("t1");
+        assertThat(meta.releaseWrites - before).as("store writes the one release made").isEqualTo(1);
     }
 
     /** A reader whose generation another reader has taken stops with a code, and writes nothing down. */

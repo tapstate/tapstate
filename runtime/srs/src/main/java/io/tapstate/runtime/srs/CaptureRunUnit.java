@@ -745,16 +745,22 @@ public final class CaptureRunUnit {
             return;
         }
         prefix.checkStillRecording();
-        int last = events.size() - 1;
-        Map<String, Long> lastSeqByTable = new LinkedHashMap<>();
-        for (int i = 0; i < events.size(); i++) {
-            long seq = forwarded.getAndIncrement();
-            Envelope event = events.get(i);
-            passthrough.accept(event.withPosition(
-                    new ChainPosition(new SourceOrder(epoch, seq), i == last ? token : null)));
-            lastSeqByTable.put(event.src(), seq);
+        try {
+            int last = events.size() - 1;
+            Map<String, Long> lastSeqByTable = new LinkedHashMap<>();
+            for (int i = 0; i < events.size(); i++) {
+                long seq = forwarded.getAndIncrement();
+                Envelope event = events.get(i);
+                passthrough.accept(event.withPosition(
+                        new ChainPosition(new SourceOrder(epoch, seq), i == last ? token : null)));
+                lastSeqByTable.put(event.src(), seq);
+            }
+            prefix.admitted(lastSeqByTable, token);
+        } catch (RuntimeException | Error failure) {
+            // Handed over and not recorded whole: nothing after it may be released past it.
+            prefix.abandon(failure);
+            throw failure;
         }
-        prefix.admitted(lastSeqByTable, token);
     }
 
     private RuntimeException rollbackStartFailure(

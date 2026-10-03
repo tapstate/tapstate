@@ -349,6 +349,32 @@ public interface SrsMetaStore {
     }
 
     /**
+     * Writes down one run the chain's reader has released, as one act: each consumer's acknowledgement in
+     * {@code acknowledged}, as {@link #advancePhysicalSinkAcked} advances one; then the source read offset to
+     * {@code position}, as {@link #advancePhysicalSourceReadOffset(String, long, ChainPosition, boolean)}
+     * advances it -- a restart resumes from {@code resumeAt} when that is the position, and from
+     * {@code resumeAt} laid down first when the run ended in runs that carried no change after it; with no
+     * {@code resumeAt}, no run released carried a change and the resume point is left where it is. Fenced by
+     * generation as those are, and answers whether the chain is still in it; nothing is written when it is not.
+     *
+     * <p>A release is written on the thread a source hands its runs over on, so its cost is paid by every run;
+     * a store that can write it in one go should. The default makes the separate calls.
+     */
+    default boolean advancePhysicalRelease(String miningChainId, long epoch,
+            Map<String, ChainPosition> acknowledged, ChainPosition resumeAt, ChainPosition position) {
+        for (Map.Entry<String, ChainPosition> landed : acknowledged.entrySet()) {
+            if (!advancePhysicalSinkAcked(miningChainId, landed.getKey(), epoch, landed.getValue())) {
+                return false;
+            }
+        }
+        if (resumeAt != null && !resumeAt.equals(position)
+                && !advancePhysicalSourceReadOffset(miningChainId, epoch, resumeAt, true)) {
+            return false;
+        }
+        return advancePhysicalSourceReadOffset(miningChainId, epoch, position, position.equals(resumeAt));
+    }
+
+    /**
      * The store-fenced form of {@link #advanceSinkAcked(String, String, ChainPosition)}. The consumer must
      * already be bound to {@code fence} by fenced writer-plan configuration; a stale or differently bound
      * advance is ignored. Stores that cannot enforce that condition refuse the fenced operation rather than

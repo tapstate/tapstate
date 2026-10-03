@@ -469,6 +469,46 @@ class MongoSrsMetaStoreIT {
         });
     }
 
+    /**
+     * A release written in one go lands as the separate calls would have: every pipeline's acknowledgement,
+     * the resume point at the last change and the read offset at the quiet run after it -- only while its
+     * reader holds the generation, never for a pipeline that left, and never backwards.
+     */
+    @Test
+    void aReleaseWrittenInOneGoLandsAsTheSeparateCallsWould() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long first = store.openEpoch(CHAIN);
+            store.selectConsumerTables(CHAIN, "pipe", List.of("orders"), first);
+            store.selectConsumerTables(CHAIN, "other", List.of("customers"), first);
+            ChainPosition change = new ChainPosition(new SourceOrder(first, 4), "t4");
+            ChainPosition quiet = new ChainPosition(new SourceOrder(first, 5), "h5");
+
+            assertThat(store.advancePhysicalRelease(CHAIN, first,
+                    Map.of("pipe", change, "other", change, "gone", change), change, quiet)).isTrue();
+            SrsMeta written = store.read(CHAIN).orElseThrow();
+            assertThat(written.sourceRead()).isEqualTo(quiet);
+            assertThat(store.resumeOffset(CHAIN)).contains("t4");
+            assertThat(written.consumerOffset("pipe").orElseThrow().sinkAcked()).isEqualTo(change);
+            assertThat(written.consumerOffset("other").orElseThrow().sinkAcked()).isEqualTo(change);
+            assertThat(written.consumerOffset("gone")).as("a pipeline that left is not brought back").isEmpty();
+
+            ChainPosition behind = new ChainPosition(new SourceOrder(first, 2), "t2");
+            assertThat(store.advancePhysicalRelease(CHAIN, first, Map.of("pipe", behind), behind, behind))
+                    .as("behind, but still current").isTrue();
+            assertThat(store.read(CHAIN).orElseThrow().sourceRead()).isEqualTo(quiet);
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow().sinkAcked())
+                    .isEqualTo(change);
+
+            store.openEpoch(CHAIN);
+            ChainPosition late = new ChainPosition(new SourceOrder(first, 9), "t9");
+            assertThat(store.advancePhysicalRelease(CHAIN, first, Map.of("pipe", late), late, late)).isFalse();
+            assertThat(store.read(CHAIN).orElseThrow().sourceRead()).isEqualTo(quiet);
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow().sinkAcked())
+                    .as("nothing of a release from a generation that was taken is written").isEqualTo(change);
+        });
+    }
+
     @Test
     void aSelectionInTheSameGenerationKeepsTheAcknowledgementsOfTheTablesItKeeps() {
         withStore(store -> {
