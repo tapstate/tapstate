@@ -402,7 +402,10 @@ final class ConvergenceDriver {
             }
             var capturedScope = scope.orElse(null);
             telemetryWork.offerQualifiedPreparation(pipelineId, failure, capturedScope,
-                    () -> publicationQualification(pipelineId, capturedScope, permit), diagnostic);
+                    () -> publicationQualification(pipelineId, capturedScope, permit), diagnostic,
+                    result != null && result.status() == ConvergeStatus.FAILED
+                            ? result.checkpoint().orElse(null) : null,
+                    permit == null ? null : ObservationScopeRecovery.Owner.of(permit.claim()));
             return Optional.empty();
         }
         if (observationScopes == null) {

@@ -99,6 +99,245 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class EngineLifecycleActuatorTest {
 
     @Test
+    void anAllocatedBuildFailurePublishesItsActualScopeWithoutPriorLatest() throws Exception {
+        requireAllocatedBuildFailurePublication(false, false);
+    }
+
+    @Test
+    void anAllocatedBuildFailureReplacesOnlyItsActualNewPriorLatest() throws Exception {
+        requireAllocatedBuildFailurePublication(true, false);
+    }
+
+    @Test
+    void aLostOwnerCannotPublishAnOldAllocatedBuildFailure() throws Exception {
+        requireAllocatedBuildFailurePublication(false, true);
+    }
+
+    @Test
+    void anAllocatedBuildFailureKeepsItsCauseAcrossAOneShotOwnerRetry() throws Exception {
+        requireAllocatedBuildFailurePublication(false, false, true);
+    }
+
+    private void requireAllocatedBuildFailurePublication(boolean publishNewBeforeRefusal, boolean loseOwner)
+            throws Exception {
+        requireAllocatedBuildFailurePublication(publishNewBeforeRefusal, loseOwner, false);
+    }
+
+    @Test
+    void anAllocatedBuildFailureKeepsItsCauseWhileContinuationOwnershipStaysBusy() throws Exception {
+        requireAllocatedBuildFailurePublication(false, false, false, true);
+    }
+
+    private void requireAllocatedBuildFailurePublication(boolean publishNewBeforeRefusal, boolean loseOwner,
+            boolean retryOnce) throws Exception {
+        requireAllocatedBuildFailurePublication(publishNewBeforeRefusal, loseOwner, retryOnce, false);
+    }
+
+    private void requireAllocatedBuildFailurePublication(boolean publishNewBeforeRefusal, boolean loseOwner,
+            boolean retryOnce, boolean continuationRetry) throws Exception {
+        var artifacts = new InMemoryArtifactStore();
+        String sourceId = "admitted_source";
+        artifacts.save(new SourceResource(sourceId, null, "mysql", Map.of("host", "controlled"), SourceMode.CDC,
+                List.of(TableRef.literal("orders"), TableRef.literal("customers")), null, null));
+        var join = io.tapstate.core.model.Step.inline("widen", io.tapstate.core.model.FromClause.aliases(
+                Map.of("o", FromRef.literal("orders"), "c", FromRef.literal("customers"))),
+                new io.tapstate.core.model.TransformBody.Join(io.tapstate.core.model.JoinEngine.BUILTIN,
+                        "SELECT o.id AS order_id, o.no_such_column AS missing, c.seq AS customer_seq "
+                                + "FROM o LEFT JOIN c ON o.seq = c.id"), null);
+        artifacts.save(new PipelineResource(PIPE, null, List.of(SourceRef.spec(sourceId, true)),
+                List.of(join), new io.tapstate.core.model.ViewBlock.Inline(
+                        "order_state", FromRef.literal("widen"), "order_id", null), null,
+                new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null));
+        var store = new InMemoryStorePort(artifacts);
+        List<io.tapstate.spi.store.SourceField> columns = List.of(
+                new io.tapstate.spi.store.SourceField("id", "bigint", io.tapstate.core.common.TapstateType.INT64),
+                new io.tapstate.spi.store.SourceField("seq", "bigint", io.tapstate.core.common.TapstateType.INT64));
+        store.schemas().save(new io.tapstate.spi.store.DiscoveredSourceModel(sourceId, "mysql", 1L,
+                new io.tapstate.spi.store.SourceModel(List.of(
+                        new io.tapstate.spi.store.SourceTable("orders", columns, List.of("id"), List.of()),
+                        new io.tapstate.spi.store.SourceTable("customers", columns, List.of("id"), List.of())))));
+        var identity = new AtomicReference<String>();
+        ArtifactStore identityArtifacts = new ArtifactStore() {
+            @Override public void saveAll(List<io.tapstate.core.model.Resource> rows) { artifacts.saveAll(rows); }
+            @Override public Optional<io.tapstate.core.model.Resource> get(String id) { return artifacts.get(id); }
+            @Override public List<io.tapstate.core.model.Resource> list() { return artifacts.list(); }
+            @Override public Optional<String> pipelineIncarnationId(String id) {
+                return PIPE.equals(id) ? Optional.ofNullable(identity.get()) : Optional.empty();
+            }
+            @Override public Optional<String> ensurePipelineIncarnationId(String id, String candidate) {
+                if (!PIPE.equals(id) || artifacts.get(id).isEmpty()) { return Optional.empty(); }
+                identity.compareAndSet(null, candidate);
+                return Optional.of(identity.get());
+            }
+        };
+        var generations = new InMemoryWorkloadClaimStore();
+        var owner = org.mockito.Mockito.spy(PipelineActuationOwnership.single("single", generations));
+        var eligible = new java.util.concurrent.atomic.AtomicBoolean(true);
+        var ownerEntered = new java.util.concurrent.CountDownLatch(1);
+        var releaseOwner = new java.util.concurrent.CountDownLatch(1);
+        var retryReturned = new java.util.concurrent.CountDownLatch(1);
+        var workerOwnerChecks = new java.util.concurrent.atomic.AtomicInteger();
+        var holdOwnerRetry = new java.util.concurrent.atomic.AtomicBoolean(continuationRetry);
+        if (loseOwner || retryOnce || continuationRetry) {
+            org.mockito.Mockito.doAnswer(invocation -> {
+                if (Thread.currentThread().getName().startsWith("tapstate-telemetry-latest-")) {
+                    int check = workerOwnerChecks.incrementAndGet();
+                    if ((retryOnce && check == 2) || (continuationRetry && check >= 2 && holdOwnerRetry.get())) {
+                        // Busy ownership can end between probes or persist through handoff admission.
+                        retryReturned.countDown();
+                        return PipelineActuationOwnership.Permit.busy();
+                    }
+                    if (loseOwner) {
+                        ownerEntered.countDown();
+                        if (!releaseOwner.await(5, TimeUnit.SECONDS)) {
+                            throw new AssertionError("old telemetry owner check was not released");
+                        }
+                    }
+                }
+                return invocation.callRealMethod();
+            }).when(owner).permit(org.mockito.ArgumentMatchers.eq(PIPE));
+        }
+        var scopes = new ObservationScopeRegistry();
+        var latest = new RetainedObservations(null);
+        ObservationPublisher publisher = new ObservationPublisher(store.state(), latest);
+        StoreBackedDagSource actualBuilder = new StoreBackedDagSource(store);
+        var admittedScope = new AtomicReference<ObservationStore.Scope>();
+        var buildRefusal = new AtomicReference<TapstateException>();
+        var buildCalls = new java.util.concurrent.atomic.AtomicInteger();
+        DagSource rejecting = new DagSource() {
+            @Override public DAG dagFor(String id) { return actualBuilder.dagFor(id); }
+            @Override public List<io.tapstate.core.lifecycle.PipelineStateHolding> stateHeldBy(String id) {
+                return actualBuilder.stateHeldBy(id);
+            }
+            @Override public NestCapacity capacityOf(String id) { return actualBuilder.capacityOf(id); }
+            @Override public StartPreparation prepareStart(String id, String database) {
+                StartPreparation actual = actualBuilder.prepareStart(id, database);
+                return new StartPreparation(actual.capacity(), actual.stateLocations(), actual.artifactSnapshot(),
+                        actual.cursorWriterToken(), fence -> {
+                            buildCalls.incrementAndGet();
+                            assertThat(fence).isNotNull();
+                            assertThat(generations.currentGeneration("single", PIPE)).hasValue(fence.executionGeneration());
+                            admittedScope.set(scopes.current(PIPE).orElseThrow());
+                            assertThat(admittedScope.get().executionGeneration()).isEqualTo(fence.executionGeneration());
+                            assertThat(StateJson.parse(store.state().read(PIPE).orElseThrow().stateJson()))
+                                    .isEqualTo(PipelineState.NEW);
+                            if (publishNewBeforeRefusal) {
+                                publisher.publishScoped(PIPE, null, admittedScope.get()).orElseThrow();
+                                assertThat(latest.readStored(PIPE).orElseThrow().observation().state())
+                                        .isEqualTo(PipelineState.NEW);
+                            }
+                            try { return actual.dagBuilder().apply(fence); }
+                            catch (TapstateException refusal) { buildRefusal.set(refusal); throw refusal; }
+                        });
+            }
+        };
+        var calls = new CopyOnWriteArrayList<String>();
+        var engine = new Engine(member);
+        var capture = new RecordingCaptureCoordinator(calls);
+        var actuator = new EngineLifecycleActuator(engine, rejecting, capture, teardown(), owner,
+                new PipelineIncarnationService(identityArtifacts), scopes);
+        var loop = new PipelineConverger(store.desired(), store.state(), actuator, Clock.systemUTC());
+        var recovery = new ObservationScopeRecovery(identityArtifacts, generations, latest, store.state(), "single");
+        var sink = new io.tapstate.core.logging.RingBufferLogSink(8, 8);
+        var logger = (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(ConvergenceDriver.class);
+        var appender = new PipelineLogAppender(sink, new io.tapstate.core.logging.SecretRedactor());
+        appender.setContext(logger.getLoggerContext()); appender.start(); logger.addAppender(appender);
+        PipelineLogContext context = PipelineLogContext.capture();
+        store.desired().save(new DesiredState(PIPE, PipelineState.RUNNING, "rev-1"));
+        var handoffs = continuationRetry ? org.mockito.Mockito.spy(new ObservationContinuationRecovery(scopes, latest,
+                store.state(), store.desired(), identityArtifacts, actuator, engine)) : null;
+        try (TelemetryDispatcher telemetry = new TelemetryDispatcher(publisher, null, MetricsExport.none(),
+                scopes, null, recovery, handoffs, 1, 4, Duration.ofSeconds(5))) {
+            var driver = new ConvergenceDriver(loop, store.desired(), publisher, null, MetricsExport.none(),
+                    eligible::get, owner, LifecycleWorkDispatcher.inline(), scopes, telemetry);
+            driver.reconcile();
+            CheckpointDoc failed = store.state().read(PIPE).orElseThrow();
+            assertThat(StateJson.parse(failed.stateJson())).isEqualTo(PipelineState.FAILED);
+            assertThat(buildRefusal.get()).isNotNull();
+            assertThat(buildRefusal.get().code()).isEqualTo(ActuationError.JOIN_SQL_INVALID);
+            assertThat(buildCalls.get()).isEqualTo(1);
+            assertThat(admittedScope.get().pipelineIncarnationId()).isEqualTo(identity.get());
+            assertThat(generations.currentGeneration("single", PIPE)).hasValue(admittedScope.get().executionGeneration());
+            assertThat(engine.executionJob(PIPE)).as("a real admitted generation is not a fabricated native Job").isEmpty();
+            assertThat(member.getJet().getJob(PIPE)).isNull();
+            if (loseOwner) {
+                assertThat(ownerEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                eligible.set(false); releaseOwner.countDown();
+            }
+            if (retryOnce || continuationRetry) {
+                assertThat(retryReturned.await(5, TimeUnit.SECONDS)).isTrue();
+                if (continuationRetry) {
+                    org.mockito.Mockito.verify(handoffs, org.mockito.Mockito.atLeastOnce()).prepareHandoff(
+                            org.mockito.ArgumentMatchers.eq(PIPE), org.mockito.ArgumentMatchers.eq(admittedScope.get()),
+                            org.mockito.ArgumentMatchers.any(java.util.function.BooleanSupplier.class));
+                }
+                long idleUntil = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                while (System.nanoTime() - idleUntil < 0
+                        && telemetry.health().get(TelemetryDispatcher.Sink.LATEST).inFlight() != 0) {
+                    TimeUnit.MILLISECONDS.sleep(5);
+                }
+                var parked = telemetry.health().get(TelemetryDispatcher.Sink.LATEST);
+                assertThat(parked.inFlight()).isZero();
+                assertThat(parked.queueDepth()).as("a transient owner retry retains the original bounded failure request")
+                        .isEqualTo(1);
+                assertThat(latest.readStored(PIPE)).isEmpty();
+                holdOwnerRetry.set(false);
+                driver.reconcile();
+            }
+            long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (System.nanoTime() - until < 0) {
+                var saved = latest.readStored(PIPE);
+                boolean done = loseOwner ? telemetry.health().get(TelemetryDispatcher.Sink.LATEST).inFlight() == 0
+                        : saved.filter(row -> row.scope().filter(admittedScope.get()::equals).isPresent()
+                                && row.observation().state() == PipelineState.FAILED
+                                && row.observation().failure() != null).isPresent();
+                if (done) { break; }
+                TimeUnit.MILLISECONDS.sleep(5);
+            }
+            var logScope = new io.tapstate.core.logging.LogSink.Scope(admittedScope.get().pipelineIncarnationId(),
+                    admittedScope.get().executionGeneration());
+            if (loseOwner) {
+                assertThat(latest.readStored(PIPE)).as("the released owner cannot publish its old failure").isEmpty();
+                assertThat(sink.tail(PIPE, logScope)).isEmpty();
+            } else {
+                var saved = latest.readStored(PIPE);
+                assertThat(saved).as("the actual failed admission publishes without relying on previous nonNEW telemetry")
+                        .isPresent();
+                Observation observation = saved.orElseThrow().observation();
+                assertThat(observation.failure()).isNotNull();
+                assertThat(observation.state()).isEqualTo(PipelineState.FAILED);
+                assertThat(saved.orElseThrow().scope()).contains(admittedScope.get());
+                assertThat(observation.failure().code()).isEqualTo(ActuationError.JOIN_SQL_INVALID.code());
+                assertThat(observation.failure().params()).containsEntry("step", "widen");
+                assertThat(observation.metrics()).containsEntry("errors." + ActuationError.JOIN_SQL_INVALID.code(), 1L);
+                assertThat(observation.facts()).extracting(MetricFact::name)
+                        .doesNotContain("tapstate.pipeline.records", "tapstate.pipeline.bytes");
+                assertThat(sink.tail(PIPE, logScope).stream().filter(line -> "WARN".equals(line.level())
+                        && line.message().contains("entered FAILED"))).hasSize(1);
+                driver.reconcile(); driver.reconcile();
+                while (System.nanoTime() - until < 0) {
+                    var health = telemetry.health().get(TelemetryDispatcher.Sink.LATEST);
+                    if (health.queueDepth() == 0 && health.inFlight() == 0) { break; }
+                    TimeUnit.MILLISECONDS.sleep(5);
+                }
+                var health = telemetry.health().get(TelemetryDispatcher.Sink.LATEST);
+                assertThat(health.queueDepth()).isZero();
+                assertThat(health.inFlight()).isZero();
+                assertThat(latest.readStored(PIPE).orElseThrow().observation().metrics())
+                        .containsEntry("errors." + ActuationError.JOIN_SQL_INVALID.code(), 1L);
+                assertThat(sink.tail(PIPE, logScope).stream().filter(line -> "WARN".equals(line.level())
+                        && line.message().contains("entered FAILED"))).hasSize(1);
+                assertThat(store.state().read(PIPE)).contains(failed);
+                assertThat(buildCalls.get()).isEqualTo(1);
+                assertThat(generations.currentGeneration("single", PIPE)).hasValue(admittedScope.get().executionGeneration());
+            }
+            assertThat(PipelineLogContext.capture()).isEqualTo(context);
+        } finally {
+            releaseOwner.countDown(); context.restore(); logger.detachAppender(appender); appender.stop();
+        }
+    }
+
+    @Test
     void anAutomaticallyReplacedFailedExecutionCarriesItsRealEventBoundary() {
         var calls = new CopyOnWriteArrayList<String>();
         var generations = new InMemoryWorkloadClaimStore();

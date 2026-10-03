@@ -64,15 +64,31 @@ final class ObservationScopeRecovery {
     }
 
     boolean unchanged(String pipelineId, Qualified qualified) {
-        return state.read(pipelineId).filter(qualified.checkpoint()::equals).isPresent()
-                && authority(pipelineId).filter(qualified.scope()::equals).isPresent();
+        return unchanged(pipelineId, qualified.scope(), qualified.checkpoint());
+    }
+
+    private boolean unchanged(String pipelineId, ObservationStore.Scope scope, CheckpointDoc checkpoint) {
+        return state.read(pipelineId).filter(checkpoint::equals).isPresent()
+                && authority(pipelineId).filter(scope::equals).isPresent();
+    }
+
+    /** An already admitted local failure needs no previous observation or fabricated native baseline. */
+    boolean failedAttemptCurrent(String pipelineId, ObservationStore.Scope scope, CheckpointDoc checkpoint,
+            Owner captured) {
+        return scope != null && checkpoint != null && pipelineId.equals(checkpoint.pipelineId())
+                && StateJson.parse(checkpoint.stateJson()) == PipelineState.FAILED
+                && matchesOwner(pipelineId, scope, captured) && unchanged(pipelineId, scope, checkpoint);
     }
 
     boolean matchesOwner(String pipelineId, Qualified qualified, Owner captured) {
+        return matchesOwner(pipelineId, qualified.scope(), captured);
+    }
+
+    private boolean matchesOwner(String pipelineId, ObservationStore.Scope scope, Owner captured) {
         return captured == null || (clusterId.equals(captured.key().clusterId())
                 && pipelineId.equals(captured.key().resourceId())
                 && captured.key().type() == WorkloadClaimType.PIPELINE_ACTUATION
-                && captured.executionGeneration() == qualified.scope().executionGeneration());
+                && captured.executionGeneration() == scope.executionGeneration());
     }
 
     private Optional<ObservationStore.Scope> authority(String pipelineId) {

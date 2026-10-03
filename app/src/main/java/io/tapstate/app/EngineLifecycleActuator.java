@@ -240,9 +240,11 @@ final class EngineLifecycleActuator implements LifecycleActuator {
             } catch (RuntimeException cleanup) {
                 failure.addSuppressed(cleanup);
             }
-            if (observationScope != null) {
+            if (observationScope != null && (replacement != null || !(failure instanceof TapstateException))) {
                 observationScopes.discard(pipelineId, observationScope);
             }
+            // A coded build refusal after ordinary admission belongs to the real allocated scope.
+            // Its FAILED checkpoint and current authority are qualified on the telemetry worker.
             throw failure;
         } finally {
             previousLogContext.restore();

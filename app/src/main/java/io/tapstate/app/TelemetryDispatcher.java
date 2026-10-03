@@ -168,6 +168,8 @@ final class TelemetryDispatcher implements AutoCloseable {
             private final PreparationFrame preparation;
             /** Set synchronously only after the publisher registered this request's non-null cause. */
             private boolean failureCaptured;
+            /** The last exact guarded admission check, retained across a transient local owner retry. */
+            private PublicationQualification preparationQualification;
             private volatile FailureTime failureTime;
             /** 0 running, 1 timed out while running, 2 finished. */
             private final AtomicInteger state = new AtomicInteger();
@@ -334,7 +336,13 @@ final class TelemetryDispatcher implements AutoCloseable {
     }
 
     private record RecoveryQualification(CheckpointDoc checkpoint, ObservationScopeRecovery.Owner ownerVersion,
-            BooleanSupplier owner) { }
+            Supplier<PublicationQualification> owner, boolean requireStoredBaseline) {
+        private RecoveryQualification(CheckpointDoc checkpoint, ObservationScopeRecovery.Owner ownerVersion,
+                BooleanSupplier owner) {
+            this(checkpoint, ownerVersion,
+                    () -> owner.getAsBoolean() ? PublicationQualification.CURRENT : PublicationQualification.STALE, true);
+        }
+    }
 
     /** Captures publication authority and the one observed cause without collecting native metrics. */
     private record PreparationFrame(String pipelineId, ObservationFailure failure, ObservationStore.Scope scope,
@@ -761,7 +769,15 @@ final class TelemetryDispatcher implements AutoCloseable {
 
     void offerQualifiedPreparation(String pipelineId, ObservationFailure failure, ObservationStore.Scope scope,
             Supplier<PublicationQualification> owner, FailureLog diagnostic) {
-        PreparationFrame request = new PreparationFrame(pipelineId, failure, scope, owner, Instant.now(), diagnostic);
+        offerQualifiedPreparation(pipelineId, failure, scope, owner, diagnostic, null, null);
+    }
+
+    void offerQualifiedPreparation(String pipelineId, ObservationFailure failure, ObservationStore.Scope scope,
+            Supplier<PublicationQualification> owner, FailureLog diagnostic, CheckpointDoc failedCheckpoint,
+            ObservationScopeRecovery.Owner ownerVersion) {
+        RecoveryQualification failed = scope != null && scopeRecovery != null && failedCheckpoint != null
+                ? new RecoveryQualification(failedCheckpoint, ownerVersion, owner, false) : null;
+        PreparationFrame request = new PreparationFrame(pipelineId, failure, scope, owner, Instant.now(), diagnostic, failed);
         if (closed.get()) {
             return;
         }
@@ -793,17 +809,32 @@ final class TelemetryDispatcher implements AutoCloseable {
     }
 
     /** Cold fallback reads occur only on the existing latest worker, after the request was admitted. */
-    private BooleanSupplier preparationCurrent(PreparationFrame request) {
+    private BooleanSupplier preparationCurrent(PreparationFrame request, Stats.Operation operation) {
         if (request.recovery() == null) { return () -> eligible(request); }
         RecoveryQualification expected = request.recovery();
+        if (!expected.requireStoredBaseline()) {
+            return () -> {
+                PublicationQualification authority = qualification(request);
+                if (authority == PublicationQualification.CURRENT) {
+                    authority = expected.owner().get();
+                }
+                if (authority == PublicationQualification.CURRENT
+                        && !scopeRecovery.failedAttemptCurrent(request.pipelineId(), request.scope(),
+                                expected.checkpoint(), expected.ownerVersion())) {
+                    authority = PublicationQualification.STALE;
+                }
+                operation.preparationQualification = authority;
+                return authority == PublicationQualification.CURRENT;
+            };
+        }
         var qualified = scopeRecovery.resolve(request.pipelineId()).orElse(null);
         if (qualified == null || !qualified.scope().equals(request.scope())
                 || !qualified.checkpoint().equals(expected.checkpoint())
                 || !scopeRecovery.matchesOwner(request.pipelineId(), qualified, expected.ownerVersion())
-                || !expected.owner().getAsBoolean()
+                || expected.owner().get() != PublicationQualification.CURRENT
                 || !stillCurrent(request.pipelineId(), qualified.scope())
                 || !scopeRecovery.unchanged(request.pipelineId(), qualified)) { return null; }
-        return () -> eligible(request) && expected.owner().getAsBoolean()
+        return () -> eligible(request) && expected.owner().get() == PublicationQualification.CURRENT
                 && stillCurrent(request.pipelineId(), qualified.scope())
                 && scopeRecovery.unchanged(request.pipelineId(), qualified);
     }
@@ -816,10 +847,18 @@ final class TelemetryDispatcher implements AutoCloseable {
             }
             return before == PublicationQualification.RETRY ? PreparationOutcome.RETRY : PreparationOutcome.SKIPPED;
         }
-        BooleanSupplier current = preparationCurrent(request);
+        BooleanSupplier current = preparationCurrent(request, operation);
         if (current == null) { return PreparationOutcome.SKIPPED; }
         if (continuations != null && !continuations.prepareHandoff(request.pipelineId(), request.scope(), current)) {
-            return eligible(request) ? PreparationOutcome.RETRY : PreparationOutcome.SKIPPED;
+            if (operation.failureCaptured || operation.preparationQualification == PublicationQualification.STALE) {
+                return PreparationOutcome.SKIPPED;
+            }
+            PublicationQualification authority = qualification(request);
+            if (authority == PublicationQualification.CURRENT && request.recovery() != null
+                    && !request.recovery().requireStoredBaseline()) {
+                authority = request.recovery().owner().get();
+            }
+            return authority == PublicationQualification.STALE ? PreparationOutcome.SKIPPED : PreparationOutcome.RETRY;
         }
         Runnable captured = () -> {
             operation.failureCaptured = true;
@@ -831,7 +870,17 @@ final class TelemetryDispatcher implements AutoCloseable {
         if (prepared.isEmpty()) {
             // The publisher acknowledges its actual account update, independently of guard success.
             // Retrying an already captured non-null cause would count the same death twice.
-            return !operation.failureCaptured && qualification(request) == PublicationQualification.RETRY
+            if (operation.failureCaptured || operation.preparationQualification == PublicationQualification.STALE) {
+                return PreparationOutcome.SKIPPED;
+            }
+            PublicationQualification authority = qualification(request);
+            if (authority == PublicationQualification.CURRENT && request.recovery() != null
+                    && !request.recovery().requireStoredBaseline()) {
+                authority = request.recovery().owner().get();
+            }
+            return authority != PublicationQualification.STALE
+                    && (authority == PublicationQualification.RETRY
+                            || operation.preparationQualification == PublicationQualification.RETRY)
                     ? PreparationOutcome.RETRY : PreparationOutcome.SKIPPED;
         }
         if (!eligible(request)) {
