@@ -25,7 +25,7 @@ class JsonValuesTest {
 
     @Test
     void measuresExactCompactUtf8JsonAndStopsAtTheLimit() {
-        Object value = Map.of("quote", "a\n\"", "emoji", "😀", "number", 12);
+        Object value = Map.of("quote", "a\n\"", "emoji", "\uD83D\uDE00", "number", 12);
         long exact = JsonValues.encodedSize(value, Long.MAX_VALUE);
         assertThat(exact).isPositive();
         assertThat(JsonValues.encodedSize(value, exact)).isEqualTo(exact);

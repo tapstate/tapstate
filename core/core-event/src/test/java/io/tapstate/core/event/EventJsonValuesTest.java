@@ -24,7 +24,7 @@ class EventJsonValuesTest {
     @Test
     void measuresPortableValuesWithEscapingDatesAndBoundedOutput() {
         Object value = List.of(new ConvertedValue(123, "int"), new Bytes((byte) 1, new byte[] {1}),
-                Date.from(Instant.parse("2026-01-01T00:00:00Z")), "😀\n");
+                Date.from(Instant.parse("2026-01-01T00:00:00Z")), "\uD83D\uDE00\n");
         long exact = EventJsonValues.encodedSize(value, Long.MAX_VALUE);
         assertThat(EventJsonValues.encodedSize(value, exact)).isEqualTo(exact);
         assertThat(EventJsonValues.encodedSize(value, exact - 1)).isEqualTo(exact);
