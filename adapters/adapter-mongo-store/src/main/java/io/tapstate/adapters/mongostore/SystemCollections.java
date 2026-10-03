@@ -139,13 +139,15 @@ public enum SystemCollections {
      * the samples leave: the server drops a document once its {@code observedAt} is older than the expiry,
      * on a sweep of its own, so a pipeline that stopped writing still has its history bounded. The expiry
      * declared here is the default retention; a configured one is written over it at startup, in place.
-     * The second index is the one read shape this collection allows -- one pipeline, one time range,
-     * with the generated id as the stable tie-breaker for samples taken at the same instant.
+     * The time-range index supports legacy and unfiltered reads, with the generated id as the stable
+     * tie-breaker. Scoped reads also constrain the incarnation before the time range, so finding one
+     * current sample does not walk the retained samples of earlier resources with the same id.
      */
     PIPELINE_RATE_HISTORY(MongoStorePort.PIPELINE_RATE_HISTORY, Database.STORE, MongoRateHistoryStore.class,
             Strategy.MIGRATED, 9,
             new IndexSpec(List.of("observedAt"), false, MongoRateHistoryStore.DEFAULT_RETENTION.toSeconds()),
-            new IndexSpec(List.of("pipelineId", "observedAt", "_id"), false)),
+            new IndexSpec(List.of("pipelineId", "observedAt", "_id"), false),
+            new IndexSpec(List.of("pipelineId", "pipelineIncarnationId", "observedAt", "_id"), false)),
 
     /**
      * Durable SRS cursors, one document per consumer pipeline on a mining chain. Keeping each pipeline's

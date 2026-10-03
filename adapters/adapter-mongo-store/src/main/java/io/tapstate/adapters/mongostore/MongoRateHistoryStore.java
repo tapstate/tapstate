@@ -71,13 +71,15 @@ public final class MongoRateHistoryStore implements RateHistoryStore {
         if (retention.isNegative() || retention.isZero()) {
             throw new IllegalArgumentException("a retention is a positive length of time: " + retention);
         }
-        // The expiring index with the configured retention, and the read index; both idempotent, and the
-        // first one altered in place when a configured retention differs from the one on the index.
+        // The expiring index and both read indexes are idempotent. The expiry changes in place when
+        // the configured retention differs from the one on the index.
         StoreIo.run(() -> {
             IndexEnsure.ensure(database, collection, new SystemCollections.IndexSpec(
                     List.of(OBSERVED_AT), false, retention.toSeconds()));
             IndexEnsure.ensure(database, collection, new SystemCollections.IndexSpec(
                     List.of(PIPELINE_ID, OBSERVED_AT, INTERNAL_ID), false));
+            IndexEnsure.ensure(database, collection, new SystemCollections.IndexSpec(
+                    List.of(PIPELINE_ID, PIPELINE_INCARNATION_ID, OBSERVED_AT, INTERNAL_ID), false));
         });
     }
 

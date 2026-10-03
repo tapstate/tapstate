@@ -103,6 +103,45 @@ class MigrationRunnerIT {
     }
 
     @Test
+    void scopedHistoryUpgradePreservesSamplesLegacyIndexAndConfiguredExpiry() {
+        MongoDatabase database = freshDatabase("runner_scoped_history_after_handoff");
+        seedSchemaDocument(database, 16, null);
+        SystemCollections row = SystemCollections.PIPELINE_RATE_HISTORY;
+        MongoCollection<Document> history = row.on(database);
+        long configuredExpiry = Duration.ofDays(3).toSeconds();
+        IndexEnsure.ensure(database, history,
+                new SystemCollections.IndexSpec(List.of("observedAt"), false, configuredExpiry));
+        IndexEnsure.ensure(database, history, row.indexes().get(1));
+        Date observedAt = Date.from(Instant.now());
+        history.insertMany(List.of(
+                new Document("pipelineId", "orders").append("observedAt", observedAt)
+                        .append("counters", new Document("records.out", 7L)),
+                new Document("pipelineId", "orders").append("observedAt", observedAt)
+                        .append("pipelineIncarnationId", "old-incarnation").append("executionGeneration", 41L)
+                        .append("counters", new Document("records.out", 11L)),
+                new Document("pipelineId", "orders").append("observedAt", observedAt)
+                        .append("pipelineIncarnationId", "current-incarnation").append("executionGeneration", 42L)
+                        .append("counters", new Document("records.out", 13L))));
+        List<Document> before = history.find().into(new ArrayList<>());
+
+        MigrationRunner.migrate(database);
+        assertThat(installedVersion(database)).isEqualTo(MigrationRunner.SUPPORTED_VERSION);
+        assertThat(history.find().into(new ArrayList<>())).containsExactlyInAnyOrderElementsOf(before);
+        assertThat(indexNames(database, row)).contains("pipelineId_observedAt__id_idx",
+                "pipelineId_pipelineIncarnationId_observedAt__id_idx");
+        assertThat(IndexEnsure.existing(history, row.indexes().get(0))
+                .get("expireAfterSeconds", Number.class).longValue()).isEqualTo(configuredExpiry);
+
+        // A takeover can rerun the installer after its index write but before the version is recorded.
+        AtomicInteger checks = new AtomicInteger();
+        new V17ScopedRateHistoryIndex().up(database, checks::incrementAndGet);
+        assertThat(checks).hasValue(1);
+        assertThat(history.find().into(new ArrayList<>())).containsExactlyInAnyOrderElementsOf(before);
+        assertThat(IndexEnsure.existing(history, row.indexes().get(0))
+                .get("expireAfterSeconds", Number.class).longValue()).isEqualTo(configuredExpiry);
+    }
+
+    @Test
     void runningItAgainstTheSameStoreAgainChangesNothing() {
         MongoDatabase database = freshDatabase("runner_twice");
 
@@ -308,7 +347,8 @@ class MigrationRunnerIT {
                         "V7RepairBlankPipelines", "V8DiscardViewSchemaPolicies", "V9RateHistoryIndexes",
                         "V10SrsConsumerOffsetIndexes", "V11RateHistoryKeysetIndex",
                         "V12PipelineEventIndexes", "V13HistoryRollupIndexes",
-                        "V14LatestObservationChunkIndexes", "V15StopReservationShape", "V16DurableRebuildHandoff");
+                        "V14LatestObservationChunkIndexes", "V15StopReservationShape", "V16DurableRebuildHandoff",
+                        "V17ScopedRateHistoryIndex");
 
         MigrationRunner.migrate(database);
 
@@ -342,8 +382,10 @@ class MigrationRunnerIT {
         Document original = new Document("_id", "orders").append("stateJson", "{\"state\":\"PAUSED\"}")
                 .append("epoch", 8L).append("touchMillis", 1_780_000_000_000L).append("stopReservation", marker);
         SystemCollections.PIPELINE_STATE.on(database).insertOne(original);
-        MigrationRunner.migrate(database);
-        MigrationRunner.migrate(database);
+        List<ChangeSet> handoffBinary = MigrationRunner.changeSets().stream()
+                .filter(change -> change.version() <= 16).toList();
+        MigrationRunner.migrate(database, handoffBinary, LOCK_TTL, PATIENT, CLOCK);
+        MigrationRunner.migrate(database, handoffBinary, LOCK_TTL, PATIENT, CLOCK);
         assertThat(installedVersion(database)).isEqualTo(16);
         assertThat(SystemCollections.PIPELINE_STATE.on(database).find(new Document("_id", "orders")).first())
                 .isEqualTo(original);
@@ -373,9 +415,11 @@ class MigrationRunnerIT {
         Document legacy = new Document("_id", "orders").append("legacy", true);
         row.on(database).insertOne(legacy);
 
-        MigrationRunner.migrate(database);
+        List<ChangeSet> handoffBinary = MigrationRunner.changeSets().stream()
+                .filter(change -> change.version() <= 16).toList();
+        MigrationRunner.migrate(database, handoffBinary, LOCK_TTL, PATIENT, CLOCK);
         new V16DurableRebuildHandoff().up(database, () -> { });
-        MigrationRunner.migrate(database);
+        MigrationRunner.migrate(database, handoffBinary, LOCK_TTL, PATIENT, CLOCK);
 
         List<Document> indexes = row.on(database).listIndexes().into(new ArrayList<>());
         List<Document> privateIndexes = indexes.stream()
