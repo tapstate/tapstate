@@ -45,13 +45,17 @@ public final class PipelinePreviewService {
     public static final long MAX_DRAFT_BYTES = 4L * 1024L * 1024L;
     private static final int MAX_CONCURRENT_COMPILATIONS = 8;
 
-    private final ApplyService compiler;
+    private final CandidateWorkspaceCompiler compiler;
     private final PipelinePreviewProbe probe;
     private final CanonicalWriter writer = new CanonicalWriter();
     private final Clock clock;
     private final Semaphore compileSlots = new Semaphore(MAX_CONCURRENT_COMPILATIONS);
 
     public PipelinePreviewService(ApplyService compiler, PipelinePreviewProbe probe, Clock clock) {
+        this(Objects.requireNonNull(compiler, "compiler")::planCandidateWorkspace, probe, clock);
+    }
+
+    PipelinePreviewService(CandidateWorkspaceCompiler compiler, PipelinePreviewProbe probe, Clock clock) {
         this.compiler = Objects.requireNonNull(compiler, "compiler");
         this.probe = Objects.requireNonNull(probe, "probe");
         this.clock = Objects.requireNonNull(clock, "clock");
@@ -83,7 +87,7 @@ public final class PipelinePreviewService {
         String candidateHash;
         String runId;
         try {
-            CandidateWorkspacePlan candidate = compiler.planCandidateWorkspace(drafts);
+            CandidateWorkspacePlan candidate = compiler.compile(drafts);
             Map<String, Resource> resources = new LinkedHashMap<>();
             candidate.resources().forEach(resource -> resources.put(resource.id(), resource));
             Resource requested = resources.get(pipelineId);
@@ -376,6 +380,11 @@ public final class PipelinePreviewService {
     }
 
     private record Output(String id, String kind, Object definition) {
+    }
+
+    @FunctionalInterface
+    interface CandidateWorkspaceCompiler {
+        CandidateWorkspacePlan compile(List<ArtifactDraft> drafts);
     }
 
     private static final class SequencedStream implements PipelinePreviewSession {

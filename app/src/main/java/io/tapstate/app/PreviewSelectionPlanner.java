@@ -42,19 +42,58 @@ final class PreviewSelectionPlanner {
     private final BoundedSnapshotQueryPort queries;
     private final PreviewSampleCache sampleCache;
     private final Clock clock;
+    private final SourceView sourceView;
+
+    @FunctionalInterface
+    interface SourceView {
+        List<PreviewSourceTable> sourceTables(PipelineResource pipeline);
+
+        default Set<String> inputSourceKeys(PipelineResource pipeline) {
+            throw new UnsupportedOperationException("input source keys are not available");
+        }
+
+        default Map<String, StoreBackedDagSource.CompiledJoin> compiledJoins(PipelineResource pipeline) {
+            return Map.of();
+        }
+    }
 
     PreviewSelectionPlanner(BoundedSnapshotQueryPort queries, PreviewSampleCache sampleCache, Clock clock) {
         this.queries = Objects.requireNonNull(queries, "queries");
         this.sampleCache = Objects.requireNonNull(sampleCache, "sampleCache");
         this.clock = Objects.requireNonNull(clock, "clock");
+        this.sourceView = null;
+    }
+
+    PreviewSelectionPlanner(BoundedSnapshotQueryPort queries, PreviewSampleCache sampleCache, Clock clock,
+            SourceView sourceView) {
+        this.queries = Objects.requireNonNull(queries, "queries");
+        this.sampleCache = Objects.requireNonNull(sampleCache, "sampleCache");
+        this.clock = Objects.requireNonNull(clock, "clock");
+        this.sourceView = Objects.requireNonNull(sourceView, "sourceView");
     }
 
     Sample load(String principal, String pipelineId, String sampleId,
             PipelineResource pipeline, StoreBackedDagSource dagSource, int rootLimit,
             Instant deadline, BoundedQueryCancellation cancellation) {
-        Context context = new Context(principal, pipelineId, sampleId, pipeline, dagSource, deadline, cancellation);
-        Set<String> required = dagSource.previewInputSourceKeys(pipeline);
-        Map<String, StoreBackedDagSource.CompiledJoin> joins = dagSource.previewCompiledJoins(pipeline);
+        SourceView sources = sourceView == null ? new SourceView() {
+            @Override
+            public List<PreviewSourceTable> sourceTables(PipelineResource candidate) {
+                return dagSource.previewSourceTables(candidate);
+            }
+
+            @Override
+            public Set<String> inputSourceKeys(PipelineResource candidate) {
+                return dagSource.previewInputSourceKeys(candidate);
+            }
+
+            @Override
+            public Map<String, StoreBackedDagSource.CompiledJoin> compiledJoins(PipelineResource candidate) {
+                return dagSource.previewCompiledJoins(candidate);
+            }
+        } : sourceView;
+        Context context = new Context(principal, pipelineId, sampleId, pipeline, sources, deadline, cancellation);
+        Set<String> required = sources.inputSourceKeys(pipeline);
+        Map<String, StoreBackedDagSource.CompiledJoin> joins = sources.compiledJoins(pipeline);
         LinkedHashSet<String> dimensions = new LinkedHashSet<>();
         LinkedHashSet<String> roots = new LinkedHashSet<>();
 
@@ -172,7 +211,7 @@ final class PreviewSelectionPlanner {
         private boolean repeatable = true;
 
         Context(String principal, String pipelineId, String sampleId,
-                PipelineResource pipeline, StoreBackedDagSource dagSource, Instant deadline,
+                PipelineResource pipeline, SourceView sources, Instant deadline,
                 BoundedQueryCancellation cancellation) {
             this.principal = Objects.requireNonNull(principal, "principal");
             this.pipelineId = Objects.requireNonNull(pipelineId, "pipelineId");
@@ -180,7 +219,7 @@ final class PreviewSelectionPlanner {
             this.pipeline = pipeline;
             this.deadline = deadline;
             this.cancellation = cancellation;
-            dagSource.previewSourceTables(pipeline).forEach(table -> {
+            sources.sourceTables(pipeline).forEach(table -> {
                 tablesByKey.put(table.sourceKey(), table);
                 String tableName = table.schema().name();
                 if (!ambiguousTableNames.contains(tableName)) {

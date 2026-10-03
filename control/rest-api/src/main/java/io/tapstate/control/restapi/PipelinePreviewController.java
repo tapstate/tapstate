@@ -83,7 +83,7 @@ class PipelinePreviewController {
         return bytes;
     }
 
-    private PipelinePreviewCommand parse(Map<?, ?> body) {
+    static PipelinePreviewCommand parse(Map<?, ?> body) {
         if (body == null) {
             throw MalformedRequest.rejecting("request body is required", null);
         }

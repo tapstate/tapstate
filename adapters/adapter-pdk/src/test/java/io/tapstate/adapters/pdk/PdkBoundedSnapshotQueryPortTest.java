@@ -73,6 +73,57 @@ class PdkBoundedSnapshotQueryPortTest {
                 .isEqualTo(ConnectorError.READ_TIMEOUT);
     }
 
+    @Test
+    void capsExactTupleReadsAndTreatsAnEmptyTupleSetAsACompleteEmptySample(@TempDir Path dir) {
+        PdkBoundedSnapshotQueryPort port = port(Synthetic.exactTupleQuerySource(dir));
+        Selection exact = new ExactTuples(List.of(Map.of("tenant_id", 1, "order_id", 1),
+                Map.of("tenant_id", 2, "order_id", 2)));
+
+        BoundedSnapshotQueryResult capped = port.query(request(exact, 1));
+        assertThat(capped.rows()).hasSize(1);
+        assertThat(capped.queryCount()).isEqualTo(1);
+        assertThat(capped.complete()).isFalse();
+        assertThat(capped.hasMore()).isTrue();
+
+        BoundedSnapshotQueryResult empty = port.query(request(new ExactTuples(List.of()), 1));
+        assertThat(empty.rows()).isEmpty();
+        assertThat(empty.queryCount()).isZero();
+        assertThat(empty.complete()).isTrue();
+    }
+
+    @Test
+    void rejectsChangedDiscoverySchemaAndSamplesThatExceedTheByteBudget(@TempDir Path dir) {
+        PdkBoundedSnapshotQueryPort port = port(Synthetic.exactTupleQuerySource(dir));
+        BoundedSnapshotQueryRequest changed = new BoundedSnapshotQueryRequest(
+                "source-1", "connector-1", Map.of(),
+                new TableSchema("t1", List.of(new FieldSchema("tenant_id", "varchar"))),
+                List.of(), new AllRows(), List.of(), 1, Instant.now().plusSeconds(5));
+        assertThatThrownBy(() -> port.query(changed))
+                .isInstanceOf(TapstateException.class)
+                .extracting(failure -> ((TapstateException) failure).code())
+                .isEqualTo(ConnectorError.READ_FAILED);
+
+        BoundedSnapshotQueryRequest tooSmall = new BoundedSnapshotQueryRequest(
+                "source-1", "connector-1", Map.of(), schema(), List.of(), new AllRows(), List.of(), 1, 1,
+                Instant.now().plusSeconds(5));
+        assertThatThrownBy(() -> port.query(tooSmall))
+                .isInstanceOf(TapstateException.class)
+                .extracting(failure -> ((TapstateException) failure).code())
+                .isEqualTo(ConnectorError.READ_FAILED);
+    }
+
+    @Test
+    void refusesWhenDiscoveryDoesNotResolveTheRequestedTable(@TempDir Path dir) {
+        PdkBoundedSnapshotQueryPort port = port(Synthetic.exactTupleQuerySource(dir));
+        BoundedSnapshotQueryRequest missing = new BoundedSnapshotQueryRequest(
+                "source-1", "connector-1", Map.of(), new TableSchema("missing", List.of()), List.of(),
+                new AllRows(), List.of(), 1, Instant.now().plusSeconds(5));
+        assertThatThrownBy(() -> port.query(missing))
+                .isInstanceOf(TapstateException.class)
+                .extracting(failure -> ((TapstateException) failure).code())
+                .isEqualTo(ConnectorError.DISCOVER_FAILED);
+    }
+
     private static PdkBoundedSnapshotQueryPort port(Path jar) {
         ConnectorRef ref = new ConnectorRef(List.of(jar), "synthetic.ExactTupleQuery", "2.0.8", null);
         return new PdkBoundedSnapshotQueryPort(connectorId -> ref);
