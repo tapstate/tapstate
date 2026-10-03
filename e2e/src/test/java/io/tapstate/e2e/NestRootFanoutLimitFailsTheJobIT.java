@@ -114,7 +114,9 @@ class NestRootFanoutLimitFailsTheJobIT {
 
                 control.lifecycle(pipelineId, LifecycleVerb.START);
 
-                await(() -> control.state(pipelineId).filter(PipelineState.FAILED::equals).isPresent());
+                await(() -> control.state(pipelineId).filter(PipelineState.FAILED::equals).isPresent()
+                        && control.failureCode(pipelineId).filter(EXPECTED_CODE::equals).isPresent()
+                        && control.errorCount(pipelineId).filter(count -> count == 1L).isPresent());
                 assertThat(control.state(pipelineId))
                         .as("a document of %d elements under a limit of %d has to stop the run.%n"
                                 + "  documents: %s%n  metrics: %s", CHILDREN, ELEMENT_LIMIT,

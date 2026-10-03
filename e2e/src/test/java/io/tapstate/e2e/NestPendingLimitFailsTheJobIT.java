@@ -117,7 +117,9 @@ class NestPendingLimitFailsTheJobIT {
 
                 control.lifecycle(pipelineId, LifecycleVerb.START);
 
-                await(() -> control.state(pipelineId).filter(PipelineState.FAILED::equals).isPresent());
+                await(() -> control.state(pipelineId).filter(PipelineState.FAILED::equals).isPresent()
+                        && control.failureCode(pipelineId).filter(EXPECTED_CODE::equals).isPresent()
+                        && control.errorCount(pipelineId).filter(count -> count == 1L).isPresent());
                 assertThat(control.state(pipelineId))
                         .as("%d changes held for root %d, which is not in the table, against a limit of "
                                 + "%d.%n  documents: %s%n  metrics: %s", ORPHANS, ABSENT_ROOT, PENDING_LIMIT,
