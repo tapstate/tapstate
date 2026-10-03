@@ -223,14 +223,27 @@ final class MetricProducerEpochs {
             Map<Map<String, String>, MetricPoint> retained = new LinkedHashMap<>();
             if (current != null) { current.points().forEach(point -> retained.put(point.attributes(), point)); }
             // A quiet native producer has no fresh measurement. Keep the exact known public point and its time.
-            account.published.forEach(retained::putIfAbsent);
+            account.published.forEach((attributes, point) -> retained.merge(attributes, point,
+                    (fresh, known) -> retainKnownHighwater(group.type(), fresh, known)));
             projected.put(group.name(), new MetricFact(group.name(), group.type(), group.unit(), List.copyOf(retained.values())));
         });
         return List.copyOf(projected.values());
     }
 
     private static boolean sameShapeOrAbsent(Group group, MetricFact fact) {
-        return fact == null || fact.type() == group.type() && fact.unit().equals(group.unit());
+        return fact == null || fact.type() == group.type() && fact.unit().equals(group.unit())
+                && fact.points().stream().filter(point -> group.producer().equals(Producer.of(point)))
+                        .allMatch(point -> point.startTime() != null);
+    }
+
+    private static MetricPoint retainKnownHighwater(MetricType type, MetricPoint current, MetricPoint known) {
+        if (type == MetricType.HISTOGRAM) {
+            if (!current.histogram().bounds().equals(known.histogram().bounds())) {
+                throw new IllegalArgumentException("a retained histogram cannot cross different bounds");
+            }
+            if (current.histogram().sum() < known.histogram().sum()) { return known; }
+        }
+        return MetricContinuation.atLeast(type, current, known, known.observedAt());
     }
 
     /** The bounded last known cumulative points, including producers absent from a quiet frame. */

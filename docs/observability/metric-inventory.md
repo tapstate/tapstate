@@ -38,6 +38,9 @@ records. An overflow point preserves the instrument's aggregate and has `otel.me
 |---|---|---|---|---|
 | `tapstate.pipeline.records` | C / `{record}` | Successful source handoff (`in`) or durable target acknowledgement (`out`); repeated work is counted again | `tapstate.table.id`: 1,000; `direction=in,out`; source `op=insert,update,delete,read,ddl,other` | Compare source work with target ACK; do not substitute issued batches for ACK |
 | `tapstate.pipeline.bytes` | C / `By` | Logical serialized payload at the corresponding in/out boundary, not compressed network bytes | `tapstate.table.id`: 1,000; `direction` | Compare payload growth with records and serialization cost |
+| `tapstate.pipeline.snapshot.rows` | C / `{row}` | Actual snapshot reads when the current-capture reading is wired; older bindings retain the loaded-reading projection | `tapstate.table.id`: 1,000; added overflow | Compare read work with retained snapshot progress and durable target ACK |
+| `tapstate.pipeline.snapshot.rows.current_run` | C / `{row}` | Row reads contributed by the current physical capture to its public cumulative account; absent when the reading is unwired | `tapstate.table.id`: 1,000; added overflow | Distinguish actual reads from previously retained table completion |
+| `tapstate.pipeline.snapshot.rows.total` | G / `{row}` | Last available table-size estimate or confirmed completed size; a missing count remains absent | `tapstate.table.id`: 1,000; added overflow | Inspect the snapshot dataset before treating the estimate as completion |
 | `tapstate.pipeline.lag` | G / `s` | Age of the latest target-acknowledged source event, per table; an idle source can make this age rise | `tapstate.table.id`: 1,000; highest-value overflow | Compare source activity, target ACK, and gaps before diagnosing backlog |
 | `tapstate.pipeline.record.delivery.duration` | H / `s` | Completed target delivery measured from the source event time; start follows the current counting job | `tapstate.table.id`: 1,000 | Compare delivery distribution with stage and target-write distributions |
 | `tapstate.pipeline.process.duration` | H / `s` | Completed timed source read/project, transform call, join/nest drain, or sink drain; stage units differ | `stage=source,transform,join,nest,sink`: 5 | Identify the expensive stage, then inspect its queue or downstream sink |
@@ -60,6 +63,13 @@ records. An overflow point preserves the instrument's aggregate and has `otel.me
 | `tapstate.pipeline.state.store.serialization.count` | C / `{serialization}` | Completed Java encoding or decoding | Namespace: 1,000; `state.codec=encode,decode` | Compare repeated encoding work with state calls |
 | `tapstate.pipeline.state.store.serialization.bytes` | C / `By` | Bytes handled by those completed codecs | Namespace: 1,000; fixed `state.codec` | Compare codec traffic with cold-store payload |
 | `tapstate.pipeline.nest.cold_layer.over_threshold` | G / `1` | Last qualifying decision window: at least 100 accesses and at least half served from cold state | `tapstate.nest.namespace`: 1,000; highest-value overflow | Inspect backfill/access deltas and hot-state budget |
+
+Snapshot counter starts belong to the public accumulation account. A new start opens a fresh account;
+a qualified rebuilding resume can replace the physical capture while retaining known counter totals
+and their original public starts. The `current_run` suffix identifies the native reading, and does not
+make its projected public point a raw physical-start receipt. Gauges are measured again. Retained
+cumulative points from a quiet producer keep their last real measurement time; a new observation does
+not make that older measurement fresh.
 
 Stage active work is sampled work occupancy, not CPU utilization or executor saturation. A transform's
 subsequent outbox drain is outside its synchronous call. A sink waiting on an asynchronous target future

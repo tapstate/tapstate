@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class MetricProducerEpochsTest {
     private static final Instant ORIGINAL = Instant.parse("2026-10-01T00:00:00Z");
@@ -159,6 +160,38 @@ class MetricProducerEpochsTest {
         MetricProducerEpochs again = MetricProducerEpochs.restore(cold.snapshot(), CardinalityBudget.folder());
         assertThat(project(again, base, List.of(histogram(SECOND.plusSeconds(1), SECOND, 2)), SECOND.plusSeconds(1))
                 .getFirst().points().getFirst().histogram().count()).isEqualTo(6);
+    }
+
+    @Test
+    void aLowerCarriedFloorCannotReplaceAMoreRecentKnownWholePoint() {
+        MetricContinuation counterBase = MetricContinuation.captureFacts(List.of(counter(ORIGINAL, ORIGINAL, 7)));
+        MetricProducerEpochs counters = new MetricProducerEpochs();
+        MetricPoint knownCounter = project(counters, counterBase, List.of(counter(FIRST, FIRST, 2)), FIRST)
+                .getFirst().points().getFirst();
+        MetricPoint quietCounter = project(counters, counterBase, List.of(), SECOND).getFirst().points().getFirst();
+        assertThat(quietCounter.value()).isEqualTo(9);
+        assertThat(quietCounter).isEqualTo(knownCounter);
+
+        Map<String, String> source = Map.of(MetricAttributes.PIPELINE_ID, "orders", MetricAttributes.STAGE, "source");
+        HistogramBounds bounds = HistogramBounds.STAGE_OUTPUT_RETRY_DURATION;
+        MetricFact floor = pressureHistogram(bounds, source, ORIGINAL, ORIGINAL, 3);
+        MetricContinuation histogramBase = MetricContinuation.captureFacts(List.of(floor));
+        MetricProducerEpochs histograms = new MetricProducerEpochs();
+        MetricPoint knownHistogram = project(histograms, histogramBase,
+                List.of(pressureHistogram(bounds, source, FIRST, FIRST, 1)), FIRST).getFirst().points().getFirst();
+        MetricPoint quietHistogram = project(histograms, histogramBase, List.of(), SECOND).getFirst().points().getFirst();
+        assertThat(quietHistogram).isEqualTo(knownHistogram);
+        var histogram = knownHistogram.histogram();
+        MetricFact lowerSum = MetricFact.single(floor.name(), MetricType.HISTOGRAM, HistogramBounds.UNIT,
+                MetricPoint.distribution(source, ORIGINAL, SECOND,
+                        bounds.value(histogram.count(), histogram.sum() / 2, histogram.bucketCounts())));
+        assertThat(histograms.continueNative(List.of(), List.of(), List.of(lowerSum), SECOND)
+                .getFirst().points().getFirst()).isEqualTo(knownHistogram);
+
+        // The registered fact boundary rejects an unregistered distribution before any epoch can accept it.
+        assertThatThrownBy(() -> MetricFact.single("tapstate.pipeline.snapshot.rows", MetricType.HISTOGRAM,
+                HistogramBounds.UNIT, pressureHistogram(bounds, TABLE, FIRST, FIRST, 1).points().getFirst()))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("no bucket bounds are registered");
     }
 
     private static List<MetricFact> project(MetricProducerEpochs epochs, MetricContinuation base,
