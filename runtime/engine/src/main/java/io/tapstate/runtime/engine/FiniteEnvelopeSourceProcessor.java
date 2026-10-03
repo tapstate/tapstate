@@ -12,6 +12,8 @@ import com.hazelcast.nio.ObjectDataInput;
 import com.hazelcast.nio.ObjectDataOutput;
 import com.hazelcast.nio.serialization.StreamSerializer;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.lifecycle.Stage;
+import io.tapstate.core.lifecycle.Staged;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
@@ -19,7 +21,14 @@ import java.util.Objects;
 import java.util.Set;
 
 /** Emits a pre-fetched finite sample and then completes; it never opens a capture or CDC source. */
-public final class FiniteEnvelopeSourceProcessor extends AbstractProcessor {
+public final class FiniteEnvelopeSourceProcessor extends AbstractProcessor implements Staged {
+
+    private StageTimer timer = StageTimer.none(Stage.SOURCE);
+
+    @Override
+    public Stage stage() {
+        return Stage.SOURCE;
+    }
 
     private final String mapName;
     private final String sourceKey;
@@ -42,6 +51,7 @@ public final class FiniteEnvelopeSourceProcessor extends AbstractProcessor {
 
     @Override
     protected void init(Processor.Context context) {
+        timer = StageTimer.of(stage(), context);
         IMap<String, Sample> samples = localMember().getMap(mapName);
         Sample sample = samples.get(sourceKey);
         if (sample == null) {
@@ -53,9 +63,11 @@ public final class FiniteEnvelopeSourceProcessor extends AbstractProcessor {
     @Override
     public boolean complete() {
         while (next < rows.size()) {
+            long started = timer.begin();
             if (!tryEmit(rows.get(next))) {
                 return false;
             }
+            timer.end(started);
             next++;
         }
         return true;

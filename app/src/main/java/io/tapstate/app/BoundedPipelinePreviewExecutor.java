@@ -114,7 +114,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
         workers.shutdownNow();
     }
 
-    private final class PreviewStream implements PipelinePreviewStream {
+    private final class PreviewStream extends PipelinePreviewStream {
 
         private final PipelinePreviewRequest request;
         private final ArrayBlockingQueue<PipelinePreviewEvent> events = new ArrayBlockingQueue<>(MAX_EVENTS);

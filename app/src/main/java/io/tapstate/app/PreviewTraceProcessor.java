@@ -11,6 +11,9 @@ import com.hazelcast.jet.core.ProcessorSupplier;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.EventJsonValues;
+import io.tapstate.core.lifecycle.Stage;
+import io.tapstate.core.lifecycle.Staged;
+import io.tapstate.runtime.engine.StageTimer;
 import java.lang.reflect.Array;
 import java.util.Collection;
 import java.util.LinkedHashMap;
@@ -21,7 +24,19 @@ import java.util.Objects;
 import java.util.Set;
 
 /** Bounded per-node sample tap used only by Pipeline preview DAGs. */
-final class PreviewTraceProcessor extends AbstractProcessor {
+final class PreviewTraceProcessor extends AbstractProcessor implements Staged {
+
+    private StageTimer timer = StageTimer.none(Stage.TRANSFORM);
+
+    @Override
+    public Stage stage() {
+        return Stage.TRANSFORM;
+    }
+
+    @Override
+    protected void init(Processor.Context context) {
+        timer = StageTimer.of(stage(), context);
+    }
 
     private static final int MAX_ROWS = 10;
     private static final int MAX_BYTES = 256 * 1024;
@@ -66,6 +81,7 @@ final class PreviewTraceProcessor extends AbstractProcessor {
                 inbox.remove();
                 continue;
             }
+            long started = timer.begin();
             rowsSeen++;
             Object row = event.after() == null ? event.before() : event.after();
             collectPointers(row, "", 0);
@@ -85,6 +101,7 @@ final class PreviewTraceProcessor extends AbstractProcessor {
                 truncated = true;
             }
             inbox.remove();
+            timer.end(started);
         }
     }
 

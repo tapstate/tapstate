@@ -1,6 +1,6 @@
 package io.tapstate.app;
 
-import io.tapdata.entity.schema.value.DateTime;
+import io.tapstate.adapters.pdk.PdkPreviewDateTimes;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.event.Bytes;
@@ -9,7 +9,6 @@ import java.lang.reflect.Array;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collection;
@@ -129,9 +128,11 @@ final class PreviewDocumentStorage {
     }
 
     private static String kind(Object value) {
+        if (PdkPreviewDateTimes.isDateTime(value)) {
+            return "datetime";
+        }
         return switch (value) {
             case Bytes ignored -> "bytes";
-            case DateTime ignored -> "datetime";
             case String ignored -> "string";
             case Double ignored -> "double";
             case BigDecimal ignored -> "big-decimal";
@@ -150,9 +151,11 @@ final class PreviewDocumentStorage {
     }
 
     private static Object wireValue(Object value) {
+        if (PdkPreviewDateTimes.isDateTime(value)) {
+            return PdkPreviewDateTimes.toIsoString(value);
+        }
         return switch (value) {
             case Bytes bytes -> Map.of("tag", bytes.tag(), "base64", Base64.getEncoder().encodeToString(bytes.value()));
-            case DateTime dateTime -> dateTime.toInstant().toString();
             case BigInteger integer -> integer.toString();
             case BigDecimal decimal -> decimal.toPlainString();
             case Date date -> date.getTime();
@@ -169,7 +172,7 @@ final class PreviewDocumentStorage {
                 yield new Bytes(number(bytes.get("tag")).byteValue(),
                         Base64.getDecoder().decode(requireString(bytes.get("base64"))));
             }
-            case "datetime" -> new DateTime(Instant.parse(requireString(value)));
+            case "datetime" -> PdkPreviewDateTimes.fromIsoString(requireString(value));
             case "string" -> requireString(value);
             case "double" -> number(value).doubleValue();
             case "big-decimal" -> new BigDecimal(requireString(value));

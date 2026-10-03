@@ -2,7 +2,7 @@ package io.tapstate.app;
 
 import io.tapstate.core.event.EventJsonValues;
 import io.tapstate.core.event.ConvertedValue;
-import io.tapdata.entity.schema.value.DateTime;
+import io.tapstate.adapters.pdk.PdkPreviewDateTimes;
 import java.lang.reflect.Array;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -25,10 +25,12 @@ final class PreviewJsonValues {
         if (depth > MAX_DEPTH) {
             throw new IllegalArgumentException("event value exceeds the maximum JSON nesting depth");
         }
+        if (PdkPreviewDateTimes.isDateTime(value)) {
+            return PdkPreviewDateTimes.toIsoString(value);
+        }
         return switch (value) {
             case null -> null;
             case ConvertedValue converted -> normalize(converted.value(), depth + 1);
-            case DateTime dateTime -> dateTime.toInstant().toString();
             case Map<?, ?> map -> normalizeMap(map, depth);
             case Collection<?> collection -> collection.stream()
                     .map(item -> normalize(item, depth + 1)).toList();
