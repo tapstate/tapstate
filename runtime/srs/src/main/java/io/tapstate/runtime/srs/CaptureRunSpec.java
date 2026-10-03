@@ -114,6 +114,14 @@ public record CaptureRunSpec(
                 cursorWriterToken);
     }
 
+    /** The same run with its caller's cursor-writer fence and unchanged table selection. */
+    public CaptureRunSpec withCursorWriterToken(String runId) {
+        return new CaptureRunSpec(
+                config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
+                startFrom, retention, schemaVer, snapshotEpoch, captureFence,
+                selectedChainTables, Objects.requireNonNull(runId, "runId"));
+    }
+
     /** The same run with its pipeline's complete table selection and cursor-writer fence. */
     public CaptureRunSpec withChainSelection(List<String> tables, String runId) {
         return new CaptureRunSpec(

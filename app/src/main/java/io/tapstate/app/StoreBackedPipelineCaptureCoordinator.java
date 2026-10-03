@@ -682,9 +682,9 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             CaptureRunSpec spec = plan.spec();
             LinkedHashSet<String> tables = spec.srsEnabled() && spec.readMode() != ReadMode.SNAPSHOT_ONLY
                     ? selected.get(MiningChainId.resolve(spec.config(), spec.srsKey())) : null;
-            complete.add(tables == null ? plan : new SourcePlan(
-                    plan.sourceId(), plan.discovered(), plan.resolution(),
-                    spec.withChainSelection(List.copyOf(tables), cursorWriterToken), plan.captureId()));
+            CaptureRunSpec bound = tables == null ? spec.withCursorWriterToken(cursorWriterToken)
+                    : spec.withChainSelection(List.copyOf(tables), cursorWriterToken);
+            complete.add(new SourcePlan(plan.sourceId(), plan.discovered(), plan.resolution(), bound, plan.captureId()));
         }
         return List.copyOf(complete);
     }

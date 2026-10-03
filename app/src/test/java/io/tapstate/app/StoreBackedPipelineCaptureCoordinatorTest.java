@@ -825,6 +825,70 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         assertThat(generations).containsExactly(1L, 2L);
     }
 
+    @Test
+    void aSnapshotOnlyPlanBindsTheSuppliedWriterTokenToItsRealSession() throws Exception {
+        requireSuppliedSnapshotSession(ReadMode.SNAPSHOT_ONLY, true);
+    }
+
+    @Test
+    void aDirectSnapshotPlanBindsTheSuppliedWriterTokenToItsRealSession() throws Exception {
+        requireSuppliedSnapshotSession(ReadMode.SNAPSHOT_AND_CDC, false);
+    }
+
+    private void requireSuppliedSnapshotSession(ReadMode mode, boolean srsEnabled) throws Exception {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        SourceResource source = cdcSource("orders_src", "orders", null);
+        artifacts.save(source);
+        artifacts.save(new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", srsEnabled)),
+                null, null, new ServeBlock.Inline(null, FromRef.literal("orders_src"),
+                        List.of(new SyncElement("sync_1", "orders_src", null, null, null)), null, null),
+                new Settings(null, null, null, null, mode, "earliest"), null));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        SrsCoordinator srs = new SrsCoordinator(store.meta());
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        AtomicReference<CaptureRunSpec> admitted = new AtomicReference<>();
+        AtomicReference<CaptureRun> opened = new AtomicReference<>();
+        String suppliedToken = java.util.UUID.randomUUID().toString();
+        try (var workers = new io.tapstate.runtime.srs.SnapshotWorkers(1, 1)) {
+            HeldSource port = new HeldSource(1, new CountDownLatch(0));
+            CaptureRunUnit unit = new CaptureRunUnit(port, srs, store.meta(),
+                    mock(HazelcastInstance.class), buffer, workers);
+            CaptureStarter starter = (spec, handoff) -> {
+                admitted.set(spec);
+                if (mode == ReadMode.SNAPSHOT_AND_CDC) {
+                    // Join an actually provisioned chain; this test reads the snapshot without starting its tail.
+                    srs.provisionSource(spec.sourceId(), MiningChainId.resolve(spec.config(), spec.srsKey()),
+                            spec.config().streams(), spec.retention());
+                }
+                CaptureRun run = unit.begin(spec, handoff, false);
+                opened.set(run);
+                return run;
+            };
+            StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                    store, starter, srs, buffer);
+            String ring = SourceCaptureResolution.of(source).ringName();
+            try {
+                coordinator.startCapture("p", artifacts, suppliedToken);
+                assertThat(buffer.hasSnapshot("p", ring, suppliedToken))
+                        .as("the actual deferred buffer session owns the caller-supplied token").isTrue();
+                assertThat(admitted.get().cursorWriterToken()).isEqualTo(suppliedToken);
+                assertThat(admitted.get().selectedChainTables()).as("non-shared plans retain their null selection").isNull();
+                assertThat(admitted.get().readMode()).isEqualTo(mode);
+                assertThat(admitted.get().srsEnabled()).isEqualTo(srsEnabled);
+                coordinator.activateSnapshot("p");
+                assertThat(opened.get().awaitLoaded(Duration.ofSeconds(5))).isTrue();
+                assertThat(coordinator.captureFailure("p")).as("the real row and completion handoffs remain current").isEmpty();
+                var rows = buffer.drainSnapshot("p", ring, suppliedToken, 8);
+                assertThat(rows.rows()).hasSize(1);
+                assertThat(rows.rows().getFirst().after()).containsEntry("id", 1L);
+                assertThat(rows.state()).isEqualTo(SnapshotBuffer.SessionState.DONE);
+                assertThat(coordinator.snapshotProgress("p").byTable().get("orders").rowsDone()).isEqualTo(1L);
+            } finally {
+                coordinator.stopCapture("p", false);
+            }
+        }
+    }
+
     // ---- a load read while the pipeline runs ---------------------------------------------------------
 
     /**
