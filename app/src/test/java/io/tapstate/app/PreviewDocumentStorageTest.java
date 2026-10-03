@@ -52,6 +52,21 @@ class PreviewDocumentStorageTest {
     }
 
     @Test
+    void traversesRawArraysAndRejectsNonStringDocumentFields() {
+        Map<String, Object> document = Map.of("values", new int[] {3, 5, 8});
+
+        Map<String, Object> restored = PreviewDocumentStorage.decode(PreviewDocumentStorage.encode(document));
+        assertThat(restored.get("values")).isEqualTo(List.of(3L, 5L, 8L));
+
+        Map<Object, Object> invalid = Map.of(7, "not-a-field-name");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> invalidDocument = (Map<String, Object>) (Map<?, ?>) invalid;
+        assertThatThrownBy(() -> PreviewDocumentStorage.encode(invalidDocument))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("field names must be strings");
+    }
+
+    @Test
     void restoresScalarAndBinaryCarrierTypesFromPrivateMetadata() {
         Map<String, Object> document = new LinkedHashMap<>();
         document.put("double", new ConvertedValue(1.25d, "DOUBLE"));
