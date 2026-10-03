@@ -124,7 +124,7 @@ class SingleNodeLifecycleE2ETest {
 
         desire(STOPPED);
         awaitStatus(job, JobStatus.FAILED); // Jet reports a cancelled job as FAILED
-        assertActualState(STOPPED, 4);
+        assertActualState(STOPPED, 5); // RUNNING, PAUSED, RUNNING, stop fence, stop completion.
         assertReadFaceReports(PIPE, STOPPED);
     }
 
@@ -140,7 +140,7 @@ class SingleNodeLifecycleE2ETest {
 
         Job fresh = member.getJet().getJob(PIPE);
         awaitStatus(fresh, JobStatus.RUNNING);
-        assertActualState(RUNNING, 3); // 1 = RUNNING, 2 = STOPPED, 3 = RUNNING again
+        assertActualState(RUNNING, 4); // RUNNING, stop fence, stop completion, fresh RUNNING.
     }
 
     /**
@@ -196,7 +196,7 @@ class SingleNodeLifecycleE2ETest {
     private void assertActualState(PipelineState expected, long epoch) {
         CheckpointDoc doc = storePort.state().read(PIPE).orElseThrow();
         assertThat(doc.stateJson()).isEqualTo(StateJson.of(expected));
-        assertThat(doc.epoch()).as("the fencing epoch advances once per converged transition").isEqualTo(epoch);
+        assertThat(doc.epoch()).as("checkpoint epochs include the stop fence and its completion").isEqualTo(epoch);
     }
 
     private static void awaitStatus(Job job, JobStatus expected) {

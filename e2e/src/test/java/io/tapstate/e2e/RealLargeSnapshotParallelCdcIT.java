@@ -229,6 +229,7 @@ class RealLargeSnapshotParallelCdcIT {
                             && inFlightRows(control) > 0 && inFlightRows(control) < BULK_ROWS
                             && bulkTargetRows(targetDatabase) > 0 && bulkTargetRows(targetDatabase) < BULK_ROWS));
             ObservationStore.Scope oldScope = before.scope().orElseThrow();
+            var beforeCumulative = CumulativeMetricWitness.capture(before);
             assertThat(claimGeneration(database, BULK_PIPELINE)).isEqualTo(oldScope.executionGeneration());
             Document oldSample = actualHistorySample(database, oldScope);
             admissions.stage("partial-snapshot-start", 1, 1);
@@ -244,6 +245,7 @@ class RealLargeSnapshotParallelCdcIT {
             var paused = Await.answered("scoped paused observation", () -> latest.readStored(BULK_PIPELINE)
                     .filter(value -> value.observation().state() == PipelineState.PAUSED));
             assertThat(paused.scope()).contains(oldScope);
+            CumulativeMetricWitness.paused(report, "snapshot-pause", beforeCumulative, CumulativeMetricWitness.capture(paused));
             assertThat(claimGeneration(database, BULK_PIPELINE)).isEqualTo(oldScope.executionGeneration());
             admissions.stage("snapshot-pause", 0, 0);
             coordination.stage("snapshot-pause", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts), boot.admission());
@@ -270,6 +272,9 @@ class RealLargeSnapshotParallelCdcIT {
                             && bulkTargetRows(targetDatabase) < BULK_ROWS));
             assertThat(claimGeneration(database, BULK_PIPELINE)).isEqualTo(resumedScope.executionGeneration());
             assertCumulativeDeliveryContinued(before.observation(), resumed.observation());
+            var resumedCumulative = CumulativeMetricWitness.running(latest, BULK_PIPELINE, resumedScope,
+                    Duration.ofMinutes(3), beforeCumulative, report, "partial-snapshot-rebuild-resume");
+            CumulativeMetricWitness.continued(report, "partial-snapshot-rebuild-resume", beforeCumulative, resumedCumulative, true);
             Document resumedSample = actualHistorySample(database, resumedScope);
             assertThat(resumedSample.getDate("countingSince")).isEqualTo(oldSample.getDate("countingSince"));
             admissions.stage("partial-snapshot-rebuild-resume", 1, 1);
@@ -310,6 +315,9 @@ class RealLargeSnapshotParallelCdcIT {
                                     .mapToLong(MetricPoint::value).sum() >= BULK_ROWS
                             && deliveryPoints(value.observation(), "tapstate.pipeline.record.delivery.duration").stream()
                                     .mapToLong(point -> point.histogram().count()).sum() >= BULK_ROWS));
+            var completedCumulative = CumulativeMetricWitness.running(latest, BULK_PIPELINE, resumedScope,
+                    WAIT, resumedCumulative, report, "snapshot-completed");
+            CumulativeMetricWitness.continued(report, "snapshot-completed", resumedCumulative, completedCumulative, false);
             assertThat(control.errorCount(BULK_PIPELINE)).contains(0L);
             assertThat(control.errorCount(FAST_PIPELINE)).contains(0L);
             admissions.stage("snapshot-completed-with-cdc-ticks", 0, 0);
@@ -323,6 +331,10 @@ class RealLargeSnapshotParallelCdcIT {
                     Await.answered("the physical stop witness retains the actual final scoped observation for " + pipeline,
                             () -> latest.readStored(pipeline).filter(value -> value.scope().isPresent()
                                     && value.observation().state() == PipelineState.STOPPED));
+                    if (pipeline.equals(BULK_PIPELINE)) {
+                        CumulativeMetricWitness.continued(report, "snapshot-final-stop", completedCumulative,
+                                CumulativeMetricWitness.capture(latest.readStored(pipeline).orElseThrow()), false);
+                    }
                 }
             }
             admissions.stage("both-stopped", 0, 0);

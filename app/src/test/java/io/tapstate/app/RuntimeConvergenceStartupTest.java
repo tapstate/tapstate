@@ -15,10 +15,13 @@ import io.tapstate.runtime.scheduler.RebuildAdmission;
 import io.tapstate.spi.store.ClusterIdentityStore;
 import io.tapstate.spi.store.PipelineEventStore;
 import io.tapstate.spi.store.StorePort;
+import io.tapstate.spi.store.WorkloadClaimStore;
 import java.time.Clock;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.convert.ApplicationConversionService;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
 
 /**
  * The runtime convergence loop is wired into startup and gated on the same store switch as the store it
@@ -53,7 +56,14 @@ class RuntimeConvergenceStartupTest {
             .withBean(ClusterMembershipGate.class, () -> new ClusterMembershipGate(new ClusterProperties()))
             .withBean(PipelineActuationOwnership.class, PipelineActuationOwnership::single)
             .withBean(RebuildAdmission.class, RebuildAdmission::never)
-            .withUserConfiguration(RuntimeConvergenceConfiguration.class);
+            .withUserConfiguration(RuntimeConvergenceConfiguration.class, AdjacentStoreConfiguration.class);
+
+    @Configuration(proxyBeanMethods = false)
+    static class AdjacentStoreConfiguration {
+        @Bean WorkloadClaimStore workloadClaimStore(StorePort storePort) {
+            return storePort.workloadClaims();
+        }
+    }
 
     private static StorePort store() {
         InMemoryStorePort store = spy(new InMemoryStorePort());

@@ -79,6 +79,8 @@ import org.junit.jupiter.api.Test;
  */
 class CaptureToSinkDataFlowTest {
 
+    private static final SourcePosition SOURCE_SEAM = new SourcePosition("seam-0");
+
     private static final String PIPELINE = "p";
     private static final String SOURCE_ID = "orders_src";
     private static final String DEST_ID = "orders_dest";
@@ -249,6 +251,10 @@ class CaptureToSinkDataFlowTest {
 
         @Override
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+            if (start instanceof CaptureStart.Resume resume) {
+                assertThat(resume.position()).as("the controlled source joins at its sampled seam").isEqualTo(SOURCE_SEAM);
+            }
+            listener.onStart(Optional.of(SOURCE_SEAM));
             for (Envelope change : changes) {
                 listener.onBatch(java.util.List.of(change), java.util.Optional.of(new SourcePosition("src-" + change.ts())));
             }
@@ -289,7 +295,7 @@ class CaptureToSinkDataFlowTest {
         public Optional<SourcePosition> seam() {
             // Sampled by the source before its first row. The run refuses to start a tail without one,
             // because a tail that begins wherever it likes loses every change made while the snapshot ran.
-            return Optional.of(new SourcePosition("seam-0"));
+            return Optional.of(SOURCE_SEAM);
         }
 
         @Override

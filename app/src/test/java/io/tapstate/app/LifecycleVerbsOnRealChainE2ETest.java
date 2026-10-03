@@ -110,21 +110,17 @@ class LifecycleVerbsOnRealChainE2ETest {
         CountDownLatch releaseSlow = new CountDownLatch(1);
         CapturePort source = new CapturePort() {
             @Override public CaptureBatch snapshot(CaptureConfig config) {
-                throw new AssertionError("streaming start must not materialize a batch");
-            }
-            @Override public void streamSnapshot(CaptureConfig config, SnapshotListener listener) {
-                listener.seam(Optional.of(new SourcePosition("seam-0")));
-                listener.row(read(1));
-                slowRead.countDown();
-                try {
-                    if (!releaseSlow.await(10, TimeUnit.SECONDS)) {
-                        throw new AssertionError("slow snapshot was not released");
+                return streamedBatch(2, () -> {
+                    slowRead.countDown();
+                    try {
+                        if (!releaseSlow.await(10, TimeUnit.SECONDS)) {
+                            throw new AssertionError("slow snapshot was not released");
+                        }
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException(interrupted);
                     }
-                } catch (InterruptedException interrupted) {
-                    Thread.currentThread().interrupt();
-                    throw new IllegalStateException(interrupted);
-                }
-                listener.row(read(2));
+                }, releaseSlow::countDown);
             }
             @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
                 listener.onStart(safeStart(start));
@@ -171,22 +167,17 @@ class LifecycleVerbsOnRealChainE2ETest {
         CountDownLatch releaseRead = new CountDownLatch(1);
         CapturePort source = new CapturePort() {
             @Override public CaptureBatch snapshot(CaptureConfig config) {
-                throw new AssertionError("streaming start must not materialize a batch");
-            }
-            @Override public void streamSnapshot(CaptureConfig config, SnapshotListener listener) {
-                listener.seam(Optional.of(new SourcePosition("seam-0")));
-                listener.row(read(1));
-                firstRead.countDown();
-                try {
-                    if (!releaseRead.await(10, TimeUnit.SECONDS)) {
-                        throw new AssertionError("snapshot read was not released");
+                return streamedBatch(3, () -> {
+                    firstRead.countDown();
+                    try {
+                        if (!releaseRead.await(10, TimeUnit.SECONDS)) {
+                            throw new AssertionError("snapshot read was not released");
+                        }
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException(interrupted);
                     }
-                } catch (InterruptedException interrupted) {
-                    Thread.currentThread().interrupt();
-                    throw new IllegalStateException(interrupted);
-                }
-                listener.row(read(2));
-                listener.row(read(3));
+                }, releaseRead::countDown);
             }
             @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
                 listener.onStart(safeStart(start));
@@ -236,19 +227,16 @@ class LifecycleVerbsOnRealChainE2ETest {
         CountDownLatch release = new CountDownLatch(1);
         CapturePort source = new CapturePort() {
             @Override public CaptureBatch snapshot(CaptureConfig config) {
-                throw new AssertionError("streaming start must not materialize a batch");
-            }
-            @Override public void streamSnapshot(CaptureConfig config, SnapshotListener listener) {
-                try {
-                    listener.seam(Optional.of(new SourcePosition("seam-0")));
-                    listener.row(read(1));
-                    reading.countDown();
-                    release.await(10, TimeUnit.SECONDS);
-                } catch (InterruptedException stopped) {
-                    Thread.currentThread().interrupt();
-                } finally {
-                    exited.countDown();
-                }
+                return streamedBatch(1, () -> {
+                    try {
+                        reading.countDown();
+                        release.await(10, TimeUnit.SECONDS);
+                    } catch (InterruptedException stopped) {
+                        Thread.currentThread().interrupt();
+                    } finally {
+                        exited.countDown();
+                    }
+                }, release::countDown);
             }
             @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
                 throw new AssertionError("cancelled snapshot must not start CDC");
@@ -274,7 +262,7 @@ class LifecycleVerbsOnRealChainE2ETest {
             assertThat(exited.await(5, TimeUnit.SECONDS)).isTrue();
             assertThat(buffer.hasSnapshot(PIPELINE, ringName)).isFalse();
             assertThat(captureCoordinator.snapshotProgress(PIPELINE)).isEqualTo(SnapshotReading.NONE);
-            assertActualState(STOPPED, 2L);
+            assertActualState(STOPPED, 3L); // RUNNING, stop fence, stop completion.
         } finally {
             release.countDown();
         }
@@ -367,7 +355,7 @@ class LifecycleVerbsOnRealChainE2ETest {
         // stop: the job is cancelled (Jet reports a cancelled job as FAILED) and the read face reports STOPPED.
         desire(STOPPED);
         awaitStatus(job, JobStatus.FAILED);
-        assertActualState(STOPPED, 4);
+        assertActualState(STOPPED, 5); // The stop reserves an epoch before completing.
         assertReadFaceReports(PIPELINE, STOPPED);
     }
 
@@ -517,7 +505,7 @@ class LifecycleVerbsOnRealChainE2ETest {
     private void assertActualState(PipelineState expected, long epoch) {
         CheckpointDoc doc = store.state().read(PIPELINE).orElseThrow();
         assertThat(doc.stateJson()).isEqualTo(StateJson.of(expected));
-        assertThat(doc.epoch()).as("the fencing epoch advances once per converged transition").isEqualTo(epoch);
+        assertThat(doc.epoch()).as("checkpoint epochs include the stop fence and its completion").isEqualTo(epoch);
     }
 
     private void awaitKeys(String... keys) {
@@ -584,6 +572,37 @@ class LifecycleVerbsOnRealChainE2ETest {
 
     private static Envelope insert(int id) {
         return Envelope.insert(id, TABLE, Map.of("id", (long) id, "amount", "v" + id), Map.of());
+    }
+
+    /** A controlled source read that opens at its seam and generates each row only when requested. */
+    private static CaptureBatch streamedBatch(int rowCount, Runnable afterFirstRow, Runnable releaseRead) {
+        return new CaptureBatch() {
+            private int emitted;
+            private boolean passedGate;
+            private volatile boolean closed;
+
+            @Override public Optional<SourcePosition> seam() {
+                return Optional.of(new SourcePosition("seam-0"));
+            }
+            @Override public boolean hasNext() {
+                if (closed) { return false; }
+                if (emitted == 1 && !passedGate) {
+                    passedGate = true;
+                    afterFirstRow.run();
+                }
+                return !closed && emitted < rowCount;
+            }
+            @Override public Envelope next() {
+                if (!hasNext()) { throw new java.util.NoSuchElementException(); }
+                return read(++emitted);
+            }
+            @Override public synchronized void close() {
+                if (!closed) {
+                    closed = true;
+                    releaseRead.run();
+                }
+            }
+        };
     }
 
     /** A fake connector: a bounded snapshot batch and a fixed cdc stream driven synchronously when cdc starts. */

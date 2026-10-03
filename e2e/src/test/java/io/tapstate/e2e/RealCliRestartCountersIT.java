@@ -81,6 +81,8 @@ class RealCliRestartCountersIT {
                         + workload.phases().get(1).expectedLogicalOutputChanges();
                 long firstGeneration = generation(database, pipeline);
                 var before = reading(latest, pipeline, firstGeneration, value -> counter(value).value() >= baselineMinimum);
+                var beforeCumulative = CumulativeMetricWitness.running(latest, pipeline, before.scope().orElseThrow(),
+                        WAIT, null, report, "before-plain-restart");
                 var scope = before.scope().orElseThrow();
                 Counter baseline = counter(before);
                 Set<String> oldEvents = eventIds(database, pipeline);
@@ -97,6 +99,9 @@ class RealCliRestartCountersIT {
                         && counter(value).value() > baseline.value());
                 assertThat(counter(continued).start()).isEqualTo(baseline.start());
                 assertThat(generation(database, pipeline)).isEqualTo(firstGeneration);
+                var continuedCumulative = CumulativeMetricWitness.running(latest, pipeline, continued.scope().orElseThrow(),
+                        WAIT, beforeCumulative, report, "plain-restart");
+                CumulativeMetricWitness.continued(report, "plain-restart", beforeCumulative, continuedCumulative, false);
                 List<Document> cycle = Await.answered("the actual CLI pause and resume to produce real state changes", WAIT, () -> {
                     List<Document> events = events(database, pipeline).stream()
                             .filter(event -> !oldEvents.contains(event.getString("_id")))
@@ -123,12 +128,18 @@ class RealCliRestartCountersIT {
                 // Observe the fresh account before the next write; an inherited old total cannot satisfy this.
                 assertThat(generation(database, pipeline)).isEqualTo(nextGeneration);
                 Counter reset = counter(fresh);
+                CumulativeMetricWitness.reset(report, "first-rerun-reading", continuedCumulative, CumulativeMetricWitness.capture(fresh));
                 long rerunAmount = amount(client.getDatabase(new ConnectionString(fork.externalTargetUri()).getDatabase())) + 1;
                 fork.executeOneSourceUpdate("UPDATE bench_copy_orders SET amount=amount+1 WHERE id=1");
                 delivered(client.getDatabase(new ConnectionString(fork.externalTargetUri()).getDatabase()), rerunAmount);
                 var progressing = reading(latest, pipeline, nextGeneration, value -> value.scope().equals(fresh.scope())
                         && counter(value).start().equals(reset.start()) && counter(value).value() > reset.value());
                 assertThat(generation(database, pipeline)).isEqualTo(nextGeneration);
+                var progressingCumulative = CumulativeMetricWitness.running(latest, pipeline, progressing.scope().orElseThrow(),
+                        WAIT, null, report, "rerun-progress");
+                CumulativeMetricWitness.reset(report, "rerun-progress", continuedCumulative, progressingCumulative);
+                CumulativeMetricWitness.continued(report, "fresh-rerun-account-progress",
+                        CumulativeMetricWitness.capture(fresh), progressingCumulative, false);
                 report.addFork(evidence("RERUN_RESTART", fork, databaseName, rerun, continued, progressing,
                         Map.of("firstFreshCounter", reset.value(), "firstFreshCounterStart", reset.start().toString(),
                                 "targetAmount", rerunAmount)));

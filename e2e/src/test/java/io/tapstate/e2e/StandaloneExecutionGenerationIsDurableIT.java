@@ -83,6 +83,8 @@ class StandaloneExecutionGenerationIsDurableIT {
                                 + workload.phases().get(1).expectedLogicalOutputChanges() - 1);
                 OutputCounter firstCounter = outputCounter(first.observation());
                 assertThat(firstCounter.value()).isPositive();
+                var firstCumulative = CumulativeMetricWitness.running(latest, pipeline, first.scope().orElseThrow(),
+                        WAIT, null, report, "initial-start");
                 String incarnation = first.scope().orElseThrow().pipelineIncarnationId();
                 record(report, "initial-start", first, firstClaim);
                 admissions.stage("first-start", 1, 1);
@@ -110,6 +112,7 @@ class StandaloneExecutionGenerationIsDurableIT {
                     assertThat(counter.value()).isGreaterThanOrEqualTo(firstCounter.value());
                 });
                 assertThat(generation(claim(database, pipeline))).isEqualTo(firstGeneration);
+                CumulativeMetricWitness.paused(report, "pause", firstCumulative, CumulativeMetricWitness.capture(paused));
                 record(report, "pause", paused, claim(database, pipeline));
                 if (directCounts) { awaitTicks(latest, pipeline, firstGeneration, PipelineState.PAUSED); }
                 admissions.stage("pause-and-paused-ticks", 0, 0);
@@ -124,6 +127,9 @@ class StandaloneExecutionGenerationIsDurableIT {
                 var resumed = activeCounter(latest, pipeline, first.scope().orElseThrow(), firstCounter.value());
                 assertThat(outputCounter(resumed.observation()).startTime()).isEqualTo(firstCounter.startTime());
                 assertThat(generation(claim(database, pipeline))).isEqualTo(firstGeneration);
+                var resumedCumulative = CumulativeMetricWitness.running(latest, pipeline, resumed.scope().orElseThrow(),
+                        WAIT, firstCumulative, report, "ordinary-resume");
+                CumulativeMetricWitness.continued(report, "ordinary-resume", firstCumulative, resumedCumulative, false);
                 record(report, "ordinary-resume", resumed, claim(database, pipeline));
                 admissions.stage("ordinary-resume", 0, 0);
                 coordination.stage("ordinary-resume", readiness(resumed, Map.of("targetExpectedAmount", resumedAmount,
@@ -137,6 +143,8 @@ class StandaloneExecutionGenerationIsDurableIT {
                 var finalCounter = outputCounter(stopped.observation());
                 assertThat(finalCounter.startTime()).isEqualTo(firstCounter.startTime());
                 assertThat(finalCounter.value()).isGreaterThanOrEqualTo(resumedRecords);
+                var stoppedCumulative = CumulativeMetricWitness.capture(stopped);
+                CumulativeMetricWitness.continued(report, "stop", resumedCumulative, stoppedCumulative, false);
                 record(report, "stop", stopped, claim(database, pipeline));
                 admissions.stage("stop", 0, 0);
                 coordination.stage("stop", readiness(stopped, Map.of()));
@@ -151,6 +159,9 @@ class StandaloneExecutionGenerationIsDurableIT {
                 var restartCounter = outputCounter(restarted.observation());
                 assertThat(restartCounter.startTime()).isAfter(firstCounter.startTime());
                 assertThat(generation(claim(database, pipeline))).isEqualTo(firstGeneration + 1);
+                var restartedCumulative = CumulativeMetricWitness.running(latest, pipeline, restarted.scope().orElseThrow(),
+                        WAIT, null, report, "stop-start");
+                CumulativeMetricWitness.reset(report, "stop-start", stoppedCumulative, restartedCumulative);
                 record(report, "stop-start", restarted, claim(database, pipeline));
                 admissions.stage("stop-start", 1, 1);
                 coordination.stage("stop-start", readiness(restarted, Map.of("targetExpectedAmount", restartedAmount,
@@ -160,6 +171,9 @@ class StandaloneExecutionGenerationIsDurableIT {
                 coordination.begin("stop-before-process-restart");
                 control.stop(pipeline, false);
                 var beforeProcessStop = stored(latest, pipeline, beforeProcessGeneration, PipelineState.STOPPED);
+                var beforeProcessCumulative = CumulativeMetricWitness.capture(beforeProcessStop);
+                CumulativeMetricWitness.continued(report, "stop-before-process-restart", restartedCumulative,
+                        beforeProcessCumulative, false);
                 admissions.stage("stop-before-process-restart", 0, 0);
                 coordination.stage("stop-before-process-restart", readiness(beforeProcessStop, Map.of()));
                 coordination.begin("first-process-shutdown");
@@ -194,6 +208,9 @@ class StandaloneExecutionGenerationIsDurableIT {
                     afterProcessRestart = activeCounter(latest, pipeline, afterProcessRestart.scope().orElseThrow(), 0);
                     assertThat(outputCounter(afterProcessRestart.observation()).startTime())
                             .isAfter(restartCounter.startTime());
+                    var afterProcessCumulative = CumulativeMetricWitness.running(latest, pipeline,
+                            afterProcessRestart.scope().orElseThrow(), WAIT, null, report, "process-restart-start");
+                    CumulativeMetricWitness.reset(report, "process-restart-start", beforeProcessCumulative, afterProcessCumulative);
                     record(report, "process-restart-start", afterProcessRestart, claim(database, pipeline));
                     admissions.stage("new-process-start", 1, 1);
                     coordination.stage("new-process-start", readiness(afterProcessRestart,
@@ -203,6 +220,9 @@ class StandaloneExecutionGenerationIsDurableIT {
                     coordination.begin("stop-before-recreate");
                     restored.stop(pipeline, false);
                     var beforeRecreateStop = stored(latest, pipeline, beforeProcessGeneration + 1, PipelineState.STOPPED);
+                    var beforeRecreateCumulative = CumulativeMetricWitness.capture(beforeRecreateStop);
+                    CumulativeMetricWitness.continued(report, "stop-before-recreate", afterProcessCumulative,
+                            beforeRecreateCumulative, false);
                     admissions.stage("stop-before-recreate", 0, 0);
                     coordination.stage("stop-before-recreate", readiness(beforeRecreateStop, Map.of()));
                     coordination.begin("delete-recreate-without-start");
@@ -224,6 +244,9 @@ class StandaloneExecutionGenerationIsDurableIT {
                     recreated = activeCounter(latest, pipeline, recreated.scope().orElseThrow(), 0);
                     assertThat(outputCounter(recreated.observation()).startTime())
                             .isAfter(outputCounter(afterProcessRestart.observation()).startTime());
+                    var recreatedCumulative = CumulativeMetricWitness.running(latest, pipeline, recreated.scope().orElseThrow(),
+                            WAIT, null, report, "delete-recreate-start");
+                    CumulativeMetricWitness.reset(report, "delete-recreate-start", beforeRecreateCumulative, recreatedCumulative);
                     record(report, "delete-recreate-start", recreated, claim(database, pipeline));
                     admissions.stage("recreate-start", 1, 1);
                     coordination.stage("recreate-start", readiness(recreated, Map.of("targetExpectedAmount", recreatedAmount,
@@ -231,6 +254,8 @@ class StandaloneExecutionGenerationIsDurableIT {
                     coordination.begin("final-stop");
                     restored.stop(pipeline, false);
                     var finalStop = stored(latest, pipeline, beforeProcessGeneration + 2, PipelineState.STOPPED);
+                    CumulativeMetricWitness.continued(report, "final-stop", recreatedCumulative,
+                            CumulativeMetricWitness.capture(finalStop), false);
                     admissions.stage("final-stop", 0, 0);
                     coordination.stage("final-stop", readiness(finalStop, Map.of()));
                     coordination.begin("second-process-shutdown");
