@@ -167,8 +167,15 @@ final class StoreBackedDagSource implements DagSource {
 
     @Override
     public void validateStart(String pipelineId) {
-        PipelineResource pipeline = PipelineInlining.inline(
-                StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        requireDiscovered(PipelineInlining.inline(
+                StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts()));
+    }
+
+    /**
+     * Refuses a pipeline that writes a view or a sync while a source reaching what it writes has never been
+     * discovered: a write target is built from the discovered fields and key, so nothing can bind it yet.
+     */
+    private void requireDiscovered(PipelineResource pipeline) {
         boolean writesView = pipeline.view() instanceof ViewBlock.Inline;
         boolean writesSync = pipeline.serve() instanceof ServeBlock.Inline serve
                 && serve.sync() != null && !serve.sync().isEmpty();
@@ -2465,9 +2472,14 @@ final class StoreBackedDagSource implements DagSource {
      *
      * <p>{@code definition} is the pipeline as stored, not expanded: whether an element is written in the
      * pipeline itself or comes from a shared definition is part of the answer, and expanding first erases it.
+     *
+     * <p>A pipeline the start would refuse because a source reaching what it writes was never discovered is
+     * refused here first, with the same coded error: the question meets every pipeline a start is asked for,
+     * and a coded refusal is what a start check reports as a target it could not check.
      */
     List<PipelineWriteTargets.WriteTarget> writeTargets(PipelineResource definition) {
         PipelineResource pipeline = PipelineInlining.inline(definition, artifacts());
+        requireDiscovered(pipeline);
         List<PipelineWriteTargets.WriteTarget> written = new ArrayList<>();
         if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null && !serve.sync().isEmpty()) {
             Map<String, SourceVertex> vertices = sourceVertices(pipeline);
