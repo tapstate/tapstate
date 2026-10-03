@@ -26,17 +26,31 @@ final class PipelineStateEvents {
     static List<PipelineEvent> of(String pipelineId, ObservationStore.Scope scope,
             ConvergeResult result, ObservationFailure failure, boolean recovering) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        if (scope == null || result == null || result.transitionFrom().isEmpty()
-                || result.checkpoint().isEmpty()) {
+        if (scope == null || result == null) {
             return List.of();
         }
+        List<PipelineEvent> events = new ArrayList<>();
+        if (result.executionBoundary().isPresent()) {
+            var boundary = result.executionBoundary().orElseThrow();
+            if (!scope.equals(boundary.scope())) { return List.of(); }
+            PipelineState before = boundary.beforeState();
+            if (before != PipelineState.RUNNING) {
+                events.add(boundaryEvent(pipelineId, boundary, PipelineEvent.Kind.STATE_CHANGED));
+            }
+            if (boundary.recovering() || recovering || before == PipelineState.FAILED) {
+                events.add(boundaryEvent(pipelineId, boundary, PipelineEvent.Kind.EXECUTION_RECOVERED));
+            }
+            if (scope.executionGeneration() > 1) {
+                events.add(boundaryEvent(pipelineId, boundary, PipelineEvent.Kind.EXECUTION_RESTARTED));
+            }
+        }
+        if (result.transitionFrom().isEmpty() || result.checkpoint().isEmpty()) { return List.copyOf(events); }
         CheckpointDoc checkpoint = result.checkpoint().orElseThrow();
         PipelineState from = result.transitionFrom().orElseThrow();
         PipelineState to = StateJson.parse(checkpoint.stateJson());
         if (from == to) {
-            return List.of();
+            return List.copyOf(events);
         }
-        List<PipelineEvent> events = new ArrayList<>();
         events.add(event(pipelineId, scope, checkpoint, PipelineEvent.Kind.STATE_CHANGED,
                 from, to, null));
         if (to == PipelineState.FAILED && failure != null) {
@@ -53,6 +67,15 @@ final class PipelineStateEvents {
                     from, to, null));
         }
         return List.copyOf(events);
+    }
+
+    private static PipelineEvent boundaryEvent(String pipelineId, ConvergeResult.ExecutionBoundary boundary,
+            PipelineEvent.Kind kind) {
+        var scope = boundary.scope();
+        return new PipelineEvent(PipelineEvent.stateId(pipelineId, scope.pipelineIncarnationId(),
+                scope.executionGeneration(), kind, boundary.checkpointEpoch()), pipelineId, scope.pipelineIncarnationId(),
+                scope.executionGeneration(), kind, boundary.occurredAt(), boundary.beforeState(), PipelineState.RUNNING,
+                null, null, null);
     }
 
     private static PipelineEvent event(String pipelineId, ObservationStore.Scope scope,

@@ -323,9 +323,12 @@ final class ConvergenceDriver {
         if (scope == null || result.checkpoint().isEmpty()) {
             return;
         }
+        if (result.executionBoundary().filter(boundary -> !scope.equals(boundary.scope())).isPresent()) { return; }
         PipelineState after = StateJson.parse(result.checkpoint().orElseThrow().stateJson());
-        boolean recovering = after == PipelineState.RUNNING && result.transitionFrom().isPresent()
-                && scope.pipelineIncarnationId().equals(failedIncarnations.get(pipelineId));
+        boolean executionRecovery = result.executionBoundary().map(ConvergeResult.ExecutionBoundary::recovering).orElse(false);
+        boolean recovering = after == PipelineState.RUNNING
+                && (result.transitionFrom().isPresent() || result.executionBoundary().isPresent())
+                && (executionRecovery || scope.pipelineIncarnationId().equals(failedIncarnations.get(pipelineId)));
         try {
             PipelineStateEvents.of(pipelineId, scope, result, failure, recovering)
                     .forEach(telemetryWork::offerEvent);

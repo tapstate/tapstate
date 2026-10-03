@@ -2,9 +2,11 @@ package io.tapstate.runtime.scheduler;
 
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.ObservationStore;
 
 import java.util.Objects;
 import java.util.Optional;
+import java.time.Instant;
 
 /**
  * The result of one convergence pass: its {@link ConvergeStatus}, the resulting checkpoint when the
@@ -16,13 +18,40 @@ import java.util.Optional;
  */
 public record ConvergeResult(
         ConvergeStatus status, Optional<CheckpointDoc> checkpoint, Optional<Throwable> failure,
-        Optional<PipelineState> transitionFrom) {
+        Optional<PipelineState> transitionFrom,
+        Optional<ExecutionBoundary> executionBoundary) {
+
+    /** One transient receipt of a real execution submission or winning successor binding. */
+    public record ExecutionBoundary(ObservationStore.Scope scope, long checkpointEpoch,
+            PipelineState beforeState, Instant occurredAt, boolean recovering) {
+        public ExecutionBoundary {
+            Objects.requireNonNull(scope, "scope");
+            Objects.requireNonNull(beforeState, "beforeState");
+            Objects.requireNonNull(occurredAt, "occurredAt");
+            if (checkpointEpoch < 0) { throw new IllegalArgumentException("an execution boundary has a factual checkpoint epoch"); }
+        }
+    }
 
     public ConvergeResult {
         Objects.requireNonNull(status, "status");
         Objects.requireNonNull(checkpoint, "checkpoint");
         Objects.requireNonNull(failure, "failure");
         Objects.requireNonNull(transitionFrom, "transitionFrom");
+        Objects.requireNonNull(executionBoundary, "executionBoundary");
+    }
+
+    public ConvergeResult(ConvergeStatus status, Optional<CheckpointDoc> checkpoint, Optional<Throwable> failure,
+            Optional<PipelineState> transitionFrom) {
+        this(status, checkpoint, failure, transitionFrom, Optional.empty());
+    }
+
+    ConvergeResult withExecutionBoundary(ExecutionBoundary boundary) {
+        return new ConvergeResult(status, checkpoint, failure, transitionFrom, Optional.of(boundary));
+    }
+
+    ConvergeResult recoveringExecution() {
+        return executionBoundary.map(boundary -> withExecutionBoundary(new ExecutionBoundary(boundary.scope(),
+                boundary.checkpointEpoch(), boundary.beforeState(), boundary.occurredAt(), true))).orElse(this);
     }
 
     /** Existing result construction with no newly applied state transition. */

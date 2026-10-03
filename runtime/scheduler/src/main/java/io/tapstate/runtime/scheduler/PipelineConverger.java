@@ -14,6 +14,7 @@ import io.tapstate.spi.store.StopReservation;
 import io.tapstate.spi.store.SuccessorEnd;
 
 import java.time.Clock;
+import java.time.Instant;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Map;
@@ -115,8 +116,14 @@ public final class PipelineConverger {
             // resuming the job. Submitting is absent-safe, and the guard is "no job is carrying it"
             // rather than "this process did not start it", so the next tick actuates nothing.
             if (!actuator.isCarryingAJob(pipelineId) && !rebuild) {
+                ConvergeResult.ExecutionBoundary submission = null;
                 try (LifecycleActuator.PreparedStart prepared = actuator.prepareStart(pipelineId)) {
                     prepared.submit();
+                    var source = actuator.stopSource(pipelineId).orElse(null);
+                    if (source != null && source.scope() != null && source.oldJob() != null) {
+                        submission = new ConvergeResult.ExecutionBoundary(source.scope(), actualDoc.orElseThrow().epoch(),
+                                PipelineState.RUNNING, clock.instant(), false);
+                    }
                 } catch (StartDeferred waiting) {
                     return ConvergeResult.startDeferred(actualDoc.orElseThrow(), waiting.reason());
                 } catch (TapstateException refused) {
@@ -127,7 +134,8 @@ public final class PipelineConverger {
                     // is exactly the condition the coded refusal exists for.
                     return failedWith(pipelineId, refused);
                 }
-                return ConvergeResult.converged(actualDoc.orElseThrow());
+                ConvergeResult restored = ConvergeResult.converged(actualDoc.orElseThrow());
+                return submission == null ? restored : restored.withExecutionBoundary(submission);
             }
         }
 
@@ -157,7 +165,8 @@ public final class PipelineConverger {
             // healthy pipeline over a dead job while it is being decided. The admission bounds itself --
             // a yes that never runs out is a restart loop wearing the word "recovery".
             if (target == PipelineState.RUNNING && rebuilds.admits(pipelineId)) {
-                return driveTo(pipelineId, target, false, actualDoc.orElse(null), false, true, false, intent.get());
+                return driveTo(pipelineId, target, false, actualDoc.orElse(null), false, true, false, intent.get())
+                        .recoveringExecution();
             }
             // Otherwise a failed run stays failed: re-driving it toward RUNNING would restart the dead job
             // on every tick, and toward PAUSED would try every tick to hold a job that is gone, be refused,
@@ -403,8 +412,7 @@ public final class PipelineConverger {
             if (!currentMarker(admitted, intent, admitted.writerAuthority())) { return ConvergeResult.superseded(); }
             prepared.submit();
             return prepared.submittedJob()
-                    .flatMap(job -> state.bindSuccessor(admitted, admitted.successor().scope(), job, clock.instant()))
-                    .map(bound -> resumeStop(bound, intent, false))
+                    .flatMap(job -> bindSuccessorWithBoundary(admitted, job, intent))
                     .orElseGet(() -> ConvergeResult.stopPending(requireCheckpoint(id)));
         } catch (StartDeferred waiting) {
             return ConvergeResult.startDeferred(requireCheckpoint(id), waiting.reason());
@@ -459,8 +467,7 @@ public final class PipelineConverger {
                     .orElseGet(ConvergeResult::superseded);
         }
         if (marker.phase() == StopReservation.Phase.SUCCESSOR_ADMITTED) {
-            return state.bindSuccessor(marker, marker.successor().scope(), actual.job().orElseThrow(), clock.instant())
-                    .map(bound -> resumeStop(bound, intent, false)).orElseGet(ConvergeResult::superseded);
+            return bindSuccessorWithBoundary(marker, actual.job().orElseThrow(), intent).orElseGet(ConvergeResult::superseded);
         }
         CheckpointDoc before = requireCheckpoint(id);
         if (actual.terminalState().isPresent()
@@ -492,6 +499,23 @@ public final class PipelineConverger {
         }
         // The actual job is running. Telemetry completion stays independently pending in the marker.
         return ConvergeResult.converged(requireCheckpoint(id));
+    }
+
+    private Optional<ConvergeResult> bindSuccessorWithBoundary(StopReservation admitted, StopReservation.JobIdentity job,
+            DesiredState intent) {
+        String id = admitted.pipelineId();
+        CheckpointDoc before = requireCheckpoint(id);
+        if (before.epoch() != admitted.reservedEpoch() || StateJson.parse(before.stateJson()) != PipelineState.STOPPED) {
+            return Optional.empty();
+        }
+        Instant boundAt = clock.instant();
+        var bound = state.bindSuccessor(admitted, admitted.successor().scope(), job, boundAt);
+        if (bound.isEmpty()) { return Optional.empty(); }
+        StopReservation receipt = bound.orElseThrow();
+        ConvergeResult continued = resumeStop(receipt, intent, false);
+        if (continued.status() == ConvergeStatus.SUPERSEDED) { return Optional.of(continued); }
+        return Optional.of(continued.withExecutionBoundary(new ConvergeResult.ExecutionBoundary(receipt.successor().scope(),
+                receipt.reservedEpoch(), StateJson.parse(before.stateJson()), boundAt, false)));
     }
 
     /** A genuine resume carries known totals; a stamped restart or purge starts fresh counters. */

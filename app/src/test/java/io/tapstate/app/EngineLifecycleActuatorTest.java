@@ -99,6 +99,101 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class EngineLifecycleActuatorTest {
 
     @Test
+    void anAutomaticallyReplacedFailedExecutionCarriesItsRealEventBoundary() {
+        var calls = new CopyOnWriteArrayList<String>();
+        var generations = new InMemoryWorkloadClaimStore();
+        var ownership = PipelineActuationOwnership.single("single", generations);
+        var incarnations = coldStopIncarnations();
+        var scopes = new ObservationScopeRegistry();
+        var desired = new InMemoryDesiredStore();
+        var state = new RestartableStopStateStore();
+        state.enableStops(desired, id -> ownership.stopAuthority(id).orElse(null), generations);
+        var capture = new RecordingCaptureCoordinator(calls);
+        var engine = new Engine(member);
+        var actuator = new EngineLifecycleActuator(engine, new RecordingDagSource(calls), capture, teardown(),
+                ownership, incarnations, scopes);
+        var allowance = new java.util.concurrent.atomic.AtomicBoolean(true);
+        var loop = new PipelineConverger(desired, state, actuator, Clock.systemUTC(),
+                id -> allowance.getAndSet(false));
+        desired.save(new DesiredState(PIPE, PipelineState.RUNNING, "rev-1"));
+        assertThat(loop.converge(PIPE).status()).isEqualTo(ConvergeStatus.CONVERGED);
+        Job original = member.getJet().getJob(PIPE);
+        awaitStatus(original, JobStatus.RUNNING);
+        var source = engine.executionJob(PIPE).orElseThrow();
+
+        capture.captureFailure = new TapstateException(io.tapstate.runtime.engine.EngineError.JOB_FAILED,
+                Map.of("pipeline", PIPE, "cause", "controlled capture reader failure"), null);
+        var failed = loop.converge(PIPE);
+        assertThat(StateJson.parse(state.read(PIPE).orElseThrow().stateJson())).isEqualTo(PipelineState.FAILED);
+        var failureEvents = PipelineStateEvents.of(PIPE, source.scope(), failed,
+                PipelineFailures.of(PIPE, failed.failure().orElseThrow()));
+        assertThat(failureEvents).extracting(io.tapstate.core.lifecycle.PipelineEvent::kind)
+                .contains(io.tapstate.core.lifecycle.PipelineEvent.Kind.FAILURE);
+
+        capture.captureFailure = null;
+        var recovered = loop.converge(PIPE);
+        Job replacement = member.getJet().getJob(PIPE);
+        awaitStatus(replacement, JobStatus.RUNNING);
+        var target = engine.executionJob(PIPE).orElseThrow();
+        assertThat(target.job().jobId()).isNotEqualTo(source.job().jobId());
+        assertThat(target.scope().pipelineIncarnationId()).isEqualTo(source.scope().pipelineIncarnationId());
+        assertThat(target.scope().executionGeneration()).isEqualTo(source.scope().executionGeneration() + 1);
+        assertThat(StateJson.parse(state.read(PIPE).orElseThrow().stateJson())).isEqualTo(PipelineState.RUNNING);
+        assertThat(state.stopReservations()).isEqualTo(1);
+        assertThat(state.readStopReservation(PIPE)).isEmpty();
+        var recoveryEvents = PipelineStateEvents.of(PIPE, target.scope(), recovered, null, true);
+        assertThat(recoveryEvents).extracting(io.tapstate.core.lifecycle.PipelineEvent::kind).containsExactly(
+                io.tapstate.core.lifecycle.PipelineEvent.Kind.STATE_CHANGED,
+                io.tapstate.core.lifecycle.PipelineEvent.Kind.EXECUTION_RECOVERED,
+                io.tapstate.core.lifecycle.PipelineEvent.Kind.EXECUTION_RESTARTED);
+        assertThat(recoveryEvents).extracting(io.tapstate.core.lifecycle.PipelineEvent::executionGeneration)
+                .containsOnly(target.scope().executionGeneration());
+        assertThat(PipelineStateEvents.of(PIPE, target.scope(), recovered, null, true)).containsExactlyElementsOf(recoveryEvents);
+        assertThat(PipelineStateEvents.of(PIPE, target.scope(), loop.converge(PIPE), null, true)).isEmpty();
+    }
+
+    @Test
+    void aMissingRunningJobReplacementEmitsOnlyItsRealExecutionBoundary() {
+        var calls = new CopyOnWriteArrayList<String>();
+        var generations = new InMemoryWorkloadClaimStore();
+        var ownership = PipelineActuationOwnership.single("single", generations);
+        var scopes = new ObservationScopeRegistry();
+        var desired = new InMemoryDesiredStore();
+        var state = new RestartableStopStateStore();
+        state.enableStops(desired, id -> ownership.stopAuthority(id).orElse(null), generations);
+        var engine = new Engine(member);
+        var actuator = new EngineLifecycleActuator(engine, new RecordingDagSource(calls),
+                new RecordingCaptureCoordinator(calls), teardown(), ownership, coldStopIncarnations(), scopes);
+        var loop = new PipelineConverger(desired, state, actuator, Clock.systemUTC());
+        desired.save(new DesiredState(PIPE, PipelineState.RUNNING, "rev-1"));
+        loop.converge(PIPE);
+        Job original = member.getJet().getJob(PIPE);
+        awaitStatus(original, JobStatus.RUNNING);
+        var source = engine.executionJob(PIPE).orElseThrow();
+        var before = state.read(PIPE).orElseThrow();
+
+        original.cancel();
+        awaitStatus(original, JobStatus.FAILED);
+        assertThat(actuator.failure(PIPE)).isEmpty();
+        var replaced = loop.converge(PIPE);
+        awaitStatus(member.getJet().getJob(PIPE), JobStatus.RUNNING);
+        var target = engine.executionJob(PIPE).orElseThrow();
+        assertThat(target.job().jobId()).isNotEqualTo(source.job().jobId());
+        assertThat(target.scope().pipelineIncarnationId()).isEqualTo(source.scope().pipelineIncarnationId());
+        assertThat(target.scope().executionGeneration()).isEqualTo(source.scope().executionGeneration() + 1);
+        assertThat(state.read(PIPE)).contains(before);
+        assertThat(replaced.checkpoint()).contains(before);
+        var events = PipelineStateEvents.of(PIPE, target.scope(), replaced, null);
+        assertThat(events).extracting(io.tapstate.core.lifecycle.PipelineEvent::kind)
+                .containsExactly(io.tapstate.core.lifecycle.PipelineEvent.Kind.EXECUTION_RESTARTED);
+        assertThat(events).extracting(io.tapstate.core.lifecycle.PipelineEvent::executionGeneration)
+                .containsOnly(target.scope().executionGeneration());
+        assertThat(PipelineStateEvents.of(PIPE, target.scope(), replaced, null)).containsExactlyElementsOf(events);
+        assertThat(PipelineStateEvents.of(PIPE, source.scope(), replaced, null)).isEmpty();
+        assertThat(PipelineStateEvents.of(PIPE, target.scope(), loop.converge(PIPE), null)).isEmpty();
+    }
+
+    @Test
     void pausingFreezesKnownCountersBeforeTheNativeProducerIsSuspended() {
         freezeAtLifecycleBoundary(true);
     }
