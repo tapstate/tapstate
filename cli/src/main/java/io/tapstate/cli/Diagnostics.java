@@ -55,6 +55,20 @@ final class Diagnostics {
         err.flush();
     }
 
+    /**
+     * One coded advisory as text: a {@code warning:} header rather than an {@code error:} one, because what a
+     * reader has to see at a glance is whether anything was refused.
+     */
+    static void printWarning(PrintWriter err, TapstateErrorCode code, Map<String, Object> args) {
+        MessageCatalog.Rendered rendered = MessageCatalog.bundled().render(code, args);
+        err.println(Ansi.AUTO.string("@|bold,yellow warning:|@") + " " + code.code());
+        err.println("  " + rendered.message());
+        if (rendered.solution() != null) {
+            err.println("  " + rendered.solution());
+        }
+        err.flush();
+    }
+
     /** One coded diagnostic as a stable, machine-readable map. */
     static Map<String, Object> map(TapstateErrorCode code, Map<String, Object> args, String source, int line, int column) {
         MessageCatalog.Rendered rendered = MessageCatalog.bundled().render(code, args);

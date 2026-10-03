@@ -54,6 +54,9 @@ record McpResult(boolean error, Map<String, Object> body) {
         body.put("message", rejected.message());
         body.put("params", rejected.params());
         body.put("status", rejected.status());
+        // whatever else the refusal carried, as it carried it: a start its checks stopped carries their report,
+        // which is what the caller has to put to a person, and four fields would leave it out
+        rejected.detail().forEach(body::putIfAbsent);
         return new McpResult(true, body);
     }
 

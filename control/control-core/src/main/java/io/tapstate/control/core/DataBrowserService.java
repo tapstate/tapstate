@@ -307,8 +307,18 @@ public final class DataBrowserService {
      * only that the connector will be handed the request, not that it can read one. Adding a connector
      * here is therefore a decision somebody makes and a reviewer sees, which is the same shape the
      * synchronised-operation set takes and for the same reason.
+     *
+     * <p>It holds every MongoDB-family connector a pipeline can write to, each one read through with its
+     * own real connector before it was added: a start looks at its targets through this face, and a
+     * target it cannot look at is a start that cannot ask before loading into a non-empty one.
      */
-    private static final Set<String> BROWSABLE_CONNECTORS = Set.of("mongodb");
+    private static final Set<String> BROWSABLE_CONNECTORS =
+            Set.of("mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb");
+
+    /** The connectors a request for rows may be sent to. */
+    static Set<String> browsableConnectors() {
+        return BROWSABLE_CONNECTORS;
+    }
 
     /**
      * Refuses a row read against a connector this face cannot ask in, before anything is sent.

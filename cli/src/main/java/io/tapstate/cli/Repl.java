@@ -164,9 +164,14 @@ final class Repl {
     /** The word that keeps everything, and the words that only say "do not ask me". */
     private static final String KEEP_STATE = "--keep-state";
     private static final Set<String> STOP_OPTIONS = Set.of(KEEP_STATE, "-y", "--non-interactive");
-    private static final Set<String> RESTART_OPTIONS = Set.of("--rerun", "-y", "--non-interactive");
+    private static final Set<String> RESTART_OPTIONS = Set.of("--rerun", "-y", "--yes", "--non-interactive");
     private static final String STOP_USAGE = "stop <pipeline-id> [--keep-state] [-y]";
-    private static final String RESTART_USAGE = "restart <pipeline-id> [--rerun] [-y]";
+    private static final String RESTART_USAGE =
+            "restart <pipeline-id> [--rerun] [-y] [--decide <check>[/<subject>]=<answer>]...";
+    private static final String START_USAGE = "start <pipeline-id> [-y] [--decide <check>[/<subject>]=<answer>]... "
+            + "[--checks-only] [-o text|json|yaml]";
+    /** The spellings of "do not ask me" a start takes: every one of them answers questions as configured. */
+    private static final Set<String> UNATTENDED = Set.of("-y", "--yes", "--non-interactive");
     private static final String POSITION_USAGE = "position <pipeline-id> [-f <file>]";
 
     private static final List<String> ONLINE_VERBS = List.of(
@@ -843,6 +848,11 @@ final class Repl {
         // composes are all positional, and the guard below would refuse the one option this takes.
         if (words.get(0).equals("restart")) {
             return restartOnline(words);
+        }
+        // A start answers its start checks, so it carries the options that answer them and parses its
+        // own line for the reason the verbs around it do.
+        if (words.get(0).equals("start")) {
+            return startOnline(words);
         }
         // A stop is the verb that clears, so it is the verb that asks first -- and it carries the two
         // words that say otherwise. It parses its own line for the same reason the two above do.
@@ -1603,6 +1613,11 @@ final class Repl {
      */
     private OptionalInt clearanceToClear(String verb, String id, boolean unattended) {
         sayWhatBecomesOfTheState(true);
+        return askToClear(verb, id, unattended);
+    }
+
+    /** The question of the gate above, asked after the list of what goes has been printed. */
+    private OptionalInt askToClear(String verb, String id, boolean unattended) {
         if (unattended) {
             return OptionalInt.empty();
         }
@@ -1645,7 +1660,21 @@ final class Repl {
     private int restartOnline(List<String> words) {
         PrintWriter err = commandLine.getErr();
         boolean rerun = words.contains("--rerun");
-        List<String> operands = words.stream().filter(word -> !RESTART_OPTIONS.contains(word)).toList();
+        List<String> decides = new ArrayList<>();
+        List<String> remaining = new ArrayList<>();
+        for (int i = 0; i < words.size(); i++) {
+            if (words.get(i).equals("--decide")) {
+                if (i + 1 >= words.size() || !StartFlow.wellFormedDecide(words.get(i + 1))) {
+                    return decideMalformed(i + 1 < words.size() ? words.get(i + 1) : "");
+                }
+                decides.add(words.get(++i));
+            } else {
+                remaining.add(words.get(i));
+            }
+        }
+        StartFlow.Answering answering = new StartFlow.Answering(
+                remaining.stream().anyMatch(UNATTENDED::contains), decides, OutputFormat.TEXT);
+        List<String> operands = remaining.stream().filter(word -> !RESTART_OPTIONS.contains(word)).toList();
         for (int i = 1; i < operands.size(); i++) {
             if (operands.get(i).startsWith("-")) {
                 err.println("restart: unknown option " + operands.get(i)
@@ -1661,23 +1690,20 @@ final class Repl {
         }
         String id = operands.get(1);
         if (rerun) {
-            // The plain restart clears nothing and asks nothing; this one is a stop that clears wearing
-            // another name, so it meets the same gate the plain stop does.
-            OptionalInt refused = clearanceToClear("restart", id, unattended(words));
-            return refused.isPresent() ? refused.getAsInt() : rerunFromTheStart(id);
+            return rerunFromTheStart(id, answering);
         }
         StatusOutcome outcome = withFailover(() ->
                 controlPlane.status(session.landingNode(), session.credential(), id),
                 o -> o instanceof StatusOutcome.Unreachable);
         return switch (outcome) {
-            case StatusOutcome.Found found -> carryOnFrom(id, found.state());
+            case StatusOutcome.Found found -> carryOnFrom(id, found.state(), answering);
             case StatusOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
             case StatusOutcome.Unreachable ignored -> reportRequestFailed();
         };
     }
 
     /** The plain restart, once the pipeline's state says which sequence carrying on actually is. */
-    private int carryOnFrom(String id, String state) {
+    private int carryOnFrom(String id, String state, StartFlow.Answering answering) {
         PrintWriter out = commandLine.getOut();
         PrintWriter err = commandLine.getErr();
         switch (state.toUpperCase(Locale.ROOT)) {
@@ -1737,7 +1763,7 @@ final class Repl {
                 out.println("restart: " + id + " has no position to carry on from; this run reads "
                         + "everything from the start");
                 out.flush();
-                return lifecycleOnline("start", id, null);
+                return startFlow("restart").start(id, answering).exitCode();
             }
             case "FAILED": {
                 // A failed run is carried on the same way anything else is, once the sequence is written
@@ -1751,7 +1777,7 @@ final class Repl {
                 if (stopped != Cli.EXIT_OK) {
                     return stopped;
                 }
-                return lifecycleOnline("start", id, null);
+                return startFlow("restart").start(id, answering).exitCode();
             }
             default:
                 err.println("restart: " + id + " is " + state.toLowerCase(Locale.ROOT)
@@ -1775,11 +1801,27 @@ final class Repl {
      * command, because the pipeline is now stopped with nothing to resume from and the next step is not
      * "try again".
      */
-    private int rerunFromTheStart(String id) {
+    private int rerunFromTheStart(String id, StartFlow.Answering answering) {
+        // Everything is asked before anything is stopped: what clearing takes, what the start that follows
+        // will be asked, and whether to clear at all. A cancel anywhere leaves the pipeline running as it was.
+        sayWhatBecomesOfTheState(true);
+        StartFlow flow = startFlow("restart");
+        StartFlow.RerunPlan plan = flow.planRerun(id, answering);
+        if (plan instanceof StartFlow.RerunPlan.Stop stop) {
+            return stop.exitCode();
+        }
+        OptionalInt refused = askToClear("restart", id, answering.unattended());
+        if (refused.isPresent()) {
+            return refused.getAsInt();
+        }
         int stopped = lifecycleOnline("stop", id, Boolean.TRUE);
         if (stopped != Cli.EXIT_OK) {
             return stopped;
         }
+        if (plan instanceof StartFlow.RerunPlan.Ready ready) {
+            return flow.startAfterRerunStop(id, ready, answering).exitCode();
+        }
+        // A server with no start checks: the rerun is the stop and the start it always was.
         int started = lifecycleOnline("start", id, null);
         if (started != Cli.EXIT_OK) {
             PrintWriter err = commandLine.getErr();
@@ -1789,6 +1831,141 @@ final class Repl {
             err.flush();
         }
         return started;
+    }
+
+    /**
+     * {@code start <pipeline-id> [-y] [--decide <check>[/<subject>]=<answer>]... [--checks-only] [-o FORMAT]}:
+     * a start through its start checks. {@code --checks-only} reads what the start would be asked and starts
+     * nothing.
+     */
+    private int startOnline(List<String> words) {
+        PrintWriter err = commandLine.getErr();
+        List<String> decides = new ArrayList<>();
+        boolean unattended = false;
+        boolean checksOnly = false;
+        OutputFormat format = OutputFormat.TEXT;
+        String id = null;
+        for (int i = 1; i < words.size(); i++) {
+            String word = words.get(i);
+            if (UNATTENDED.contains(word)) {
+                unattended = true;
+            } else if (word.equals("--checks-only")) {
+                checksOnly = true;
+            } else if (word.equals("--decide")) {
+                if (i + 1 >= words.size() || !StartFlow.wellFormedDecide(words.get(i + 1))) {
+                    return decideMalformed(i + 1 < words.size() ? words.get(i + 1) : "");
+                }
+                decides.add(words.get(++i));
+            } else if (word.equals("-o") || word.equals("--output")) {
+                if (i + 1 >= words.size()) {
+                    return startUsage(word + " needs text, json or yaml");
+                }
+                OutputFormat chosen = outputFormat(words.get(++i));
+                if (chosen == null) {
+                    return startUsage("unknown output format '" + words.get(i) + "'");
+                }
+                format = chosen;
+            } else if (word.startsWith("-")) {
+                return startUsage("unknown option " + word);
+            } else if (id == null) {
+                id = word;
+            } else {
+                return startUsage("unexpected operand '" + word + "'");
+            }
+        }
+        if (id == null || id.isBlank()) {
+            err.println("start: missing operand (usage: " + START_USAGE + ")");
+            err.flush();
+            return Cli.EXIT_USAGE;
+        }
+        if (checksOnly && (unattended || !decides.isEmpty())) {
+            return startUsage("--checks-only starts nothing, so it takes no answers");
+        }
+        StartFlow flow = startFlow("start");
+        return checksOnly ? flow.checksOnly(id, format).exitCode()
+                : flow.start(id, new StartFlow.Answering(unattended, decides, format)).exitCode();
+    }
+
+    private int startUsage(String why) {
+        PrintWriter err = commandLine.getErr();
+        err.println("start: " + why + " (usage: " + START_USAGE + ")");
+        err.flush();
+        return Cli.EXIT_USAGE;
+    }
+
+    private int decideMalformed(String decide) {
+        PrintWriter err = commandLine.getErr();
+        Diagnostics.printText(err, CliError.DECIDE_MALFORMED, Map.of("decide", decide));
+        err.flush();
+        return Cli.EXIT_USAGE;
+    }
+
+    /**
+     * The start, through its start checks, for every verb that ends in one. Reading the checks may be sent
+     * to another member if the landing one cannot be reached; the start itself only when no connection was
+     * made at all, because a start that timed out may already have gone ahead.
+     */
+    private StartFlow startFlow(String verb) {
+        StartFlow.Server server = new StartFlow.Server() {
+            @Override
+            public StartAttempt start(String pipelineId, List<StartDecision> decisions, String ifMatch) {
+                return withFailover(() -> controlPlane.start(
+                                session.landingNode(), session.credential(), pipelineId, decisions, ifMatch),
+                        outcome -> outcome instanceof StartAttempt.Unreachable unreachable && !unreachable.sent());
+            }
+
+            @Override
+            public StartChecksOutcome checks(String pipelineId, String intent) {
+                return withFailover(() -> controlPlane.startChecks(
+                                session.landingNode(), session.credential(), pipelineId, intent),
+                        outcome -> outcome instanceof StartChecksOutcome.Unreachable);
+            }
+        };
+        StartFlow.Reporting reporting = new StartFlow.Reporting() {
+            @Override
+            public int rejection(String code, String message, Map<String, Object> params) {
+                return renderRejection(code, message, params);
+            }
+
+            @Override
+            public int unreachable() {
+                return reportRequestFailed();
+            }
+
+            @Override
+            public int unanswered(String pipelineId) {
+                if (!session.isConnected()) {
+                    return Cli.EXIT_DIAGNOSTIC;
+                }
+                Diagnostics.printText(commandLine.getErr(), CliError.START_MAY_HAVE_GONE_AHEAD,
+                        Map.of("pipeline", pipelineId, "server", hostPort(session.landingNode())), session.versions());
+                return Cli.EXIT_DIAGNOSTIC;
+            }
+        };
+        return new StartFlow(verb, server, commandLine.getOut(), commandLine.getErr(), this::prompter, terminal,
+                reporting, this::workspaceFileOf);
+    }
+
+    /**
+     * The workspace file that declares pipeline {@code id}, relative to the workspace, or null when no file
+     * there declares it -- what a person is told still holds the old value after a start changed it.
+     */
+    private String workspaceFileOf(String id) {
+        try {
+            for (LocalDraft draft : collectDrafts(workdir, env)) {
+                try {
+                    if (new io.tapstate.core.dsl.DslParser().parse(draft.content())
+                            instanceof io.tapstate.core.model.PipelineResource pipeline && pipeline.id().equals(id)) {
+                        return draft.source();
+                    }
+                } catch (RuntimeException unreadable) {
+                    // A file that does not parse names nothing here; apply is where it is reported.
+                }
+            }
+        } catch (IOException | RuntimeException unreadable) {
+            return null;
+        }
+        return null;
     }
 
     private int lifecycleOnline(String verb, String id, Boolean purgeState) {
@@ -4349,7 +4526,7 @@ final class Repl {
             Diagnostics.printText(err, CliError.NOT_AUTHENTICATED, Map.of("verb", "up"), session.versions());
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
-        return new UpRun(workspace, options.format(), connectedHere).run();
+        return new UpRun(workspace, options.format(), connectedHere, options.yes()).run();
     }
 
     /**
@@ -4447,7 +4624,7 @@ final class Repl {
                 user = words.get(++i);
             } else if (word.startsWith("-u=") || word.startsWith("--user=")) {
                 user = word.substring(word.indexOf('=') + 1);
-            } else if (word.equals("-y") || word.equals("--yes")) {
+            } else if (UNATTENDED.contains(word)) {
                 yes = true;
             } else if (word.startsWith("-")) {
                 return upUsage("unknown option '" + word + "'");
@@ -4498,12 +4675,17 @@ final class Repl {
         private final Map<String, List<String>> notes = new LinkedHashMap<>();
         /** Each pipeline's state after the start stage, as the server reports it. */
         private final Map<String, String> states = new LinkedHashMap<>();
+        /** What each pipeline's start checks said when it was started, for the structured summary. */
+        private final Map<String, Map<String, Object>> startChecks = new LinkedHashMap<>();
+        /** Whether {@code --yes} was given: it also answers every start check question as configured. */
+        private final boolean yes;
         private boolean nothingToDo = true;
 
-        UpRun(Path workspace, OutputFormat format, boolean connectedHere) {
+        UpRun(Path workspace, OutputFormat format, boolean connectedHere, boolean yes) {
             this.workspace = workspace;
             this.format = format;
             this.connectedHere = connectedHere;
+            this.yes = yes;
         }
 
         int run() {
@@ -4787,6 +4969,7 @@ final class Repl {
          * reports is read back after, from the server.
          */
         private int start() {
+            StartFlow flow = startFlow("up");
             for (UpDraft pipeline : pipelines()) {
                 String id = pipeline.id();
                 if (UNCHANGED.equalsIgnoreCase(changes.get(id))
@@ -4797,13 +4980,37 @@ final class Repl {
                     continue;
                 }
                 String target;
-                switch (lifecycleFor(id, "start")) {
-                    case LifecycleOutcome.Accepted accepted -> target = accepted.targetState();
-                    case LifecycleOutcome.Rejected rejected -> {
-                        return failure(UpCmd.STAGE_START, id, rejected.code(), rejected.message(), Map.of());
+                StartFlow.Result result = flow.start(id, new StartFlow.Answering(yes, List.of(), format, true));
+                switch (result.attempt()) {
+                    case StartAttempt.Started started -> {
+                        target = started.targetState();
+                        if (started.checks() != null) {
+                            startChecks.put(id, started.checks().raw());
+                            started.checks().findings().stream()
+                                    .filter(finding -> StartChecks.WARN.equals(finding.behavior()))
+                                    .forEach(finding -> note(id, "start check: " + finding.message()));
+                        }
                     }
-                    case LifecycleOutcome.Unreachable ignored -> {
+                    case StartAttempt.Stopped stopped -> {
+                        // Stopped to ask, and nothing here could answer: this run had no terminal to ask at, or
+                        // was told to print a document rather than ask. The way on is named, with the report.
+                        return failure(UpCmd.STAGE_START, id, stopped.code(), stopped.message(), stopped.params(),
+                                List.of("Answer at a terminal, run 'tapstate up --yes' to go ahead as configured, "
+                                        + "or start it with 'tapstate start " + id + " --decide <check>=<answer>'."),
+                                stopped.checks().raw());
+                    }
+                    case StartAttempt.Rejected rejected -> {
+                        return failure(UpCmd.STAGE_START, id, rejected.code(), rejected.message(), rejected.params());
+                    }
+                    case StartAttempt.Unreachable unreachable when unreachable.sent() -> {
+                        return failure(UpCmd.STAGE_START, id, CliError.START_MAY_HAVE_GONE_AHEAD,
+                                Map.of("pipeline", id, "server", hostPort(session.landingNode())));
+                    }
+                    case StartAttempt.Unreachable ignored -> {
                         return unreachable(UpCmd.STAGE_START, id);
+                    }
+                    case null -> {
+                        return Cli.EXIT_DIAGNOSTIC;
                     }
                 }
                 nothingToDo = false;
@@ -4822,7 +5029,7 @@ final class Repl {
         private void summary() {
             List<FirstRunSummary.UpPipeline> pipelines = pipelines().stream()
                     .map(p -> new FirstRunSummary.UpPipeline(p.id(), states.get(p.id()),
-                            notes.getOrDefault(p.id(), List.of())))
+                            notes.getOrDefault(p.id(), List.of()), startChecks.get(p.id())))
                     .toList();
             List<FirstRunSummary.UpSource> sources = sources().stream()
                     .map(s -> new FirstRunSummary.UpSource(s.id(), notes.getOrDefault(s.id(), List.of())))
@@ -4869,12 +5076,18 @@ final class Repl {
          */
         private int failure(String stage, String on, String code, String message, Map<String, Object> params,
                 List<String> nextAction) {
+            return failure(stage, on, code, message, params, nextAction, null);
+        }
+
+        /** The same report, carrying the start checks that stopped a start when there are any. */
+        private int failure(String stage, String on, String code, String message, Map<String, Object> params,
+                List<String> nextAction, Map<String, Object> checks) {
             List<String> remedyLines = nextAction;
             if (remedyLines.isEmpty()) {
                 String solution = MessageCatalog.bundled().render(code, params).solution();
                 remedyLines = present(solution) && !hasUnboundName(solution) ? List.of(solution) : List.of();
             }
-            return reportUpFailure(format, stage, on, code, message, params, remedyLines);
+            return reportUpFailure(format, stage, on, code, message, params, remedyLines, checks);
         }
     }
 
@@ -4887,6 +5100,11 @@ final class Repl {
      */
     private int reportUpFailure(OutputFormat format, String stage, String on, String code, String message,
             Map<String, Object> params, List<String> remedyLines) {
+        return reportUpFailure(format, stage, on, code, message, params, remedyLines, null);
+    }
+
+    private int reportUpFailure(OutputFormat format, String stage, String on, String code, String message,
+            Map<String, Object> params, List<String> remedyLines, Map<String, Object> startChecks) {
         if (format != OutputFormat.TEXT) {
             Map<String, Object> document = new LinkedHashMap<>();
             document.put("code", code);
@@ -4900,6 +5118,9 @@ final class Repl {
             }
             document.put("stage", stage);
             document.put("on", on);
+            if (startChecks != null) {
+                document.put("startChecks", startChecks);
+            }
             PrintWriter out = commandLine.getOut();
             out.println(format == OutputFormat.JSON ? JsonOut.write(document) : YamlOut.write(document));
             out.flush();

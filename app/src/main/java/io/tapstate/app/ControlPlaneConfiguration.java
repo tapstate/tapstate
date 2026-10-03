@@ -40,7 +40,14 @@ import io.tapstate.control.core.DataBrowserService;
 import io.tapstate.control.core.LoginService;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.PasswordHasher;
+import io.tapstate.control.core.DataBrowserTargetProbe;
+import io.tapstate.control.core.DraftSyncingDefinitionWriter;
 import io.tapstate.control.core.PipelineLifecycleService;
+import io.tapstate.control.core.PipelineStartService;
+import io.tapstate.control.core.PipelineWriteTargets;
+import io.tapstate.control.core.StartCheckEvaluator;
+import io.tapstate.control.core.StartChecks;
+import io.tapstate.control.core.StartPlanner;
 import io.tapstate.control.core.PipelineDraftService;
 import io.tapstate.control.core.PipelineCatalogService;
 import io.tapstate.control.core.PipelineLayoutService;
@@ -92,6 +99,7 @@ import io.tapstate.spi.store.AuditStore;
 import io.tapstate.spi.store.DataBrowser;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.messages.ExplanationCatalog;
+import io.tapstate.messages.MessageCatalog;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ConnectionTestResultStore;
 import io.tapstate.spi.store.ConnectionTester;
@@ -119,6 +127,7 @@ import org.springframework.lang.Nullable;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.time.Clock;
+import java.util.concurrent.Executors;
 
 /**
  * Wires the control plane into the assembly root: the authentication ports over the store, the control-core
@@ -639,6 +648,37 @@ class ControlPlaneConfiguration {
     @Bean
     PipelineChains pipelineChains(StorePort storePort) {
         return new StoreBackedPipelineChains(storePort);
+    }
+
+    /**
+     * Which tables a pipeline writes, named by the topology build's own derivation -- resolved here for
+     * the reason the chains above are: the side that binds a sink is the one that knows its table names.
+     */
+    @Bean
+    PipelineWriteTargets pipelineWriteTargets(StorePort storePort) {
+        return new StoreBackedPipelineWriteTargets(storePort);
+    }
+
+    /**
+     * A person's start: the registered start checks, evaluated against how the start would load each
+     * target and what each target holds, looked at through the data browser's own reads. The checks run
+     * on virtual threads, one per check and one per target probed, so a slow target holds up nothing but
+     * its own finding.
+     */
+    @Bean
+    PipelineStartService pipelineStartService(PipelineLifecycleService lifecycle, PipelineChains pipelineChains,
+            PipelineWriteTargets pipelineWriteTargets, StorePort storePort, DataBrowserService dataBrowserService,
+            ApplyService applyService, AuditGate auditGate, Clock clock) {
+        MessageCatalog catalog = MessageCatalog.bundled();
+        StartCheckEvaluator evaluator = new StartCheckEvaluator(StartChecks.registered(),
+                new StartPlanner(pipelineChains, storePort.meta(), pipelineWriteTargets),
+                new DataBrowserTargetProbe(dataBrowserService),
+                (code, params) -> catalog.render(code, params).message(),
+                Executors.newVirtualThreadPerTaskExecutor(), clock);
+        // A definition a start's answer changes is written together with the pipeline's draft, so the
+        // editor's next publish neither undoes the answer nor is refused for being based on the old one.
+        return new PipelineStartService(lifecycle, evaluator,
+                new DraftSyncingDefinitionWriter(applyService, storePort.drafts(), auditGate, clock));
     }
 
     @Bean

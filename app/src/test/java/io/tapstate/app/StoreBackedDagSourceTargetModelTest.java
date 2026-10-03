@@ -361,19 +361,43 @@ class StoreBackedDagSourceTargetModelTest {
 
     @Test
     void refuses_a_view_over_a_literal_table_when_the_source_schema_was_never_discovered() {
-        InMemoryStorePort store = new InMemoryStorePort();
-        store.artifacts().save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
-                SourceMode.CDC, List.of(TableRef.literal("orders")), null, null));
-        store.artifacts().save(new SourceResource(ViewTargetResolver.STATE_STORE_SOURCE_ID, null,
-                "mongodb", Map.of("uri", "u"), null, null, null, null));
-        store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.bare("orders_src")), null,
-                new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "id", null),
-                null, null, null));
+        InMemoryStorePort store = seededViewPipeline();
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).validateStart("p"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
                 .hasMessageContaining("actuation.source-schema-not-discovered")
                 .hasMessageContaining("orders_src");
+    }
+
+    /**
+     * A start's checks ask where a pipeline writes before the start is accepted, so the question meets every
+     * pipeline a start can be asked for - one whose source was never discovered included. It is refused the
+     * way the start itself would be, with a code a check turns into a finding that says the targets could
+     * not be checked; any other failure fails the start.
+     */
+    @Test
+    void names_no_write_target_of_a_sync_whose_source_schema_was_never_discovered() {
+        InMemoryStorePort store = seededPipeline();
+
+        assertNotDiscovered(() -> new StoreBackedPipelineWriteTargets(store)
+                .of(StoredArtifacts.requirePipeline(store.artifacts(), "p")));
+    }
+
+    /** A view's collection is named without the source's model, but the start is refused all the same. */
+    @Test
+    void names_no_write_target_of_a_view_whose_source_schema_was_never_discovered() {
+        InMemoryStorePort store = seededViewPipeline();
+
+        assertNotDiscovered(() -> new StoreBackedPipelineWriteTargets(store)
+                .of(StoredArtifacts.requirePipeline(store.artifacts(), "p")));
+    }
+
+    private static void assertNotDiscovered(org.assertj.core.api.ThrowableAssert.ThrowingCallable call) {
+        assertThatThrownBy(call).isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                refused -> {
+                    assertThat(refused.code()).isEqualTo(ActuationError.SOURCE_SCHEMA_NOT_DISCOVERED);
+                    assertThat(refused.args()).containsEntry("source", "orders_src");
+                });
     }
 
     @Test
@@ -714,6 +738,19 @@ class StoreBackedDagSourceTargetModelTest {
                         List.of(syncElements), null, null),
                 null, null));
         OpenRingGenerations.forSources(store, "orders_src");
+        return store;
+    }
+
+    /** A pipeline writing only a view over one literal table, its source never discovered. */
+    private static InMemoryStorePort seededViewPipeline() {
+        InMemoryStorePort store = new InMemoryStorePort();
+        store.artifacts().save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders")), null, null));
+        store.artifacts().save(new SourceResource(ViewTargetResolver.STATE_STORE_SOURCE_ID, null,
+                "mongodb", Map.of("uri", "u"), null, null, null, null));
+        store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.bare("orders_src")), null,
+                new ViewBlock.Inline("order_state", FromRef.literal("orders_src"), "id", null),
+                null, null, null));
         return store;
     }
 

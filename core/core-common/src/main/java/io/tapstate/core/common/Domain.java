@@ -88,6 +88,11 @@ public enum Domain {
     PIPELINE,
     // Pipeline authoring operations: draft revisions, compilation, publication and discard
     PIPELINE_DRAFT,
+    // the questions a pipeline start answers before anything is written: each start check's findings
+    // and the actions a person can take on them. Its codes name the text of a start check report and
+    // are never thrown -- a start the checks refuse is refused under LIFECYCLE, which owns the verb.
+    // Distinct from LIFECYCLE so a check can be added without touching the verb's own vocabulary (control)
+    START_CHECK,
     // local MCP presentation: sidecar input, connector-spec and upstream-response failures
     MCP,
     // runtime data plane: reading a source's snapshot / cdc into the replay store — diagnosable

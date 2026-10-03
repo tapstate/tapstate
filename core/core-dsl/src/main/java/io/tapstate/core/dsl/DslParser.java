@@ -118,7 +118,8 @@ public final class DslParser {
     static final Set<String> REQUIRED_NEST_STATE_KEYS = Set.of("database");
     private static final Set<String> EMBED_KEYS = Set.of(
             "from", "on", "as", "path", "key", "arrayKey", "ignoreUpdates", "trackKeyChanges", "embed");
-    private static final Set<String> VIEW_INLINE_KEYS = Set.of("id", "from", PRIMARY_KEY_FIELD, STORAGE_FIELD);
+    private static final Set<String> VIEW_INLINE_KEYS = Set.of(
+            "id", "from", PRIMARY_KEY_FIELD, STORAGE_FIELD, "write_mode", "on_full_load");
     private static final Set<String> VIEW_USE_KEYS = Set.of("id", "use", "from");
     private static final Set<String> STORAGE_KEYS = Set.of("hot", "warm", "cold");
     private static final Set<String> HOT_KEYS = Set.of("ttl");
@@ -136,7 +137,8 @@ public final class DslParser {
     static final Set<String> TRANSFORM_DEF_KEYS = Set.of(
             VERSION_FIELD, "kind", "id", METADATA_FIELD, "type", OPTIONS_FIELD, EXPERIMENTAL_FIELD);
     private static final Set<String> VIEW_DEF_KEYS = Set.of(
-            VERSION_FIELD, "kind", "id", METADATA_FIELD, PRIMARY_KEY_FIELD, STORAGE_FIELD, EXPERIMENTAL_FIELD);
+            VERSION_FIELD, "kind", "id", METADATA_FIELD, PRIMARY_KEY_FIELD, STORAGE_FIELD,
+            "write_mode", "on_full_load", EXPERIMENTAL_FIELD);
     private static final Set<String> SERVE_DEF_KEYS = Set.of(
             VERSION_FIELD, "kind", "id", METADATA_FIELD, "sync", "query", "push", EXPERIMENTAL_FIELD);
 
@@ -652,7 +654,9 @@ public final class DslParser {
                 id != null ? id : "view",
                 blockFrom(v, prevId, n),
                 v.string(PRIMARY_KEY_FIELD),
-                storage(v.mapping(STORAGE_FIELD)));
+                storage(v.mapping(STORAGE_FIELD)),
+                enumByYaml(WriteMode.values(), WriteMode::yaml, v, "write_mode"),
+                enumByYaml(OnFullLoad.values(), OnFullLoad::yaml, v, "on_full_load"));
     }
 
     private Storage storage(YamlMap st) {
@@ -839,7 +843,10 @@ public final class DslParser {
         m.requirePresent(REQUIRED_VIEW_DEF_KEYS);
         return new ViewResource(
                 m.require("id", idOf(m)), metadata(m), m.string(PRIMARY_KEY_FIELD),
-                storage(m.mapping(STORAGE_FIELD)), m.freeMap(EXPERIMENTAL_FIELD));
+                storage(m.mapping(STORAGE_FIELD)),
+                enumByYaml(WriteMode.values(), WriteMode::yaml, m, "write_mode"),
+                enumByYaml(OnFullLoad.values(), OnFullLoad::yaml, m, "on_full_load"),
+                m.freeMap(EXPERIMENTAL_FIELD));
     }
 
     /** A reusable publish-surface definition (§8, X19): sync / query / push, no wiring. */

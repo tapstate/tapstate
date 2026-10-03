@@ -488,7 +488,8 @@ class DataBrowserServiceTest {
                     // other says what can, which is the only thing a reader can act on.
                     assertThat(coded.args())
                             .containsEntry("connector", "mysql")
-                            .containsEntry("browsable", "mongodb");
+                            .containsEntry("browsable",
+                                    "aliyun-db-mongodb, mongodb, mongodb-atlas, tencent-db-mongodb");
                 });
         assertThat(read.get()).as("a read that was refused must not have been sent").isNull();
         assertThat(listed.get()).as("nor cost a round trip to find out").isNull();

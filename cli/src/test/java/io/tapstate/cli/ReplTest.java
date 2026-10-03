@@ -6,6 +6,8 @@ import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import picocli.CommandLine;
 
 import java.io.ByteArrayOutputStream;
@@ -203,6 +205,23 @@ class ReplTest {
          * what "the definition changed under the run" looks like from here.
          */
         final Map<String, LifecycleOutcome> lifecycleOutcomeByVerb = new HashMap<>();
+        /**
+         * What successive starts answer, in order; the last one sticks. Empty, a start is the lifecycle verb
+         * it always was, answered from {@link #lifecycleOutcomeByVerb} with no start checks in it -- which is
+         * what a server released before start checks answers.
+         */
+        final Deque<StartAttempt> startAttempts = new ArrayDeque<>();
+        /** Every start sent, as {@code <pipeline> [<finding>=<action>, ...]}, plus {@code ifMatch=<hash>} when set. */
+        final List<String> startCalls = new ArrayList<>();
+        /**
+         * Answers each start from the answers it carries, the way a server with start checks does; when set it
+         * decides every start a healthy member gets, and {@link #startAttempts} is not read.
+         */
+        java.util.function.Function<List<StartDecision>, StartAttempt> startResponder;
+        /** What a read of the start checks answers, by intent; an intent with none is a server without them. */
+        final Map<String, StartChecksOutcome> startChecksByIntent = new HashMap<>();
+        /** Every read of the start checks, as {@code <intent> <pipeline>}. */
+        final List<String> startCheckReads = new ArrayList<>();
         StatusOutcome statusOutcome = new StatusOutcome.Unreachable();
         /**
          * The states successive status reads answer, in order; the last one sticks. A single value
@@ -488,6 +507,33 @@ class ReplTest {
                     + (purgeState == null ? "" : " purgeState=" + purgeState));
             LifecycleOutcome answer = lifecycleOutcomeByVerb.getOrDefault(verb, lifecycleOutcome);
             return healthy.contains(baseUrl) ? answer : new LifecycleOutcome.Unreachable();
+        }
+
+        @Override
+        public StartAttempt start(URI baseUrl, String credential, String pipelineId, List<StartDecision> decisions,
+                String ifMatch) {
+            startCalls.add(pipelineId + " " + decisions.stream().map(d -> d.finding() + "=" + d.action()).toList()
+                    + (ifMatch == null ? "" : " ifMatch=" + ifMatch));
+            if (!healthy.contains(baseUrl) || (startResponder == null && startAttempts.isEmpty())) {
+                // the lifecycle verb records the call; a member that is down refuses the connection, so
+                // nothing reached it and the start may be sent to another
+                StartAttempt answer = ControlPlaneClient.super.start(baseUrl, credential, pipelineId, decisions, ifMatch);
+                return healthy.contains(baseUrl) ? answer : new StartAttempt.Unreachable(false);
+            }
+            lifecycleCalls.add(credential + "@" + baseUrl + " start " + pipelineId);
+            if (startResponder != null) {
+                return startResponder.apply(decisions);
+            }
+            return startAttempts.size() == 1 ? startAttempts.peek() : startAttempts.poll();
+        }
+
+        @Override
+        public StartChecksOutcome startChecks(URI baseUrl, String credential, String pipelineId, String intent) {
+            startCheckReads.add(intent + " " + pipelineId);
+            if (!healthy.contains(baseUrl)) {
+                return new StartChecksOutcome.Unreachable();
+            }
+            return startChecksByIntent.getOrDefault(intent, new StartChecksOutcome.NotSupported());
         }
 
         @Override
@@ -4366,6 +4412,268 @@ class ReplTest {
                 "jwt-tok@http://node1:7900 start pl1");
     }
 
+    // ---- start checks: every verb that ends in a start asks them the same way ---------------------
+
+    /**
+     * A server whose start checks ask one question, about the rows already in orders: a start that carries
+     * an answer goes ahead, and one that does not is stopped to ask -- which is how the server decides it.
+     */
+    private static void asksAboutOrders(FakeControlPlane client) {
+        Map<String, Object> report = StartCheckReports.report("NEEDS_CONFIRMATION", StartCheckReports.notEmpty("orders"));
+        client.startChecksByIntent.put("start", new StartChecksOutcome.Found(StartChecks.parse(report)));
+        client.startChecksByIntent.put("rerun", new StartChecksOutcome.Found(StartChecks.parse(StartCheckReports
+                .withIntent(StartCheckReports.report("NEEDS_CONFIRMATION", StartCheckReports.notEmpty("orders")),
+                        "RERUN"))));
+        client.startResponder = decisions -> decisions.isEmpty() ? StartCheckReports.stoppedBy(report)
+                : StartCheckReports.started(report, List.of(), List.of());
+    }
+
+    /** The commands a refusal printed for answering it, in the order printed. */
+    private static List<String> answeringCommands(String output) {
+        String marker = "Answer them on the command line: ";
+        int at = output.indexOf(marker);
+        assertThat(at).as("the line that prints the commands, in:%n%s", output).isNotNegative();
+        return List.of(output.substring(at + marker.length()).lines().findFirst().orElseThrow().split(" \\| "));
+    }
+
+    @Test
+    void everyCommandAStartWithNobodyToAskPrintsStartsThePipelineWhenRunAsPrinted() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        asksAboutOrders(client);
+        Harness h = onlineSession(Path.of("tap-work"), client, new ScriptedPrompter());
+        h.repl().terminalCheck(() -> false);
+
+        h.repl().dispatch("start pl1");
+
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(h.sink().toString()).contains("cli.start-needs-an-answer");
+        List<String> commands = answeringCommands(h.sink().toString());
+        assertThat(commands).containsExactly("tapstate start pl1 --decide target-not-empty=clear",
+                "tapstate start pl1 --decide target-not-empty=keep", "tapstate start pl1 -y");
+        // Run as printed: each one starts the pipeline, with the answer it names.
+        for (String command : commands) {
+            client.startCalls.clear();
+            h.repl().dispatch(command.substring("tapstate ".length()));
+            assertThat(h.repl().lastExitCode()).as(command).isZero();
+            assertThat(client.startCalls).as(command).last().asString().contains(
+                    "target-not-empty/warehouse/orders=" + (command.endsWith("=clear") ? "clear" : "keep"));
+        }
+    }
+
+    @Test
+    void aStartThatGotNoAnswerIsNotSentToAnotherMember() {
+        FakeControlPlane client = new FakeControlPlane(
+                URI.create("http://localhost:7900"), URI.create("http://localhost:7901"));
+        client.loginOutcome = new LoginOutcome.Success("jwt-tok");
+        client.startAttempts.add(new StartAttempt.Unreachable(true));
+        Harness h = harness(Path.of("tap-work"), client, new ScriptedPrompter("pw"));
+        h.repl().dispatch("connect localhost:7900,localhost:7901");
+        h.repl().dispatch("login alice");
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("start pl1");
+
+        // It may have gone ahead on the member that got it; sent to another, it is a second start.
+        assertThat(client.startCalls).hasSize(1);
+        assertThat(h.sink().toString().substring(mark))
+                .contains("cli.start-may-have-gone-ahead").contains("tapstate status pl1")
+                .doesNotContain("reconnected");
+    }
+
+    @Test
+    void aDecideAgainstAServerWithoutStartChecksNeverSendsTheStart() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("start pl1 --decide target-not-empty=clear");
+
+        // Such a server would start it and drop the answer, keeping the rows the answer said to clear.
+        assertThat(client.startCheckReads).containsExactly("start pl1");
+        assertThat(client.lifecycleCalls).isEmpty();
+        assertThat(h.sink().toString()).contains("cli.start-checks-unsupported");
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"-y", "--yes", "--non-interactive"})
+    void startTakesEverySpellingOfDoNotAsk(String flag) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        asksAboutOrders(client);
+        Harness h = onlineSession(Path.of("tap-work"), client, new ScriptedPrompter());
+        h.repl().terminalCheck(() -> true);
+
+        h.repl().dispatch("start pl1 " + flag);
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(client.startCalls).containsExactly("pl1 []",
+                "pl1 [target-not-empty/warehouse/orders=keep] ifMatch=" + StartCheckReports.HASH);
+    }
+
+    @Test
+    void aStartPrintingADocumentNeverAsksEvenAtATerminal() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        asksAboutOrders(client);
+        ScriptedPrompter prompter = new ScriptedPrompter();
+        Harness h = onlineSession(Path.of("tap-work"), client, prompter);
+        h.repl().terminalCheck(() -> true);
+
+        h.repl().dispatch("start pl1 -o json");
+
+        assertThat(prompter.offered).isEmpty();
+        assertThat(client.startCalls).containsExactly("pl1 []");
+        assertThat(h.sink().toString()).contains("\"code\"").contains(StartCheckReports.NEEDS_CONFIRMATION);
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+    }
+
+    @Test
+    void checksOnlyReadsTheChecksAndStartsNothing() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        asksAboutOrders(client);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch("start pl1 --checks-only");
+
+        assertThat(client.startCheckReads).containsExactly("start pl1");
+        assertThat(client.lifecycleCalls).isEmpty();
+        assertThat(h.sink().toString()).contains("orders on warehouse already holds 5 rows.");
+        // a start would be asked, so this is not a green light for a script
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"start pl1 --checks-only -y", "start pl1 --decide target-not-empty",
+            "start pl1 --decide =clear", "start pl1 --bogus"})
+    void aStartLineThatCannotBeReadIsAUsageErrorAndCallsNothing(String line) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        asksAboutOrders(client);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        h.repl().dispatch(line);
+
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_USAGE);
+        assertThat(client.startCheckReads).isEmpty();
+        assertThat(client.lifecycleCalls).isEmpty();
+    }
+
+    @Test
+    void aRerunAsksItsStartChecksBeforeStoppingAndACancelThereStopsNothing() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        asksAboutOrders(client);
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        ScriptedPrompter prompter = new ScriptedPrompter();   // nothing typed: the last option, cancel
+        Harness h = onlineSession(Path.of("tap-work"), client, prompter);
+        h.repl().terminalCheck(() -> true);
+
+        h.repl().dispatch("restart pl1 --rerun");
+
+        assertThat(client.startCheckReads).containsExactly("rerun pl1");
+        assertThat(prompter.offered).hasSize(1);
+        assertThat(prompter.offered.getFirst().getLast()).isEqualTo("cancel");
+        // the clearing question is never reached, and nothing was stopped
+        assertThat(prompter.questions).isEmpty();
+        assertThat(client.lifecycleCalls).isEmpty();
+        assertThat(h.repl().lastExitCode()).isNotZero();
+    }
+
+    @Test
+    void aRerunAnsweredAtATerminalStopsThenStartsWithThoseAnswers() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        asksAboutOrders(client);
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        ScriptedPrompter prompter = new ScriptedPrompter("keep  Keep the rows already in orders", "yes");
+        Harness h = onlineSession(Path.of("tap-work"), client, prompter);
+        h.repl().terminalCheck(() -> true);
+
+        h.repl().dispatch("restart pl1 --rerun");
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(client.lifecycleCalls).containsExactly(
+                "jwt-tok@http://node1:7900 stop pl1 purgeState=true", "jwt-tok@http://node1:7900 start pl1");
+        assertThat(client.startCalls).containsExactly(
+                "pl1 [target-not-empty/warehouse/orders=keep] ifMatch=" + StartCheckReports.HASH);
+        assertThat(prompter.questions).containsExactly("Clear pl1? Type yes to go ahead");
+    }
+
+    @Test
+    void aRerunWithNobodyToAskPrintsTheRerunCommandsAndStopsNothing() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        asksAboutOrders(client);
+        Harness h = onlineSession(Path.of("tap-work"), client, new ScriptedPrompter());
+        h.repl().terminalCheck(() -> false);
+
+        h.repl().dispatch("restart pl1 --rerun");
+
+        assertThat(client.lifecycleCalls).isEmpty();
+        assertThat(answeringCommands(h.sink().toString())).containsExactly(
+                "tapstate restart pl1 --rerun --decide target-not-empty=clear",
+                "tapstate restart pl1 --rerun --decide target-not-empty=keep", "tapstate restart pl1 --rerun -y");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"409", "412"})
+    void aRerunWhoseStartIsRefusedAfterTheStopSaysWhatThatLeftBehind(String status) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.startChecksByIntent.put("rerun", new StartChecksOutcome.Found(StartChecks.parse(StartCheckReports
+                .withIntent(StartCheckReports.report("NEEDS_CONFIRMATION", StartCheckReports.notEmpty("orders")),
+                        "RERUN"))));
+        client.lifecycleOutcomeByVerb.put("stop", new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc"));
+        // Between the questions and the start something changed: the target now refuses the start, or the
+        // definition moved under the answers.
+        client.startAttempts.add(status.equals("409")
+                ? new StartAttempt.Stopped("lifecycle.start-blocked", Map.of("pipeline", "pl1"), "pl1 cannot start",
+                        StartChecks.parse(StartCheckReports.report("BLOCKED", StartCheckReports.blocked("orders"))))
+                : new StartAttempt.Rejected("pipeline.version-conflict", Map.of("id", "pl1"), "pl1 changed",
+                        List.of()));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        h.repl().terminalCheck(() -> false);
+
+        h.repl().dispatch("restart pl1 --rerun -y");
+
+        assertThat(client.lifecycleCalls).containsExactly(
+                "jwt-tok@http://node1:7900 stop pl1 purgeState=true", "jwt-tok@http://node1:7900 start pl1");
+        assertThat(h.sink().toString())
+                .contains(status.equals("409") ? "lifecycle.start-blocked" : "pipeline.version-conflict")
+                // a report that changed since the questions were asked is shown: it is why the start refused
+                .contains(status.equals("409") ? "and on_full_load is fail." : "pl1 changed")
+                .contains("restart: pl1 was stopped and its state cleared, but it has not been started")
+                .contains("Start it with: tapstate start pl1");
+        assertThat(h.repl().lastExitCode()).isNotZero();
+    }
+
+    @Test
+    void aRestartThatLandsOnAStartAsksItsStartChecksToo() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        asksAboutOrders(client);
+        client.statusOutcome = new StatusOutcome.Found("pl1", "STOPPED");
+        Harness h = onlineSession(Path.of("tap-work"), client, new ScriptedPrompter());
+        h.repl().terminalCheck(() -> false);
+
+        h.repl().dispatch("restart pl1");
+
+        assertThat(client.startCalls).containsExactly("pl1 []");
+        assertThat(h.sink().toString()).contains("cli.start-needs-an-answer");
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"-y", "--yes", "--non-interactive"})
+    void aRestartOfAFailedPipelineAnswersItsStartChecksWhenToldNotToAsk(String flag) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        asksAboutOrders(client);
+        client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "engine.job-failed", "its job died");
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        Harness h = onlineSession(Path.of("tap-work"), client, new ScriptedPrompter());
+        h.repl().terminalCheck(() -> false);
+
+        h.repl().dispatch("restart pl1 " + flag);
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(client.lifecycleCalls).first().isEqualTo("jwt-tok@http://node1:7900 stop pl1 purgeState=false");
+        assertThat(client.startCalls).containsExactly("pl1 []",
+                "pl1 [target-not-empty/warehouse/orders=keep] ifMatch=" + StartCheckReports.HASH);
+    }
+
     @Test
     void statusPrintsTheStateLineFirstAndTheAnswerUnderIt() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
@@ -7099,6 +7407,9 @@ class ReplTest {
         // says "are you sure?" and nothing else trains its reader to answer yes without reading.
         assertThat(output).contains(everyKindOfStateAPipelineHolds());
         assertThat(output).contains(PipelineStateInventory.NEXT_RUN_HAS_NO_POSITION);
+        // What clearing means for the rows already written, which is the part a person reading this
+        // does not think of: the next run loads afresh and cannot see what the source deleted meanwhile.
+        assertThat(output).contains(PipelineStateInventory.KEPT_ROWS_OUTLIVE_THEIR_SOURCE);
         assertThat(output).contains(PipelineStateInventory.TARGET_UNTOUCHED);
         // Reporting success for a thing that did not happen is how a script concludes the opposite.
         assertThat(h.repl().lastExitCode()).isNotZero();
@@ -7229,6 +7540,7 @@ class ReplTest {
         // The one sentence that turns on the answer: saying it here would promise a re-read that is not
         // going to happen, and this is the path whose whole point is that it does not.
         assertThat(output).doesNotContain(PipelineStateInventory.NEXT_RUN_HAS_NO_POSITION);
+        assertThat(output).doesNotContain(PipelineStateInventory.KEPT_ROWS_OUTLIVE_THEIR_SOURCE);
         assertThat(h.repl().lastExitCode()).isZero();
     }
 
@@ -7328,6 +7640,7 @@ class ReplTest {
         assertThat(output).contains(everyKindOfStateAPipelineHolds());
         assertThat(output).contains(PipelineStateInventory.TARGET_UNTOUCHED);
         assertThat(output).doesNotContain(PipelineStateInventory.NEXT_RUN_HAS_NO_POSITION);
+        assertThat(output).doesNotContain(PipelineStateInventory.KEPT_ROWS_OUTLIVE_THEIR_SOURCE);
     }
 
     @Test

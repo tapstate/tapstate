@@ -153,8 +153,10 @@ class AStoppedPipelineLetsGoOfItsJoinStateIT {
                     .isPresent();
 
             // Everything above is still satisfied by a takedown that broke the join outright. What
-            // separates that from letting go of state a run rebuilds for itself is the run after it.
-            control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
+            // separates that from letting go of state a run rebuilds for itself is the run after it. Its
+            // new full load goes into the rows the first run published, so the start asks first; keeping
+            // them is the answer, as the run rewrites each of them by its key.
+            control.startAnswering(PIPELINE_ID, "target-not-empty", "keep");
             awaitName(mongo, target, 10, "ada", "the restarted run to re-read the driving rows");
 
             // On a row written before the stop, so only a reverse index built again from the source can

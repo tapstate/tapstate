@@ -3,6 +3,8 @@ package io.tapstate.cli;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import picocli.CommandLine;
 
 import java.io.IOException;
@@ -543,6 +545,80 @@ class UpCmdTest {
         assertThat(r.err()).isEmpty();
     }
 
+    // ---- start checks -------------------------------------------------------------------------------
+
+    /**
+     * A server whose start checks ask about the rows already in the pipeline's target: a start carrying an
+     * answer goes ahead, one without is stopped to ask.
+     */
+    private static void asksAboutTheTarget(FakeUpControlPlane client) {
+        Map<String, Object> report = StartCheckReports.report("NEEDS_CONFIRMATION",
+                StartCheckReports.notEmpty("orders"));
+        client.startResponder = decisions -> decisions.isEmpty() ? StartCheckReports.stoppedBy(report)
+                : StartCheckReports.started(report, List.of(), List.of());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"-y", "--yes", "--non-interactive"})
+    void toldNotToAskUpAnswersEveryStartCheckByGoingAheadAsConfigured(String flag, @TempDir Path home,
+            @TempDir Path ws) {
+        scaffold(home, ws);
+        signIn(home);
+        FakeUpControlPlane client = new FakeUpControlPlane();
+        asksAboutTheTarget(client);
+
+        Run r = up(home, client, "up", flag, "-w", ws.toString());
+
+        assertThat(r.code()).as(r.all()).isZero();
+        assertThat(client.calls).containsSubsequence("start orders_sync []",
+                "start orders_sync [target-not-empty/warehouse/orders=keep]");
+        assertThat(r.out()).contains("pipeline orders_sync: running");
+    }
+
+    @Test
+    void withNobodyToAskUpStopsAtTheStartAndSaysHowToAnswer(@TempDir Path home, @TempDir Path ws) {
+        scaffold(home, ws);
+        signIn(home);
+        FakeUpControlPlane client = new FakeUpControlPlane();
+        asksAboutTheTarget(client);
+
+        Run r = up(home, client, "up", "-w", ws.toString());
+
+        assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        // asked, and not answered by anybody: a question nobody saw is never answered by default
+        assertThat(client.calls).contains("start orders_sync []")
+                .doesNotContain("start orders_sync [target-not-empty/warehouse/orders=keep]");
+        assertThat(r.all()).contains(StartCheckReports.NEEDS_CONFIRMATION).contains("tapstate up --yes");
+    }
+
+    @Test
+    void theJsonEnvelopeOfAStopAtTheStartCarriesTheReport(@TempDir Path home, @TempDir Path ws) {
+        scaffold(home, ws);
+        signIn(home);
+        FakeUpControlPlane client = new FakeUpControlPlane();
+        asksAboutTheTarget(client);
+
+        Run r = up(home, client, "up", "-w", ws.toString(), "-o", "json");
+
+        assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(r.out()).contains("\"stage\": \"start\"").contains("\"startChecks\"")
+                .contains("target-not-empty/warehouse/orders");
+    }
+
+    @Test
+    void theJsonEnvelopeOfAStartedPipelineCarriesWhatItsStartChecksSaid(@TempDir Path home, @TempDir Path ws) {
+        scaffold(home, ws);
+        signIn(home);
+        FakeUpControlPlane client = new FakeUpControlPlane();
+        asksAboutTheTarget(client);
+
+        Run r = up(home, client, "up", "--yes", "-w", ws.toString(), "-o", "json");
+
+        assertThat(r.code()).as(r.all()).isZero();
+        assertThat(r.out()).contains("\"state\": \"running\"").contains("\"startChecks\"")
+                .contains("target-not-empty/warehouse/orders");
+    }
+
     // ---- the machine surface and the help -----------------------------------------------------------
 
     @Test
@@ -707,6 +783,25 @@ class UpCmdTest {
             calls.add("lifecycle " + verb + " " + id);
             pipelineState = "RUNNING";
             return new LifecycleOutcome.Accepted(id, "RUNNING", "1");
+        }
+
+        /**
+         * Answers each start from the answers it carries, the way a server with start checks does; null, a start
+         * is the lifecycle verb with no start checks in its answer.
+         */
+        Function<List<StartDecision>, StartAttempt> startResponder;
+
+        @Override
+        public StartAttempt start(URI u, String c, String id, List<StartDecision> decisions, String ifMatch) {
+            if (startResponder == null) {
+                return ControlPlaneClient.super.start(u, c, id, decisions, ifMatch);
+            }
+            calls.add("start " + id + " " + decisions.stream().map(d -> d.finding() + "=" + d.action()).toList());
+            StartAttempt answer = startResponder.apply(decisions);
+            if (answer instanceof StartAttempt.Started) {
+                pipelineState = "RUNNING";
+            }
+            return answer;
         }
 
         @Override

@@ -298,6 +298,77 @@ class PipelineDraftCompilerTest {
     }
 
     @Test
+    void aTargetOrViewNodesFullLoadPolicyIsPublishedWithIt() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source-orders", "source", "crm", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("orders-view", "view", null, null,
+                        Map.of("primaryKey", "id", "writeMode", "append", "onFullLoad", "clear"),
+                        Map.of("viewId", "orders_view")),
+                new PipelineDraft.Node("warehouse-orders", "target", "warehouse", "orders",
+                        Map.of("onFullLoad", "fail"), Map.of())),
+                List.of(
+                        new PipelineDraft.Edge("source-to-view", "source-orders", "orders-view"),
+                        new PipelineDraft.Edge("source-to-target", "source-orders", "warehouse-orders")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        PipelineResource compiled = compiler.compile(dagDraft(graph));
+
+        ViewBlock.Inline view = (ViewBlock.Inline) compiled.view();
+        assertThat(view.writeMode()).isEqualTo(io.tapstate.core.model.WriteMode.APPEND);
+        assertThat(view.onFullLoad()).isEqualTo(io.tapstate.core.model.OnFullLoad.CLEAR);
+        assertThat(((ServeBlock.Inline) compiled.serve()).sync().getFirst().onFullLoad())
+                .isEqualTo(io.tapstate.core.model.OnFullLoad.FAIL);
+        String canonical = new CanonicalWriter().write(compiled);
+        assertThat(canonical).contains("on_full_load: clear").contains("on_full_load: fail");
+        assertThat(new CanonicalWriter().write(new DslParser().parse(canonical))).isEqualTo(canonical);
+    }
+
+    @Test
+    void aWizardOutputsFullLoadPolicyIsPublishedWithIt() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft draft = new PipelineDraft(
+                template.pipelineId(), template.schemaVersion(), template.revision(), template.mode(),
+                template.name(), template.description(), template.graph(),
+                new PipelineDraft.Wizard(wizard.root(), List.of(), List.of(),
+                        new PipelineDraft.Output("source", Map.of(
+                                "sourceId", "warehouse", "table", "orders", "onFullLoad", "clear"))),
+                template.baseArtifactHash(), template.publishedDraftRevision(), template.publishedArtifactHash(),
+                template.createdAt(), template.updatedAt(), template.updatedBy());
+
+        assertThat(((ServeBlock.Inline) compiler.compile(draft).serve()).sync().getFirst().onFullLoad())
+                .isEqualTo(io.tapstate.core.model.OnFullLoad.CLEAR);
+    }
+
+    @Test
+    void aNodeThatSaysNothingAboutTheFullLoadPublishesWhatItAlwaysDid() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source-orders", "source", "crm", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("orders-view", "view", null, null, Map.of("primaryKey", "id"),
+                        Map.of("viewId", "orders_view"))),
+                List.of(new PipelineDraft.Edge("source-to-view", "source-orders", "orders-view")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        ViewBlock.Inline view = (ViewBlock.Inline) compiler.compile(dagDraft(graph)).view();
+
+        assertThat(view).isEqualTo(new ViewBlock.Inline("orders_view", FromRef.literal("crm.orders"), "id", null));
+    }
+
+    @Test
+    void anUnknownFullLoadPolicyIsRefusedRatherThanPublishedAsKeepingRows() {
+        PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
+                new PipelineDraft.Node("source-orders", "source", "crm", "orders", Map.of(), Map.of()),
+                new PipelineDraft.Node("warehouse-orders", "target", "warehouse", "orders",
+                        Map.of("onFullLoad", "truncate"), Map.of())),
+                List.of(new PipelineDraft.Edge("source-to-target", "source-orders", "warehouse-orders")),
+                new PipelineDraft.Viewport(0, 0, 1));
+
+        assertThatThrownBy(() -> compiler.compile(dagDraft(graph)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("unsupported full-load policy: warehouse-orders");
+    }
+
+    @Test
     void compilesDirectDagSourceToTargetWithDistinctIdsAndTargetTableRename() {
         PipelineDraft.Graph graph = new PipelineDraft.Graph(List.of(
                 new PipelineDraft.Node("draft:source:1", "source", "mysql", "ai_fulfillment_orders", Map.of(), Map.of()),

@@ -54,10 +54,20 @@ public final class HttpControlClient implements AutoCloseable {
 
     public ControlResponse post(
             URI baseUrl, String token, String path, Object body, RequestBudget budget) {
+        return post(baseUrl, token, path, body, budget, null);
+    }
+
+    /**
+     * The same, carrying {@code expectedContentHash} as a quoted entity tag, so the server acts only on the
+     * version the caller read. A null hash sends no {@code If-Match} at all, as for {@link #delete}.
+     */
+    public ControlResponse post(URI baseUrl, String token, String path, Object body, RequestBudget budget,
+            String expectedContentHash) {
         HttpRequest.BodyPublisher publisher = body == null
                 ? HttpRequest.BodyPublishers.noBody()
                 : HttpRequest.BodyPublishers.ofString(JsonWriter.write(body), StandardCharsets.UTF_8);
-        return exchange(baseUrl, token, path, "POST", publisher, null, budget);
+        String ifMatch = expectedContentHash == null ? null : "\"" + expectedContentHash + "\"";
+        return exchange(baseUrl, token, path, "POST", publisher, ifMatch, budget);
     }
 
     /**
@@ -146,7 +156,14 @@ public final class HttpControlClient implements AutoCloseable {
         String message = object.get("message") instanceof String value
                 ? value
                 : "The server refused the request.";
-        return new ControlResponse.Rejected(status, code, message, params(object.get("params")));
+        Map<String, Object> detail = new LinkedHashMap<>();
+        object.forEach((key, value) -> {
+            String name = String.valueOf(key);
+            if (!name.equals("code") && !name.equals("message") && !name.equals("params")) {
+                detail.put(name, value);
+            }
+        });
+        return new ControlResponse.Rejected(status, code, message, params(object.get("params")), detail);
     }
 
     private Duration timeout(RequestBudget budget) {
