@@ -38,6 +38,7 @@ final class ObservationScopeRegistry {
         private MetricContinuation active;
         private MetricContinuation restored;
         private long revision;
+        private long bindingRevision;
         private FailedAdmission failedAdmission;
         private RestoreTicket restore;
         private ColdRebuildTicket coldRebuild;
@@ -345,6 +346,7 @@ final class ObservationScopeRegistry {
                 return new TargetPreparation(PreparationStatus.UNKNOWN);
             }
             entry.revision++; entry.restore = null; entry.coldRebuild = null;
+            entry.bindingRevision++;
             entry.current = ticket.target.scope(); entry.actualTarget = ticket.target; entry.failedAdmission = null;
             entry.continuationKey = ticket.key;
             entry.pending = null; entry.pendingFrom = null; entry.restored = null; entry.last = null;
@@ -505,6 +507,7 @@ final class ObservationScopeRegistry {
             entry.continuationBase = List.of(); entry.baselineOrigin = Optional.empty(); entry.continuationUnknown = false;
             entry.unknownProven = false; entry.privateReceipt = null; entry.durableReceipt = null;
             entry.pending = null; entry.pendingFrom = null; entry.active = null; entry.restored = null; entry.last = null;
+            entry.bindingRevision++;
             entry.epochs = new MetricProducerEpochs(); entry.folder = CardinalityBudget.folder(); entry.current = scope;
             entry.failedAdmission = null;
         }
@@ -903,6 +906,7 @@ final class ObservationScopeRegistry {
             if (entry.coldRebuild != null && !entry.coldRebuild.existingScope.equals(stored.scope().orElseThrow())) {
                 clearStagedColdRebuild(entry);
             }
+            entry.bindingRevision++;
             entry.current = stored.scope().orElseThrow();
             entry.failedAdmission = null;
             entry.restored = ticket.baseline == null
@@ -976,6 +980,7 @@ final class ObservationScopeRegistry {
             }
             entry.last = null;
             entry.epochs = new MetricProducerEpochs();
+            entry.bindingRevision++;
             entry.current = scope;
         }
         return scope;
@@ -1011,6 +1016,49 @@ final class ObservationScopeRegistry {
         return expected != null && failedAdmission(pipelineId, expected.scope()).orElse(null) == expected;
     }
 
+    /** Local binding identity, including invalidation while both scopes are absent. */
+    static final class BindingIdentity {
+        private final Entry entry;
+        private final long revision;
+        private final ObservationStore.Scope scope;
+
+        private BindingIdentity(Entry entry, long revision, ObservationStore.Scope scope) {
+            this.entry = entry; this.revision = revision; this.scope = scope;
+        }
+
+        boolean known() { return scope != null; }
+
+        @Override public boolean equals(Object other) {
+            return other instanceof BindingIdentity identity && entry == identity.entry
+                    && revision == identity.revision && Objects.equals(scope, identity.scope);
+        }
+
+        @Override public int hashCode() {
+            return Objects.hash(System.identityHashCode(entry), revision, scope);
+        }
+    }
+
+    BindingIdentity bindingIdentity(String pipelineId) {
+        Entry entry = entries.get(pipelineId);
+        if (entry == null) { return new BindingIdentity(null, 0, null); }
+        synchronized (entry) {
+            return new BindingIdentity(entry, entry.bindingRevision, entry.current);
+        }
+    }
+
+    /** The mutation is only a local projection; no store, native or ownership callback runs here. */
+    void withBindingIdentity(String pipelineId, BindingIdentity expected, Runnable mutation) {
+        if (expected == null || expected.entry == null) { return; }
+        Entry entry = entries.get(pipelineId);
+        if (entry != expected.entry) { return; }
+        synchronized (entry) {
+            if (entries.get(pipelineId) == entry && entry.bindingRevision == expected.revision
+                    && Objects.equals(entry.current, expected.scope)) {
+                mutation.run();
+            }
+        }
+    }
+
     Optional<ObservationStore.Scope> current(String pipelineId) {
         Entry entry = entries.get(pipelineId);
         return entry == null ? Optional.empty() : Optional.ofNullable(entry.current);
@@ -1041,6 +1089,7 @@ final class ObservationScopeRegistry {
             entry.coldRebuild = null;
             entry.restored = null;
             // Keep the entry object: a concurrent begin may already hold it after computeIfAbsent.
+            entry.bindingRevision++;
             entry.current = null;
             entry.failedAdmission = null;
             entry.last = null;
@@ -1206,6 +1255,7 @@ final class ObservationScopeRegistry {
                 entry.restore = null;
                 entry.coldRebuild = null;
                 entry.restored = null;
+                entry.bindingRevision++;
                 entry.current = null;
                 entry.last = null;
                 entry.active = null;

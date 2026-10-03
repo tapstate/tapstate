@@ -10,6 +10,7 @@ import io.tapstate.adapters.mongostore.MongoStateStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.JsonWriter;
+import io.tapstate.control.core.MonitorError;
 import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
@@ -127,9 +128,21 @@ class PipelineObservabilityLiveIT {
                         history -> pointCount(history) >= 1, "the first retained sample");
                 update(mysql, "moving");
                 awaitCustomer(mongo, target, "moving", "a CDC update before the restart");
-                Map<String, Object> baseline = awaitHistory(first.baseUrl(), control.credential(), from,
-                        history -> startReasons(history).contains("COUNTER_RESET"),
-                        "the first delivery counter baseline");
+                FirstResetObservationReceipt.captureIfRequested("after-first-cdc", storeUri, PIPELINE_ID, control, from, null);
+                Map<String, Object> baseline;
+                try {
+                    baseline = awaitHistory(first.baseUrl(), control.credential(), from,
+                            PipelineObservabilityLiveIT::hasKnownInitialOutputInterval,
+                            "the first known output interval in the initial window");
+                } catch (AssertionError failed) {
+                    try {
+                        FirstResetObservationReceipt.captureIfRequested("first-reset-failed", storeUri,
+                                PIPELINE_ID, control, from, failed);
+                    } catch (Exception | Error receiptFailure) {
+                        if (failed != receiptFailure) { failed.addSuppressed(receiptFailure); }
+                    }
+                    throw failed;
+                }
                 int resetsBeforeRestart = reasonCount(baseline, "COUNTER_RESET");
                 update(mysql, "moving-again");
                 awaitCustomer(mongo, target, "moving-again", "a second CDC update after the counter baseline");
@@ -143,15 +156,27 @@ class PipelineObservabilityLiveIT {
                         "a current non-failure explanation");
                 assertThat(normal).containsEntry("state", "RUNNING");
 
+                FirstResetObservationReceipt.captureIfRequested("before-counter-reset", storeUri, PIPELINE_ID, control, from, null);
                 control.stop(PIPELINE_ID, false);
                 awaitState(control, PipelineState.STOPPED);
                 control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
                 awaitState(control, PipelineState.RUNNING);
                 update(mysql, "after-counter-reset");
                 awaitCustomer(mongo, target, "after-counter-reset", "a CDC update after the run reset");
-                awaitHistory(first.baseUrl(), control.credential(), from,
-                        history -> reasonCount(history, "COUNTER_RESET") > resetsBeforeRestart,
-                        "a counter-reset segment after stop/start");
+                FirstResetObservationReceipt.captureIfRequested("after-counter-reset", storeUri, PIPELINE_ID, control, from, null);
+                try {
+                    awaitHistory(first.baseUrl(), control.credential(), from,
+                            history -> reasonCount(history, "COUNTER_RESET") > resetsBeforeRestart,
+                            "a counter-reset segment after stop/start");
+                } catch (AssertionError failed) {
+                    try {
+                        FirstResetObservationReceipt.captureIfRequested("counter-reset-failed", storeUri,
+                                PIPELINE_ID, control, from, failed);
+                    } catch (Exception | Error receiptFailure) {
+                        if (failed != receiptFailure) { failed.addSuppressed(receiptFailure); }
+                    }
+                    throw failed;
+                }
 
                 first.close();
                 first = null;
@@ -493,9 +518,9 @@ class PipelineObservabilityLiveIT {
             URI base, String token, java.util.function.Predicate<String> kind, String what) {
         AtomicReference<Map<String, Object>> last = new AtomicReference<>(Map.of());
         Await.until(what, REAL_CONNECTOR_WAIT, () -> {
-            Map<String, Object> value = explanation(base, token);
+            Map<String, Object> value = get(base, token, "/api/pipelines/" + PIPELINE_ID + "/explain", true);
             last.set(value);
-            return kind.test(String.valueOf(value.get("kind")));
+            return value.containsKey("kind") && kind.test(String.valueOf(value.get("kind")));
         }, () -> String.valueOf(last.get()));
         return last.get();
     }
@@ -510,8 +535,12 @@ class PipelineObservabilityLiveIT {
         return get(base, token, "/api/pipelines/" + PIPELINE_ID + "/explain");
     }
 
-    @SuppressWarnings("unchecked")
     private static Map<String, Object> get(URI base, String token, String path) {
+        return get(base, token, path, false);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> get(URI base, String token, String path, boolean awaitingObservation) {
         HttpRequest request = HttpRequest.newBuilder(base.resolve(path))
                 .timeout(Duration.ofSeconds(20))
                 .header("Authorization", "Bearer " + token)
@@ -520,6 +549,11 @@ class PipelineObservabilityLiveIT {
         try {
             HttpResponse<String> response = HttpClient.newHttpClient()
                     .send(request, HttpResponse.BodyHandlers.ofString());
+            if (awaitingObservation && response.statusCode() == 404
+                    && JsonReader.parse(response.body()) instanceof Map<?, ?> body
+                    && MonitorError.NO_OBSERVATION.code().equals(body.get("code"))) {
+                return (Map<String, Object>) body;
+            }
             if (response.statusCode() != 200) {
                 throw new AssertionError("GET " + path + " returned " + response.statusCode()
                         + ": " + response.body());
@@ -567,6 +601,20 @@ class PipelineObservabilityLiveIT {
         return points(history).stream()
                 .flatMap(point -> ((List<Map<String, Object>>) point.get("lag")).stream())
                 .toList();
+    }
+
+    private static boolean hasKnownInitialOutputInterval(Map<String, Object> history) {
+        if (!(history.get("segments") instanceof List<?> segments)) { return false; }
+        return segments.stream().anyMatch(segment -> segment instanceof Map<?, ?> window
+                && "WINDOW_START".equals(window.get("startReason"))
+                && window.get("points") instanceof List<?> readings
+                && readings.stream().anyMatch(point -> point instanceof Map<?, ?> interval
+                        && interval.get("recordsOut") instanceof Map<?, ?> output
+                        && output.get("delta") instanceof Number delta
+                        && Double.isFinite(delta.doubleValue()) && delta.doubleValue() >= 0
+                        && interval.get("intervalStart") instanceof String start
+                        && interval.get("intervalEnd") instanceof String end
+                        && Instant.parse(end).isAfter(Instant.parse(start))));
     }
 
     private static boolean hasPositiveOutputDelta(Map<String, Object> history) {

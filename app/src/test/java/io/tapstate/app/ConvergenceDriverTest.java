@@ -378,6 +378,337 @@ class ConvergenceDriverTest {
     }
 
     @Test
+    void aKnownFailedNoopDoesNotBecomeAQueuedStart() throws Exception {
+        verifyKnownFailedNoopPending(false);
+    }
+
+    @Test
+    void aKnownFailedNoopDoesNotBecomeAStartCapacityWait() throws Exception {
+        verifyKnownFailedNoopPending(true);
+    }
+
+    private void verifyKnownFailedNoopPending(boolean fillQueue) throws Exception {
+        CountDownLatch slowEntered = new CountDownLatch(1);
+        CountDownLatch releaseSlow = new CountDownLatch(1);
+        AtomicInteger failedStarts = new AtomicInteger();
+        LifecycleActuator blocking = new LifecycleActuator() {
+            @Override public void start(String id) {
+                if (id.equals("orders")) {
+                    failedStarts.incrementAndGet();
+                }
+                if (id.equals("slow")) {
+                    slowEntered.countDown();
+                    try {
+                        if (!releaseSlow.await(5, TimeUnit.SECONDS)) {
+                            throw new AssertionError("the other pipeline's start was not released");
+                        }
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException(interrupted);
+                    }
+                }
+            }
+            @Override public void pause(String id) { }
+            @Override public void resume(String id) { }
+            @Override public void stop(String id, boolean purgeState) { }
+            @Override public Optional<Throwable> failure(String id) { return Optional.empty(); }
+            @Override public Optional<Throwable> lost(String id) { return Optional.empty(); }
+            @Override public boolean isCarryingAJob(String id) { return !id.equals("orders"); }
+        };
+        DesiredState intent = new DesiredState("orders", RUNNING, "rev-1", false,
+                "assembly-1", false, null);
+        desired.save(intent);
+        state.create("orders", StateJson.of(FAILED), T0);
+        var failed = state.read("orders").orElseThrow();
+        PipelineConverger loop = new PipelineConverger(desired, state, blocking,
+                Clock.fixed(T0, ZoneOffset.UTC));
+        LifecyclePendingRegistry pending = new LifecyclePendingRegistry();
+        try (LifecycleWorkDispatcher work = new LifecycleWorkDispatcher(1, 1)) {
+            ConvergenceDriver isolated = new ConvergenceDriver(loop, desired,
+                    new ObservationPublisher(state, observations), null, MetricsExport.none(), () -> true,
+                    PipelineActuationOwnership.single(), work, null, null, pending);
+            isolated.reconcile();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (work.health().pendingPipelines() != 0 && System.nanoTime() - deadline < 0) {
+                Thread.sleep(10);
+            }
+            assertThat(work.health().pendingPipelines()).isZero();
+            if (work.activeCount() != 0) {
+                isolated.reconcile();
+            }
+            assertThat(work.activeCount()).isZero();
+            assertThat(pending.pending("orders")).isEmpty();
+            assertThat(state.read("orders")).contains(failed);
+
+            DesiredState slow = new DesiredState("slow", RUNNING, "slow-rev");
+            desired.save(slow);
+            assertThat(work.offer("slow", slow, () -> loop.converge("slow")))
+                    .isEqualTo(LifecycleWorkDispatcher.Submission.ACCEPTED);
+            assertThat(slowEntered.await(5, TimeUnit.SECONDS)).isTrue();
+            if (fillQueue) {
+                DesiredState queued = new DesiredState("queued", RUNNING, "queued-rev");
+                desired.save(queued);
+                assertThat(work.offer("queued", queued, () -> loop.converge("queued")))
+                        .isEqualTo(LifecycleWorkDispatcher.Submission.ACCEPTED);
+            }
+
+            isolated.reconcile();
+
+            assertThat(state.read("orders")).contains(failed);
+            assertThat(desired.read("orders")).contains(intent);
+            assertThat(failedStarts).hasValue(0);
+            assertThat(pending.pending("orders"))
+                    .as("a queued periodic terminal NOOP is not a requested or admitted start")
+                    .isEmpty();
+            assertThat(pending.pending("slow").orElseThrow().reason()).isEqualTo(PendingReason.START_PENDING);
+            if (fillQueue) {
+                assertThat(pending.pending("queued").orElseThrow().reason()).isEqualTo(PendingReason.START_PENDING);
+            }
+            releaseSlow.countDown();
+        } finally {
+            releaseSlow.countDown();
+        }
+    }
+
+    @Test
+    void anUnspentRebuildStampStillPublishesAQueuedStartAfterTerminalNoop() throws Exception {
+        verifyTerminalNoopChange(PendingChange.REBUILD);
+    }
+
+    @Test
+    void anAdmittedRecoveryReplacesTerminalNoopBeforePreparingItsStart() throws Exception {
+        verifyTerminalNoopChange(PendingChange.RECOVERY);
+    }
+
+    @Test
+    void aDeletedIncarnationCannotHideTheSameIdsFreshQueuedStart() throws Exception {
+        verifyTerminalNoopChange(PendingChange.INCARNATION);
+    }
+
+    @Test
+    void continuationCleanupCannotRelabelTheSameBlockedStopAsAStart() throws Exception {
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        var scope = scopes.begin("orders", "inc-a", 1);
+        CountDownLatch stopping = new CountDownLatch(1);
+        CountDownLatch releaseStop = new CountDownLatch(1);
+        var cause = new io.tapstate.core.common.TapstateException(io.tapstate.runtime.engine.EngineError.JOB_FAILED,
+                Map.of("pipeline", "orders", "cause", "controlled capture failure"), null);
+        LifecycleActuator actuator = new LifecycleActuator() {
+            @Override public void start(String id) { }
+            @Override public void pause(String id) { }
+            @Override public void resume(String id) { }
+            @Override public void stop(String id, boolean purgeState) {
+                // The real ordinary stop clears carry before waiting for the native job to end.
+                scopes.clearContinuation(id);
+                stopping.countDown();
+                try {
+                    if (!releaseStop.await(5, TimeUnit.SECONDS)) {
+                        throw new AssertionError("the controlled stop was not released");
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("the controlled stop was interrupted", interrupted);
+                }
+            }
+            @Override public Optional<Throwable> failure(String id) {
+                return id.equals("orders") ? Optional.of(cause) : Optional.empty();
+            }
+            @Override public Optional<Throwable> lost(String id) { return Optional.empty(); }
+            @Override public boolean isCarryingAJob(String id) { return true; }
+        };
+        DesiredState intent = new DesiredState("orders", RUNNING, "same-revision", false,
+                "same-assembly", false, null);
+        desired.save(intent);
+        state.create("orders", StateJson.of(RUNNING), T0);
+        ObservationStore latest = new ObservationStore() {
+            @Override public void save(Observation observation) { observations.save(observation); }
+            @Override public boolean saveScoped(Observation observation, Scope owner) {
+                observations.save(observation);
+                return true;
+            }
+            @Override public Optional<Observation> read(String id) { return observations.read(id); }
+            @Override public void delete(String id) { observations.delete(id); }
+        };
+        LifecyclePendingRegistry pending = new LifecyclePendingRegistry();
+        try (LifecycleWorkDispatcher work = new LifecycleWorkDispatcher(1, 1)) {
+            ConvergenceDriver isolated = new ConvergenceDriver(
+                    new PipelineConverger(desired, state, actuator, Clock.fixed(T0, ZoneOffset.UTC)), desired,
+                    new ObservationPublisher(state, latest), null, MetricsExport.none(), () -> true,
+                    PipelineActuationOwnership.single(), work, scopes, null, pending);
+            isolated.reconcile();
+            assertThat(stopping.await(5, TimeUnit.SECONDS)).isTrue();
+            var concluded = state.read("orders").orElseThrow();
+            assertThat(StateJson.parse(concluded.stateJson())).isEqualTo(FAILED);
+            assertThat(scopes.current("orders")).contains(scope);
+            assertThat(pending.pending("orders").orElseThrow().reason()).isEqualTo(PendingReason.STOP_PENDING);
+            assertThat(work.activeCount()).isEqualTo(1);
+
+            isolated.reconcile();
+
+            assertThat(state.read("orders")).contains(concluded);
+            assertThat(desired.read("orders")).contains(intent);
+            assertThat(scopes.current("orders")).contains(scope);
+            assertThat(work.activeCount()).isEqualTo(1);
+            assertThat(pending.pending("orders").orElseThrow().reason())
+                    .as("continuation cleanup preserves the actual STOP decision of the same accepted work")
+                    .isEqualTo(PendingReason.STOP_PENDING);
+            releaseStop.countDown();
+        } finally {
+            releaseStop.countDown();
+        }
+    }
+
+    @Test
+    void aSameScopeResetInvalidatesAnOlderBindingMutation() {
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        var scope = scopes.begin("orders", "inc-a", 1);
+        var original = scopes.bindingIdentity("orders");
+        AtomicInteger applied = new AtomicInteger();
+
+        assertThat(scopes.begin("orders", "inc-a", 1)).isEqualTo(scope);
+        assertThat(scopes.bindingIdentity("orders")).isEqualTo(original);
+
+        assertThat(scopes.beginResetExecution("orders", scope)).isEqualTo(scope);
+        assertThat(scopes.current("orders")).contains(scope);
+        scopes.withBindingIdentity("orders", original, applied::incrementAndGet);
+        assertThat(applied).as("equal scope values cannot revive the old binding lifetime").hasValue(0);
+        scopes.withBindingIdentity("orders", scopes.bindingIdentity("orders"), applied::incrementAndGet);
+        assertThat(applied).hasValue(1);
+
+        var reset = scopes.bindingIdentity("orders");
+        scopes.discard("orders", scope);
+        assertThat(scopes.current("orders")).isEmpty();
+        assertThat(scopes.begin("orders", "inc-a", 1)).isEqualTo(scope);
+        scopes.withBindingIdentity("orders", reset, applied::incrementAndGet);
+        assertThat(applied).as("equal scope values cannot revive a discarded binding lifetime").hasValue(1);
+        scopes.withBindingIdentity("orders", scopes.bindingIdentity("orders"), applied::incrementAndGet);
+        assertThat(applied).hasValue(2);
+    }
+
+    private enum PendingChange { REBUILD, RECOVERY, INCARNATION }
+
+    private void verifyTerminalNoopChange(PendingChange change) throws Exception {
+        CountDownLatch slowEntered = new CountDownLatch(1);
+        CountDownLatch releaseSlow = new CountDownLatch(1);
+        CountDownLatch preparingRecovery = new CountDownLatch(1);
+        CountDownLatch releaseRecovery = new CountDownLatch(1);
+        AtomicBoolean recover = new AtomicBoolean();
+        AtomicInteger admissions = new AtomicInteger();
+        AtomicInteger starts = new AtomicInteger();
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        scopes.begin("orders", "inc-a", 1);
+        LifecycleActuator blocking = new LifecycleActuator() {
+            @Override public PreparedStart prepareStart(String id) {
+                if (id.equals("orders") && change == PendingChange.RECOVERY) {
+                    preparingRecovery.countDown();
+                    try {
+                        if (!releaseRecovery.await(5, TimeUnit.SECONDS)) {
+                            throw new AssertionError("the admitted recovery preparation was not released");
+                        }
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException(interrupted);
+                    }
+                }
+                return LifecycleActuator.super.prepareStart(id);
+            }
+            @Override public void start(String id) {
+                if (id.equals("orders")) { starts.incrementAndGet(); }
+                if (id.equals("slow")) {
+                    slowEntered.countDown();
+                    try {
+                        if (!releaseSlow.await(5, TimeUnit.SECONDS)) {
+                            throw new AssertionError("the other pipeline's start was not released");
+                        }
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException(interrupted);
+                    }
+                }
+            }
+            @Override public void pause(String id) { }
+            @Override public void resume(String id) { }
+            @Override public void stop(String id, boolean purgeState) { }
+            @Override public Optional<Throwable> failure(String id) { return Optional.empty(); }
+            @Override public Optional<Throwable> lost(String id) { return Optional.empty(); }
+            @Override public boolean isCarryingAJob(String id) { return !id.equals("orders"); }
+        };
+        DesiredState original = new DesiredState("orders", RUNNING, "same-revision", false,
+                "same-assembly", false, null);
+        desired.save(original);
+        state.create("orders", StateJson.of(FAILED), T0);
+        var failed = state.read("orders").orElseThrow();
+        PipelineConverger loop = new PipelineConverger(desired, state, blocking,
+                Clock.fixed(T0, ZoneOffset.UTC), id -> {
+                    if (id.equals("orders") && recover.get()) {
+                        admissions.incrementAndGet();
+                        return true;
+                    }
+                    return false;
+                });
+        ObservationStore latest = new ObservationStore() {
+            @Override public void save(Observation observation) { observations.save(observation); }
+            @Override public boolean saveScoped(Observation observation, Scope scope) {
+                observations.save(observation);
+                return true;
+            }
+            @Override public Optional<Observation> read(String id) { return observations.read(id); }
+            @Override public void delete(String id) { observations.delete(id); }
+        };
+        LifecyclePendingRegistry pending = new LifecyclePendingRegistry();
+        try (LifecycleWorkDispatcher work = new LifecycleWorkDispatcher(1, 1)) {
+            ConvergenceDriver isolated = new ConvergenceDriver(loop, desired,
+                    new ObservationPublisher(state, latest), null, MetricsExport.none(), () -> true,
+                    PipelineActuationOwnership.single(), work, scopes, null, pending);
+            isolated.reconcile();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (work.health().pendingPipelines() != 0 && System.nanoTime() - deadline < 0) {
+                Thread.sleep(10);
+            }
+            assertThat(work.health().pendingPipelines()).isZero();
+            if (work.activeCount() != 0) { isolated.reconcile(); }
+            assertThat(work.activeCount()).isZero();
+            assertThat(pending.pending("orders")).isEmpty();
+
+            DesiredState slow = new DesiredState("slow", RUNNING, "slow-rev");
+            desired.save(slow);
+            assertThat(work.offer("slow", slow, () -> loop.converge("slow")))
+                    .isEqualTo(LifecycleWorkDispatcher.Submission.ACCEPTED);
+            assertThat(slowEntered.await(5, TimeUnit.SECONDS)).isTrue();
+            if (change == PendingChange.REBUILD) {
+                desired.save(new DesiredState("orders", RUNNING, original.revision(), original.purgeState(),
+                        original.assemblyRevision(), true, failed.epoch()));
+            } else if (change == PendingChange.INCARNATION) {
+                scopes.forgetIncarnation("orders", "inc-a");
+                assertThat(scopes.current("orders")).isEmpty();
+                scopes.forgetIncarnation("orders", "inc-a");
+                state.delete("orders");
+                state.create("orders", StateJson.of(NEW), T0);
+                scopes.begin("orders", "inc-b", 2);
+            } else {
+                recover.set(true);
+            }
+
+            isolated.reconcile();
+
+            if (change == PendingChange.RECOVERY) {
+                releaseSlow.countDown();
+                assertThat(preparingRecovery.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(admissions).as("pending classification cannot consume a second recovery admission")
+                        .hasValue(1);
+                assertThat(desired.read("orders")).contains(original);
+                assertThat(starts).hasValue(0);
+            }
+            assertThat(pending.pending("orders").orElseThrow().reason()).isEqualTo(PendingReason.START_PENDING);
+            releaseSlow.countDown();
+            releaseRecovery.countDown();
+        } finally {
+            releaseSlow.countDown();
+            releaseRecovery.countDown();
+        }
+    }
+
+    @Test
     void aMissingPausedJobReachesTheStoreBackedStatusWithItsCodedReason() {
         AtomicBoolean carrying = new AtomicBoolean(true);
         LifecycleActuator job = new LifecycleActuator() {

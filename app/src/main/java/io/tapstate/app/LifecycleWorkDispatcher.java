@@ -23,6 +23,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
+import java.util.function.Consumer;
 import org.slf4j.MDC;
 
 /**
@@ -208,6 +209,30 @@ final class LifecycleWorkDispatcher implements AutoCloseable {
         return work.outcome;
     }
 
+    /** A worker decision belongs only to the still accepted, uncancelled full intent. */
+    boolean current(String pipelineId, DesiredState intent) {
+        Work work = workByPipeline.get(pipelineId);
+        return work != null && !work.wasCancelled.get() && work.outcome == null && work.desired.equals(intent);
+    }
+
+    Object currentIdentity(String pipelineId, DesiredState intent) {
+        Work work = workByPipeline.get(pipelineId);
+        return work != null && !work.wasCancelled.get() && work.outcome == null && work.desired.equals(intent)
+                ? work : null;
+    }
+
+    /** Serializes a pure local projection with cancellation of this exact accepted work. */
+    void withCurrentDecision(String pipelineId, DesiredState intent, Consumer<Object> record) {
+        Work work = workByPipeline.get(pipelineId);
+        if (work == null) { return; }
+        synchronized (work) {
+            if (workByPipeline.get(pipelineId) == work && work.runner == Thread.currentThread()
+                    && !work.wasCancelled.get() && work.outcome == null && work.desired.equals(intent)) {
+                record.accept(work);
+            }
+        }
+    }
+
     /** Stops obsolete work when this member no longer drives the pipeline. */
     void cancel(String pipelineId) {
         Work work = workByPipeline.get(pipelineId);
@@ -273,11 +298,10 @@ final class LifecycleWorkDispatcher implements AutoCloseable {
         }
 
         private void supersede() {
-            if (outcome != null) {
-                return;
-            }
-            if (!wasCancelled.compareAndSet(false, true)) {
-                return;
+            synchronized (this) {
+                if (outcome != null || !wasCancelled.compareAndSet(false, true)) {
+                    return;
+                }
             }
             cancelled.incrementAndGet();
             if (workers != null && workers.remove(this)) {

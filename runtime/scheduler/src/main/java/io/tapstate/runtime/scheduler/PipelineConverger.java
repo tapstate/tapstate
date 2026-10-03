@@ -19,6 +19,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Consumer;
 
 /**
  * Converges a pipeline's actual state toward its desired intent. It reads the desired target, seeds
@@ -55,12 +56,32 @@ public final class PipelineConverger {
         this.rebuilds = Objects.requireNonNull(rebuilds, "rebuilds");
     }
 
+    /** One factual worker-side decision, before any corresponding lifecycle action is attempted. */
+    public record PendingDecision(DesiredState intent, Optional<CheckpointDoc> checkpoint, PendingAction action) {
+        public PendingDecision {
+            Objects.requireNonNull(intent, "intent");
+            Objects.requireNonNull(checkpoint, "checkpoint");
+            Objects.requireNonNull(action, "action");
+        }
+    }
+
+    public enum PendingAction { NONE, START, STOP }
+
     /** Drives the pipeline's actual state toward its current desired target, seeding it if new. */
     public ConvergeResult converge(String pipelineId) {
+        return converge(pipelineId, ignored -> { });
+    }
+
+    /** The callback runs on this worker and cannot grant or repeat a lifecycle admission. */
+    public ConvergeResult converge(String pipelineId, Consumer<PendingDecision> decisions) {
+        Objects.requireNonNull(decisions, "decisions");
         Optional<DesiredState> intent = desired.read(pipelineId);
         Optional<StopReservation> stopping = state.supportsStopReservations()
                 ? state.readStopReservation(pipelineId) : Optional.empty();
         if (stopping.isPresent()) {
+            intent.ifPresent(value -> decisions.accept(new PendingDecision(value, Optional.empty(),
+                    stopping.orElseThrow().phase() == StopReservation.Phase.STOPPING
+                            ? PendingAction.STOP : PendingAction.START)));
             return intent.isEmpty() ? ConvergeResult.superseded()
                     : resumeStop(stopping.orElseThrow(), intent.orElseThrow(), false);
         }
@@ -98,6 +119,7 @@ public final class PipelineConverger {
             // the driver can surface it. A converge-side transition, never a user verb.
             Optional<Throwable> failure = actuator.failure(pipelineId);
             if (failure.isPresent()) {
+                decisions.accept(new PendingDecision(intent.orElseThrow(), actualDoc, PendingAction.STOP));
                 ConvergeResult driven =
                         driveTo(pipelineId, PipelineState.FAILED, false, actualDoc.orElse(null), false);
                 return driven.checkpoint()
@@ -116,6 +138,7 @@ public final class PipelineConverger {
             // resuming the job. Submitting is absent-safe, and the guard is "no job is carrying it"
             // rather than "this process did not start it", so the next tick actuates nothing.
             if (!actuator.isCarryingAJob(pipelineId) && !rebuild) {
+                decisions.accept(new PendingDecision(intent.orElseThrow(), actualDoc, PendingAction.START));
                 ConvergeResult.ExecutionBoundary submission = null;
                 try (LifecycleActuator.PreparedStart prepared = actuator.prepareStart(pipelineId)) {
                     prepared.submit();
@@ -147,6 +170,7 @@ public final class PipelineConverger {
                                 Map.of("pipeline", pipelineId), null)));
             }
             if (failure.isPresent()) {
+                decisions.accept(new PendingDecision(intent.orElseThrow(), actualDoc, PendingAction.STOP));
                 ConvergeResult driven = driveTo(
                         pipelineId, PipelineState.FAILED, false, actualDoc.orElse(null), false);
                 Throwable cause = failure.get();
@@ -165,6 +189,7 @@ public final class PipelineConverger {
             // healthy pipeline over a dead job while it is being decided. The admission bounds itself --
             // a yes that never runs out is a restart loop wearing the word "recovery".
             if (target == PipelineState.RUNNING && rebuilds.admits(pipelineId)) {
+                decisions.accept(new PendingDecision(intent.orElseThrow(), actualDoc, PendingAction.START));
                 return driveTo(pipelineId, target, false, actualDoc.orElse(null), false, true, false, intent.get())
                         .recoveringExecution();
             }
@@ -176,6 +201,7 @@ public final class PipelineConverger {
             // second.
             // actual is FAILED only when the checkpoint was read and parsed, so
             // the doc is necessarily present; orElseThrow makes that invariant explicit and fail-loud.
+            decisions.accept(new PendingDecision(intent.orElseThrow(), actualDoc, PendingAction.NONE));
             return ConvergeResult.converged(actualDoc.orElseThrow());
         }
 
@@ -185,9 +211,14 @@ public final class PipelineConverger {
             // out. Driving it would start the whole run again -- on this tick, and on every tick after
             // it, since each new run reaches the same end. Running it again is a user's stop and start,
             // which arrives as the one instruction handled above.
+            decisions.accept(new PendingDecision(intent.orElseThrow(), actualDoc, PendingAction.NONE));
             return ConvergeResult.converged(actualDoc.orElseThrow());
         }
 
+        PendingAction action = target == PipelineState.RUNNING && (actual != target || rebuild || rebuildOwed)
+                ? PendingAction.START : target == PipelineState.STOPPED && actual != target
+                        ? PendingAction.STOP : PendingAction.NONE;
+        decisions.accept(new PendingDecision(intent.orElseThrow(), actualDoc, action));
         return driveTo(pipelineId, target, true, actualDoc.orElse(null), purgeState, rebuild, rebuildOwed, intent.get());
     }
 

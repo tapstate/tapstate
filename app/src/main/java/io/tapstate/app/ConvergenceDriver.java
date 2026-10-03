@@ -1,6 +1,8 @@
 package io.tapstate.app;
 
 import io.tapstate.core.lifecycle.ObservationFailure;
+import io.tapstate.core.common.TapstateException;
+import java.util.Objects;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
@@ -187,7 +189,7 @@ final class ConvergenceDriver {
                         observationScopes.cancelRestoration(pipelineId);
                     }
                     if (pendingWork != null) {
-                        pendingWork.clear(pipelineId);
+                        pendingWork.forget(pipelineId);
                     }
                     if (telemetryWork != null) {
                         telemetryWork.discardStalePreparation(pipelineId);
@@ -201,15 +203,17 @@ final class ConvergenceDriver {
                     if (intent == null) {
                         lifecycleWork.cancel(pipelineId);
                         if (pendingWork != null) {
-                            pendingWork.clear(pipelineId);
+                            pendingWork.forget(pipelineId);
                         }
                         continue;
                     }
+                    LifecyclePendingRegistry.Context context = pendingContext(pipelineId, permit);
                     LifecycleWorkDispatcher.Submission submission = lifecycleWork.offer(
-                            pipelineId, intent, () -> converger.converge(pipelineId),
+                            pipelineId, intent, () -> converger.converge(pipelineId,
+                                    decision -> noteDecision(pipelineId, intent, context, decision)),
                             pendingWork == null ? System.nanoTime()
                                     : pendingWork.capacitySince(pipelineId, intent.targetState()));
-                    notePending(pipelineId, intent, submission);
+                    notePending(pipelineId, intent, context, submission);
                     if (submission == LifecycleWorkDispatcher.Submission.CAPACITY) {
                         LOG.debug("Lifecycle work for pipeline {} is waiting for dispatcher capacity", pipelineId);
                     }
@@ -255,7 +259,7 @@ final class ConvergenceDriver {
                 }
             } catch (RuntimeException e) {
                 if (pendingWork != null) {
-                    pendingWork.clear(pipelineId);
+                    pendingWork.forget(pipelineId);
                 }
                 // A pass that keeps throwing never reaches publish(), so the read face would stay empty and a
                 // permanently broken pipeline would look identical to a slow one. Count the consecutive
@@ -347,20 +351,60 @@ final class ConvergenceDriver {
         }
     }
 
-    private void notePending(String pipelineId, DesiredState intent, LifecycleWorkDispatcher.Submission submission) {
+    private LifecyclePendingRegistry.Context pendingContext(String pipelineId,
+            PipelineActuationOwnership.Permit permit) {
+        return new LifecyclePendingRegistry.Context(observationScopes == null ? null
+                : observationScopes.bindingIdentity(pipelineId), ObservationScopeRecovery.Owner.of(permit.claim()));
+    }
+
+    private void noteDecision(String pipelineId, DesiredState offered, LifecyclePendingRegistry.Context context,
+            PipelineConverger.PendingDecision decision) {
+        if (pendingWork == null || !offered.equals(decision.intent())
+                || !lifecycleWork.current(pipelineId, offered)) {
+            return;
+        }
+        try {
+            if (!businessEligible.getAsBoolean() || !desired.read(pipelineId).filter(offered::equals).isPresent()) {
+                pendingWork.discardDecision(pipelineId);
+                return;
+            }
+            PipelineActuationOwnership.Permit current = actuation.permit(pipelineId);
+            if (!current.granted() || !Objects.equals(context, pendingContext(pipelineId, current))) {
+                pendingWork.discardDecision(pipelineId);
+                return;
+            }
+        } catch (TapstateException unavailable) {
+            pendingWork.discardDecision(pipelineId);
+            LOG.debug("Could not qualify the local lifecycle decision for pipeline {}", pipelineId, unavailable);
+            return;
+        }
+        lifecycleWork.withCurrentDecision(pipelineId, offered, workIdentity -> {
+            if (observationScopes == null) {
+                pendingWork.decided(decision, context, workIdentity);
+            } else {
+                observationScopes.withBindingIdentity(pipelineId, context.binding(),
+                        () -> pendingWork.decided(decision, context, workIdentity));
+            }
+        });
+    }
+
+    private void notePending(String pipelineId, DesiredState intent, LifecyclePendingRegistry.Context context,
+            LifecycleWorkDispatcher.Submission submission) {
         if (pendingWork == null) {
             return;
         }
         if (intent.targetState() == PipelineState.RUNNING) {
-            pendingWork.put(pipelineId, submission == LifecycleWorkDispatcher.Submission.CAPACITY
-                    ? PendingReason.START_CAPACITY : PendingReason.START_PENDING);
+            pendingWork.provisional(pipelineId, intent, context, lifecycleWork.currentIdentity(pipelineId, intent),
+                    submission == LifecycleWorkDispatcher.Submission.CAPACITY
+                            ? PendingReason.START_CAPACITY : PendingReason.START_PENDING);
         } else if (intent.targetState() == PipelineState.STOPPED) {
-            pendingWork.put(pipelineId, submission == LifecycleWorkDispatcher.Submission.CAPACITY
-                    ? PendingReason.STOP_CAPACITY : PendingReason.STOP_PENDING);
+            pendingWork.provisional(pipelineId, intent, context, lifecycleWork.currentIdentity(pipelineId, intent),
+                    submission == LifecycleWorkDispatcher.Submission.CAPACITY
+                            ? PendingReason.STOP_CAPACITY : PendingReason.STOP_PENDING);
         } else if (submission == LifecycleWorkDispatcher.Submission.CAPACITY) {
             pendingWork.rememberCapacity(pipelineId, intent.targetState());
         } else {
-            pendingWork.clear(pipelineId);
+            pendingWork.forget(pipelineId);
         }
     }
 
@@ -376,7 +420,11 @@ final class ConvergenceDriver {
         } else if (result != null && result.status() == ConvergeStatus.STOP_PENDING) {
             pendingWork.put(pipelineId, PendingReason.STOP_PENDING);
         } else {
-            pendingWork.clear(pipelineId);
+            if (completed.superseded() || completed.failure() != null) {
+                pendingWork.forget(pipelineId);
+            } else {
+                pendingWork.clear(pipelineId);
+            }
         }
     }
 
