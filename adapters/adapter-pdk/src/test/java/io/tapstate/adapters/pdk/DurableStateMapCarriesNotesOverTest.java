@@ -166,17 +166,68 @@ class DurableStateMapCarriesNotesOverTest {
     }
 
     /**
+     * A note written here by another opening after the key was forgotten outlives a carrier that finds the key
+     * forgotten once it has carried it over: the carrier takes back only what it carried. Erased, the note a
+     * connector just wrote about a resource it created would be gone the next time it looked, and it would
+     * create another.
+     */
+    @Test
+    void aNoteWrittenAfterTheKeyWasForgottenOutlivesACarrierThatFindsItForgotten() {
+        earlier(OPENER).put("slot", "old-slot");
+        java.util.concurrent.atomic.AtomicReference<Runnable> afterRead = new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicReference<Runnable> afterClaim = new java.util.concurrent.atomic.AtomicReference<>();
+        io.tapstate.spi.store.KeyedStateStore racing = hooked(OPENER, "slot", afterRead, HERE, "slot", afterClaim);
+        DurableStateMap carrier = new DurableStateMap(racing, HERE, List.of(OPENER, OTHER));
+        DurableStateMap forgetter = new DurableStateMap(racing, HERE, List.of(OPENER, OTHER));
+        DurableStateMap writer = new DurableStateMap(racing, HERE, List.of(OPENER, OTHER));
+        afterRead.set(() -> {
+            forgetter.remove("slot");
+            afterClaim.set(() -> writer.put("slot", "fresh-slot"));
+        });
+
+        carrier.get("slot");
+
+        assertThat(carrying().get("slot")).as("the note written after the forgetting").isEqualTo("fresh-slot");
+    }
+
+    /** A key carried over while the notes here are cleared does not come back after the clear. */
+    @Test
+    void aKeyCarriedOverWhileTheNotesAreClearedDoesNotComeBack() {
+        earlier(OPENER).put("slot", "old-slot");
+        java.util.concurrent.atomic.AtomicReference<Runnable> between = new java.util.concurrent.atomic.AtomicReference<>();
+        io.tapstate.spi.store.KeyedStateStore racing = interleaving(OPENER, "slot", between);
+        DurableStateMap carrier = new DurableStateMap(racing, HERE, List.of(OPENER, OTHER));
+        DurableStateMap clearer = new DurableStateMap(racing, HERE, List.of(OPENER, OTHER));
+        between.set(clearer::clear);
+
+        carrier.get("slot");
+
+        assertThat(carrying().get("slot")).isNull();
+    }
+
+    /**
      * {@link #store}, running what {@code between} holds -- once -- just after {@code key} is read from
      * {@code namespace}, as another connector acting on the same notes would.
      */
     private io.tapstate.spi.store.KeyedStateStore interleaving(
             String namespace, String key, java.util.concurrent.atomic.AtomicReference<Runnable> between) {
+        return hooked(namespace, key, between, null, null, new java.util.concurrent.atomic.AtomicReference<>());
+    }
+
+    /**
+     * {@link #store}, running what {@code afterRead} holds -- once -- just after {@code key} is read from
+     * {@code namespace}, and what {@code afterClaim} holds -- once -- just after {@code claimedKey} is claimed in
+     * {@code claimedIn}.
+     */
+    private io.tapstate.spi.store.KeyedStateStore hooked(
+            String namespace, String key, java.util.concurrent.atomic.AtomicReference<Runnable> afterRead,
+            String claimedIn, String claimedKey, java.util.concurrent.atomic.AtomicReference<Runnable> afterClaim) {
         return new io.tapstate.spi.store.KeyedStateStore() {
             @Override
             public java.util.Optional<byte[]> load(String readFrom, String read) {
                 java.util.Optional<byte[]> found = store.load(readFrom, read);
                 if (namespace.equals(readFrom) && key.equals(read)) {
-                    Runnable meanwhile = between.getAndSet(null);
+                    Runnable meanwhile = afterRead.getAndSet(null);
                     if (meanwhile != null) {
                         meanwhile.run();
                     }
@@ -191,7 +242,14 @@ class DurableStateMapCarriesNotesOverTest {
 
             @Override
             public java.util.Optional<byte[]> saveIfAbsent(String in, String saved, byte[] state) {
-                return store.saveIfAbsent(in, saved, state);
+                java.util.Optional<byte[]> first = store.saveIfAbsent(in, saved, state);
+                if (first.isEmpty() && in.equals(claimedIn) && saved.equals(claimedKey)) {
+                    Runnable meanwhile = afterClaim.getAndSet(null);
+                    if (meanwhile != null) {
+                        meanwhile.run();
+                    }
+                }
+                return first;
             }
 
             @Override

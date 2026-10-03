@@ -111,10 +111,18 @@ final class DurableStateMap implements KVMap<Object> {
                 if (first.isPresent()) {
                     return ConnectorStateCodec.decode(first.get());
                 }
-                if (forgotten(key)) {
-                    // Forgotten here while it was being carried over: the forgetting stands.
-                    store.delete(namespace, key);
-                    return null;
+                if (forgotten(key) || store.load(namespace, CARRYING_ENDED).isPresent()) {
+                    // Forgotten here, or the notes cleared, while it was being carried over: the forgetting stands.
+                    // Only what this carried is taken back -- a note another opening wrote since is its own. The
+                    // store has no conditional delete, so a write landing between the look and the delete is
+                    // still lost, and until the delete another opening reading the key sees what was carried;
+                    // both windows are a read and a write wide.
+                    Optional<byte[]> now = store.load(namespace, key);
+                    if (now.isPresent() && java.util.Arrays.equals(now.get(), kept.get())) {
+                        store.delete(namespace, key);
+                        return null;
+                    }
+                    return now.map(ConnectorStateCodec::decode).orElse(null);
                 }
                 return ConnectorStateCodec.decode(kept.get());
             }
