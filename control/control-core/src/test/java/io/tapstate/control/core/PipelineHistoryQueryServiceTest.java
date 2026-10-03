@@ -517,6 +517,336 @@ class PipelineHistoryQueryServiceTest {
         assertThat(observed).isEmpty();
     }
 
+    @Test
+    void aFreshPartialCoverageCacheCannotHideARealResetAcrossUnknown() {
+        RecordingHistory raw = scopedUnknownBridge(true);
+        RecordingRollups cache = staleUnknownBridgeCache(raw);
+        Instant from = Instant.parse("2026-09-21T10:00:00Z");
+        PipelineHistoryQuery request = new PipelineHistoryQuery("orders", from, from.plusSeconds(300),
+                HistoryResolution.PT5M, 100, List.of(), null);
+        PipelineMetricsHistory expected = scopedCacheService(raw, null, ignored -> { }, ignored -> { },
+                25_000).query(request);
+        assertThat(expected.segments()).extracting(PipelineMetricsHistory.Segment::startReason)
+                .contains(PipelineMetricsHistory.StartReason.COUNTER_RESET);
+        raw.rawReads = 0;
+        raw.pageRanges.clear();
+        List<HistoryRollupStore.Key> hints = new ArrayList<>();
+        List<PipelineHistoryQueryService.RollupFallback> fallbacks = new ArrayList<>();
+
+        PipelineHistoryQueryService.QueryRun actual = scopedCacheService(raw, cache, hints::add,
+                fallbacks::add, 25_000).execute(request);
+
+        assertThat(actual.history()).isEqualTo(expected);
+        assertThat(actual.cost().rawDocumentsScanned()).isPositive().isLessThanOrEqualTo(25_000);
+        assertThat(actual.cost().peakRawEntriesHeld()).isLessThanOrEqualTo(3);
+        assertThat(raw.pageRanges).containsOnly(new TimeRange(from, from.plusSeconds(300)));
+        assertThat(hints).containsExactly(new HistoryRollupStore.Key("orders",
+                HistoryRollupStore.Scope.incarnation("inc-a"), HistoryRollupStore.Resolution.PT5M, from));
+        assertThat(fallbacks).containsExactly(new PipelineHistoryQueryService.RollupFallback(
+                HistoryRollupStore.Resolution.PT5M, 1, false));
+    }
+
+    @Test
+    void aFreshPartialCoverageCacheMatchesRawAndMissingCachePagesAcrossTheReset() {
+        RecordingHistory raw = scopedUnknownBridge(true);
+        RecordingRollups cache = staleUnknownBridgeCache(raw);
+        Instant from = Instant.parse("2026-09-21T10:00:00Z");
+        Instant to = from.plusSeconds(300);
+        PipelineHistoryQueryService forcedRaw = scopedCacheService(raw, null, ignored -> { },
+                ignored -> { }, 25_000);
+        PipelineHistoryQueryService cached = scopedCacheService(raw, cache, ignored -> { },
+                ignored -> { }, 25_000);
+        PipelineHistoryQueryService missing = scopedCacheService(raw, new RecordingRollups(),
+                ignored -> { }, ignored -> { }, 25_000);
+        PipelineHistoryQuery whole = new PipelineHistoryQuery("orders", from, to,
+                HistoryResolution.PT5M, 100, List.of(), null);
+        PipelineMetricsHistory expected = forcedRaw.query(whole);
+        assertThat(missing.query(whole)).isEqualTo(expected);
+        assertThat(cached.query(whole)).isEqualTo(expected);
+        List<PipelineMetricsHistory.Point> received = new ArrayList<>();
+        List<PipelineMetricsHistory.StartReason> reasons = new ArrayList<>();
+        String rawCursor = null;
+        String cachedCursor = null;
+        String missingCursor = null;
+        for (int page = 0; page < 4; page++) {
+            PipelineMetricsHistory rawPage = forcedRaw.query(new PipelineHistoryQuery("orders", from, to,
+                    HistoryResolution.PT5M, 1, List.of(), rawCursor));
+            PipelineMetricsHistory missingPage = missing.query(new PipelineHistoryQuery("orders", from, to,
+                    HistoryResolution.PT5M, 1, List.of(), missingCursor));
+            PipelineHistoryQueryService.QueryRun run = cached.execute(new PipelineHistoryQuery("orders",
+                    from, to, HistoryResolution.PT5M, 1, List.of(), cachedCursor));
+            assertThat(run.history().segments()).isEqualTo(rawPage.segments()).isEqualTo(missingPage.segments());
+            assertThat(run.history().gaps()).isEqualTo(rawPage.gaps()).isEqualTo(missingPage.gaps());
+            assertThat(run.history().unavailable()).isEqualTo(rawPage.unavailable())
+                    .isEqualTo(missingPage.unavailable());
+            assertThat(run.history().nextCursor() == null).isEqualTo(rawPage.nextCursor() == null)
+                    .isEqualTo(missingPage.nextCursor() == null);
+            assertThat(run.cost().rawDocumentsScanned()).isLessThanOrEqualTo(25_000);
+            assertThat(run.cost().peakRawEntriesHeld()).isLessThanOrEqualTo(3);
+            received.addAll(points(run.history()));
+            run.history().segments().forEach(segment -> reasons.add(segment.startReason()));
+            rawCursor = rawPage.nextCursor();
+            missingCursor = missingPage.nextCursor();
+            cachedCursor = run.history().nextCursor();
+            if (cachedCursor == null) {
+                break;
+            }
+        }
+        assertThat(cachedCursor).isNull();
+        assertThat(received).isEqualTo(points(expected));
+        assertThat(reasons).contains(PipelineMetricsHistory.StartReason.COUNTER_RESET);
+        assertThat(received.stream().map(PipelineMetricsHistory.Point::recordsOut)
+                .filter(java.util.Objects::nonNull).toList()).singleElement().satisfies(rate ->
+                        assertThat(rate.delta()).isEqualByComparingTo("1"));
+    }
+
+    @Test
+    void anAmbiguousCacheFallbackChargesTheExistingRawScanBudget() {
+        RecordingHistory raw = scopedUnknownBridge(true);
+        RecordingRollups cache = staleUnknownBridgeCache(raw);
+        List<PipelineHistoryQueryService.RollupFallback> fallbacks = new ArrayList<>();
+        PipelineHistoryQueryService service = scopedCacheService(raw, cache, ignored -> { },
+                fallbacks::add, 4);
+        Instant from = Instant.parse("2026-09-21T10:00:00Z");
+
+        TapstateException refusal = catchThrowableOfType(() -> service.query(new PipelineHistoryQuery(
+                "orders", from, from.plusSeconds(300), HistoryResolution.PT5M, 100, List.of(), null)),
+                TapstateException.class);
+
+        assertThat(refusal).isNotNull();
+        assertThat(refusal.code()).isEqualTo(MonitorError.QUERY_BUDGET_EXCEEDED);
+        assertThat(refusal.args()).containsEntry("budget", "RAW_SCAN").containsEntry("limit", 4);
+        assertThat(fallbacks).isEmpty();
+    }
+
+    @Test
+    void aPartialCoverageSameStartCacheDownDrillsWithoutInventingAReset() {
+        RecordingHistory raw = scopedUnknownBridge(false);
+        RecordingRollups cache = staleUnknownBridgeCache(raw);
+        Instant from = Instant.parse("2026-09-21T10:00:00Z");
+        PipelineHistoryQuery request = new PipelineHistoryQuery("orders", from, from.plusSeconds(300),
+                HistoryResolution.PT5M, 100, List.of(), null);
+        PipelineMetricsHistory expected = scopedCacheService(raw, null, ignored -> { }, ignored -> { },
+                25_000).query(request);
+        raw.rawReads = 0;
+        raw.pageRanges.clear();
+
+        PipelineMetricsHistory actual = scopedCacheService(raw, cache, ignored -> { }, ignored -> { },
+                25_000).query(request);
+
+        assertThat(actual).isEqualTo(expected);
+        assertThat(actual.segments()).extracting(PipelineMetricsHistory.Segment::startReason)
+                .contains(PipelineMetricsHistory.StartReason.CONTINUATION)
+                .doesNotContain(PipelineMetricsHistory.StartReason.COUNTER_RESET);
+        assertThat(raw.pageRanges).containsOnly(new TimeRange(from, from.plusSeconds(300)));
+        assertThat(points(actual).stream().map(PipelineMetricsHistory.Point::recordsOut)
+                .filter(java.util.Objects::nonNull).toList()).singleElement().satisfies(rate ->
+                        assertThat(rate.delta()).isEqualByComparingTo("1"));
+    }
+
+    @Test
+    void aRawFallbackPageDoesNotStopAtUnknownBeforeTheFollowingReset() {
+        RecordingHistory raw = scopedUnknownBridge(true);
+        Instant from = Instant.parse("2026-09-21T10:00:00Z");
+        Instant to = from.plusSeconds(600);
+        RecordingRollups cache = new RecordingRollups();
+        cache.add(new HistoryRollupStore.Bucket(new HistoryRollupStore.Key("orders",
+                HistoryRollupStore.Scope.incarnation("inc-a"), HistoryRollupStore.Resolution.PT5M,
+                from.plusSeconds(300)), NOW.minusSeconds(30), NOW.minusSeconds(30),
+                NOW.plusSeconds(120), false, List.of(), List.of(), 0));
+        PipelineHistoryQueryService cached = scopedCacheService(raw, cache, ignored -> { },
+                ignored -> { }, 25_000);
+        PipelineHistoryQueryService forcedRaw = scopedCacheService(raw, null, ignored -> { },
+                ignored -> { }, 25_000);
+        PipelineMetricsHistory expected = forcedRaw.query(new PipelineHistoryQuery("orders", from, to,
+                HistoryResolution.PT5M, 100, List.of(), null));
+        assertThat(cached.query(new PipelineHistoryQuery("orders", from, to, HistoryResolution.PT5M,
+                100, List.of(), null))).isEqualTo(expected);
+        List<PipelineMetricsHistory.Point> received = new ArrayList<>();
+        List<PipelineMetricsHistory.StartReason> reasons = new ArrayList<>();
+        String rawCursor = null;
+        String cachedCursor = null;
+        for (int page = 0; page < 4; page++) {
+            PipelineMetricsHistory rawPage = forcedRaw.query(new PipelineHistoryQuery("orders", from, to,
+                    HistoryResolution.PT5M, 1, List.of(), rawCursor));
+            PipelineHistoryQueryService.QueryRun run = cached.execute(new PipelineHistoryQuery("orders",
+                    from, to, HistoryResolution.PT5M, 1, List.of(), cachedCursor));
+            assertThat(run.history().segments()).isEqualTo(rawPage.segments());
+            assertThat(run.history().nextCursor() == null).isEqualTo(rawPage.nextCursor() == null);
+            assertThat(run.cost().rawDocumentsScanned()).isLessThanOrEqualTo(25_000);
+            received.addAll(points(run.history()));
+            run.history().segments().forEach(segment -> reasons.add(segment.startReason()));
+            rawCursor = rawPage.nextCursor();
+            cachedCursor = run.history().nextCursor();
+            if (cachedCursor == null) {
+                break;
+            }
+        }
+        assertThat(cachedCursor).isNull();
+        assertThat(received).isEqualTo(points(expected));
+        assertThat(reasons).contains(PipelineMetricsHistory.StartReason.COUNTER_RESET);
+    }
+
+    @Test
+    void aRawFallbackResumeWithNoRemainingRowsKeepsTheWholeCrossBucketGap() {
+        RecordingHistory raw = new RecordingHistory();
+        Instant from = Instant.parse("2026-09-21T10:00:00Z");
+        Instant to = from.plusSeconds(600);
+        ObservationStore.Scope scope = new ObservationStore.Scope("inc-a", 41);
+        raw.addScoped(sample(from.toString(), 1, 10, 0, Map.of(), COUNTING_SINCE), scope);
+        raw.addScoped(sample(from.plusSeconds(60).toString(), 2, 20, 0, Map.of(), COUNTING_SINCE), scope);
+        raw.addScoped(sample(from.plusSeconds(360).toString(), 3, 30, 0, Map.of(), COUNTING_SINCE), scope);
+        RecordingRollups cache = new RecordingRollups();
+        HistoryRollupStore.Bucket second = scopedFiveMinuteProjection(raw, from.plusSeconds(300));
+        assertThat(second.inWindowSamples()).isEqualTo(1);
+        assertThat(second.gaps()).singleElement().satisfies(gap -> {
+            assertThat(gap.intervalStart()).isEqualTo(from.plusSeconds(300));
+            assertThat(gap.intervalEnd()).isEqualTo(from.plusSeconds(360));
+        });
+        cache.add(second);
+        PipelineHistoryQueryService forcedRaw = scopedCacheService(raw, null, ignored -> { },
+                ignored -> { }, 25_000);
+        PipelineHistoryQueryService cached = scopedCacheService(raw, cache, ignored -> { },
+                ignored -> { }, 25_000);
+        PipelineHistoryQuery wholeQuery = new PipelineHistoryQuery("orders", from, to,
+                HistoryResolution.PT5M, 100, List.of(), null);
+        PipelineMetricsHistory whole = forcedRaw.query(wholeQuery);
+        assertThat(whole.gaps()).containsExactly(new PipelineMetricsHistory.Gap(from.plusSeconds(60),
+                from.plusSeconds(360), PipelineMetricsHistory.GapReason.SAMPLE_GAP));
+        assertThat(cached.query(wholeQuery)).isEqualTo(whole);
+        PipelineHistoryQuery firstQuery = new PipelineHistoryQuery("orders", from, to,
+                HistoryResolution.PT5M, 1, List.of(), null);
+        PipelineMetricsHistory rawFirst = forcedRaw.query(firstQuery);
+        PipelineMetricsHistory cachedFirst = cached.query(firstQuery);
+        assertThat(cachedFirst.segments()).isEqualTo(rawFirst.segments());
+        assertThat(cachedFirst.gaps()).isEqualTo(rawFirst.gaps()).isEmpty();
+        assertThat(rawFirst.nextCursor()).isNotBlank();
+        assertThat(cachedFirst.nextCursor()).isNotBlank();
+        PipelineMetricsHistory rawSecond = forcedRaw.query(new PipelineHistoryQuery("orders", from, to,
+                HistoryResolution.PT5M, 1, List.of(), rawFirst.nextCursor()));
+        PipelineHistoryQueryService.QueryRun cachedSecond = cached.execute(new PipelineHistoryQuery("orders",
+                from, to, HistoryResolution.PT5M, 1, List.of(), cachedFirst.nextCursor()));
+        assertThat(rawSecond.gaps()).isEqualTo(whole.gaps());
+        assertThat(cachedSecond.history().segments()).isEqualTo(rawSecond.segments());
+        assertThat(cachedSecond.history().gaps()).isEqualTo(rawSecond.gaps());
+        assertThat(cachedSecond.history().unavailable()).isEqualTo(rawSecond.unavailable());
+        assertThat(cachedSecond.history().nextCursor()).isNull();
+        assertThat(rawSecond.nextCursor()).isNull();
+        assertThat(cachedSecond.cost().rawDocumentsScanned()).isLessThanOrEqualTo(25_000);
+        assertThat(cachedSecond.cost().peakRawEntriesHeld()).isLessThanOrEqualTo(3);
+        List<PipelineMetricsHistory.Point> paged = new ArrayList<>(points(cachedFirst));
+        paged.addAll(points(cachedSecond.history()));
+        assertThat(paged).isEqualTo(points(whole));
+    }
+
+    @Test
+    void aPartialRawFallbackWithNoWindowSampleDoesNotInventRetainedHistory() {
+        RecordingHistory raw = new RecordingHistory();
+        Instant at = Instant.parse("2026-09-21T10:00:00Z");
+        ObservationStore.Scope scope = new ObservationStore.Scope("inc-a", 41);
+        raw.addScoped(sample(at.toString(), 1, 10, 0, Map.of(), COUNTING_SINCE), scope);
+        raw.addScoped(sample(at.plusSeconds(90).toString(), 2, 20, 0, Map.of(), COUNTING_SINCE), scope);
+        RecordingRollups cache = new RecordingRollups();
+        HistoryRollupStore.Bucket bucket = scopedFiveMinuteProjection(raw, at);
+        assertThat(bucket.inWindowSamples()).isEqualTo(2);
+        assertThat(bucket.fragments()).singleElement().satisfies(fragment ->
+                assertThat(fragment.recordsOut().delta()).isEqualByComparingTo("1"));
+        cache.add(bucket);
+        PipelineHistoryQuery request = new PipelineHistoryQuery("orders", at.plusSeconds(30), at.plusSeconds(60),
+                HistoryResolution.PT5M, 1, List.of(), null);
+        PipelineMetricsHistory rawAnswer = scopedCacheService(raw, null, ignored -> { }, ignored -> { },
+                25_000).query(request);
+        PipelineHistoryQueryService.QueryRun cachedAnswer = scopedCacheService(raw, cache, ignored -> { },
+                ignored -> { }, 25_000).execute(request);
+        assertThat(cachedAnswer.history()).isEqualTo(rawAnswer);
+        assertThat(cachedAnswer.history().status()).isEqualTo(PipelineMetricsHistory.Status.NO_RETAINED_SAMPLES);
+        assertThat(cachedAnswer.history().segments()).isEmpty();
+        assertThat(cachedAnswer.history().gaps()).isEmpty();
+        assertThat(cachedAnswer.history().nextCursor()).isNull();
+        assertThat(cachedAnswer.cost().rawDocumentsScanned()).isLessThanOrEqualTo(25_000);
+    }
+
+    private static HistoryRollupStore.Bucket scopedFiveMinuteProjection(RecordingHistory raw, Instant at) {
+        var visibility = new RateHistoryStore.Visibility("inc-a", false);
+        Entry predecessor = raw.predecessorVisible("orders", visibility, at).orElse(null);
+        Instant end = at.plusSeconds(300);
+        List<Entry> entries = raw.readPageVisible("orders", visibility, at, end, null, 10).entries();
+        Entry successor = raw.successorVisible("orders", visibility, end).orElse(null);
+        HistoryAggregator aggregator = new HistoryAggregator(at, end, at, Duration.ofMinutes(5),
+                Duration.ofMinutes(1), List.of(), predecessor == null
+                        ? PipelineMetricsHistory.StartReason.WINDOW_START : PipelineMetricsHistory.StartReason.CONTINUATION,
+                HistoryRollupStore.MAX_FRAGMENTS + 1);
+        aggregator.begin(predecessor);
+        entries.forEach(aggregator::add);
+        HistoryAggregator.Projection projection = aggregator.finish(successor);
+        List<HistoryRollupStore.Fragment> fragments = projection.points().stream().map(point ->
+                new HistoryRollupStore.Fragment(point.segment(),
+                        HistoryRollupStore.StartReason.valueOf(point.startReason().name()),
+                        point.point().intervalStart(), point.point().intervalEnd(),
+                        cachedRate(point.point().recordsOut()), cachedRate(point.point().bytesOut()), List.of(),
+                        point.recordsOutStats() == null ? null : new HistoryRollupStore.CounterStats(
+                                point.recordsOutStats().delta(), point.recordsOutStats().coveredNanos(),
+                                point.recordsOutStats().maxRate()),
+                        point.bytesOutStats() == null ? null : new HistoryRollupStore.CounterStats(
+                                point.bytesOutStats().delta(), point.bytesOutStats().coveredNanos(),
+                                point.bytesOutStats().maxRate()), point.resumeAfter(), point.resumeAt())).toList();
+        List<HistoryRollupStore.Gap> gaps = projection.gaps().stream().map(gap ->
+                new HistoryRollupStore.Gap(gap.segment(), gap.gap().intervalStart(), gap.gap().intervalEnd(),
+                        HistoryRollupStore.GapReason.valueOf(gap.gap().reason().name()))).toList();
+        return new HistoryRollupStore.Bucket(new HistoryRollupStore.Key("orders",
+                HistoryRollupStore.Scope.incarnation("inc-a"), HistoryRollupStore.Resolution.PT5M, at),
+                NOW.minusSeconds(30), NOW.minusSeconds(30), NOW.plusSeconds(120), false,
+                fragments, gaps, entries.size());
+    }
+
+    private static RecordingHistory scopedUnknownBridge(boolean reset) {
+        RecordingHistory history = unknownBridge(reset);
+        Instant at = Instant.parse("2026-09-21T10:00:00Z");
+        history.addScoped(sample(at.plusSeconds(45).toString(), 900, 9_000, 0, Map.of(),
+                COUNTING_SINCE.plusSeconds(2)), new ObservationStore.Scope("other-incarnation", 1));
+        history.add(sample(at.plusSeconds(45).toString(), 800, 8_000, 0, Map.of(),
+                COUNTING_SINCE.plusSeconds(3)));
+        return history;
+    }
+
+    private static RecordingRollups staleUnknownBridgeCache(RecordingHistory raw) {
+        Instant at = Instant.parse("2026-09-21T10:00:00Z");
+        List<Entry> current = raw.entries.stream().filter(entry -> entry.scope()
+                .map(scope -> scope.pipelineIncarnationId().equals("inc-a")).orElse(false)).toList();
+        var first = new HistoryRollupStore.Fragment(0, HistoryRollupStore.StartReason.WINDOW_START,
+                at, at, null, null, List.of(), null, null, current.getFirst().key(), at);
+        var recordsPerSecond = java.math.BigDecimal.ONE
+                .divide(java.math.BigDecimal.valueOf(30), 30, java.math.RoundingMode.HALF_EVEN);
+        var bytesPerSecond = java.math.BigDecimal.TEN
+                .divide(java.math.BigDecimal.valueOf(30), 30, java.math.RoundingMode.HALF_EVEN);
+        var recordsRate = new HistoryRollupStore.Rate(java.math.BigDecimal.ONE,
+                recordsPerSecond.setScale(9, java.math.RoundingMode.HALF_EVEN),
+                recordsPerSecond.setScale(9, java.math.RoundingMode.HALF_EVEN));
+        var bytesRate = new HistoryRollupStore.Rate(java.math.BigDecimal.TEN,
+                bytesPerSecond.setScale(9, java.math.RoundingMode.HALF_EVEN),
+                bytesPerSecond.setScale(9, java.math.RoundingMode.HALF_EVEN));
+        var recordsStats = new HistoryRollupStore.CounterStats(java.math.BigDecimal.ONE,
+                Duration.ofSeconds(30).toNanos(), recordsPerSecond);
+        var bytesStats = new HistoryRollupStore.CounterStats(java.math.BigDecimal.TEN,
+                Duration.ofSeconds(30).toNanos(), bytesPerSecond);
+        var continued = new HistoryRollupStore.Fragment(1, HistoryRollupStore.StartReason.CONTINUATION,
+                at.plusSeconds(30), at.plusSeconds(90), recordsRate, bytesRate, List.of(),
+                recordsStats, bytesStats, current.getLast().key(), at.plusSeconds(90));
+        RecordingRollups cache = new RecordingRollups();
+        cache.add(new HistoryRollupStore.Bucket(new HistoryRollupStore.Key("orders",
+                HistoryRollupStore.Scope.incarnation("inc-a"), HistoryRollupStore.Resolution.PT5M, at),
+                NOW.minusSeconds(30), NOW.minusSeconds(30), NOW.plusSeconds(120), false,
+                List.of(first, continued), List.of(), 4));
+        return cache;
+    }
+
+    private static PipelineHistoryQueryService scopedCacheService(RecordingHistory raw,
+            RecordingRollups cache, java.util.function.Consumer<HistoryRollupStore.Key> hints,
+            java.util.function.Consumer<PipelineHistoryQueryService.RollupFallback> fallbacks, int budget) {
+        return new PipelineHistoryQueryService(artifactsWithOwner("inc-a", "orders"), raw, cache,
+                hints, fallbacks, Duration.ofMinutes(1), fixedClock(), cursorCodec(), 2, budget);
+    }
+
     private static PipelineHistoryQueryService cachedService(RecordingHistory raw, RecordingRollups cache) {
         return new PipelineHistoryQueryService(artifactsWith("orders"), raw, cache,
                 Duration.ofMinutes(1), fixedClock(), cursorCodec(), 128, 25_000);
@@ -626,6 +956,153 @@ class PipelineHistoryQueryServiceTest {
     }
 
     private static final Instant NOW = Instant.parse("2026-09-21T12:00:00Z");
+
+    @Test
+    void realResetAcrossAnUnknownSampleSurvivesRawAndAggregatePaging() {
+        for (HistoryResolution resolution : List.of(HistoryResolution.RAW, HistoryResolution.PT5M)) {
+            RecordingHistory history = unknownBridge(true);
+            PipelineHistoryQueryService service = new PipelineHistoryQueryService(
+                    artifactsWithOwner("inc-a", "orders"), history, Duration.ofMinutes(1), fixedClock(),
+                    cursorCodec(), 2, 100);
+            PipelineHistoryQuery wholeQuery = query("2026-09-21T10:00:00Z", "2026-09-21T10:02:00Z",
+                    resolution, 10, List.of(), null);
+            PipelineMetricsHistory whole = service.query(wholeQuery);
+            assertThat(whole.segments()).extracting(PipelineMetricsHistory.Segment::startReason)
+                    .contains(PipelineMetricsHistory.StartReason.COUNTER_RESET);
+            List<PipelineMetricsHistory.Point> paged = new ArrayList<>();
+            List<PipelineMetricsHistory.StartReason> reasons = new ArrayList<>();
+            String cursor = null;
+            do {
+                PipelineHistoryQueryService.QueryRun run = service.execute(query(
+                        "2026-09-21T10:00:00Z", "2026-09-21T10:02:00Z", resolution, 1, List.of(), cursor));
+                paged.addAll(points(run.history()));
+                run.history().segments().forEach(segment -> reasons.add(segment.startReason()));
+                assertThat(run.cost().rawDocumentsScanned()).isLessThanOrEqualTo(100);
+                assertThat(run.cost().peakRawEntriesHeld()).isLessThanOrEqualTo(3);
+                cursor = run.history().nextCursor();
+            } while (cursor != null);
+            assertThat(paged).isEqualTo(points(whole));
+            assertThat(reasons).contains(PipelineMetricsHistory.StartReason.COUNTER_RESET);
+            assertThat(whole.gaps()).isEmpty();
+            assertThat(points(whole).stream().map(PipelineMetricsHistory.Point::recordsOut)
+                    .filter(java.util.Objects::nonNull).toList()).singleElement()
+                    .satisfies(rate -> assertThat(rate.delta()).isEqualByComparingTo("1"));
+        }
+    }
+
+    @Test
+    void sameStartAcrossAnUnknownSampleContinuesWithoutInventingRates() {
+        RecordingHistory history = unknownBridge(false);
+        PipelineHistoryQueryService service = new PipelineHistoryQueryService(
+                artifactsWithOwner("inc-a", "orders"), history, Duration.ofMinutes(1), fixedClock(),
+                cursorCodec(), 2, 100);
+        PipelineMetricsHistory result = service.query(query("2026-09-21T10:00:00Z",
+                "2026-09-21T10:02:00Z", HistoryResolution.RAW, 10, List.of(), null));
+        assertThat(result.segments()).extracting(PipelineMetricsHistory.Segment::startReason)
+                .contains(PipelineMetricsHistory.StartReason.CONTINUATION)
+                .doesNotContain(PipelineMetricsHistory.StartReason.COUNTER_RESET);
+        assertThat(points(result).subList(0, 3)).allSatisfy(point -> {
+            assertThat(point.recordsOut()).isNull();
+            assertThat(point.bytesOut()).isNull();
+        });
+        assertThat(points(result).getLast().recordsOut().delta()).isEqualByComparingTo("1");
+        assertThat(result.gaps()).isEmpty();
+    }
+
+    @Test
+    void anUnknownPredecessorReconstructsEarlierEqualTimestampEvidence() {
+        RecordingHistory history = new RecordingHistory();
+        Instant at = Instant.parse("2026-09-21T10:00:00Z");
+        ObservationStore.Scope scope = new ObservationStore.Scope("inc-a", 41);
+        history.addScoped(sample(at.toString(), 3, 30, 0, Map.of(), COUNTING_SINCE), scope);
+        history.addScoped(new RateSample("orders", at, Map.of(), Map.of(), null), scope);
+        history.addScoped(sample(at.plusSeconds(30).toString(), 1, 10, 0, Map.of(),
+                COUNTING_SINCE.plusSeconds(1)), new ObservationStore.Scope("inc-a", 42));
+        PipelineHistoryQueryService service = new PipelineHistoryQueryService(
+                artifactsWithOwner("inc-a", "orders"), history, Duration.ofMinutes(1), fixedClock(),
+                cursorCodec(), 1, 100);
+        PipelineMetricsHistory result = service.query(new PipelineHistoryQuery("orders", at.plusSeconds(1),
+                at.plusSeconds(60), HistoryResolution.RAW, 1, List.of(), null));
+        assertThat(result.segments()).extracting(PipelineMetricsHistory.Segment::startReason)
+                .containsExactly(PipelineMetricsHistory.StartReason.COUNTER_RESET);
+        assertThat(points(result)).singleElement().satisfies(point -> {
+            assertThat(point.recordsOut()).isNull();
+            assertThat(point.bytesOut()).isNull();
+        });
+    }
+
+    @Test
+    void rebuildingUnknownBoundaryEvidenceSharesTheOriginalRawScanBudget() {
+        RecordingHistory history = new RecordingHistory();
+        Instant at = Instant.parse("2026-09-21T10:00:00Z");
+        for (int i = 0; i < 8; i++) {
+            history.add(sample(at.minusSeconds(480 - i * 60L).toString(), 3, 30, 0, Map.of(), COUNTING_SINCE));
+        }
+        history.add(new RateSample("orders", at, Map.of(), Map.of(), null));
+        history.add(sample(at.plusSeconds(30).toString(), 1, 10, 0, Map.of(), COUNTING_SINCE.plusSeconds(1)));
+        PipelineHistoryQueryService service = service(history, 2, 5);
+        TapstateException refusal = catchThrowableOfType(() -> service.query(new PipelineHistoryQuery("orders",
+                at.plusSeconds(1), at.plusSeconds(60), HistoryResolution.RAW, 1, List.of(), null)),
+                TapstateException.class);
+        assertThat(refusal).isNotNull();
+        assertThat(refusal.code()).isEqualTo(MonitorError.QUERY_BUDGET_EXCEEDED);
+        assertThat(refusal.args()).containsEntry("budget", "RAW_SCAN").containsEntry("limit", 5);
+    }
+
+    @Test
+    void anExpiredUnknownCursorAnchorKeepsEarlierEqualTimestampEvidence() {
+        RecordingHistory history = new RecordingHistory();
+        Instant at = Instant.parse("2026-09-21T10:00:00Z");
+        ObservationStore.Scope scope = new ObservationStore.Scope("inc-a", 41);
+        history.addScoped(sample(at.toString(), 3, 30, 0, Map.of(), COUNTING_SINCE), scope);
+        history.addScoped(new RateSample("orders", at, Map.of(), Map.of(), null), scope);
+        history.addScoped(sample(at.plusSeconds(30).toString(), 1, 10, 0, Map.of(),
+                COUNTING_SINCE.plusSeconds(1)), new ObservationStore.Scope("inc-a", 42));
+        PipelineHistoryQueryService service = new PipelineHistoryQueryService(
+                artifactsWithOwner("inc-a", "orders"), history, Duration.ofMinutes(1), fixedClock(),
+                cursorCodec(), 1, 100);
+        PipelineHistoryQuery request = new PipelineHistoryQuery("orders", at, at.plusSeconds(60),
+                HistoryResolution.RAW, 2, List.of(), null);
+        PipelineMetricsHistory first = service.query(request);
+        assertThat(first.nextCursor()).isNotBlank();
+        history.entries.remove(1);
+
+        PipelineMetricsHistory resumed = service.query(new PipelineHistoryQuery("orders", request.from(),
+                request.to(), request.resolution(), request.limit(), List.of(), first.nextCursor()));
+
+        assertThat(resumed.segments()).extracting(PipelineMetricsHistory.Segment::startReason)
+                .containsExactly(PipelineMetricsHistory.StartReason.COUNTER_RESET);
+        assertThat(points(resumed)).singleElement().satisfies(point -> {
+            assertThat(point.recordsOut()).isNull();
+            assertThat(point.bytesOut()).isNull();
+        });
+    }
+
+    private static RecordingHistory unknownBridge(boolean reset) {
+        RecordingHistory history = new RecordingHistory();
+        Instant at = Instant.parse("2026-09-21T10:00:00Z");
+        ObservationStore.Scope old = new ObservationStore.Scope("inc-a", 41);
+        ObservationStore.Scope rebuilt = new ObservationStore.Scope("inc-a", 42);
+        history.addScoped(sample(at.toString(), 3, 30, 0, Map.of(), COUNTING_SINCE), old);
+        history.addScoped(new RateSample("orders", at.plusSeconds(30), Map.of(), Map.of(), null), rebuilt);
+        Instant start = reset ? COUNTING_SINCE.plusSeconds(1) : COUNTING_SINCE;
+        long records = reset ? 1 : 5;
+        history.addScoped(sample(at.plusSeconds(60).toString(), records, records * 10, 0, Map.of(), start), rebuilt);
+        history.addScoped(sample(at.plusSeconds(90).toString(), records + 1, (records + 1) * 10, 0, Map.of(), start), rebuilt);
+        return history;
+    }
+
+    @Test
+    void aggregateCostCountsTheRetainedEntryWhenLoadingAnotherBatch() {
+        RecordingHistory history = unknownBridge(false);
+        PipelineHistoryQueryService service = new PipelineHistoryQueryService(
+                artifactsWithOwner("inc-a", "orders"), history, Duration.ofMinutes(1), fixedClock(),
+                cursorCodec(), 2, 100);
+        PipelineHistoryQueryService.QueryRun run = service.execute(query("2026-09-21T10:00:00Z",
+                "2026-09-21T10:02:00Z", HistoryResolution.PT5M, 10, List.of(), null));
+        assertThat(points(run.history())).isNotEmpty();
+        assertThat(run.cost().peakRawEntriesHeld()).isEqualTo(3);
+    }
     private static final Instant COUNTING_SINCE = Instant.parse("2026-09-21T00:00:00Z");
     private static final byte[] SECRET = "history-query-test-secret".getBytes(StandardCharsets.UTF_8);
 

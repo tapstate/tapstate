@@ -77,6 +77,52 @@ class HistoryAggregatorTest {
     }
 
     @Test
+    void aRealResetAcrossAnUnknownSampleRemainsVisibleWithoutInventingRates() {
+        Instant from = Instant.parse("2026-09-21T10:00:00Z");
+        HistoryAggregator aggregator = history(from);
+        aggregator.add(known(1, from, 3, START, 41));
+        aggregator.add(new Entry(new Key(from.plusSeconds(30), "002"),
+                new RateSample("orders", from.plusSeconds(30), Map.of(), Map.of(), null),
+                Optional.of(new ObservationStore.Scope("inc-a", 42))));
+        aggregator.add(known(3, from.plusSeconds(60), 1, START.plusSeconds(1), 42));
+
+        HistoryAggregator.Projection result = aggregator.finish(null);
+
+        assertThat(result.points()).extracting(Emitted::startReason).contains(StartReason.COUNTER_RESET);
+        assertThat(result.points()).allSatisfy(point -> {
+            assertThat(point.point().recordsOut()).isNull();
+            assertThat(point.point().bytesOut()).isNull();
+        });
+        assertThat(result.gaps()).isEmpty();
+        assertThat(result.peakRawEntriesHeld()).isLessThanOrEqualTo(2);
+    }
+
+    @Test
+    void aContinuousStartAcrossAnUnknownNewExecutionDoesNotInventResetOrRates() {
+        Instant from = Instant.parse("2026-09-21T10:00:00Z");
+        HistoryAggregator aggregator = history(from);
+        aggregator.add(known(1, from, 3, START, 41));
+        aggregator.add(new Entry(new Key(from.plusSeconds(30), "002"),
+                new RateSample("orders", from.plusSeconds(30), Map.of(), Map.of(), null),
+                Optional.of(new ObservationStore.Scope("inc-a", 42))));
+        aggregator.add(known(3, from.plusSeconds(60), 5, START, 42));
+        aggregator.add(known(4, from.plusSeconds(90), 6, START, 42));
+
+        HistoryAggregator.Projection result = aggregator.finish(null);
+
+        assertThat(result.points()).extracting(Emitted::startReason)
+                .contains(StartReason.CONTINUATION).doesNotContain(StartReason.COUNTER_RESET);
+        assertThat(result.points().stream().map(point -> point.point().recordsOut())
+                .filter(Objects::nonNull).toList()).singleElement().satisfies(rate ->
+                        assertThat(rate.delta()).isEqualByComparingTo("1"));
+        assertThat(result.points().stream().map(point -> point.point().bytesOut())
+                .filter(Objects::nonNull).toList()).singleElement().satisfies(rate ->
+                        assertThat(rate.delta()).isEqualByComparingTo("10"));
+        assertThat(result.gaps()).isEmpty();
+        assertThat(result.peakRawEntriesHeld()).isLessThanOrEqualTo(2);
+    }
+
+    @Test
     void aChangedKnownStartOrADecreasedKnownCounterStillReportsARealReset() {
         Instant from = Instant.parse("2026-09-21T10:00:00Z");
         HistoryAggregator newStart = history(from);

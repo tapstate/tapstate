@@ -190,10 +190,10 @@ public final class PipelineHistoryQueryService {
         if (cached != null) {
             run = cached;
         } else {
-            Entry predecessor = boundaryBefore(normalized, frozen, cost);
+            Boundary boundary = boundaryBefore(normalized, frozen, cost);
             run = effective.raw()
-                    ? raw(normalized, frozen, effective, predecessor, cost)
-                    : aggregate(normalized, frozen, effective, predecessor, cost);
+                    ? raw(normalized, frozen, effective, boundary, cost)
+                    : aggregate(normalized, frozen, effective, boundary, cost);
         }
         if (!visibility.equals(requirePipeline(normalized.binding().pipelineId()))) {
             throw new TapstateException(MonitorError.INVALID_CURSOR,
@@ -277,7 +277,7 @@ public final class PipelineHistoryQueryService {
             Bucket bucket = cached.get(at);
             if (hinted < MAX_REFRESH_OFFERS_PER_QUERY
                     && (bucket == null || !bucket.validUntil().isAfter(checkedAt)
-                            || bucket.inWindowSamples() < 0)) {
+                            || bucket.inWindowSamples() < 0 || ambiguousCounterBoundary(bucket))) {
                 offerRefresh(new HistoryRollupStore.Key(binding.pipelineId(), scope, resolution, at));
                 hinted++;
             }
@@ -285,6 +285,7 @@ public final class PipelineHistoryQueryService {
             if (!full || bucket == null || !bucket.usableAt(checkedAt)
                     || bucket.inWindowSamples() < 0
                     || bucket.inWindowSamples() > 0 && bucket.fragments().isEmpty()
+                    || ambiguousCounterBoundary(bucket)
                     || resume != null && resume.isRawFallback()
                             && resume.bucketStart().equals(at)) {
                 bucket = null;
@@ -301,7 +302,7 @@ public final class PipelineHistoryQueryService {
             }
             if (!resume.isRawFallback()) {
                 Bucket anchor = cached.get(resume.bucketStart());
-                if (anchor == null || !anchor.usableAt(checkedAt)
+                if (anchor == null || !anchor.usableAt(checkedAt) || ambiguousCounterBoundary(anchor)
                         || !anchor.computedAt().equals(resume.computedAt())
                         || resume.fragmentIndex() >= anchor.fragments().size()
                         || !Objects.equals(anchor.fragments().get(resume.fragmentIndex()).resumeAfter(),
@@ -318,7 +319,7 @@ public final class PipelineHistoryQueryService {
         List<Emitted> output = new ArrayList<>();
         List<Gap> observedGaps = new ArrayList<>();
         List<HistoryCursorCodec.CachePosition> positions = new ArrayList<>();
-        boolean passedAnchor = resume == null;
+        boolean passedAnchor = resume == null || resume.isRawFallback();
         int globalSegment = 0;
         int precedingLocalSegment = -1;
         Instant precedingBucket = null;
@@ -467,6 +468,22 @@ public final class PipelineHistoryQueryService {
                 .toList();
     }
 
+    /** Explicit uncovered counter intervals cannot qualify an unknown continuation boundary. */
+    private static boolean ambiguousCounterBoundary(Bucket bucket) {
+        for (Fragment fragment : bucket.fragments()) {
+            long span = Duration.between(fragment.intervalStart(), fragment.intervalEnd()).toNanos();
+            if (fragment.startReason() == HistoryRollupStore.StartReason.CONTINUATION
+                            && fragment.recordsOut() == null && fragment.bytesOut() == null
+                    || fragment.recordsOutStats() != null
+                            && fragment.recordsOutStats().coveredNanos() != span
+                    || fragment.bytesOutStats() != null
+                            && fragment.bytesOutStats().coveredNanos() != span) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private SliceProjection cachedSlice(Bucket bucket, List<String> tables) {
         List<SourcePoint> points = new ArrayList<>();
         for (int index = 0; index < bucket.fragments().size(); index++) {
@@ -494,24 +511,38 @@ public final class PipelineHistoryQueryService {
             EffectiveHistoryResolution effective, BucketSlice slice, Cost cost) {
         cost.rollupRawBuckets++;
         QueryBinding binding = normalized.binding();
-        cost.storeReads++;
-        Optional<Entry> boundary = history.predecessorVisible(binding.pipelineId(), binding.visibility(),
-                slice.from());
-        boundary.ifPresent(ignored -> cost.rawDocumentsScanned++);
-        Entry predecessor = retained(boundary, frozen).orElse(null);
-        requireScanBudget(cost);
-        HistoryAggregator aggregator = new HistoryAggregator(slice.from(), slice.to(), slice.from(),
+        HistoryCursorCodec.CachePosition position = frozen.cachePosition();
+        boolean resuming = position != null && position.isRawFallback()
+                && position.bucketStart().equals(slice.bucketStart());
+        Entry predecessor;
+        HistoryCounterCheckpoint checkpoint;
+        if (resuming) {
+            Boundary boundary = boundaryBefore(normalized, frozen, cost);
+            predecessor = boundary.predecessor();
+            checkpoint = boundary.checkpoint();
+        } else {
+            cost.storeReads++;
+            Optional<Entry> boundary = history.predecessorVisible(binding.pipelineId(), binding.visibility(),
+                    slice.from());
+            boundary.ifPresent(ignored -> cost.rawDocumentsScanned++);
+            predecessor = retained(boundary, frozen).orElse(null);
+            requireScanBudget(cost);
+            checkpoint = checkpointBefore(binding, frozen, predecessor, cost);
+        }
+        HistoryAggregator aggregator = new HistoryAggregator(slice.from(), slice.to(),
+                resuming ? frozen.resumeAt() : slice.from(),
                 effective.duration(), sampleInterval, normalized.tables(),
-                slice.from().equals(frozen.from()) ? StartReason.WINDOW_START : StartReason.CONTINUATION,
+                !resuming && slice.from().equals(frozen.from())
+                        ? StartReason.WINDOW_START : StartReason.CONTINUATION,
                 binding.limit() + 1);
-        aggregator.begin(predecessor);
-        Key after = null;
+        aggregator.begin(predecessor, checkpoint);
+        Key after = resuming ? frozen.afterKey() : null;
         int count = 0;
         boolean storeHasMore;
         do {
             Page page = history.readPageVisible(binding.pipelineId(), binding.visibility(),
                     slice.from(), slice.to(), after, rawBatchSize);
-            cost.page(page, predecessor == null ? 0 : 1);
+            cost.page(page, predecessor == null && count == 0 ? 0 : 1);
             requireScanBudget(cost);
             for (Entry entry : page.entries()) {
                 aggregator.add(entry);
@@ -527,7 +558,7 @@ public final class PipelineHistoryQueryService {
             }
         } while (storeHasMore);
         Entry successor = null;
-        if (count > 0 && !aggregator.full() && !storeHasMore) {
+        if ((count > 0 || resuming) && !aggregator.full() && !storeHasMore) {
             cost.storeReads++;
             successor = history.successorVisible(binding.pipelineId(), binding.visibility(),
                     slice.to()).orElse(null);
@@ -560,8 +591,10 @@ public final class PipelineHistoryQueryService {
     }
 
     private QueryRun raw(Normalized normalized, Frozen frozen, EffectiveHistoryResolution effective,
-            Entry predecessor, Cost cost) {
+            Boundary boundary, Cost cost) {
         QueryBinding binding = normalized.binding();
+        Entry predecessor = boundary.predecessor();
+        HistoryCounterCheckpoint checkpoint = boundary.checkpoint();
         Page page = history.readPageVisible(binding.pipelineId(), binding.visibility(),
                 frozen.from(), frozen.to(), frozen.afterKey(),
                 binding.limit());
@@ -576,7 +609,7 @@ public final class PipelineHistoryQueryService {
 
         Projection projection = rawProjection(page.entries(), predecessor,
                 frozen.afterKey() == null ? StartReason.WINDOW_START : StartReason.CONTINUATION,
-                frozen.from(), frozen.to(), normalized.tables());
+                frozen.from(), frozen.to(), normalized.tables(), checkpoint);
         String next = null;
         if (page.hasMore() && !page.entries().isEmpty()) {
             Entry last = page.entries().getLast();
@@ -592,13 +625,14 @@ public final class PipelineHistoryQueryService {
     }
 
     private QueryRun aggregate(Normalized normalized, Frozen frozen, EffectiveHistoryResolution effective,
-            Entry predecessor, Cost cost) {
+            Boundary boundary, Cost cost) {
         QueryBinding binding = normalized.binding();
+        Entry predecessor = boundary.predecessor();
         HistoryAggregator aggregator = new HistoryAggregator(frozen.from(), frozen.to(), frozen.resumeAt(),
                 effective.duration(), sampleInterval, normalized.tables(),
                 frozen.afterKey() == null ? StartReason.WINDOW_START : StartReason.CONTINUATION,
                 binding.limit() + 1);
-        aggregator.begin(predecessor);
+        aggregator.begin(predecessor, boundary.checkpoint());
 
         Key after = frozen.afterKey();
         boolean storeHasMore = true;
@@ -606,7 +640,7 @@ public final class PipelineHistoryQueryService {
         while (storeHasMore && !aggregator.full()) {
             Page page = history.readPageVisible(binding.pipelineId(), binding.visibility(),
                     frozen.from(), frozen.to(), after, rawBatchSize);
-            cost.page(page, predecessor == null ? 0 : 1);
+            cost.page(page, predecessor == null && inWindowSamples == 0 ? 0 : 1);
             predecessor = null;
             requireScanBudget(cost);
             for (Entry entry : page.entries()) {
@@ -660,7 +694,17 @@ public final class PipelineHistoryQueryService {
         return measured(response, cost);
     }
 
-    private Entry boundaryBefore(Normalized normalized, Frozen frozen, Cost cost) {
+    private HistoryCounterCheckpoint checkpointBefore(QueryBinding binding, Frozen frozen,
+            Entry predecessor, Cost cost) {
+        if (predecessor == null) { return new HistoryCounterCheckpoint(binding.pipelineId()); }
+        return HistoryCounterCheckpoint.replay(history, binding.visibility(), frozen.cutoff(), predecessor,
+                sampleInterval, rawBatchSize, page -> {
+                    cost.page(page, 1);
+                    requireScanBudget(cost);
+                });
+    }
+
+    private Boundary boundaryBefore(Normalized normalized, Frozen frozen, Cost cost) {
         QueryBinding binding = normalized.binding();
         if (frozen.afterKey() != null) {
             cost.storeReads++;
@@ -670,16 +714,10 @@ public final class PipelineHistoryQueryService {
                 cost.rawDocumentsScanned++;
                 cost.peakRawEntriesHeld = 1;
                 requireScanBudget(cost);
-                return exact.orElseThrow();
+                Entry predecessor = exact.orElseThrow();
+                return new Boundary(predecessor, checkpointBefore(binding, frozen, predecessor, cost));
             }
-            cost.storeReads++;
-            Optional<Entry> read = history.predecessorVisible(binding.pipelineId(), binding.visibility(),
-                    frozen.resumeAt());
-            read.ifPresent(ignored -> cost.rawDocumentsScanned++);
-            Optional<Entry> fallback = retained(read, frozen);
-            cost.peakRawEntriesHeld = read.isPresent() ? 1 : 0;
-            requireScanBudget(cost);
-            return fallback.orElse(null);
+            return recoverBeforeExpiredAnchor(binding, frozen, cost);
         }
         cost.storeReads++;
         Optional<Entry> read = history.predecessorVisible(binding.pipelineId(), binding.visibility(),
@@ -688,7 +726,33 @@ public final class PipelineHistoryQueryService {
         Optional<Entry> predecessor = retained(read, frozen);
         cost.peakRawEntriesHeld = read.isPresent() ? 1 : 0;
         requireScanBudget(cost);
-        return predecessor.orElse(null);
+        Entry entry = predecessor.orElse(null);
+        return new Boundary(entry, checkpointBefore(binding, frozen, entry, cost));
+    }
+
+    private Boundary recoverBeforeExpiredAnchor(QueryBinding binding, Frozen frozen, Cost cost) {
+        HistoryCounterCheckpoint checkpoint = new HistoryCounterCheckpoint(binding.pipelineId());
+        Entry predecessor = null;
+        Key after = null;
+        Instant end = frozen.afterKey().observedAt().plusMillis(1);
+        while (frozen.cutoff().isBefore(end)) {
+            Page page = history.readPageVisible(binding.pipelineId(), binding.visibility(),
+                    frozen.cutoff(), end, after, rawBatchSize);
+            cost.page(page, predecessor == null ? 0 : 1);
+            requireScanBudget(cost);
+            for (Entry entry : page.entries()) {
+                int byTime = entry.key().observedAt().compareTo(frozen.afterKey().observedAt());
+                if (byTime > 0 || byTime == 0 && entry.key().internalKey()
+                        .compareTo(frozen.afterKey().internalKey()) > 0) {
+                    return new Boundary(predecessor, checkpoint);
+                }
+                checkpoint.observe(entry, sampleInterval);
+                predecessor = entry;
+            }
+            if (!page.hasMore()) { break; }
+            after = page.lastKey().orElseThrow();
+        }
+        return new Boundary(predecessor, checkpoint);
     }
 
     private static Optional<Entry> retained(Optional<Entry> boundary, Frozen frozen) {
@@ -786,7 +850,7 @@ public final class PipelineHistoryQueryService {
     }
 
     private Projection rawProjection(List<Entry> entries, Entry predecessor, StartReason initialReason,
-            Instant from, Instant to, List<String> tables) {
+            Instant from, Instant to, List<String> tables, HistoryCounterCheckpoint checkpoint) {
         List<Emitted> points = new ArrayList<>();
         List<EmittedGap> gaps = new ArrayList<>();
         Entry previous = predecessor;
@@ -794,7 +858,8 @@ public final class PipelineHistoryQueryService {
         StartReason reason = initialReason;
         for (Entry current : entries) {
             Point point;
-            StartReason boundary = previous == null ? null : boundary(previous, current);
+            boolean reset = checkpoint.observe(current, sampleInterval);
+            StartReason boundary = previous == null ? null : boundary(previous, current, reset);
             if (boundary != null) {
                 segment++;
                 reason = boundary;
@@ -832,7 +897,7 @@ public final class PipelineHistoryQueryService {
         return new Projection(points, gaps);
     }
 
-    private StartReason boundary(Entry previous, Entry current) {
+    private StartReason boundary(Entry previous, Entry current, boolean reset) {
         RateSample left = previous.sample();
         RateSample right = current.sample();
         Duration elapsed = Duration.between(left.observedAt(), right.observedAt());
@@ -843,10 +908,7 @@ public final class PipelineHistoryQueryService {
                 && elapsed.compareTo(sampleInterval.multipliedBy(2)) >= 0) {
             return StartReason.GAP;
         }
-        // Only two known starts can prove a changed accumulation epoch.
-        boolean changedKnownStart = left.countingSince() != null && right.countingSince() != null
-                && !left.countingSince().equals(right.countingSince());
-        if (changedKnownStart
+        if (reset
                 || decreased(left, right, HistoryAggregator.RECORDS_OUT)
                 || decreased(left, right, HistoryAggregator.BYTES_OUT)) {
             return StartReason.COUNTER_RESET;
@@ -982,6 +1044,9 @@ public final class PipelineHistoryQueryService {
     }
 
     private record Normalized(QueryBinding binding, List<String> tables, String cursor) {
+    }
+
+    private record Boundary(Entry predecessor, HistoryCounterCheckpoint checkpoint) {
     }
 
     private record Frozen(Instant from, Instant to, Instant cutoff, Key afterKey, Instant resumeAt,

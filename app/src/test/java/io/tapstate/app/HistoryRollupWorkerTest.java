@@ -550,6 +550,201 @@ class HistoryRollupWorkerTest {
         });
     }
 
+    @Test
+    void rawBucketRestoresResetEvidenceBeforeAnUnknownPredecessor() {
+        InMemoryRateHistoryStore raw = unknownPredecessor(false, false);
+        Bucket bucket = refreshRaw(raw);
+
+        assertThat(bucket.requiresFinerResolution()).isFalse();
+        assertThat(bucket.inWindowSamples()).isEqualTo(2);
+        assertThat(bucket.fragments()).singleElement().satisfies(fragment -> {
+            assertThat(fragment.startReason()).isEqualTo(HistoryRollupStore.StartReason.COUNTER_RESET);
+            assertThat(fragment.intervalStart()).isEqualTo(TEN);
+            assertThat(fragment.recordsOut().delta()).isEqualByComparingTo("1");
+            assertThat(fragment.bytesOut().delta()).isEqualByComparingTo("10");
+            assertThat(fragment.recordsOutStats().coveredNanos()).isEqualTo(Duration.ofMinutes(1).toNanos());
+        });
+        assertThat(bucket.gaps()).isEmpty();
+    }
+
+    @Test
+    void rawBucketKeepsTheSameStartAcrossAnUnknownPredecessor() {
+        Bucket bucket = refreshRaw(unknownPredecessor(true, false));
+
+        assertThat(bucket.requiresFinerResolution()).isFalse();
+        assertThat(bucket.fragments()).singleElement().satisfies(fragment -> {
+            assertThat(fragment.startReason()).isEqualTo(HistoryRollupStore.StartReason.CONTINUATION);
+            assertThat(fragment.recordsOut().delta()).isEqualByComparingTo("1");
+            assertThat(fragment.bytesOut().delta()).isEqualByComparingTo("10");
+            assertThat(fragment.recordsOutStats().coveredNanos()).isEqualTo(Duration.ofMinutes(1).toNanos());
+        });
+        assertThat(bucket.gaps()).isEmpty();
+    }
+
+    @Test
+    void equalTimeUnknownPredecessorReplaysTheEarlierStableKey() {
+        Bucket bucket = refreshRaw(unknownPredecessor(false, true));
+
+        assertThat(bucket.requiresFinerResolution()).isFalse();
+        assertThat(bucket.fragments()).singleElement().satisfies(fragment -> {
+            assertThat(fragment.startReason()).isEqualTo(HistoryRollupStore.StartReason.COUNTER_RESET);
+            assertThat(fragment.recordsOut().delta()).isEqualByComparingTo("1");
+            assertThat(fragment.bytesOut().delta()).isEqualByComparingTo("10");
+        });
+        assertThat(bucket.gaps()).isEmpty();
+    }
+
+    @Test
+    void aGapBeforeAnUnknownPredecessorEndsOldResetEvidence() {
+        InMemoryRateHistoryStore raw = new InMemoryRateHistoryStore();
+        raw.appendScoped(outputs(TEN.minusSeconds(120), 3, START), owner(1));
+        raw.appendScoped(new RateSample(ID, TEN.minusSeconds(60), Map.of(), Map.of(), null), owner(2),
+                TEN.minusSeconds(120));
+        raw.appendScoped(outputs(TEN, 1, START.plusSeconds(1)), owner(2));
+        raw.appendScoped(outputs(TEN.plusSeconds(60), 2, START.plusSeconds(1)), owner(2));
+        Bucket bucket = refreshRaw(raw);
+
+        assertThat(bucket.fragments()).singleElement().satisfies(fragment -> {
+            assertThat(fragment.startReason()).isEqualTo(HistoryRollupStore.StartReason.CONTINUATION);
+            assertThat(fragment.recordsOut().delta()).isEqualByComparingTo("1");
+        });
+        assertThat(bucket.gaps()).isEmpty();
+    }
+
+    @Test
+    void aFreshAmbiguousBucketIsRebuiltBeforeReuse() {
+        MutableClock clock = new MutableClock(TEN.plus(Duration.ofMinutes(6)));
+        InMemoryRateHistoryStore raw = new InMemoryRateHistoryStore();
+        raw.appendScoped(outputs(TEN, 3, START), owner(1));
+        raw.appendScoped(new RateSample(ID, TEN.plusSeconds(60), Map.of(), Map.of(), null), owner(2));
+        raw.appendScoped(outputs(TEN.plusSeconds(120), 1, START.plusSeconds(1)), owner(2));
+        raw.appendScoped(outputs(TEN.plusSeconds(180), 61, START.plusSeconds(1)), owner(2));
+        var entries = raw.readPageVisible(ID, new Visibility("inc-a", false),
+                TEN, FIRST.bucketEnd(), null, 10).entries();
+        var first = new HistoryRollupStore.Fragment(0, HistoryRollupStore.StartReason.WINDOW_START,
+                TEN, TEN, null, null, List.of(), null, null, entries.getFirst().key(), TEN);
+        var continued = staleContinuation(TEN.plusSeconds(60), TEN.plusSeconds(180),
+                entries.getLast().key());
+        MemoryRollups rollups = new MemoryRollups();
+        rollups.upsert(new Bucket(FIRST, clock.instant(), clock.instant(),
+                clock.instant().plus(Duration.ofMinutes(5)), false,
+                List.of(first, continued), List.of(), 4));
+        rollups.attempts.clear();
+
+        try (HistoryRollupWorker worker = worker(raw, rollups, clock, 1,
+                List.of(new HistoryRollupWorker.Work(ID, SCOPED)), ignored -> true)) {
+            worker.runOneBatch();
+        }
+
+        Bucket rebuilt = rollups.read(FIRST).orElseThrow();
+        assertThat(rollups.attempts).containsExactly(FIRST);
+        assertThat(rebuilt.fragments()).filteredOn(fragment ->
+                fragment.startReason() == HistoryRollupStore.StartReason.COUNTER_RESET)
+                .singleElement().satisfies(fragment -> {
+                    assertThat(fragment.intervalStart()).isEqualTo(TEN.plusSeconds(120));
+                    assertThat(fragment.recordsOut().delta()).isEqualByComparingTo("60");
+                });
+        assertThat(rebuilt.gaps()).isEmpty();
+    }
+
+    @Test
+    void cascadeRejectsAChildThatLostAResetBehindAnUnknownSample() {
+        Key target = new Key(ID, SCOPED, Resolution.PT30M, TEN);
+        MutableClock clock = new MutableClock(target.bucketEnd().plus(Duration.ofMinutes(1)));
+        InMemoryRateHistoryStore raw = new InMemoryRateHistoryStore();
+        raw.appendScoped(outputs(TEN.minusSeconds(60), 3, START), owner(1));
+        raw.appendScoped(new RateSample(ID, TEN, Map.of(), Map.of(), null), owner(2));
+        raw.appendScoped(outputs(TEN.plusSeconds(60), 1, START.plusSeconds(1)), owner(2));
+        raw.appendScoped(outputs(TEN.plusSeconds(120), 61, START.plusSeconds(1)), owner(2));
+        var last = raw.readPageVisible(ID, new Visibility("inc-a", false), TEN, FIRST.bucketEnd(),
+                null, 10).entries().getLast().key();
+        MemoryRollups rollups = new MemoryRollups();
+        for (Instant at = TEN; at.isBefore(target.bucketEnd()); at = at.plus(Duration.ofMinutes(5))) {
+            Key childKey = new Key(ID, SCOPED, Resolution.PT5M, at);
+            List<HistoryRollupStore.Fragment> fragments = at.equals(TEN)
+                    ? List.of(staleContinuation(TEN, TEN.plusSeconds(120), last)) : List.of();
+            rollups.upsert(new Bucket(childKey, clock.instant(), clock.instant(),
+                    clock.instant().plus(Duration.ofMinutes(5)), false, fragments, List.of(),
+                    at.equals(TEN) ? 3 : 0));
+        }
+        rollups.attempts.clear();
+
+        try (HistoryRollupWorker worker = worker(raw, rollups, clock, 1,
+                List.of(new HistoryRollupWorker.Work(ID, SCOPED)), ignored -> true)) {
+            assertThat(worker.requestRefresh(target)).isTrue();
+            worker.runOneBatch();
+            worker.runOneBatch();
+        }
+
+        Bucket rebuilt = rollups.read(target).orElseThrow();
+        assertThat(rebuilt.requiresFinerResolution()).isFalse();
+        assertThat(rebuilt.inWindowSamples()).isEqualTo(3);
+        assertThat(rebuilt.fragments()).filteredOn(fragment ->
+                fragment.startReason() == HistoryRollupStore.StartReason.COUNTER_RESET)
+                .singleElement().satisfies(fragment -> {
+                    assertThat(fragment.intervalStart()).isEqualTo(TEN.plusSeconds(60));
+                    assertThat(fragment.recordsOut().delta()).isEqualByComparingTo("60");
+                });
+        assertThat(rebuilt.gaps()).isEmpty();
+    }
+
+    @Test
+    void aPrefixThatExhaustsTheExistingRawBudgetUsesTheFallbackMarker() {
+        InMemoryRateHistoryStore raw = new InMemoryRateHistoryStore();
+        for (int before = HistoryRollupWorker.MAX_RAW_ENTRIES_PER_BUCKET + 1; before > 0; before--) {
+            raw.appendScoped(new RateSample(ID, TEN.minusSeconds(before), Map.of(), Map.of(), null), owner(1));
+        }
+        raw.appendScoped(outputs(TEN, 1, START), owner(1));
+        raw.appendScoped(outputs(TEN.plusSeconds(60), 2, START), owner(1));
+        Bucket bucket = refreshRaw(raw);
+
+        assertThat(bucket.requiresFinerResolution()).isTrue();
+        assertThat(bucket.fragments()).isEmpty();
+        assertThat(bucket.gaps()).isEmpty();
+    }
+
+    private static InMemoryRateHistoryStore unknownPredecessor(boolean continuing, boolean equalTime) {
+        InMemoryRateHistoryStore raw = new InMemoryRateHistoryStore();
+        raw.appendScoped(outputs(TEN.minusSeconds(equalTime ? 60 : 120), 3, START), owner(1));
+        raw.appendScoped(new RateSample(ID, TEN.minusSeconds(60), Map.of(), Map.of(), null), owner(2));
+        Instant nextStart = continuing ? START : START.plusSeconds(1);
+        long nextValue = continuing ? 4 : 1;
+        raw.appendScoped(outputs(TEN, nextValue, nextStart), owner(2));
+        raw.appendScoped(outputs(TEN.plusSeconds(60), nextValue + 1, nextStart), owner(2));
+        raw.appendScoped(outputs(TEN.minusSeconds(30), 900, START.plusSeconds(2)),
+                new ObservationStore.Scope("other-incarnation", 1));
+        raw.append(outputs(TEN.minusSeconds(30), 800, START.plusSeconds(3)));
+        return raw;
+    }
+
+    private static Bucket refreshRaw(InMemoryRateHistoryStore raw) {
+        MutableClock clock = new MutableClock(TEN.plus(Duration.ofMinutes(6)));
+        MemoryRollups rollups = new MemoryRollups();
+        try (HistoryRollupWorker worker = worker(raw, rollups, clock, 1,
+                List.of(new HistoryRollupWorker.Work(ID, SCOPED)), ignored -> true)) {
+            assertThat(worker.requestRefresh(FIRST)).isTrue();
+            worker.runOneBatch();
+        }
+        return rollups.read(FIRST).orElseThrow();
+    }
+
+    private static RateSample outputs(Instant at, long records, Instant start) {
+        return new RateSample(ID, at, Map.of("records.out", records, "bytes.out", records * 10),
+                Map.of(), start);
+    }
+
+    private static HistoryRollupStore.Fragment staleContinuation(Instant start, Instant end,
+            io.tapstate.spi.store.RateHistoryStore.Key last) {
+        var rate = new HistoryRollupStore.Rate(BigDecimal.valueOf(60), BigDecimal.ONE, BigDecimal.ONE);
+        var stats = new HistoryRollupStore.CounterStats(BigDecimal.valueOf(60),
+                Duration.ofMinutes(1).toNanos(), BigDecimal.ONE);
+        var byteRate = new HistoryRollupStore.Rate(BigDecimal.valueOf(600), BigDecimal.TEN, BigDecimal.TEN);
+        var byteStats = new HistoryRollupStore.CounterStats(BigDecimal.valueOf(600),
+                Duration.ofMinutes(1).toNanos(), BigDecimal.TEN);
+        return new HistoryRollupStore.Fragment(0, HistoryRollupStore.StartReason.CONTINUATION,
+                start, end, rate, byteRate, List.of(), stats, byteStats, last, end);
+    }
+
     private static Bucket child(Key key, Instant now, int childIndex) {
         Instant readAt = now.minusSeconds(60);
         Instant validUntil = now.plusSeconds(childIndex == 0 ? 120 : 240);

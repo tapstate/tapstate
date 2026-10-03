@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.control.core.HistoryAggregator;
+import io.tapstate.control.core.HistoryCounterCheckpoint;
 import io.tapstate.control.core.HistoryAggregator.Emitted;
 import io.tapstate.control.core.HistoryAggregator.EmittedGap;
 import io.tapstate.control.core.PipelineMetricsHistory;
@@ -367,13 +368,20 @@ final class HistoryRollupWorker implements AutoCloseable {
         if (key.bucketEnd().isAfter(clock.instant())) {
             return false;
         }
-        if (rollups.read(key).isEmpty()) {
+        Bucket existing = rollups.read(key).orElse(null);
+        if (existing == null) {
             BuildResult built = upsert(key);
             if (built == BuildResult.NO_INPUT) {
                 emptyRetryAt.put(level, clock.instant().plus(EMPTY_POLL_INTERVAL));
                 return false;
             }
             if (built == BuildResult.OWNER_LOST) {
+                return false;
+            }
+        } else if (existing.usableAt(clock.instant()) && ambiguous(existing)) {
+            Bucket corrected = rawBucket(key);
+            if (corrected != null && boundariesDiffer(existing, corrected)
+                    && publishRaw(corrected) == BuildResult.OWNER_LOST) {
                 return false;
             }
         }
@@ -400,46 +408,84 @@ final class HistoryRollupWorker implements AutoCloseable {
     }
 
     private BuildResult upsertFromRaw(Key key) {
+        Bucket bucket = rawBucket(key);
+        return bucket == null ? BuildResult.NO_INPUT : publishRaw(bucket);
+    }
+
+    private BuildResult publishRaw(Bucket bucket) {
+        Key key = bucket.key();
+        if (!permitted.test(new Work(key.pipelineId(), key.scope()))) {
+            return BuildResult.OWNER_LOST;
+        }
+        rollups.upsert(bucket);
+        computed.incrementAndGet(key.resolution().ordinal());
+        return BuildResult.WRITTEN;
+    }
+
+    /** Replays only fixed scalar boundary evidence; all raw reads share the bucket's existing budget. */
+    private Bucket rawBucket(Key key) {
         Instant readStartedAt = clock.instant().truncatedTo(ChronoUnit.MILLIS);
         Visibility visibility = visibility(key.scope());
-        Entry predecessor = raw.predecessorVisible(key.pipelineId(), visibility, key.bucketStart())
-                .filter(entry -> !entry.key().observedAt().isBefore(readStartedAt.minus(rawRetention)))
+        Entry fetchedPredecessor = raw.predecessorVisible(key.pipelineId(), visibility, key.bucketStart())
                 .orElse(null);
+        Entry predecessor = fetchedPredecessor != null
+                && !fetchedPredecessor.key().observedAt().isBefore(readStartedAt.minus(rawRetention))
+                ? fetchedPredecessor : null;
+        RawBudget budget = new RawBudget();
+        HistoryCounterCheckpoint checkpoint = new HistoryCounterCheckpoint(key.pipelineId());
         List<Entry> entries = new ArrayList<>();
         TreeSet<String> tables = new TreeSet<>();
-        RateHistoryStore.Key after = null;
+        Entry successor = null;
         boolean tooLarge = false;
-        while (true) {
-            Page page = raw.readPageVisible(key.pipelineId(), visibility,
-                    key.bucketStart(), key.bucketEnd(), after, RateHistoryStore.MAX_PAGE_SIZE);
-            for (Entry entry : page.entries()) {
-                entries.add(entry);
-                tables.addAll(entry.sample().lag().keySet());
-                if (entries.size() > MAX_RAW_ENTRIES_PER_BUCKET
-                        || tables.size() > HistoryRollupStore.MAX_LAGS_PER_FRAGMENT) {
-                    tooLarge = true;
+        try {
+            if (fetchedPredecessor != null) {
+                budget.charge(1);
+            }
+            if (predecessor != null) {
+                checkpoint = HistoryCounterCheckpoint.replay(raw, visibility,
+                        readStartedAt.minus(rawRetention), predecessor, sampleInterval,
+                        RateHistoryStore.MAX_PAGE_SIZE, budget::charge);
+            }
+            RateHistoryStore.Key after = null;
+            while (true) {
+                Page page = raw.readPageVisible(key.pipelineId(), visibility,
+                        key.bucketStart(), key.bucketEnd(), after, RateHistoryStore.MAX_PAGE_SIZE);
+                budget.charge(page);
+                for (Entry entry : page.entries()) {
+                    entries.add(entry);
+                    tables.addAll(entry.sample().lag().keySet());
+                    if (tables.size() > HistoryRollupStore.MAX_LAGS_PER_FRAGMENT) {
+                        tooLarge = true;
+                        break;
+                    }
+                }
+                if (tooLarge || !page.hasMore()) {
                     break;
                 }
+                after = page.lastKey().orElseThrow();
             }
-            if (tooLarge || !page.hasMore()) {
-                break;
+            if (!tooLarge) {
+                successor = raw.successorVisible(key.pipelineId(), visibility, key.bucketEnd()).orElse(null);
+                if (successor != null) {
+                    budget.charge(1);
+                }
             }
-            after = page.lastKey().orElseThrow();
+        } catch (RawBudgetExceeded exhausted) {
+            tooLarge = true;
         }
 
         List<Fragment> fragments = List.of();
         List<Gap> gaps = List.of();
         if (!tooLarge) {
-            Entry successor = raw.successorVisible(key.pipelineId(), visibility, key.bucketEnd()).orElse(null);
             if (entries.isEmpty() && successor == null) {
-                return BuildResult.NO_INPUT;
+                return null;
             }
             HistoryAggregator aggregator = new HistoryAggregator(key.bucketStart(), key.bucketEnd(),
                     key.bucketStart(), key.resolution().duration(), sampleInterval, List.copyOf(tables),
                     predecessor == null ? PipelineMetricsHistory.StartReason.WINDOW_START
                             : PipelineMetricsHistory.StartReason.CONTINUATION,
                     HistoryRollupStore.MAX_FRAGMENTS + 1);
-            aggregator.begin(predecessor);
+            aggregator.begin(predecessor, checkpoint);
             for (Entry entry : entries) {
                 aggregator.add(entry);
                 if (aggregator.full()) {
@@ -466,13 +512,58 @@ final class HistoryRollupWorker implements AutoCloseable {
         if (!computedAt.isBefore(validUntil) || computedAt.isBefore(key.bucketEnd())) {
             throw new IllegalStateException("rollup inputs expired or the clock moved before bucket close");
         }
-        if (!permitted.test(new Work(key.pipelineId(), key.scope()))) {
-            return BuildResult.OWNER_LOST;
+        return new Bucket(key, computedAt, readStartedAt, validUntil, tooLarge,
+                tooLarge ? List.of() : fragments, tooLarge ? List.of() : gaps, entries.size());
+    }
+
+    /** Incomplete coverage cannot prove that an unknown frame did not hide a reset. */
+    private static boolean ambiguous(Bucket bucket) {
+        if (bucket.inWindowSamples() < 0
+                || bucket.inWindowSamples() > 0 && bucket.fragments().isEmpty()) {
+            return true;
         }
-        rollups.upsert(new Bucket(key, computedAt, readStartedAt, validUntil, tooLarge,
-                tooLarge ? List.of() : fragments, tooLarge ? List.of() : gaps, entries.size()));
-        computed.incrementAndGet(key.resolution().ordinal());
-        return BuildResult.WRITTEN;
+        for (Fragment part : bucket.fragments()) {
+            long span = Duration.between(part.intervalStart(), part.intervalEnd()).toNanos();
+            if (span == 0 || part.recordsOut() == null && part.bytesOut() == null
+                    || part.recordsOut() != null && (part.recordsOutStats() == null
+                            || part.recordsOutStats().coveredNanos() != span)
+                    || part.bytesOut() != null && (part.bytesOutStats() == null
+                            || part.bytesOutStats().coveredNanos() != span)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean boundariesDiffer(Bucket cached, Bucket corrected) {
+        return corrected.requiresFinerResolution()
+                || !cached.gaps().equals(corrected.gaps())
+                || !cached.fragments().stream()
+                        .filter(part -> part.startReason() == HistoryRollupStore.StartReason.COUNTER_RESET)
+                        .map(Fragment::intervalStart).toList().equals(corrected.fragments().stream()
+                                .filter(part -> part.startReason() == HistoryRollupStore.StartReason.COUNTER_RESET)
+                                .map(Fragment::intervalStart).toList());
+    }
+
+    private static final class RawBudget {
+        private int scanned;
+
+        void charge(Page page) {
+            charge(page.entries().size() + (page.hasMore() ? 1 : 0));
+        }
+
+        void charge(int count) {
+            scanned = Math.addExact(scanned, count);
+            if (scanned > MAX_RAW_ENTRIES_PER_BUCKET) {
+                throw new RawBudgetExceeded();
+            }
+        }
+    }
+
+    private static final class RawBudgetExceeded extends RuntimeException {
+        private RawBudgetExceeded() {
+            super(null, null, false, false);
+        }
     }
 
     /** A missing, stale or complex child is recomputed from bounded raw input for this coarse bucket. */
@@ -490,7 +581,7 @@ final class HistoryRollupWorker implements AutoCloseable {
                 at = at.plus(finer.duration())) {
             Bucket child = rollups.read(new Key(key.pipelineId(), key.scope(), finer, at)).orElse(null);
             if (child == null || !child.usableAt(readAt) || child.inWindowSamples() < 0
-                    || !child.gaps().isEmpty() || child.fragments().size() > 1) {
+                    || !child.gaps().isEmpty() || child.fragments().size() > 1 || ambiguous(child)) {
                 return null;
             }
             earliestRead = earliestRead == null || child.inputReadStartedAt().isBefore(earliestRead)

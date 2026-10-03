@@ -84,6 +84,7 @@ public final class HistoryAggregator {
     private final List<EmittedGap> gaps = new ArrayList<>();
 
     private Entry previous;
+    private HistoryCounterCheckpoint checkpoint;
     private Bucket active;
     private int segment;
     private StartReason segmentReason;
@@ -115,10 +116,20 @@ public final class HistoryAggregator {
 
     /** Supplies the predecessor without outputting it. */
     public void begin(Entry predecessor) {
+        begin(predecessor, null);
+    }
+
+    /** Supplies scalar evidence already reconstructed through the actual predecessor. */
+    public void begin(Entry predecessor, HistoryCounterCheckpoint checkpoint) {
         if (previous != null) {
             throw new IllegalStateException("a history aggregation predecessor is supplied once");
         }
         previous = predecessor;
+        this.checkpoint = checkpoint;
+        if (predecessor != null && checkpoint == null) {
+            this.checkpoint = new HistoryCounterCheckpoint(predecessor.sample().pipelineId());
+            this.checkpoint.observe(predecessor, gapThreshold.dividedBy(2));
+        }
     }
 
     /** Adds one in-window sample. Calls may span any number of store pages. */
@@ -128,6 +139,10 @@ public final class HistoryAggregator {
             throw new IllegalStateException("rate-history entries are not in stable ascending order");
         }
         if (previous == null) {
+            if (checkpoint == null) {
+                checkpoint = new HistoryCounterCheckpoint(current.sample().pipelineId());
+            }
+            checkpoint.observe(current, gapThreshold.dividedBy(2));
             if (current.gapFrom() != null) {
                 segmentReason = StartReason.GAP;
                 Instant gapStart = max(resumeFrom, current.gapFrom());
@@ -210,16 +225,14 @@ public final class HistoryAggregator {
     private StartReason boundary(Entry previous, Entry current, Duration elapsed) {
         RateSample left = previous.sample();
         RateSample right = current.sample();
+        boolean reset = checkpoint.observe(current, gapThreshold.dividedBy(2));
         if (current.gapFrom() != null) {
             return StartReason.GAP;
         }
         if (!elapsed.isZero() && elapsed.compareTo(gapThreshold) >= 0) {
             return StartReason.GAP;
         }
-        // Only two known starts can prove a changed accumulation epoch.
-        boolean changedKnownStart = left.countingSince() != null && right.countingSince() != null
-                && !left.countingSince().equals(right.countingSince());
-        if (changedKnownStart
+        if (reset
                 || decreased(left, right, RECORDS_OUT)
                 || decreased(left, right, BYTES_OUT)) {
             return StartReason.COUNTER_RESET;
