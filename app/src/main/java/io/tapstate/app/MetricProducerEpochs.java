@@ -11,8 +11,10 @@ import io.tapstate.spi.store.ObservationContinuation;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /** Native producer epochs stay separate from public starts; only budgeted, folded facts are retained. */
 final class MetricProducerEpochs {
@@ -153,6 +155,13 @@ final class MetricProducerEpochs {
             List<MetricFact> alreadyContinued, Instant at) {
         Map<String, MetricFact> folded = byName(foldedFacts);
         Map<String, MetricFact> projected = byName(alreadyContinued);
+        Map<String, MetricFact> offered = byName(rawFacts);
+        Set<Group> supplied = new LinkedHashSet<>();
+        for (MetricFact raw : rawFacts) {
+            if (raw.type() != MetricType.GAUGE) {
+                groups(raw).keySet().forEach(producer -> supplied.add(new Group(raw.name(), raw.type(), raw.unit(), producer)));
+            }
+        }
         for (MetricFact raw : rawFacts) {
             if (raw.type() == MetricType.GAUGE || raw.points().isEmpty()
                     || CardinalityBudget.forInstrument(raw.name()).isEmpty()) {
@@ -203,7 +212,25 @@ final class MetricProducerEpochs {
             projected.put(raw.name(), new MetricFact(publicFact.name(), publicFact.type(), publicFact.unit(),
                     List.copyOf(publicPoints.values())));
         }
+        accounts.forEach((group, account) -> {
+            // An explicitly supplied invalid epoch is rejected above, rather than hidden by a retained point.
+            if (supplied.contains(group) || account.published.isEmpty()) { return; }
+            MetricFact raw = offered.get(group.name());
+            MetricFact measured = folded.get(group.name());
+            MetricFact current = projected.get(group.name());
+            if (!sameShapeOrAbsent(group, raw) || !sameShapeOrAbsent(group, measured)
+                    || !sameShapeOrAbsent(group, current)) { return; }
+            Map<Map<String, String>, MetricPoint> retained = new LinkedHashMap<>();
+            if (current != null) { current.points().forEach(point -> retained.put(point.attributes(), point)); }
+            // A quiet native producer has no fresh measurement. Keep the exact known public point and its time.
+            account.published.forEach(retained::putIfAbsent);
+            projected.put(group.name(), new MetricFact(group.name(), group.type(), group.unit(), List.copyOf(retained.values())));
+        });
         return List.copyOf(projected.values());
+    }
+
+    private static boolean sameShapeOrAbsent(Group group, MetricFact fact) {
+        return fact == null || fact.type() == group.type() && fact.unit().equals(group.unit());
     }
 
     /** The bounded last known cumulative points, including producers absent from a quiet frame. */
