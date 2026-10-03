@@ -29,7 +29,6 @@ public final class ControlOperations {
             Map.of(Frontend.CLI, Maturity.CURRENT, Frontend.MCP, Maturity.CURRENT);
     private static final Map<Frontend, Maturity> CLI_AND_REST =
             Map.of(Frontend.CLI, Maturity.CURRENT, Frontend.REST, Maturity.CURRENT);
-    private static final Map<Frontend, Maturity> REST_ONLY = Map.of(Frontend.REST, Maturity.CURRENT);
 
     // system domain
     public static final Operation SYSTEM_VERSION = new Operation(
@@ -224,7 +223,7 @@ public final class ControlOperations {
     public static final Operation PIPELINE_PREVIEW = new Operation(
             "pipeline.preview", Scope.READ, false, null,
             "Run a bounded preview of an uncommitted Pipeline candidate without writing a target or artifact.",
-            REST_ONLY);
+            CLI_AND_REST);
     public static final Operation PIPELINE_DRAFT_PUBLISH = new Operation(
             "pipeline-draft.publish", Scope.WRITE, true, null,
             "Compile and atomically publish one Pipeline draft after its revision and artifact checks.", CLI_AND_REST);
