@@ -6,32 +6,46 @@ import io.tapdata.entity.schema.TapTable;
 import io.tapdata.pdk.apis.context.TapConnectorContext;
 import io.tapdata.pdk.apis.functions.ConnectorFunctions;
 import io.tapdata.pdk.apis.entity.TapAdvanceFilter;
+import io.tapdata.pdk.apis.entity.TapExecuteCommand;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.spi.sink.OnFullLoad;
 import io.tapstate.spi.sink.SinkPreparationNamespace;
 import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.spi.store.KeyedStateStore;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /** Prepares each table before writing; a durable receipt prevents destructive preparation on recovery. */
 final class PdkTargetPreparation {
+    private static final Set<String> MONGO_TARGETS = Set.of(
+            "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb");
     private final TapConnectorContext context;
     private final ConnectorFunctions functions;
     private final OnFullLoad onFullLoad;
     private final boolean fullLoad;
     private final String namespace;
     private final KeyedStateStore stateStore;
+    private final boolean mongoTarget;
     private final Set<String> prepared = new HashSet<>();
 
     PdkTargetPreparation(TapConnectorContext context, ConnectorFunctions functions, OnFullLoad onFullLoad,
             boolean fullLoad, PipelineNode node, KeyedStateStore stateStore) {
+        this(null, context, functions, onFullLoad, fullLoad, node, stateStore);
+    }
+
+    PdkTargetPreparation(String connectorId, TapConnectorContext context, ConnectorFunctions functions,
+            OnFullLoad onFullLoad, boolean fullLoad, PipelineNode node, KeyedStateStore stateStore) {
         this.context = context;
         this.functions = functions;
         this.onFullLoad = onFullLoad;
         this.fullLoad = fullLoad;
         this.namespace = SinkPreparationNamespace.of(node);
         this.stateStore = stateStore;
+        this.mongoTarget = connectorId != null && MONGO_TARGETS.contains(connectorId);
     }
 
     void prepare(TargetTable target, TapTable table) throws Throwable {
@@ -44,10 +58,15 @@ final class PdkTargetPreparation {
         }
         byte[] receipt = namespace == null || stateStore == null
                 ? null : stateStore.load(namespace, target.name()).orElse(null);
+        if (mongoTarget && receipt == null && fullLoad) {
+            // MongoDB create-table always reports new, and can already create indexes. Count or
+            // clear first; both operations also accept a missing collection without creating it.
+            prepareExisting(table);
+        }
         boolean created = create(table);
         boolean primaryKeyAlreadyCreated = created || (receipt != null && receipt[0] == 2);
         if (receipt == null) {
-            if (!created && fullLoad) {
+            if (!mongoTarget && !created && fullLoad) {
                 prepareExisting(table);
             }
             if (namespace != null && stateStore != null) {
@@ -85,6 +104,10 @@ final class PdkTargetPreparation {
             case APPEND -> { }
             case CLEAR -> {
                 if (functions.getClearTableFunction() == null) {
+                    if (mongoTarget && functions.getExecuteCommandFunction() != null) {
+                        clearMongo(table);
+                        break;
+                    }
                     throw new IllegalStateException("target table " + table.getId()
                             + " cannot honor on_full_load clear: connector provides no clear-table function");
                 }
@@ -107,6 +130,34 @@ final class PdkTargetPreparation {
                             + " is not empty; on_full_load is fail");
                 }
             }
+        }
+    }
+
+    private void clearMongo(TapTable table) throws Throwable {
+        // The connector rejects an empty delete filter. A constant true expression matches every
+        // document, including null or missing ids, without dropping indexes or collection options.
+        Map<String, Object> params = new HashMap<>();
+        params.put("op", "delete");
+        params.put("collection", table.getId());
+        params.put("filter", Map.of("$expr", true));
+        // The connector supplies its configured database by updating the mutable parameters.
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        AtomicBoolean completed = new AtomicBoolean();
+        functions.getExecuteCommandFunction().execute(context,
+                TapExecuteCommand.create().command("execute").params(params), result -> {
+                    if (result != null) {
+                        if (result.getError() != null) {
+                            failure.compareAndSet(null, result.getError());
+                        } else if (result.getResult() instanceof Number rows && rows.longValue() >= 0) {
+                            completed.set(true);
+                        }
+                    }
+                });
+        if (failure.get() != null) {
+            throw failure.get();
+        }
+        if (!completed.get()) {
+            throw new IllegalStateException("clear command did not report success for target table " + table.getId());
         }
     }
 }
