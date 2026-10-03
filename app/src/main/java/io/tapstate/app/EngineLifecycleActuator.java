@@ -270,6 +270,11 @@ final class EngineLifecycleActuator implements LifecycleActuator {
                         && observationScope.equals(job.scope())).map(Engine.ExecutionJob::job) : Optional.empty();
             }
 
+            @Override public Optional<StopReservation.Source> submittedSource() {
+                return Optional.ofNullable(submittedExecution).map(job -> new StopReservation.Source(
+                        job.job().clusterId(), job.scope(), job.job()));
+            }
+
             @Override
             public void submit() {
                 if (closed || submitted) {

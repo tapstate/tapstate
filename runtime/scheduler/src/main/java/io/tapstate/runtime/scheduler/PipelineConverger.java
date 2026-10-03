@@ -119,7 +119,7 @@ public final class PipelineConverger {
                 ConvergeResult.ExecutionBoundary submission = null;
                 try (LifecycleActuator.PreparedStart prepared = actuator.prepareStart(pipelineId)) {
                     prepared.submit();
-                    var source = actuator.stopSource(pipelineId).orElse(null);
+                    var source = prepared.submittedSource().orElse(null);
                     if (source != null && source.scope() != null && source.oldJob() != null) {
                         submission = new ConvergeResult.ExecutionBoundary(source.scope(), actualDoc.orElseThrow().epoch(),
                                 PipelineState.RUNNING, clock.instant(), false);

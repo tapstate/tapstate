@@ -194,6 +194,29 @@ class EngineLifecycleActuatorTest {
     }
 
     @Test
+    void anUnscopedCompatibilityStartIsNotFailedByAnUnavailableEventReceipt() {
+        var calls = new CopyOnWriteArrayList<String>();
+        var state = new InMemoryStateStore();
+        state.create(PIPE, StateJson.of(PipelineState.RUNNING), Instant.now());
+        var before = state.read(PIPE).orElseThrow();
+        var desired = new InMemoryDesiredStore();
+        desired.save(new DesiredState(PIPE, PipelineState.RUNNING, "rev-1"));
+        var actuator = new EngineLifecycleActuator(new Engine(member), new RecordingDagSource(calls),
+                new RecordingCaptureCoordinator(calls), teardown(),
+                PipelineActuationOwnership.single("single", new InMemoryWorkloadClaimStore()));
+
+        var restored = new PipelineConverger(desired, state, actuator, Clock.systemUTC()).converge(PIPE);
+
+        assertThat(restored.status()).isEqualTo(ConvergeStatus.CONVERGED);
+        assertThat(restored.checkpoint()).contains(before);
+        assertThat(state.read(PIPE)).contains(before);
+        awaitStatus(member.getJet().getJob(PIPE), JobStatus.RUNNING);
+        assertThat(restored.executionBoundary()).isEmpty();
+        assertThat(calls).contains("startCapture:" + PIPE, "buildDag:" + PIPE)
+                .doesNotContain("stopCapture:" + PIPE + "[keep][jobLive]");
+    }
+
+    @Test
     void pausingFreezesKnownCountersBeforeTheNativeProducerIsSuspended() {
         freezeAtLifecycleBoundary(true);
     }

@@ -27,6 +27,11 @@ public interface LifecycleActuator {
     interface PreparedStart extends AutoCloseable {
         void submit();
 
+        /** The actual scoped execution captured by a successful submission, when this binding supplies one. */
+        default Optional<StopReservation.Source> submittedSource() {
+            return Optional.empty();
+        }
+
         @Override
         void close();
     }
