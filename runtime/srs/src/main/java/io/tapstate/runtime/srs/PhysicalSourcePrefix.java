@@ -136,6 +136,8 @@ final class PhysicalSourcePrefix implements AutoCloseable {
     /** Whether the last release written was refused by the store, and since when releases have been. */
     private boolean refused;
     private long refusedSinceNanos;
+    /** Whether releases are held: the runs are recorded and nothing is written down. */
+    private boolean held;
     private boolean started;
     private boolean closed;
     /** Set before the stream behind the account is closed, so whatever that close cuts short fails nothing. */
@@ -437,6 +439,9 @@ final class PhysicalSourcePrefix implements AutoCloseable {
      * that has refused releases for {@link #UNWRITTEN_BOUND_MILLIS} in a row stops the account with its refusal.
      */
     private boolean release(Collection<ConsumerOffset> consumers) {
+        if (held) {
+            return false;
+        }
         Map<String, ConsumerOffset> current = new LinkedHashMap<>();
         consumers.forEach(consumer -> current.put(consumer.pipelineId(), consumer));
         boolean released = false;
@@ -595,6 +600,22 @@ final class PhysicalSourcePrefix implements AutoCloseable {
      */
     void closing() {
         closing = true;
+    }
+
+    /**
+     * Holds every release until {@link #unhold}: the runs the source hands over are still recorded, and nothing
+     * is written down. For a reader publishing a wider selection: from the moment the store may take it, a
+     * pipeline may find its table published and begin its load, and a release by the stream that does not read
+     * that table yet would carry the chain past changes the load did not cover.
+     */
+    synchronized void hold() {
+        held = true;
+    }
+
+    /** Lets the releases {@link #hold} held be written again, from the next re-check on. */
+    synchronized void unhold() {
+        held = false;
+        recheckSoon();
     }
 
     /** How many recorded runs are waiting on a confirmation; for the cases. */

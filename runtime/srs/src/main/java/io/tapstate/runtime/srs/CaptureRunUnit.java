@@ -536,7 +536,9 @@ public final class CaptureRunUnit {
      * what it had not is read by the second. Rings are kept, and so is every reader of them. Everything up to
      * the publication is done with the first stream still running, so a store that fails a widening for a
      * moment stops nothing; once the publication stands, only a stream over it may read the chain, and a wider
-     * stream that cannot be started after a second try leaves the reader closed.
+     * stream that cannot be started after a second try leaves the reader closed. While the publication is under
+     * way the first stream releases nothing, and one the store took without answering is settled by what the
+     * store holds afterwards.
      *
      * <p>Each table's durable log is cut as a run is released, through the last sequence the run reached in
      * that table: everyone who reads that ring has landed everything up to there, and a sequence is only ever
@@ -546,6 +548,10 @@ public final class CaptureRunUnit {
 
         /** How many times a publication raced by a newer request is taken again before the start gives up. */
         private static final int PUBLISH_ATTEMPTS = 8;
+
+        /** A wider selection published without an answer, and where the stream over it begins once it stands. */
+        private record Unsettled(SrsMetaStore.PhysicalSelection wider, CaptureStart start) {
+        }
 
         private final CaptureRunSpec spec;
         private final String chainId;
@@ -557,6 +563,10 @@ public final class CaptureRunUnit {
         private final AtomicReference<Subscription> stream = new AtomicReference<>();
         /** The last position the source was told it may release, for a stream that replaces the one told. */
         private volatile SourcePosition acknowledged;
+        /** The account of the stream running now. */
+        private PhysicalSourcePrefix account;
+        /** A wider selection whose publication the store has not yet said it took, and where its stream begins. */
+        private Unsettled unsettled;
         private boolean closed;
 
         SharedTail(CaptureRunSpec spec, String chainId, long epoch, CaptureHealth health) {
@@ -606,6 +616,9 @@ public final class CaptureRunUnit {
             if (closed || stream.get() == null) {
                 return false;
             }
+            if (unsettled != null) {
+                return settle();
+            }
             // Every table a pipeline reads through the ring is asked for before its selection is recorded, so a
             // look that finds nothing asked has nothing to take on -- and nothing to write.
             if (meta.requestedPhysicalTables(chainId).isEmpty()) {
@@ -622,10 +635,27 @@ public final class CaptureRunUnit {
                 CaptureStart start = tailStart(meta, chainId, spec.pipelineId(), null, false, CaptureStart.present());
                 SrsMetaStore.PhysicalSelection wider =
                         new SrsMetaStore.PhysicalSelection(epoch, published.revision() + 1, tables);
-                if (meta.replacePhysicalSelection(chainId, published, wider)) {
+                // Nothing is released while the publication is under way: from the moment the store may take it,
+                // a pipeline may find its table published and begin its load past where the running stream, which
+                // does not read that table, would release.
+                account.hold();
+                boolean replaced;
+                try {
+                    replaced = meta.replacePhysicalSelection(chainId, published, wider);
+                } catch (TapstateException unanswered) {
+                    if (unanswered.code() != IoError.STORE_UNAVAILABLE) {
+                        account.unhold();
+                        throw unanswered;
+                    }
+                    // The write may have landed and only its answer been lost: what the store holds says which.
+                    unsettled = new Unsettled(wider, start);
+                    return settle();
+                }
+                if (replaced) {
                     replaceTheStream(wider, start);
                     return true;
                 }
+                account.unhold();
                 if (meta.physicalSelection(chainId).filter(published::equals).isEmpty()) {
                     // Whoever replaced what this reader published owns the chain now.
                     closed = true;
@@ -638,6 +668,30 @@ public final class CaptureRunUnit {
                     return false;
                 }
             }
+        }
+
+        /**
+         * Settles a wider selection whose publication was not answered, by what the store holds now. Holding it,
+         * the store took the publication, and the stream over it starts where it would have. Holding what this
+         * reader published, it did not: the running stream releases again, and a later look widens anew. Holding
+         * anything else, whoever wrote it owns the chain. A store that cannot say yet leaves it to the next look,
+         * the running stream still reading and still releasing nothing.
+         */
+        private boolean settle() {
+            Optional<SrsMetaStore.PhysicalSelection> held = meta.physicalSelection(chainId);
+            Unsettled pending = unsettled;
+            unsettled = null;
+            if (held.filter(pending.wider()::equals).isPresent()) {
+                replaceTheStream(pending.wider(), pending.start());
+                return true;
+            }
+            account.unhold();
+            if (held.filter(published::equals).isPresent()) {
+                return false;
+            }
+            closed = true;
+            closeTheStream();
+            throw new TapstateException(CaptureError.SHARED_SELECTION_RESTART_REQUIRED, Map.of("chain", chainId), null);
         }
 
         /**
@@ -690,6 +744,7 @@ public final class CaptureRunUnit {
             CaptureConfig physical = spec.config().over(selection.tables()).sharing(notes);
             Subscription begun = CdcPhase.run(port, physical, start, routes, health, prefix);
             stream.set(begun);
+            account = prefix;
             // Told at once where the chain stands, as the stream it replaces was: on a quiet chain that position
             // may not change again for a long while, and a source never told it keeps its log.
             SourcePosition told = acknowledged;

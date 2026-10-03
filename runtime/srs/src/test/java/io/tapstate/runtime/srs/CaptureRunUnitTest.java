@@ -1936,6 +1936,133 @@ class CaptureRunUnitTest {
     }
 
     /**
+     * A widening the store took but whose answer was lost -- the write landed, the reply did not -- is settled by
+     * what the store holds: the wider selection is published, so the stream over it starts, from where the chain
+     * stood before the publication. Left reading the narrower stream, the reader would go on releasing runs that
+     * owe nothing to a pipeline that found its table published and began its load, past changes it still needs.
+     */
+    @Test
+    void aWideningWhoseAnswerWasLostIsSettledByWhatTheStoreHolds() {
+        java.util.concurrent.atomic.AtomicBoolean loseTheAnswer = new java.util.concurrent.atomic.AtomicBoolean();
+        InMemoryMeta meta = new InMemoryMeta() {
+            @Override
+            public synchronized boolean replacePhysicalSelection(
+                    String miningChainId, PhysicalSelection current, PhysicalSelection wider) {
+                boolean applied = super.replacePhysicalSelection(miningChainId, current, wider);
+                if (applied && loseTheAnswer.compareAndSet(true, false)) {
+                    throw new TapstateException(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE,
+                            Map.of("detail", "the answer was lost"), null);
+                }
+                return applied;
+            }
+        };
+        FakeSource source = new FakeSource(List.of(), List.of());
+        CaptureRunUnit unit = runUnit(source, meta);
+        CaptureRun owner = unit.start(specOver("pipe-1", "k-widen-lost", "orders"), e -> { });
+        String chainId = owner.chainId().orElseThrow().value();
+        meta.requestPhysicalTables(chainId, meta.read(chainId).orElseThrow().epoch(), List.of("customers"));
+        loseTheAnswer.set(true);
+
+        assertThat(unit.widen(owner)).as("the widening, settled").isTrue();
+
+        assertThat(source.cdcStreams).containsExactly(List.of("orders"), List.of("customers", "orders"));
+        assertThat(source.cdcStart).isEqualTo(CaptureStart.resume(new SourcePosition("start")));
+        assertThat(unit.widen(owner)).as("and nothing is left to take on").isFalse();
+        assertThat(owner.health().failure()).isEmpty();
+        owner.close();
+    }
+
+    /**
+     * Where the store cannot yet say whether it took the widening, the running stream reads on and releases
+     * nothing until a later look can: a pipeline may already have found the wider selection published and begun
+     * its load past where the running stream would release. Settled, the wider stream starts from where the
+     * chain stood before the publication.
+     */
+    @Test
+    void aWideningWhoseOutcomeCannotBeReadYetReleasesNothingUntilItIsSettled() throws Exception {
+        java.util.concurrent.atomic.AtomicBoolean loseTheAnswer = new java.util.concurrent.atomic.AtomicBoolean();
+        java.util.concurrent.atomic.AtomicBoolean unreadable = new java.util.concurrent.atomic.AtomicBoolean();
+        InMemoryMeta meta = new InMemoryMeta() {
+            @Override
+            public synchronized boolean replacePhysicalSelection(
+                    String miningChainId, PhysicalSelection current, PhysicalSelection wider) {
+                boolean applied = super.replacePhysicalSelection(miningChainId, current, wider);
+                if (applied && loseTheAnswer.compareAndSet(true, false)) {
+                    // The store goes away with the answer, and stays away for a while.
+                    unreadable.set(true);
+                    throw new TapstateException(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE,
+                            Map.of("detail", "the answer was lost"), null);
+                }
+                return applied;
+            }
+
+            @Override
+            public synchronized Optional<PhysicalSelection> physicalSelection(String miningChainId) {
+                if (unreadable.get()) {
+                    throw new TapstateException(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE,
+                            Map.of("detail", "the primary is being elected"), null);
+                }
+                return super.physicalSelection(miningChainId);
+            }
+        };
+        FakeSource source = new FakeSource(List.of(), List.of(change(10)));
+        CaptureRunUnit unit = runUnit(source, meta);
+        CaptureRun owner = unit.start(specOver("pipe-1", "k-widen-unknown", "orders"), e -> { });
+        String chainId = owner.chainId().orElseThrow().value();
+        long epoch = meta.read(chainId).orElseThrow().epoch();
+        meta.requestPhysicalTables(chainId, epoch, List.of("customers"));
+        loseTheAnswer.set(true);
+
+        org.assertj.core.api.Assertions.catchThrowable(() -> unit.widen(owner));
+        assertThat(meta.selections.get(chainId).tables()).as("what the store took").contains("customers");
+        meta.advanceTableSinkAcked(chainId, "pipe-1", "orders", new ChainPosition(new SourceOrder(epoch, 0), null));
+        Thread.sleep(10 * PhysicalSourcePrefix.TICK_MILLIS);
+
+        assertThat(meta.read(chainId).orElseThrow().sourceReadOffset())
+                .as("what the running stream released while the outcome was unknown").isEqualTo("start");
+        assertThat(source.cdcClosed).as("the stream it was reading still runs").isFalse();
+        assertThat(owner.health().failure()).isEmpty();
+
+        unreadable.set(false);
+        assertThat(unit.widen(owner)).as("a later look settles it").isTrue();
+        assertThat(source.cdcStreams).containsExactly(List.of("orders"), List.of("customers", "orders"));
+        assertThat(source.cdcStart).as("from where the chain stood before the publication")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("start")));
+        owner.close();
+    }
+
+    /** A widening the store did not take, its answer lost too, lets the running stream release again at once. */
+    @Test
+    void aWideningTheStoreDidNotTakeLetsTheRunningStreamReleaseAgain() throws Exception {
+        java.util.concurrent.atomic.AtomicBoolean unwritable = new java.util.concurrent.atomic.AtomicBoolean();
+        InMemoryMeta meta = new InMemoryMeta() {
+            @Override
+            public synchronized boolean replacePhysicalSelection(
+                    String miningChainId, PhysicalSelection current, PhysicalSelection wider) {
+                if (unwritable.get()) {
+                    throw new TapstateException(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE,
+                            Map.of("detail", "the primary is being elected"), null);
+                }
+                return super.replacePhysicalSelection(miningChainId, current, wider);
+            }
+        };
+        FakeSource source = new FakeSource(List.of(), List.of(change(10)));
+        CaptureRunUnit unit = runUnit(source, meta);
+        CaptureRun owner = unit.start(specOver("pipe-1", "k-widen-untaken", "orders"), e -> { });
+        String chainId = owner.chainId().orElseThrow().value();
+        long epoch = meta.read(chainId).orElseThrow().epoch();
+        meta.requestPhysicalTables(chainId, epoch, List.of("customers"));
+        unwritable.set(true);
+
+        org.assertj.core.api.Assertions.catchThrowable(() -> unit.widen(owner));
+        meta.advanceTableSinkAcked(chainId, "pipe-1", "orders", new ChainPosition(new SourceOrder(epoch, 0), null));
+
+        awaitSourceRead(meta, chainId, "src-10");
+        assertThat(owner.health().failure()).isEmpty();
+        owner.close();
+    }
+
+    /**
      * A widening whose wider stream cannot be started leaves nothing reading the chain, and
      * the run says so rather than going on healthy over rings nobody writes.
      */
