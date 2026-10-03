@@ -22,6 +22,7 @@ import org.junit.jupiter.api.Test;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -47,7 +48,10 @@ class ExecutionGenerationSurvivesModeAndOwnerChangesIT {
         assertThat(Files.isRegularFile(jar)).as("the explicitly selected application artifact").isTrue();
         BenchmarkCaptureCalibrationLiveRunIT.requireConnectors();
         Path output = Path.of(required("output"));
-        PipelineBenchmarkLiveRunIT.requireSafeOutput(output, PipelineBenchmarkLiveRunIT.harnessRoot());
+        Path harnessRoot = PipelineBenchmarkLiveRunIT.harnessRoot();
+        PipelineBenchmarkLiveRunIT.requireSafeOutput(output, harnessRoot);
+        Map<String, Object> telemetryInputs = TelemetryMongoIdentityWitness.inputHashes(harnessRoot);
+        Instant telemetryFrom = Instant.now().minusSeconds(1);
         BenchmarkLiveReport report = new BenchmarkLiveReport(output);
         try {
             Map<String, Object> application = PipelineBenchmarkLiveRunIT.artifact(jar);
@@ -59,15 +63,20 @@ class ExecutionGenerationSurvivesModeAndOwnerChangesIT {
             String pipeline = workload.pipelineIds().getFirst();
             report.begin(Map.of("purpose", "REAL_EXECUTION_MODE_AND_OWNER_SEQUENCE",
                     "application", application, "connectors", connectors, "workload", workload.id(),
-                    "clusterProfile", "process-failure-only", "clusterMembers", 2),
+                    "clusterProfile", "process-failure-only", "clusterMembers", 2,
+                    "mongoTelemetryWitnessInputs", telemetryInputs),
                     PipelineBenchmarkLiveRunIT.environment(), List.of());
-            try (var fork = BenchmarkForkEnvironment.open(workload, jar, "execution-mode-owner");
+            try (var fork = BenchmarkForkEnvironment.open(workload, jar, "execution-mode-owner",
+                    (uri, operator, artifact) -> new BenchmarkForkEnvironment.OwnedBoot(
+                            RealProcessServer.start(uri, operator, artifact,
+                                    List.of(TelemetryMongoIdentityWitness.HISTORY_ARGUMENT)), null));
                     var client = MongoClients.create(fork.storeUri())) {
                 MongoDatabase database = client.getDatabase(new ConnectionString(fork.storeUri()).getDatabase());
                 var latest = new MongoObservationStore(client,
                         database.getCollection(MongoStorePort.PIPELINE_OBSERVATION),
                         database.getCollection(MongoStorePort.PIPELINE_OBSERVATION_CHUNKS));
                 var claims = new MongoWorkloadClaimStore(database.getCollection(MongoStorePort.WORKLOAD_CLAIMS));
+                var telemetry = new TelemetryMongoIdentityWitness(database, latest, report, pipeline, telemetryFrom, WAIT);
                 fork.runPhase(workload.phases().getFirst(), true);
                 fork.runPhase(workload.phases().get(1), true);
                 fork.runPhase(workload.phases().get(2), true);
@@ -83,6 +92,7 @@ class ExecutionGenerationSurvivesModeAndOwnerChangesIT {
                 var first = stored(latest, pipeline, n, PipelineState.RUNNING);
                 String incarnation = first.scope().orElseThrow().pipelineIncarnationId();
                 record(report, "standalone-start", first, standalone, null);
+                telemetry.capture("standalone-start", first, fork.control(), fork.server().baseUrl(), true);
                 oneDocument(database, key, documentId, n);
 
                 fork.control().stop(pipeline, false);
@@ -90,13 +100,16 @@ class ExecutionGenerationSurvivesModeAndOwnerChangesIT {
                 var stopped = stored(latest, pipeline, n, PipelineState.STOPPED);
                 assertThat(stopped.scope()).isEqualTo(first.scope());
                 record(report, "standalone-stop", stopped, document(database, documentId), null);
+                telemetry.capture("standalone-stop", stopped, fork.control(), fork.server().baseUrl(), false);
                 fork.server().close();
                 assertThat(fork.server().isAlive()).as("the standalone process ended before cluster admission").isFalse();
                 oneDocument(database, key, documentId, n);
 
                 String operatorDatabase = new ConnectionString(fork.operatorStateUri()).getDatabase();
                 try (var cluster = TwoMemberCluster.start(fork.storeUri(), operatorDatabase, jar,
-                        clusterId, "benchmark", "benchmark-password")) {
+                        clusterId, "benchmark", "benchmark-password",
+                        List.of(TelemetryMongoIdentityWitness.HISTORY_JVM_ARGUMENT),
+                        List.of(TelemetryMongoIdentityWitness.HISTORY_JVM_ARGUMENT))) {
                     assertThat(cluster.awaitBothMembers())
                             .containsExactly(TwoMemberCluster.NODE_A, TwoMemberCluster.NODE_B);
                     assertThat(cluster.second().clusterMemberNodeIds())
@@ -124,6 +137,8 @@ class ExecutionGenerationSurvivesModeAndOwnerChangesIT {
                     assertThat(oldClaim.topologyRevision()).isEqualTo(firstOwner.claim().topologyRevision());
                     assertThat(cluster.first().pipelineControllerOf(pipeline)).contains(oldClaim.owner().nodeId());
                     record(report, "cluster-start", clustered, document(database, documentId), readyOwner);
+                    telemetry.capture("cluster-start", clustered, cluster.first(),
+                            cluster.processCarrying(TwoMemberCluster.NODE_A).baseUrl(), true);
                     String oldOwner = oldClaim.owner().nodeId();
                     ControlPlane survivor = cluster.memberOtherThan(oldOwner);
                     RealProcessServer failedOwner = cluster.processCarrying(oldOwner);
@@ -145,6 +160,8 @@ class ExecutionGenerationSurvivesModeAndOwnerChangesIT {
                     assertThat(readySuccessor.claim().claimGeneration()).isEqualTo(successor.claim().claimGeneration());
                     assertThat(readySuccessor.claim().topologyRevision()).isEqualTo(successor.claim().topologyRevision());
                     record(report, "automatic-owner-takeover", takeover, document(database, documentId), readySuccessor);
+                    telemetry.capture("automatic-owner-takeover", takeover, survivor,
+                            cluster.processCarrying(readySuccessor.claim().owner().nodeId()).baseUrl(), true);
 
                     assertThat(claims.advanceUnderClaim(oldClaim, oldClaim.topologyRevision()))
                             .as("the actual superseded claim cannot allocate another execution").isEmpty();
@@ -153,14 +170,19 @@ class ExecutionGenerationSurvivesModeAndOwnerChangesIT {
                     var afterRefusal = stored(latest, pipeline, takeoverGeneration, PipelineState.RUNNING);
                     record(report, "old-owner-advance-refused", afterRefusal,
                             document(database, documentId), leasedClaim(claims, key, takeoverGeneration, oldOwner));
+                    telemetry.capture("old-owner-advance-refused", afterRefusal, survivor,
+                            cluster.processCarrying(readySuccessor.claim().owner().nodeId()).baseUrl(), false);
 
                     survivor.stop(pipeline, false);
                     awaitState(survivor, pipeline, PipelineState.STOPPED);
-                    stored(latest, pipeline, takeoverGeneration, PipelineState.STOPPED);
+                    var finalStopped = stored(latest, pipeline, takeoverGeneration, PipelineState.STOPPED);
+                    telemetry.capture("cluster-final-stop", finalStopped, survivor,
+                            cluster.processCarrying(readySuccessor.claim().owner().nodeId()).baseUrl(), false);
                     oneDocument(database, key, documentId, takeoverGeneration);
                 }
             }
             assertThat(PipelineBenchmarkLiveRunIT.artifact(jar)).isEqualTo(application);
+            assertThat(TelemetryMongoIdentityWitness.inputHashes(harnessRoot)).isEqualTo(telemetryInputs);
             for (var connector : connectors.entrySet()) {
                 assertThat(PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor(connector.getKey())))
                         .as("the %s connector bytes remained fixed", connector.getKey()).isEqualTo(connector.getValue());

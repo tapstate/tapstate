@@ -43,23 +43,30 @@ class StandaloneExecutionGenerationIsDurableIT {
         assertThat(Files.isRegularFile(jar)).isTrue();
         BenchmarkCaptureCalibrationLiveRunIT.requireConnectors();
         Path output = Path.of(required("output"));
-        PipelineBenchmarkLiveRunIT.requireSafeOutput(output, PipelineBenchmarkLiveRunIT.harnessRoot());
+        Path harnessRoot = PipelineBenchmarkLiveRunIT.harnessRoot();
+        PipelineBenchmarkLiveRunIT.requireSafeOutput(output, harnessRoot);
+        Map<String, Object> telemetryInputs = TelemetryMongoIdentityWitness.inputHashes(harnessRoot);
+        Instant telemetryFrom = Instant.now().minusSeconds(1);
         BenchmarkLiveReport report = new BenchmarkLiveReport(output);
         ExecutionAdmissionStages admissions = new ExecutionAdmissionStages(report, directCounts);
         try {
             String sha = PipelineBenchmarkLiveRunIT.sha256(jar);
             report.begin(Map.of("purpose", directCounts ? "REAL_STANDALONE_LIFECYCLE_ADMISSION_AND_PHYSICAL_COUNTS"
                             : "REAL_STANDALONE_LIFECYCLE_IDENTITY",
-                    "application", PipelineBenchmarkLiveRunIT.artifact(jar), "discoveryMode", "none"),
+                    "application", PipelineBenchmarkLiveRunIT.artifact(jar), "discoveryMode", "none",
+                    "mongoTelemetryWitnessInputs", telemetryInputs),
                     PipelineBenchmarkLiveRunIT.environment(), List.of());
             var workload = BenchmarkWorkloadDefinitions.byId("copy");
             String pipeline = workload.pipelineIds().getFirst();
             try (var coordination = new ExecutionCoordinationProfileStages(report, directCounts, pipeline);
                     var fork = BenchmarkForkEnvironment.open(workload, jar, "standalone-identity",
                     (uri, operator, artifact) -> {
-                        if (!directCounts) { return BenchmarkForkEnvironment.OwnedBoot.plain(uri, operator, artifact); }
+                        if (!directCounts) { return new BenchmarkForkEnvironment.OwnedBoot(
+                                RealProcessServer.start(uri, operator, artifact,
+                                        List.of(TelemetryMongoIdentityWitness.HISTORY_ARGUMENT)), null); }
                         String nativeUri = coordination.openOwned(uri);
-                        var observer = ExecutionAdmissionJdiSession.startWithLeaseObservation(nativeUri, operator, artifact, pipeline);
+                        var observer = ExecutionAdmissionJdiSession.startWithLeaseObservation(nativeUri, operator, artifact, pipeline,
+                                List.of(TelemetryMongoIdentityWitness.HISTORY_ARGUMENT));
                         admissions.bind(observer);
                         return new BenchmarkForkEnvironment.OwnedBoot(observer.server(), null, observer);
                     }, boot -> {
@@ -72,6 +79,7 @@ class StandaloneExecutionGenerationIsDurableIT {
                 var latest = new MongoObservationStore(client,
                         database.getCollection(MongoStorePort.PIPELINE_OBSERVATION),
                         database.getCollection(MongoStorePort.PIPELINE_OBSERVATION_CHUNKS));
+                var telemetry = new TelemetryMongoIdentityWitness(database, latest, report, pipeline, telemetryFrom, WAIT);
                 var initialPhase = fork.runPhase(workload.phases().getFirst(), true);
                 var warmupPhase = fork.runPhase(workload.phases().get(1), true);
                 ControlPlane control = fork.control();
@@ -87,6 +95,7 @@ class StandaloneExecutionGenerationIsDurableIT {
                         WAIT, null, report, "initial-start");
                 String incarnation = first.scope().orElseThrow().pipelineIncarnationId();
                 record(report, "initial-start", first, firstClaim);
+                telemetry.capture("initial-start", first, control, fork.server().baseUrl(), true);
                 admissions.stage("first-start", 1, 1);
                 coordination.stage("first-start", readiness(first, Map.of("targetPhases",
                         List.of(targetReadiness(initialPhase), targetReadiness(warmupPhase)))));
@@ -114,6 +123,7 @@ class StandaloneExecutionGenerationIsDurableIT {
                 assertThat(generation(claim(database, pipeline))).isEqualTo(firstGeneration);
                 CumulativeMetricWitness.paused(report, "pause", firstCumulative, CumulativeMetricWitness.capture(paused));
                 record(report, "pause", paused, claim(database, pipeline));
+                telemetry.capture("pause", paused, control, fork.server().baseUrl(), false);
                 if (directCounts) { awaitTicks(latest, pipeline, firstGeneration, PipelineState.PAUSED); }
                 admissions.stage("pause-and-paused-ticks", 0, 0);
                 coordination.stage("pause-and-paused-ticks", readiness(stored(latest, pipeline, firstGeneration, PipelineState.PAUSED),
@@ -131,6 +141,7 @@ class StandaloneExecutionGenerationIsDurableIT {
                         WAIT, firstCumulative, report, "ordinary-resume");
                 CumulativeMetricWitness.continued(report, "ordinary-resume", firstCumulative, resumedCumulative, false);
                 record(report, "ordinary-resume", resumed, claim(database, pipeline));
+                telemetry.capture("ordinary-resume", resumed, control, fork.server().baseUrl(), true);
                 admissions.stage("ordinary-resume", 0, 0);
                 coordination.stage("ordinary-resume", readiness(resumed, Map.of("targetExpectedAmount", resumedAmount,
                         "targetActualAmount", targetAmount(client, fork.externalTargetUri()))));
@@ -146,6 +157,7 @@ class StandaloneExecutionGenerationIsDurableIT {
                 var stoppedCumulative = CumulativeMetricWitness.capture(stopped);
                 CumulativeMetricWitness.continued(report, "stop", resumedCumulative, stoppedCumulative, false);
                 record(report, "stop", stopped, claim(database, pipeline));
+                telemetry.capture("stop", stopped, control, fork.server().baseUrl(), false);
                 admissions.stage("stop", 0, 0);
                 coordination.stage("stop", readiness(stopped, Map.of()));
                 coordination.begin("stop-start");
@@ -163,6 +175,7 @@ class StandaloneExecutionGenerationIsDurableIT {
                         WAIT, null, report, "stop-start");
                 CumulativeMetricWitness.reset(report, "stop-start", stoppedCumulative, restartedCumulative);
                 record(report, "stop-start", restarted, claim(database, pipeline));
+                telemetry.capture("stop-start", restarted, control, fork.server().baseUrl(), true);
                 admissions.stage("stop-start", 1, 1);
                 coordination.stage("stop-start", readiness(restarted, Map.of("targetExpectedAmount", restartedAmount,
                         "targetActualAmount", targetAmount(client, fork.externalTargetUri()))));
@@ -171,6 +184,7 @@ class StandaloneExecutionGenerationIsDurableIT {
                 coordination.begin("stop-before-process-restart");
                 control.stop(pipeline, false);
                 var beforeProcessStop = stored(latest, pipeline, beforeProcessGeneration, PipelineState.STOPPED);
+                telemetry.capture("stop-before-process-restart", beforeProcessStop, control, fork.server().baseUrl(), false);
                 var beforeProcessCumulative = CumulativeMetricWitness.capture(beforeProcessStop);
                 CumulativeMetricWitness.continued(report, "stop-before-process-restart", restartedCumulative,
                         beforeProcessCumulative, false);
@@ -184,10 +198,12 @@ class StandaloneExecutionGenerationIsDurableIT {
                 coordination.begin("new-process-boot-without-start");
                 String restoredNativeUri = coordination.nativeUri(fork.storeUri());
                 var nextObserver = directCounts ? ExecutionAdmissionJdiSession.startWithLeaseObservation(
-                        restoredNativeUri, new ConnectionString(fork.operatorStateUri()).getDatabase(), jar, pipeline) : null;
+                        restoredNativeUri, new ConnectionString(fork.operatorStateUri()).getDatabase(), jar, pipeline,
+                        List.of(TelemetryMongoIdentityWitness.HISTORY_ARGUMENT)) : null;
                 try (var next = nextObserver == null
-                        ? BenchmarkForkEnvironment.OwnedBoot.plain(restoredNativeUri,
-                                new ConnectionString(fork.operatorStateUri()).getDatabase(), jar)
+                        ? new BenchmarkForkEnvironment.OwnedBoot(RealProcessServer.start(restoredNativeUri,
+                                new ConnectionString(fork.operatorStateUri()).getDatabase(), jar,
+                                List.of(TelemetryMongoIdentityWitness.HISTORY_ARGUMENT)), null)
                         : new BenchmarkForkEnvironment.OwnedBoot(nextObserver.server(), null, nextObserver)) {
                     if (nextObserver != null) { admissions.bind(nextObserver); }
                     ControlPlane restored = new ControlPlane(next.server().baseUrl());
@@ -212,6 +228,7 @@ class StandaloneExecutionGenerationIsDurableIT {
                             afterProcessRestart.scope().orElseThrow(), WAIT, null, report, "process-restart-start");
                     CumulativeMetricWitness.reset(report, "process-restart-start", beforeProcessCumulative, afterProcessCumulative);
                     record(report, "process-restart-start", afterProcessRestart, claim(database, pipeline));
+                    telemetry.capture("process-restart-start", afterProcessRestart, restored, next.server().baseUrl(), true);
                     admissions.stage("new-process-start", 1, 1);
                     coordination.stage("new-process-start", readiness(afterProcessRestart,
                             Map.of("targetExpectedAmount", processRestartAmount,
@@ -220,6 +237,8 @@ class StandaloneExecutionGenerationIsDurableIT {
                     coordination.begin("stop-before-recreate");
                     restored.stop(pipeline, false);
                     var beforeRecreateStop = stored(latest, pipeline, beforeProcessGeneration + 1, PipelineState.STOPPED);
+                    telemetry.capture("stop-before-recreate", beforeRecreateStop, restored, next.server().baseUrl(), false);
+                    var retainedCursor = telemetry.beforeRecreation(restored, next.server().baseUrl());
                     var beforeRecreateCumulative = CumulativeMetricWitness.capture(beforeRecreateStop);
                     CumulativeMetricWitness.continued(report, "stop-before-recreate", afterProcessCumulative,
                             beforeRecreateCumulative, false);
@@ -231,6 +250,7 @@ class StandaloneExecutionGenerationIsDurableIT {
                     assertThat(generation(claim(database, pipeline))).isEqualTo(beforeProcessGeneration + 1);
                     restored.apply(workload.resources(fork.sourceSettings(),
                             fork.externalTargetUri()));
+                    telemetry.recreatedBeforeStart(retainedCursor, restored, next.server().baseUrl());
                     admissions.stage("delete-recreate-without-start", 0, 0);
                     coordination.stage("delete-recreate-without-start", Map.of("deletedArtifactAbsenceVerified", true,
                             "recreatedResourcesApplied", true, "startRequested", false));
@@ -248,12 +268,14 @@ class StandaloneExecutionGenerationIsDurableIT {
                             WAIT, null, report, "delete-recreate-start");
                     CumulativeMetricWitness.reset(report, "delete-recreate-start", beforeRecreateCumulative, recreatedCumulative);
                     record(report, "delete-recreate-start", recreated, claim(database, pipeline));
+                    telemetry.capture("delete-recreate-start", recreated, restored, next.server().baseUrl(), true);
                     admissions.stage("recreate-start", 1, 1);
                     coordination.stage("recreate-start", readiness(recreated, Map.of("targetExpectedAmount", recreatedAmount,
                             "targetActualAmount", targetAmount(client, fork.externalTargetUri()))));
                     coordination.begin("final-stop");
                     restored.stop(pipeline, false);
                     var finalStop = stored(latest, pipeline, beforeProcessGeneration + 2, PipelineState.STOPPED);
+                    telemetry.capture("final-stop", finalStop, restored, next.server().baseUrl(), false);
                     CumulativeMetricWitness.continued(report, "final-stop", recreatedCumulative,
                             CumulativeMetricWitness.capture(finalStop), false);
                     admissions.stage("final-stop", 0, 0);
@@ -265,6 +287,7 @@ class StandaloneExecutionGenerationIsDurableIT {
                 coordination.requireComplete();
             }
             assertThat(PipelineBenchmarkLiveRunIT.sha256(jar)).isEqualTo(sha);
+            assertThat(TelemetryMongoIdentityWitness.inputHashes(harnessRoot)).isEqualTo(telemetryInputs);
             report.completeDiagnostic(Map.of("correctness", "REAL_LIFECYCLE_IDENTITIES_MATCHED_DURABLE_GENERATIONS",
                     "performanceAcceptanceEligible", false,
                     "unverified", directCounts
