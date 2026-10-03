@@ -24,6 +24,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -141,8 +142,13 @@ class AnEngineOutOfMemoryFailsTheHealthCheckAndItsPipelinesIT {
             String credential = control.credential();
             Await.until("the server to stop passing its health check, and to stop reporting the pipeline as "
                             + "running, now that the engine that carried it is gone",
-                    () -> !healthCheck(server.baseUrl()).passes()
-                            && PipelineState.FAILED.name().equals(stateIn(status(server.baseUrl(), credential))),
+                    () -> {
+                        Answer latest = status(server.baseUrl(), credential);
+                        String cause = failureMessageIn(latest);
+                        return !healthCheck(server.baseUrl()).passes()
+                                && PipelineState.FAILED.name().equals(stateIn(latest))
+                                && cause != null && cause.toLowerCase(Locale.ROOT).contains("memory");
+                    },
                     () -> "health check " + healthCheck(server.baseUrl())
                             + "; status " + status(server.baseUrl(), credential)
                             + "; why " + get(server.baseUrl(), "/api/pipelines/" + PIPELINE + "/explain", credential));
