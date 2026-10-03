@@ -40,6 +40,52 @@ import org.mockito.AdditionalAnswers;
 class StoreBackedSinkAckFactoryTest {
 
     @Test
+    void anUnusedTableMappingDoesNotHoldASingleTableLegacyCheckpoint() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        store.create("mc-mail", null);
+        Map<String, List<String>> plan = Map.of(
+                "orders", List.of("view"), "mail", List.of("view"));
+        StoreBackedSinkAckFactory factory = new StoreBackedSinkAckFactory(
+                Map.of("orders", "mc-orders", "items", "mc-orders", "mail", "mc-mail"),
+                "pipe-1", store);
+        factory.prepareWriterPlan(plan);
+        SinkAck ack = factory.forWriter("view", List.copyOf(plan.keySet()), plan).resolve(memberWith(store));
+
+        ack.advance("orders", at(7, "w7"));
+        ack.advance("mail", at(11, "mail-11"));
+
+        assertThat(store.read("mc-orders").orElseThrow().sourceReadOffset()).isEqualTo("w7");
+        assertThat(store.read("mc-mail").orElseThrow().sourceReadOffset()).isEqualTo("mail-11");
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1"))
+                .containsExactlyEntriesOf(Map.of("orders", 7L));
+    }
+
+    @Test
+    void separateWritersCannotRankTheLegacyTablesInTheirCompletePlan() {
+        InMemorySrsMetaStore backing = new InMemorySrsMetaStore();
+        backing.create("mc-orders", null);
+        SrsMetaStore store = mock(SrsMetaStore.class, AdditionalAnswers.delegatesTo(backing));
+        Map<String, List<String>> plan = Map.of(
+                "orders", List.of("orders-view"), "mail", List.of("mail-view"));
+        StoreBackedSinkAckFactory factory = new StoreBackedSinkAckFactory(
+                Map.of("orders", "mc-orders", "mail", "mc-orders"), "pipe-1", store);
+        factory.prepareWriterPlan(plan);
+        SinkAck orders = factory.forWriter("orders-view", List.of("orders"), plan).resolve(memberWith(store));
+        SinkAck mail = factory.forWriter("mail-view", List.of("mail"), plan).resolve(memberWith(store));
+
+        orders.advance("orders", at(1, "low"));
+        backing.advanceConsumerReadSeq("mc-orders", "pipe-1", "orders", 2L);
+        mail.advance("mail", at(1_000, "mail-after-high"));
+
+        assertThat(backing.ringDoneThrough("mc-orders", "pipe-1"))
+                .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 1L, "mail", 1_000L));
+        assertThat(backing.read("mc-orders").orElseThrow().sourceReadOffset()).isNull();
+        verify(store, never()).consumerOffsets(anyString());
+        verify(store, never()).advanceSourceReadOffset(anyString(), any());
+    }
+
+    @Test
     void sharedCaptureKeepsEachSourceNodesConfirmedTablesSeparate() {
         InMemorySrsMetaStore backing = new InMemorySrsMetaStore();
         backing.create("crm", null);

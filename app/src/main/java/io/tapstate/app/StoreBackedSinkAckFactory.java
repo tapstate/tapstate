@@ -195,10 +195,16 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
             advanceWriterAck(meta, progress, writer.id(), chain, acked, fence);
             if (progress.kind() == ConsumerProgressKind.DIRECT_SOURCE
                     || (progress.kind() == ConsumerProgressKind.LEGACY
-                            && progressByTable.values().stream().filter(progress::equals).count() == 1)) {
+                            && hasSingleTablePlan(writer, progress))) {
                 recordHowFarTheSourceHasBeenRead(meta, progress, acked, recorded);
             }
         }
+    }
+
+    /** Only the complete writer plan proves which tables share this consumer's legacy order. */
+    private boolean hasSingleTablePlan(WriterBinding writer, SourceProgress progress) {
+        Set<String> streams = writer.plan() == null ? progressByTable.keySet() : writer.plan().keySet();
+        return streams.stream().filter(stream -> progress.equals(progressByTable.get(stream))).count() == 1;
     }
 
     /**

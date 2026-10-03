@@ -173,10 +173,8 @@ public final class CdcRecoveryFixture {
                         }
                         delivered = through;
                     }
-                    try {
-                        Thread.sleep(20);
-                    } catch (InterruptedException cancelled) {
-                        Thread.currentThread().interrupt();
+                    if (!pausedBetweenPolls(20)) {
+                        break;
                     }
                 }
             } finally {
