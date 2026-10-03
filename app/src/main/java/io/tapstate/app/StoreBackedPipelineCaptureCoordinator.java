@@ -808,12 +808,12 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      * <p>A stop that preserves state leaves that record beside the operator state it ordered. Looking
      * across every such chain also covers a pipeline whose source binding changed while stopped; using
      * only the source it names now would lose the generation of the state the earlier binding left behind.
+     * Each chain counts every generation opened on it, not only its own: a stream reading the source directly
+     * stamps its changes under a generation of its own, which the chain's never becomes.
      */
     private long retainedChainGeneration(String pipelineId) {
         return storePort.meta().miningChainIdsWithConsumer(pipelineId).stream()
-                .map(storePort.meta()::read)
-                .flatMap(Optional::stream)
-                .mapToLong(SrsMeta::epoch)
+                .mapToLong(storePort.meta()::highestGenerationOpened)
                 .max()
                 .orElse(0L);
     }

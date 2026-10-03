@@ -478,6 +478,12 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     }
 
     @Override
+    public synchronized long highestGenerationOpened(String miningChainId) {
+        SrsMeta m = records.get(miningChainId);
+        return m == null ? 0L : Math.max(m.epoch(), epochsOpened.getOrDefault(miningChainId, 0L));
+    }
+
+    @Override
     public synchronized long openDirectEpoch(String miningChainId) {
         SrsMeta m = require(miningChainId);
         long opened = Math.max(m.epoch(), epochsOpened.getOrDefault(miningChainId, 0L)) + 1;

@@ -1465,6 +1465,14 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         return readEpoch(updated, EPOCHS_OPENED);
     }
 
+    @Override
+    public long highestGenerationOpened(String miningChainId) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Document root = StoreIo.call(() -> collection.find(new Document("_id", miningChainId))
+                .projection(Projections.include("epoch", EPOCHS_OPENED)).first());
+        return root == null ? 0L : Math.max(readEpoch(root, "epoch"), readEpoch(root, EPOCHS_OPENED));
+    }
+
     /** One past the highest generation the record says was opened, shared or direct. */
     private static Document nextGeneration() {
         return new Document("$add", List.of(new Document("$max", List.of(

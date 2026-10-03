@@ -131,6 +131,25 @@ class MongoSrsMetaStoreIT {
         });
     }
 
+    /**
+     * The highest generation opened on a chain counts a direct stream's as well as the chain's own, and a
+     * record written before direct streams had generations of their own answers its own generation.
+     */
+    @Test
+    void theHighestGenerationOpenedCountsADirectStreamsAsWellAsTheChainsOwn() {
+        withCollection((store, collection) -> {
+            assertThat(store.highestGenerationOpened(CHAIN)).as("no record").isZero();
+            store.create(CHAIN, null);
+            collection.updateOne(new Document("_id", CHAIN), new Document("$set", new Document("epoch", 7L)));
+            assertThat(store.highestGenerationOpened(CHAIN)).isEqualTo(7L);
+
+            long direct = store.openDirectEpoch(CHAIN);
+
+            assertThat(store.read(CHAIN).orElseThrow().epoch()).isEqualTo(7L);
+            assertThat(store.highestGenerationOpened(CHAIN)).isEqualTo(direct);
+        });
+    }
+
     /** A pipeline that selects nothing -- one reading the source directly -- keeps no place in any ring. */
     @Test
     void aPipelineSelectingNothingKeepsNoPlaceInAnyRing() {

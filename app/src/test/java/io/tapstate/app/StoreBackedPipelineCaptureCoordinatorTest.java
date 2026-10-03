@@ -852,6 +852,39 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         assertThat(generations).containsExactly(1L, 2L);
     }
 
+    /**
+     * A snapshot-only run of a pipeline that read its source directly before starts above the generation its
+     * direct stream stamped its changes with. That generation is never the chain's own -- the chain's stays the
+     * shared reader's, here never opened -- so a run ranked above the chain's alone would stamp its rows with
+     * the very generation of those changes, and lose every strict comparison against the state they left.
+     */
+    @Test
+    void aSnapshotOnlyRunAfterADirectStreamStartsAboveTheGenerationThatStreamStamped() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        SourceResource source = cdcSource("orders_src", "orders", null);
+        artifacts.save(source);
+        artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_ONLY));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        String chainId = SourceCaptureResolution.of(source).chainId().value();
+        store.meta().create(chainId, null);
+        long direct = store.meta().openDirectEpoch(chainId);
+        store.meta().selectConsumerTables(chainId, "p", List.of(), direct);
+        List<Long> generations = new ArrayList<>();
+        CaptureStarter starter = (spec, passthrough) -> {
+            generations.add(spec.snapshotEpoch());
+            return new CaptureRun(
+                    Optional.empty(), false, 1L, Optional.empty(), Optional.empty(), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, starter, new SrsCoordinator(store.meta()), new SnapshotBuffer());
+
+        coordinator.startCapture("p");
+
+        assertThat(store.meta().read(chainId).orElseThrow().epoch()).as("the chain's own generation").isZero();
+        assertThat(generations).singleElement().satisfies(generation ->
+                assertThat(generation).as("the snapshot-only run's generation").isGreaterThan(direct));
+    }
+
     // ---- a load read while the pipeline runs ---------------------------------------------------------
 
     /**

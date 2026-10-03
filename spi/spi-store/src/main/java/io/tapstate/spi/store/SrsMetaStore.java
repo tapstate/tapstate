@@ -613,6 +613,17 @@ public interface SrsMetaStore {
     }
 
     /**
+     * The highest generation ever opened on the chain, by its shared reader or by a stream reading its source
+     * directly; zero for a chain with no record. A direct stream's generation is never the chain's own
+     * ({@link SrsMeta#epoch}), so this is the number anything that has to rank above every change a stream of
+     * the chain stamped -- a later run's rows -- must start past. The default answers the chain's own
+     * generation, which is the highest a store whose direct streams open the chain's generation has.
+     */
+    default long highestGenerationOpened(String miningChainId) {
+        return read(miningChainId).map(SrsMeta::epoch).orElse(0L);
+    }
+
+    /**
      * Appends a version to the chain's schema history — the version just appended is always recorded. A
      * mutate on an unseeded chain is a caller ordering error.
      *
