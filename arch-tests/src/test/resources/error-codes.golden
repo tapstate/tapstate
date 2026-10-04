@@ -285,6 +285,7 @@ source.not-found
 source.precondition-required
 source.srs-change-while-running
 source.version-conflict
+store.database-access-failed
 store.invalid-operator-state-database
 store.invalid-uri
 store.not-replica-set

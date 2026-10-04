@@ -179,7 +179,12 @@ class CloudExternalConfigStartupIT {
         first.close();
         int previousReports = statusReports.size();
         Running restarted = start(carrier, values, MONGO.getReplicaSetUrl(ignored), seed);
-        restarted.awaitReady();
+        try {
+            restarted.awaitReady();
+        } catch (AssertionError failure) {
+            failure.addSuppressed(new AssertionError(mongoDiagnostic()));
+            throw failure;
+        }
         assertVersion(restarted);
         try (var raw = MongoClients.create(MONGO.getReplicaSetUrl())) {
             assertThat(raw.getDatabase(selected).getCollection(SystemCollections.ARTIFACTS.collectionName())
@@ -190,6 +195,22 @@ class CloudExternalConfigStartupIT {
         awaitStatusReport(previousReports, restarted);
         assertSafeOutput(first, values.get("tapstate.cloud.atlas-uri"));
         assertSafeOutput(restarted, values.get("tapstate.cloud.atlas-uri"));
+    }
+
+    private static String mongoDiagnostic() {
+        boolean running = MONGO.isRunning();
+        String status = "fixture Mongo running=" + running;
+        if (running) {
+            try (var raw = MongoClients.create(new com.mongodb.ConnectionString(
+                    MONGO.getReplicaSetUrl() + "?serverSelectionTimeoutMS=5000&connectTimeoutMS=5000"))) {
+                Document hello = raw.getDatabase("admin").runCommand(new Document("hello", 1));
+                status += ", writablePrimary=" + hello.getBoolean("isWritablePrimary");
+            } catch (RuntimeException unavailable) {
+                status += ", observer=" + unavailable.getClass().getSimpleName();
+            }
+        }
+        return status + ", containerTail=" + MONGO.getLogs().lines().skip(Math.max(0, MONGO.getLogs().lines().count() - 12))
+                .collect(java.util.stream.Collectors.joining("\n"));
     }
 
     @ParameterizedTest

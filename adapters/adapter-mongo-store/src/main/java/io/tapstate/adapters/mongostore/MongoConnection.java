@@ -3,6 +3,9 @@ package io.tapstate.adapters.mongostore;
 import com.mongodb.ConnectionString;
 import com.mongodb.MongoClientSettings;
 import com.mongodb.MongoException;
+import com.mongodb.TransactionOptions;
+import com.mongodb.ReadConcern;
+import com.mongodb.WriteConcern;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
@@ -23,6 +26,7 @@ import java.security.cert.CertificateFactory;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 
@@ -72,6 +76,47 @@ public final class MongoConnection implements AutoCloseable {
         } catch (RuntimeException e) {
             close();
             throw e;
+        }
+    }
+
+    /**
+     * Proves access to deployment-owned databases using this connection's existing identity.
+     * Collection handles and ping do not check authorization. The probe exercises real CRUD inside
+     * an aborted transaction, so no probe record or namespace is committed on success or failure.
+     * User Pipeline databases are never supplied by the assembly to this method.
+     */
+    public void verifyDeploymentDatabases(List<String> databases) {
+        Objects.requireNonNull(databases, "databases");
+        for (String database : databases) {
+            if (!MongoDatabaseNames.isValid(database)) {
+                throw new IllegalArgumentException("a deployment database name is invalid");
+            }
+            String id = UUID.randomUUID().toString();
+            var collection = client().getDatabase(database).getCollection("tapstate_access_probe_" + id.replace("-", ""));
+            try (var session = client().startSession()) {
+                session.startTransaction(TransactionOptions.builder().readConcern(ReadConcern.SNAPSHOT)
+                        .writeConcern(WriteConcern.MAJORITY.withJournal(true))
+                        .timeout(Math.max(1L, settings.serverSelectionTimeout().toMillis()), TimeUnit.MILLISECONDS).build());
+                try {
+                    collection.insertOne(session, new Document("_id", id).append("value", "initial"));
+                    Document read = collection.find(session, new Document("_id", id)).first();
+                    if (read == null || !"initial".equals(read.getString("value"))
+                            || collection.updateOne(session, new Document("_id", id),
+                                    new Document("$set", new Document("value", "updated"))).getModifiedCount() != 1
+                            || collection.deleteOne(session, new Document("_id", id)).getDeletedCount() != 1) {
+                        throw new TapstateException(StoreError.DATABASE_ACCESS_FAILED, Map.of("database", database), null);
+                    }
+                } catch (RuntimeException | Error failure) {
+                    // Preserve a programmer defect rather than allowing cleanup to replace it.
+                    try { if (session.hasActiveTransaction()) session.abortTransaction(); }
+                    catch (MongoException abortFailure) { /* An uncommitted failed probe must never be retried. */ }
+                    throw failure;
+                }
+                session.abortTransaction();
+            } catch (MongoException unavailable) {
+                // Driver messages can contain credentials. Only the already validated database name travels out.
+                throw new TapstateException(StoreError.DATABASE_ACCESS_FAILED, Map.of("database", database), null);
+            }
         }
     }
 

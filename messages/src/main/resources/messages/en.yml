@@ -447,6 +447,9 @@ role.unsupported:
 store.unreachable:
   message: "Cannot reach the store at {target}."
   solution: "Check the store is running and the connection settings are correct, then restart."
+store.database-access-failed:
+  message: "Cannot verify read/write access to the deployment database {database}."
+  solution: "Check MongoDB connectivity and grant the Cluster user read/write access to its metadata, operator-state, and views databases."
 store.not-replica-set:
   message: "The store at {target} is not a transaction-capable replica set or sharded cluster."
   solution: "Use a replica set or sharded cluster; standalone MongoDB cannot host checkpoint transactions."

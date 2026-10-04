@@ -41,8 +41,19 @@ class StoreConfiguration {
                 properties.getServerSelectionTimeout()));
         // Fail fast at startup: a coded diagnostic surfaces through CodedFailureAnalyzer if the
         // store is unreachable or is not a replica-set, rather than a bare driver stack trace.
-        connection.verify();
-        return connection;
+        try {
+            connection.verify();
+            if (cloud.cloud()) {
+                connection.verifyDeploymentDatabases(java.util.List.of(
+                        cloud.operatorStateDatabase(properties.getOperatorStateDatabase()),
+                        cloud.viewsDatabase("views")));
+            }
+            return connection;
+        } catch (RuntimeException | Error failure) {
+            // Spring cannot destroy a connection whose factory failed before returning the bean.
+            connection.close();
+            throw failure;
+        }
     }
 
     /**

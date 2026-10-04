@@ -21,6 +21,9 @@ public enum StoreError implements TapstateErrorCode {
     /** The store could not be reached: {@code target} is the connection target that failed. */
     UNREACHABLE("store.unreachable", Set.of("target")),
 
+    /** A deployment-owned database could not prove read/write access using the configured identity. */
+    DATABASE_ACCESS_FAILED("store.database-access-failed", Set.of("database")),
+
     /** The store was reached but lacks a transactional topology: {@code target} is the connection target. */
     NOT_REPLICA_SET("store.not-replica-set", Set.of("target")),
 
