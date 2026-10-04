@@ -141,6 +141,58 @@ class V12EncryptSourceConfigsIT {
     }
 
     @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void restoredCiphertextWithARegressedSchemaNeverCreatesAnUnrelatedReplacementKey(boolean unknownEnvelope) {
+        MongoDatabase database = freshDatabase("v12_incomplete_restore_" + unknownEnvelope);
+        MongoCollection<Document> artifacts = SystemCollections.ARTIFACTS.on(database);
+        MongoCollection<Document> systemMeta = SystemCollections.SYSTEM_META.on(database);
+        Resource source = PARSER.parse("""
+                version: tapstate/v1
+                kind: source
+                id: restored_source
+                connector: unknown
+                config: { password: incomplete-restore-secret }
+                """);
+        artifacts.insertOne(stored(source));
+        seedVersion(database, 11);
+        MigrationRunner.migrate(database);
+        Document original = artifacts.find(new Document("_id", source.id())).first();
+        Document keyring = systemMeta.find(new Document("_id", "source-config-keyring")).first();
+        String material = keyring.getList("keys", Document.class).getFirst().getString("material");
+        if (unknownEnvelope) {
+            artifacts.updateOne(new Document("_id", source.id()), new Document("$set",
+                    new Document("body.config", "tscfg:999:incomplete-restore-input")));
+        }
+        Document restored = artifacts.find(new Document("_id", source.id())).first();
+        assertThat(systemMeta.deleteOne(new Document("_id", "source-config-keyring")).getDeletedCount())
+                .isEqualTo(1);
+        seedVersion(database, 11);
+
+        assertThatThrownBy(() -> MigrationRunner.migrate(database))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(io.tapstate.adapters.mongostore.MigrationError.CHANGESET_FAILED);
+                    StringWriter printed = new StringWriter();
+                    failure.printStackTrace(new PrintWriter(printed));
+                    assertThat(printed.toString()).doesNotContain(material, "incomplete-restore-secret",
+                            "tscfg:", "incomplete-restore-input");
+                });
+        assertThat(MigrationRunner.inspect(database).installed()).isEqualTo(11);
+        assertThat(artifacts.find(new Document("_id", source.id())).first()).isEqualTo(restored);
+        assertThat(systemMeta.countDocuments(new Document("_id", "source-config-keyring")))
+                .as("ciphertext needs its restored keys; startup must not manufacture a replacement")
+                .isZero();
+
+        // Repairing the actual pair, rather than accepting a newly generated key, permits reentry.
+        systemMeta.insertOne(keyring);
+        artifacts.replaceOne(new Document("_id", source.id()), original);
+        MigrationRunner.migrate(database);
+        assertThat(MigrationRunner.inspect(database).installed()).isEqualTo(12);
+        assertThat(artifacts.find(new Document("_id", source.id())).first()).isEqualTo(original);
+        assertThat(new MongoArtifactStore(client, artifacts,
+                new SourceConfigKeyringStore(database).loadExistingCipher()).get(source.id())).contains(source);
+    }
+
+    @ParameterizedTest
     @ValueSource(ints = {1, 11})
     void bothLegacyCanonicalAndStructuredSourcesMigrateAcrossEveryConnectorAndAnEmptyConfig(int legacyVersion) {
         MongoDatabase database = freshDatabase("v12_legacy_matrix_" + legacyVersion);

@@ -70,7 +70,8 @@ class SourceConfigKeyringClusterIT {
             }
             assertReleased(database, firstEnding);
             assertReleased(database, secondEnding);
-            assertThat(keyring(database).equals(keyring)).as("shutdown does not replace or delete keys").isTrue();
+            assertThat(stableKeyring(keyring(database))).as("shutdown does not replace or delete keys")
+                    .isEqualTo(stableKeyring(keyring));
             try (TwoMemberCluster restarted = original.restarted()) {
                 assertThat(restarted.awaitBothMembers())
                         .containsExactly(TwoMemberCluster.NODE_A, TwoMemberCluster.NODE_B);
@@ -80,7 +81,8 @@ class SourceConfigKeyringClusterIT {
                         acknowledgement(database, clusterId, TwoMemberCluster.NODE_A));
                 assertReplacement(secondEnding.acknowledgement(),
                         acknowledgement(database, clusterId, TwoMemberCluster.NODE_B));
-                assertThat(keyring(database).equals(keyring)).as("both restarted nodes load the durable winner").isTrue();
+                assertThat(stableKeyring(keyring(database))).as("both restarted nodes load the durable winner")
+                        .isEqualTo(stableKeyring(keyring));
                 assertSource(database, restarted.first(), first, keyring.getString("activeKeyId"));
                 assertSource(database, restarted.second(), second, keyring.getString("activeKeyId"));
                 Resource afterRestart = source("after_restart", "restart-write-sentinel");
@@ -245,6 +247,14 @@ class SourceConfigKeyringClusterIT {
                 .find(new Document("_id", "source-config-keyring")).first();
         assertThat(document).isNotNull();
         return document;
+    }
+
+    private static Document stableKeyring(Document keyring) {
+        // Node acknowledgements touch the shared record to fence a concurrent epoch switch.
+        // That coordination counter changes; the epoch, key identities and material must not.
+        Document stable = new Document(keyring);
+        stable.remove("nodeAckFence");
+        return stable;
     }
 
     private static Document acknowledgement(MongoDatabase database, String clusterId, String nodeId) {

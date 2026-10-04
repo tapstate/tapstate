@@ -62,11 +62,14 @@ public final class SourceConfigKeyringHandle implements SourceConfigCipherProvid
     /** Reloads every key for the current epoch, then binds this exact live node-session to it. */
     @Override
     public void acknowledge(WorkloadClaim session, Duration ttl) {
-        SourceConfigKeyringStore.Loaded next = store.loadExisting();
-        loaded.set(next);
-        if (!store.acknowledge(session, next.epoch(), ttl)) {
-            throw new TapstateException(StoreError.SOURCE_CONFIG_KEYRING_NOT_READY, Map.of(), null);
+        for (int attempt = 0; attempt < 3; attempt++) {
+            SourceConfigKeyringStore.Loaded next = store.loadExisting();
+            if (store.acknowledge(session, next.epoch(), ttl)) {
+                loaded.set(next);
+                return;
+            }
         }
+        throw new TapstateException(StoreError.SOURCE_CONFIG_KEYRING_NOT_READY, Map.of(), null);
     }
 
     /** Ends only this exact boot/generation acknowledgement; a replacement node remains untouched. */

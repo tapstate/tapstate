@@ -4,6 +4,7 @@ import com.mongodb.ErrorCategory;
 import com.mongodb.MongoException;
 import com.mongodb.ReadConcern;
 import com.mongodb.ReadPreference;
+import com.mongodb.TransactionOptions;
 import com.mongodb.WriteConcern;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.ClientSession;
@@ -35,6 +36,11 @@ public final class SourceConfigKeyringStore {
     private static final int FORMAT_VERSION = 1;
     private static final int KEY_BYTES = 32;
     private static final String ACK_KIND = "source-config-keyring-node";
+    private static final TransactionOptions ACK_TRANSACTION = TransactionOptions.builder()
+            .readPreference(ReadPreference.primary())
+            .readConcern(ReadConcern.SNAPSHOT)
+            .writeConcern(WriteConcern.MAJORITY.withJournal(true))
+            .build();
 
     private final MongoCollection<Document> systemMeta;
     private final MongoCollection<Document> workloadClaims;
@@ -74,6 +80,14 @@ public final class SourceConfigKeyringStore {
 
     /** Creates the first keyring once, or loads the winner of a concurrent create. */
     public SourceConfigCipher loadOrCreateCipher() {
+        // A partially restored or interrupted migration may already contain ciphertext while its
+        // schema marker is older. Unknown envelopes also need the original keys, never a new ring.
+        Document encryptedSource = new Document("$or", List.of(
+                new Document("kind", "source"), new Document("body.kind", "source")))
+                .append("body.config", new Document("$type", "string"));
+        if (StoreIo.call(() -> artifacts.find(encryptedSource).projection(new Document("_id", 1)).first()) != null) {
+            return loadExistingCipher();
+        }
         byte[] candidate = new byte[KEY_BYTES];
         random.nextBytes(candidate);
         try {
@@ -299,7 +313,73 @@ public final class SourceConfigKeyringStore {
     boolean acknowledge(WorkloadClaim session, long epoch, Duration ttl) {
         requireNodeSession(session);
         Objects.requireNonNull(ttl, "ttl");
-        if (epoch < 1 || ttl.isZero() || ttl.isNegative()) throw new IllegalArgumentException("invalid keyring lease");
+        if (epoch < 1 || ttl.toMillis() < 1) throw new IllegalArgumentException("invalid keyring lease");
+        if (client == null) throw new IllegalStateException("keyring acknowledgement needs the owning store client");
+        return StoreIo.call(() -> {
+            for (int attempt = 0; attempt < 3; attempt++) {
+                try {
+                    return acknowledgeOnce(session, epoch, ttl);
+                } catch (MongoException error) {
+                    if (attempt == 2 || !error.hasErrorLabel("TransientTransactionError")
+                            || error.hasErrorLabel("UnknownTransactionCommitResult")) throw error;
+                }
+            }
+            throw new IllegalStateException("acknowledgement attempts must return or throw");
+        });
+    }
+
+    private boolean acknowledgeOnce(WorkloadClaim node, long epoch, Duration ttl) {
+        try (ClientSession transaction = client.startSession()) {
+            transaction.startTransaction(ACK_TRANSACTION);
+            try {
+                // Touch both records in the ACK transaction: a takeover/release or epoch switch
+                // cannot commit between proving ownership/loading and publishing the proof.
+                Document expected = new Document("_id", new Document("clusterId", node.key().clusterId())
+                        .append("resourceType", WorkloadClaimType.NODE_SESSION.name())
+                        .append("resourceId", node.key().resourceId()))
+                        .append("ownerNodeId", node.owner().nodeId())
+                        .append("ownerBootId", node.owner().bootId())
+                        .append("claimGeneration", node.claimGeneration())
+                        .append("executionGeneration", node.executionGeneration())
+                        .append("topologyRevision", node.topologyRevision())
+                        .append("$expr", new Document("$gt", List.of("$leaseUntil", "$$NOW")));
+                Document live = workloadClaims.findOneAndUpdate(transaction, expected,
+                        new Document("$inc", new Document("sourceConfigAckFence", 1L)),
+                        new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER));
+                if (live == null) {
+                    transaction.abortTransaction();
+                    return false;
+                }
+                UpdateResult ring = systemMeta.updateOne(transaction,
+                        new Document("_id", KEYRING_ID).append("epoch", epoch),
+                        new Document("$inc", new Document("nodeAckFence", 1L)));
+                if (ring.getMatchedCount() != 1 || ring.getModifiedCount() != 1) {
+                    transaction.abortTransaction();
+                    return false;
+                }
+                Document acknowledged = writeAcknowledgement(transaction, node, epoch, ttl, live);
+                if (acknowledged == null) {
+                    transaction.abortTransaction();
+                    return false;
+                }
+            } catch (RuntimeException error) {
+                try {
+                    transaction.abortTransaction();
+                } catch (RuntimeException abortFailure) {
+                    error.addSuppressed(abortFailure);
+                }
+                if (error instanceof MongoException driver
+                        && ErrorCategory.fromErrorCode(driver.getCode()) == ErrorCategory.DUPLICATE_KEY) return false;
+                throw error;
+            }
+            // An ambiguous commit is not permission to replay the transaction.
+            transaction.commitTransaction();
+            return true;
+        }
+    }
+
+    private Document writeAcknowledgement(ClientSession transaction, WorkloadClaim session,
+            long epoch, Duration ttl, Document live) {
         Document id = acknowledgementId(session);
         Document eligible = new Document("$and", List.of(
                 new Document("_id", id),
@@ -314,16 +394,11 @@ public final class SourceConfigKeyringStore {
                 .append("bootId", session.owner().bootId())
                 .append("claimGeneration", session.claimGeneration())
                 .append("epoch", epoch)
-                .append("leaseUntil", new Document("$dateAdd", new Document("startDate", "$$NOW")
-                        .append("unit", "millisecond").append("amount", ttl.toMillis())));
-        try {
-            Document acknowledged = systemMeta.findOneAndUpdate(eligible, List.of(new Document("$set", fields)),
-                    new FindOneAndUpdateOptions().upsert(true).returnDocument(ReturnDocument.AFTER));
-            return acknowledged != null;
-        } catch (MongoException raced) {
-            if (ErrorCategory.fromErrorCode(raced.getCode()) == ErrorCategory.DUPLICATE_KEY) return false;
-            throw StoreIo.coded(raced);
-        }
+                .append("leaseUntil", new Document("$min", List.of(live.getDate("leaseUntil"),
+                        new Document("$dateAdd", new Document("startDate", "$$NOW")
+                                .append("unit", "millisecond").append("amount", ttl.toMillis())))));
+        return systemMeta.findOneAndUpdate(transaction, eligible, List.of(new Document("$set", fields)),
+                new FindOneAndUpdateOptions().upsert(true).returnDocument(ReturnDocument.AFTER));
     }
 
     void release(WorkloadClaim session) {
