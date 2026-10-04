@@ -12,6 +12,7 @@ import java.util.Optional;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
@@ -84,6 +85,50 @@ class StartCheckEvaluatorTest {
         });
         assertThatThrownBy(bench::evaluator).isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("optimist");
+    }
+
+    @Test
+    void aCheckIsNamedInLowerKebabOrRefused() {
+        for (String id : List.of("target-not-empty", "a", "a1", "x-1-2")) {
+            bench.checks.clear();
+            bench.checks.add(named(id));
+            assertThatCode(bench::evaluator).as("check id %s", id).doesNotThrowAnyException();
+        }
+        for (String id : List.of("Target", "target--x", "-target", "target-", "1target", "a_b", "")) {
+            bench.checks.clear();
+            bench.checks.add(named(id));
+            assertThatThrownBy(bench::evaluator).as("check id '%s'", id)
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("lower-kebab");
+        }
+    }
+
+    /** Matching an id walks its segments without recursing once per segment, however many there are. */
+    @Test
+    void aLongIdIsCheckedWithoutRunningOutOfStack() {
+        bench.checks.clear();
+        bench.checks.add(named("a" + "-a".repeat(100_000)));
+
+        assertThatCode(bench::evaluator).doesNotThrowAnyException();
+    }
+
+    private static StartCheck named(String id) {
+        return new StartCheck() {
+            @Override
+            public String id() {
+                return id;
+            }
+
+            @Override
+            public List<StartFinding> evaluate(StartCheckContext context) {
+                return List.of();
+            }
+
+            @Override
+            public StartFinding.Behavior whenUnavailable() {
+                return StartFinding.Behavior.WARN;
+            }
+        };
     }
 
     @Test

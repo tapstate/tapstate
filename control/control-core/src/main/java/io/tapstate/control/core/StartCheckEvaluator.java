@@ -34,7 +34,12 @@ import java.util.regex.Pattern;
  */
 public final class StartCheckEvaluator {
 
-    private static final Pattern CHECK_ID = Pattern.compile("[a-z][a-z0-9]*(-[a-z0-9]+)*");
+    /**
+     * Lower-kebab, written possessively: a repeated group that holds a repetition of its own is matched
+     * recursively, one call per segment, and a long enough id runs the stack out; possessive repetition
+     * matches the same ids in a loop.
+     */
+    private static final Pattern CHECK_ID = Pattern.compile("[a-z][a-z0-9]*+(?:-[a-z0-9]++)*+");
 
     /**
      * The longest all of one start's checks together may take. Clients released before start checks wait
