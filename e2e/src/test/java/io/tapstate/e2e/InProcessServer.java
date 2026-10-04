@@ -8,6 +8,7 @@ import org.springframework.scheduling.config.ScheduledTask;
 import org.springframework.scheduling.config.ScheduledTaskHolder;
 
 import java.net.URI;
+import java.util.List;
 
 /**
  * The product booted inside the test JVM, from its real assembly root.
@@ -40,6 +41,14 @@ final class InProcessServer implements ServerHandle {
 
     /** Boots the assembly with an explicit operator-state database. */
     static InProcessServer start(String storeUri, String operatorStateDatabase) {
+        return start(storeUri, operatorStateDatabase, List.of());
+    }
+
+    /** Additional settings let a focused witness select the actual Cloud assembly. */
+    static InProcessServer start(String storeUri, String operatorStateDatabase, List<String> additionalArguments) {
+        java.util.ArrayList<String> arguments = new java.util.ArrayList<>(List.of(
+                "--server.address=127.0.0.1", "--server.port=0"));
+        arguments.addAll(additionalArguments);
         ConfigurableApplicationContext context = new SpringApplicationBuilder(Bootstrap.class)
                 .properties(
                         "tapstate.store.mongo.enabled=true",
@@ -63,7 +72,7 @@ final class InProcessServer implements ServerHandle {
                 // it was granted, and receive none of the requests -- every route answering whatever bare
                 // status the stranger returns. Binding the loopback makes the collision impossible,
                 // because the allocator will not hand out a loopback port that is already taken.
-                .run("--server.address=127.0.0.1", "--server.port=0");
+                .run(arguments.toArray(String[]::new));
         int port = ((WebServerApplicationContext) context).getWebServer().getPort();
         // The literal address, not the name: "localhost" resolves to both 127.0.0.1 and ::1, and only
         // one of those is the address bound above.

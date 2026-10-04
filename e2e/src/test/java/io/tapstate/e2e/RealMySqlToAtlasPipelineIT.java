@@ -5,30 +5,32 @@ import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.lifecycle.LifecycleVerb;
-import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.sql.Connection;
 import java.sql.Statement;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.TreeMap;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
-/** Real MySQL source and Atlas target through the on-prem Pipeline runtime. */
+/** Real MySQL and Atlas through both runtime modes, including a shipped-JVM restart. */
 @RequiresDocker
 class RealMySqlToAtlasPipelineIT {
 
     private static final Duration TIMEOUT = Duration.ofSeconds(120);
     private static final String COLLECTION = "orders";
     private static final String PIPELINE_ID = "mysql_to_atlas";
+    private static final int SEEDED_ROWS = 32;
 
     @BeforeAll
     static void requireRealArtifactsAndAtlas() {
@@ -37,26 +39,40 @@ class RealMySqlToAtlasPipelineIT {
         RealConnectorGate.require("mysql", "mongodb-atlas");
     }
 
-    @Test
-    void mysqlSnapshotAndChangesReachAtlasWithDurableAckAcrossRestart() throws Exception {
-        String suffix = UUID.randomUUID().toString().substring(0, 12);
-        Map<String, Object> mysqlSettings = SharedMySql.settings("ts_plan_mysql_atlas_src_" + suffix);
+    @ParameterizedTest(name = "{0}/REAL_PROCESS")
+    @EnumSource(AtlasRuntime.Mode.class)
+    void mysqlSnapshotAndChangesReachAtlasAcrossAWholeJvmRestart(AtlasRuntime.Mode mode) throws Exception {
+        String suffix = (mode == AtlasRuntime.Mode.CLOUD ? "cl" : "op") + "_"
+                + UUID.randomUUID().toString().substring(0, 8);
+        String sourceDatabase = "ts_plan_ms_" + suffix;
+        Map<String, Object> mysqlSettings = SharedMySql.settings(sourceDatabase);
+        try (AutoCloseable mysqlCleanup = () -> dropMySql(mysqlSettings, sourceDatabase)) {
+            verify(mode, suffix, mysqlSettings);
+        }
+    }
+
+    private static void verify(AtlasRuntime.Mode mode, String suffix, Map<String, Object> mysqlSettings)
+            throws Exception {
         try (Connection mysql = SharedMySql.connect(mysqlSettings); Statement statement = mysql.createStatement()) {
             statement.execute("CREATE TABLE orders (id BIGINT PRIMARY KEY, name VARCHAR(64))");
             statement.execute("INSERT INTO orders (id, name) VALUES (1, 'seeded')");
+            for (int id = 2; id <= SEEDED_ROWS; id++) {
+                statement.execute("INSERT INTO orders (id, name) VALUES (" + id + ", 'seed-" + id + "')");
+            }
         }
 
-        String targetDatabase = "ts_plan_mysql_atlas_tgt_" + suffix;
+        String targetDatabase = "ts_plan_mt_" + suffix;
         String targetUri = inDatabase(System.getenv("TAPSTATE_ATLAS_TEST_URI"), targetDatabase);
-        String storeUri = SharedMongo.replicaSetUrl("ts_plan_mysql_atlas_store_" + suffix);
-        try (MongoClient atlas = MongoClients.create(targetUri)) {
-            try {
+        String storeUri = SharedMongo.replicaSetUrl("ts_plan_mm_" + suffix);
+        try (MongoClient atlas = MongoClients.create(targetUri);
+             AtlasRuntime runtime = new AtlasRuntime(mode, storeUri)) {
+            try (AutoCloseable targetCleanup = () -> atlas.getDatabase(targetDatabase).drop()) {
                 MongoCollection<Document> targetRows = atlas.getDatabase(targetDatabase).getCollection(COLLECTION);
-                try (ServerHandle server = Tiers.IN_PROCESS.launch(storeUri)) {
-                    ControlPlane control = new ControlPlane(server.baseUrl());
-                    control.bootstrapAndLogin("e2e", "e2e-password");
-                    control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
-                    control.registerConnector("mongodb-atlas", ConnectorJars.bytesFor("mongodb-atlas"));
+                String acknowledged;
+                Map<Long, String> beforeShutdown;
+                try (ServerHandle server = runtime.launch(Tiers.REAL_PROCESS)) {
+                    ControlPlane control = runtime.control(server, true);
+                    runtime.register(control, "mysql", "mongodb-atlas");
 
                     Map<String, String> resources = new LinkedHashMap<>();
                     resources.put("mysql.tap.yml", sourceYaml(mysqlSettings));
@@ -66,51 +82,98 @@ class RealMySqlToAtlasPipelineIT {
                     control.discoverSchema("mysql_source", "mysql", mysqlSettings);
                     control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
 
-                    awaitNames(targetRows, List.of("seeded"), "MySQL snapshot to reach Atlas");
+                    awaitRows(targetRows, mysqlRows(mysqlSettings), "MySQL snapshot to reach Atlas");
+                    String snapshotAck = Await.answered("Atlas snapshot ACK", TIMEOUT,
+                            () -> control.durablePosition(PIPELINE_ID, COLLECTION));
                     try (Connection mysql = SharedMySql.connect(mysqlSettings);
                          Statement statement = mysql.createStatement()) {
                         statement.execute("UPDATE orders SET name = 'updated' WHERE id = 1");
-                        statement.execute("INSERT INTO orders (id, name) VALUES (2, 'new')");
                     }
-                    awaitNames(targetRows, List.of("new", "updated"), "MySQL update and insert to reach Atlas");
+                    awaitRows(targetRows, mysqlRows(mysqlSettings), "MySQL update to reach Atlas");
+                    String updatedAck = Await.answered("Atlas update ACK", TIMEOUT,
+                            () -> control.durablePosition(PIPELINE_ID, COLLECTION)
+                                    .filter(position -> !position.equals(snapshotAck)));
                     try (Connection mysql = SharedMySql.connect(mysqlSettings);
                          Statement statement = mysql.createStatement()) {
-                        statement.execute("DELETE FROM orders WHERE id = 2");
+                        statement.execute("INSERT INTO orders (id, name) VALUES (33, 'new')");
                     }
-                    awaitNames(targetRows, List.of("updated"), "MySQL delete to reach Atlas");
-                    String ackedBeforeRestart = Await.answered("Atlas target ACK after MySQL CDC", TIMEOUT,
-                            () -> control.durablePosition(PIPELINE_ID, COLLECTION));
+                    awaitRows(targetRows, mysqlRows(mysqlSettings), "MySQL insert to reach Atlas");
+                    String insertedAck = Await.answered("Atlas insert ACK", TIMEOUT,
+                            () -> control.durablePosition(PIPELINE_ID, COLLECTION)
+                                    .filter(position -> !position.equals(updatedAck)));
+                    try (Connection mysql = SharedMySql.connect(mysqlSettings);
+                         Statement statement = mysql.createStatement()) {
+                        statement.execute("DELETE FROM orders WHERE id = 33");
+                    }
+                    awaitRows(targetRows, mysqlRows(mysqlSettings), "MySQL delete to reach Atlas");
+                    acknowledged = Await.answered("Atlas target ACK after the final MySQL delete", TIMEOUT,
+                            () -> control.durablePosition(PIPELINE_ID, COLLECTION)
+                                    .filter(position -> !position.equals(insertedAck)));
+                    beforeShutdown = atlasRows(targetRows);
+                    assertThat(control.snapshotRowsRead(PIPELINE_ID)).containsEntry(COLLECTION, (long) SEEDED_ROWS);
+                }
 
-                    control.stop(PIPELINE_ID, false);
-                    Await.until("MySQL-to-Atlas Pipeline to stop", TIMEOUT,
-                            () -> control.state(PIPELINE_ID).filter(PipelineState.STOPPED::equals).isPresent(),
-                            () -> String.valueOf(control.state(PIPELINE_ID)));
-                    control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
+                Instant stoppedAt = Instant.now();
+                try (Connection mysql = SharedMySql.connect(mysqlSettings);
+                     Statement statement = mysql.createStatement()) {
+                    statement.execute("INSERT INTO orders (id, name) VALUES (34, 'downtime-inserted')");
+                    statement.execute("UPDATE orders SET name = 'downtime-updated' WHERE id = 2");
+                    statement.execute("DELETE FROM orders WHERE id = 3");
+                }
+                assertThat(atlasRows(targetRows)).as("the stopped JVM cannot carry downtime changes")
+                        .isEqualTo(beforeShutdown);
+
+                try (ServerHandle server = runtime.launch(Tiers.REAL_PROCESS)) {
+                    ControlPlane control = runtime.control(server, false);
+                    awaitRows(targetRows, mysqlRows(mysqlSettings), "MySQL downtime changes to reach Atlas");
+                    String replayAck = Await.answered("Atlas downtime target ACK", TIMEOUT,
+                            () -> control.durablePosition(PIPELINE_ID, COLLECTION)
+                                    .filter(position -> !position.equals(acknowledged)));
                     try (Connection mysql = SharedMySql.connect(mysqlSettings);
                          Statement statement = mysql.createStatement()) {
-                        statement.execute("INSERT INTO orders (id, name) VALUES (3, 'resumed')");
+                        statement.execute("INSERT INTO orders (id, name) VALUES (35, 'resumed')");
                     }
-                    awaitNames(targetRows, List.of("resumed", "updated"), "MySQL CDC resume to reach Atlas");
+                    awaitRows(targetRows, mysqlRows(mysqlSettings), "fresh MySQL CDC after the JVM restart");
                     Await.until("Atlas target ACK to advance after restart", TIMEOUT,
                             () -> control.durablePosition(PIPELINE_ID, COLLECTION)
-                                    .filter(position -> !position.equals(ackedBeforeRestart)).isPresent(),
+                                    .filter(position -> !position.equals(replayAck)).isPresent()
+                                    && control.observedAt(PIPELINE_ID).filter(time -> time.isAfter(stoppedAt)).isPresent(),
                             () -> "target ACK did not advance after the resumed MySQL write");
-                    assertThat(names(targetRows)).containsExactly("resumed", "updated");
+                    AtlasRuntime.assertResumedRun(control, PIPELINE_ID, COLLECTION, SEEDED_ROWS, TIMEOUT);
+                    assertThat(atlasRows(targetRows)).isEqualTo(mysqlRows(mysqlSettings));
+                    assertThat(atlasRows(targetRows)).doesNotContainKeys(3L, 33L);
+                    runtime.assertAuthenticationBoundary();
                 }
-            } finally {
-                atlas.getDatabase(targetDatabase).drop();
             }
         }
     }
 
-    private static void awaitNames(MongoCollection<Document> rows, List<String> expected, String phase) {
-        Await.until(phase, TIMEOUT, () -> names(rows).equals(expected), () -> names(rows).toString());
+    private static void dropMySql(Map<String, Object> settings, String database) throws Exception {
+        try (Connection mysql = SharedMySql.connect(settings); Statement statement = mysql.createStatement()) {
+            statement.execute("DROP DATABASE `" + database + "`");
+        }
     }
 
-    private static List<String> names(MongoCollection<Document> rows) {
-        return rows.find().into(new java.util.ArrayList<>()).stream()
-                .map(row -> row.getString("name"))
-                .sorted().toList();
+    private static void awaitRows(MongoCollection<Document> rows, Map<Long, String> expected, String phase) {
+        Await.until(phase, TIMEOUT, () -> atlasRows(rows).equals(expected), () -> atlasRows(rows).toString());
+    }
+
+    private static Map<Long, String> atlasRows(MongoCollection<Document> rows) {
+        Map<Long, String> result = new TreeMap<>();
+        for (Document row : rows.find()) {
+            assertThat(result.put(((Number) row.get("id")).longValue(), row.getString("name")))
+                    .as("each source primary key has exactly one target row").isNull();
+        }
+        return result;
+    }
+
+    private static Map<Long, String> mysqlRows(Map<String, Object> settings) throws Exception {
+        Map<Long, String> rows = new TreeMap<>();
+        try (Connection mysql = SharedMySql.connect(settings); Statement statement = mysql.createStatement();
+             var result = statement.executeQuery("SELECT id, name FROM orders ORDER BY id")) {
+            while (result.next()) rows.put(result.getLong("id"), result.getString("name"));
+        }
+        return rows;
     }
 
     private static String sourceYaml(Map<String, Object> settings) {
@@ -131,8 +194,8 @@ class RealMySqlToAtlasPipelineIT {
                 kind: source
                 id: atlas_target
                 connector: mongodb-atlas
-                config: { isUri: true, uri: "%s" }
-                """.formatted(uri);
+                config: %s
+                """.formatted(JsonWriter.write(Map.of("isUri", true, "uri", uri)));
     }
 
     private static String pipelineYaml() {

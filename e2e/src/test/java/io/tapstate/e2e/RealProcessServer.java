@@ -61,6 +61,11 @@ final class RealProcessServer implements ServerHandle {
         return start(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, bootJar(), additionalArguments);
     }
 
+    /** Keeps a focused witness's durable operator state in its own deployment database. */
+    static RealProcessServer start(String storeUri, String operatorStateDatabase, List<String> additionalArguments) {
+        return start(storeUri, operatorStateDatabase, bootJar(), additionalArguments);
+    }
+
     /** Launches the deliverable with an explicit operator-state database. */
     static RealProcessServer start(String storeUri, String operatorStateDatabase) {
         return start(storeUri, operatorStateDatabase, bootJar());
