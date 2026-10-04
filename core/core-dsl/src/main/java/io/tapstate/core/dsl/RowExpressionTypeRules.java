@@ -214,22 +214,26 @@ public final class RowExpressionTypeRules {
             }
             for (DiscoveredTable table : discovered) {
                 if (up.table() == null || up.table().equals(table.name())) {
-                    Map<String, TapstateType> columns = table.columns();
-                    for (Step step : route.steps()) {
-                        TransformBody body = switch (step) {
-                            case Step.Inline inline -> inline.body();
-                            case Step.Use use -> byId.get(use.use()) instanceof TransformResource definition
-                                    ? definition.body() : null;
-                        };
-                        if (body instanceof TransformBody.MapProjection projection) {
-                            columns = projectedTypes(projection.fields(), columns);
-                        }
-                    }
-                    reached.add(new DiscoveredTable(table.name(), columns));
+                    reached.add(projectedTable(table, route.steps()));
                 }
             }
         }
         return reached;
+    }
+
+    private DiscoveredTable projectedTable(DiscoveredTable table, List<Step> steps) {
+        Map<String, TapstateType> columns = table.columns();
+        for (Step step : steps) {
+            TransformBody body = switch (step) {
+                case Step.Inline inline -> inline.body();
+                case Step.Use use -> byId.get(use.use()) instanceof TransformResource definition
+                        ? definition.body() : null;
+            };
+            if (body instanceof TransformBody.MapProjection projection) {
+                columns = projectedTypes(projection.fields(), columns);
+            }
+        }
+        return new DiscoveredTable(table.name(), columns);
     }
 
     /** A map reads its input for every rule, then carries the unlisted, unconsumed fields onward. */
@@ -246,17 +250,11 @@ public final class RowExpressionTypeRules {
                         output.put(name, input.get(rename.sourceField()));
                     }
                 }
-                case FieldRule.Drop ignored -> dropped.add(name);
-                case FieldRule.Literal literal -> output.put(name, switch (literal.value()) {
-                    case Boolean ignored -> TapstateType.BOOLEAN;
-                    case String ignored -> TapstateType.STRING;
-                    case Integer ignored -> TapstateType.INT64;
-                    case Long ignored -> TapstateType.INT64;
-                    case Double ignored -> TapstateType.DOUBLE;
-                    default -> TapstateType.UNKNOWN;
-                });
+                case FieldRule.Drop() -> dropped.add(name);
+                case FieldRule.Literal literal -> output.put(name, literalType(literal.value()));
                 case FieldRule.Computed computed ->
                         output.put(name, RowExpressions.typedValueType(computed.celExpr(), input));
+                default -> throw new IllegalStateException("Unexpected field rule: " + rule);
             }
         });
         input.forEach((name, type) -> {
@@ -265,6 +263,22 @@ public final class RowExpressionTypeRules {
             }
         });
         return output;
+    }
+
+    private static TapstateType literalType(Object value) {
+        if (value instanceof Boolean) {
+            return TapstateType.BOOLEAN;
+        }
+        if (value instanceof String) {
+            return TapstateType.STRING;
+        }
+        if (value instanceof Integer || value instanceof Long) {
+            return TapstateType.INT64;
+        }
+        if (value instanceof Double) {
+            return TapstateType.DOUBLE;
+        }
+        return TapstateType.UNKNOWN;
     }
 
     private void judgeTypes(String expr, Set<String> referenced, DiscoveredTable table,

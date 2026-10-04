@@ -12,6 +12,8 @@ import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 /**
  * Judging a batch's row expressions against the columns their sources were discovered to hold. This
@@ -227,6 +229,78 @@ class RowExpressionTypeRulesTest {
                     model("a", TapstateType.DECIMAL, "b", TapstateType.DECIMAL)))
                     .doesNotThrowAnyException();
         }
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', textBlock = """
+            true       | after.value                   | after.value * 2 > 0
+            kept       | after.value == 'kept'          | after.value * 2 > 0
+            2147483648 | after.value > 0                | after.value && true
+            2.5        | after.value > 0.0              | after.value && true
+            """)
+    void aLiteralReplacementIsJudgedByItsOwnType(String literal, String valid, String invalid) {
+        String fields = "{ value: " + literal + " }";
+        Map<String, List<DiscoveredTable>> discovered = model("value", TapstateType.DECIMAL);
+
+        assertThatCode(() -> RowExpressionTypeRules.validate(
+                batch(projectThenFilter(fields, valid)), discovered)).doesNotThrowAnyException();
+
+        DslException thrown = catchThrowableOfType(DslException.class,
+                () -> RowExpressionTypeRules.validate(batch(projectThenFilter(fields, invalid)), discovered));
+        assertThat(thrown.code()).isEqualTo(DslError.ILLEGAL_EXPRESSION);
+        assertThat(thrown.path()).isEqualTo("transforms[1].expr");
+        assertThat(thrown.args()).containsEntry("expr", invalid);
+    }
+
+    @Test
+    void anUnresolvedLiteralReplacementIsRefusedEvenForAPresenceTest() {
+        DslException thrown = catchThrowableOfType(DslException.class,
+                () -> RowExpressionTypeRules.validate(
+                        batch(projectThenFilter("{ value: [1, 2] }", "has(after.value)")),
+                        model("value", TapstateType.INT64)));
+
+        assertThat(thrown.code()).isEqualTo(DslError.ROW_EXPRESSION_TYPE_UNKNOWN);
+        assertThat(thrown.args()).containsEntry("column", "value").containsEntry("table", "orders");
+        assertThat(thrown.path()).isEqualTo("transforms[1].expr");
+    }
+
+    @Test
+    void renamesKeepTypesAndConsumeTheirInputsWhileDropsRemoveFields() {
+        String fields = "{ moved: $amount, discarded: false, absent: $missing }";
+        Map<String, List<DiscoveredTable>> discovered = model(
+                "amount", TapstateType.DECIMAL, "discarded", TapstateType.DECIMAL,
+                "retained", TapstateType.UNKNOWN);
+
+        assertThatCode(() -> RowExpressionTypeRules.validate(batch(projectThenFilter(fields,
+                "after.amount * 2 > 0 && after.discarded * 2 > 0 && after.absent * 2 > 0")), discovered))
+                .doesNotThrowAnyException();
+
+        DslException renamed = catchThrowableOfType(DslException.class,
+                () -> RowExpressionTypeRules.validate(
+                        batch(projectThenFilter(fields, "after.moved * 2 > 0")), discovered));
+        assertThat(renamed.code()).isEqualTo(DslError.ROW_EXPRESSION_TYPE_UNSUPPORTED);
+        assertThat(renamed.args()).containsEntry("column", "moved").containsEntry("type", "DECIMAL");
+
+        DslException retained = catchThrowableOfType(DslException.class,
+                () -> RowExpressionTypeRules.validate(
+                        batch(projectThenFilter(fields, "after.retained > 0")), discovered));
+        assertThat(retained.code()).isEqualTo(DslError.ROW_EXPRESSION_TYPE_UNKNOWN);
+        assertThat(retained.args()).containsEntry("column", "retained");
+    }
+
+    private static String projectThenFilter(String fields, String expr) {
+        return """
+                version: tapstate/v1
+                kind: pipeline
+                id: orders_out
+                source: src_orders
+                transforms:
+                  - { id: project, from: [orders], type: map, fields: %s }
+                  - { id: keep, from: [project], type: filter, expr: "%s" }
+                serve:
+                  from: keep
+                  sync: [ { id: out, source: src_orders, write_mode: upsert } ]
+                """.formatted(fields, expr);
     }
 
     // ---- a column whose type nothing resolved -------------------------------------------

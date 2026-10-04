@@ -177,21 +177,7 @@ final class Wiring {
             return;
         }
         if (nodeFrom.containsKey(token)) {
-            if (visiting.add(token)) {
-                Step step = stepsById.get(token);
-                if (routes != null && step != null) {
-                    steps.add(step);
-                }
-                collect(nodeFrom.get(token), reached, visiting, routes, steps);
-                if (routes != null) {
-                    if (step != null) {
-                        steps.removeLast();
-                    }
-                    // Route collection follows shared nodes once per path; source-only collection
-                    // keeps its global visited set, which also backs nodesReaching.
-                    visiting.remove(token);
-                }
-            }
+            followNode(token, reached, visiting, routes, steps);
             return;
         }
         // A bare token is a table name, so the table is known even where the source is not: it is
@@ -205,6 +191,27 @@ final class Wiring {
         // A name nothing claims cannot be attributed, so no source may be ruled out.
         for (String sourceId : supplying.isEmpty() ? allSources : supplying) {
             arrive(Set.of(new Upstream(sourceId, token)), reached, routes, steps);
+        }
+    }
+
+    private void followNode(String token, Set<Upstream> reached, Set<String> visiting,
+            List<Route> routes, List<Step> steps) {
+        if (!visiting.add(token)) {
+            return;
+        }
+        Step step = stepsById.get(token);
+        boolean trackStep = routes != null && step != null;
+        if (trackStep) {
+            steps.add(step);
+        }
+        collect(nodeFrom.get(token), reached, visiting, routes, steps);
+        if (routes != null) {
+            if (trackStep) {
+                steps.removeLast();
+            }
+            // Route collection follows shared nodes once per path; source-only collection
+            // keeps its global visited set, which also backs nodesReaching.
+            visiting.remove(token);
         }
     }
 
