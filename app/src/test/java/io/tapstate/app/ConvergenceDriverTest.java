@@ -620,8 +620,19 @@ class ConvergenceDriverTest {
         verifyBoundPendingDecision(BoundPendingChange.MARKER_DURING_PROOF);
     }
 
+    @Test
+    void aClaimedSuccessorReportsNoStartAfterRestoringItsOwnBinding() throws Exception {
+        verifyBoundPendingDecision(BoundPendingChange.CLAIMED_RESTORE);
+    }
+
+    @Test
+    void aReturnedOwnerCannotReuseItsEarlierClaimReceiptForTheSameExecution() throws Exception {
+        verifyBoundPendingDecision(BoundPendingChange.REPLACED_CLAIM);
+    }
+
     private enum BoundPendingChange {
-        UNCHANGED, RESTORE, INCARNATION, GENERATION, MARKER, GENERATION_WITH_SAME_BINDING, MARKER_DURING_PROOF
+        UNCHANGED, RESTORE, INCARNATION, GENERATION, MARKER, GENERATION_WITH_SAME_BINDING, MARKER_DURING_PROOF,
+        CLAIMED_RESTORE, REPLACED_CLAIM
     }
 
     private void verifyBoundPendingDecision(BoundPendingChange change) throws Exception {
@@ -629,11 +640,10 @@ class ConvergenceDriverTest {
         var scope = new ObservationStore.Scope("inc-a", 2);
         boolean sameBinding = change == BoundPendingChange.UNCHANGED
                 || change == BoundPendingChange.GENERATION_WITH_SAME_BINDING
-                || change == BoundPendingChange.MARKER_DURING_PROOF;
+                || change == BoundPendingChange.MARKER_DURING_PROOF || change == BoundPendingChange.REPLACED_CLAIM;
         scopes.begin("orders", "inc-a", sameBinding ? 2 : 1);
         InMemoryWorkloadClaimStore generations = new InMemoryWorkloadClaimStore();
-        assertThat(generations.advanceStandalone("cluster-a", "orders")).hasValue(1);
-        assertThat(generations.advanceStandalone("cluster-a", "orders")).hasValue(2);
+        boolean claimed = change == BoundPendingChange.CLAIMED_RESTORE || change == BoundPendingChange.REPLACED_CLAIM;
         var onAuthorityRead = new java.util.concurrent.atomic.AtomicReference<Runnable>(() -> { });
         io.tapstate.spi.store.ExecutionGenerationStore qualifiedGenerations = new io.tapstate.spi.store.ExecutionGenerationStore() {
             @Override public Optional<io.tapstate.spi.store.WorkloadClaim> advanceUnderClaim(
@@ -648,22 +658,61 @@ class ConvergenceDriverTest {
                 return generations.currentGeneration(cluster, id);
             }
         };
-        var ownership = PipelineActuationOwnership.single("cluster-a", qualifiedGenerations);
+        ClusterMembershipGate membership;
+        ClusterWorkloadClaims claims;
+        PipelineActuationOwnership ownership;
+        io.tapstate.spi.store.WorkloadClaim seedClaim;
+        io.tapstate.spi.store.StopAuthority authority;
+        if (claimed) {
+            ClusterProperties properties = new ClusterProperties();
+            properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
+            membership = new ClusterMembershipGate(properties);
+            membership.install(new io.tapstate.spi.store.ClusterMembership("cluster-a", 7,
+                    java.util.Set.of("node-a", "node-b", "node-c")));
+            assertThat(membership.canCommit(java.util.Set.of("node-a", "node-b"))).isTrue();
+            claims = new ClusterWorkloadClaims(generations, membership);
+            var key = new io.tapstate.spi.store.WorkloadClaimKey("cluster-a",
+                    io.tapstate.spi.store.WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+            var owner = new io.tapstate.spi.store.WorkloadOwner("node-a", "boot-a");
+            var acquired = claims.acquire(key, owner, 7, Duration.ofSeconds(30)).orElseThrow();
+            assertThat(acquired.acquired()).isTrue();
+            var firstRun = claims.advanceExecution(acquired.claim(), 7,
+                    java.util.Set.of("node-a", "node-b")).orElseThrow();
+            seedClaim = claims.advanceExecution(firstRun, 7, java.util.Set.of("node-a", "node-b")).orElseThrow();
+            assertThat(seedClaim.executionGeneration()).isEqualTo(2);
+            ownership = new PipelineActuationOwnership("cluster-a", owner, membership, claims,
+                    Duration.ofSeconds(30), Duration.ofSeconds(10), () -> 0L);
+            authority = io.tapstate.spi.store.StopAuthority.claimed(io.tapstate.spi.store.WorkloadClaimFence.from(seedClaim));
+        } else {
+            membership = null;
+            claims = null;
+            seedClaim = null;
+            assertThat(generations.advanceStandalone("cluster-a", "orders")).hasValue(1);
+            assertThat(generations.advanceStandalone("cluster-a", "orders")).hasValue(2);
+            ownership = PipelineActuationOwnership.single("cluster-a", qualifiedGenerations);
+            authority = io.tapstate.spi.store.StopAuthority.standalone("cluster-a", 2);
+        }
         DesiredState intent = new DesiredState("orders", RUNNING, "rev-1");
         desired.save(intent);
         state.create("orders", StateJson.of(RUNNING), T0);
         state.compareAndSwap("orders", 0, StateJson.of(RUNNING), T0);
         state.compareAndSwap("orders", 1, StateJson.of(RUNNING), T0);
         var checkpoint = state.read("orders").orElseThrow();
-        var authority = io.tapstate.spi.store.StopAuthority.standalone("cluster-a", 2);
-        var job = new io.tapstate.spi.store.StopReservation.JobIdentity("cluster-a", 102, "successor-boot");
+        String successorBoot = claimed ? "boot-a" : "successor-boot";
+        var job = new io.tapstate.spi.store.StopReservation.JobIdentity("cluster-a", 102, successorBoot);
         var marker = new io.tapstate.spi.store.StopReservation("orders", "handoff-a", 0, 2, intent,
                 new io.tapstate.spi.store.StopReservation.Source("cluster-a", new ObservationStore.Scope("inc-a", 1),
                         new io.tapstate.spi.store.StopReservation.JobIdentity("cluster-a", 101, "source-boot")),
                 io.tapstate.spi.store.StopReservation.Phase.SUCCESSOR_BOUND,
                 io.tapstate.spi.store.StopReservation.CounterPolicy.CONTINUE, authority,
-                new io.tapstate.spi.store.StopReservation.Successor(scope, "successor-boot", job),
+                new io.tapstate.spi.store.StopReservation.Successor(scope, successorBoot, job),
                 io.tapstate.spi.store.StopReservation.CURRENT_FORMAT);
+        if (claimed) {
+            var admitted = claimedAdmission(marker, authority);
+            assertThat(ownership.adoptAdmission(new io.tapstate.spi.store.SuccessorAdmission(admitted,
+                    Optional.of(seedClaim))).allowed()).isTrue();
+            assertThat(ownership.permit("orders").claim().claimGeneration()).isEqualTo(1);
+        }
         var savedMarker = new java.util.concurrent.atomic.AtomicReference<>(marker);
         io.tapstate.spi.store.StateStore handoff = new io.tapstate.spi.store.StateStore() {
             @Override public Optional<io.tapstate.core.lifecycle.CheckpointDoc> read(String id) { return state.read(id); }
@@ -706,6 +755,20 @@ class ConvergenceDriverTest {
                             marker.pipelineId(), "handoff-b", marker.sourceEpoch(), marker.reservedEpoch(),
                             marker.originalDesired(), marker.source(), marker.phase(), marker.counterPolicy(),
                             marker.writerAuthority(), marker.successor(), marker.formatVersion())));
+                } else if (change == BoundPendingChange.REPLACED_CLAIM) {
+                    var held = ownership.permit("orders").claim();
+                    assertThat(claims.release(held)).isTrue();
+                    var other = claims.acquire(held.key(), new io.tapstate.spi.store.WorkloadOwner("node-b", "boot-b"),
+                            7, Duration.ofSeconds(30)).orElseThrow().claim();
+                    assertThat(other.claimGeneration()).isEqualTo(2);
+                    assertThat(claims.release(other)).isTrue();
+                    var returned = claims.acquire(held.key(), held.owner(), 7, Duration.ofSeconds(30)).orElseThrow().claim();
+                    assertThat(returned.claimGeneration()).isEqualTo(3);
+                    assertThat(returned.executionGeneration()).isEqualTo(2);
+                    var freshAuthority = io.tapstate.spi.store.StopAuthority.claimed(
+                            io.tapstate.spi.store.WorkloadClaimFence.from(returned));
+                    assertThat(ownership.adoptAdmission(new io.tapstate.spi.store.SuccessorAdmission(
+                            claimedAdmission(marker, freshAuthority), Optional.of(returned))).allowed()).isTrue();
                 }
                 return current.getAsBoolean();
             }
@@ -736,7 +799,8 @@ class ConvergenceDriverTest {
         try (LifecycleWorkDispatcher work = new LifecycleWorkDispatcher(1, 1)) {
             ConvergenceDriver isolated = new ConvergenceDriver(
                     new PipelineConverger(desired, handoff, actuator, Clock.fixed(T0, ZoneOffset.UTC)), desired,
-                    new ObservationPublisher(handoff, scopedLatest), null, MetricsExport.none(), () -> true,
+                    new ObservationPublisher(handoff, scopedLatest), null, MetricsExport.none(),
+                    claimed ? membership::businessEligible : () -> true,
                     ownership, work, scopes, null, pending);
             isolated.reconcile();
             assertThat(adopting.await(5, TimeUnit.SECONDS)).isTrue();
@@ -766,7 +830,8 @@ class ConvergenceDriverTest {
             assertThat(latest.state()).isEqualTo(RUNNING);
             assertThat(latest.failure()).as("a telemetry fixture failure cannot erase pending and make this pass")
                     .isNull();
-            if (change == BoundPendingChange.UNCHANGED || change == BoundPendingChange.RESTORE) {
+            if (change == BoundPendingChange.UNCHANGED || change == BoundPendingChange.RESTORE
+                    || change == BoundPendingChange.CLAIMED_RESTORE) {
                 assertThat(scopes.current("orders")).contains(scope);
                 assertThat(pending.pending("orders"))
                         .as("a coalesced tick cannot invent start while a known bound job waits only for telemetry")
@@ -779,10 +844,23 @@ class ConvergenceDriverTest {
             assertThat(generations.currentGeneration("cluster-a", "orders"))
                     .hasValue(change == BoundPendingChange.GENERATION
                             || change == BoundPendingChange.GENERATION_WITH_SAME_BINDING ? 3 : 2);
+            if (claimed) {
+                assertThat(ownership.permit("orders").claim().claimGeneration())
+                        .isEqualTo(change == BoundPendingChange.REPLACED_CLAIM ? 3 : 1);
+            }
             releaseAdoption.countDown();
         } finally {
             releaseAdoption.countDown();
         }
+    }
+
+    private static io.tapstate.spi.store.StopReservation claimedAdmission(
+            io.tapstate.spi.store.StopReservation bound, io.tapstate.spi.store.StopAuthority authority) {
+        return new io.tapstate.spi.store.StopReservation(bound.pipelineId(), bound.token(), bound.sourceEpoch(),
+                bound.reservedEpoch(), bound.originalDesired(), bound.source(),
+                io.tapstate.spi.store.StopReservation.Phase.SUCCESSOR_ADMITTED, bound.counterPolicy(), authority,
+                new io.tapstate.spi.store.StopReservation.Successor(bound.successor().scope(),
+                        bound.successor().submissionBootId(), null), bound.formatVersion());
     }
 
     private enum PendingChange { REBUILD, RECOVERY, INCARNATION }
