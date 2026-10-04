@@ -146,18 +146,22 @@ class RealLargeSnapshotParallelCdcIT {
         Path jar = Path.of(System.getProperty(BOOT_JAR_PROPERTY));
         boolean directCounts = Boolean.getBoolean("tapstate.e2e.large-snapshot.direct-counts");
         BenchmarkLiveReport report = directCounts ? admissionReport() : null;
+        Map<String, Object> telemetryInputs = directCounts ? snapshotTelemetryInputs() : Map.of();
         var admissions = new ExecutionAdmissionStages(report, directCounts);
         try {
             if (report != null) {
                 report.begin(Map.of("purpose", "REAL_PARTIAL_SNAPSHOT_REBUILD_ADMISSION_AND_PHYSICAL_COUNTS",
-                                "application", PipelineBenchmarkLiveRunIT.artifact(jar), "discoveryMode", "none"),
+                                "application", PipelineBenchmarkLiveRunIT.artifact(jar), "discoveryMode", "none",
+                                "mongoTelemetryWitnessInputs", telemetryInputs),
                         PipelineBenchmarkLiveRunIT.environment(), List.of());
             }
             runSnapshotRebuildWitness(jar, admissions, report, directCounts);
             if (report != null) {
+                assertThat(snapshotTelemetryInputs()).isEqualTo(telemetryInputs);
                 report.completeDiagnostic(Map.of("correctness", "REAL_PARTIAL_SNAPSHOT_REBUILT_ONCE_WITH_CONTINUOUS_TOTALS",
                         "performanceAcceptanceEligible", false,
-                        "unverified", List.of("ALL_TELEMETRY_SURFACE_IDENTITIES")));
+                        "unverified", List.of("ALL_TELEMETRY_SURFACE_IDENTITIES",
+                                "PARTIAL_PHASE_FRESH_POSITIVE_RAW_AND_CURRENT_OUTPUT_POINTS", "SNAPSHOT_PROCESS_RESTORATION")));
             }
         } catch (Exception | Error failure) {
             if (report != null) {
@@ -178,6 +182,14 @@ class RealLargeSnapshotParallelCdcIT {
         return new BenchmarkLiveReport(output);
     }
 
+    private static Map<String, Object> snapshotTelemetryInputs() throws Exception {
+        Path root = PipelineBenchmarkLiveRunIT.harnessRoot();
+        Map<String, Object> inputs = new LinkedHashMap<>(TelemetryMongoIdentityWitness.inputHashes(root));
+        inputs.put("RealLargeSnapshotParallelCdcIT", PipelineBenchmarkLiveRunIT.artifact(root.resolve(
+                "e2e/src/test/java/io/tapstate/e2e/RealLargeSnapshotParallelCdcIT.java")));
+        return Map.copyOf(inputs);
+    }
+
     private static void runSnapshotRebuildWitness(Path jar, ExecutionAdmissionStages admissions,
             BenchmarkLiveReport report, boolean directCounts) throws Exception {
         Map<String, Object> bulkMysql = SharedMySql.settings("snapshot_resume_source");
@@ -189,6 +201,7 @@ class RealLargeSnapshotParallelCdcIT {
         String targetUri = SharedMongo.replicaSetUrl("snapshot_resume_target");
         EndpointAddress target = EndpointAddress.uri(targetUri);
         String jarSha = PipelineBenchmarkLiveRunIT.sha256(jar);
+        Instant telemetryFrom = Instant.now().minusSeconds(1);
 
         try (var coordination = new SnapshotCoordinationProfileStages(report, directCounts, BULK_PIPELINE, FAST_PIPELINE);
                 MongoEndpoints mongo = new MongoEndpoints();
@@ -201,6 +214,10 @@ class RealLargeSnapshotParallelCdcIT {
             var latest = new MongoObservationStore(storeClient,
                     database.getCollection(MongoStorePort.PIPELINE_OBSERVATION),
                     database.getCollection(MongoStorePort.PIPELINE_OBSERVATION_CHUNKS));
+            var bulkTelemetry = directCounts ? new TelemetryMongoIdentityWitness(database, latest, report,
+                    BULK_PIPELINE, telemetryFrom, Duration.ofMinutes(2)) : null;
+            var fastTelemetry = directCounts ? new TelemetryMongoIdentityWitness(database, latest, report,
+                    FAST_PIPELINE, telemetryFrom, Duration.ofMinutes(2)) : null;
             MongoDatabase targetDatabase = targetClient.getDatabase(new ConnectionString(targetUri).getDatabase());
             ControlPlane control = new ControlPlane(boot.server().baseUrl());
             control.bootstrapAndLogin("snapshot-resume", "snapshot-resume-password");
@@ -220,6 +237,10 @@ class RealLargeSnapshotParallelCdcIT {
             long fastBefore = Await.answered("known CDC output before snapshot pause",
                     () -> control.recordsOut(FAST_PIPELINE).filter(count -> count > 0));
             Instant fastObservedBefore = control.statusObservedAt(FAST_PIPELINE);
+            if (directCounts) {
+                fastTelemetry.captureIdentityOnly("parallel-cdc-start", latest.readStored(FAST_PIPELINE).orElseThrow(),
+                        control, boot.server().baseUrl());
+            }
             admissions.stage("before-bulk-start", 0, 0);
             coordination.stage("before-bulk-start", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts), boot.admission());
             coordination.begin("partial-snapshot-start", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts));
@@ -248,6 +269,12 @@ class RealLargeSnapshotParallelCdcIT {
             assertThat(paused.scope()).contains(oldScope);
             CumulativeMetricWitness.paused(report, "snapshot-pause", beforeCumulative, CumulativeMetricWitness.capture(paused));
             assertThat(claimGeneration(database, BULK_PIPELINE)).isEqualTo(oldScope.executionGeneration());
+            if (directCounts) {
+                // Pause while the snapshot is unfinished before waiting for diagnostic receipts.
+                // The saved RUNNING and PAUSED observations share the unchanged execution scope.
+                bulkTelemetry.captureIdentityOnly("partial-snapshot-start", before, control, boot.server().baseUrl());
+                bulkTelemetry.captureIdentityOnly("snapshot-pause", paused, control, boot.server().baseUrl());
+            }
             admissions.stage("snapshot-pause", 0, 0);
             coordination.stage("snapshot-pause", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts), boot.admission());
 
@@ -256,6 +283,10 @@ class RealLargeSnapshotParallelCdcIT {
             awaitFastTargetAndObservation(control, mongo, target, "while_paused", fastBefore, fastObservedBefore);
             long fastPaused = control.recordsOut(FAST_PIPELINE).orElseThrow();
             Instant fastObservedPaused = control.statusObservedAt(FAST_PIPELINE);
+            if (directCounts) {
+                fastTelemetry.captureIdentityOnly("parallel-cdc-while-snapshot-paused",
+                        latest.readStored(FAST_PIPELINE).orElseThrow(), control, boot.server().baseUrl());
+            }
             admissions.stage("parallel-cdc-while-snapshot-paused", 0, 0);
             coordination.stage("parallel-cdc-while-snapshot-paused", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts),
                     boot.admission());
@@ -278,6 +309,9 @@ class RealLargeSnapshotParallelCdcIT {
             CumulativeMetricWitness.continued(report, "partial-snapshot-rebuild-resume", beforeCumulative, resumedCumulative, true);
             Document resumedSample = actualHistorySample(database, resumedScope);
             assertThat(resumedSample.getDate("countingSince")).isEqualTo(oldSample.getDate("countingSince"));
+            if (directCounts) {
+                bulkTelemetry.captureIdentityOnly("partial-snapshot-rebuild-resume", resumed, control, boot.server().baseUrl());
+            }
             admissions.stage("partial-snapshot-rebuild-resume", 1, 1);
             coordination.stage("partial-snapshot-rebuild-resume", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts),
                     boot.admission());
@@ -303,6 +337,10 @@ class RealLargeSnapshotParallelCdcIT {
                     .isGreaterThanOrEqualTo(2);
             assertThat(segments.stream().map(Map.class::cast).map(segment -> segment.get("startReason")))
                     .contains("CONTINUATION").doesNotContain("COUNTER_RESET");
+            if (directCounts) {
+                fastTelemetry.captureIdentityOnly("parallel-cdc-after-snapshot-resume",
+                        latest.readStored(FAST_PIPELINE).orElseThrow(), control, boot.server().baseUrl());
+            }
             admissions.stage("parallel-cdc-after-snapshot-resume", 0, 0);
             coordination.stage("parallel-cdc-after-snapshot-resume", snapshotReadiness(latest, targetDatabase, mongo, target, directCounts),
                     boot.admission());
@@ -310,7 +348,7 @@ class RealLargeSnapshotParallelCdcIT {
             Await.until("the resumed snapshot to reach its complete physical target", WAIT,
                     () -> bulkTargetRows(targetDatabase) == BULK_ROWS,
                     () -> "targetRows=" + bulkTargetRows(targetDatabase));
-            Await.answered("final cumulative delivery records and histogram to cover the full snapshot", () ->
+            ObservationStore.Stored completed = Await.answered("final cumulative delivery records and histogram to cover the full snapshot", () ->
                     latest.readStored(BULK_PIPELINE).filter(value -> value.scope().filter(resumedScope::equals).isPresent()
                             && deliveryPoints(value.observation(), "tapstate.pipeline.records").stream()
                                     .mapToLong(MetricPoint::value).sum() >= BULK_ROWS
@@ -319,6 +357,11 @@ class RealLargeSnapshotParallelCdcIT {
             var completedCumulative = CumulativeMetricWitness.running(latest, BULK_PIPELINE, resumedScope,
                     WAIT, resumedCumulative, report, "snapshot-completed");
             CumulativeMetricWitness.continued(report, "snapshot-completed", resumedCumulative, completedCumulative, false);
+            if (directCounts) {
+                bulkTelemetry.capture("snapshot-completed", completed, control, boot.server().baseUrl(), true);
+                fastTelemetry.capture("parallel-cdc-after-snapshot-completed",
+                        latest.readStored(FAST_PIPELINE).orElseThrow(), control, boot.server().baseUrl(), true);
+            }
             assertThat(control.errorCount(BULK_PIPELINE)).contains(0L);
             assertThat(control.errorCount(FAST_PIPELINE)).contains(0L);
             admissions.stage("snapshot-completed-with-cdc-ticks", 0, 0);
@@ -329,12 +372,15 @@ class RealLargeSnapshotParallelCdcIT {
             control.stop(FAST_PIPELINE, false);
             if (directCounts) {
                 for (String pipeline : List.of(BULK_PIPELINE, FAST_PIPELINE)) {
-                    Await.answered("the physical stop witness retains the actual final scoped observation for " + pipeline,
+                    ObservationStore.Stored stopped = Await.answered("the physical stop witness retains the actual final scoped observation for " + pipeline,
                             () -> latest.readStored(pipeline).filter(value -> value.scope().isPresent()
                                     && value.observation().state() == PipelineState.STOPPED));
                     if (pipeline.equals(BULK_PIPELINE)) {
                         CumulativeMetricWitness.continued(report, "snapshot-final-stop", completedCumulative,
                                 CumulativeMetricWitness.capture(latest.readStored(pipeline).orElseThrow()), false);
+                        bulkTelemetry.captureIdentityOnly("snapshot-final-stop", stopped, control, boot.server().baseUrl());
+                    } else {
+                        fastTelemetry.captureIdentityOnly("parallel-cdc-final-stop", stopped, control, boot.server().baseUrl());
                     }
                 }
             }

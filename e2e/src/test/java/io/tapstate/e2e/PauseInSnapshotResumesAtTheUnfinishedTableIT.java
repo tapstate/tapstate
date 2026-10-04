@@ -4,7 +4,9 @@ import com.mongodb.ConnectionString;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.lifecycle.LifecycleVerb;
+import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.DockerGate;
 import org.bson.Document;
 import org.junit.jupiter.api.AfterEach;
@@ -22,7 +24,9 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -150,7 +154,7 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
 
             // A durable synchronisation point rather than a sleep: the record itself is what says the two
             // tables are confirmed, and it is the only thing this test carries across the restart.
-            awaitCompleted(storeUri, Set.of(FIRST, SECOND));
+            awaitCompleted(storeUri, Set.of(FIRST, SECOND), control);
             assertThat(completedTables(storeUri))
                     .as("the third table is in no selection that has run, so nothing has confirmed it")
                     .doesNotContain(OWED);
@@ -182,8 +186,10 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
             control.apply(resources(FIRST + ", " + SECOND + ", " + OWED));
             control.discoverSchema(SOURCE, E2eConnectorJar.CONNECTOR_ID, sourceSettings());
 
+            RestartAuthority beforeStart = restartAuthority(storeUri);
+            assertThat(beforeStart).as("the original execution has a factual authority before the next START").isNotNull();
             control.lifecycle(PIPELINE, LifecycleVerb.START);
-            Map<String, Long> owedRunReads = awaitSettledReads(control);
+            Map<String, Long> owedRunReads = awaitSettledReads(control, storeUri, beforeStart);
 
             assertThat(owedRunReads)
                     .as("the two tables the sink confirmed are not read again; the one it never confirmed "
@@ -199,6 +205,27 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
         }
     }
 
+    /** Reads only the authority needed to distinguish the next execution from retained read counts. */
+    private static RestartAuthority restartAuthority(String storeUri) {
+        String database = new ConnectionString(storeUri).getDatabase();
+        if (database == null) { throw new AssertionError("the store URL names no database"); }
+        try (MongoClient client = MongoClients.create(storeUri)) {
+            var store = client.getDatabase(database);
+            Document identity = SystemCollections.CLUSTER_IDENTITY.on(store).withTimeout(2, TimeUnit.SECONDS)
+                    .find(new Document("_id", "cluster")).projection(new Document("clusterId", 1)).first();
+            if (identity == null || !(identity.get("clusterId") instanceof String clusterId)) { return null; }
+            Document sequenceId = new Document("clusterId", clusterId)
+                    .append("resourceType", "PIPELINE_ACTUATION").append("resourceId", PIPELINE);
+            Document sequence = SystemCollections.WORKLOAD_CLAIMS.on(store).withTimeout(2, TimeUnit.SECONDS)
+                    .find(new Document("_id", sequenceId)).projection(new Document("executionGeneration", 1)).first();
+            return sequence != null && sequence.get("executionGeneration") instanceof Number generation
+                    && generation.longValue() > 0
+                    ? new RestartAuthority(new Document(sequenceId), generation.longValue()) : null;
+        }
+    }
+
+    private record RestartAuthority(Document sequenceId, long generation) { }
+
     /** Writes one table's file: an ordering id column the tail reads, and a name to make rows distinct. */
     private void seed(String table, int rows) {
         List<String> lines = new ArrayList<>();
@@ -210,18 +237,24 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
                 String.join(System.lineSeparator(), lines) + System.lineSeparator());
     }
 
-    /** Waits until the chain record names every table a sink is expected to have confirmed. */
-    private static void awaitCompleted(String storeUri, Set<String> expected) {
+    /** Waits for durable completion and the actual first-run read counts within one shared budget. */
+    private static void awaitCompleted(String storeUri, Set<String> expected, ControlPlane control) {
         long deadline = System.nanoTime() + TIMEOUT.toNanos();
         List<String> last = List.of();
+        Map<String, Long> reads = Map.of();
         while (System.nanoTime() - deadline < 0) {
             last = completedTables(storeUri);
             if (last.containsAll(expected)) {
-                return;
+                reads = control.snapshotRowsRead(PIPELINE);
+                if (Long.valueOf(2).equals(reads.get(FIRST)) && Long.valueOf(3).equals(reads.get(SECOND))) {
+                    return;
+                }
             }
             sleep();
         }
         assertThat(last).as("tables the sink confirmed before the restart").containsAll(expected);
+        assertThat(reads).as("the current first run published its confirmed per-table read counts before stop")
+                .containsEntry(FIRST, 2L).containsEntry(SECOND, 3L);
     }
 
     /**
@@ -229,20 +262,43 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
      * bounded round finishes, never part way through, so the wait is for the run to exist rather than for
      * the reading to complete.
      */
-    private static Map<String, Long> awaitSettledReads(ControlPlane control) {
+    private static Map<String, Long> awaitSettledReads(ControlPlane control, String storeUri, RestartAuthority beforeStart) {
         long deadline = System.nanoTime() + TIMEOUT.toNanos();
         Map<String, Long> last = Map.of();
+        Optional<PipelineState> state = Optional.empty();
+        Long generation = null;
+        boolean admitted = false;
         long unchangedSince = System.nanoTime();
-        while (System.nanoTime() - deadline < 0) {
-            Map<String, Long> now = control.snapshotRowsRead(PIPELINE);
-            if (!now.equals(last)) {
-                last = now;
-                unchangedSince = System.nanoTime();
-            } else if (!now.isEmpty() && System.nanoTime() - unchangedSince > SETTLE.toNanos()) {
-                return now;
+        String database = new ConnectionString(storeUri).getDatabase();
+        if (database == null) { throw new AssertionError("the store URL names no database"); }
+        try (MongoClient client = MongoClients.create(storeUri)) {
+            var sequences = SystemCollections.WORKLOAD_CLAIMS.on(client.getDatabase(database));
+            while (System.nanoTime() - deadline < 0) {
+                state = control.state(PIPELINE);
+                Map<String, Long> now = control.snapshotRowsRead(PIPELINE);
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) { last = now; break; }
+                Document sequence = sequences.withTimeout(Math.min(remaining, TimeUnit.SECONDS.toNanos(2)), TimeUnit.NANOSECONDS)
+                        .find(new Document("_id", beforeStart.sequenceId()))
+                        .projection(new Document("executionGeneration", 1)).first();
+                generation = sequence != null && sequence.get("executionGeneration") instanceof Number actual
+                        ? actual.longValue() : null;
+                boolean currentRun = state.filter(PipelineState.RUNNING::equals).isPresent()
+                        && generation != null && generation > beforeStart.generation();
+                if (!currentRun || !admitted || !now.equals(last)) {
+                    last = now;
+                    admitted = currentRun;
+                    unchangedSince = System.nanoTime();
+                } else if (!now.isEmpty() && System.nanoTime() - unchangedSince > SETTLE.toNanos()) {
+                    return now;
+                }
+                sleep();
             }
-            sleep();
         }
+        assertThat(admitted && state.filter(PipelineState.RUNNING::equals).isPresent()
+                && generation != null && generation > beforeStart.generation())
+                .as("a new execution entered within the original bound; state=%s, authority=%s, before=%s, reads=%s",
+                        state, generation, beforeStart.generation(), last).isTrue();
         assertThat(last).as("the run that came back published no per-table read counts").isNotEmpty();
         return last;
     }

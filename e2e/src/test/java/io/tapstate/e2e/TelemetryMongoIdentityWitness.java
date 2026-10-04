@@ -236,6 +236,131 @@ final class TelemetryMongoIdentityWitness {
         issued.put(scope, selection);
     }
 
+    /** Qualifies identity and retained public output without claiming quiet-stage counter or raw-pair evidence. */
+    void captureIdentityOnly(String action, ObservationStore.Stored expected, ControlPlane control, URI base) {
+        deadline = System.nanoTime() + bound.toNanos();
+        ObservationStore.Scope scope = requireActualScope(expected);
+        assertThat(issued.size() < MAX_SCOPES || issued.containsKey(scope))
+                .as("the finite lifecycle witness holds at most %s issued scopes", MAX_SCOPES).isTrue();
+        issued.putIfAbsent(scope, new Selection(List.of(), List.of(), null, List.of(), null));
+        Selection previous = issued.get(scope);
+        PipelineState state = expected.observation().state();
+        PipelineState beforeState = previous.capturedState();
+        boolean changedState = beforeState != null && beforeState != state;
+        var last = new java.util.concurrent.atomic.AtomicReference<Emitted>();
+        Emitted emitted;
+        try {
+            emitted = Await.answered("actual emitted envelope identities and lifecycle event for " + action,
+                    remaining(), () -> {
+                        Instant to = Instant.now();
+                        List<Document> raw = rows(MongoStorePort.PIPELINE_RATE_HISTORY, "observedAt", to,
+                                "_id", "pipelineId", "pipelineIncarnationId", "executionGeneration",
+                                "observedAt", "countingSince", "counters", "gapFrom");
+                        List<Document> events = rows(MongoStorePort.PIPELINE_EVENTS, "occurredAt", to,
+                                "_id", "pipelineId", "pipelineIncarnationId", "executionGeneration",
+                                "occurredAt", "kind", "beforeState", "afterState");
+                        raw.forEach(this::requireIssued);
+                        events.forEach(this::requireIssued);
+                        List<Document> transitions = events.stream().filter(row -> owner(row).equals(scope))
+                                .filter(row -> LIFECYCLE_KINDS.contains(row.getString("kind")))
+                                .filter(row -> state.name().equals(row.getString("afterState")))
+                                .filter(row -> !changedState || "STATE_CHANGED".equals(row.getString("kind"))
+                                        && beforeState.name().equals(row.getString("beforeState"))
+                                        && !previous.eventIds().contains(String.valueOf(row.get("_id"))))
+                                .toList();
+                        Emitted actual = new Emitted(raw, events, List.of(), transitions, to);
+                        last.set(actual);
+                        return transitions.isEmpty() ? java.util.Optional.empty() : java.util.Optional.of(actual);
+                    });
+        } catch (AssertionError failure) {
+            try {
+                Map<String, Object> missing = new LinkedHashMap<>();
+                missing.put("action", "mongo-telemetry-" + action + "-missing");
+                missing.put("status", "MISSING_EVIDENCE");
+                missing.put("qualification", "ACTUAL_ENVELOPE_IDENTITIES_AND_RETAINED_PUBLIC_PROJECTIONS");
+                missing.put("expectedIncarnation", scope.pipelineIncarnationId());
+                missing.put("expectedExecutionGeneration", scope.executionGeneration());
+                missing.put("expectedAfterState", state.name());
+                missing.put("positiveRawRequired", false);
+                missing.put("positiveRawQualification", "UNVERIFIED_AT_THIS_STAGE");
+                missing.put("outputPointQualification", "UNVERIFIED_AT_THIS_STAGE");
+                missing.put("unverifiedSurfaces", List.of("FRESH_POSITIVE_RAW_PAIR", "CURRENT_OUTPUT_POINT_START_AND_TOTALS"));
+                Emitted actual = last.get();
+                if (actual != null) {
+                    missing.put("lastScannedAt", actual.to().toString());
+                    missing.put("rawCount", actual.raw().size());
+                    missing.put("eventCount", actual.events().size());
+                    missing.put("ownedRawEnvelopes", actual.raw().stream().filter(row -> owner(row).equals(scope))
+                            .map(TelemetryMongoIdentityWitness::rawIdentityEvidence).toList());
+                    missing.put("matchingTransitionCount", actual.transitions().size());
+                    missing.put("actualEvents", actual.events().stream()
+                            .map(TelemetryMongoIdentityWitness::eventEvidence).toList());
+                }
+                missing.put("diagnostic", failure.getMessage());
+                missing.put("performanceAcceptanceEligible", false);
+                report.addFork(missing);
+            } catch (RuntimeException | Error diagnosticFailure) {
+                if (failure != diagnosticFailure) { failure.addSuppressed(diagnosticFailure); }
+            }
+            throw failure;
+        }
+        requireActualScope(expected);
+        requireRetained(scope, emitted);
+        List<Document> ownedRaw = emitted.raw().stream().filter(row -> owner(row).equals(scope)).toList();
+        Selection selection = new Selection(
+                java.util.stream.Stream.concat(previous.rawIds().stream(), ids(ownedRaw).stream()).distinct().toList(),
+                java.util.stream.Stream.concat(previous.eventIds().stream(), ids(emitted.transitions()).stream())
+                        .distinct().toList(), previous.intervalEnd(), previous.pairs(), state);
+        Map<ObservationStore.Scope, Selection> retained = new LinkedHashMap<>(issued);
+        retained.put(scope, selection);
+        List<Map<?, ?>> segments = publicRows(control, base, "metrics/history", emitted.to(), "segments");
+        List<Map<?, ?>> events = publicRows(control, base, "events", emitted.to(), "events");
+        Set<Instant> ends = intervalEnds(segments);
+        Set<String> publicEventIds = events.stream().map(row -> String.valueOf(row.get("id")))
+                .collect(Collectors.toSet());
+        for (var earlier : retained.entrySet()) {
+            if (!earlier.getKey().pipelineIncarnationId().equals(scope.pipelineIncarnationId())) { continue; }
+            if (earlier.getValue().intervalEnd() != null) {
+                assertThat(ends).as("public history retains a previously qualified actual raw point")
+                        .contains(earlier.getValue().intervalEnd());
+            }
+            assertThat(publicEventIds).as("public events retain each actually emitted event of this incarnation")
+                    .containsAll(earlier.getValue().eventIds());
+            for (RawPair pair : earlier.getValue().pairs()) { requirePublicPair(segments, pair); }
+        }
+        requirePublicBoundaries(segments, emitted.raw(), scope.pipelineIncarnationId());
+        Map<String, Object> evidence = new LinkedHashMap<>();
+        evidence.put("action", "mongo-telemetry-" + action);
+        evidence.put("qualification", "ACTUAL_ENVELOPE_IDENTITIES_AND_RETAINED_PUBLIC_PROJECTIONS");
+        evidence.put("pipelineId", pipeline);
+        evidence.put("incarnation", scope.pipelineIncarnationId());
+        evidence.put("executionGeneration", scope.executionGeneration());
+        evidence.put("coordinationId", coordinationId);
+        evidence.put("clusterId", clusterId);
+        evidence.put("state", state.name());
+        evidence.put("from", from.toString());
+        evidence.put("to", emitted.to().toString());
+        evidence.put("requestedObservationAt", expected.observation().observedAt().toString());
+        evidence.put("positiveRawRequired", false);
+        evidence.put("positiveRawQualification", "UNVERIFIED_AT_THIS_STAGE");
+        evidence.put("outputPointQualification", "UNVERIFIED_AT_THIS_STAGE");
+        evidence.put("unverifiedSurfaces", List.of("FRESH_POSITIVE_RAW_PAIR", "CURRENT_OUTPUT_POINT_START_AND_TOTALS"));
+        evidence.put("receiptOnly", beforeState == state);
+        if (beforeState != null) { evidence.put("expectedBeforeState", beforeState.name()); }
+        evidence.put("ownedRawEnvelopeState", ownedRaw.isEmpty() ? "ABSENT" : "EMITTED");
+        evidence.put("ownedRawEnvelopes", ownedRaw.stream().map(TelemetryMongoIdentityWitness::rawIdentityEvidence).toList());
+        evidence.put("selectedEvents", emitted.transitions().stream()
+                .map(TelemetryMongoIdentityWitness::eventEvidence).toList());
+        evidence.put("retainedRawCount", emitted.raw().size());
+        evidence.put("retainedEventCount", emitted.events().size());
+        evidence.put("retainedStrictRawPairs", selection.pairs().size());
+        evidence.put("historySegments", segments);
+        evidence.put("publicEventIds", events.stream().map(row -> row.get("id")).toList());
+        evidence.put("performanceAcceptanceEligible", false);
+        report.addFork(evidence);
+        issued.put(scope, selection);
+    }
+
     RetainedCursor beforeRecreation(ControlPlane control, URI base) {
         deadline = System.nanoTime() + bound.toNanos();
         Instant to = Instant.now();
@@ -563,6 +688,27 @@ final class TelemetryMongoIdentityWitness {
                 "countingSince", row.getDate("countingSince").toInstant().toString(),
                 "recordsOut", row.get("counters", Document.class).get("records.out"),
                 "incarnation", row.getString("pipelineIncarnationId"), "executionGeneration", row.get("executionGeneration"));
+    }
+
+    private static Map<String, Object> rawIdentityEvidence(Document row) {
+        Map<String, Object> evidence = new LinkedHashMap<>();
+        evidence.put("id", String.valueOf(row.get("_id")));
+        evidence.put("observedAt", row.getDate("observedAt").toInstant().toString());
+        evidence.put("incarnation", row.getString("pipelineIncarnationId"));
+        evidence.put("executionGeneration", row.get("executionGeneration"));
+        assertThat(row.get("countingSince") == null || row.get("countingSince") instanceof Date)
+                .as("an actually emitted raw start is a BSON date when present").isTrue();
+        evidence.put("countingSinceState", row.get("countingSince") instanceof Date ? "RECORDED" : "ABSENT");
+        if (row.get("countingSince") instanceof Date start) {
+            evidence.put("countingSince", start.toInstant().toString());
+        }
+        assertThat(row.get("counters") == null || row.get("counters") instanceof Document)
+                .as("actually emitted raw counters form a document when present").isTrue();
+        Object output = row.get("counters") instanceof Document counters ? counters.get("records.out") : null;
+        assertThat(output == null || output instanceof Number).as("an emitted output counter is numeric when present").isTrue();
+        evidence.put("recordsOutState", output instanceof Number ? "RECORDED" : "ABSENT");
+        if (output instanceof Number) { evidence.put("recordsOut", output); }
+        return Map.copyOf(evidence);
     }
 
     private static Map<String, Object> eventEvidence(Document row) {
