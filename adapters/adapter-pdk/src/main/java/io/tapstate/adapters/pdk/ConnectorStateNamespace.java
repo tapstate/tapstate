@@ -48,4 +48,9 @@ public final class ConnectorStateNamespace {
     public static String ofShared(String chainId) {
         return SHARED_PREFIX + Objects.requireNonNull(chainId, "chainId");
     }
+
+    /** Markers that prevent earlier private notes from repopulating a shared notes namespace. */
+    public static String migrationOf(String namespace) {
+        return "pdk.notes-migration." + Objects.requireNonNull(namespace, "namespace");
+    }
 }

@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.pdk.ConnectorStateNamespace;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.PipelineResource;
@@ -1086,7 +1087,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 // resumes from, the schema history, and which tables finished their initial load. This
                 // is what makes the next run of this pipeline read its source from the beginning, which
                 // is what asking for the state to be cleared meant.
-                firstFailure = runCleanup(() -> storePort.meta().dropChain(chainId.value()), firstFailure);
+                firstFailure = runCleanup(() -> purgeChain(chainId.value()), firstFailure);
             } else {
                 // Others are still reading it, so only this pipeline's own cursor is its to give back.
                 // Run whether or not the release above succeeded, and safe to run twice: the detach
@@ -1211,12 +1212,21 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         return runCleanup(
                 () -> {
                     if (lastOneOff) {
-                        storePort.meta().dropChain(chainId);
+                        purgeChain(chainId);
                     } else {
                         storePort.meta().detachConsumer(chainId, pipelineId);
                     }
                 },
                 firstFailure);
+    }
+
+    private void purgeChain(String chainId) {
+        String connectorNamespace = ConnectorStateNamespace.ofShared(chainId);
+        // Keep the record until both namespaces are gone so a failed drop remains discoverable
+        // by a later purge, including after this process has lost its live capture handles.
+        storePort.keyedState().dropNamespace(connectorNamespace);
+        storePort.keyedState().dropNamespace(ConnectorStateNamespace.migrationOf(connectorNamespace));
+        storePort.meta().dropChain(chainId);
     }
 
     /** Runs one release step, keeping the first failure and hanging any later one off it as suppressed. */

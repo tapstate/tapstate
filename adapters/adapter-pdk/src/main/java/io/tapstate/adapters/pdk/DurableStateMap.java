@@ -54,7 +54,7 @@ final class DurableStateMap implements KVMap<Object> {
         this.store = Objects.requireNonNull(store, "store");
         this.namespace = Objects.requireNonNull(namespace, "namespace");
         this.carriedFrom = List.copyOf(Objects.requireNonNull(carriedFrom, "carriedFrom"));
-        this.migrationNamespace = shared ? "pdk.notes-migration." + namespace : null;
+        this.migrationNamespace = shared ? ConnectorStateNamespace.migrationOf(namespace) : null;
         if (!shared && !carriedFrom.isEmpty()) {
             throw new IllegalArgumentException("only a shared capture can carry earlier connector notes");
         }

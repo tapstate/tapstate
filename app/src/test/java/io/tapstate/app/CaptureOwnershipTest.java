@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import com.hazelcast.core.HazelcastInstance;
+import io.tapstate.adapters.pdk.ConnectorStateNamespace;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.FromClause;
@@ -497,6 +498,10 @@ class CaptureOwnershipTest {
         b.captures.startCapture("q");
         // What q's own run leaves on the record as it reads: its cursor, and its place on the chain with it.
         store.meta().upsertConsumerOffset(CHAIN, new ConsumerOffset("q", Map.of(), null));
+        String connectorNamespace = ConnectorStateNamespace.ofShared(CHAIN);
+        String migrationNamespace = "pdk.notes-migration." + connectorNamespace;
+        store.keyedState().save(connectorNamespace, "slot", new byte[]{11, 12});
+        store.keyedState().save(migrationNamespace, "removed:expired", new byte[]{1});
 
         a.captures.stopCapture("p", true);
 
@@ -504,12 +509,18 @@ class CaptureOwnershipTest {
                 .as("the chain is still there for the pipeline reading it on the other member")
                 .isPresent();
         assertThat(consumersOn(store)).containsExactly("q");
+        assertThat(store.keyedState().load(connectorNamespace, "slot"))
+                .hasValueSatisfying(value -> assertThat(value).containsExactly((byte) 11, (byte) 12));
+        assertThat(store.keyedState().load(migrationNamespace, "removed:expired"))
+                .hasValueSatisfying(value -> assertThat(value).containsExactly((byte) 1));
 
         b.captures.stopCapture("q", true);
 
         assertThat(store.meta().read(CHAIN))
                 .as("and it goes with the last pipeline on it, whichever member ran that one")
                 .isEmpty();
+        assertThat(store.keyedState().count(connectorNamespace)).isZero();
+        assertThat(store.keyedState().count(migrationNamespace)).isZero();
     }
 
     /**
