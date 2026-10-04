@@ -8,6 +8,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import io.tapstate.adapters.pdk.ConnectorStateNamespace;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
@@ -21,6 +22,7 @@ import io.tapstate.core.model.SourceMode;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TableRef;
+import io.tapstate.runtime.srs.CaptureHandoff;
 import io.tapstate.runtime.srs.CaptureHealth;
 import io.tapstate.runtime.srs.CaptureRun;
 import io.tapstate.runtime.srs.CaptureRunSpec;
@@ -32,6 +34,7 @@ import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.StorePort;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -210,8 +213,15 @@ class StoppingOnePipelineDoesNotClearTheChainTest {
         fixture.assertConnectorNotesPurged();
     }
 
+    /**
+     * A clearing whose last step -- dropping the connector notes -- fails has already let go of the chain's
+     * record, and of what the source set up for it after that: no run can resume from a position the source
+     * has since given up, which is what a record left standing over a released slot would hand the next one.
+     * What it costs is the notes. With the record gone nothing finds them through it any more, so the failure
+     * is said, and what the drop left stays where it is.
+     */
     @Test
-    void aFailedNoteDropLeavesTheChainDiscoverableForARetry() {
+    void aFailedNoteDropComesOnlyAfterTheRecordAndTheSourceHaveLetGo() {
         Fixture fixture = new Fixture();
         fixture.seedAChainNobodyIsRunning();
         fixture.leaveACursorFor("p");
@@ -221,19 +231,29 @@ class StoppingOnePipelineDoesNotClearTheChainTest {
                 .when(failingState).dropNamespace(fixture.migrationNamespace());
         StorePort failingStore = mock(StorePort.class, delegatesTo(fixture.store));
         when(failingStore.keyedState()).thenReturn(failingState);
+        List<Boolean> recordGoneAtRelease = new ArrayList<>();
         StoreBackedPipelineCaptureCoordinator failingCoordinator = new StoreBackedPipelineCaptureCoordinator(
-                failingStore, fixture::start, fixture.srsCoordinator, new SnapshotBuffer());
+                failingStore, new CaptureStarter() {
+                    @Override
+                    public CaptureRun start(CaptureRunSpec spec, CaptureHandoff handoff) {
+                        return fixture.start(spec, handoff);
+                    }
+
+                    @Override
+                    public Optional<TapstateException> release(CaptureRunSpec spec) {
+                        recordGoneAtRelease.add(fixture.chainRecord().isEmpty());
+                        return Optional.empty();
+                    }
+                }, fixture.srsCoordinator, new SnapshotBuffer());
 
         assertThatThrownBy(() -> failingCoordinator.stopCapture("p", true))
                 .isInstanceOf(IllegalStateException.class).hasMessage("namespace drop failed");
-        assertThat(fixture.chainRecord()).isPresent();
-        assertThat(fixture.store.meta().miningChainIdsWithConsumer("p")).containsExactly(fixture.chainId());
-        assertThat(fixture.store.keyedState().count(fixture.migrationNamespace())).isEqualTo(1L);
 
-        fixture.coordinator.stopCapture("p", true);
-
-        assertThat(fixture.chainRecord()).isEmpty();
-        fixture.assertConnectorNotesPurged();
+        assertThat(recordGoneAtRelease).as("the source let go only once the record was gone").containsExactly(true);
+        assertThat(fixture.chainRecord()).as("no record is left to resume from").isEmpty();
+        assertThat(fixture.store.meta().miningChainIdsWithConsumer("p")).isEmpty();
+        assertThat(fixture.store.keyedState().count(fixture.migrationNamespace()))
+                .as("what the failed drop left, which nothing finds through the record any more").isEqualTo(1L);
     }
 
     @Test

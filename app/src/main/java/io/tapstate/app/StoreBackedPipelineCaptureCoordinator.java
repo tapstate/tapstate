@@ -1241,7 +1241,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      * the slot back up or creates it again. Dropped last, the record would outlive a slot that is gone, and the
      * next run would resume from a position the source no longer keeps -- quietly skipping whatever happened
      * in between. What this order gives up is finding left-behind notes again: once the record is gone, a
-     * later clearing has nothing to look them up by.
+     * later clearing has nothing to look them up by, and a run started afresh on the same source reads them as
+     * its own. No order avoids both, because the release needs the notes to find what it lets go of.
      *
      * <p>A source that refuses is said and left as it is. The state is cleared either way: a clearing that
      * failed over a source it cannot reach would leave a pipeline that can neither keep its state nor let go of
