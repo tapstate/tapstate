@@ -15,6 +15,7 @@ import io.tapstate.core.model.TransformResource;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -43,6 +44,9 @@ import java.util.Set;
  * tables type differently unresolved, which is the ordinary shape of a real database rather than a
  * corner of it, and would refuse expressions that are perfectly correct about the table they read.
  * Judging each in turn refuses the same genuine conflicts while naming the table that caused one.
+ *
+ * <p>Each table's types follow the preceding maps on its own wiring path. An expression reads the
+ * columns those maps produced, rather than the original columns discovery recorded.
  *
  * <p>Once the columns are known, three outcomes, split because each has a different next step for the
  * author: a column whose type cannot survive the operation is refused as unsupported; a column
@@ -89,7 +93,7 @@ public final class RowExpressionTypeRules {
         if (transforms != null) {
             for (int i = 0; i < transforms.size(); i++) {
                 Step step = transforms.get(i);
-                validateStep(step, wiring.reaching(step.from()), "transforms[" + i + "]");
+                validateStep(step, wiring.routesReaching(step.from()), "transforms[" + i + "]");
             }
         }
         validateServe(p.serve(), wiring);
@@ -97,7 +101,7 @@ public final class RowExpressionTypeRules {
 
     // ---- where an expression can sit -----------------------------------------------------
 
-    private void validateStep(Step step, Set<Upstream> upstream, String path) {
+    private void validateStep(Step step, List<Wiring.Route> upstream, String path) {
         switch (step) {
             case Step.Inline inline -> validateBody(inline.body(), upstream, path);
             // The body lives in the referenced definition, but a definition on its own reads no
@@ -110,7 +114,7 @@ public final class RowExpressionTypeRules {
         }
     }
 
-    private void validateBody(TransformBody body, Set<Upstream> upstream, String path) {
+    private void validateBody(TransformBody body, List<Wiring.Route> upstream, String path) {
         switch (body) {
             case TransformBody.Filter filter -> judgePredicate(filter.expr(), upstream, path + ".expr");
             case TransformBody.MapProjection projection ->
@@ -131,16 +135,16 @@ public final class RowExpressionTypeRules {
             case null -> {
             }
             case ServeBlock.Inline inline ->
-                    validatePush(inline.push(), wiring.reaching(inline.from()), "serve");
+                    validatePush(inline.push(), wiring.routesReaching(inline.from()), "serve");
             case ServeBlock.Use use -> {
                 if (byId.get(use.use()) instanceof ServeResource definition) {
-                    validatePush(definition.push(), wiring.reaching(use.from()), "serve.use");
+                    validatePush(definition.push(), wiring.routesReaching(use.from()), "serve.use");
                 }
             }
         }
     }
 
-    private void validatePush(List<PushElement> push, Set<Upstream> upstream, String path) {
+    private void validatePush(List<PushElement> push, List<Wiring.Route> upstream, String path) {
         if (push == null) {
             return;
         }
@@ -157,7 +161,7 @@ public final class RowExpressionTypeRules {
     }
 
     private void validateFieldRules(
-            Map<String, FieldRule> fields, Set<Upstream> upstream, String path) {
+            Map<String, FieldRule> fields, List<Wiring.Route> upstream, String path) {
         fields.forEach((name, rule) -> {
             if (rule instanceof FieldRule.Computed computed) {
                 judgeValue(computed.celExpr(), upstream, path + "." + name);
@@ -167,7 +171,7 @@ public final class RowExpressionTypeRules {
 
     // ---- the judgment --------------------------------------------------------------------
 
-    private void judgePredicate(String expr, Set<Upstream> upstream, String path) {
+    private void judgePredicate(String expr, List<Wiring.Route> upstream, String path) {
         Set<String> referenced = RowExpressions.rowColumns(expr);
         if (referenced.isEmpty()) {
             return;     // reads no row data, so no source model bears on it
@@ -178,7 +182,7 @@ public final class RowExpressionTypeRules {
         }
     }
 
-    private void judgeValue(String expr, Set<Upstream> upstream, String path) {
+    private void judgeValue(String expr, List<Wiring.Route> upstream, String path) {
         Set<String> referenced = RowExpressions.rowColumns(expr);
         if (referenced.isEmpty()) {
             return;     // reads no row data, so no source model bears on it
@@ -197,9 +201,10 @@ public final class RowExpressionTypeRules {
      * back to the source's other tables: the fallback is exactly the pooled view this check exists
      * without, and it would let a table the expression never reads decide the fate of one it does.
      */
-    private List<DiscoveredTable> tablesReaching(String expr, Set<Upstream> upstream, String path) {
+    private List<DiscoveredTable> tablesReaching(String expr, List<Wiring.Route> upstream, String path) {
         List<DiscoveredTable> reached = new ArrayList<>();
-        for (Upstream up : upstream) {
+        for (Wiring.Route route : upstream) {
+            Upstream up = route.upstream();
             List<DiscoveredTable> discovered = tablesBySource.get(up.source());
             if (discovered == null) {
                 // Reported as undiscovered rather than as columns with no resolved type: both would
@@ -209,11 +214,71 @@ public final class RowExpressionTypeRules {
             }
             for (DiscoveredTable table : discovered) {
                 if (up.table() == null || up.table().equals(table.name())) {
-                    reached.add(table);
+                    reached.add(projectedTable(table, route.steps()));
                 }
             }
         }
         return reached;
+    }
+
+    private DiscoveredTable projectedTable(DiscoveredTable table, List<Step> steps) {
+        Map<String, TapstateType> columns = table.columns();
+        for (Step step : steps) {
+            TransformBody body = switch (step) {
+                case Step.Inline inline -> inline.body();
+                case Step.Use use -> byId.get(use.use()) instanceof TransformResource definition
+                        ? definition.body() : null;
+            };
+            if (body instanceof TransformBody.MapProjection projection) {
+                columns = projectedTypes(projection.fields(), columns);
+            }
+        }
+        return new DiscoveredTable(table.name(), columns);
+    }
+
+    /** A map reads its input for every rule, then carries the unlisted, unconsumed fields onward. */
+    private static Map<String, TapstateType> projectedTypes(
+            Map<String, FieldRule> rules, Map<String, TapstateType> input) {
+        Map<String, TapstateType> output = new LinkedHashMap<>();
+        Set<String> consumed = new LinkedHashSet<>();
+        Set<String> dropped = new LinkedHashSet<>();
+        rules.forEach((name, rule) -> {
+            switch (rule) {
+                case FieldRule.Rename rename -> {
+                    consumed.add(rename.sourceField());
+                    if (input.containsKey(rename.sourceField())) {
+                        output.put(name, input.get(rename.sourceField()));
+                    }
+                }
+                case FieldRule.Drop() -> dropped.add(name);
+                case FieldRule.Literal literal -> output.put(name, literalType(literal.value()));
+                case FieldRule.Computed computed ->
+                        output.put(name, RowExpressions.typedValueType(computed.celExpr(), input));
+                default -> throw new IllegalStateException("Unexpected field rule: " + rule);
+            }
+        });
+        input.forEach((name, type) -> {
+            if (!output.containsKey(name) && !consumed.contains(name) && !dropped.contains(name)) {
+                output.put(name, type);
+            }
+        });
+        return output;
+    }
+
+    private static TapstateType literalType(Object value) {
+        if (value instanceof Boolean) {
+            return TapstateType.BOOLEAN;
+        }
+        if (value instanceof String) {
+            return TapstateType.STRING;
+        }
+        if (value instanceof Integer || value instanceof Long) {
+            return TapstateType.INT64;
+        }
+        if (value instanceof Double) {
+            return TapstateType.DOUBLE;
+        }
+        return TapstateType.UNKNOWN;
     }
 
     private void judgeTypes(String expr, Set<String> referenced, DiscoveredTable table,
