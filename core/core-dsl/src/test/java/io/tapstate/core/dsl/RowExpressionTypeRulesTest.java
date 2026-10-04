@@ -285,6 +285,38 @@ class RowExpressionTypeRulesTest {
     }
 
     @Test
+    void aDecimalChoiceIsRefusedInBothPushFormats() {
+        String expression = "has(after.a) ? after.a : after.b";
+        Map<String, String> formats = Map.of(
+                "\"=" + expression + "\"", "serve.push[0].format",
+                "{ chosen: \"=" + expression + "\" }", "serve.push[0].format.chosen");
+        for (var format : formats.entrySet()) {
+            String pipeline = """
+                    version: tapstate/v1
+                    kind: pipeline
+                    id: orders_out
+                    source: src_orders
+                    transforms:
+                      - { id: keep, from: [orders], type: filter, expr: "op == 'i'" }
+                    serve:
+                      from: keep
+                      push: [ { id: topic_out, source: src_orders, topic: t, format: %s } ]
+                    """.formatted(format.getKey());
+
+            DslException thrown = catchThrowableOfType(DslException.class,
+                    () -> RowExpressionTypeRules.validate(batch(pipeline),
+                            model("a", TapstateType.DECIMAL, "b", TapstateType.DECIMAL)));
+
+            assertThat(thrown).isNotNull();
+            assertThat(thrown.code()).isEqualTo(DslError.ROW_EXPRESSION_TYPE_UNSUPPORTED);
+            assertThat(thrown.args()).containsEntry("expr", expression)
+                    .containsEntry("column", "a").containsEntry("type", "DECIMAL")
+                    .containsEntry("table", "orders");
+            assertThat(thrown.path()).isEqualTo(format.getValue());
+        }
+    }
+
+    @Test
     @DisplayName("an expression inside a reused transform definition is judged where the pipeline uses it")
     void reusedTransformDefinitionIsJudged() {
         String definition = """
