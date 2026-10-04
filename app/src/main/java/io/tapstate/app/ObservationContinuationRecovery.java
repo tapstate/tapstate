@@ -73,6 +73,9 @@ final class ObservationContinuationRecovery {
                 marker.counterPolicy(), marker.writerAuthority());
         var target = marker.phase() == StopReservation.Phase.SUCCESSOR_BOUND
                 ? new ObservationScopeRegistry.ActualTarget(marker.successor().scope(), marker.successor().job()) : null;
+        Optional<ObservationContinuation.Target> admittedTarget = marker.successor() == null ? Optional.empty()
+                : Optional.of(new ObservationContinuation.Target(marker.successor().scope(),
+                        Optional.ofNullable(marker.successor().job())));
         boolean sameBound = target != null && stored.filter(saved -> saved.receipt().knownBaseline()
                 && saved.receipt().matches(marker.handoffIdentity())).isPresent();
         Optional<ObservationScopeRegistry.SourceSnapshot> frozen = Optional.empty();
@@ -95,15 +98,24 @@ final class ObservationContinuationRecovery {
             frozen = source.snapshot();
             if (frozen.isPresent()) {
                 ObservationContinuation next = frozen.orElseThrow().continuation();
-                if (target != null) {
+                if (admittedTarget.isPresent()) {
+                    // A STOPPED frame for an admitted scope must retain its source floor even before
+                    // the native Job exists. Admission pins the carrier without inventing a producer.
                     next = new ObservationContinuation(next.token(), next.sourceScope(),
-                            Optional.of(new ObservationContinuation.Target(target.scope(), Optional.of(target.job()))),
+                            admittedTarget,
                             next.baselineOrigin(), next.baselineFacts(), next.producerStates());
                 }
-                var receipt = observations.saveContinuation(id, marker, stored.map(ObservationStore.StoredContinuation::receipt), next);
-                if (receipt.isEmpty() || !current.getAsBoolean()) { return false; }
-                stored = observations.readContinuation(id);
-                if (stored.isEmpty() || !stored.orElseThrow().receipt().equals(receipt.orElseThrow())) { return false; }
+                if (keepsUnsubmittedCarrier(marker, stored)) {
+                    // The retired slot still protects this floor from a STOPPED frame at the same
+                    // generation. Keep its verified carrier until an actual next slot can retarget it.
+                    if (!scopes.continuationAttached(sourceTicket, stored.orElseThrow().receipt())
+                            || !current.getAsBoolean()) { return false; }
+                } else {
+                    var receipt = observations.saveContinuation(id, marker, stored.map(ObservationStore.StoredContinuation::receipt), next);
+                    if (receipt.isEmpty() || !current.getAsBoolean()) { return false; }
+                    stored = observations.readContinuation(id);
+                    if (stored.isEmpty() || !stored.orElseThrow().receipt().equals(receipt.orElseThrow())) { return false; }
+                }
             }
         }
         if (target == null || requestedScope == null) { return current.getAsBoolean(); }
@@ -116,6 +128,17 @@ final class ObservationContinuationRecovery {
         stored.filter(saved -> saved.receipt().matches(marker.handoffIdentity()))
                 .ifPresent(saved -> scopes.continuationRead(targetTicket, saved));
         return current.getAsBoolean();
+    }
+
+    private static boolean keepsUnsubmittedCarrier(StopReservation marker,
+            Optional<ObservationStore.StoredContinuation> stored) {
+        if (marker.phase() != StopReservation.Phase.REPLACEMENT_PENDING || marker.writerAuthority() == null) { return false; }
+        return stored.filter(saved -> saved.receipt().knownBaseline()
+                && saved.continuation().token().equals(marker.token())
+                && Objects.equals(saved.continuation().sourceScope(), marker.source().scope())
+                && saved.continuation().target().filter(target -> target.realJob().isEmpty()
+                        && target.scope().pipelineIncarnationId().equals(marker.source().scope().pipelineIncarnationId())
+                        && target.scope().executionGeneration() == marker.writerAuthority().executionGeneration()).isPresent()).isPresent();
     }
 
     boolean adoptExisting(ResolvedTarget resolved) {

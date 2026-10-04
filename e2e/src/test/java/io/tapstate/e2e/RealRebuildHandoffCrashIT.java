@@ -57,6 +57,37 @@ class RealRebuildHandoffCrashIT {
     private record Series(String name, Map<String, String> attributes) { }
     private record Matched(ObservationStore.Stored publicValue, ObservationStore.StoredContinuation privateValue,
             RebuildHandoffJdiSession.Raw raw) { }
+    private static final class MatchTrace {
+        private final Map<String, Long> counts = new TreeMap<>();
+        private String lastStage = "NOT_POLLED";
+        private Map<String, Object> lastPublic = Map.of(), lastQualified = Map.of();
+
+        void publicValue(Optional<ObservationStore.Stored> reading) {
+            lastPublic = reading.map(value -> {
+                Map<String, Object> evidence = new LinkedHashMap<>();
+                evidence.put("state", value.observation().state().name());
+                evidence.put("observedAt", value.observation().observedAt().toString());
+                value.scope().ifPresent(scope -> evidence.put("scope", RebuildHandoffJdiSession.scopeEvidence(scope)));
+                return evidence;
+            }).orElseGet(LinkedHashMap::new);
+        }
+
+        void stage(String stage) {
+            lastStage = stage;
+            counts.merge(stage, 1L, Math::addExact);
+        }
+
+        void qualified(Matched value) {
+            stage("QUALIFIED");
+            lastQualified = matchedEvidence(value);
+        }
+
+        Map<String, Object> evidence() {
+            return Map.of("action", "unchanged-native-sample-diagnostic", "stageCounts", Map.copyOf(counts),
+                    "lastStage", lastStage, "lastPublic", lastPublic, "lastQualified", lastQualified,
+                    "capturedAt", Instant.now().toString());
+        }
+    }
 
     @BeforeAll
     static void requireInputs() {
@@ -157,7 +188,8 @@ class RealRebuildHandoffCrashIT {
                     report.addFork(Map.of("action", "qualified-crash-boundary", "held", held.evidence(),
                             "pid", killedPid, "serverOutput", first.retainedOutput().toString(), "pausedTargetRows", pausedRows,
                             "marker", markerEvidence(marker), "floor", factsEvidence(savedFloor.baselineFacts()),
-                            "sourceCheckpoint", sourceCheckpoint(database), "oldJobProof", oldJobProof.evidence()));
+                            "sourceCheckpoint", sourceCheckpoint(database), "oldJobProof", oldJobProof.evidence(),
+                            "carrier", continuationEvidence(carrier)));
                     first.killHeldProcess();
                     assertThat(first.server().isAlive()).isFalse();
                     assertThat(actual.readStopReservation(PIPELINE)).contains(marker);
@@ -178,8 +210,27 @@ class RealRebuildHandoffCrashIT {
                             ? Math.incrementExact(oldScope.executionGeneration())
                             : Math.incrementExact(marker.successor().scope().executionGeneration());
                     ObservationStore.Scope expected = new ObservationStore.Scope(oldScope.pipelineIncarnationId(), expectedGeneration);
-                    Matched firstKnown = Await.answered("same-store restart to publish floor plus its actual raw native facts", SETUP_WAIT,
-                            () -> matched(latest, restarted, expected, savedFloor, null));
+                    MatchTrace recoveryTrace = new MatchTrace();
+                    Matched firstKnown;
+                    try {
+                        firstKnown = Await.answered("same-store restart to publish floor plus its actual raw native facts", SETUP_WAIT,
+                                () -> matched(latest, restarted, expected, savedFloor, null, recoveryTrace));
+                    } finally {
+                        Map<String, Object> recovery = new LinkedHashMap<>();
+                        recovery.put("action", "first-native-recovery-diagnostic");
+                        recovery.put("sampling", recoveryTrace.evidence());
+                        recovery.put("expectedScope", RebuildHandoffJdiSession.scopeEvidence(expected));
+                        recovery.put("durableGeneration", generation(database));
+                        actual.read(PIPELINE).ifPresent(checkpoint -> recovery.put("actual", Map.of(
+                                "state", StateJson.parse(checkpoint.stateJson()).name(), "epoch", checkpoint.epoch(),
+                                "touchTime", checkpoint.touchTime().toString())));
+                        actual.readStopReservation(PIPELINE).ifPresent(reservation -> recovery.put("marker", markerEvidence(reservation)));
+                        latest.readContinuation(PIPELINE).ifPresent(carrier -> recovery.put("carrier", continuationEvidence(carrier)));
+                        desired.read(PIPELINE).ifPresent(intent -> recovery.put("desired", Map.of(
+                                "targetState", intent.targetState().name(), "reassemble", intent.reassemble(),
+                                "purgeState", intent.purgeState())));
+                        report.addFork(recovery);
+                    }
                     assertCumulativeExactly(firstKnown, savedFloor);
                     assertThat(generation(database)).isEqualTo(expectedGeneration);
                     report.addFork(Map.of("action", "known-counter-recovery", "scope", RebuildHandoffJdiSession.scopeEvidence(expected),
@@ -213,12 +264,26 @@ class RealRebuildHandoffCrashIT {
                             () -> "targetRows=" + target.getCollection(TABLE).countDocuments()
                                     + ", actual=" + actual.read(PIPELINE) + ", offsets=" + sourceCheckpoint(database));
                     String coverageSha = assertFullTargetContent(target);
+                    Instant targetConfirmedAt = Instant.now();
                     Matched quiet = Await.answered("known final native delivery frame", SETUP_WAIT,
-                            () -> matched(latest, restarted, expected, savedFloor, firstKnown.publicValue().observation().observedAt()));
+                            () -> matched(latest, restarted, expected, savedFloor, targetConfirmedAt));
                     assertCumulativeExactly(quiet, savedFloor);
-                    Matched repeated = Await.answered("a later unchanged native sample to retain totals without adding the floor again", SETUP_WAIT,
-                            () -> matched(latest, restarted, expected, savedFloor, quiet.publicValue().observation().observedAt())
-                                    .filter(value -> sameNativeTotals(quiet.raw(), value.raw())));
+                    report.addFork(Map.of("action", "post-delivery-native-anchor", "targetConfirmedAt", targetConfirmedAt.toString(),
+                            "anchor", matchedEvidence(quiet)));
+                    MatchTrace repeatedTrace = new MatchTrace();
+                    Matched repeated;
+                    try {
+                        repeated = Await.answered("a later unchanged native sample to retain totals without adding the floor again", SETUP_WAIT,
+                                () -> matched(latest, restarted, expected, savedFloor, quiet.publicValue().observation().observedAt(), repeatedTrace)
+                                        .filter(value -> {
+                                            assertCumulativeExactly(value, savedFloor);
+                                            boolean unchanged = sameNativeTotals(quiet.raw(), value.raw());
+                                            repeatedTrace.stage(unchanged ? "UNCHANGED" : "NATIVE_TOTALS_CHANGED");
+                                            return unchanged;
+                                        }));
+                    } finally {
+                        report.addFork(repeatedTrace.evidence());
+                    }
                     assertCumulativeExactly(repeated, savedFloor);
                     assertSameTotals(delivery(quiet.publicValue().observation().facts()),
                             delivery(repeated.publicValue().observation().facts()));
@@ -290,20 +355,70 @@ class RealRebuildHandoffCrashIT {
 
     private static Optional<Matched> matched(MongoObservationStore latest, RebuildHandoffJdiSession observer,
             ObservationStore.Scope expected, ObservationContinuation floor, Instant after) {
-        var current = latest.readStored(PIPELINE).filter(value -> value.scope().filter(expected::equals).isPresent()
-                && value.observation().state() == PipelineState.RUNNING && hasKnownDelivery(value.observation().facts())
-                && (after == null || value.observation().observedAt().isAfter(after)));
-        if (current.isEmpty()) { return Optional.empty(); }
+        return matched(latest, observer, expected, floor, after, null);
+    }
+
+    private static Optional<Matched> matched(MongoObservationStore latest, RebuildHandoffJdiSession observer,
+            ObservationStore.Scope expected, ObservationContinuation floor, Instant after, MatchTrace trace) {
+        var current = latest.readStored(PIPELINE);
+        if (trace != null) { trace.publicValue(current); }
+        if (current.isEmpty()) { return rejected(trace, "PUBLIC_ABSENT"); }
         ObservationStore.Stored publicValue = current.orElseThrow();
+        if (publicValue.scope().filter(expected::equals).isEmpty()) { return rejected(trace, "PUBLIC_SCOPE_MISMATCH"); }
+        if (publicValue.observation().state() != PipelineState.RUNNING) { return rejected(trace, "PUBLIC_NOT_RUNNING"); }
+        if (!hasKnownDelivery(publicValue.observation().facts())) { return rejected(trace, "PUBLIC_DELIVERY_UNKNOWN"); }
+        if (after != null && !publicValue.observation().observedAt().isAfter(after)) { return rejected(trace, "PUBLIC_TIME_NOT_ADVANCED"); }
         var raw = observer.rawAt(expected, publicValue.observation().observedAt()).filter(value -> hasKnownDelivery(value.facts()));
+        if (raw.isEmpty()) { return rejected(trace, "RAW_ABSENT_OR_UNKNOWN"); }
         var privateValue = latest.readContinuation(PIPELINE);
-        if (raw.isEmpty() || privateValue.isEmpty()) { return Optional.empty(); }
+        if (privateValue.isEmpty()) { return rejected(trace, "CONTINUATION_ABSENT"); }
         var measured = raw.orElseThrow(); var saved = privateValue.orElseThrow();
         HandoffIdentity identity = new HandoffIdentity(PIPELINE, floor.token(), StopReservation.CounterPolicy.CONTINUE,
                 floor.sourceScope(), expected, measured.job());
-        if (!saved.receipt().knownBaseline() || !saved.receipt().matches(identity)
-                || !latest.readStored(PIPELINE).filter(publicValue::equals).isPresent()) { return Optional.empty(); }
-        return Optional.of(new Matched(publicValue, saved, measured));
+        if (!saved.receipt().knownBaseline()) { return rejected(trace, "BASELINE_UNKNOWN"); }
+        if (!saved.receipt().matches(identity)) { return rejected(trace, "RECEIPT_MISMATCH"); }
+        if (!latest.readStored(PIPELINE).filter(publicValue::equals).isPresent()) { return rejected(trace, "PUBLIC_CHANGED_DURING_READ"); }
+        Matched result = new Matched(publicValue, saved, measured);
+        if (trace != null) { trace.qualified(result); }
+        return Optional.of(result);
+    }
+
+    private static Optional<Matched> rejected(MatchTrace trace, String stage) {
+        if (trace != null) { trace.stage(stage); }
+        return Optional.empty();
+    }
+
+    private static Map<String, Object> matchedEvidence(Matched value) {
+        return Map.of("scope", RebuildHandoffJdiSession.scopeEvidence(value.raw().scope()),
+                "job", RebuildHandoffJdiSession.jobEvidence(value.raw().job()),
+                "observedAt", value.publicValue().observation().observedAt().toString(),
+                "rawNative", factsEvidence(value.raw().facts()),
+                "cumulative", factsEvidence(value.publicValue().observation().facts()));
+    }
+
+    private static Map<String, Object> continuationEvidence(ObservationStore.StoredContinuation stored) {
+        ObservationContinuation value = stored.continuation();
+        Map<String, Object> evidence = new LinkedHashMap<>();
+        evidence.put("token", value.token());
+        if (value.sourceScope() != null) { evidence.put("sourceScope", RebuildHandoffJdiSession.scopeEvidence(value.sourceScope())); }
+        value.target().ifPresent(target -> evidence.put("target", targetEvidence(target)));
+        value.baselineOrigin().ifPresent(origin -> evidence.put("baselineOrigin", targetEvidence(origin)));
+        evidence.put("knownBaseline", value.knownBaseline());
+        evidence.put("baselineFacts", factsEvidence(value.baselineFacts()));
+        evidence.put("producerStates", value.producerStates().stream().map(state -> Map.of(
+                "name", state.name(), "nativeStart", state.nativeStart().toString(),
+                "offsetPoints", state.offsets().size(), "publishedPoints", state.published().size())).toList());
+        evidence.put("receipt", Map.of("revision", stored.receipt().revision(), "digest", stored.receipt().digest(),
+                "encodingVersion", stored.receipt().encodingVersion(), "knownBaseline", stored.receipt().knownBaseline()));
+        return evidence;
+    }
+
+    private static Map<String, Object> targetEvidence(ObservationContinuation.Target target) {
+        Map<String, Object> evidence = new LinkedHashMap<>();
+        evidence.put("scope", RebuildHandoffJdiSession.scopeEvidence(target.scope()));
+        target.realJob().ifPresent(job -> evidence.put("job", RebuildHandoffJdiSession.jobEvidence(job)));
+        evidence.put("realJobAvailability", target.realJob().isPresent() ? "PRESENT" : "ABSENT");
+        return evidence;
     }
 
     private static void assertCumulativeExactly(Matched reading, ObservationContinuation floor) {

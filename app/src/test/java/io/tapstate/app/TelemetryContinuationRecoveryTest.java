@@ -12,6 +12,8 @@ import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.CheckpointDoc;
+import io.tapstate.core.lifecycle.HistogramValue;
+import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.scheduler.ConvergeResult;
@@ -34,6 +36,8 @@ import org.junit.jupiter.api.Test;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
@@ -59,6 +63,102 @@ class TelemetryContinuationRecoveryTest {
     private static final StopReservation.JobIdentity JOB = new StopReservation.JobIdentity("single", 77, "boot-target");
     private static final ObservationFailure FAILURE = new ObservationFailure(
             LifecycleError.PAUSED_JOB_MISSING.code(), Map.of("pipeline", PIPELINE));
+
+    @Test
+    void anUnsubmittedAdmissionPinsItsKnownFloorBeforePublishingItsStoppedScope() {
+        var scopes = new ObservationScopeRegistry();
+        var store = new MemoryContinuationStore();
+        MetricFact records = store.privateState.get().continuation().baselineFacts().getFirst();
+        Map<String, String> durationAttributes = Map.of(MetricAttributes.PIPELINE_ID, PIPELINE, MetricAttributes.TABLE_ID, "orders");
+        MetricFact duration = MetricFact.single("tapstate.pipeline.record.delivery.duration", MetricType.HISTOGRAM, "s",
+                MetricPoint.distribution(durationAttributes, AT.minusSeconds(60), AT,
+                        quarterSecondHistogram(7)));
+        var original = new ObservationContinuation("resumed-42", SOURCE, Optional.empty(), Optional.empty(),
+                List.of(records, duration), List.of());
+        store.privateState.set(new ObservationStore.StoredContinuation(original,
+                MemoryContinuationStore.receipt(original, "source-only")));
+
+        var state = mock(StateStore.class);
+        var desired = new InMemoryDesiredStore();
+        var actuator = mock(LifecycleActuator.class);
+        var artifacts = mock(ArtifactStore.class);
+        var engine = mock(Engine.class);
+        var authority = new AtomicReference<>(StopAuthority.standalone("single", TARGET.executionGeneration()));
+        var intent = new DesiredState(PIPELINE, PipelineState.RUNNING, "rev-1");
+        desired.save(intent);
+        var source = new StopReservation.Source("single", SOURCE,
+                new StopReservation.JobIdentity("single", 70, "boot-source"));
+        var marker = new AtomicReference<>(new StopReservation(PIPELINE, original.token(), 0, 5, intent, source,
+                StopReservation.Phase.SUCCESSOR_ADMITTED, StopReservation.CounterPolicy.CONTINUE, authority.get(),
+                new StopReservation.Successor(TARGET, "boot-never-submitted", null), StopReservation.CURRENT_FORMAT));
+        var actual = new AtomicReference<>(new CheckpointDoc(PIPELINE, StateJson.of(PipelineState.STOPPED), 5, AT));
+        var actualJob = new AtomicReference<Engine.ExecutionJob>();
+        when(state.supportsStopReservations()).thenReturn(true);
+        when(state.readStopReservation(PIPELINE)).thenAnswer(call -> Optional.of(marker.get()));
+        when(state.read(PIPELINE)).thenAnswer(call -> Optional.of(actual.get()));
+        when(actuator.stopAuthority(PIPELINE)).thenAnswer(call -> Optional.of(authority.get()));
+        when(artifacts.pipelineIncarnationId(PIPELINE)).thenReturn(Optional.of("inc-a"));
+        when(engine.executionJob(PIPELINE)).thenAnswer(call -> Optional.ofNullable(actualJob.get()));
+        when(engine.noUnfinishedJob(PIPELINE)).thenAnswer(call -> actualJob.get() == null);
+        var recovery = new ObservationContinuationRecovery(scopes, store, state, desired, artifacts, actuator, engine);
+        scopes.begin(PIPELINE, "inc-a", TARGET.executionGeneration());
+
+        assertThat(recovery.prepareHandoff(PIPELINE, TARGET, () -> true)).isTrue();
+        var admittedCarrier = store.privateState.get();
+        assertThat(admittedCarrier.continuation().target())
+                .as("the source-only floor is pinned to the admitted scope before its STOPPED publication can supersede it")
+                .contains(new ObservationContinuation.Target(TARGET, Optional.empty()));
+        assertThat(admittedCarrier.continuation().baselineFacts()).isEqualTo(original.baselineFacts());
+        assertThat(admittedCarrier.continuation().producerStates()).isEmpty();
+        assertThat(scopes.activeContinuationTarget(PIPELINE)).as("admission is not a real native Job").isEmpty();
+
+        marker.set(new StopReservation(PIPELINE, original.token(), 0, 6, intent, source,
+                StopReservation.Phase.REPLACEMENT_PENDING, StopReservation.CounterPolicy.CONTINUE, authority.get(),
+                null, StopReservation.CURRENT_FORMAT));
+        actual.set(new CheckpointDoc(PIPELINE, StateJson.of(PipelineState.STOPPED), 6, AT));
+        assertThat(recovery.prepareHandoff(PIPELINE, TARGET, () -> true)).isTrue();
+        assertThat(store.privateState.get()).as("retiring an unsubmitted slot preserves its exact carrier until the next admission")
+                .isEqualTo(admittedCarrier);
+
+        var nextScope = new ObservationStore.Scope("inc-a", 43);
+        var nextJob = new StopReservation.JobIdentity("single", 88, "boot-next");
+        authority.set(StopAuthority.standalone("single", nextScope.executionGeneration()));
+        marker.set(new StopReservation(PIPELINE, original.token(), 0, 6, intent, source,
+                StopReservation.Phase.SUCCESSOR_BOUND, StopReservation.CounterPolicy.CONTINUE, authority.get(),
+                new StopReservation.Successor(nextScope, nextJob.bootId(), nextJob), StopReservation.CURRENT_FORMAT));
+        actual.set(new CheckpointDoc(PIPELINE, StateJson.of(PipelineState.RUNNING), 6, AT));
+        actualJob.set(new Engine.ExecutionJob(nextJob, nextScope));
+        scopes.begin(PIPELINE, "inc-a", nextScope.executionGeneration());
+        assertThat(recovery.prepareHandoff(PIPELINE, nextScope, () -> true)).isTrue();
+        assertThat(store.privateState.get().continuation().baselineFacts()).isEqualTo(original.baselineFacts());
+        for (Instant sample : List.of(AT.plusSeconds(1), AT.plusSeconds(2))) {
+            var raw = new ObservationPublisher.Prepared(new Observation(PIPELINE, PipelineState.RUNNING,
+                    Map.of("records.out", 2L), Map.of(), Map.of(), null, sample, List.of(
+                            new MetricFact(records.name(), records.type(), records.unit(), List.of(MetricPoint.accumulated(records.points().getFirst().attributes(),
+                                    AT.plusSeconds(1), sample, 2))),
+                            new MetricFact(duration.name(), duration.type(), duration.unit(), List.of(MetricPoint.distribution(durationAttributes, AT.plusSeconds(1), sample,
+                                    quarterSecondHistogram(2)))))),
+                    false, Map.of(), Map.of(), Map.of());
+            var packet = scopes.prepareContinuationPublication(raw,
+                    new ObservationScopeRegistry.ActualTarget(nextScope, nextJob), () -> true).orElseThrow();
+            assertThat(packet.projected().observation().facts()).filteredOn(fact -> fact.type() == MetricType.COUNTER)
+                    .singleElement().satisfies(fact -> assertThat(fact.points()).singleElement().satisfies(point -> {
+                        assertThat(point.value()).isEqualTo(9);
+                        assertThat(point.startTime()).isEqualTo(AT.minusSeconds(60));
+                    }));
+            assertThat(packet.projected().observation().facts()).filteredOn(fact -> fact.type() == MetricType.HISTOGRAM)
+                    .singleElement().satisfies(fact -> assertThat(fact.points()).singleElement().satisfies(point -> {
+                        assertThat(point.histogram()).isEqualTo(quarterSecondHistogram(9));
+                        assertThat(point.startTime()).isEqualTo(AT.minusSeconds(60));
+                    }));
+        }
+    }
+
+    private static HistogramValue quarterSecondHistogram(long count) {
+        List<Long> buckets = new ArrayList<>(Collections.nCopies(HistogramBounds.RECORD_DELIVERY_DURATION.buckets(), 0L));
+        buckets.set(5, count);
+        return new HistogramValue(count, count * 0.25, HistogramBounds.RECORD_DELIVERY_DURATION.bounds(), buckets);
+    }
 
     @Test
     void aConcludedBoundTargetWithoutNativeHistoryKeepsKnownNineAndAcknowledgesTheExactReceipt() throws Exception {
