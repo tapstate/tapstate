@@ -41,6 +41,14 @@ final class BenchmarkAckOracle {
     }
 
     static void verify(List<Fork> forks) {
+        verifyAgainst(forks, null);
+    }
+
+    static void verify(List<Fork> forks, Map<String, String> frozenTerminals) {
+        verifyAgainst(forks, Map.copyOf(frozenTerminals));
+    }
+
+    private static void verifyAgainst(List<Fork> forks, Map<String, String> frozenTerminals) {
         if (forks == null || forks.isEmpty()) {
             throw new AssertionError("no benchmark forks to verify");
         }
@@ -48,6 +56,10 @@ final class BenchmarkAckOracle {
         Map<String, String> expectedTerminals = null;
         for (Fork fork : forks) {
             Map<String, String> terminals = verifyFork(fork);
+            if (frozenTerminals != null && !frozenTerminals.equals(terminals)) {
+                throw new AssertionError("source chains or terminal identities differ from frozen workload in fork "
+                        + fork.id());
+            }
             if (expectedTerminals == null) {
                 expectedTerminals = terminals;
             } else if (!expectedTerminals.equals(terminals)) {

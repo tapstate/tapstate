@@ -7,6 +7,7 @@ import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.stream.Collectors;
 
 /** Drives the same frozen workloads against two separately built application jars. */
 final class PipelineBenchmarkHarness {
@@ -58,6 +59,7 @@ final class PipelineBenchmarkHarness {
                 new EnumMap<>(PipelineBenchmarkComparison.Workload.class);
         for (BenchmarkWorkloadDefinitions.Workload workload : BenchmarkWorkloadDefinitions.all()) {
             PipelineBenchmarkComparison.Workload kind = kindOf(workload.id());
+            Map<String, String> frozenTerminals = expectedTerminals(workload);
             List<ForkResult> forks = new ArrayList<>();
             int baselineFork = 0;
             int candidateFork = 0;
@@ -68,10 +70,10 @@ final class PipelineBenchmarkHarness {
                 if (result.measurement().arm() != arm) {
                     throw new AssertionError(workload.id() + " fork " + armFork + " reported the wrong arm");
                 }
-                BenchmarkAckOracle.verify(List.of(result.correctness()));
+                BenchmarkAckOracle.verify(List.of(result.correctness()), frozenTerminals);
                 forks.add(result);
             }
-            BenchmarkAckOracle.verify(forks.stream().map(ForkResult::correctness).toList());
+            BenchmarkAckOracle.verify(forks.stream().map(ForkResult::correctness).toList(), frozenTerminals);
             results.put(kind, List.copyOf(forks));
             measurements.put(kind, forks.stream().map(ForkResult::measurement).toList());
         }
@@ -80,6 +82,12 @@ final class PipelineBenchmarkHarness {
                 ? PipelineBenchmarkComparison.evaluateObservabilityCost(measurements)
                 : PipelineBenchmarkComparison.evaluate(measurements, target, primary);
         return new Report(baseline, candidate, results, evaluation);
+    }
+
+    static Map<String, String> expectedTerminals(BenchmarkWorkloadDefinitions.Workload workload) {
+        return workload.sourceChains().stream().collect(Collectors.toUnmodifiableMap(
+                BenchmarkWorkloadDefinitions.SourceChain::id,
+                BenchmarkWorkloadDefinitions.SourceChain::terminalLogicalId));
     }
 
     private static Path requireJar(Path jar) {

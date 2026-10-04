@@ -67,6 +67,95 @@ class PipelineBenchmarkHarnessTest {
     }
 
     @Test
+    void omittingTheSameFrozenSourceChainFromEveryForkRejectsTheComparison() throws Exception {
+        Path baseline = jar("baseline.jar");
+        Path candidate = jar("candidate.jar");
+
+        assertThatThrownBy(() -> PipelineBenchmarkHarness.run(
+                PipelineBenchmarkHarness.Gate.OBSERVABILITY_COST, baseline, candidate,
+                null, null, (workload, arm, armFork, applicationJar) -> {
+                    PipelineBenchmarkHarness.ForkResult complete = fork(workload, arm, armFork, 100, false);
+                    if (!workload.id().equals("stateful")) {
+                        return complete;
+                    }
+                    assertThat(workload.sourceChains()).hasSizeGreaterThanOrEqualTo(2);
+                    BenchmarkWorkloadDefinitions.SourceChain omitted = workload.sourceChains().getLast();
+                    BenchmarkAckOracle.Fork original = complete.correctness();
+                    List<BenchmarkAckOracle.SourceChain> remaining = original.chains().stream()
+                            .filter(chain -> !chain.id().equals(omitted.id())).toList();
+                    Map<String, Long> remainingCoverage = new LinkedHashMap<>(original.logicalCoverage());
+                    remainingCoverage.remove(omitted.terminalLogicalId());
+                    BenchmarkAckOracle.Fork incomplete = new BenchmarkAckOracle.Fork(
+                            original.id(), remaining, remainingCoverage, original.checksum(), original.errorTotal());
+                    return new PipelineBenchmarkHarness.ForkResult(complete.measurement(), incomplete);
+                }))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("source chain");
+    }
+
+    @Test
+    void addingTheSameUnfrozenSourceChainToEveryForkRejectsTheComparison() throws Exception {
+        Path baseline = jar("baseline.jar");
+        Path candidate = jar("candidate.jar");
+
+        assertThatThrownBy(() -> PipelineBenchmarkHarness.run(
+                PipelineBenchmarkHarness.Gate.OBSERVABILITY_COST, baseline, candidate,
+                null, null, (workload, arm, armFork, applicationJar) -> {
+                    PipelineBenchmarkHarness.ForkResult complete = fork(workload, arm, armFork, 100, false);
+                    if (!workload.id().equals("stateful")) {
+                        return complete;
+                    }
+                    BenchmarkAckOracle.Fork original = complete.correctness();
+                    List<BenchmarkAckOracle.SourceChain> extra = new ArrayList<>(original.chains());
+                    String token = "unexpected-source-" + arm + "-" + armFork;
+                    extra.add(new BenchmarkAckOracle.SourceChain("unexpected-source",
+                            List.of(new BenchmarkAckOracle.TerminalEvent("unexpected-terminal", token)),
+                            token, String::equals));
+                    Map<String, Long> extraCoverage = new LinkedHashMap<>(original.logicalCoverage());
+                    extraCoverage.put("unexpected-terminal", 1L);
+                    BenchmarkAckOracle.Fork expanded = new BenchmarkAckOracle.Fork(
+                            original.id(), extra, extraCoverage, original.checksum(), original.errorTotal());
+                    return new PipelineBenchmarkHarness.ForkResult(complete.measurement(), expanded);
+                }))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("source chains or terminal identities differ from frozen workload");
+    }
+
+    @Test
+    void rewritingTheSameFrozenTerminalIdentityInEveryForkRejectsTheComparison() throws Exception {
+        Path baseline = jar("baseline.jar");
+        Path candidate = jar("candidate.jar");
+
+        assertThatThrownBy(() -> PipelineBenchmarkHarness.run(
+                PipelineBenchmarkHarness.Gate.OBSERVABILITY_COST, baseline, candidate,
+                null, null, (workload, arm, armFork, applicationJar) -> {
+                    PipelineBenchmarkHarness.ForkResult complete = fork(workload, arm, armFork, 100, false);
+                    if (!workload.id().equals("stateful")) {
+                        return complete;
+                    }
+                    BenchmarkWorkloadDefinitions.SourceChain changed = workload.sourceChains().getLast();
+                    String rewrittenId = changed.terminalLogicalId() + "-rewritten";
+                    BenchmarkAckOracle.Fork original = complete.correctness();
+                    List<BenchmarkAckOracle.SourceChain> rewritten = original.chains().stream().map(chain -> {
+                        if (!chain.id().equals(changed.id())) {
+                            return chain;
+                        }
+                        BenchmarkAckOracle.TerminalEvent terminal = chain.sourceTerminals().getFirst();
+                        return new BenchmarkAckOracle.SourceChain(chain.id(),
+                                List.of(new BenchmarkAckOracle.TerminalEvent(rewrittenId, terminal.sourcePosition())),
+                                chain.authoritativeTargetAck(), chain.positionCoverage());
+                    }).toList();
+                    Map<String, Long> rewrittenCoverage = new LinkedHashMap<>(original.logicalCoverage());
+                    rewrittenCoverage.put(rewrittenId, rewrittenCoverage.remove(changed.terminalLogicalId()));
+                    BenchmarkAckOracle.Fork incorrect = new BenchmarkAckOracle.Fork(
+                            original.id(), rewritten, rewrittenCoverage, original.checksum(), original.errorTotal());
+                    return new PipelineBenchmarkHarness.ForkResult(complete.measurement(), incorrect);
+                }))
+                .isInstanceOf(AssertionError.class)
+                .hasMessageContaining("source chains or terminal identities differ from frozen workload");
+    }
+
+    @Test
     void optimizationRequiresAFrozenTargetAndUsesTheSeparateGainGate() throws Exception {
         Path baseline = jar("baseline.jar");
         Path candidate = jar("candidate.jar");

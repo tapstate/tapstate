@@ -1349,7 +1349,8 @@ final class StoreBackedDagSource implements DagSource {
             boolean freshFullLoad,
             ExecutionFence fence) {
         ChainAxes axes = frontier.axes();
-        boolean snapshotOnly = readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY;
+        ReadMode readMode = readModeOf(pipeline);
+        boolean snapshotOnly = readMode == ReadMode.SNAPSHOT_ONLY;
         long snapshotEpoch = snapshotOnly
                 ? SnapshotRunOrder.current(storePort.keyedState(), pipeline.id())
                 : 0L;
@@ -1358,7 +1359,7 @@ final class StoreBackedDagSource implements DagSource {
         StartFrom freshStart = freshRingStart(pipeline);
         Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = progressByTable(pipeline);
         return new DagBindings(
-                key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch, freshStart,
+                key -> sourceVertex(sourceVertices.get(key), axes, readMode, snapshotEpoch, freshStart,
                         progress.get(sourceVertices.get(key).table()).kind() == ConsumerProgressKind.DIRECT_SOURCE),
                 step -> transformBinding(step, stepsById, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds),
                 element -> FencedSinkWriterFactory.heldTo(
@@ -2334,7 +2335,7 @@ final class StoreBackedDagSource implements DagSource {
      * writer fills.
      */
     private ProcessorMetaSupplier sourceVertex(
-            SourceVertex vertex, ChainAxes axes, boolean snapshotOnly, long snapshotEpoch, StartFrom freshStart,
+            SourceVertex vertex, ChainAxes axes, ReadMode readMode, long snapshotEpoch, StartFrom freshStart,
             boolean direct) {
         if (vertex == null) {
             throw new IllegalStateException("source vertex binding is missing");
@@ -2345,10 +2346,11 @@ final class StoreBackedDagSource implements DagSource {
         String chain = vertex.table();
         byte axis = axes.axisOf(chain);
         String ringName = vertex.resolution().ringName(vertex.table());
-        String snapshotToken = snapshotBuffer != null && cursorWriterToken != null
-                && snapshotBuffer.hasSnapshot(vertex.pipelineId(), ringName, cursorWriterToken)
+        // A prepared snapshot keeps its own token even after its session is cancelled or replaced.
+        // The reader must observe that cancellation rather than enter the legacy channel.
+        String snapshotToken = snapshotBuffer != null && readMode != ReadMode.CDC_ONLY
                 ? cursorWriterToken : null;
-        if (snapshotOnly) {
+        if (readMode == ReadMode.SNAPSHOT_ONLY) {
             return SrsSourceProcessor.snapshotOnlyMetaSupplier(
                     vertex.pipelineId(), ringName, vertex.table(), snapshotEpoch,
                     order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement,

@@ -15,7 +15,9 @@ class BenchmarkAckOracleIsRunRelativeTest {
 
     @Test
     void twoChainsWithEqualLogicalResultsAndDifferentOpaquePositionsPass() {
-        BenchmarkAckOracle.verify(List.of(fork("baseline", "first"), fork("candidate", "second")));
+        List<BenchmarkAckOracle.Fork> forks = List.of(fork("baseline", "first"), fork("candidate", "second"));
+        BenchmarkAckOracle.verify(forks);
+        BenchmarkAckOracle.verify(forks, Map.of("orders", "terminal-orders", "customers", "terminal-customers"));
     }
 
     @Test

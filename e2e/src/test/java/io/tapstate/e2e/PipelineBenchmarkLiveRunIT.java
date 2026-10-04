@@ -313,6 +313,7 @@ class PipelineBenchmarkLiveRunIT {
             PipelineBenchmarkHarness.ForkResult result, Instant startedAt) {
         PipelineBenchmarkComparison.Fork performance = result.measurement();
         BenchmarkAckOracle.Fork correctness = result.correctness();
+        BenchmarkAckOracle.verify(List.of(correctness), PipelineBenchmarkHarness.expectedTerminals(evidence.workload()));
         long[] durations = performance.deliveryNanos();
         long[] sorted = durations.clone();
         Arrays.sort(sorted);

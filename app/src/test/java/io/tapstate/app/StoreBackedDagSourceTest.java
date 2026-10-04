@@ -3,21 +3,37 @@ package io.tapstate.app;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.hazelcast.config.Config;
+import com.hazelcast.core.Hazelcast;
+import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.jet.Job;
+import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Edge;
+import com.hazelcast.jet.core.JobStatus;
+import com.hazelcast.jet.core.Outbox;
+import com.hazelcast.jet.core.Processor;
+import com.hazelcast.jet.core.ProcessorMetaSupplier;
+import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Vertex;
+import com.hazelcast.jet.core.Watermark;
+import com.hazelcast.jet.impl.processor.ProcessorWrapper;
+import com.hazelcast.jet.impl.util.WrappingProcessorMetaSupplier;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.ServeResource;
+import io.tapstate.core.model.Settings;
 import io.tapstate.core.model.SourceMode;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.Step;
@@ -26,6 +42,9 @@ import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.ViewResource;
+import io.tapstate.runtime.srs.CaptureRunUnit;
+import io.tapstate.runtime.srs.SnapshotBuffer;
+import io.tapstate.runtime.srs.SrsSourceProcessor;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.CatalogStore;
 import io.tapstate.spi.store.ConnectionTestResultStore;
@@ -58,13 +77,21 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 /**
  * Structure-assert coverage for the store-backed DAG source: it loads a stored pipeline artifact and its
- * referenced source and target artifacts, then hands them to the engine's DAG builder. These tests assert
- * the built graph's vertex and edge topology against an in-memory artifact store, without running a Jet job
- * - the leaves (SRS source vertex, transform port, sink writer) are built but never opened here.
+ * referenced source and target artifacts, then hands them to the engine's DAG builder. Most cases inspect
+ * the built graph against an in-memory artifact store. The deferred snapshot case opens the prepared source
+ * supplier in a real Jet job to verify cancellation and consumption of the member-local hand-off.
  */
 class StoreBackedDagSourceTest {
 
@@ -315,6 +342,96 @@ class StoreBackedDagSourceTest {
         later.build(null);
         earlier.build(null);
         assertThat(earlier.cursorWriterToken()).isEqualTo(earlierToken);
+    }
+
+    @Test
+    @Timeout(30)
+    void aDeferredSnapshotBuildIsCancelledAfterItsSessionIsReplaced() throws Exception {
+        FakeStorePort store = new FakeStorePort();
+        SourceResource sourceResource = cdcSource("orders_src", "orders");
+        store.artifacts().save(sourceResource);
+        store.artifacts().save(connectionSupplier("orders_dest"));
+        PipelineResource pipeline = new PipelineResource(
+                "p", null, List.of(SourceRef.spec("orders_src", true)), List.of(), null,
+                serve(FromRef.literal("orders_src"), sync("sync_1", "orders_dest")),
+                new Settings(null, null, null, null, ReadMode.SNAPSHOT_ONLY, null), null);
+        store.artifacts().save(pipeline);
+        discovered(store, "orders_src", "orders");
+        String ringName = SourceCaptureResolution.forPipeline(pipeline, sourceResource,
+                store.schemas().get("orders_src").orElseThrow().model()).orElseThrow().ringName("orders");
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        StoreBackedDagSource source = new StoreBackedDagSource(
+                store, StoreBackedDagSource.assembledSinkWriterBinder(), buffer);
+
+        DagSource.StartPreparation earlier = source.prepareStart("p", "default");
+        SnapshotRunOrder.next(store.keyedState(), "p", 0L);
+        buffer.beginSnapshot("p", ringName, earlier.cursorWriterToken());
+        DagSource.StartPreparation later = source.prepareStart("p", "default");
+        long laterOrder = SnapshotRunOrder.next(store.keyedState(), "p", 0L);
+        buffer.beginSnapshot("p", ringName, later.cursorWriterToken());
+        buffer.appendSnapshot("p", ringName, later.cursorWriterToken(),
+                Envelope.read(1L, "orders", Map.of("id", 100), Map.of())
+                        .withOrder(SourceOrder.snapshotRow(laterOrder)));
+        buffer.completeSnapshot("p", ringName, later.cursorWriterToken());
+
+        // Both suppliers come from actual deferred builds after the newer session replaced the old one.
+        ProcessorMetaSupplier earlierSupplier = earlier.build(null).dag()
+                .getVertex("orders_src").getMetaSupplier();
+        ProcessorMetaSupplier laterSupplier = later.build(null).dag()
+                .getVertex("orders_src").getMetaSupplier();
+        SnapshotOutputReceipt earlierOutput = new SnapshotOutputReceipt();
+        SnapshotOutputReceipt laterOutput = new SnapshotOutputReceipt();
+        HazelcastInstance member = snapshotMember(store, buffer);
+        Job earlierJob = null;
+        Job laterJob = null;
+        try {
+            member.getUserContext().put("test.snapshot.earlier.output", earlierOutput);
+            member.getUserContext().put("test.snapshot.later.output", laterOutput);
+            earlierJob = member.getJet().newJob(snapshotSourceDag(
+                    earlierSupplier, "test.snapshot.earlier.output"));
+            // Jet retries processor cancellation, so its job future is not a source-cancellation receipt.
+            boolean earlierCancelled = earlierOutput.sourceCancelled.await(5L, TimeUnit.SECONDS);
+            if (!earlierCancelled) {
+                assertThat(earlierOutput.normalSourceReturns.get())
+                        .as("the stale source actually ran and returned, rather than waiting for job setup")
+                        .isPositive();
+            }
+            finishOwnedJob(earlierJob);
+            earlierJob = null;
+
+            // Run the positive control before asserting the stale outcome, including on the defective source.
+            laterJob = member.getJet().newJob(snapshotSourceDag(
+                    laterSupplier, "test.snapshot.later.output"));
+            assertThat(laterOutput.snapshotBound.await(5L, TimeUnit.SECONDS))
+                    .as("the newer prepared source emits its row and then the real snapshot bound")
+                    .isTrue();
+            assertThat(laterJob.getStatus()).isEqualTo(JobStatus.RUNNING);
+            finishOwnedJob(laterJob);
+            laterJob = null;
+            assertThat(laterOutput.rows).containsExactly(100);
+            assertThat(earlierOutput.rows).isEmpty();
+            assertThat(earlierCancelled)
+                    .as("the old prepared source must retain its token and throw on replacement")
+                    .isTrue();
+            assertThat(earlierOutput.sourceCancellation.get().getStackTrace())
+                    .as("the cancellation came from the actual streaming snapshot drain")
+                    .anyMatch(frame -> frame.getClassName().equals(SrsSourceProcessor.class.getName())
+                            && frame.getMethodName().equals("drainSnapshotSession"));
+        } finally {
+            try {
+                finishOwnedJob(earlierJob);
+            } finally {
+                try {
+                    finishOwnedJob(laterJob);
+                } finally {
+                    try {
+                        member.shutdown();
+                    } finally {
+                        buffer.release("p");
+                    }
+                }
+            }
+        }
     }
 
     @Test
@@ -1030,6 +1147,115 @@ class StoreBackedDagSourceTest {
     }
 
     // ---- fixtures ----------------------------------------------------------------------
+
+    private static HazelcastInstance snapshotMember(FakeStorePort store, SnapshotBuffer buffer) {
+        Config config = new Config();
+        config.setClusterName("prepared-snapshot-test-" + java.util.UUID.randomUUID());
+        config.setProperty("hazelcast.phone.home.enabled", "false");
+        config.setProperty("hazelcast.shutdownhook.enabled", "false");
+        config.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");
+        config.getNetworkConfig().getJoin().getAutoDetectionConfig().setEnabled(false);
+        config.getNetworkConfig().getJoin().getMulticastConfig().setEnabled(false);
+        config.getJetConfig().setEnabled(true);
+        HazelcastInstance member = Hazelcast.newHazelcastInstance(config);
+        member.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+        member.getUserContext().put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY, store.meta());
+        member.getUserContext().put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY, store.srsLog());
+        return member;
+    }
+
+    private static DAG snapshotSourceDag(ProcessorMetaSupplier preparedSource, String outputKey) {
+        DAG dag = new DAG();
+        ProcessorMetaSupplier observedSource = new WrappingProcessorMetaSupplier(preparedSource,
+                processor -> new PreparedSnapshotSource(processor, outputKey));
+        Vertex source = dag.newVertex("source", observedSource).localParallelism(1);
+        Vertex output = dag.newVertex("output", ProcessorMetaSupplier.forceTotalParallelismOne(
+                ProcessorSupplier.of(() -> new PreparedSnapshotOutput(outputKey))));
+        dag.edge(Edge.between(source, output));
+        return dag;
+    }
+
+    private static void finishOwnedJob(Job job) throws Exception {
+        if (job == null) {
+            return;
+        }
+        if (!job.getFuture().isDone()) {
+            job.cancel();
+        }
+        try {
+            job.getFuture().get(5L, TimeUnit.SECONDS);
+        } catch (ExecutionException | CancellationException terminal) {
+            // Owned jobs can finish exceptionally; both are explicitly cancelled while still live.
+        }
+    }
+
+    private static final class SnapshotOutputReceipt {
+        private final List<Object> rows = new CopyOnWriteArrayList<>();
+        private final CountDownLatch snapshotBound = new CountDownLatch(1);
+        private final CountDownLatch sourceCancelled = new CountDownLatch(1);
+        private final AtomicReference<CancellationException> sourceCancellation = new AtomicReference<>();
+        private final AtomicLong normalSourceReturns = new AtomicLong();
+    }
+
+    /** Observes the prepared source's real completion callback without changing its return or exception. */
+    private static final class PreparedSnapshotSource extends ProcessorWrapper {
+        private final String outputKey;
+        private SnapshotOutputReceipt output;
+
+        private PreparedSnapshotSource(Processor delegate, String outputKey) {
+            super(delegate);
+            this.outputKey = outputKey;
+        }
+
+        @Override
+        protected void initWrapper(Outbox outbox, Context context) {
+            output = (SnapshotOutputReceipt) context.hazelcastInstance().getUserContext().get(outputKey);
+        }
+
+        @Override
+        public boolean complete() {
+            try {
+                boolean complete = super.complete();
+                output.normalSourceReturns.incrementAndGet();
+                return complete;
+            } catch (CancellationException cancelled) {
+                output.sourceCancellation.compareAndSet(null, cancelled);
+                output.sourceCancelled.countDown();
+                throw cancelled;
+            }
+        }
+    }
+
+    private static final class PreparedSnapshotOutput extends AbstractProcessor {
+        private final String outputKey;
+        private SnapshotOutputReceipt output;
+
+        private PreparedSnapshotOutput(String outputKey) {
+            this.outputKey = outputKey;
+        }
+
+        @Override
+        protected void init(Context context) {
+            output = (SnapshotOutputReceipt) context.hazelcastInstance().getUserContext().get(outputKey);
+        }
+
+        @Override
+        protected boolean tryProcess(int ordinal, Object item) {
+            output.rows.add(((Envelope) item).after().get("id"));
+            return true;
+        }
+
+        @Override
+        public boolean tryProcessWatermark(int ordinal, Watermark watermark) {
+            output.snapshotBound.countDown();
+            return true;
+        }
+
+        @Override
+        public boolean tryProcessWatermark(Watermark watermark) {
+            return true;
+        }
+    }
 
     private static SourceResource cdcSource(String id, String table) {
         return new SourceResource(id, null, "mysql", Map.of("host", "h"), SourceMode.CDC,
