@@ -43,6 +43,7 @@ boot.cloud-status-config-invalid
 boot.cloud-status-mode-required
 boot.cloud-status-sdk-required
 boot.cloud-store-required
+boot.cloud-view-store-conflict
 boot.cluster-id-invalid
 boot.cluster-id-mismatch
 boot.cluster-id-required

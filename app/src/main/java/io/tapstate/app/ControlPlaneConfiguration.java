@@ -535,7 +535,7 @@ class ControlPlaneConfiguration {
         // removes is a seam where a later change to that marking would silently not apply here.
         return new ViewStoreSeedRunner(
                 artifactStore, cloud.metadataUri(mongoProperties.getUri()), mongoProperties.getTlsCaFile(),
-                cloud.viewsDatabase(ViewTargetResolver.STATE_STORE_SOURCE_ID));
+                cloud.viewsDatabase(ViewTargetResolver.STATE_STORE_SOURCE_ID), cloud.cloud());
     }
 
     @Bean

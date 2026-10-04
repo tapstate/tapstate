@@ -42,6 +42,9 @@ enum BootError implements TapstateErrorCode {
     /** The optional on-prem store switch cannot disable managed Cloud metadata persistence. */
     CLOUD_STORE_REQUIRED("boot.cloud-store-required", Set.of()),
 
+    /** An existing view-store resource conflicts with the managed deployment or a concurrent refresh. */
+    CLOUD_VIEW_STORE_CONFLICT("boot.cloud-view-store-conflict", Set.of("store")),
+
     /** The outbound status switch is malformed; its value is deliberately not echoed. */
     CLOUD_STATUS_CONFIG_INVALID("boot.cloud-status-config-invalid", Set.of()),
 

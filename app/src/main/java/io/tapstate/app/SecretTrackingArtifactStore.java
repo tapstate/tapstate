@@ -114,6 +114,11 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
         return delegate.get(id);
     }
 
+    /** Registers a store-proven startup winner, never a candidate from a refused write. */
+    synchronized void trackLoaded(Resource resource) {
+        track(resource);
+    }
+
     @Override
     public List<Resource> list() {
         return delegate.list();

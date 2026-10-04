@@ -23,14 +23,14 @@ final class InMemoryArtifactStore implements ArtifactStore {
     private final Map<String, Integer> reads = Collections.synchronizedMap(new HashMap<>());
 
     @Override
-    public void saveAll(List<Resource> artifacts) {
+    public synchronized void saveAll(List<Resource> artifacts) {
         for (Resource artifact : artifacts) {
             byId.put(artifact.id(), artifact);
         }
     }
 
     @Override
-    public Optional<String> saveAll(List<Resource> artifacts, Map<String, String> expectedContentHashes) {
+    public synchronized Optional<String> saveAll(List<Resource> artifacts, Map<String, String> expectedContentHashes) {
         for (Map.Entry<String, String> expected : expectedContentHashes.entrySet()) {
             Resource stored = byId.get(expected.getKey());
             if (stored == null || !expected.getValue().equals(CanonicalHash.of(stored))) {
@@ -47,7 +47,7 @@ final class InMemoryArtifactStore implements ArtifactStore {
      * so a double that upserted here would let such a caller pass while overwriting in production.
      */
     @Override
-    public ArtifactMutation create(Resource artifact) {
+    public synchronized ArtifactMutation create(Resource artifact) {
         if (byId.containsKey(artifact.id())) {
             return ArtifactMutation.ALREADY_EXISTS;
         }
@@ -56,7 +56,17 @@ final class InMemoryArtifactStore implements ArtifactStore {
     }
 
     @Override
-    public Optional<Resource> get(String id) {
+    public synchronized ArtifactMutation replace(String id, String expectedContentHash, Resource replacement) {
+        if (!id.equals(replacement.id())) throw new IllegalArgumentException("replacement id must equal the artifact id");
+        Resource observed = byId.get(id);
+        if (observed == null) return ArtifactMutation.NOT_FOUND;
+        if (!CanonicalHash.of(observed).equals(expectedContentHash)) return ArtifactMutation.VERSION_CONFLICT;
+        byId.put(id, replacement);
+        return ArtifactMutation.REPLACED;
+    }
+
+    @Override
+    public synchronized Optional<Resource> get(String id) {
         reads.merge(id, 1, Integer::sum);
         return Optional.ofNullable(byId.get(id));
     }
@@ -74,7 +84,7 @@ final class InMemoryArtifactStore implements ArtifactStore {
     }
 
     @Override
-    public List<Resource> list() {
+    public synchronized List<Resource> list() {
         return List.copyOf(byId.values());
     }
 }

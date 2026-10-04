@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import com.mongodb.MongoCommandException;
+import com.mongodb.MongoSecurityException;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import io.tapstate.adapters.mongostore.SystemCollections;
@@ -136,6 +137,48 @@ class ManagedMongoStoreIsolationIT {
         return start(metadataUri, clusterId, new AtomicInteger());
     }
 
+    @Test
+    void managedViewsUseRenewedDeploymentCredentialsAfterRestart() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String metadata = "isolation_renewed_" + suffix;
+        String user = "user_renewed_" + suffix;
+        String renewedPassword = "controlled-renewed-mongo-password";
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            createUser(admin, user, List.of(metadata, metadata + "_operator", metadata + "_views"));
+            try (ConfigurableApplicationContext first = start(uri(user, metadata), metadata)) {
+                StorePort store = first.getBean(StorePort.class);
+                store.keyedState().save("permissions-proof", "renewed-key", new byte[] {7});
+                SourceResource views = (SourceResource) store.artifacts().get("views").orElseThrow();
+                try (MongoClient materialization = MongoClients.create(String.valueOf(views.config().get("uri")))) {
+                    materialization.getDatabase(metadata + "_views").getCollection("proof")
+                            .insertOne(new Document("_id", "before-renewal").append("owner", metadata));
+                }
+            }
+            admin.getDatabase("admin").runCommand(new Document("updateUser", user).append("pwd", renewedPassword));
+            try (MongoClient revoked = MongoClients.create(uri(user, metadata))) {
+                assertThatThrownBy(() -> revoked.getDatabase(metadata).getCollection("proof").countDocuments())
+                        .as("the server no longer accepts the original password")
+                        .isInstanceOf(MongoSecurityException.class);
+            }
+            try (ConfigurableApplicationContext restarted = start(uri(user, metadata, renewedPassword), metadata)) {
+                StorePort store = restarted.getBean(StorePort.class);
+                assertThat(store.keyedState().load("permissions-proof", "renewed-key"))
+                        .hasValueSatisfying(value -> assertThat(value).isEqualTo(new byte[] {7}));
+                SourceResource views = (SourceResource) store.artifacts().get("views").orElseThrow();
+                try (MongoClient materialization = MongoClients.create(String.valueOf(views.config().get("uri")))) {
+                    materialization.getDatabase(metadata + "_views").getCollection("proof")
+                            .insertOne(new Document("_id", "after-renewal").append("owner", metadata));
+                }
+                assertThat(admin.getDatabase(metadata + "_views").getCollection("proof").countDocuments()).isEqualTo(2);
+                Object rawConfig = admin.getDatabase(metadata).getCollection(SystemCollections.ARTIFACTS.collectionName())
+                        .find(new Document("_id", "views")).first().get("body", Document.class).get("config");
+                assertThat(rawConfig).isInstanceOf(String.class);
+                assertThat((String) rawConfig).doesNotContain(PASSWORD, renewedPassword);
+                assertNoProbes(admin, metadata);
+            }
+        }
+    }
+
     @ParameterizedTest
     @EnumSource(Missing.class)
     void readableButUnwritableDerivedDatabaseCannotReportReady(Missing readOnly) {
@@ -238,7 +281,11 @@ class ManagedMongoStoreIsolationIT {
     }
 
     private static String uri(String user, String database) {
-        return "mongodb://" + user + ":" + PASSWORD + "@" + MONGO.getHost() + ":" + MONGO.getMappedPort(27017)
+        return uri(user, database, PASSWORD);
+    }
+
+    private static String uri(String user, String database, String password) {
+        return "mongodb://" + user + ":" + password + "@" + MONGO.getHost() + ":" + MONGO.getMappedPort(27017)
                 + "/" + database + "?replicaSet=" + REPLICA_SET + "&directConnection=true&authSource=admin";
     }
 }

@@ -111,6 +111,9 @@ boot.web-console-url-invalid:
 boot.cloud-store-required:
   message: "Managed Cloud mode requires its metadata store."
   solution: "Remove tapstate.store.mongo.enabled=false and supply the assigned Cloud Atlas metadata URI."
+boot.cloud-view-store-conflict:
+  message: "The managed Cloud view store `{store}` conflicts with this deployment configuration."
+  solution: "Preserve the conflicting resource and align the deployment with its assigned view database. All Cluster members must use the same connection settings."
 boot.cloud-status-config-invalid:
   message: "The Cloud status sender switch is not a valid boolean."
   solution: "Set SDK_STATUS_SENDER_ENABLED to true or false."
