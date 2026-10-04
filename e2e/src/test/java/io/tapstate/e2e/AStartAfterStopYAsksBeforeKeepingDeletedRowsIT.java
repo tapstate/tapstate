@@ -103,54 +103,51 @@ class AStartAfterStopYAsksBeforeKeepingDeletedRowsIT {
     void aViewKeepsTheRowsItWasToldToKeepAndTheStartRecordsTheAnswer(@TempDir Path directory) throws Exception {
         RealConnectorGate.require("mongodb");
         String storeUri = SharedMongo.replicaSetUrl("asks_after_stop_view_store");
-        String viewUri = SharedMongo.replicaSetUrl("asks_after_stop_view_views");
-        EndpointAddress views = EndpointAddress.uri(viewUri);
-        EndpointAddress source = EndpointAddress.uri(Files.createDirectories(directory.resolve("src")).toString());
-        FileEndpoints files = new FileEndpoints();
-        files.seed(source, TABLE, SeedRows.generated(SEEDED));
-
         try (ServerHandle server = InProcessServer.start(storeUri);
                 StoreDocuments documents = StoreDocuments.at(storeUri);
                 MongoEndpoints mongo = new MongoEndpoints()) {
-            ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
-            control.registerConnector(E2eConnectorJar.CONNECTOR_ID, Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
-            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
-            control.discoverSchema("src_file", E2eConnectorJar.CONNECTOR_ID, source.settings());
-            Map<String, String> resources = new LinkedHashMap<>();
-            resources.put("src_file.tap.yml", fileYaml("src_file", E2eConnectorJar.CONNECTOR_ID, source, true));
-            resources.put("views.tap.yml", """
-                    version: tapstate/v1
-                    kind: source
-                    id: views
-                    connector: mongodb
-                    config: { uri: "%s" }
-                    """.formatted(viewUri));
-            resources.put(PIPELINE + ".tap.yml", """
-                    version: tapstate/v1
-                    kind: pipeline
-                    id: %s
-                    source: src_file
-                    settings: { read_mode: snapshot_and_cdc }
-                    view:
-                      id: %s
-                      from: %s
-                      primary_key: id
-                      storage: { warm: { collection: %s } }
-                    """.formatted(PIPELINE, VIEW, TABLE, VIEW));
-            control.apply(resources);
-            loadThenStopClearing(control, () -> mongo.count(views, VIEW));
+            ViewScene scene = ViewScene.loadedAndStopped(server, mongo, directory,
+                    SharedMongo.replicaSetUrl("asks_after_stop_view_views"));
 
             Map<String, Object> question = askedOnceTheSourceDeletedRows(
-                    control, source, files, "target-not-empty/views/" + VIEW);
-            assertThat(control.start(PIPELINE, List.of(answer(question, "keep")), hashOf(question)).status())
-                    .isEqualTo(200);
+                    scene.control(), scene.source(), scene.files(), "target-not-empty/views/" + VIEW);
+            assertThat(scene.control().start(PIPELINE, List.of(answer(question, "keep")), hashOf(question))
+                    .status()).isEqualTo(200);
 
-            awaitTheNewFullLoad(id -> viewRow(mongo, views, id));
-            assertThat(mongo.count(views, VIEW)).as("documents in the view").isEqualTo(SEEDED);
-            assertThat(viewRow(mongo, views, 4L)).isPresent();
-            assertThat(viewRow(mongo, views, 5L)).isPresent();
+            awaitTheNewFullLoad(id -> viewRow(mongo, scene.views(), id));
+            assertThat(mongo.count(scene.views(), VIEW)).as("documents in the view").isEqualTo(SEEDED);
+            assertThat(viewRow(mongo, scene.views(), 4L)).isPresent();
+            assertThat(viewRow(mongo, scene.views(), 5L)).isPresent();
             assertAnswerAudited(documents, question, "keep");
+        }
+    }
+
+    @Test
+    void aViewClearedByTheAnswerHoldsExactlyWhatTheSourceHolds(@TempDir Path directory) throws Exception {
+        RealConnectorGate.require("mongodb");
+        String storeUri = SharedMongo.replicaSetUrl("asks_after_stop_view_clear_store");
+        try (ServerHandle server = InProcessServer.start(storeUri);
+                MongoEndpoints mongo = new MongoEndpoints()) {
+            ViewScene scene = ViewScene.loadedAndStopped(server, mongo, directory,
+                    SharedMongo.replicaSetUrl("asks_after_stop_view_clear_views"));
+
+            Map<String, Object> question = askedOnceTheSourceDeletedRows(
+                    scene.control(), scene.source(), scene.files(), "target-not-empty/views/" + VIEW);
+            assertThat(scene.control().start(PIPELINE, List.of(answer(question, "clear")), hashOf(question))
+                    .status()).isEqualTo(200);
+
+            assertThat(scene.control().artifact(PIPELINE).orElseThrow().canonicalForm())
+                    .as("the pipeline's definition after the answer")
+                    .contains("on_full_load: clear");
+            // Three documents with the changed row among them is the new full load into a cleared collection;
+            // one that kept the old documents stays at five, with the deleted rows still there.
+            Await.until("the view to hold exactly what the source holds", () ->
+                            mongo.count(scene.views(), VIEW) == SEEDED - 2
+                                    && viewRow(mongo, scene.views(), 1L)
+                                    .map(row -> seq(row) == CHANGED_SEQ).orElse(false),
+                    () -> "documents=" + mongo.count(scene.views(), VIEW));
+            assertThat(viewRow(mongo, scene.views(), 4L)).isEmpty();
+            assertThat(viewRow(mongo, scene.views(), 5L)).isEmpty();
         }
     }
 
@@ -185,6 +182,48 @@ class AStartAfterStopYAsksBeforeKeepingDeletedRowsIT {
             control.apply(resources);
             loadThenStopClearing(control, () -> files.count(target, TABLE));
             return new SyncScene(control, files, source, target);
+        }
+    }
+
+    /** One view case's endpoints and session, with the pipeline loaded once and then stopped with its state cleared. */
+    private record ViewScene(ControlPlane control, FileEndpoints files, EndpointAddress source, EndpointAddress views) {
+
+        static ViewScene loadedAndStopped(ServerHandle server, MongoEndpoints mongo, Path directory, String viewUri)
+                throws Exception {
+            EndpointAddress views = EndpointAddress.uri(viewUri);
+            EndpointAddress source = EndpointAddress.uri(Files.createDirectories(directory.resolve("src")).toString());
+            FileEndpoints files = new FileEndpoints();
+            files.seed(source, TABLE, SeedRows.generated(SEEDED));
+
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            control.bootstrapAndLogin("e2e", "e2e-password");
+            control.registerConnector(E2eConnectorJar.CONNECTOR_ID, Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
+            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+            control.discoverSchema("src_file", E2eConnectorJar.CONNECTOR_ID, source.settings());
+            Map<String, String> resources = new LinkedHashMap<>();
+            resources.put("src_file.tap.yml", fileYaml("src_file", E2eConnectorJar.CONNECTOR_ID, source, true));
+            resources.put("views.tap.yml", """
+                    version: tapstate/v1
+                    kind: source
+                    id: views
+                    connector: mongodb
+                    config: { uri: "%s" }
+                    """.formatted(viewUri));
+            resources.put(PIPELINE + ".tap.yml", """
+                    version: tapstate/v1
+                    kind: pipeline
+                    id: %s
+                    source: src_file
+                    settings: { read_mode: snapshot_and_cdc }
+                    view:
+                      id: %s
+                      from: %s
+                      primary_key: id
+                      storage: { warm: { collection: %s } }
+                    """.formatted(PIPELINE, VIEW, TABLE, VIEW));
+            control.apply(resources);
+            loadThenStopClearing(control, () -> mongo.count(views, VIEW));
+            return new ViewScene(control, files, source, views);
         }
     }
 
