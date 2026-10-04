@@ -200,7 +200,7 @@ public final class CaptureRunUnit {
             Supplier<Optional<Subscription>> tail = () -> {
                 Optional<Subscription> opened = openTail(spec, plan, state.chainId, state.epoch, ownSeam,
                         startTail, health, handoff);
-                state.sharedTail = state.chainId == null ? null : sharedTails.get(state.chainId.value());
+                state.sharedTail.set(state.chainId == null ? null : sharedTails.get(state.chainId.value()));
                 return opened;
             };
 
@@ -231,8 +231,9 @@ public final class CaptureRunUnit {
 
     private static CaptureRun withWidening(CaptureRun run, OpenState state) {
         return run.withWidening(() -> {
-            if (state.sharedTail != null) {
-                state.sharedTail.widen();
+            SharedTail sharedTail = state.sharedTail.get();
+            if (sharedTail != null) {
+                sharedTail.widen();
             }
         });
     }
@@ -387,7 +388,7 @@ public final class CaptureRunUnit {
         private long epoch;
         private Optional<Subscription> subscription = Optional.empty();
         private SnapshotPhase.Load load;
-        private volatile SharedTail sharedTail;
+        private final AtomicReference<SharedTail> sharedTail = new AtomicReference<>();
     }
 
     private void registerConsumerTables(String chainId, String pipelineId, List<String> tables) {
