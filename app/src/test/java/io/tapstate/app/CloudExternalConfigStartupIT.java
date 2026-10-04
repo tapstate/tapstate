@@ -22,6 +22,9 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 
 import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -44,6 +47,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.catchThrowableOfType;
 
 /** Exercises external configuration through the shipped JAR in a separate, real JVM process. */
 @RequiresDocker
@@ -179,12 +183,7 @@ class CloudExternalConfigStartupIT {
         first.close();
         int previousReports = statusReports.size();
         Running restarted = start(carrier, values, MONGO.getReplicaSetUrl(ignored), seed);
-        try {
-            restarted.awaitReady();
-        } catch (AssertionError failure) {
-            failure.addSuppressed(new AssertionError(mongoDiagnostic()));
-            throw failure;
-        }
+        restarted.awaitReady();
         assertVersion(restarted);
         try (var raw = MongoClients.create(MONGO.getReplicaSetUrl())) {
             assertThat(raw.getDatabase(selected).getCollection(SystemCollections.ARTIFACTS.collectionName())
@@ -209,8 +208,104 @@ class CloudExternalConfigStartupIT {
                 status += ", observer=" + unavailable.getClass().getSimpleName();
             }
         }
-        return status + ", containerTail=" + MONGO.getLogs().lines().skip(Math.max(0, MONGO.getLogs().lines().count() - 12))
+        String logs = MONGO.getLogs();
+        return status + ", containerTail=" + logs.lines().skip(Math.max(0, logs.lines().count() - 12))
                 .collect(java.util.stream.Collectors.joining("\n"));
+    }
+
+    private static AssertionError withMongoDiagnostic(AssertionError failure) {
+        try {
+            failure.addSuppressed(new AssertionError(mongoDiagnostic()));
+        } catch (RuntimeException observerFailure) {
+            // A failed diagnostic must not replace the startup assertion or expose a driver message.
+            failure.addSuppressed(new AssertionError("Mongo diagnostic observer failed: "
+                    + observerFailure.getClass().getSimpleName()));
+        }
+        return failure;
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = Distribution.class, names = {"CLOUD", "ON_PREM"})
+    void aHealthyDelayedMongoHelloUsesTheNormalStartupBound(Distribution distribution) throws Exception {
+        String database = uniqueDatabase("delayed_hello");
+        try (var gate = delayMongoHello()) {
+            String uri = "mongodb://127.0.0.1:" + gate.port() + "/" + database + "?directConnection=true";
+            Map<String, String> values = distribution == Distribution.CLOUD ? cloudValues(uri) : Map.of();
+            String[] extra = distribution == Distribution.CLOUD
+                    ? new String[]{"--tapstate.connectors.seed-dir=" + CloudConnectorTestInputs.seedDirectory()}
+                    : new String[0];
+            long started = System.nanoTime();
+            Running running = start(Carrier.FILE, values, uri, extra);
+            try {
+                gate.awaitFirstReply(Duration.ofSeconds(15));
+                running.awaitMongoSelection();
+                // Hold a real, already returned hello beyond the accelerated rejection bound. This is
+                // deliberate fault injection, not a guessed sleep for fixture or application readiness.
+                long releaseAt = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(750);
+                while (System.nanoTime() < releaseAt) {
+                    LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(10));
+                }
+                assertThat(running.safeOutput()).doesNotContain(READY);
+                assertThat(cloudRequests.get()).isZero();
+                gate.release();
+                running.awaitReady();
+                assertVersion(running);
+                if (distribution == Distribution.CLOUD) awaitStatusReport(0, running);
+                else assertThat(cloudRequests.get()).isZero();
+                try (var raw = MongoClients.create(MONGO.getReplicaSetUrl(database))) {
+                    assertThat(raw.getDatabase(database).listCollectionNames().into(new ArrayList<>()))
+                            .contains(SystemCollections.ARTIFACTS.collectionName());
+                    assertConnectors(raw.getDatabase(database),
+                            distribution == Distribution.CLOUD ? CONNECTORS : Set.of());
+                }
+                assertSafeOutput(running, uri);
+                assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(90));
+            } finally {
+                running.close();
+            }
+        }
+    }
+
+    @Test
+    void anExplicitShortMongoSelectionBoundStillFailsBeforeReadyOrStatus() throws Exception {
+        String database = uniqueDatabase("expired_hello");
+        try (var gate = delayMongoHello()) {
+            String uri = "mongodb://127.0.0.1:" + gate.port() + "/" + database + "?directConnection=true";
+            Running running = start(Carrier.FILE, cloudValues(uri), uri,
+                    "--tapstate.connectors.seed-dir=" + CloudConnectorTestInputs.seedDirectory(),
+                    "--tapstate.store.mongo.server-selection-timeout=500ms");
+            try {
+                // A short-bound client may close before the upstream reply is fully captured. Hold
+                // all first replies anyway; do not turn that expected abort into a fixture timeout.
+                running.awaitMongoSelection();
+                long releaseAt = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(750);
+                while (System.nanoTime() < releaseAt) {
+                    LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(10));
+                }
+                gate.release();
+                running.awaitFailure("store.unreachable");
+                AssertionError diagnosed = catchThrowableOfType(running::awaitReady, AssertionError.class);
+                assertThat(diagnosed).hasMessageContaining("store.unreachable");
+                assertThat(diagnosed.getSuppressed()).hasSize(1);
+                assertThat(diagnosed.getSuppressed()[0].getMessage())
+                        .contains("fixture Mongo running=true", "writablePrimary=true");
+                StringWriter stack = new StringWriter();
+                diagnosed.printStackTrace(new PrintWriter(stack));
+                assertThat(stack.toString()).doesNotContain(TOKEN, PASSWORD, uri);
+                assertUntouched(database);
+                assertUntouched(database + "_operator");
+                assertUntouched(database + "_views");
+                assertSafeOutput(running, uri);
+            } finally {
+                running.close();
+            }
+        }
+    }
+
+    private static MongoHandshakeGate delayMongoHello() throws IOException {
+        assertThat(InetAddress.getByName(MONGO.getHost()).isLoopbackAddress())
+                .as("the controlled delay only forwards to the owned local Mongo fixture").isTrue();
+        return new MongoHandshakeGate("127.0.0.1", MONGO.getMappedPort(27017));
     }
 
     @ParameterizedTest
@@ -303,7 +398,8 @@ class CloudExternalConfigStartupIT {
     void unavailableCloudStoreFailsRatherThanFallingBackToTheWorkingOnPremStore() throws Exception {
         String ignored = uniqueDatabase("unreachable_ignored");
         String uri = "mongodb://unreachable-user:atlas-password-sentinel@127.0.0.1:1/metadata";
-        Running running = start(Carrier.ENVIRONMENT, cloudValues(uri), MONGO.getReplicaSetUrl(ignored));
+        Running running = start(Carrier.ENVIRONMENT, cloudValues(uri), MONGO.getReplicaSetUrl(ignored),
+                "--tapstate.store.mongo.server-selection-timeout=500ms");
         running.awaitFailure("store.unreachable");
         assertUntouched(ignored);
         assertSafeOutput(running, uri);
@@ -450,8 +546,7 @@ class CloudExternalConfigStartupIT {
                 "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2",
                 "--tapstate.connectors.plugins-dir=" + work.resolve("plugins"),
                 "--tapstate.store.mongo.uri=" + onPremUri,
-                "--tapstate.store.mongo.operator-state-database=" + operatorDatabase,
-                "--tapstate.store.mongo.server-selection-timeout=500ms"));
+                "--tapstate.store.mongo.operator-state-database=" + operatorDatabase));
         command.addAll(List.of(extraArgs));
         if (carrier == Carrier.FILE) {
             Path config = directory.resolve("application.properties");
@@ -531,13 +626,29 @@ class CloudExternalConfigStartupIT {
                 }
                 LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(40));
             }
-            throw new AssertionError("Boot process did not finish startup and become healthy: " + safeOutput());
+            throw withMongoDiagnostic(new AssertionError(
+                    "Boot process did not finish startup and become healthy: " + safeOutput()));
+        }
+
+        void awaitMongoSelection() throws Exception {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15);
+            while (System.nanoTime() < deadline) {
+                if (output().contains("Waiting for server to become available for operation hello")) return;
+                if (!process.isAlive()) break;
+                LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(10));
+            }
+            throw withMongoDiagnostic(new AssertionError(
+                    "The child did not select Mongo for its initial hello: " + safeOutput()));
         }
 
         void awaitFailure(String code) throws Exception {
-            assertThat(process.waitFor(45, TimeUnit.SECONDS)).as("startup failed without hanging").isTrue();
-            assertThat(process.exitValue()).isNotZero();
-            assertThat(safeOutput()).contains(code).doesNotContain("Tomcat started on port", READY);
+            try {
+                assertThat(process.waitFor(45, TimeUnit.SECONDS)).as("startup failed without hanging").isTrue();
+                assertThat(process.exitValue()).isNotZero();
+                assertThat(safeOutput()).contains(code).doesNotContain("Tomcat started on port", READY);
+            } catch (AssertionError failure) {
+                throw withMongoDiagnostic(failure);
+            }
         }
 
         @Override

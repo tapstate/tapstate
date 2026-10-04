@@ -12,7 +12,7 @@ import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.spi.store.StorePort;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.io.InputStream;
 import java.net.InetSocketAddress;
@@ -120,13 +120,14 @@ class SdkStatusProjectionTest {
     }
 
     @ParameterizedTest
-    @ValueSource(ints = {401, 409})
-    void anHttpRejectionIsSafeAndDoesNotPreventTheNextReport(int status) throws Exception {
+    @CsvSource({"401, sdk.token-invalid", "409, auth.nonce-replay"})
+    void anHttpRejectionIsSafeAndDoesNotPreventTheNextReport(int status, String code) throws Exception {
         StorePort projectionStore = projectionOnly(seededStorage());
         try (StatusEndpoint endpoint = new StatusEndpoint()) {
             endpoint.response.set(new Response(status,
-                    "{\"opId\":\"status-failed\",\"code\":\"sdk.token-invalid\","
-                            + "\"msg\":\"provider-password-sentinel\",\"data\":{\"uri\":\"provider-uri-sentinel\"}}"));
+                    JSON.writeValueAsString(Map.of("opId", "status-failed", "code", code,
+                            "msg", "provider-password-sentinel",
+                            "data", Map.of("uri", "provider-uri-sentinel")))));
             CloudStatusReporter reporter = reporter(projectionStore, Clock.fixed(NOW, ZoneOffset.UTC),
                     endpoint, new ArrayDeque<>(List.of("rejected-status-nonce", "recovered-status-nonce")));
 

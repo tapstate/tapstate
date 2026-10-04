@@ -180,8 +180,8 @@ class CloudSdkLiveContractTest {
                     assertThat(login.jwtId()).isEqualTo("jwt-one");
                 });
                 assertThat(exchangeSecret.get()).isEqualTo(TOKEN);
-                assertThat(exchangeBody.get().path("exchangeCode").asText()).isEqualTo(code);
-                assertThat(exchangeBody.get().path("clusterId").asText()).isEqualTo(CLUSTER);
+                assertThat(exchangeBody.get()).isEqualTo(JSON.valueToTree(Map.of(
+                        "exchangeCode", code, "clusterId", CLUSTER)));
                 assertThat(bridge.validate(exchanged, deployment, "different.customer.example")).isEmpty();
                 assertThat(bridge.validate(jwt(keyPair, baseUrl, CLUSTER + ".api.tapstate.io"), deployment, audience))
                         .isEmpty();
