@@ -275,6 +275,20 @@ the review — it is a reviewed exception, not something you assert about your o
 change. The check verifies a case is *present*; whether it is *adequate* is the
 reviewer's call.
 
+### Shared database resources
+
+The end-to-end JVM keeps its shared database daemons alive across cases. On a
+Docker VM with limited memory, set
+`-Dtapstate.e2e.mongo.wired-tiger-cache-gb=0.5` before the shared Mongo fixture
+starts to select a WiredTiger cache budget. The default leaves Mongo's cache
+setting unchanged. This bounds the engine cache only, not total container RSS;
+it neither removes real-connector cases nor restarts a lost fixture.
+
+Benchmark environment evidence records the selected value or `SYSTEM_DEFAULT`.
+Use identical fixture settings for both comparison arms. Changing a resource
+setting changes the harness conditions: rerun every compared version and do not
+combine those results with an earlier resource configuration.
+
 ### Mutation evidence
 
 **An assertion is only as good as the red it has been seen to produce.** A case

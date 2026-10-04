@@ -6,6 +6,11 @@ import io.tapstate.testsupport.DockerGate;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.utility.DockerImageName;
 
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Optional;
+
 /**
  * One replica set for every specification in the JVM.
  *
@@ -16,11 +21,13 @@ import org.testcontainers.utility.DockerImageName;
 final class SharedMongo {
 
     private static final DockerImageName IMAGE = DockerImageName.parse("mongo:7.0");
+    private static final String CACHE_BUDGET_PROPERTY = "tapstate.e2e.mongo.wired-tiger-cache-gb";
 
     /** Kept as its own constant rather than reached for across modules: this module depends on neither. */
     static final String OPERATOR_STATE_DATABASE = "tapstate_nest";
 
     private static MongoDBContainer container;
+    private static Optional<BigDecimal> cacheBudget;
 
     private SharedMongo() {
     }
@@ -64,9 +71,25 @@ final class SharedMongo {
         if (container == null) {
             DockerGate.require();
             MongoDBContainer starting = new MongoDBContainer(IMAGE);
+            configuredCacheBudget().ifPresent(budget -> {
+                // Preserve the replica-set arguments supplied by the container binding.
+                var arguments = new ArrayList<>(Arrays.asList(starting.getCommandParts()));
+                arguments.add("--wiredTigerCacheSizeGB=" + budget.toPlainString());
+                starting.withCommand(arguments.toArray(String[]::new));
+            });
             starting.start();
             container = starting;
         }
         return container.getReplicaSetUrl(database);
+    }
+
+    /** A startup input, never a total mongod memory limit or a late reconfiguration. */
+    static synchronized Optional<BigDecimal> configuredCacheBudget() {
+        if (cacheBudget != null) { return cacheBudget; }
+        String configured = System.getProperty(CACHE_BUDGET_PROPERTY);
+        if (configured == null) { return cacheBudget = Optional.empty(); }
+        BigDecimal budget = new BigDecimal(configured);
+        if (budget.signum() <= 0) { throw new IllegalArgumentException("the shared Mongo cache budget must be positive"); }
+        return cacheBudget = Optional.of(budget.stripTrailingZeros());
     }
 }

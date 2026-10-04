@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.management.ManagementFactory;
+import java.math.BigDecimal;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.DigestInputStream;
@@ -253,7 +254,9 @@ class PipelineBenchmarkLiveRunIT {
                         "vendor", System.getProperty("java.vendor"),
                         "vm", System.getProperty("java.vm.name"),
                         "maxHeapBytes", Runtime.getRuntime().maxMemory()),
-                "docker", dockerInfo());
+                "docker", dockerInfo(),
+                "testFixtures", object("mongoWiredTigerCacheGiB", SharedMongo.configuredCacheBudget()
+                        .map(BigDecimal::toPlainString).orElse("SYSTEM_DEFAULT")));
     }
 
     private static Map<String, Object> dockerInfo() throws Exception {
