@@ -685,6 +685,43 @@ class E2eExecutorTest {
                 .execute(new Envelope(published.name(), published.setup(), published.pipeline(), published.seed(), snapshot));
     }
 
+    @Test
+    void customerAndPaymentExampleWaitsForEveryInitialPayment() {
+        java.nio.file.Path workspace = Examples.ROOT.resolve(
+                "an-order-row-is-widened-by-its-customer-and-its-payment");
+        Envelope published = EnvelopeParser.parse(Examples.read(workspace.resolve("spec.e2e.yml")));
+        List<Step> snapshot = published.steps().stream().takeWhile(step -> !(step instanceof Step.Cdc)).toList();
+        TableAlias target = new TableAlias("views", "order_state");
+        binding.countsOverTime(target, 3L);
+        AtomicInteger paymentReads = new AtomicInteger();
+        binding.documentReader = (table, where) -> {
+            assertThat(table).isEqualTo(target);
+            int id = ((Number) where.get("order_id")).intValue();
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("order_id", id);
+            row.put("qty", switch (id) {
+                case 10 -> 2;
+                case 11 -> 5;
+                case 12 -> 7;
+                default -> throw new AssertionError("unexpected order " + id);
+            });
+            row.put("customer_name", id == 11 ? "bo" : "ada");
+            // Three rows and order 10's payment can arrive before order 11's enrichment. The next
+            // reading has the payment, as the failure scene did after the immediate assertion failed.
+            row.put("payment_method", switch (id) {
+                case 10 -> "card";
+                case 11 -> paymentReads.incrementAndGet() == 1 ? null : "transfer";
+                default -> null;
+            });
+            return Optional.of(row);
+        };
+
+        // Run the published snapshot's checks unchanged: no replacement of an assertion with an await.
+        new E2eExecutor(binding, new FilePipelineLoader(workspace), Duration.ofMillis(200), Duration.ofMillis(1))
+                .execute(new Envelope(published.name(), published.setup(), published.pipeline(), published.seed(), snapshot));
+        assertThat(paymentReads.get()).as("order 11's payment must be read after it arrives").isGreaterThanOrEqualTo(2);
+    }
+
     private void execute(String yaml) {
         binding.calls.clear();
         new E2eExecutor(binding, path -> PIPELINE_ID, Duration.ofMillis(200), Duration.ofMillis(1))
