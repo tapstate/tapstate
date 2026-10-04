@@ -123,7 +123,14 @@ class DurableSinkAcknowledgementFenceIT {
                             .containsExactlyInAnyOrderEntriesOf(Map.of(
                                     TABLE, new ChainPosition(snapshotPosition.order(), "w0"),
                                     "items", new ChainPosition(snapshotPosition.order(), "w0")));
-                    assertThat(ackedBy(meta)).as("multiple tables do not publish an unsupported scalar frontier").isNull();
+                    ChainPosition seam = new ChainPosition(snapshotPosition.order(), "w0");
+                    assertThat(ackedBy(meta)).as("the jointly confirmed snapshot retains its common source seam").isEqualTo(seam);
+                    ack.advance(TABLE, position(1));
+                    ack.advance("items", position(2));
+                    assertThat(meta.read(CHAIN).orElseThrow().consumerOffset(PIPELINE).orElseThrow().sinkAckedByTable())
+                            .containsExactlyInAnyOrderEntriesOf(Map.of(TABLE, position(1), "items", position(2)));
+                    assertThat(ackedBy(meta)).as("independent table CDC sequences do not advance the common snapshot seam")
+                            .isEqualTo(seam);
                 } else {
                     assertThat(ackedBy(meta)).isEqualTo(position(2));
                     assertThat(meta.ringDoneThrough(CHAIN, PIPELINE)).containsEntry(TABLE, 2L);
