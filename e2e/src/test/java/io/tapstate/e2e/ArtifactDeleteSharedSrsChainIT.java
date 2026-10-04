@@ -3,6 +3,7 @@ package io.tapstate.e2e;
 import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.testsupport.DockerGate;
 
 import org.junit.jupiter.api.BeforeAll;
@@ -99,7 +100,8 @@ class ArtifactDeleteSharedSrsChainIT {
                     "both pipelines to hold a cursor on one shared mining chain",
                     () -> documents.miningChainIds().size() == 1
                             && documents.consumersOf(onlyChain(documents)).containsAll(
-                                    Set.of(DEPARTING_ID, SURVIVING_ID)),
+                                    Set.of(SrsConsumerId.of(DEPARTING_ID, SOURCE_ID).value(),
+                                            SrsConsumerId.of(SURVIVING_ID, SOURCE_ID).value())),
                     () -> "chains=" + documents.miningChainIds() + " consumers="
                             + documents.miningChainIds().stream().map(documents::consumersOf).toList());
             String chainId = onlyChain(documents);
@@ -135,7 +137,7 @@ class ArtifactDeleteSharedSrsChainIT {
             assertThat(documents.consumersOf(chainId))
                     .as("exactly who holds a cursor now - the departed one gone, the survivor's kept; a "
                             + "detach that cleared both would break the chain for everyone left on it")
-                    .containsExactly(SURVIVING_ID);
+                    .containsExactly(SrsConsumerId.of(SURVIVING_ID, SOURCE_ID).value());
             assertThat(files.count(EndpointAddress.uri(directory.resolve(DEPARTING_TARGET).toString()), TABLE))
                     .as("the rows the departed pipeline had already landed, which are the user's data and "
                             + "not bookkeeping the removal is entitled to reclaim; a removal that tidied "
@@ -146,7 +148,8 @@ class ArtifactDeleteSharedSrsChainIT {
             // Everything above is still satisfied by an implementation that detached nothing but removed the
             // chain document too, and by one that detached correctly. What follows is what separates a
             // working chain from one that is quietly pinned forever.
-            long readSeqAfterRemoval = documents.consumerReadSeq(chainId, SURVIVING_ID, TABLE);
+            long readSeqAfterRemoval = documents.consumerReadSeq(
+                    chainId, SrsConsumerId.of(SURVIVING_ID, SOURCE_ID).value(), TABLE);
             long rowsAfterRemoval = files.count(EndpointAddress.uri(directory.resolve(SURVIVING_TARGET).toString()), TABLE);
             files.cdc(EndpointAddress.uri(sourceDirectory.toString()), TABLE, CdcOp.INSERT, 3);
 
@@ -161,8 +164,10 @@ class ArtifactDeleteSharedSrsChainIT {
             // while still reporting itself RUNNING - the failure that reports nothing.
             Await.until(
                     "the surviving consumer's cursor on the shared chain to keep advancing",
-                    () -> documents.consumerReadSeq(chainId, SURVIVING_ID, TABLE) > readSeqAfterRemoval,
-                    () -> "read seq = " + documents.consumerReadSeq(chainId, SURVIVING_ID, TABLE)
+                    () -> documents.consumerReadSeq(
+                            chainId, SrsConsumerId.of(SURVIVING_ID, SOURCE_ID).value(), TABLE) > readSeqAfterRemoval,
+                    () -> "read seq = " + documents.consumerReadSeq(
+                            chainId, SrsConsumerId.of(SURVIVING_ID, SOURCE_ID).value(), TABLE)
                             + ", was " + readSeqAfterRemoval + ", chain = " + documents.chain(chainId));
         }
     }

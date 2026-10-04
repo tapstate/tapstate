@@ -13,6 +13,7 @@ import io.tapdata.entity.schema.TapTable;
 import io.tapdata.entity.utils.DataMap;
 import io.tapdata.pdk.apis.TapConnector;
 import io.tapstate.core.model.PipelineNode;
+import io.tapstate.spi.capture.SharedNotes;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapdata.pdk.apis.context.TapConnectorContext;
 import io.tapdata.pdk.apis.entity.ConnectorCapabilities;
@@ -20,6 +21,7 @@ import io.tapdata.pdk.apis.functions.ConnectorFunctions;
 import io.tapdata.pdk.apis.spec.TapNodeSpecification;
 
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -106,11 +108,20 @@ final class PdkConnector implements AutoCloseable {
      */
     static PdkConnector open(String connectorId, ConnectorRef ref, Map<String, Object> settings,
                              PipelineNode node, KeyedStateStore stateStore) {
+        return open(connectorId, ref, settings, node, stateStore, null);
+    }
+
+    /** Physical notes are shared without changing the actual owner used for connector log attribution. */
+    static PdkConnector open(String connectorId, ConnectorRef ref, Map<String, Object> settings,
+                             PipelineNode node, KeyedStateStore stateStore, SharedNotes notes) {
         ensureDeploymentIdentity();
         // The contract's shared static log channel prints to standard output until somebody listens, and
         // the first connector opened is the earliest point at which anybody has.
         ConnectorLog.installSharedChannel();
-        String stateNamespace = ConnectorStateNamespace.of(node);
+        String stateNamespace = notes == null
+                ? ConnectorStateNamespace.of(node) : ConnectorStateNamespace.ofShared(notes.sharedBy());
+        List<String> carriedFrom = notes == null ? List.of()
+                : notes.carriedFrom().stream().map(ConnectorStateNamespace::of).toList();
         String pipelineId = node == null ? null : node.pipelineId();
         gateApiLevel(connectorId, ref);
 
@@ -163,7 +174,7 @@ final class PdkConnector implements AutoCloseable {
             // and refuse to run when they differ, and that expectation is nowhere in the signatures.
             context.setStateMap(stateNamespace == null || stateStore == null
                     ? new InMemoryStateMap()
-                    : new DurableStateMap(stateStore, stateNamespace));
+                    : new DurableStateMap(stateStore, stateNamespace, carriedFrom, notes != null));
             // The map the contract calls global is one the whole deployment shares, so it is the store
             // that makes it so: every member reads and writes the same namespace, and a write is visible
             // to the next reader wherever it runs. It is read through rather than loaded once on the way

@@ -3,6 +3,7 @@ package io.tapstate.runtime.srs;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.PayloadBytes;
 import io.tapstate.spi.capture.CaptureListener;
+import io.tapstate.spi.capture.CaptureStartedListener;
 import io.tapstate.spi.capture.SourcePosition;
 
 import java.time.Instant;
@@ -126,7 +127,7 @@ public final class CaptureHealth {
      * counting a row is package-private and has no other way in, so every arrival still goes through here.
      */
     public CaptureListener recording(CaptureListener onBatch) {
-        return new CaptureListener() {
+        CaptureListener recorded = new CaptureListener() {
             @Override
             public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
                 events.forEach(CaptureHealth.this::received);
@@ -136,6 +137,25 @@ public final class CaptureHealth {
             @Override
             public void onError(Throwable error) {
                 fail(error);
+            }
+        };
+        if (!(onBatch instanceof CaptureStartedListener started)) {
+            return recorded;
+        }
+        return new CaptureStartedListener() {
+            @Override
+            public void onStart(SourcePosition position) {
+                started.onStart(position);
+            }
+
+            @Override
+            public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                recorded.onBatch(events, position);
+            }
+
+            @Override
+            public void onError(Throwable error) {
+                recorded.onError(error);
             }
         };
     }

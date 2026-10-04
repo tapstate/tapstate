@@ -13,7 +13,9 @@ import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.ConsumerProgressKind;
 import io.tapstate.spi.store.SchemaVersion;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
 import org.junit.jupiter.api.Test;
@@ -104,6 +106,75 @@ class PipelinePositionServiceTest {
                 .isEqualTo(new PipelinePosition.Point("mysql-bin.000001:4", null, null));
     }
 
+    @Test
+    void reportsEachSourceNodesOwnProgressAndNamesOwningPipelinesOnlyOnce() {
+        onOneChain("orders_sync");
+        chains.put("orders_sync", List.of(
+                new PipelineChains.Chain(CHAIN, "shop_db", List.of("orders", "items")),
+                new PipelineChains.Chain(CHAIN, "shop_copy", List.of("orders"))));
+        String shop = SrsConsumerId.of("orders_sync", "shop_db").value();
+        String copy = SrsConsumerId.of("orders_sync", "shop_copy").value();
+        ChainPosition seam = new ChainPosition(SourceOrder.snapshotRow(3), "snapshot-seam");
+        ChainPosition copyAck = new ChainPosition(new SourceOrder(3, 100), "copy-confirmed");
+        meta.put(new SrsMeta(CHAIN, new ChainPosition(new SourceOrder(3, 9), "captured-batch"),
+                List.of(
+                        new ConsumerOffset("orders_sync", Map.of(),
+                                new ChainPosition(new SourceOrder(3, 999), "legacy-unscoped")),
+                        new ConsumerOffset(copy, Map.of("orders", 110L), copyAck,
+                                List.of("orders"), null, 0, Map.of("orders", copyAck), ConsumerProgressKind.SRS),
+                        new ConsumerOffset(shop, Map.of("orders", 12L, "items", 1L), seam,
+                                List.of("orders", "items"), "snapshot-seam", 3,
+                                Map.of("orders", new ChainPosition(new SourceOrder(3, 11), "orders-confirmed"),
+                                        "items", new ChainPosition(new SourceOrder(3, 0), "later-item")),
+                                ConsumerProgressKind.SRS),
+                        new ConsumerOffset(SrsConsumerId.of("orders_audit", "audit_db").value(), Map.of(), null),
+                        new ConsumerOffset(SrsConsumerId.of("orders_audit", "audit_copy").value(), Map.of(), null),
+                        new ConsumerOffset("orders_audit", Map.of(), null)),
+                List.of(), null, 3, WRITTEN_AT, true));
+
+        List<PipelinePosition.Chain> reported = service.read("orders_sync").chains();
+
+        assertThat(reported).hasSize(2);
+        assertThat(reported.get(0).targetAcked())
+                .isEqualTo(new PipelinePosition.Point("snapshot-seam", 3L, SourceOrder.SNAPSHOT_SEQ));
+        assertThat(reported.get(1).targetAcked())
+                .isEqualTo(new PipelinePosition.Point("copy-confirmed", 3L, 100L));
+        assertThat(reported).allSatisfy(chain -> {
+            assertThat(chain.resumeFrom()).isEqualTo(new PipelinePosition.Point("captured-batch", 3L, 9L));
+            assertThat(chain.sharedWith()).containsExactly("orders_audit");
+        });
+    }
+
+    @Test
+    void doesNotRankIndependentTableConfirmationsIntoOneReportedPosition() {
+        onOneChain("orders_sync");
+        String consumer = SrsConsumerId.of("orders_sync", "shop_db").value();
+        meta.put(new SrsMeta(CHAIN, null,
+                List.of(new ConsumerOffset(consumer, Map.of("orders", 10L, "items", 0L), null,
+                        List.of(), null, 0,
+                        Map.of("orders", new ChainPosition(new SourceOrder(2, 9), "before-pending-high"),
+                                "items", new ChainPosition(new SourceOrder(2, 0), "after-mail")),
+                        ConsumerProgressKind.SRS)),
+                List.of(), null));
+
+        assertThat(service.read("orders_sync").chains().getFirst().targetAcked())
+                .as("different table counters cannot prove one source recovery position")
+                .isNull();
+    }
+
+    @Test
+    void legacyPipelineProgressDoesNotStandForEitherOfTwoSourceNodes() {
+        chains.put("orders_sync", List.of(
+                new PipelineChains.Chain(CHAIN, "shop_db", List.of("orders")),
+                new PipelineChains.Chain(CHAIN, "shop_copy", List.of("items"))));
+        meta.put(new SrsMeta(CHAIN, null,
+                List.of(new ConsumerOffset("orders_sync", Map.of(),
+                        new ChainPosition(new SourceOrder(1, 3), "unknown-source"))), List.of(), null));
+
+        assertThat(service.read("orders_sync").chains())
+                .allSatisfy(chain -> assertThat(chain.targetAcked()).isNull());
+    }
+
     // ------------------------------------------------------------ writing back
 
     @Test
@@ -161,6 +232,40 @@ class PipelinePositionServiceTest {
     }
 
     @Test
+    void explicitWriteBackClearsTableConfirmationsWithoutChangingTheirCoordinateSystem() {
+        onOneChain("orders_sync");
+        atRest("orders_sync");
+        atRest("orders_audit");
+        String mine = SrsConsumerId.of("orders_sync", "shop_db").value();
+        String other = SrsConsumerId.of("orders_audit", "audit_db").value();
+        ChainPosition confirmed = new ChainPosition(new SourceOrder(3, 7), "confirmed-orders");
+        meta.put(new SrsMeta(CHAIN, new ChainPosition(new SourceOrder(3, 12), "captured-batch"),
+                List.of(
+                        new ConsumerOffset(mine, Map.of("orders", 9L), null, List.of("orders"),
+                                "snapshot-seam", 2, Map.of("orders", confirmed), ConsumerProgressKind.SRS),
+                        new ConsumerOffset(other, Map.of("orders", 8L), confirmed, List.of(),
+                                null, 0, Map.of("orders", confirmed), ConsumerProgressKind.DIRECT_SOURCE)),
+                List.of(), null, 3, WRITTEN_AT, true));
+
+        service.writeBack("alice", "orders_sync", new PipelinePosition("orders_sync", List.of(
+                PipelinePosition.Chain.resumingAt(CHAIN, "earlier-position"))));
+
+        List<ConsumerOffset> after = meta.read(CHAIN).orElseThrow().consumerOffsets();
+        assertThat(after).allSatisfy(offset -> {
+            assertThat(offset.sinkAcked()).isNull();
+            assertThat(offset.sinkAckedByTable()).isEmpty();
+        });
+        ConsumerOffset afterMine = after.stream().filter(offset -> offset.pipelineId().equals(mine))
+                .findFirst().orElseThrow();
+        assertThat(afterMine.progressKind()).isEqualTo(ConsumerProgressKind.SRS);
+        assertThat(afterMine.perTableSeq()).containsExactly(Map.entry("orders", 9L));
+        assertThat(afterMine.cdcStartPosition()).isEqualTo("snapshot-seam");
+        assertThat(afterMine.snapshotEpoch()).isEqualTo(2);
+        assertThat(after.stream().filter(offset -> offset.pipelineId().equals(other)).findFirst().orElseThrow()
+                .progressKind()).isEqualTo(ConsumerProgressKind.DIRECT_SOURCE);
+    }
+
+    @Test
     void refusesWhileThePipelineItselfIsStillUp() {
         onOneChain("orders_sync");
         running("orders_sync");
@@ -191,6 +296,22 @@ class PipelinePositionServiceTest {
                 List.of(), null, 3L, WRITTEN_AT));
 
         TapstateException refused = refuse("orders_sync", CHAIN, "mysql-bin.000001:4");
+
+        assertThat(refused.code()).isEqualTo(PositionError.WRITE_BACK_WHILE_LIVE);
+        assertThat(refused.args()).containsEntry("pipelines", List.of("orders_audit"));
+        assertThat(meta.rewinds).isEmpty();
+    }
+
+    @Test
+    void writeBackGuardsTheLiveOwnerOfAStoredSourceScopedConsumer() {
+        onOneChain("orders_sync");
+        atRest("orders_sync");
+        running("orders_audit");
+        meta.put(new SrsMeta(CHAIN, new ChainPosition(new SourceOrder(3, 9), "captured-batch"),
+                List.of(new ConsumerOffset(SrsConsumerId.of("orders_audit", "other_source").value(),
+                        Map.of(), null)), List.of(), null, 3, WRITTEN_AT));
+
+        TapstateException refused = refuse("orders_sync", CHAIN, "earlier-position");
 
         assertThat(refused.code()).isEqualTo(PositionError.WRITE_BACK_WHILE_LIVE);
         assertThat(refused.args()).containsEntry("pipelines", List.of("orders_audit"));
@@ -406,7 +527,8 @@ class PipelinePositionServiceTest {
                 next.add(existing.pipelineId().equals(offset.pipelineId()) ? offset : existing);
             }
             records.put(miningChainId, new SrsMeta(miningChainId, held.sourceRead(), next,
-                    held.schemaHistory(), held.retention(), held.epoch(), held.sourceReadAt()));
+                    held.schemaHistory(), held.retention(), held.epoch(), held.sourceReadAt(),
+                    held.sourceReadDurable()));
         }
 
         @Override

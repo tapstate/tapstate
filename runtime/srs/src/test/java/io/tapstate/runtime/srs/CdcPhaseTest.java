@@ -40,6 +40,7 @@ import org.junit.jupiter.api.Test;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -48,6 +49,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
@@ -104,6 +106,31 @@ class CdcPhaseTest {
 
     private static CaptureConfig config() {
         return new CaptureConfig("mysql", Map.of(), List.of("orders"));
+    }
+
+    @Test
+    void aLateDurableCallbackRetainsItsOwnSelectionAfterTheRoutesAreWidened() {
+        RecordingMeta meta = new RecordingMeta();
+        SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.chain.late-selection")));
+        CdcChain chain = new CdcChain(gate, meta, "chain", RING_GENERATION, 0L);
+        Map<String, CdcPhase.TableRoute> routes = new LinkedHashMap<>();
+        routes.put("orders", new CdcPhase.TableRoute(chain, List::of, ignored -> { }));
+        AtomicReference<CaptureListener> callback = new AtomicReference<>();
+        FakeCdcPort source = new FakeCdcPort(List.of()) {
+            @Override
+            public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+                callback.set(listener);
+                return () -> { };
+            }
+        };
+        CdcPhase.runDurable(source, config(), CaptureStart.present(), routes, new CaptureHealth(), new AtomicLong());
+
+        routes.put("customers", new CdcPhase.TableRoute(chain, List::of, ignored -> { }));
+        callback.get().onBatch(List.of(Envelope.insert(1, "orders", Map.of("id", 1), Map.of())),
+                Optional.of(new SourcePosition("late-narrow-batch")));
+
+        assertThat(meta.captureSelections).containsExactly(List.of("orders"));
+        assertThat(meta.advances).containsExactly("late-narrow-batch");
     }
 
     /**
@@ -865,7 +892,7 @@ class CdcPhaseTest {
      * A cdc port that drives a fixed list of change events into the listener when the stream starts,
      * stating a position for each one the way a source does.
      */
-    private static final class FakeCdcPort implements CapturePort {
+    private static class FakeCdcPort implements CapturePort {
         private final List<Envelope> events;
         private final Throwable error;
         private final Supplier<SourcePosition> positions = sourceStatedPositions();
@@ -1064,6 +1091,14 @@ class CdcPhaseTest {
         }
 
         final List<String> advances = new ArrayList<>();
+        final List<List<String>> captureSelections = new ArrayList<>();
+
+        @Override
+        public void advanceCaptureCheckpoint(
+                String miningChainId, ChainPosition position, List<String> servedTables) {
+            captureSelections.add(servedTables);
+            advances.add(position.token());
+        }
 
         @Override
         public void rewindSourceReadOffset(String miningChainId, String token) {
