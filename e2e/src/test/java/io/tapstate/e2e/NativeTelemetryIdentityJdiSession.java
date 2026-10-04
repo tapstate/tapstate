@@ -25,7 +25,7 @@ import java.util.zip.ZipInputStream;
 /** Passive, artifact-pinned observation of one native pipeline; fault actions belong to its caller. */
 final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     interface OwnedLauncher { RealProcessServer launch(Path jar, List<String> jvmArguments) throws Exception; }
-    enum Target { JOB, ADMISSION, REPLACEMENT_ADMISSION, SUBMIT, LOG, OFFER, VISIBLE, PRODUCE, PREPARE, FOLDER_FORGET, EXPORT_FORGET, EXPORT_INCARNATION,
+    enum Target { JOB, ADMISSION, REPLACEMENT_ADMISSION, RAW_CONTINUATION, SUBMIT, LOG, OFFER, VISIBLE, PRODUCE, PREPARE, FOLDER_FORGET, EXPORT_FORGET, EXPORT_INCARNATION,
         PUBLISHER_SWEEP, EXPORT_SWEEP, FOLDER_SWEEP }
     record Binding(String type, String method, String descriptor, String origin,
             String codeSha256, long loaderId, List<Integer> returns) { }
@@ -56,7 +56,8 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             Map<Target, Binding> bindings, Map<Target, Counts> counts, List<Map<String, Object>> records,
             List<AuthorityReceipt> authorityReceipts, Set<String> unverified, Set<String> decodedLayouts,
             String vmVersion, long events, long handlingNanos, int openCalls, boolean queueDrained,
-            boolean ownedVmDeath, boolean ownedVmDisconnected, boolean replacementObservationEnabled) {
+            boolean ownedVmDeath, boolean ownedVmDisconnected, boolean replacementObservationEnabled,
+            boolean rawContinuationObservationEnabled) {
         Boundary {
             bindings = Map.copyOf(bindings); counts = Map.copyOf(counts); records = List.copyOf(records);
             authorityReceipts = List.copyOf(authorityReceipts); unverified = Set.copyOf(unverified);
@@ -68,6 +69,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         }
         boolean decodedAndAuthorityBound() {
             return unverified.isEmpty() && bindings.size() == Target.values().length - (replacementObservationEnabled ? 0 : 1)
+                    - (rawContinuationObservationEnabled ? 0 : 1)
                     && invocationDrainComplete() && !authorityReceipts.isEmpty();
         }
         Map<String, Object> evidence() {
@@ -95,6 +97,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             out.put("submissionObservationMode", replacementObservationEnabled
                     ? "ORDINARY_AND_REPLACEMENT_ADMISSION" : "ORDINARY_ADMISSION_ONLY");
             out.put("replacementObservationEnabled", replacementObservationEnabled);
+            out.put("rawContinuationObservationEnabled", rawContinuationObservationEnabled);
             out.put("passiveObserver", true); out.put("performanceAcceptanceEligible", false);
             return Map.copyOf(out);
         }
@@ -153,6 +156,10 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                     "(Ljava/lang/String;)" + EXECUTION, 1, 0),
             new Spec(Target.REPLACEMENT_ADMISSION, "io.tapstate.app.PipelineActuationOwnership", "adoptAdmission",
                     "(Lio/tapstate/spi/store/SuccessorAdmission;)" + EXECUTION, 1, -1),
+            new Spec(Target.RAW_CONTINUATION, "io.tapstate.app.ObservationScopeRegistry", "prepareContinuationPublication",
+                    "(Lio/tapstate/runtime/scheduler/ObservationPublisher$Prepared;"
+                            + "Lio/tapstate/app/ObservationScopeRegistry$ActualTarget;"
+                            + "Ljava/util/function/BooleanSupplier;)Ljava/util/Optional;", 3, -1),
             new Spec(Target.SUBMIT, "io.tapstate.app.EngineLifecycleActuator$2", "submit", "()V", 0, -1),
             new Spec(Target.LOG, "io.tapstate.core.logging.RingBufferLogSink", "append",
                     "(Ljava/lang/String;Lio/tapstate/core/logging/LogSink$Scope;Lio/tapstate/core/logging/LogLine;)V", 3, 0),
@@ -181,7 +188,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
 
     private final Path jar;
     private final String sha, pipeline;
-    private final boolean replacementObservationEnabled;
+    private final boolean replacementObservationEnabled, rawContinuationObservationEnabled;
     private final RealProcessServer server;
     private final VirtualMachine vm;
     private final String vmVersion;
@@ -215,12 +222,15 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     private UnqualifiedEntry lastUnqualifiedEntry;
 
     private NativeTelemetryIdentityJdiSession(Path jar, String sha, String pipeline,
-            Map<String, Image> images, RealProcessServer server, VirtualMachine vm, boolean replacementObservationEnabled) throws Exception {
+            Map<String, Image> images, RealProcessServer server, VirtualMachine vm, boolean replacementObservationEnabled,
+            boolean rawContinuationObservationEnabled) throws Exception {
         this.jar = jar; this.sha = sha; this.pipeline = pipeline; this.images = images;
         this.server = server; this.vm = vm; this.vmVersion = vm.version();
         this.replacementObservationEnabled = replacementObservationEnabled;
+        this.rawContinuationObservationEnabled = rawContinuationObservationEnabled;
         for (Spec spec : SPECS) {
-            if (spec.target() == Target.REPLACEMENT_ADMISSION && !replacementObservationEnabled) { continue; }
+            if (spec.target() == Target.REPLACEMENT_ADMISSION && !replacementObservationEnabled
+                    || spec.target() == Target.RAW_CONTINUATION && !rawContinuationObservationEnabled) { continue; }
             totals.put(spec.target(), new Totals());
             Image image = images.get(spec.type());
             if (image == null || !image.methods().containsKey(spec.method() + spec.descriptor())) {
@@ -246,17 +256,23 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     /** A cluster caller can supply its existing routable owned launch without changing debug ownership. */
     static NativeTelemetryIdentityJdiSession start(Path input, String expectedSha256, String pipelineId,
             OwnedLauncher launcher) throws Exception {
-        return start(input, expectedSha256, pipelineId, launcher, false);
+        return start(input, expectedSha256, pipelineId, launcher, false, false);
     }
 
     /** A single owned debugger also observes the actual atomic replacement admission and native binding. */
     static NativeTelemetryIdentityJdiSession startWithReplacementObservation(Path input, String expectedSha256,
             String pipelineId, OwnedLauncher launcher) throws Exception {
-        return start(input, expectedSha256, pipelineId, launcher, true);
+        return start(input, expectedSha256, pipelineId, launcher, true, false);
+    }
+
+    /** The same owned debugger can retain raw continuation entries and their actual publication returns. */
+    static NativeTelemetryIdentityJdiSession startWithContinuationObservation(Path input, String expectedSha256,
+            String pipelineId, OwnedLauncher launcher) throws Exception {
+        return start(input, expectedSha256, pipelineId, launcher, true, true);
     }
 
     private static NativeTelemetryIdentityJdiSession start(Path input, String expectedSha256, String pipelineId,
-            OwnedLauncher launcher, boolean replacementObservationEnabled) throws Exception {
+            OwnedLauncher launcher, boolean replacementObservationEnabled, boolean rawContinuationObservationEnabled) throws Exception {
         Objects.requireNonNull(expectedSha256); Objects.requireNonNull(pipelineId);
         Objects.requireNonNull(launcher);
         if (!expectedSha256.matches("[0-9a-f]{64}") || pipelineId.isBlank() || pipelineId.length() > 256) {
@@ -288,7 +304,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             if (!vm.canGetBytecodes() || !vm.canGetMethodReturnValues()) { throw invalid("required mirror capability missing"); }
             connector.stopListening(options); listening = false;
             session = new NativeTelemetryIdentityJdiSession(jar, expectedSha256, pipelineId, images, server, vm,
-                    replacementObservationEnabled);
+                    replacementObservationEnabled, rawContinuationObservationEnabled);
             server.awaitHealthy(); session.check();
             return session;
         } catch (Throwable problem) {
@@ -515,6 +531,8 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                                 || mirror.field(receiver, "val$accepted", "Lio/tapstate/spi/store/SuccessorAdmission;") == null)
                 : site.target() == Target.REPLACEMENT_ADMISSION
                         ? pipeline.equals(replacementPipeline(arguments.getFirst(), mirror))
+                : site.target() == Target.RAW_CONTINUATION
+                        ? pipeline.equals(rawPipeline(arguments.getFirst(), mirror))
                 : site.target() == Target.PUBLISHER_SWEEP ? publishers.contains(receiver.uniqueID())
                 : site.target() == Target.FOLDER_SWEEP ? publisherFolders.contains(receiver.uniqueID())
                 : spec.pipeline() < 0 ? producers.contains(receiver.uniqueID())
@@ -655,6 +673,19 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             out.put("requestScope", scope); out.put("fence", admission.fence());
             out.put("members", admission.members()); out.put("claim", admission.claim());
             out.put("admissionKind", admission.replacement().isPresent() ? "REPLACEMENT" : "ORDINARY");
+        } else if (spec.target() == Target.RAW_CONTINUATION) {
+            ObjectReference prepared = requiredObject(arguments.getFirst(),
+                    "io.tapstate.runtime.scheduler.ObservationPublisher$Prepared", mirror);
+            ObjectReference observation = requiredObject(mirror.field(prepared, "observation",
+                    "Lio/tapstate/core/lifecycle/Observation;"), "io.tapstate.core.lifecycle.Observation", mirror);
+            ObjectReference target = requiredObject(arguments.get(1), "io.tapstate.app.ObservationScopeRegistry$ActualTarget", mirror);
+            out.put("preparedObject", prepared.uniqueID()); out.put("rawObservationObject", observation.uniqueID());
+            out.put("actualTargetObject", target.uniqueID());
+            out.put("scope", mirror.scope(mirror.field(target, "scope", SCOPE)));
+            out.put("job", mirror.job(mirror.field(target, "job", "Lio/tapstate/spi/store/StopReservation$JobIdentity;")));
+            out.put("observedAt", mirror.scalar(mirror.field(observation, "observedAt", "Ljava/time/Instant;")));
+            out.put("state", mirror.enumName(mirror.field(observation, "state", "Lio/tapstate/core/lifecycle/PipelineState;")));
+            out.put("facts", facts(mirror.field(observation, "facts", "Ljava/util/List;"), mirror));
         } else if (spec.target() == Target.OFFER) {
             producers.add(receiver.uniqueID());
             out.put("scope", mirror.scope(arguments.get(1))); out.put("state", mirror.enumName(arguments.get(2)));
@@ -939,6 +970,32 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                 out.put("account", account(call.receiver, mirror));
                 out.put("preparedPresent", mirror.field(mirror.object(returned), "value", "Ljava/lang/Object;") != null);
             }
+            case RAW_CONTINUATION -> {
+                if (call.entry.containsKey("decoderStatus")) {
+                    throw new NativeTelemetryMirror.Unavailable("RAW_CONTINUATION_ENTRY_UNVERIFIED");
+                }
+                ObjectReference optional = requiredObject(returned, "java.util.Optional", mirror);
+                Value value = mirror.field(optional, "value", "Ljava/lang/Object;");
+                out.put("publicationPresent", value != null);
+                if (value != null) {
+                    ObjectReference publication = requiredObject(value,
+                            "io.tapstate.app.ObservationScopeRegistry$ContinuationPublication", mirror);
+                    ObjectReference projected = requiredObject(mirror.field(publication, "projected",
+                            "Lio/tapstate/runtime/scheduler/ObservationPublisher$Prepared;"),
+                            "io.tapstate.runtime.scheduler.ObservationPublisher$Prepared", mirror);
+                    ObjectReference observation = requiredObject(mirror.field(projected, "observation",
+                            "Lio/tapstate/core/lifecycle/Observation;"), "io.tapstate.core.lifecycle.Observation", mirror);
+                    Map<String, Object> scope = mirror.scope(mirror.field(publication, "scope", SCOPE));
+                    Object at = mirror.scalar(mirror.field(observation, "observedAt", "Ljava/time/Instant;"));
+                    if (!pipeline.equals(mirror.text(mirror.field(observation, "pipelineId", "Ljava/lang/String;")))
+                            || !scope.equals(call.entry.get("scope")) || !Objects.equals(at, call.entry.get("observedAt"))) {
+                        throw new NativeTelemetryMirror.Unavailable("RAW_CONTINUATION_PUBLICATION_MISMATCH");
+                    }
+                    out.put("publicationObject", publication.uniqueID()); out.put("projectedPreparedObject", projected.uniqueID());
+                    out.put("projectedObservationObject", observation.uniqueID()); out.put("publicationScope", scope);
+                    out.put("publicationObservedAt", at);
+                }
+            }
             case FOLDER_FORGET -> out.put("after", folderNames(call.receiver, mirror));
             case EXPORT_FORGET, EXPORT_INCARNATION -> {
                 out.put("afterNamed", exporterNames(call.receiver, mirror));
@@ -971,6 +1028,13 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             throw new NativeTelemetryMirror.Unavailable("OBJECT_TYPE:" + type);
         }
         return object;
+    }
+
+    private static String rawPipeline(Value value, NativeTelemetryMirror mirror) throws Exception {
+        ObjectReference prepared = requiredObject(value, "io.tapstate.runtime.scheduler.ObservationPublisher$Prepared", mirror);
+        ObjectReference observation = requiredObject(mirror.field(prepared, "observation",
+                "Lio/tapstate/core/lifecycle/Observation;"), "io.tapstate.core.lifecycle.Observation", mirror);
+        return mirror.text(mirror.field(observation, "pipelineId", "Ljava/lang/String;"));
     }
 
     private static String replacementPipeline(Value value, NativeTelemetryMirror mirror) throws Exception {
@@ -1499,7 +1563,8 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         Map<Target, Counts> counts = new EnumMap<>(Target.class);
         Set<String> missing = new LinkedHashSet<>(unverified);
         for (Target target : Target.values()) {
-            if (target == Target.REPLACEMENT_ADMISSION && !replacementObservationEnabled) { continue; }
+            if (target == Target.REPLACEMENT_ADMISSION && !replacementObservationEnabled
+                    || target == Target.RAW_CONTINUATION && !rawContinuationObservationEnabled) { continue; }
             if (!bindings.containsKey(target)) { missing.add("LIVE_BINDING_UNAVAILABLE:" + target); }
             else if (!disconnected) {
                 Method method = methods.get(target);
@@ -1520,7 +1585,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         return new Boundary(phase, ++sequence, sha, pipeline, bindings, counts, records, authorities,
                 missing, layouts, vmVersion, events, handlingNanos,
                 threads.values().stream().mapToInt(state -> state.calls.size()).sum(), drained, vmDeath, disconnected,
-                replacementObservationEnabled);
+                replacementObservationEnabled, rawContinuationObservationEnabled);
     }
     private void qualifyScopes(Object value, Set<String> missing, int depth) {
         if (depth > 16) { throw invalid("scope qualification depth exceeded"); }
@@ -1617,7 +1682,10 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                 "io.tapstate.spi.store.StopReservation$Source", "io.tapstate.spi.store.StopReservation$Successor",
                 "io.tapstate.spi.store.StopReservation$Phase", "io.tapstate.spi.store.StopReservation$CounterPolicy",
                 "io.tapstate.spi.store.StopAuthority", "io.tapstate.spi.store.WorkloadClaimFence",
-                "io.tapstate.core.lifecycle.DesiredState",
+                "io.tapstate.core.lifecycle.DesiredState", "io.tapstate.core.lifecycle.Observation",
+                "io.tapstate.runtime.scheduler.ObservationPublisher$Prepared",
+                "io.tapstate.app.ObservationScopeRegistry$ActualTarget",
+                "io.tapstate.app.ObservationScopeRegistry$ContinuationPublication",
                 "io.tapstate.runtime.engine.Engine$ExecutionJob", "io.tapstate.spi.store.StopReservation$JobIdentity",
                 "io.tapstate.spi.store.ObservationStore$Scope", "io.tapstate.core.logging.LogSink$Scope",
                 "io.tapstate.core.logging.LogLine", "io.tapstate.spi.metrics.MetricsExport$ScopeToken",

@@ -32,6 +32,7 @@ final class NativeTelemetryMirror {
     private static final int MAX_ARRAY = 16384;
     private static final int MAX_TEXT = 4096;
     private static final int MAX_READS = 8192;
+    private static final int MAP_READ_ATTEMPTS = 3;
     private static final int MAX_TEXT_TOTAL = 65536;
     private final Validator validator;
     private final Set<String> layouts;
@@ -228,49 +229,68 @@ final class NativeTelemetryMirror {
             }
             case "java.util.TreeMap" -> { return treeMap(object); }
             case "java.util.HashMap", "java.util.LinkedHashMap", "java.util.concurrent.ConcurrentHashMap" -> {
-                boolean concurrent = type.endsWith("ConcurrentHashMap");
-                long size = concurrent ? concurrentSize(object) : integral(field(object, "size", "I"));
-                long version = concurrent ? size : integral(field(object, "modCount", "I"));
-                String descriptor = concurrent ? "[Ljava/util/concurrent/ConcurrentHashMap$Node;"
-                        : "[Ljava/util/HashMap$Node;";
-                Value tableValue = field(object, "table", descriptor);
-                long tableId = tableValue == null ? 0 : object(tableValue).uniqueID();
-                Set<Long> visited = new HashSet<>();
-                if (tableValue != null) {
-                    for (Value bucket : array(tableValue).getValues()) {
-                        if (bucket == null) { continue; }
-                        ObjectReference node = object(bucket);
-                        if (concurrent && node.referenceType().name().equals("java.util.concurrent.ConcurrentHashMap$TreeBin")) {
-                            node = nullableObject(field(node, "first", "Ljava/util/concurrent/ConcurrentHashMap$TreeNode;"));
-                        }
-                        while (node != null) {
-                            if (!visited.add(node.uniqueID()) || result.size() >= MAX_ITEMS) {
-                                throw unavailable("MAP_NODE_BUDGET_OR_CYCLE");
-                            }
-                            String nodeType = node.referenceType().name();
-                            if (!Set.of("java.util.HashMap$Node", "java.util.HashMap$TreeNode",
-                                    "java.util.LinkedHashMap$Entry", "java.util.concurrent.ConcurrentHashMap$Node",
-                                    "java.util.concurrent.ConcurrentHashMap$TreeNode").contains(nodeType)) {
-                                throw unavailable("MAP_NODE_LAYOUT:" + nodeType);
-                            }
-                            result.add(new Pair(field(node, "key", "Ljava/lang/Object;"),
-                                    field(node, concurrent ? "val" : "value", "Ljava/lang/Object;")));
-                            node = nullableObject(field(node, "next", concurrent
-                                    ? "Ljava/util/concurrent/ConcurrentHashMap$Node;" : "Ljava/util/HashMap$Node;"));
-                        }
-                    }
-                }
-                Value afterTable = field(object, "table", descriptor);
-                long afterId = afterTable == null ? 0 : object(afterTable).uniqueID();
-                long afterSize = concurrent ? concurrentSize(object) : integral(field(object, "size", "I"));
-                long afterVersion = concurrent ? afterSize : integral(field(object, "modCount", "I"));
-                if (size != result.size() || afterSize != size || version != afterVersion || tableId != afterId) {
-                    throw unavailable("INCOHERENT_MAP");
-                }
+                return coherentHashMap(object, type.endsWith("ConcurrentHashMap"));
             }
             default -> throw unavailable("MAP_LAYOUT:" + type);
         }
         if (result.size() > MAX_ITEMS) { throw unavailable("MAP_ITEM_BUDGET"); }
+        return List.copyOf(result);
+    }
+
+    private List<Pair> coherentHashMap(ObjectReference object, boolean concurrent) throws Exception {
+        for (int attempt = 1; attempt <= MAP_READ_ATTEMPTS; attempt++) {
+            try { return hashMapOnce(object, concurrent); }
+            catch (Unavailable changed) {
+                // Other target threads can change a map during this event-thread suspension. Retry
+                // only a complete incoherent read; this mirror's read/text/layout budgets remain spent.
+                if (!"INCOHERENT_MAP".equals(changed.getMessage()) || attempt == MAP_READ_ATTEMPTS) { throw changed; }
+            }
+        }
+        throw new AssertionError("a bounded map read ended without a result or failure");
+    }
+
+    private List<Pair> hashMapOnce(ObjectReference object, boolean concurrent) throws Exception {
+        List<Pair> result = new ArrayList<>();
+        long size = concurrent ? concurrentSize(object) : integral(field(object, "size", "I"));
+        if (size < 0 || size > MAX_ITEMS) { throw unavailable("MAP_SIZE_BUDGET"); }
+        long version = concurrent ? size : integral(field(object, "modCount", "I"));
+        String descriptor = concurrent ? "[Ljava/util/concurrent/ConcurrentHashMap$Node;"
+                : "[Ljava/util/HashMap$Node;";
+        Value tableValue = field(object, "table", descriptor);
+        long tableId = tableValue == null ? 0 : object(tableValue).uniqueID();
+        Set<Long> visited = new HashSet<>();
+        if (tableValue != null) {
+            for (Value bucket : array(tableValue).getValues()) {
+                if (bucket == null) { continue; }
+                ObjectReference node = object(bucket);
+                if (concurrent && node.referenceType().name().equals("java.util.concurrent.ConcurrentHashMap$TreeBin")) {
+                    node = nullableObject(field(node, "first", "Ljava/util/concurrent/ConcurrentHashMap$TreeNode;"));
+                }
+                while (node != null) {
+                    if (!visited.add(node.uniqueID()) || result.size() >= MAX_ITEMS) {
+                        throw unavailable("MAP_NODE_BUDGET_OR_CYCLE");
+                    }
+                    String nodeType = node.referenceType().name();
+                    if (!Set.of("java.util.HashMap$Node", "java.util.HashMap$TreeNode",
+                            "java.util.LinkedHashMap$Entry", "java.util.concurrent.ConcurrentHashMap$Node",
+                            "java.util.concurrent.ConcurrentHashMap$TreeNode").contains(nodeType)) {
+                        throw unavailable("MAP_NODE_LAYOUT:" + nodeType);
+                    }
+                    result.add(new Pair(field(node, "key", "Ljava/lang/Object;"),
+                            field(node, concurrent ? "val" : "value", "Ljava/lang/Object;")));
+                    node = nullableObject(field(node, "next", concurrent
+                            ? "Ljava/util/concurrent/ConcurrentHashMap$Node;" : "Ljava/util/HashMap$Node;"));
+                }
+            }
+        }
+        Value afterTable = field(object, "table", descriptor);
+        long afterId = afterTable == null ? 0 : object(afterTable).uniqueID();
+        long afterSize = concurrent ? concurrentSize(object) : integral(field(object, "size", "I"));
+        if (afterSize < 0 || afterSize > MAX_ITEMS) { throw unavailable("MAP_SIZE_BUDGET"); }
+        long afterVersion = concurrent ? afterSize : integral(field(object, "modCount", "I"));
+        if (size != result.size() || afterSize != size || version != afterVersion || tableId != afterId) {
+            throw unavailable("INCOHERENT_MAP");
+        }
         return List.copyOf(result);
     }
 
