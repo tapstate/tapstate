@@ -141,6 +141,7 @@ connector.read-abandoned
 connector.read-failed
 connector.read-timeout
 connector.registration-conflict
+connector.release-failed
 connector.spec-invalid
 connector.spec-not-found
 connector.state-unreadable

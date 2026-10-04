@@ -90,16 +90,19 @@ Tapstate by that much, and the source keeps that much more WAL.
 ## Clearing a pipeline's state drops the slot
 
 Clearing a pipeline's state - `stop <pipeline>` without `--keep-state`, or `restart <pipeline> --rerun` -
-drops the slot **when no other pipeline reads the same source**. Clearing one of several pipelines that
-share the source leaves the slot to the others, and a stop that keeps the state keeps it.
+drops the slot it read through **once no other pipeline reads through that slot**. Clearing one of several
+pipelines that share the change log leaves the shared slot to the others; clearing a pipeline that reads its
+source directly drops its own slot, whatever else reads the source. Nothing else drops a slot: a stop that
+keeps the state, pausing, resuming and a plain `restart` all leave it where it is, so the pipeline carries on
+from it.
 
 - The connector drops the slot only while `autoClearSlot` is on, which it is by default. With it off, the
   slot stays after clearing and is yours to drop.
 - A slot you named yourself with `customSlotName` is dropped the same way when `autoClearSlot` is on.
   Turn `autoClearSlot` off to keep it.
-- If the source cannot be reached at that moment, the clearing still completes, and the server logs a
-  warning, `connector.release-failed`, naming the source. Drop the slot on the source once nothing is
-  using it:
+- If the source cannot be reached at that moment, or does not answer within a minute, the clearing still
+  completes, and the server logs a warning, `connector.release-failed`, naming the source and the slot.
+  Drop the slot on the source once nothing is using it:
 
   ```sql
   SELECT pg_drop_replication_slot('<slot_name>');

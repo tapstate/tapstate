@@ -1,6 +1,7 @@
 package io.tapstate.runtime.srs;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.core.event.ChainPosition;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
@@ -17,6 +18,7 @@ import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
+import io.tapstate.spi.capture.SharedNotes;
 import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.CaptureStart;
@@ -1510,6 +1512,10 @@ class CaptureRunUnitTest {
         boolean cdcClosed;
         /** Every position the run told this source it may release up to, in order. */
         final List<String> acknowledged = new java.util.concurrent.CopyOnWriteArrayList<>();
+        /** Every config the run asked this source to let go of what it set up through, in order. */
+        final List<CaptureConfig> released = new java.util.concurrent.CopyOnWriteArrayList<>();
+        /** What this source answers a release with. */
+        Optional<TapstateException> refusal = Optional.empty();
 
         FakeSource(List<Envelope> snapshotRows, List<Envelope> changes) {
             this(snapshotRows, changes, "seam-0");
@@ -1576,6 +1582,12 @@ class CaptureRunUnitTest {
         @Override
         public DiscoveredSchema discoverSchema(CaptureConfig config) {
             throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public Optional<TapstateException> release(CaptureConfig config) {
+            released.add(config);
+            return refusal;
         }
     }
 
@@ -2309,5 +2321,67 @@ class CaptureRunUnitTest {
             assertThat(port.acknowledged).containsExactly("src-11");
         }
         assertThat(port.cdcClosed).as("closing the run closes the tail it followed").isTrue();
+    }
+
+    /**
+     * A capture whose rings write through reads through the physical capture's notes, so letting go of what
+     * its connector set up is asked of those -- carried over from the node of the pipeline asking, all a
+     * cleared chain has left to carry from -- and not of the node's own notes, which such a capture never
+     * wrote to.
+     */
+    @Test
+    void aSharedCaptureIsReleasedThroughThePhysicalCapturesNotes() {
+        HazelcastInstance member = emptyDurableMember();
+        try {
+            InMemoryMeta meta = new InMemoryMeta();
+            CaptureRunSpec owner = new CaptureRunSpec(config(), ReadMode.CDC_ONLY, "chain-released-shared",
+                    true, "root_source", "root_pipeline", StartFrom.latest(), null, 0L)
+                    .withConsumerId(SrsConsumerId.of("root_pipeline", "root_source").value());
+            FakeSource port = new FakeSource(List.of(), List.of());
+
+            assertThat(new CaptureRunUnit(port, new SrsCoordinator(meta), meta, member).release(owner)).isEmpty();
+
+            PipelineNode node = new PipelineNode("root_pipeline", "root_source");
+            assertThat(port.released).singleElement().satisfies(released -> {
+                assertThat(released.sharedNotes())
+                        .isEqualTo(new SharedNotes(owner.miningChainId().value(), List.of(node)));
+                assertThat(released.node()).isEqualTo(node);
+            });
+        } finally {
+            member.shutdown();
+        }
+    }
+
+    /**
+     * A direct channel -- and a chain whose rings do not write through, which only a pipeline reading as its
+     * own consumer runs -- reads through its node's own notes, and letting go is asked of those; what the
+     * source refuses comes back as it was answered.
+     */
+    @Test
+    void aTailThroughTheNodesOwnNotesIsReleasedThroughThem() {
+        FakeSource port = new FakeSource(List.of(), List.of());
+        TapstateException refused = new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "no"), null);
+        port.refusal = Optional.of(refused);
+
+        assertThat(runUnit(port, new InMemoryMeta()).release(spec(ReadMode.CDC_ONLY, false, "chain-released-direct")))
+                .containsSame(refused);
+        assertThat(runUnit(port, new InMemoryMeta()).release(spec(ReadMode.CDC_ONLY, true, "chain-released-own")))
+                .containsSame(refused);
+
+        assertThat(port.released).hasSize(2).allSatisfy(released -> {
+            assertThat(released.sharedNotes()).isNull();
+            assertThat(released.node()).isEqualTo(new PipelineNode("pipe-1", "src-1"));
+        });
+    }
+
+    /** A read with no change tail set nothing up for one, so nothing is asked of its source. */
+    @Test
+    void aReadWithNoTailReleasesNothing() {
+        FakeSource port = new FakeSource(List.of(), List.of());
+
+        assertThat(runUnit(port, new InMemoryMeta()).release(spec(ReadMode.SNAPSHOT_ONLY, true))).isEmpty();
+        assertThat(runUnit(port, new InMemoryMeta()).release(spec(ReadMode.SNAPSHOT_ONLY, false))).isEmpty();
+
+        assertThat(port.released).isEmpty();
     }
 }

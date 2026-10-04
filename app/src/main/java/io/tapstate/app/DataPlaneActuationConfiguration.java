@@ -3,10 +3,14 @@ package io.tapstate.app;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.adapters.pdk.PdkCapturePort;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.runtime.scheduler.RebuildAdmission;
+import io.tapstate.runtime.srs.CaptureHandoff;
+import io.tapstate.runtime.srs.CaptureRun;
+import io.tapstate.runtime.srs.CaptureRunSpec;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SourcePlacement;
@@ -20,6 +24,7 @@ import io.tapstate.spi.store.StorePort;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import java.time.Duration;
+import java.util.Optional;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -189,7 +194,17 @@ class DataPlaneActuationConfiguration {
         // Begun rather than started: a run comes back as soon as its load is open, and the load is read while
         // the pipeline's job takes it. Read to the end first, it would have to fit on the heap whole.
         // The attacher's widening path invokes the handler installed on the runtime's shared reader.
-        CaptureAttacher attacher = captureRunUnit::begin;
+        CaptureAttacher attacher = new CaptureAttacher() {
+            @Override
+            public CaptureRun start(CaptureRunSpec spec, CaptureHandoff handoff, boolean startTail) {
+                return captureRunUnit.begin(spec, handoff, startTail);
+            }
+
+            @Override
+            public Optional<TapstateException> release(CaptureRunSpec spec) {
+                return captureRunUnit.release(spec);
+            }
+        };
         if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
             return new StoreBackedPipelineCaptureCoordinator(
                     storePort, attacher, srsCoordinator, snapshotBuffer);

@@ -14,9 +14,11 @@ import java.util.stream.Collectors;
  * so they are answered per pipeline by whatever keeps the state; this holds the vocabulary, which is
  * the same for every pipeline and is what a surface with no pipeline in hand can still speak from.
  *
- * <p>Nothing declared anywhere names the user's own database, and the sentence says so out loud. A stop
+ * <p>Nothing declared anywhere names the user's own data, and the sentence says so out loud. A stop
  * reaches what this product recorded about the pipeline; the rows the pipeline wrote to its target are
- * the user's, and no answer to a stop touches them.
+ * the user's, and no answer to a stop touches them. The one thing declared on a database of the user's is
+ * what a source connector created there itself so as to read its changes -- a replication slot -- and it
+ * is named as exactly that.
  */
 public final class PipelineStateInventory {
 
@@ -75,8 +77,20 @@ public final class PipelineStateInventory {
             "what the shared mining chain had read, once this is the last pipeline reading it",
             PipelineStateHolding.Scope.CHAIN);
 
+    /**
+     * What a source connector set up on the source database to read the chain's changes -- a PostgreSQL
+     * replication slot -- which the source keeps its change log for until it is let go of. It goes with the
+     * chain, once this is the last pipeline reading through it; a pipeline reading its source directly has a
+     * chain of its own, so its slot goes with the pipeline. A source that cannot be reached at the time keeps
+     * it, and the clearing goes on and says which one is left to remove there by hand.
+     */
+    public static final PipelineStateHolding SOURCE_RESOURCES = PipelineStateHolding.named(
+            "any replication slot its source connector created on the source database, once this is the last "
+                    + "pipeline reading through it",
+            PipelineStateHolding.Scope.CHAIN);
+
     private static final List<PipelineStateHolding> VOCABULARY =
-            List.of(OPERATOR_STATE, CONNECTOR_STATE, RESUME_POSITION, CHAIN_RECORD);
+            List.of(OPERATOR_STATE, CONNECTOR_STATE, RESUME_POSITION, CHAIN_RECORD, SOURCE_RESOURCES);
 
     /**
      * Every kind of state this product records about a running pipeline. What a surface says without a

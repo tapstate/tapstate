@@ -567,6 +567,51 @@ final class Synthetic {
         return pollingSource(dir, "UnacknowledgingSource", channel, "");
     }
 
+    /**
+     * A source that, as the postgres connector does, creates a slot the first time a drive reads it and keeps
+     * the slot's name in its notes under {@code tapdata_pg_slot}; each read answers one row naming the slot it
+     * read through. Its release function reports the slot its notes name under {@code released} in the
+     * {@code channel} map. With {@code unreachable} in the map it then throws, as a source that cannot be
+     * reached does; with {@code hang} it waits until interrupted, and reports that under {@code interrupted}.
+     */
+    static Path slotKeepingSource(Path dir, String channel) {
+        String register = ""
+                + "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
+                + "  Object slot = context.getStateMap().get(\"tapdata_pg_slot\");"
+                + "  if (slot == null) {"
+                + "    slot = \"slot-\" + java.util.UUID.randomUUID();"
+                + "    context.getStateMap().put(\"tapdata_pg_slot\", slot);"
+                + "  }"
+                + "  Map<String,Object> r = new LinkedHashMap<>();"
+                + "  r.put(\"id\", 1); r.put(\"slot\", String.valueOf(slot));"
+                + "  List<TapEvent> evs = new ArrayList<>();"
+                + "  evs.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(100L).after(r));"
+                + "  consumer.accept(evs, null);"
+                + "});"
+                + "functions.supportReleaseExternalFunction(context -> {"
+                + "  @SuppressWarnings(\"unchecked\") List<Object> released = (List<Object>) channel().get(\"released\");"
+                + "  released.add(String.valueOf(context.getStateMap().get(\"tapdata_pg_slot\")));"
+                + "  if (channel().containsKey(\"hang\")) {"
+                + "    try {"
+                + "      Thread.sleep(Long.MAX_VALUE);"
+                + "    } catch (InterruptedException e) {"
+                + "      channel().put(\"interrupted\", true);"
+                + "      throw e;"
+                + "    }"
+                + "  }"
+                + "  if (channel().containsKey(\"unreachable\")) {"
+                + "    throw new IllegalStateException(\"connection refused\");"
+                + "  }"
+                + "});";
+        String members = ""
+                + "@SuppressWarnings(\"unchecked\")"
+                + "private static Map<String,Object> channel() {"
+                + "  return (Map<String,Object>) System.getProperties().get(\"" + channel + "\");"
+                + "}";
+        return SyntheticJar.compileToJar(dir, "synthetic.SlotKeepingSource",
+                source("SlotKeepingSource", "", register, members));
+    }
+
     /** A flush function that records each call under {@code flushes}, then runs {@code after}. */
     private static String flushFunction(String after) {
         return ""

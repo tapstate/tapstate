@@ -28,6 +28,7 @@ import io.tapdata.entity.utils.cache.Entry;
 import io.tapdata.entity.utils.cache.Iterator;
 import io.tapdata.entity.utils.cache.KVReadOnlyMap;
 import io.tapdata.pdk.apis.consumer.StreamReadConsumer;
+import io.tapdata.pdk.apis.functions.connector.common.ReleaseExternalFunction;
 import io.tapdata.pdk.apis.functions.connector.source.BatchReadFunction;
 import io.tapdata.pdk.apis.functions.connector.source.StreamReadFunction;
 import io.tapdata.pdk.apis.functions.connector.source.TimestampToStreamOffsetFunction;
@@ -94,11 +95,27 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
      */
     private static final long ACKNOWLEDGE_WARNING_INTERVAL_NANOS = Duration.ofMinutes(1).toNanos();
 
+    /**
+     * The longest a release waits for its connector to let go of what it set up on the source. A source that
+     * cannot be reached usually says so within its driver's connect timeout; one that accepts a connection and
+     * then never answers would otherwise hold the clearing that asked -- and everything waiting behind it --
+     * for as long as it stays silent.
+     */
+    private static final Duration DEFAULT_RELEASE_TIMEOUT = Duration.ofSeconds(60);
+
+    /**
+     * Per connector, the notes naming something it set up on its source that its release function lets go of.
+     * Read only to say what is left there when a release fails.
+     */
+    static final Map<String, List<String>> NOTES_NAMING_SOURCE_RESOURCES =
+            Map.of("postgres", List.of("tapdata_pg_slot"));
+
     private final ConnectorProvisioner provisioner;
     private final KeyedStateStore stateStore;
     private final Duration preflightTimeout;
     private final long acknowledgeIntervalNanos;
     private final LongSupplier nanoClock;
+    private final Duration releaseTimeout;
 
     /** For the drives that keep nothing: no store, so nothing a connector writes is filed anywhere. */
     public PdkCapturePort(ConnectorProvisioner provisioner) {
@@ -121,11 +138,18 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
      */
     PdkCapturePort(ConnectorProvisioner provisioner, KeyedStateStore stateStore, Duration preflightTimeout,
             Duration acknowledgeInterval, LongSupplier nanoClock) {
+        this(provisioner, stateStore, preflightTimeout, acknowledgeInterval, nanoClock, DEFAULT_RELEASE_TIMEOUT);
+    }
+
+    /** As above, with how long a release waits for its connector -- for a case that cannot wait a minute. */
+    PdkCapturePort(ConnectorProvisioner provisioner, KeyedStateStore stateStore, Duration preflightTimeout,
+            Duration acknowledgeInterval, LongSupplier nanoClock, Duration releaseTimeout) {
         this.provisioner = provisioner;
         this.stateStore = stateStore;
         this.preflightTimeout = requirePositive(preflightTimeout, "preflightTimeout");
         this.acknowledgeIntervalNanos = requirePositive(acknowledgeInterval, "acknowledgeInterval").toNanos();
         this.nanoClock = Objects.requireNonNull(nanoClock, "nanoClock");
+        this.releaseTimeout = requirePositive(releaseTimeout, "releaseTimeout");
     }
 
     private static Duration requirePositive(Duration value, String name) {
@@ -433,6 +457,100 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
             connector.stopQuietly();
             connector.close();
         }
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>The connector is opened over the notes a read over {@code config} opens -- the physical capture's for
+     * a shared one, carried over from its earlier nodes' where it never took them over, and the node's own for
+     * a source read directly -- so its release function finds what it recorded there, a replication slot's
+     * name, say, and lets go of that on the source. A connector that registered no release function set
+     * nothing up there that it knows to let go of.
+     *
+     * <p>What the notes name on the source is read before the connector is asked, so that a release the source
+     * refuses can still say what is left there to remove by hand. Which notes name such a thing is the
+     * connector's own knowledge; {@link #NOTES_NAMING_SOURCE_RESOURCES} lists what is known of it, and a
+     * connector it does not list is still released and still answered for, only without the names.
+     *
+     * <p>The connector is driven on a thread of its own and waited for a bounded time. One that has not
+     * answered by then is answered for as a refusal and left to finish, or not, by itself: the clearing that
+     * asked goes on either way.
+     */
+    @Override
+    public Optional<TapstateException> release(CaptureConfig config) {
+        Objects.requireNonNull(config, "config");
+        if (stateStore == null || (config.node() == null && config.sharedNotes() == null)) {
+            // Nothing was kept anywhere a later drive could read it, so nothing was set up through it either.
+            return Optional.empty();
+        }
+        AtomicReference<List<String>> named = new AtomicReference<>();
+        CompletableFuture<Void> released = new CompletableFuture<>();
+        Thread thread = new Thread(() -> {
+            try {
+                PdkConnector connector = open(config);
+                try {
+                    named.set(namedOnTheSource(connector, config.connectorId()));
+                    ReleaseExternalFunction release = connector.functions().getReleaseExternalFunction();
+                    if (release != null) {
+                        connector.underLoader(() -> {
+                            release.release(connector.context());
+                            return null;
+                        });
+                    }
+                } finally {
+                    connector.stopQuietly();
+                    connector.close();
+                }
+                released.complete(null);
+            } catch (Throwable failure) {
+                released.completeExceptionally(failure);
+                if (failure instanceof VirtualMachineError fatal) {
+                    throw fatal;
+                }
+            }
+        }, "tapstate-release-" + config.connectorId());
+        thread.setDaemon(true);
+        thread.start();
+        Throwable failure;
+        try {
+            released.get(releaseTimeout.toNanos(), TimeUnit.NANOSECONDS);
+            return Optional.empty();
+        } catch (ExecutionException refused) {
+            failure = refused.getCause();
+            if (failure instanceof VirtualMachineError fatal) {
+                throw fatal;
+            }
+        } catch (TimeoutException silent) {
+            thread.interrupt();
+            failure = new TimeoutException("the source did not answer within " + releaseTimeout.toSeconds() + "s");
+        } catch (InterruptedException interrupted) {
+            thread.interrupt();
+            Thread.currentThread().interrupt();
+            failure = interrupted;
+        }
+        List<String> left = named.get();
+        return Optional.of(new TapstateException(ConnectorError.RELEASE_FAILED,
+                Map.of("connector", config.connectorId(), "detail", detail(failure),
+                        "resources", left == null ? "whatever its notes name, which could not be read"
+                                : left.isEmpty() ? "nothing its notes name" : String.join(", ", left)),
+                failure));
+    }
+
+    /** What {@code connector}'s notes name on its source, read as its own drive would read them. */
+    private static List<String> namedOnTheSource(PdkConnector connector, String connectorId) {
+        List<String> named = new ArrayList<>();
+        for (String key : NOTES_NAMING_SOURCE_RESOURCES.getOrDefault(connectorId, List.of())) {
+            try {
+                Object value = connector.context().getStateMap().get(key);
+                if (value != null) {
+                    named.add(String.valueOf(value));
+                }
+            } catch (RuntimeException unreadable) {
+                // Only the refusal loses this name; the release itself goes ahead either way.
+            }
+        }
+        return List.copyOf(named);
     }
 
     // ---- drive helpers ---------------------------------------------------------------------------

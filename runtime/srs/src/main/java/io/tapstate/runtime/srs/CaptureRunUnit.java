@@ -174,6 +174,30 @@ public final class CaptureRunUnit {
         return open(spec, handoff, startTail, true);
     }
 
+    /**
+     * Lets go of what {@code spec}'s source connector set up on the source to read changes -- a replication
+     * slot -- through the notes its change tail reads: the physical capture's for a tail through the shared
+     * write-through rings, and the node's own for one read directly. A read with no change tail set nothing
+     * up for one. Answers what the source refused to let go of, for the caller to report.
+     *
+     * <p>For the caller to call once nobody reads through those notes any more and the state they belong to
+     * is being cleared: after the chain's record is gone, and before the notes are. Released while anyone
+     * still reads through them, a stream would go on over a slot that is gone; released while the record
+     * still stands, a start in between would resume from a position the source no longer keeps.
+     */
+    public Optional<TapstateException> release(CaptureRunSpec spec) {
+        Objects.requireNonNull(spec, "spec");
+        ConsumptionPlan plan = ConsumptionPlan.of(spec.readMode(), spec.srsEnabled());
+        if (!plan.tail()) {
+            return Optional.empty();
+        }
+        // The same notes the tail opens over -- see openTail -- or the release finds nothing they recorded.
+        CaptureConfig config = plan.sharedRing() && durableLog() != null
+                ? spec.config().sharing(sharedNotes(spec, spec.miningChainId().value()))
+                : spec.config();
+        return port.release(config);
+    }
+
     private CaptureRun open(CaptureRunSpec spec, CaptureHandoff handoff, boolean startTail, boolean inBackground) {
         Objects.requireNonNull(spec, "spec");
         Objects.requireNonNull(handoff, "handoff");
