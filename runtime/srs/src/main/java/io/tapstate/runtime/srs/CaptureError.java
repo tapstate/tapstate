@@ -23,6 +23,15 @@ public enum CaptureError implements TapstateErrorCode {
     /** A live capture could no longer renew the cluster ownership generation that fences its writes. */
     CLAIM_LOST("capture.claim-lost", Set.of("captureId")),
 
+    /** A confirmed SRS cursor cannot be served without skipping missing or unverified history. */
+    RECOVERY_LOG_GAP("capture.recovery-log-gap", Set.of("ring", "sequence", "reason")),
+
+    /** Older state cannot prove this source node's independent recovery boundary. */
+    RECOVERY_PROGRESS_UNPROVEN("capture.recovery-progress-unproven", Set.of("pipeline", "source")),
+
+    /** Shared capture cannot checkpoint until its change log is configured for durable write-through. */
+    SRS_NOT_RECOVERABLE("capture.srs-not-recoverable", Set.of("chain")),
+
     /**
      * A pipeline driven by a member that does not hold its capture found no change ring open to read for
      * the whole stretch that takes a capture's claim to move, and could not take the capture over itself.

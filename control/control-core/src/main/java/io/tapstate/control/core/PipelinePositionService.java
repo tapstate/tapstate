@@ -7,6 +7,7 @@ import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
 
@@ -57,8 +58,11 @@ public final class PipelinePositionService {
     public PipelinePosition read(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         List<PipelinePosition.Chain> reported = new ArrayList<>();
-        for (PipelineChains.Chain chain : chains.of(pipelineId)) {
-            reported.add(report(pipelineId, chain));
+        List<PipelineChains.Chain> sources = chains.of(pipelineId);
+        for (PipelineChains.Chain chain : sources) {
+            boolean soleSource = sources.stream().filter(source -> source.chainId().equals(chain.chainId()))
+                    .map(PipelineChains.Chain::sourceId).distinct().limit(2).count() == 1;
+            reported.add(report(pipelineId, chain, soleSource));
         }
         return new PipelinePosition(pipelineId, reported);
     }
@@ -123,13 +127,13 @@ public final class PipelinePositionService {
      */
     private void releaseTheAcksThatWouldOutrankIt(String chainId) {
         for (ConsumerOffset offset : meta.read(chainId).map(SrsMeta::consumerOffsets).orElse(List.of())) {
-            if (offset.sinkAcked() != null) {
+            if (offset.sinkAcked() != null || !offset.sinkAckedByTable().isEmpty()) {
                 // Rewritten rather than deleted: the read cursor and the tables whose initial load this
                 // pipeline finished are answers about work that did happen, and moving the tail says
                 // nothing about either.
                 meta.upsertConsumerOffset(chainId, new ConsumerOffset(offset.pipelineId(),
                         offset.perTableSeq(), null, offset.snapshotCompletedTables(),
-                        offset.cdcStartPosition(), offset.snapshotEpoch()));
+                        offset.cdcStartPosition(), offset.snapshotEpoch(), Map.of(), offset.progressKind()));
             }
         }
     }
@@ -234,16 +238,16 @@ public final class PipelinePositionService {
     }
 
     /** One chain's reading: where it resumes, when that was written, this pipeline's ack, and who shares it. */
-    private PipelinePosition.Chain report(String pipelineId, PipelineChains.Chain chain) {
+    private PipelinePosition.Chain report(String pipelineId, PipelineChains.Chain chain, boolean soleSource) {
         Optional<SrsMeta> record = meta.read(chain.chainId());
-        Optional<ConsumerOffset> mine = record.stream()
-                .flatMap(found -> found.consumerOffsets().stream())
-                .filter(offset -> offset.pipelineId().equals(pipelineId))
-                .findFirst();
+        String consumer = SrsConsumerId.of(pipelineId, chain.sourceId()).value();
+        Optional<ConsumerOffset> mine = record.flatMap(found -> found.consumerOffset(consumer)
+                .or(() -> soleSource ? found.consumerOffset(pipelineId) : Optional.empty()));
         Set<String> shared = new TreeSet<>();
         record.ifPresent(found -> found.consumerOffsets().forEach(offset -> {
-            if (!offset.pipelineId().equals(pipelineId)) {
-                shared.add(offset.pipelineId());
+            String owner = SrsConsumerId.pipelineOf(offset.pipelineId());
+            if (!owner.equals(pipelineId)) {
+                shared.add(owner);
             }
         }));
         return new PipelinePosition.Chain(

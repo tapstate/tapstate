@@ -852,7 +852,7 @@ public class CsvConnector implements TapConnector {
      * look at its files, and a held read's next look for the signal to go on. Answers false when interrupted,
      * with the interrupt kept for whoever asks next.
      */
-    private static boolean pausedBetweenPolls(long millis) {
+    protected static boolean pausedBetweenPolls(long millis) {
         try {
             Thread.sleep(millis);
             return true;

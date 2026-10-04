@@ -56,7 +56,10 @@ capture.cluster-refused-the-read
 capture.cluster-refused-writes
 capture.event-table-not-selected
 capture.no-ring-to-attach
+capture.recovery-log-gap
+capture.recovery-progress-unproven
 capture.snapshot-reports-no-seam
+capture.srs-not-recoverable
 capture.start-from-outside-window
 capture.start-from-unparsable
 cli.alias-install-dir-unknown
@@ -204,6 +207,7 @@ io.document-unreadable
 io.schema-read-contention
 io.schema-write-contention
 io.sink-writer-progress-ambiguous
+io.srs-progress-unproven
 io.store-unauthorized
 io.store-unavailable
 io.workload-claim-fenced

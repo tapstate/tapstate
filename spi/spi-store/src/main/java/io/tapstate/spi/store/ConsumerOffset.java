@@ -55,7 +55,9 @@ public record ConsumerOffset(
         ChainPosition sinkAcked,
         List<String> snapshotCompletedTables,
         String cdcStartPosition,
-        long snapshotEpoch) {
+        long snapshotEpoch,
+        Map<String, ChainPosition> sinkAckedByTable,
+        ConsumerProgressKind progressKind) {
 
     public ConsumerOffset {
         if (pipelineId == null || pipelineId.isBlank()) {
@@ -73,6 +75,23 @@ public record ConsumerOffset(
         }
         perTableSeq = Collections.unmodifiableMap(new LinkedHashMap<>(perTableSeq));
         snapshotCompletedTables = List.copyOf(snapshotCompletedTables);
+        sinkAckedByTable = Collections.unmodifiableMap(new LinkedHashMap<>(
+                java.util.Objects.requireNonNull(sinkAckedByTable, "sinkAckedByTable")));
+        java.util.Objects.requireNonNull(progressKind, "progressKind");
+    }
+
+    /** Older callers do not establish a shared ordering between their table cursors. */
+    public ConsumerOffset(String pipelineId, Map<String, Long> perTableSeq, ChainPosition sinkAcked,
+            List<String> snapshotCompletedTables, String cdcStartPosition, long snapshotEpoch) {
+        this(pipelineId, perTableSeq, sinkAcked, snapshotCompletedTables, cdcStartPosition,
+                snapshotEpoch, Map.of(), ConsumerProgressKind.LEGACY);
+    }
+
+    public ConsumerOffset(String pipelineId, Map<String, Long> perTableSeq, ChainPosition sinkAcked,
+            List<String> snapshotCompletedTables, String cdcStartPosition, long snapshotEpoch,
+            Map<String, ChainPosition> sinkAckedByTable) {
+        this(pipelineId, perTableSeq, sinkAcked, snapshotCompletedTables, cdcStartPosition,
+                snapshotEpoch, sinkAckedByTable, ConsumerProgressKind.LEGACY);
     }
 
     /** A cursor with completion state but no snapshot seam recorded yet. */

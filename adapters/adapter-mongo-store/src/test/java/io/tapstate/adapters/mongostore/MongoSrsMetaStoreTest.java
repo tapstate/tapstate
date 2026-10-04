@@ -8,8 +8,10 @@ import com.mongodb.ServerAddress;
 import com.mongodb.WriteError;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.ConsumerProgressKind;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SchemaVersion;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
@@ -139,6 +141,93 @@ class MongoSrsMetaStoreTest {
         assertThat(document.get("consumerOffsets", Document.class)).isEmpty();
         assertThat(document.getList("schemaHistory", Document.class)).isEmpty();
         assertThat(MongoSrsMetaStore.toMeta(document)).isEqualTo(seed);
+    }
+
+    @Test
+    void oldProgressDoesNotAcquireDurableLogProofOrPerTableConfirmationsWhenRead() {
+        Document released = new Document("_id", "crm@postgres")
+                .append("sourceReadOffset", "after-mail")
+                .append("sourceReadEpoch", 1L).append("sourceReadSeq", 0L)
+                .append("consumerOffsets", new Document("support_case_state", new Document(
+                        "perTableSeq", new Document("support_case", 3L).append("emailmessage", 0L))
+                        .append("sinkAckedSrcpos", "after-mail")
+                        .append("sinkAckedEpoch", 1L).append("sinkAckedSeq", 0L)
+                        .append("snapshotCompletedTables", List.of("support_case", "emailmessage"))
+                        .append("cdcStartPosition", "snapshot-seam").append("snapshotEpoch", 1L)))
+                .append("schemaHistory", List.of());
+
+        SrsMeta decoded = MongoSrsMetaStore.toMeta(released);
+
+        assertThat(decoded.sourceReadDurable()).isFalse();
+        ConsumerOffset legacy = decoded.consumerOffset("support_case_state").orElseThrow();
+        assertThat(legacy.progressKind()).isEqualTo(ConsumerProgressKind.LEGACY);
+        assertThat(legacy.sinkAckedByTable()).isEmpty();
+        assertThat(legacy.sinkAcked())
+                .as("reading preserves old evidence without guessing a different ordering")
+                .isEqualTo(new ChainPosition(new SourceOrder(1, 0), "after-mail"));
+        assertThat(legacy.perTableSeq())
+                .containsExactlyInAnyOrderEntriesOf(Map.of("support_case", 3L, "emailmessage", 0L));
+        assertThat(decoded.consumerOffset(SrsConsumerId.of("support_case_state", "case_source").value()))
+                .isEmpty();
+    }
+
+    @Test
+    void durableCaptureProofAndIndependentConfirmedGenerationsSurviveTheStoredFormat() {
+        String consumer = SrsConsumerId.of("support_case_state", "case_source").value();
+        Document captured = new Document("_id", "crm@postgres")
+                .append("sourceReadOffset", "batch-durable")
+                .append("sourceReadEpoch", 4L).append("sourceReadSeq", 90L)
+                .append("sourceReadDurable", true).append("epoch", 4L)
+                .append("consumerOffsets", new Document(consumer, new Document(
+                        "perTableSeq", new Document("support_case", 12L).append("emailmessage", 1L))
+                        .append("progressKind", "SRS")
+                        .append("sinkAckedByTable", new Document(
+                                "support_case", new Document("sinkAckedEpoch", 3L)
+                                        .append("sinkAckedSeq", 11L).append("sinkAckedSrcpos", "before-high"))
+                                .append("emailmessage", new Document("sinkAckedEpoch", 4L)
+                                        .append("sinkAckedSeq", 0L).append("sinkAckedSrcpos", "after-mail")))))
+                .append("schemaHistory", List.of());
+
+        SrsMeta decoded = MongoSrsMetaStore.toMeta(captured);
+
+        assertThat(decoded.sourceReadDurable()).isTrue();
+        ConsumerOffset offset = decoded.consumerOffset(consumer).orElseThrow();
+        assertThat(offset.progressKind()).isEqualTo(ConsumerProgressKind.SRS);
+        assertThat(offset.sinkAcked()).isNull();
+        assertThat(offset.sinkAckedByTable()).containsExactlyInAnyOrderEntriesOf(Map.of(
+                "support_case", new ChainPosition(new SourceOrder(3, 11), "before-high"),
+                "emailmessage", new ChainPosition(new SourceOrder(4, 0), "after-mail")));
+        assertThat(MongoSrsMetaStore.toMeta(MongoSrsMetaStore.toDocument(decoded))).isEqualTo(decoded);
+    }
+
+    @Test
+    void anUnknownOrMalformedProgressKindIsACodedStoredDocumentRefusal() {
+        for (Object kind : List.of("UNRECOGNIZED", 1L)) {
+            Document stored = new Document("_id", "crm@postgres")
+                    .append("consumerOffsets", new Document("support_case_state",
+                            new Document("progressKind", kind))).append("schemaHistory", List.of());
+
+            Throwable thrown = catchThrowable(() -> MongoSrsMetaStore.toMeta(stored));
+
+            assertThat(thrown).as("stored progress kind %s", kind).isInstanceOf(TapstateException.class);
+            assertThat(((TapstateException) thrown).code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+            assertThat(((TapstateException) thrown).args()).containsEntry("field", "progressKind");
+        }
+    }
+
+    @Test
+    void malformedDurableCaptureProofIsACodedStoredDocumentRefusal() {
+        for (Object durable : List.of("true", 1L, new Document())) {
+            Document stored = new Document("_id", "crm@postgres")
+                    .append("consumerOffsets", new Document()).append("schemaHistory", List.of())
+                    .append("sourceReadDurable", durable);
+
+            Throwable thrown = catchThrowable(() -> MongoSrsMetaStore.toMeta(stored));
+
+            assertThat(thrown).as("stored durable proof %s", durable).isInstanceOf(TapstateException.class);
+            assertThat(((TapstateException) thrown).code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+            assertThat(((TapstateException) thrown).args()).containsEntry("field", "sourceReadDurable");
+        }
     }
 
     @Test

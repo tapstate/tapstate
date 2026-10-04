@@ -5,9 +5,14 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.tapstate.core.model.SourceMode;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.model.SourceRef;
+import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.Srs;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.runtime.srs.MiningChainId;
+import io.tapstate.runtime.srs.CaptureRunSpec;
+import io.tapstate.runtime.srs.StartFrom;
 import io.tapstate.runtime.srs.SrsRingbuffer;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.store.SourceModel;
@@ -153,6 +158,67 @@ class SourceCaptureResolutionTest {
         assertThatThrownBy(() -> SourceCaptureResolution.of(source))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
                 .hasMessageContaining("actuation.source-table-spec-unsupported");
+    }
+
+    @Test
+    void aDirectReferenceResolvesTheSameRecoveryRecordAsItsCaptureRun() {
+        SourceResource source = cdcSource("orders_src", "orders", "shared-db");
+        PipelineResource pipeline = pipeline("pipeline-a", SourceRef.spec(source.id(), false));
+        SourceCaptureResolution resolution = SourceCaptureResolution.forPipeline(pipeline, source, null)
+                .orElseThrow();
+        CaptureRunSpec run = new CaptureRunSpec(resolution.config(), ReadMode.CDC_ONLY,
+                resolution.srsKey(), false, source.id(), pipeline.id(), StartFrom.latest(), null, 0L);
+
+        assertThat(resolution.chainId()).isEqualTo(run.miningChainId());
+        assertThat(resolution.chainId()).isNotEqualTo(MiningChainId.ofKey("shared-db"));
+    }
+
+    @Test
+    void twoDirectPipelinesOnOneDatabaseResolveIndependentRecoveryRecords() {
+        SourceResource source = cdcSource("orders_src", "orders", null);
+        SourceCaptureResolution first = SourceCaptureResolution.forPipeline(
+                pipeline("pipeline-a", SourceRef.spec(source.id(), false)), source, null).orElseThrow();
+        SourceCaptureResolution second = SourceCaptureResolution.forPipeline(
+                pipeline("pipeline-b", SourceRef.spec(source.id(), false)), source, null).orElseThrow();
+
+        assertThat(first.chainId()).isNotEqualTo(second.chainId());
+        assertThat(first.chainId()).isNotEqualTo(SourceCaptureResolution.of(source).chainId());
+    }
+
+    @Test
+    void twoDirectSourceNodesInOnePipelineResolveIndependentRecoveryRecords() {
+        SourceResource root = cdcSource("root_src", "orders", null);
+        SourceResource mail = cdcSource("mail_src", "emailmessage", null);
+        PipelineResource pipeline = pipeline("pipeline",
+                SourceRef.spec(root.id(), false), SourceRef.spec(mail.id(), false));
+
+        assertThat(SourceCaptureResolution.forPipeline(pipeline, root, null).orElseThrow().chainId())
+                .isNotEqualTo(SourceCaptureResolution.forPipeline(pipeline, mail, null).orElseThrow().chainId());
+    }
+
+    @Test
+    void sharedSourceNodesOnOneDatabaseResolveTheSamePhysicalCapture() {
+        SourceResource root = cdcSource("root_src", "orders", null);
+        SourceResource mail = cdcSource("mail_src", "emailmessage", null);
+        PipelineResource pipeline = pipeline("pipeline",
+                SourceRef.spec(root.id(), true), SourceRef.spec(mail.id(), true));
+
+        assertThat(SourceCaptureResolution.forPipeline(pipeline, root, null).orElseThrow().chainId())
+                .isEqualTo(SourceCaptureResolution.forPipeline(pipeline, mail, null).orElseThrow().chainId());
+    }
+
+    @Test
+    void scopingAResolutionAlwaysStartsFromThePhysicalSourceIdentity() {
+        SourceCaptureResolution physical = SourceCaptureResolution.of(cdcSource("orders_src", "orders", null));
+
+        assertThat(physical.scopedTo("pipeline-a", false).scopedTo("pipeline-a", false).chainId())
+                .isEqualTo(physical.scopedTo("pipeline-a", false).chainId());
+        assertThat(physical.scopedTo("pipeline-a", false).scopedTo("pipeline-b", true).chainId())
+                .isEqualTo(physical.chainId());
+    }
+
+    private static PipelineResource pipeline(String id, SourceRef... refs) {
+        return new PipelineResource(id, null, List.of(refs), null, null, null, null, null);
     }
 
     private static SourceModel discovered(String... names) {

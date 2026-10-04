@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.RingbufferConfig;
+import com.hazelcast.config.RingbufferStoreConfig;
 import com.hazelcast.config.SerializerConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
@@ -38,6 +39,7 @@ import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.SrsItem;
 import io.tapstate.runtime.srs.SrsItemSerializer;
+import io.tapstate.runtime.srs.SrsLogRingbufferStoreFactory;
 import io.tapstate.runtime.srs.SrsRingbuffer;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
@@ -100,9 +102,11 @@ class NestOverTwoSourcesDataFlowTest {
     private static final String EMBED_PATH = "items";
 
     private HazelcastInstance member;
+    private InMemorySrsLogStore log;
 
     @BeforeEach
     void startMember() {
+        log = new InMemorySrsLogStore();
         Config config = new Config();
         config.setClusterName("nest-two-source-test-" + System.nanoTime());
         config.setProperty("hazelcast.phone.home.enabled", "false");
@@ -115,7 +119,9 @@ class NestOverTwoSourcesDataFlowTest {
                 .setCapacity(16)
                 .setInMemoryFormat(InMemoryFormat.OBJECT)
                 .setTimeToLiveSeconds(0)
-                .setBackupCount(0));
+                .setBackupCount(0)
+                .setRingbufferStoreConfig(new RingbufferStoreConfig().setEnabled(true)
+                        .setFactoryImplementation(new SrsLogRingbufferStoreFactory(log))));
         config.getSerializationConfig().addSerializerConfig(
                 new SerializerConfig().setImplementation(new SrsItemSerializer()).setTypeClass(SrsItem.class));
         member = Hazelcast.newHazelcastInstance(config);
@@ -301,6 +307,7 @@ class NestOverTwoSourcesDataFlowTest {
             Map<String, List<Envelope>> rowsByTable) {
         SrsMetaStore meta = store.meta();
         member.getUserContext().put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY, meta);
+        member.getUserContext().put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY, store.srsLog());
         member.getUserContext().put(PdkSinkWriterFactory.CONNECTOR_PROVISIONER_USER_CONTEXT_KEY,
                 (ConnectorProvisioner) connectorId -> {
                     throw new UnsupportedOperationException("not resolved by this data-flow test");
@@ -330,11 +337,11 @@ class NestOverTwoSourcesDataFlowTest {
     }
 
     /** The two sources, the sink connection and the nest pipeline, plus a discovered model for each source. */
-    private static InMemoryStorePort seedStore() {
+    private InMemoryStorePort seedStore() {
         return seedStore(ReadMode.SNAPSHOT_AND_CDC);
     }
 
-    private static InMemoryStorePort seedStore(ReadMode readMode) {
+    private InMemoryStorePort seedStore(ReadMode readMode) {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(source(PARENT_SOURCE, PARENT_TABLE));
         artifacts.save(source(CHILD_SOURCE, CHILD_TABLE));
@@ -342,7 +349,7 @@ class NestOverTwoSourcesDataFlowTest {
 
         artifacts.save(pipeline(readMode));
 
-        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        InMemoryStorePort store = new InMemoryStorePort(artifacts, log);
         // Both models are discovered: the parent's resolves the target the sink writes, and each supplies
         // the key an embed falls back on when it declares no arrayKey of its own.
         store.schemas().save(discovered(PARENT_SOURCE,

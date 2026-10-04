@@ -2,11 +2,14 @@ package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.ConsumerProgressKind;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -31,6 +34,22 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     private final Map<String, Map<String, Map<String, Long>>> ringDone = new LinkedHashMap<>();
     /** Per chain and pipeline, the writer plan and the progress kept apart beneath its derived cursor. */
     private final Map<String, Map<String, SinkWriters>> sinkWriters = new LinkedHashMap<>();
+    private final Map<String, LinkedHashSet<String>> captureTables = new LinkedHashMap<>();
+    private final Map<String, List<String>> servingTables = new LinkedHashMap<>();
+    private final Map<String, Long> servingEpoch = new LinkedHashMap<>();
+    private final Map<String, Map<String, DirectCapture>> directCaptures = new LinkedHashMap<>();
+
+    private static final class DirectCapture {
+        private final long epoch;
+        private final List<DirectBatch> pending = new ArrayList<>();
+        private String anchor;
+
+        private DirectCapture(long epoch) {
+            this.epoch = epoch;
+        }
+    }
+
+    private record DirectBatch(ChainPosition position, Map<String, Long> targets) { }
 
     private static final class SinkWriters {
         private Map<String, List<String>> expected = Map.of();
@@ -49,6 +68,33 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     }
 
     @Override
+    public synchronized void requestCaptureTables(String miningChainId, List<String> tables) {
+        require(miningChainId);
+        captureTables.computeIfAbsent(miningChainId, ignored -> new LinkedHashSet<>()).addAll(tables);
+    }
+
+    @Override
+    public synchronized List<String> captureTables(String miningChainId) {
+        return List.copyOf(captureTables.getOrDefault(miningChainId, new LinkedHashSet<>()));
+    }
+
+    @Override
+    public synchronized List<String> captureServingTables(String miningChainId) {
+        return servingTables.getOrDefault(miningChainId, List.of());
+    }
+
+    @Override
+    public synchronized boolean publishCaptureTables(String miningChainId, long epoch, List<String> tables) {
+        SrsMeta meta = require(miningChainId);
+        if (meta.epoch() != epoch || !tables.containsAll(captureTables(miningChainId))) {
+            return false;
+        }
+        servingTables.put(miningChainId, List.copyOf(new LinkedHashSet<>(tables)));
+        servingEpoch.put(miningChainId, epoch);
+        return true;
+    }
+
+    @Override
     public synchronized void create(String miningChainId, String retention) {
         if (records.containsKey(miningChainId)) {
             throw new IllegalStateException("mining chain already seeded: " + miningChainId);
@@ -61,15 +107,97 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         SrsMeta m = require(miningChainId);
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), new ChainPosition(null, token), m.consumerOffsets(),
-                m.schemaHistory(), m.retention(), m.epoch(), Instant.now()));
+                m.schemaHistory(), m.retention(), m.epoch(), Instant.now(), false));
     }
 
     @Override
     public synchronized void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
         SrsMeta m = require(miningChainId);
+        if (m.sourceRead() != null && m.sourceRead().order() != null
+                && position.order().compareTo(m.sourceRead().order()) <= 0) {
+            return;
+        }
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), position, m.consumerOffsets(),
-                m.schemaHistory(), m.retention(), m.epoch()));
+                m.schemaHistory(), m.retention(), m.epoch(), Instant.now(), false));
+    }
+
+    @Override
+    public synchronized void advanceCaptureCheckpoint(String miningChainId, ChainPosition position) {
+        advanceCaptureCheckpoint(miningChainId, position, captureServingTables(miningChainId));
+    }
+
+    @Override
+    public synchronized void advanceCaptureCheckpoint(
+            String miningChainId, ChainPosition position, List<String> servedTables) {
+        SrsMeta before = require(miningChainId);
+        if (before.epoch() != position.order().epoch()) {
+            return;
+        }
+        if (!captureTables(miningChainId).isEmpty() && servingEpoch.containsKey(miningChainId)
+                && (servingEpoch.get(miningChainId) != before.epoch()
+                        || !captureServingTables(miningChainId).containsAll(captureTables(miningChainId))
+                        || !servedTables.containsAll(captureTables(miningChainId)))) {
+            return;
+        }
+        advanceSourceReadOffset(miningChainId, position);
+        SrsMeta m = require(miningChainId);
+        if (position.equals(m.sourceRead())) {
+            records.put(miningChainId, new SrsMeta(
+                    m.miningChainId(), m.sourceRead(), m.consumerOffsets(),
+                    m.schemaHistory(), m.retention(), m.epoch(), m.sourceReadAt(), true));
+        }
+    }
+
+    @Override
+    public synchronized void beginDirectCapture(String miningChainId, String consumerId, long epoch, String anchor) {
+        SrsMeta meta = require(miningChainId);
+        if (meta.epoch() != epoch) {
+            throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+        }
+        Map<String, DirectCapture> captures = directCaptures.computeIfAbsent(
+                miningChainId, ignored -> new LinkedHashMap<>());
+        DirectCapture currentCapture = captures.get(consumerId);
+        if (currentCapture != null && currentCapture.epoch == epoch) {
+            if (anchor == null || currentCapture.anchor != null) {
+                return;
+            }
+            if (!currentCapture.pending.isEmpty()) {
+                throw new TapstateException(IoError.SRS_PROGRESS_UNPROVEN,
+                        Map.of("pipeline", SrsConsumerId.pipelineOf(consumerId)), null);
+            }
+        }
+        if (currentCapture == null || currentCapture.epoch != epoch) {
+            currentCapture = new DirectCapture(epoch);
+            captures.put(consumerId, currentCapture);
+        }
+        currentCapture.anchor = anchor;
+        ConsumerOffset current = meta.consumerOffset(consumerId).orElse(null);
+        ChainPosition prior = current == null ? null : current.sinkAcked();
+        ChainPosition confirmed = anchor == null ? prior : new ChainPosition(SourceOrder.snapshotRow(epoch), anchor);
+        replaceConsumer(miningChainId, new ConsumerOffset(consumerId,
+                current == null ? Map.of() : current.perTableSeq(), confirmed, completedOf(current),
+                current == null ? null : current.cdcStartPosition(), current == null ? 0L : current.snapshotEpoch(),
+                confirmedOf(current), ConsumerProgressKind.DIRECT_SOURCE));
+        if (anchor != null) {
+            advanceSourceReadOffset(miningChainId, new ChainPosition(SourceOrder.snapshotRow(epoch), anchor));
+        }
+    }
+
+    @Override
+    public synchronized void recordDirectBatch(String miningChainId, String consumerId, ChainPosition position,
+            Map<String, Long> targets) {
+        SrsMeta meta = require(miningChainId);
+        if (position.token() == null) {
+            return;
+        }
+        DirectCapture capture = directCapture(miningChainId, consumerId);
+        if (capture == null || capture.epoch != position.order().epoch()
+                || meta.epoch() != position.order().epoch()) {
+            throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+        }
+        capture.pending.add(new DirectBatch(position, Map.copyOf(targets)));
+        advanceDirectCompletion(miningChainId, consumerId);
     }
 
     @Override
@@ -78,12 +206,13 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         // A rewritten record carries no per-table acks, as the real store's replacement carries none.
         forgetRingSeqs(miningChainId, offset.pipelineId());
         forgetSinkWriters(miningChainId, offset.pipelineId());
+        forgetDirectCapture(miningChainId, offset.pipelineId());
         List<ConsumerOffset> next = new ArrayList<>(m.consumerOffsets());
         next.removeIf(c -> c.pipelineId().equals(offset.pipelineId()));
         next.add(offset);
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), m.sourceRead(), next,
-                m.schemaHistory(), m.retention(), m.epoch()));
+                m.schemaHistory(), m.retention(), m.epoch(), m.sourceReadAt(), m.sourceReadDurable()));
     }
 
     /**
@@ -101,6 +230,14 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         return existing == null ? List.of() : existing.snapshotCompletedTables();
     }
 
+    private static Map<String, ChainPosition> confirmedOf(ConsumerOffset existing) {
+        return existing == null ? Map.of() : existing.sinkAckedByTable();
+    }
+
+    private static ConsumerProgressKind kindOf(ConsumerOffset existing) {
+        return existing == null ? ConsumerProgressKind.LEGACY : existing.progressKind();
+    }
+
     @Override
     public synchronized void advanceConsumerReadSeq(
             String miningChainId, String pipelineId, String table, long lastReadSeq) {
@@ -115,7 +252,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
             }
         }
         Map<String, Long> perTable = new LinkedHashMap<>(existing == null ? Map.of() : existing.perTableSeq());
-        perTable.put(table, lastReadSeq);
+        perTable.merge(table, lastReadSeq, Math::max);
         ChainPosition ack = existing == null ? null : existing.sinkAcked();
         next.add(new ConsumerOffset(
                 pipelineId,
@@ -123,10 +260,10 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
                 ack,
                 completedOf(existing),
                 existing == null ? null : existing.cdcStartPosition(),
-                existing == null ? 0L : existing.snapshotEpoch()));
+                existing == null ? 0L : existing.snapshotEpoch(), confirmedOf(existing), kindOf(existing)));
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), m.sourceRead(), next,
-                m.schemaHistory(), m.retention(), m.epoch()));
+                m.schemaHistory(), m.retention(), m.epoch(), m.sourceReadAt(), m.sourceReadDurable()));
     }
 
     @Override
@@ -148,10 +285,10 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
                 position,
                 completedOf(existing),
                 existing == null ? null : existing.cdcStartPosition(),
-                existing == null ? 0L : existing.snapshotEpoch()));
+                existing == null ? 0L : existing.snapshotEpoch(), confirmedOf(existing), kindOf(existing)));
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), m.sourceRead(), next,
-                m.schemaHistory(), m.retention(), m.epoch()));
+                m.schemaHistory(), m.retention(), m.epoch(), m.sourceReadAt(), m.sourceReadDurable()));
     }
 
     @Override
@@ -182,10 +319,10 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
                 existing == null ? null : existing.sinkAcked(),
                 completedOf(existing),
                 cdcStartPosition,
-                snapshotEpoch));
+                snapshotEpoch, confirmedOf(existing), kindOf(existing)));
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), m.sourceRead(), next,
-                m.schemaHistory(), m.retention(), m.epoch()));
+                m.schemaHistory(), m.retention(), m.epoch(), m.sourceReadAt(), m.sourceReadDurable()));
     }
 
     @Override
@@ -194,7 +331,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         long opened = m.epoch() + 1;
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), m.sourceRead(), m.consumerOffsets(),
-                m.schemaHistory(), m.retention(), opened));
+                m.schemaHistory(), m.retention(), opened, m.sourceReadAt(), m.sourceReadDurable()));
         return opened;
     }
 
@@ -205,7 +342,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         next.add(version);
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), m.sourceRead(), m.consumerOffsets(),
-                next, m.retention(), m.epoch()));
+                next, m.retention(), m.epoch(), m.sourceReadAt(), m.sourceReadDurable()));
     }
 
     @Override
@@ -230,16 +367,16 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         consumers.add(new ConsumerOffset(pipelineId, mine == null ? Map.of() : mine.perTableSeq(),
                 mine == null ? null : mine.sinkAcked(), completed,
                 mine == null ? null : mine.cdcStartPosition(),
-                mine == null ? 0L : mine.snapshotEpoch()));
+                mine == null ? 0L : mine.snapshotEpoch(), confirmedOf(mine), kindOf(mine)));
         records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), consumers,
-                m.schemaHistory(), m.retention(), m.epoch()));
+                m.schemaHistory(), m.retention(), m.epoch(), m.sourceReadAt(), m.sourceReadDurable()));
     }
 
     @Override
     public synchronized List<String> miningChainIdsWithConsumer(String pipelineId) {
         List<String> chains = new ArrayList<>();
         records.forEach((chainId, m) -> {
-            if (m.consumerOffsets().stream().anyMatch(c -> c.pipelineId().equals(pipelineId))) {
+            if (m.consumerOffsets().stream().anyMatch(c -> SrsConsumerId.belongsTo(c.pipelineId(), pipelineId))) {
                 chains.add(chainId);
             }
         });
@@ -252,12 +389,35 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         records.remove(miningChainId);
         ringDone.remove(miningChainId);
         sinkWriters.remove(miningChainId);
+        captureTables.remove(miningChainId);
+        servingTables.remove(miningChainId);
+        servingEpoch.remove(miningChainId);
+        directCaptures.remove(miningChainId);
     }
 
     @Override
     public synchronized void advanceSinkAcked(
             String miningChainId, String pipelineId, String table, ChainPosition position) {
-        advanceSinkAcked(miningChainId, pipelineId, position);
+        SrsMeta m = require(miningChainId);
+        ConsumerOffset current = m.consumerOffset(pipelineId).orElse(null);
+        Map<String, ChainPosition> byTable = new LinkedHashMap<>(confirmedOf(current));
+        byTable.merge(table, position, (old, updated) ->
+                updated.order().compareTo(old.order()) > 0 ? updated : old);
+        ChainPosition aggregate = current == null ? null : current.sinkAcked();
+        SinkWriters configured = writers(miningChainId, pipelineId);
+        boolean activeDirect = directCapture(miningChainId, pipelineId) != null;
+        if (!activeDirect && ((configured == null && byTable.size() == 1
+                && (current == null || current.perTableSeq().size() <= 1))
+                || (configured != null && configured.expected.size() == 1))) {
+            aggregate = position;
+        } else if (kindOf(current) != ConsumerProgressKind.DIRECT_SOURCE
+                && aggregate != null && aggregate.order().seq() != SourceOrder.SNAPSHOT_SEQ) {
+            aggregate = null;
+        }
+        replaceConsumer(miningChainId, new ConsumerOffset(pipelineId,
+                current == null ? Map.of() : current.perTableSeq(), aggregate, completedOf(current),
+                current == null ? null : current.cdcStartPosition(), current == null ? 0L : current.snapshotEpoch(),
+                byTable, kindOf(current)));
         if (position.order().seq() >= 0) {
             ringDone.computeIfAbsent(miningChainId, chain -> new LinkedHashMap<>())
                     .computeIfAbsent(pipelineId, pipeline -> new LinkedHashMap<>())
@@ -278,12 +438,31 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     @Override
     public synchronized void configureSinkWriters(
             String miningChainId, String pipelineId, Map<String, List<String>> writerIdsByTable) {
+        configureSinkWriters(miningChainId, pipelineId, writerIdsByTable, ConsumerProgressKind.LEGACY);
+    }
+
+    @Override
+    public synchronized void configureSinkWriters(
+            String miningChainId, String pipelineId, Map<String, List<String>> writerIdsByTable,
+            ConsumerProgressKind kind) {
         SrsMeta meta = require(miningChainId);
+        String owningPipeline = SrsConsumerId.pipelineOf(pipelineId);
+        ConsumerOffset legacy = SrsConsumerId.sourceOf(pipelineId).isPresent()
+                ? meta.consumerOffset(owningPipeline).orElse(null) : null;
+        if (legacy != null && (legacy.sinkAcked() != null || !legacy.sinkAckedByTable().isEmpty()
+                || !legacy.snapshotCompletedTables().isEmpty())) {
+            long writerCount = writerIdsByTable.values().stream().flatMap(List::stream).distinct().count();
+            if (writerCount > 1) {
+                throw new TapstateException(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS,
+                        Map.of("pipeline", owningPipeline), null);
+            }
+            throw new TapstateException(IoError.SRS_PROGRESS_UNPROVEN, Map.of("pipeline", owningPipeline), null);
+        }
         if (meta.consumerOffset(pipelineId).isEmpty()) {
             List<ConsumerOffset> consumers = new ArrayList<>(meta.consumerOffsets());
             consumers.add(new ConsumerOffset(pipelineId, Map.of(), null));
             meta = new SrsMeta(meta.miningChainId(), meta.sourceRead(), consumers,
-                    meta.schemaHistory(), meta.retention(), meta.epoch());
+                    meta.schemaHistory(), meta.retention(), meta.epoch(), meta.sourceReadAt(), meta.sourceReadDurable());
             records.put(miningChainId, meta);
         }
         ConsumerOffset existing = meta.consumerOffset(pipelineId).orElse(null);
@@ -300,6 +479,9 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
             throw new TapstateException(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS,
                     Map.of("pipeline", pipelineId), null);
         }
+        replaceConsumer(miningChainId, new ConsumerOffset(pipelineId, existing.perTableSeq(), existing.sinkAcked(),
+                existing.snapshotCompletedTables(), existing.cdcStartPosition(), existing.snapshotEpoch(),
+                existing.sinkAckedByTable(), kind));
         SinkWriters writers = priorPlan != null
                 ? priorPlan
                 : sinkWriters.computeIfAbsent(miningChainId, ignored -> new LinkedHashMap<>())
@@ -310,7 +492,12 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
             for (String writerId : writerIds) {
                 WriterProgress progress = writerProgress(writers, writerId, table);
                 if (progress.acked == null && existing != null) {
-                    progress.acked = existing.sinkAcked();
+                    progress.acked = existing.sinkAckedByTable().get(table);
+                    if (progress.acked == null && (writerIdsByTable.size() == 1
+                            || (existing.sinkAcked() != null
+                                    && existing.sinkAcked().order().seq() == SourceOrder.SNAPSHOT_SEQ))) {
+                        progress.acked = existing.sinkAcked();
+                    }
                 }
                 if (progress.ringDone == null) {
                     progress.ringDone = completedRing.get(table);
@@ -333,6 +520,13 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
     }
 
     @Override
+    public synchronized void configureSinkWriters(
+            String miningChainId, String pipelineId, Map<String, List<String>> writerIdsByTable,
+            ConsumerProgressKind kind, WorkloadClaimFence fence) {
+        configureSinkWriters(miningChainId, pipelineId, writerIdsByTable, kind);
+    }
+
+    @Override
     public synchronized void advanceSinkWriterAcked(
             String miningChainId,
             String pipelineId,
@@ -350,10 +544,15 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
                     ? position.order().seq()
                     : Math.max(progress.ringDone, position.order().seq());
         }
+        derivedTableAck(writers, table).ifPresent(derived ->
+                advanceSinkAcked(miningChainId, pipelineId, table, derived));
         derivedAck(writers).ifPresent(derived -> {
             ConsumerOffset current = require(miningChainId).consumerOffset(pipelineId).orElse(null);
-            if (current == null || current.sinkAcked() == null
-                    || derived.order().compareTo(current.sinkAcked().order()) > 0) {
+            boolean comparable = directCapture(miningChainId, pipelineId) == null
+                    && (current.progressKind() == ConsumerProgressKind.DIRECT_SOURCE
+                            || writers.expected.size() == 1 || derived.order().seq() == SourceOrder.SNAPSHOT_SEQ);
+            if (comparable && (current.sinkAcked() == null
+                    || derived.order().compareTo(current.sinkAcked().order()) > 0)) {
                 advanceSinkAcked(miningChainId, pipelineId, derived);
             }
         });
@@ -361,6 +560,7 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
                 ringDone.computeIfAbsent(miningChainId, ignored -> new LinkedHashMap<>())
                         .computeIfAbsent(pipelineId, ignored -> new LinkedHashMap<>())
                         .merge(table, seq, Math::max));
+        advanceDirectCompletion(miningChainId, pipelineId);
     }
 
     @Override
@@ -441,6 +641,48 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
         }
     }
 
+    private void forgetDirectCapture(String miningChainId, String consumerId) {
+        Map<String, DirectCapture> captures = directCaptures.get(miningChainId);
+        if (captures != null) {
+            captures.remove(consumerId);
+        }
+    }
+
+    private DirectCapture directCapture(String miningChainId, String consumerId) {
+        return directCaptures.getOrDefault(miningChainId, Map.of()).get(consumerId);
+    }
+
+    private void advanceDirectCompletion(String miningChainId, String consumerId) {
+        DirectCapture capture = directCapture(miningChainId, consumerId);
+        SinkWriters writers = writers(miningChainId, consumerId);
+        if (capture == null || writers == null || require(miningChainId).epoch() != capture.epoch) {
+            return;
+        }
+        int completed = 0;
+        ChainPosition candidate = null;
+        for (DirectBatch batch : capture.pending) {
+            boolean settled = batch.position().order().epoch() == capture.epoch;
+            for (Map.Entry<String, Long> target : batch.targets().entrySet()) {
+                ChainPosition confirmed = derivedTableAck(writers, target.getKey()).orElse(null);
+                if (confirmed == null || confirmed.order().epoch() != capture.epoch
+                        || confirmed.order().seq() < target.getValue()) {
+                    settled = false;
+                    break;
+                }
+            }
+            if (!settled) {
+                break;
+            }
+            candidate = batch.position();
+            completed++;
+        }
+        if (candidate != null) {
+            advanceSinkAcked(miningChainId, consumerId, candidate);
+            advanceSourceReadOffset(miningChainId, candidate);
+            capture.pending.subList(0, completed).clear();
+        }
+    }
+
     @Override
     public synchronized void detachConsumer(String miningChainId, String pipelineId) {
         // Idempotent, unlike the advancing mutators: an absent chain already satisfies what a detach states.
@@ -449,14 +691,31 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
             return;
         }
         List<ConsumerOffset> next = new ArrayList<>(m.consumerOffsets());
-        next.removeIf(c -> c.pipelineId().equals(pipelineId));
-        forgetRingSeqs(miningChainId, pipelineId);
-        forgetSinkWriters(miningChainId, pipelineId);
+        boolean oneNode = SrsConsumerId.sourceOf(pipelineId).isPresent();
+        next.removeIf(c -> {
+            boolean remove = oneNode ? c.pipelineId().equals(pipelineId)
+                    : SrsConsumerId.belongsTo(c.pipelineId(), pipelineId);
+            if (remove) {
+                forgetRingSeqs(miningChainId, c.pipelineId());
+                forgetSinkWriters(miningChainId, c.pipelineId());
+                forgetDirectCapture(miningChainId, c.pipelineId());
+            }
+            return remove;
+        });
         // Every field but the departing consumer is carried across. The chain generation and every
         // staying consumer's snapshot state remain unchanged.
         records.put(miningChainId, new SrsMeta(
                 m.miningChainId(), m.sourceRead(), next,
-                m.schemaHistory(), m.retention(), m.epoch()));
+                m.schemaHistory(), m.retention(), m.epoch(), m.sourceReadAt(), m.sourceReadDurable()));
+    }
+
+    private void replaceConsumer(String miningChainId, ConsumerOffset replacement) {
+        SrsMeta meta = require(miningChainId);
+        List<ConsumerOffset> consumers = new ArrayList<>(meta.consumerOffsets());
+        consumers.removeIf(current -> current.pipelineId().equals(replacement.pipelineId()));
+        consumers.add(replacement);
+        records.put(miningChainId, new SrsMeta(meta.miningChainId(), meta.sourceRead(), consumers,
+                meta.schemaHistory(), meta.retention(), meta.epoch(), meta.sourceReadAt(), meta.sourceReadDurable()));
     }
 
     private SrsMeta require(String miningChainId) {
@@ -495,6 +754,20 @@ final class InMemorySrsMetaStore implements SrsMetaStore {
                 if (lowest == null || acked.order().compareTo(lowest.order()) < 0) {
                     lowest = acked;
                 }
+            }
+        }
+        return Optional.ofNullable(lowest);
+    }
+
+    private static Optional<ChainPosition> derivedTableAck(SinkWriters writers, String table) {
+        ChainPosition lowest = null;
+        for (String writerId : writers.expected.getOrDefault(table, List.of())) {
+            ChainPosition acked = writerProgress(writers, writerId, table).acked;
+            if (acked == null) {
+                return Optional.empty();
+            }
+            if (lowest == null || acked.order().compareTo(lowest.order()) < 0) {
+                lowest = acked;
             }
         }
         return Optional.ofNullable(lowest);

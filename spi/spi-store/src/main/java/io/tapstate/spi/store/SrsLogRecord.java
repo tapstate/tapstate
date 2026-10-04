@@ -23,6 +23,8 @@ import java.util.Objects;
  * {@code before}, an update both, a ddl neither. An absent image is null; a present one is a
  * shallow-unmodifiable defensive copy. A snapshot read (op {@code r}) never enters the change log and is
  * rejected here by construction, the same way the ring rejects it: the log holds what the ring held.
+ * The original capture {@code epoch} survives restart; zero means an older record never stored it and
+ * must not be interpreted as a proven replay generation.
  */
 public record SrsLogRecord(
         String srcToken,
@@ -31,7 +33,8 @@ public record SrsLogRecord(
         Map<String, Object> before,
         Map<String, Object> after,
         long schemaVer,
-        WorkloadClaimFence captureFence) {
+        WorkloadClaimFence captureFence,
+        long epoch) {
 
     public SrsLogRecord(
             String srcToken,
@@ -40,7 +43,31 @@ public record SrsLogRecord(
             Map<String, Object> before,
             Map<String, Object> after,
             long schemaVer) {
-        this(srcToken, op, ts, before, after, schemaVer, null);
+        this(srcToken, op, ts, before, after, schemaVer, null, 0L);
+    }
+
+    /** A record carrying its capture fence but no recorded original generation. */
+    public SrsLogRecord(
+            String srcToken,
+            Op op,
+            long ts,
+            Map<String, Object> before,
+            Map<String, Object> after,
+            long schemaVer,
+            WorkloadClaimFence captureFence) {
+        this(srcToken, op, ts, before, after, schemaVer, captureFence, 0L);
+    }
+
+    /** A record with its original capture generation and no capture fence. */
+    public SrsLogRecord(
+            String srcToken,
+            Op op,
+            long ts,
+            Map<String, Object> before,
+            Map<String, Object> after,
+            long schemaVer,
+            long epoch) {
+        this(srcToken, op, ts, before, after, schemaVer, null, epoch);
     }
 
     public SrsLogRecord {
@@ -50,6 +77,9 @@ public record SrsLogRecord(
         }
         if (schemaVer < 0) {
             throw new IllegalArgumentException("schemaVer must be non-negative");
+        }
+        if (epoch < 0) {
+            throw new IllegalArgumentException("epoch must be non-negative");
         }
         before = copyOrNull(before);
         after = copyOrNull(after);
