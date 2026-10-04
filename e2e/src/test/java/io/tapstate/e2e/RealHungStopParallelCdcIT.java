@@ -5,11 +5,14 @@ import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.MongoDesiredStore;
+import io.tapstate.adapters.mongostore.MongoObservationStore;
 import io.tapstate.adapters.mongostore.MongoStateStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.core.common.JsonReader;
+import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
+import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
@@ -34,7 +37,7 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** A native Jet teardown wait must leave another pipeline's CDC and observation moving. */
+/** A native start failure or teardown wait must leave another pipeline's CDC and observation moving. */
 @RequiresDocker
 @EnabledIfSystemProperty(named = "tapstate.e2e.hung-stop.jar", matches = ".+")
 class RealHungStopParallelCdcIT {
@@ -305,6 +308,158 @@ class RealHungStopParallelCdcIT {
             catch (RuntimeException writeFailure) { failure.addSuppressed(writeFailure); }
             throw failure;
         }
+    }
+
+    @Test
+    void aSchemaRejectedStartLeavesAnIndependentPipelineMoving() throws Exception {
+        Path jar = Path.of(required("jar")).toRealPath();
+        Path requested = Path.of(required("output"));
+        Path output = requested.resolveSibling(requested.getFileName() + ".failed-start-isolation.json");
+        PipelineBenchmarkLiveRunIT.requireSafeOutput(output, PipelineBenchmarkLiveRunIT.harnessRoot());
+        Map<String, Object> application = PipelineBenchmarkLiveRunIT.artifact(jar);
+        Map<String, Object> connectors = Map.of(
+                "mysql", PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor("mysql")),
+                "mongodb", PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor("mongodb")));
+        BenchmarkLiveReport report = new BenchmarkLiveReport(output);
+        report.begin(Map.of("purpose", "REAL_FAILED_START_PARALLEL_CDC",
+                        "application", application, "connectors", connectors),
+                Map.of("kind", "correctness-only", "pipelineCount", 2), List.of());
+        try {
+            String suffix = UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+            Map<String, Object> sourceA = SharedMySql.settings("failed_start_a_" + suffix);
+            Map<String, Object> sourceB = SharedMySql.settings("failed_start_b_" + suffix);
+            seedJoinSource(sourceA);
+            seed(sourceB);
+            String storeUri = SharedMongo.replicaSetUrl("failed_start_" + suffix + "_store");
+            String targetA = SharedMongo.replicaSetUrl("failed_start_" + suffix + "_target_a");
+            String targetB = SharedMongo.replicaSetUrl("failed_start_" + suffix + "_target_b");
+            try (MongoClient store = MongoClients.create(storeUri);
+                    MongoClient target = MongoClients.create(targetB);
+                    RealProcessServer server = RealProcessServer.start(
+                            storeUri, "failed_start_" + suffix + "_operator", jar)) {
+                MongoDatabase database = store.getDatabase(new ConnectionString(storeUri).getDatabase());
+                MongoDatabase targetDatabase = target.getDatabase(new ConnectionString(targetB).getDatabase());
+                MongoDesiredStore desired = new MongoDesiredStore(database.getCollection(MongoStorePort.PIPELINE_DESIRED));
+                MongoStateStore actual = new MongoStateStore(database.getCollection(MongoStorePort.PIPELINE_STATE));
+                MongoObservationStore latest = new MongoObservationStore(store,
+                        database.getCollection(MongoStorePort.PIPELINE_OBSERVATION),
+                        database.getCollection(MongoStorePort.PIPELINE_OBSERVATION_CHUNKS));
+                ControlPlane control = new ControlPlane(server.baseUrl());
+                control.bootstrapAndLogin("failed-start", "failed-start-password");
+                control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
+                control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+                Map<String, String> inputs = resources(sourceA, sourceB, targetA, targetB);
+                inputs.put("source_a.tap.yml", sourceYaml("source_a", sourceA)
+                        .replace("tables: [ orders ]", "tables: [ orders, customers ]"));
+                inputs.put("a.tap.yml", schemaRejectedPipelineYaml());
+                control.apply(inputs);
+                control.discoverSchema("source_a", "mysql", sourceA);
+                control.discoverSchema("source_b", "mysql", sourceB);
+                control.lifecycle(B, LifecycleVerb.START);
+                awaitRunning(control, B);
+                Await.until("B's real initial row", SETUP_WAIT,
+                        () -> targetAmount(targetDatabase) == 0L,
+                        () -> "B target=" + targetAmount(targetDatabase));
+                Progress initial = baseline(control, actual, targetDatabase);
+                ObservationStore.Scope bScope = latest.readStored(B).orElseThrow().scope().orElseThrow();
+                assertThat(executionGeneration(database, B)).isEqualTo(bScope.executionGeneration());
+                assertThat(initial.actual()).isEqualTo(PipelineState.RUNNING);
+                assertThat(desired.read(B).orElseThrow().targetState()).isEqualTo(PipelineState.RUNNING);
+                report.addFork(Map.of("action", "healthy-b-before-a-start", "progress", initial.evidence(),
+                        "scope", RebuildHandoffJdiSession.scopeEvidence(bScope)));
+
+                // The SQL parses, but deriving it against the real discovered columns refuses the start.
+                control.lifecycle(A, LifecycleVerb.START);
+                var failed = Await.answered("A's actual allocated FAILED scope and coded build refusal", SETUP_WAIT,
+                        () -> latest.readStored(A).filter(value -> value.scope().isPresent()
+                                && value.scope().orElseThrow().executionGeneration() > 0
+                                && value.scope().orElseThrow().executionGeneration() == executionGeneration(database, A)
+                                && value.observation().state() == PipelineState.FAILED
+                                && value.observation().failure() != null
+                                && actual.read(A).map(checkpoint -> StateJson.parse(checkpoint.stateJson()))
+                                        .filter(PipelineState.FAILED::equals).isPresent()));
+                assertThat(failed.observation().failure().code()).isEqualTo("actuation.join-sql-invalid");
+                assertThat(failed.observation().failure().params()).containsEntry("step", "widen").containsKey("detail");
+                assertThat(failed.observation().failure().params().get("detail")).containsIgnoringCase("no_such_column");
+                assertThat(control.state(A)).contains(PipelineState.FAILED);
+                assertThat(control.failureCode(A)).contains(failed.observation().failure().code());
+                assertThat(desired.read(A).orElseThrow().targetState()).isEqualTo(PipelineState.RUNNING);
+                ObservationStore.Scope aScope = failed.scope().orElseThrow();
+                report.addFork(Map.of("action", "actual-post-admission-start-failure",
+                        "scope", RebuildHandoffJdiSession.scopeEvidence(aScope),
+                        "code", failed.observation().failure().code(), "params", failed.observation().failure().params(),
+                        "observedAt", failed.observation().observedAt().toString()));
+
+                Progress previous = initial;
+                for (int update = 1; update <= 3; update++) {
+                    Progress advanced = advanceB(control, actual, sourceB, targetDatabase, previous, SETUP_WAIT);
+                    assertThat(advanced.actual()).isEqualTo(PipelineState.RUNNING);
+                    assertThat(advanced.reported()).isEqualTo(PipelineState.RUNNING);
+                    assertThat(desired.read(B).orElseThrow().targetState()).isEqualTo(PipelineState.RUNNING);
+                    assertThat(latest.readStored(B).orElseThrow().scope()).contains(bScope);
+                    assertThat(executionGeneration(database, B)).isEqualTo(bScope.executionGeneration());
+                    assertThat(actual.read(A).map(checkpoint -> StateJson.parse(checkpoint.stateJson())))
+                            .contains(PipelineState.FAILED);
+                    assertThat(control.failureCode(A)).contains(failed.observation().failure().code());
+                    assertThat(executionGeneration(database, A)).isEqualTo(aScope.executionGeneration());
+                    report.addFork(Map.of("action", "b-progress-after-a-start-failure", "update", update,
+                            "progress", advanced.evidence(), "scope", RebuildHandoffJdiSession.scopeEvidence(bScope)));
+                    previous = advanced;
+                }
+                assertThat(previous.targetAmount()).isEqualTo(3L);
+            }
+            assertThat(PipelineBenchmarkLiveRunIT.artifact(jar)).isEqualTo(application);
+            assertThat(PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor("mysql"))).isEqualTo(connectors.get("mysql"));
+            assertThat(PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor("mongodb"))).isEqualTo(connectors.get("mongodb"));
+            report.completeDiagnostic(Map.of("correctness", "REAL_CODED_START_FAILURE_DID_NOT_STOP_INDEPENDENT_CDC",
+                    "performanceAcceptanceEligible", false,
+                    "unverified", List.of("CLAIMED_START_FAILURE", "OTHER_LIFECYCLE_CAPACITY_WINDOWS", "PERFORMANCE_ACCEPTANCE")));
+        } catch (Exception | Error failure) {
+            try { report.fail(failure); }
+            catch (RuntimeException writeFailure) { failure.addSuppressed(writeFailure); }
+            throw failure;
+        }
+    }
+
+    private static long executionGeneration(MongoDatabase database, String pipelineId) {
+        Document claim = database.getCollection(MongoStorePort.WORKLOAD_CLAIMS)
+                .find(new Document("resourceType", "PIPELINE_ACTUATION").append("resourceId", pipelineId)).first();
+        if (claim == null || !(claim.get("executionGeneration") instanceof Number generation)) {
+            throw new AssertionError("the actual execution-generation document is absent for " + pipelineId);
+        }
+        return generation.longValue();
+    }
+
+    private static void seedJoinSource(Map<String, Object> source) throws Exception {
+        try (Connection connection = SharedMySql.connect(source);
+                Statement statement = connection.createStatement()) {
+            statement.execute("CREATE TABLE orders (id BIGINT PRIMARY KEY, seq BIGINT NOT NULL)");
+            statement.execute("CREATE TABLE customers (id BIGINT PRIMARY KEY, seq BIGINT NOT NULL)");
+            statement.execute("INSERT INTO orders (id, seq) VALUES (1, 1)");
+            statement.execute("INSERT INTO customers (id, seq) VALUES (1, 1)");
+        }
+    }
+
+    private static String schemaRejectedPipelineYaml() {
+        return """
+                version: tapstate/v1
+                kind: pipeline
+                id: %s
+                source: source_a
+                settings: { read_mode: snapshot_and_cdc }
+                transforms:
+                  - id: widen
+                    type: join
+                    from: { o: orders, c: customers }
+                    engine: builtin
+                    sql: >-
+                      SELECT o.id AS order_id, o.no_such_column AS missing, c.seq AS customer_seq
+                      FROM o LEFT JOIN c ON o.seq = c.id
+                serve:
+                  from: widen
+                  sync:
+                    - source: target_a
+                """.formatted(A);
     }
 
     private static Progress baseline(ControlPlane control, MongoStateStore actual, MongoDatabase target) {
