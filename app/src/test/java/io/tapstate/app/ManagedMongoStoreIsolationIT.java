@@ -4,10 +4,15 @@ import com.mongodb.MongoCommandException;
 import com.mongodb.MongoSecurityException;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.IndexOptions;
+import io.tapstate.adapters.mongostore.MigrationError;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.adapters.mongostore.StoreError;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.RateSample;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
@@ -30,9 +35,12 @@ import org.testcontainers.utility.DockerImageName;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
@@ -135,6 +143,165 @@ class ManagedMongoStoreIsolationIT {
 
     private ConfigurableApplicationContext start(String metadataUri, String clusterId) {
         return start(metadataUri, clusterId, new AtomicInteger());
+    }
+
+    @Test
+    void changingHistoryRetentionNeedsOnlyTheHistoryCollectionsAlterPrivilege() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String metadata = "isolation_ttl_" + suffix;
+        String user = "user_ttl_" + suffix;
+        long originalSeconds = Duration.ofDays(15).toSeconds();
+        long changedSeconds = Duration.ofDays(7).toSeconds();
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            createUser(admin, user, List.of(metadata, metadata + "_operator", metadata + "_views"));
+            MongoDatabase database = admin.getDatabase(metadata);
+            Instant observedAt = Instant.now().minusSeconds(60).truncatedTo(ChronoUnit.MILLIS);
+            RateSample sample = new RateSample("retention-proof", observedAt,
+                    Map.of("records.out", 3L), Map.of(), observedAt.minusSeconds(60));
+            try (ConfigurableApplicationContext first = start(uri(user, metadata), metadata)) {
+                first.getBean(StorePort.class).rateHistory().append(sample);
+            }
+            Document originalIndex = historyIndex(database);
+            Document originalCollection = historyCollection(database);
+            Document originalSample = SystemCollections.PIPELINE_RATE_HISTORY.on(database).find().first();
+            Document originalSource = SystemCollections.ARTIFACTS.on(database).find(new Document("_id", "views")).first();
+            assertThat(originalIndex.get("expireAfterSeconds", Number.class).longValue()).isEqualTo(originalSeconds);
+            try (ConfigurableApplicationContext unchanged = start(uri(user, metadata), metadata)) {
+                assertThat(unchanged.getBean(StorePort.class).rateHistory()
+                        .readPage(sample.pipelineId(), observedAt.minusSeconds(1), observedAt.plusSeconds(1), null, 1)
+                        .entries()).singleElement().satisfies(entry -> assertThat(entry.sample()).isEqualTo(sample));
+            }
+            try (MongoClient limited = MongoClients.create(uri(user, metadata))) {
+                assertThatThrownBy(() -> limited.getDatabase(metadata).runCommand(historyExpiry(changedSeconds)))
+                        .isInstanceOfSatisfying(MongoCommandException.class, error -> assertThat(error.getErrorCode()).isEqualTo(13));
+            }
+            AtomicInteger ready = new AtomicInteger();
+            Throwable failure = catchThrowable(() -> {
+                try (var unexpected = start(uri(user, metadata), metadata, ready,
+                        "--tapstate.metrics.history.retention=7d")) {
+                    throw new AssertionError("Cloud startup accepted an unchanged TTL under a changed retention");
+                }
+            });
+            assertThat(ready.get()).isZero();
+            assertThat(coded(failure)).isInstanceOfSatisfying(TapstateException.class, error -> {
+                assertThat(error.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                assertThat(error.args()).containsExactlyEntriesOf(Map.of("detail", "MongoCommandException code=13"));
+                assertThat(error.getCause()).isNull();
+            });
+            assertThat(historyIndex(database)).isEqualTo(originalIndex);
+            assertThat(historyCollection(database)).isEqualTo(originalCollection);
+            assertThat(SystemCollections.PIPELINE_RATE_HISTORY.on(database).find().first()).isEqualTo(originalSample);
+            assertThat(SystemCollections.ARTIFACTS.on(database).find(new Document("_id", "views")).first()).isEqualTo(originalSource);
+
+            String role = "alter_history_" + suffix;
+            database.runCommand(new Document("createRole", role).append("roles", List.of()).append("privileges", List.of(
+                    new Document("resource", new Document("db", metadata)
+                            .append("collection", SystemCollections.PIPELINE_RATE_HISTORY.collectionName()))
+                            .append("actions", List.of("collMod")))));
+            admin.getDatabase("admin").runCommand(new Document("grantRolesToUser", user).append("roles", List.of(
+                    new Document("role", role).append("db", metadata))));
+            database.getCollection("unrelated_history").createIndex(new Document("observedAt", 1),
+                    new IndexOptions().name("observedAt_idx").expireAfter(originalSeconds, TimeUnit.SECONDS));
+            try (MongoClient limited = MongoClients.create(uri(user, metadata))) {
+                assertThatThrownBy(() -> limited.getDatabase(metadata).runCommand(
+                        historyExpiry(changedSeconds).append("collMod", "unrelated_history")))
+                        .isInstanceOfSatisfying(MongoCommandException.class, error -> assertThat(error.getErrorCode()).isEqualTo(13));
+            }
+            AtomicInteger recoveredReady = new AtomicInteger();
+            try (ConfigurableApplicationContext recovered = start(uri(user, metadata), metadata, recoveredReady,
+                    "--tapstate.metrics.history.retention=7d")) {
+                assertThat(recoveredReady.get()).isEqualTo(1);
+                assertThat(recovered.getBean(StorePort.class).rateHistory().retention()).isEqualTo(Duration.ofDays(7));
+                assertThat(recovered.getBean(StorePort.class).rateHistory()
+                        .readPage(sample.pipelineId(), observedAt.minusSeconds(1), observedAt.plusSeconds(1), null, 1)
+                        .entries()).singleElement().satisfies(entry -> assertThat(entry.sample()).isEqualTo(sample));
+            }
+            Document expectedIndex = new Document(originalIndex).append("expireAfterSeconds", changedSeconds);
+            Document actualIndex = historyIndex(database);
+            assertThat(actualIndex.get("expireAfterSeconds", Number.class).longValue()).isEqualTo(changedSeconds);
+            // The server may store the altered expiry as an int rather than the original long.
+            assertThat(new Document(actualIndex).append("expireAfterSeconds", changedSeconds)).isEqualTo(expectedIndex);
+            assertThat(historyCollection(database)).isEqualTo(originalCollection);
+            assertThat(SystemCollections.PIPELINE_RATE_HISTORY.on(database).find().first()).isEqualTo(originalSample);
+            assertThat(SystemCollections.ARTIFACTS.on(database).find(new Document("_id", "views")).first()).isEqualTo(originalSource);
+            assertNoProbes(admin, metadata);
+        }
+    }
+
+    @Test
+    void missingMigrationIndexPrivilegeIsCodedWithoutTheDriverMessageOrCause() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String metadata = "isolation_migration_" + suffix;
+        String user = "user_migration_" + suffix;
+        String role = "without_create_index_" + suffix;
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            Document builtin = admin.getDatabase("admin").runCommand(new Document("rolesInfo",
+                    new Document("role", "readWrite").append("db", metadata)).append("showPrivileges", true))
+                    .getList("roles", Document.class).getFirst();
+            List<Document> privileges = builtin.getList("privileges", Document.class).stream()
+                    .map(privilege -> new Document(privilege).append("actions", privilege.getList("actions", String.class)
+                            .stream().filter(action -> !"createIndex".equals(action)).toList())).toList();
+            admin.getDatabase(metadata).runCommand(new Document("createRole", role)
+                    .append("roles", List.of()).append("privileges", privileges));
+            admin.getDatabase("admin").runCommand(new Document("createUser", user).append("pwd", PASSWORD).append("roles", List.of(
+                    new Document("role", role).append("db", metadata),
+                    new Document("role", "readWrite").append("db", metadata + "_operator"),
+                    new Document("role", "readWrite").append("db", metadata + "_views"))));
+            try (MongoClient limited = MongoClients.create(uri(user, metadata))) {
+                assertThatThrownBy(() -> limited.getDatabase(metadata).getCollection("index_denied")
+                        .createIndex(new Document("value", 1)))
+                        .isInstanceOfSatisfying(MongoCommandException.class, error -> assertThat(error.getErrorCode()).isEqualTo(13));
+            }
+            AtomicInteger ready = new AtomicInteger();
+            Throwable failure = catchThrowable(() -> {
+                try (var unexpected = start(uri(user, metadata), metadata, ready)) {
+                    throw new AssertionError("Cloud startup accepted a failed index migration");
+                }
+            });
+            assertThat(ready.get()).isZero();
+            assertThat(coded(failure)).isInstanceOfSatisfying(TapstateException.class, error -> {
+                assertThat(error.code()).isEqualTo(MigrationError.CHANGESET_FAILED);
+                assertThat(error.args()).containsExactlyEntriesOf(Map.of(
+                        "changeset", "V1BaselineIndexes", "cause", "MongoCommandException code=13"));
+                assertThat(error.getCause()).isNull();
+            });
+            Document schema = SystemCollections.SYSTEM_META.on(admin.getDatabase(metadata)).find(new Document("_id", "schema")).first();
+            assertThat(schema).doesNotContainKey("installedVersion");
+            assertThat(schema.get("lock", Document.class)).doesNotContainKeys("owner", "since", "heartbeat");
+            assertNoProbes(admin, metadata);
+
+            admin.getDatabase(metadata).runCommand(new Document("updateRole", role)
+                    .append("privileges", builtin.getList("privileges", Document.class)));
+            AtomicInteger recoveredReady = new AtomicInteger();
+            try (ConfigurableApplicationContext recovered = start(uri(user, metadata), metadata, recoveredReady)) {
+                assertThat(recoveredReady.get()).isEqualTo(1);
+                assertThat(recovered.getBean(StorePort.class).artifacts().get("views")).isPresent();
+            }
+            assertThat(SystemCollections.SYSTEM_META.on(admin.getDatabase(metadata)).find(new Document("_id", "schema"))
+                    .first().getInteger("installedVersion"))
+                    .isEqualTo(io.tapstate.adapters.mongostore.migration.MigrationRunner.SUPPORTED_VERSION);
+            assertNoProbes(admin, metadata);
+        }
+    }
+
+    private static Throwable coded(Throwable failure) {
+        Throwable current = failure;
+        for (int depth = 0; depth < 16 && current != null && !(current instanceof TapstateException); depth++) current = current.getCause();
+        return current;
+    }
+
+    private static Document historyExpiry(long seconds) {
+        return new Document("collMod", SystemCollections.PIPELINE_RATE_HISTORY.collectionName())
+                .append("index", new Document("name", "observedAt_idx").append("expireAfterSeconds", seconds));
+    }
+
+    private static Document historyIndex(MongoDatabase database) {
+        return SystemCollections.PIPELINE_RATE_HISTORY.on(database).listIndexes().into(new ArrayList<>()).stream()
+                .filter(index -> "observedAt_idx".equals(index.getString("name"))).findFirst().orElseThrow();
+    }
+
+    private static Document historyCollection(MongoDatabase database) {
+        return database.listCollections().filter(new Document("name", SystemCollections.PIPELINE_RATE_HISTORY.collectionName())).first();
     }
 
     @Test
@@ -257,7 +424,7 @@ class ManagedMongoStoreIsolationIT {
         }
     }
 
-    private ConfigurableApplicationContext start(String metadataUri, String clusterId, AtomicInteger ready) {
+    private ConfigurableApplicationContext start(String metadataUri, String clusterId, AtomicInteger ready, String... overrides) {
         List<String> args = new ArrayList<>(List.of("--server.address=127.0.0.1", "--server.port=0",
                 "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2", "--logging.level.root=ERROR",
                 "--SDK_STATUS_SENDER_ENABLED=false", "--tapstate.store.mongo.server-selection-timeout=2s",
@@ -265,6 +432,7 @@ class ManagedMongoStoreIsolationIT {
                 "--tapstate.connectors.seed-dir=" + CloudConnectorTestInputs.seedDirectory(),
                 "--tapstate.cloud.base-url=https://cloud.example.invalid", "--tapstate.cloud.token=controlled-sdk-token",
                 "--tapstate.cloud.cluster-id=" + clusterId, "--tapstate.cloud.atlas-uri=" + metadataUri));
+        args.addAll(List.of(overrides));
         return new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated())
                 .listeners((ApplicationListener<ApplicationReadyEvent>) event -> ready.incrementAndGet())
                 .run(args.toArray(String[]::new));
