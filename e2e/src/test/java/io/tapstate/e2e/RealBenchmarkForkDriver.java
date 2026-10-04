@@ -53,11 +53,23 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     Map<String, Long> declaredSourceCoverage,
                     Map<String, Long> observedTargetCoverage,
                     String checksum, long errorTotal,
+                    List<Map<String, Object>> terminalMetaReceipts,
                     Optional<BenchmarkJdiTelemetrySession.Evidence> telemetry) {
+        Evidence(String forkId, BenchmarkWorkloadDefinitions.Workload workload,
+                PipelineBenchmarkComparison.Arm arm, Path applicationJar,
+                List<MeasuredPhase> phases, BenchmarkResourceSampler.Summary resources,
+                BenchmarkMongoCommandSampler.Summary mongoCommands,
+                Map<String, Long> declaredSourceCoverage, Map<String, Long> observedTargetCoverage,
+                String checksum, long errorTotal, Optional<BenchmarkJdiTelemetrySession.Evidence> telemetry) {
+            this(forkId, workload, arm, applicationJar, phases, resources, mongoCommands,
+                    declaredSourceCoverage, observedTargetCoverage, checksum, errorTotal, List.of(), telemetry);
+        }
+
         Evidence {
             phases = List.copyOf(phases);
             declaredSourceCoverage = Map.copyOf(declaredSourceCoverage);
             observedTargetCoverage = Map.copyOf(observedTargetCoverage);
+            terminalMetaReceipts = List.copyOf(terminalMetaReceipts);
             Objects.requireNonNull(telemetry, "telemetry availability");
         }
     }
@@ -199,9 +211,22 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 long[] latencies = allDurations.stream().mapToLong(Long::longValue).toArray();
                 PipelineBenchmarkComparison.Fork performance = new PipelineBenchmarkComparison.Fork(
                         arm, throughput, latencies, resources.peakHeapBytes(), resources.peakRssBytes());
+                List<Map<String, Object>> receipts = new ArrayList<>();
+                // All measured ACK, resource and command windows have already closed.
+                try (StoreDocuments documents = StoreDocuments.at(fork.storeUri())) {
+                    Map<String, ControlPlane.PositionRead> positions = new LinkedHashMap<>();
+                    for (BenchmarkWorkloadDefinitions.SourceChain chain : workload.sourceChains()) {
+                        ControlPlane.PositionRead position = positions.computeIfAbsent(
+                                chain.pipelineId(), fork.control()::positionRead);
+                        BenchmarkAckOracle.SourceChain proof = chains.stream()
+                                .filter(candidate -> candidate.id().equals(chain.id())).findFirst().orElseThrow();
+                        receipts.add(BenchmarkTerminalMetaReceipt.read(documents, position, chain,
+                                proof.sourceTerminals().getFirst().sourcePosition(), positionCoverage));
+                    }
+                }
                 Evidence run = new Evidence(forkId, workload, arm, applicationJar,
                         measured, resources, mongoCommands,
-                        declaredSourceCoverage, observedTargetCoverage, checksum, errorTotal,
+                        declaredSourceCoverage, observedTargetCoverage, checksum, errorTotal, receipts,
                         fork.finishTelemetryCapture());
                 evidence.add(run);
                 return new PipelineBenchmarkHarness.ForkResult(performance, correctness);

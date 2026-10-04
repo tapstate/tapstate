@@ -45,6 +45,13 @@ final class TwoMemberCluster implements AutoCloseable {
     /** Membership is committed through the coordination store, so it converges rather than being instant. */
     private static final Duration JOIN_BUDGET = Duration.ofSeconds(90);
 
+    /** An owned member launch can add passive observation while preserving the cluster arguments. */
+    @FunctionalInterface
+    interface MemberLauncher {
+        RealProcessServer start(String nodeId, String listenAddress,
+                IntFunction<List<String>> applicationArguments, List<String> jvmArguments);
+    }
+
     private final RealProcessServer first;
     private final RealProcessServer second;
     private final ControlPlane a;
@@ -152,6 +159,17 @@ final class TwoMemberCluster implements AutoCloseable {
     static TwoMemberCluster start(String storeUri, String operatorStateDatabase, Path applicationJar,
             String clusterId, String administrator, String password,
             List<String> firstJvmArguments, List<String> secondJvmArguments) {
+        return start(storeUri, operatorStateDatabase, applicationJar, clusterId, administrator, password,
+                firstJvmArguments, secondJvmArguments, (nodeId, listenAddress, arguments, jvmArguments) ->
+                        RealProcessServer.start(storeUri, operatorStateDatabase, applicationJar, listenAddress,
+                                arguments, jvmArguments));
+    }
+
+    /** Keeps the member topology and login contract while callers own each observed process. */
+    static TwoMemberCluster start(String storeUri, String operatorStateDatabase, Path applicationJar,
+            String clusterId, String administrator, String password,
+            List<String> firstJvmArguments, List<String> secondJvmArguments, MemberLauncher launcher) {
+        Objects.requireNonNull(launcher, "launcher");
         Objects.requireNonNull(applicationJar, "applicationJar");
         Objects.requireNonNull(operatorStateDatabase, "operatorStateDatabase");
         Objects.requireNonNull(clusterId, "clusterId");
@@ -164,17 +182,23 @@ final class TwoMemberCluster implements AutoCloseable {
         int memberPortA = RealProcessServer.reservePort();
         int memberPortB = RealProcessServer.reservePort();
         String seeds = bindAddress + ":" + memberPortA + "," + bindAddress + ":" + memberPortB;
-        RealProcessServer first = RealProcessServer.start(storeUri, operatorStateDatabase, applicationJar, "0.0.0.0",
-                httpPort -> arguments(clusterId, NODE_A, memberPortA, seeds, httpPort, bindAddress, null),
-                firstJvmArguments);
+        RealProcessServer first = null;
         RealProcessServer second;
         try {
-            second = RealProcessServer.start(storeUri, operatorStateDatabase, applicationJar, "0.0.0.0",
+            first = launcher.start(NODE_A, "0.0.0.0",
+                    httpPort -> arguments(clusterId, NODE_A, memberPortA, seeds, httpPort, bindAddress, null),
+                    firstJvmArguments);
+            second = launcher.start(NODE_B, "0.0.0.0",
                     httpPort -> arguments(clusterId, NODE_B, memberPortB, seeds, httpPort, bindAddress, null),
                     secondJvmArguments);
         } catch (RuntimeException | Error failure) {
-            first.close();
+            if (first != null) {
+                first.close();
+            }
             throw failure;
+        } finally {
+            RealProcessServer.releasePort(memberPortA);
+            RealProcessServer.releasePort(memberPortB);
         }
         TwoMemberCluster cluster = new TwoMemberCluster(first, second, storeUri, clusterId, bindAddress,
                 seeds, null, applicationJar, operatorStateDatabase, administrator, password);

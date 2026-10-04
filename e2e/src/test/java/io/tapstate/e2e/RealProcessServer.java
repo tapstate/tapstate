@@ -211,6 +211,13 @@ final class RealProcessServer implements ServerHandle {
                 port -> applicationOptions, List.copyOf(jvmArguments));
     }
 
+    /** Starts an explicit member without waiting, so its observer can accept the suspended debug VM. */
+    static RealProcessServer launchingWithJvmArguments(String storeUri, String operatorStateDatabase, Path jar,
+            String listenAddress, IntFunction<List<String>> applicationArguments, List<String> jvmArguments) {
+        return launching(storeUri, operatorStateDatabase, jar, listenAddress,
+                List.copyOf(jvmArguments), applicationArguments);
+    }
+
     /**
      * The same, listening on {@code listenAddress} rather than the loopback, with the jar this reactor
      * built -- what a member of a cluster needs, since one that binds the loopback is refused.

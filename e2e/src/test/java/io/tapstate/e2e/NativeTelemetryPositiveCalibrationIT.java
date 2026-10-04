@@ -207,19 +207,19 @@ class NativeTelemetryPositiveCalibrationIT {
         }
     }
 
-    private static boolean has(List<Map<String, Object>> records, String target,
+    static boolean has(List<Map<String, Object>> records, String target,
             NativeTelemetryIdentityJdiSession.AuthorityReceipt receipt) {
         return records.stream().anyMatch(record -> target.equals(record.get("target"))
                 && receipt.scope().equals(record.get("scope")) && Boolean.TRUE.equals(record.get("normalReturn"))
                 && !record.containsKey("decoderStatus"));
     }
-    private static boolean flag(List<Map<String, Object>> records, String target, String field,
+    static boolean flag(List<Map<String, Object>> records, String target, String field,
             NativeTelemetryIdentityJdiSession.AuthorityReceipt receipt) {
         return records.stream().anyMatch(record -> target.equals(record.get("target"))
                 && receipt.scope().equals(record.get("scope")) && Boolean.TRUE.equals(record.get("normalReturn"))
                 && Boolean.TRUE.equals(record.get(field)) && !record.containsKey("decoderStatus"));
     }
-    private static boolean positiveProduced(Map<String, Object> record) {
+    static boolean positiveProduced(Map<String, Object> record) {
         if (record.containsKey("decoderStatus") || !(record.get("metrics") instanceof List<?> metrics)
                 || !(record.get("includedFrames") instanceof List<?> included) || included.isEmpty()) { return false; }
         return metrics.stream().filter(Map.class::isInstance).map(Map.class::cast).anyMatch(metric ->
@@ -230,7 +230,7 @@ class NativeTelemetryPositiveCalibrationIT {
                                         && point.get("attributes") instanceof Map<?, ?> attributes
                                         && "out".equals(attributes.get("direction"))));
     }
-    private static boolean positiveScrape(String body, String pipeline) {
+    static boolean positiveScrape(String body, String pipeline) {
         return body.lines().filter(line -> line.startsWith("tapstate_pipeline_records_total{"))
                 .filter(line -> line.contains("tapstate_pipeline_id=\"" + pipeline + "\"")
                         && line.contains("direction=\"out\"")).anyMatch(line -> {
@@ -240,7 +240,7 @@ class NativeTelemetryPositiveCalibrationIT {
                             return new java.math.BigDecimal(value).signum() > 0;
                         });
     }
-    private static boolean matchingProduced(List<Map<String, Object>> records, String body,
+    static boolean matchingProduced(List<Map<String, Object>> records, String body,
             NativeTelemetryIdentityJdiSession.AuthorityReceipt receipt) {
         for (Map<String, Object> record : records) {
             if (!"PRODUCE".equals(record.get("target")) || !positiveProduced(record)
@@ -313,7 +313,7 @@ class NativeTelemetryPositiveCalibrationIT {
         String label = name + "=\"" + escaped + "\"";
         return line.startsWith("tapstate_pipeline_records_total{" + label) || line.contains("," + label);
     }
-    private static Map<String, Object> assertScopedLogRead(List<Map<String, Object>> observed, HttpClient http,
+    static Map<String, Object> assertScopedLogRead(List<Map<String, Object>> observed, HttpClient http,
             ControlPlane control, URI base, NativeTelemetryIdentityJdiSession.AuthorityReceipt receipt) throws Exception {
         var response = http.send(HttpRequest.newBuilder(base.resolve(
                 "/api/pipelines/" + receipt.pipelineId() + "/logs?scope=current")).timeout(Duration.ofSeconds(20))
@@ -340,7 +340,7 @@ class NativeTelemetryPositiveCalibrationIT {
                 "bodySha256", digest(response.body().getBytes(StandardCharsets.UTF_8)),
                 "incarnation", receipt.incarnation(), "generation", receipt.generation());
     }
-    private static String scrape(HttpClient http, URI endpoint, long deadline) throws Exception {
+    static String scrape(HttpClient http, URI endpoint, long deadline) throws Exception {
         long left = deadline - System.nanoTime();
         assertThat(left).as("the calibration uses one original wait budget").isPositive();
         Duration timeout = Duration.ofNanos(Math.min(left, Duration.ofSeconds(20).toNanos()));

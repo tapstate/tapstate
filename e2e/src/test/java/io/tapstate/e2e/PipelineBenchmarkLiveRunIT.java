@@ -343,6 +343,7 @@ class PipelineBenchmarkLiveRunIT {
                 "declaredSourceCoverage", evidence.declaredSourceCoverage(),
                 "observedTargetCoverage", evidence.observedTargetCoverage(),
                 "logicalCoverage", correctness.logicalCoverage(),
+                "terminalMetaReceipts", evidence.terminalMetaReceipts(),
                 "sourceChains", correctness.chains().stream().map(chain -> object(
                         "id", chain.id(), "authoritativeTargetAck", chain.authoritativeTargetAck(),
                         "sourceTerminals", chain.sourceTerminals().stream().map(event -> object(

@@ -97,6 +97,9 @@ class ARestartKeepsAViewMaterializingIT {
                 ControlPlane control = new ControlPlane(second.baseUrl());
                 control.login("e2e", "e2e-password");
 
+                Await.until("the adopted view pipeline to publish its current running observation",
+                        () -> control.state(PIPELINE_ID).filter(PipelineState.RUNNING::equals).isPresent(),
+                        () -> "state=" + control.state(PIPELINE_ID) + ", logs=" + control.logs(PIPELINE_ID));
                 assertThat(control.state(PIPELINE_ID))
                         .as("the pipeline the restarted server adopted from the store it read")
                         .contains(PipelineState.RUNNING);

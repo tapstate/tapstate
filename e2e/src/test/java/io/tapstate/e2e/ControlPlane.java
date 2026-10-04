@@ -1739,9 +1739,12 @@ final class ControlPlane {
             throw new IllegalArgumentException("a benchmark source chain is required");
         }
         String pipelineId = sourceChain.pipelineId();
+        return resolveTargetAckIfPresent(positionRead(pipelineId), sourceChain);
+    }
+
+    PositionRead positionRead(String pipelineId) {
         HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/position"));
-        return resolveTargetAckIfPresent(
-                interpretPositionRead(response.statusCode(), response.body(), pipelineId), sourceChain);
+        return interpretPositionRead(response.statusCode(), response.body(), pipelineId);
     }
 
     record PositionChain(String chainId, String sourceId, List<String> tables, String targetAckedToken) {
@@ -1750,9 +1753,12 @@ final class ControlPlane {
         }
     }
 
-    record PositionRead(String pipelineId, List<PositionChain> chains) {
+    record PositionRead(String pipelineId, List<PositionChain> chains, String observedDocument) {
         PositionRead {
             chains = List.copyOf(chains);
+        }
+        PositionRead(String pipelineId, List<PositionChain> chains) {
+            this(pipelineId, chains, null);
         }
     }
 
@@ -1804,7 +1810,7 @@ final class ControlPlane {
             }
             chains.add(new PositionChain(chainId, sourceId, tables, token));
         }
-        return new PositionRead(pipelineId, chains);
+        return new PositionRead(pipelineId, chains, body);
     }
 
     /** Refuses to attribute a different source's ACK to this benchmark chain. */
