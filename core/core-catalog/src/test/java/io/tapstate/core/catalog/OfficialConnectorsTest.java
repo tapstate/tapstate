@@ -66,8 +66,13 @@ class OfficialConnectorsTest {
         // A preview is accepted without a verified database behind it. Listed under a kind as well, it
         // would quietly pick up that kind's verification promise, which no release lane keeps for it.
         assertThat(OfficialConnectors.PREVIEW_IDS).containsExactly("db2");
-        OfficialConnectors.IDS_BY_DATABASE_KIND.values().forEach(ids ->
-                assertThat(ids).doesNotContainAnyElementsOf(OfficialConnectors.PREVIEW_IDS));
+        // Flattened and pinned first: over an empty set of kinds, "contains no preview" holds trivially.
+        List<String> idsUnderAKind = OfficialConnectors.IDS_BY_DATABASE_KIND.values().stream()
+                .flatMap(List::stream)
+                .toList();
+        assertThat(idsUnderAKind)
+                .contains("mysql", "sqlserver")
+                .doesNotContainAnyElementsOf(OfficialConnectors.PREVIEW_IDS);
         assertThat(OfficialConnectors.IDS).endsWith(OfficialConnectors.PREVIEW_IDS.toArray(String[]::new));
         assertThat(OfficialConnectors.isOfficial("db2")).isTrue();
     }
