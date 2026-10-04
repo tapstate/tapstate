@@ -19,6 +19,7 @@ import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Vertex;
 import com.hazelcast.jet.core.Watermark;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
+import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.FromClause;
@@ -55,6 +56,7 @@ import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.ConsumerProgressKind;
 import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceField;
@@ -112,6 +114,7 @@ class CaptureToSinkAckFrontierTest {
 
     private HazelcastInstance member;
     private InMemorySrsLogStore log;
+    private StoreBackedPipelineCaptureCoordinator coordinator;
 
     @BeforeEach
     void startMember() {
@@ -139,6 +142,9 @@ class CaptureToSinkAckFrontierTest {
 
     @AfterEach
     void stopMember() {
+        if (coordinator != null) {
+            coordinator.close();
+        }
         if (member != null) {
             member.shutdown();
         }
@@ -195,6 +201,84 @@ class CaptureToSinkAckFrontierTest {
         }
 
         assertThat(gatedSource.cdcClosed).as("stop closes the capture subscription").isTrue();
+    }
+
+    @Test
+    void singleMemberRetiresSinkConfirmedChangesWithoutAnotherPipelineStarting() {
+        InMemoryStorePort store = seedStore();
+        GatedSource source = new GatedSource();
+        LifecycleActuator actuator = wireRuntime(store, source, UnaryOperator.identity());
+        SourceCaptureResolution resolution = SourceCaptureResolution.of(
+                StoredArtifacts.requireSource(store.artifacts(), SOURCE_ID));
+        String chainId = resolution.chainId().value();
+        String ring = resolution.ringName(TABLE);
+
+        actuator.start(PIPELINE);
+        try {
+            source.feed(change(0));
+            awaitSinkSize(1);
+            source.feed(change(1));
+            awaitSinkSize(2);
+            awaitSinkAck(store.meta(), chainId, "src-1");
+
+            awaitLogTrimmed(ring, 1L);
+            assertThat(log.load(ring, 0L)).isEmpty();
+            assertThat(log.load(ring, 1L)).isEmpty();
+            assertThat(log.largestSequence(ring)).isEqualTo(1L);
+
+            source.feed(change(2));
+            awaitSinkAck(store.meta(), chainId, "src-2");
+            awaitLogTrimmed(ring, 2L);
+            assertThat(log.load(ring, 2L)).isEmpty();
+            assertThat(log.largestSequence(ring)).isEqualTo(2L);
+            assertThat(source.starts).hasSize(1);
+            assertThat(source.activeSubscriptions()).isEqualTo(1L);
+        } finally {
+            actuator.stop(PIPELINE, true);
+        }
+    }
+
+    @Test
+    void singleMemberRetainsChangesUntilEveryConsumerConfirms() {
+        InMemoryStorePort store = seedStore();
+        GatedSource source = new GatedSource();
+        LifecycleActuator actuator = wireRuntime(store, source, UnaryOperator.identity());
+        SourceCaptureResolution resolution = SourceCaptureResolution.of(
+                StoredArtifacts.requireSource(store.artifacts(), SOURCE_ID));
+        String chainId = resolution.chainId().value();
+        String ring = resolution.ringName(TABLE);
+        String slowConsumer = SrsConsumerId.of("paused_peer", SOURCE_ID).value();
+
+        actuator.start(PIPELINE);
+        try {
+            store.meta().upsertConsumerOffset(chainId, new ConsumerOffset(slowConsumer,
+                    Map.of(TABLE, -1L), null, List.of(), null, 0L, Map.of(), ConsumerProgressKind.SRS));
+            store.meta().startRingAfter(chainId, slowConsumer, TABLE, -1L);
+            source.feed(change(0));
+            awaitSinkSize(1);
+            source.feed(change(1));
+            awaitSinkSize(2);
+            awaitSinkAck(store.meta(), chainId, "src-1");
+
+            // The peer's read cursor reaches the second change while its sink confirms only the first.
+            long epoch = store.meta().read(chainId).orElseThrow().epoch();
+            store.meta().advanceConsumerReadSeq(chainId, slowConsumer, TABLE, 1L);
+            store.meta().advanceSinkAcked(chainId, slowConsumer, TABLE,
+                    new ChainPosition(new SourceOrder(epoch, 0L), "src-0"));
+
+            awaitLogTrimmed(ring, 0L);
+            assertThat(log.load(ring, 0L)).isEmpty();
+            assertThat(log.load(ring, 1L)).isPresent();
+            assertThat(log.largestSequence(ring)).isEqualTo(1L);
+
+            store.meta().advanceSinkAcked(chainId, slowConsumer, TABLE,
+                    new ChainPosition(new SourceOrder(epoch, 1L), "src-1"));
+            awaitLogTrimmed(ring, 1L);
+            assertThat(log.load(ring, 1L)).isEmpty();
+            assertThat(source.starts).hasSize(1);
+        } finally {
+            actuator.stop(PIPELINE, true);
+        }
     }
 
     @Test
@@ -342,8 +426,8 @@ class CaptureToSinkAckFrontierTest {
 
         SrsCoordinator srsCoordinator = new SrsCoordinator(meta);
         CaptureRunUnit captureRunUnit = new CaptureRunUnit(gatedSource, srsCoordinator, meta, member);
-        PipelineCaptureCoordinator coordinator =
-                new StoreBackedPipelineCaptureCoordinator(store, captureRunUnit::start, srsCoordinator, snapshotBuffer);
+        coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, captureRunUnit::start, srsCoordinator, snapshotBuffer);
 
         StoreBackedDagSource.SinkWriterBinder capturingSink =
                 (connectorId, settings, writeMode, ddl, target, node) -> (SupplierEx<SinkWriter>) CapturingSinkWriter::new;
@@ -459,6 +543,18 @@ class CaptureToSinkAckFrontierTest {
             }
             park();
         }
+    }
+
+    private void awaitLogTrimmed(String ring, long through) {
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        while (log.bounds(ring).trimmedThrough() < through) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("timed out waiting for durable log retirement through " + through
+                        + ", bounds=" + log.bounds(ring));
+            }
+            park();
+        }
+        assertThat(log.bounds(ring).trimmedThrough()).isEqualTo(through);
     }
 
     /** Waits for the chain's own record of how far its source has been read to reach {@code expected}. */

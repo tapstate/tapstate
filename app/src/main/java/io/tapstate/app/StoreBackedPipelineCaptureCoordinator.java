@@ -98,7 +98,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     private final Map<CaptureId, RingWait> ringWaits = new LinkedHashMap<>();
     private final Map<CaptureId, RingWait> servingWaits = new LinkedHashMap<>();
 
-    /** Looks for ownerless captures and table requests current readers must serve. */
+    /** Looks for ownerless captures and maintains shared readers, including durable-log retirement. */
     private ScheduledExecutorService takeovers;
 
     /** How far each running pipeline's load has got, keyed by pipeline; dropped when it stops. */
@@ -570,7 +570,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     private void lookForCapturesNobodyTails() {
-        if (takeovers != null || claimRenewInterval.isZero()) {
+        if (takeovers != null) {
             return;
         }
         takeovers = Executors.newSingleThreadScheduledExecutor(runnable -> {
@@ -578,7 +578,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             thread.setDaemon(true);
             return thread;
         });
-        long every = claimRenewInterval.toMillis();
+        // Shared readers retire confirmed history even when a single member has no claim to renew.
+        long every = claimRenewInterval.isZero() ? TimeUnit.SECONDS.toMillis(1) : claimRenewInterval.toMillis();
         takeovers.scheduleWithFixedDelay(() -> {
             try {
                 tailWhatNobodyTails();
@@ -602,7 +603,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         }
     }
 
-    /** Remote members request tables through metadata; the owner serves them on its existing schedule. */
+    /** Serves requested tables and retires confirmed history on every owner's maintenance schedule. */
     synchronized void widenTheReadersHere() {
         for (OwnedCapture owned : ownedCaptures.values()) {
             try {
@@ -614,7 +615,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         }
     }
 
-    /** Stops looking for captures to take over. What this member already tails is its stops' to close. */
+    /** Stops capture maintenance. What this member already tails is its stops' to close. */
     public synchronized void close() {
         if (takeovers != null) {
             takeovers.shutdownNow();
