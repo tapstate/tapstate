@@ -10,13 +10,13 @@ import java.util.Objects;
 
 /**
  * Stable identity of one normalized source/read contract, shared by every pipeline using it.
- * Pipeline/source node identity is deliberately excluded. A shared-ring tail is owned once per physical
- * mining chain, regardless of each pipeline's selected table subset; snapshot-only and direct reads still
- * include their selected streams and node identity because those reads belong to their own pipelines.
+ * Pipeline/source node identity is deliberately excluded from a shared tail: every table selection on
+ * one physical mining chain is served by the same capture. Bounded and direct reads name their streams
+ * because they read only that selection and belong to their own pipeline/source node.
  *
- * <p>A direct tail streams only to the pipeline that opened it, and a snapshot carries that pipeline's
- * own bounded rows. Their identities therefore name the pipeline and source; only the ring-backed CDC
- * tail has an output that another pipeline can attach to.
+ * <p>A direct tail -- one with the shared ring switched off -- streams to the pipeline that opened it
+ * and writes nothing anybody else could read. A bounded snapshot carries that pipeline's own rows.
+ * Their identities therefore name the pipeline and source, so each pipeline holds its own capture.
  */
 public record CaptureId(String value) {
 
@@ -37,19 +37,18 @@ public record CaptureId(String value) {
     public static CaptureId of(CaptureRunSpec spec) {
         Objects.requireNonNull(spec, "spec");
         if (spec.readMode() == ReadMode.SNAPSHOT_ONLY) {
-            return of(spec.config(), spec.srsKey(), "snapshot:" + nodeIdentity(spec), true);
+            String reader = Objects.requireNonNull(spec.pipelineId(), "spec.pipelineId");
+            String source = Objects.requireNonNull(spec.sourceId(), "spec.sourceId");
+            return of(spec.config(), spec.srsKey(), "snapshot:"
+                    + reader.length() + ':' + reader + '|' + source.length() + ':' + source, true);
         }
         if (spec.srsEnabled()) {
             return of(spec.config(), spec.srsKey(), "tail:ring", false);
         }
-        return of(spec.config(), spec.srsKey(), "tail:direct:" + directStart(spec.startFrom())
-                + '|' + nodeIdentity(spec), true);
-    }
-
-    private static String nodeIdentity(CaptureRunSpec spec) {
         String reader = Objects.requireNonNull(spec.pipelineId(), "spec.pipelineId");
         String source = Objects.requireNonNull(spec.sourceId(), "spec.sourceId");
-        return reader.length() + ":" + reader + '|' + source.length() + ':' + source;
+        return of(spec.config(), spec.srsKey(), "tail:direct:" + directStart(spec.startFrom())
+                + '|' + reader.length() + ':' + reader + '|' + source.length() + ':' + source, true);
     }
 
     private static String directStart(StartFrom startFrom) {
@@ -60,12 +59,11 @@ public record CaptureId(String value) {
         };
     }
 
-    private static CaptureId of(CaptureConfig config, String srsKey, String readAxis,
-            boolean includeStreams) {
+    private static CaptureId of(CaptureConfig config, String srsKey, String readAxis, boolean namesStreams) {
         Objects.requireNonNull(config, "config");
         StringBuilder contract = new StringBuilder(MiningChainId.resolve(config, srsKey).value())
                 .append('|').append(readAxis);
-        if (includeStreams) {
+        if (namesStreams) {
             List<String> streams = new ArrayList<>(Objects.requireNonNull(config.streams(), "config.streams"));
             streams.sort(String::compareTo);
             contract.append('|').append(streams.size());

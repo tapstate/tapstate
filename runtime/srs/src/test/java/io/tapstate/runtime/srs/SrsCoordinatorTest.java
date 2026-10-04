@@ -5,6 +5,7 @@ import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
+import io.tapstate.spi.store.SrsConsumerId;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -34,6 +35,25 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class SrsCoordinatorTest {
 
     private static final MiningChainId CHAIN = MiningChainId.ofKey("orders-db");
+
+    @Test
+    void aPipelineStopReleasesItsSourceAndLegacyMembershipsWithoutTakingAnotherPipelinesHold() {
+        SrsCoordinator coordinator = new SrsCoordinator(new FakeMeta());
+        coordinator.provisionSource("source", CHAIN, List.of("orders"), null);
+        String first = SrsConsumerId.of("pipeline", "first").value();
+        String second = SrsConsumerId.of("pipeline", "second").value();
+        String survivor = SrsConsumerId.of("pipeline_extra", "first").value();
+        for (String consumer : List.of("pipeline", first, second, survivor)) {
+            coordinator.attachConsumer(CHAIN, consumer);
+        }
+
+        assertThat(coordinator.releaseConsumer(CHAIN, first)).isFalse();
+        assertThat(coordinator.affectedConsumers(CHAIN)).containsExactly("pipeline", second, survivor);
+        assertThat(coordinator.releasePipelineConsumers(CHAIN, "pipeline")).isFalse();
+        assertThat(coordinator.affectedConsumers(CHAIN)).containsExactly(survivor);
+        assertThat(coordinator.releasePipelineConsumers(CHAIN, "pipeline_extra")).isTrue();
+        assertThat(coordinator.isProvisioned(CHAIN)).isFalse();
+    }
 
     // ---- provision + forced merge ------------------------------------------------
 

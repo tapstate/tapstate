@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.RingbufferConfig;
+import com.hazelcast.config.RingbufferStoreConfig;
 import com.hazelcast.config.SerializerConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
@@ -31,6 +32,7 @@ import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.SrsItem;
 import io.tapstate.runtime.srs.SrsItemSerializer;
+import io.tapstate.runtime.srs.SrsLogRingbufferStoreFactory;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
@@ -88,9 +90,11 @@ class CaptureToSinkDataFlowTest {
     private static final String SINK = "capture-to-sink-flow";
 
     private HazelcastInstance member;
+    private InMemorySrsLogStore log;
 
     @BeforeEach
     void startMember() {
+        log = new InMemorySrsLogStore();
         Config config = new Config();
         // Isolated, structurally undiscoverable single member -- never merge with anything on the LAN.
         config.setClusterName("capture-to-sink-test-" + System.nanoTime());
@@ -105,7 +109,9 @@ class CaptureToSinkDataFlowTest {
                 .setCapacity(16)
                 .setInMemoryFormat(InMemoryFormat.OBJECT)
                 .setTimeToLiveSeconds(0)
-                .setBackupCount(0));
+                .setBackupCount(0)
+                .setRingbufferStoreConfig(new RingbufferStoreConfig().setEnabled(true)
+                        .setFactoryImplementation(new SrsLogRingbufferStoreFactory(log))));
         config.getSerializationConfig().addSerializerConfig(
                 new SerializerConfig().setImplementation(new SrsItemSerializer()).setTypeClass(SrsItem.class));
         member = Hazelcast.newHazelcastInstance(config);
@@ -135,7 +141,7 @@ class CaptureToSinkDataFlowTest {
                 new ServeBlock.Inline(null, FromRef.literal("keep_even"),
                         List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null));
-        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        InMemoryStorePort store = new InMemoryStorePort(artifacts, log);
         store.schemas().save(new DiscoveredSourceModel(SOURCE_ID, "fake", 0L, new SourceModel(List.of(
                 new SourceTable(TABLE, List.of(new SourceField("id", "INT")), List.of("id"), List.of())))));
 
@@ -144,6 +150,7 @@ class CaptureToSinkDataFlowTest {
         // capture and the capturing sink bypass it), but binding it is the sink-capable step under test.
         SrsMetaStore meta = store.meta();
         member.getUserContext().put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY, meta);
+        member.getUserContext().put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY, store.srsLog());
         ConnectorProvisioner provisioner = connectorId -> {
             throw new UnsupportedOperationException("not resolved by this data-flow test");
         };
@@ -254,7 +261,9 @@ class CaptureToSinkDataFlowTest {
             if (start instanceof CaptureStart.Resume resume) {
                 assertThat(resume.position()).as("the controlled source joins at its sampled seam").isEqualTo(SOURCE_SEAM);
             }
-            listener.onStart(Optional.of(SOURCE_SEAM));
+            if (listener instanceof io.tapstate.spi.capture.CaptureStartedListener started) {
+                started.onStart(SOURCE_SEAM);
+            }
             for (Envelope change : changes) {
                 listener.onBatch(java.util.List.of(change), java.util.Optional.of(new SourcePosition("src-" + change.ts())));
             }

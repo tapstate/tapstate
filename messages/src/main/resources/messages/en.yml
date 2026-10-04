@@ -153,6 +153,18 @@ capture.start-from-outside-window:
 capture.event-table-not-selected:
   message: "The capture stream emitted table `{table}`, which this pipeline did not select."
   solution: "Update the source table selection or verify the connector emits the configured table names."
+capture.recovery-log-gap:
+  message: "Change log `{ring}` cannot recover sequence {sequence}: {reason}."
+  solution: "Restore the retained SRS log or stop with state purge and perform a full reload. Do not resume from a newer cursor; a CDC-only baseline requires explicit acceptance of the missing interval."
+capture.recovery-progress-unproven:
+  message: "Pipeline `{pipeline}` source `{source}` has retained progress without a proven independent recovery boundary."
+  solution: "Keep the retained state for diagnosis. Perform a full reload, or explicitly accept a new CDC-only baseline and the missing interval; state is not cleared automatically."
+capture.srs-not-recoverable:
+  message: "Shared capture `{chain}` has no recoverable SRS write-through log."
+  solution: "Configure durable SRS log storage before starting shared capture. An independent source channel may be used with SRS disabled."
+io.srs-progress-unproven:
+  message: "Pipeline `{pipeline}` has legacy progress that cannot prove each source node's confirmed SRS cursor."
+  solution: "Keep the retained state for diagnosis and perform a full reload, or explicitly accept a new incremental baseline with the missing interval."
 capture.claim-lost:
   message: "Capture `{captureId}` lost its cluster ownership claim."
   solution: "Let the current owner continue from the durable position; do not restart the fenced process."

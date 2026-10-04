@@ -77,8 +77,8 @@ class AConnectorReadsBackItsOwnNotesAfterTheServerIsReplacedIT {
     private static final String TABLE = "orders";
     private static final long SEEDED_ROWS = 3;
 
-    /** Where the engine files a connector's own notes: one namespace per pipeline node. */
-    private static final String NAMESPACE_PREFIX = "pdk.state.";
+    /** Where a shared physical capture files the connector's own notes. */
+    private static final String NAMESPACE_PREFIX = "pdk.chain.";
 
     private static final String STATE_DATABASE = "tapstate_nest";
     private static final String STATE_COLLECTION = "operator_state";
@@ -92,12 +92,11 @@ class AConnectorReadsBackItsOwnNotesAfterTheServerIsReplacedIT {
     @EnumSource(Tiers.class)
     void theNotepadTheRunAfterTheReplacementOpensIsTheOneTheRunBeforeItWroteIn(
             Tiers tier, @TempDir Path directory) throws Exception {
-        // The tier rides on the pipeline id because the namespace is built from it and both tiers use this
-        // test deployment's configured state database. Two tiers sharing an id would write the same
-        // notepad, and the second would read back a value the first minted and call it its own.
+        // Each tier uses its own source directory, physical chain and control store, so the second
+        // tier cannot read back a name the first minted and call it its own.
         String suffix = tier.name().toLowerCase(Locale.ROOT);
         String pipelineId = PIPELINE_BASE + "_" + suffix;
-        String namespace = NAMESPACE_PREFIX + pipelineId + "." + SOURCE_ID;
+        String namespace;
         String storeUri = SharedMongo.replicaSetUrl("connector_notes_store_" + suffix);
 
         Path sourceDirectory = Files.createDirectories(directory.resolve(SOURCE_ID));
@@ -109,7 +108,8 @@ class AConnectorReadsBackItsOwnNotesAfterTheServerIsReplacedIT {
         files.seed(source, TABLE, SeedRows.generated(SEEDED_ROWS));
 
         byte[] minted;
-        try (ServerHandle first = tier.launch(storeUri)) {
+        try (ServerHandle first = tier.launch(storeUri);
+                StoreDocuments documents = StoreDocuments.at(storeUri)) {
             ControlPlane control = new ControlPlane(first.baseUrl());
             control.bootstrapAndLogin("e2e", "e2e-password");
             control.registerConnector(
@@ -127,6 +127,7 @@ class AConnectorReadsBackItsOwnNotesAfterTheServerIsReplacedIT {
                     "the first run to carry the seeded rows to the target",
                     () -> files.count(target, TABLE) >= SEEDED_ROWS,
                     () -> "rows at target = " + files.count(target, TABLE));
+            namespace = NAMESPACE_PREFIX + documents.miningChainIds().iterator().next();
             Await.until(
                     "the connector to have filed the name it minted",
                     () -> note(storeUri, namespace).isPresent(),

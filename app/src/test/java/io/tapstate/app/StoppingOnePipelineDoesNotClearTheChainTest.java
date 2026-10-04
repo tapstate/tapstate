@@ -1,7 +1,13 @@
 package io.tapstate.app;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.AdditionalAnswers.delegatesTo;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
+import io.tapstate.adapters.pdk.ConnectorStateNamespace;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
@@ -22,8 +28,10 @@ import io.tapstate.runtime.srs.MiningChainId;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
+import io.tapstate.spi.store.StorePort;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -80,6 +88,7 @@ class StoppingOnePipelineDoesNotClearTheChainTest {
         assertThat(chain.snapshotCompletedTables("q"))
                 .as("and the survivor's, which no stop of somebody else may touch")
                 .containsExactly("orders");
+        fixture.assertConnectorNotesKept();
     }
 
     @Test
@@ -117,6 +126,7 @@ class StoppingOnePipelineDoesNotClearTheChainTest {
         assertThat(chain.snapshotCompletedTables("p"))
                 .as("and the pipeline that asked for its state to be cleared no longer looks finished")
                 .isEmpty();
+        fixture.assertConnectorNotesKept();
     }
 
     @Test
@@ -137,6 +147,30 @@ class StoppingOnePipelineDoesNotClearTheChainTest {
         assertThat(fixture.chainRecord())
                 .as("nobody is left reading it, so what it accumulated is this stop's to clear")
                 .isEmpty();
+        fixture.assertConnectorNotesPurged();
+    }
+
+    @Test
+    void purgingTheSolePipelineLeavesNoSharedNotesForItsNextFullLoad() {
+        Fixture fixture = new Fixture();
+        fixture.coordinator.startCapture("p");
+        fixture.leaveACursorFor("p");
+        fixture.leaveWhatTheChainAccumulated();
+        fixture.store.keyedState().save("pdk.global-state", "installation", new byte[]{7});
+        String otherChain = ConnectorStateNamespace.ofShared("unrelated-chain");
+        fixture.store.keyedState().save(otherChain, "slot", new byte[]{8});
+        fixture.store.keyedState().save("pdk.notes-migration." + otherChain, "cleared", new byte[]{1});
+
+        fixture.coordinator.stopCapture("p", true);
+        fixture.coordinator.startCapture("p");
+
+        fixture.assertConnectorNotesPurged();
+        assertThat(fixture.store.keyedState().load("pdk.global-state", "installation"))
+                .hasValueSatisfying(value -> assertThat(value).containsExactly((byte) 7));
+        assertThat(fixture.store.keyedState().load(otherChain, "slot"))
+                .hasValueSatisfying(value -> assertThat(value).containsExactly((byte) 8));
+        assertThat(fixture.store.keyedState().load("pdk.notes-migration." + otherChain, "cleared"))
+                .hasValueSatisfying(value -> assertThat(value).containsExactly((byte) 1));
     }
 
     @Test
@@ -153,6 +187,7 @@ class StoppingOnePipelineDoesNotClearTheChainTest {
         // says which of the two an implementation is actually reading.
         assertThat(fixture.chainRecord()).isPresent();
         assertThat(fixture.consumersOnTheChain()).containsExactly("p");
+        fixture.assertConnectorNotesKept();
     }
 
     @Test
@@ -172,6 +207,33 @@ class StoppingOnePipelineDoesNotClearTheChainTest {
                         + "accumulated is this stop's to clear -- holding no handle for it is not the "
                         + "same as there being nothing to clear")
                 .isEmpty();
+        fixture.assertConnectorNotesPurged();
+    }
+
+    @Test
+    void aFailedNoteDropLeavesTheChainDiscoverableForARetry() {
+        Fixture fixture = new Fixture();
+        fixture.seedAChainNobodyIsRunning();
+        fixture.leaveACursorFor("p");
+        fixture.leaveWhatTheChainAccumulated();
+        KeyedStateStore failingState = mock(KeyedStateStore.class, delegatesTo(fixture.store.keyedState()));
+        doThrow(new IllegalStateException("namespace drop failed"))
+                .when(failingState).dropNamespace(fixture.migrationNamespace());
+        StorePort failingStore = mock(StorePort.class, delegatesTo(fixture.store));
+        when(failingStore.keyedState()).thenReturn(failingState);
+        StoreBackedPipelineCaptureCoordinator failingCoordinator = new StoreBackedPipelineCaptureCoordinator(
+                failingStore, fixture::start, fixture.srsCoordinator, new SnapshotBuffer());
+
+        assertThatThrownBy(() -> failingCoordinator.stopCapture("p", true))
+                .isInstanceOf(IllegalStateException.class).hasMessage("namespace drop failed");
+        assertThat(fixture.chainRecord()).isPresent();
+        assertThat(fixture.store.meta().miningChainIdsWithConsumer("p")).containsExactly(fixture.chainId());
+        assertThat(fixture.store.keyedState().count(fixture.migrationNamespace())).isEqualTo(1L);
+
+        fixture.coordinator.stopCapture("p", true);
+
+        assertThat(fixture.chainRecord()).isEmpty();
+        fixture.assertConnectorNotesPurged();
     }
 
     @Test
@@ -200,6 +262,7 @@ class StoppingOnePipelineDoesNotClearTheChainTest {
         assertThat(chain.snapshotCompletedTables("q"))
                 .as("the survivor keeps what it finished")
                 .containsExactly("orders");
+        fixture.assertConnectorNotesKept();
     }
 
     @Test
@@ -215,6 +278,7 @@ class StoppingOnePipelineDoesNotClearTheChainTest {
         // what to clear and whether to clear anything are two questions, and only this says which is read.
         assertThat(fixture.chainRecord()).isPresent();
         assertThat(fixture.consumersOnTheChain()).containsExactly("p");
+        fixture.assertConnectorNotesKept();
     }
 
     @Test
@@ -237,6 +301,7 @@ class StoppingOnePipelineDoesNotClearTheChainTest {
         assertThat(fixture.consumersOnTheChain())
                 .as("and the leaving pipeline's own cursor is still given back")
                 .isEmpty();
+        fixture.assertConnectorNotesKept();
     }
 
     /** Two pipelines over one source, so both resolve to the very same mining chain. */
@@ -290,6 +355,28 @@ class StoppingOnePipelineDoesNotClearTheChainTest {
                     .forEach(consumer -> store.meta().setCdcStart(
                             chainId(), consumer.pipelineId(), "seam-1", 1L));
             store.meta().appendSchemaVersion(chainId(), new SchemaVersion(0, Map.of("id", "int"), 0));
+            store.keyedState().save(connectorNamespace(), "slot", new byte[]{11, 12});
+            store.keyedState().save(migrationNamespace(), "removed:expired", new byte[]{1});
+        }
+
+        void assertConnectorNotesKept() {
+            assertThat(store.keyedState().load(connectorNamespace(), "slot"))
+                    .hasValueSatisfying(value -> assertThat(value).containsExactly((byte) 11, (byte) 12));
+            assertThat(store.keyedState().load(migrationNamespace(), "removed:expired"))
+                    .hasValueSatisfying(value -> assertThat(value).containsExactly((byte) 1));
+        }
+
+        void assertConnectorNotesPurged() {
+            assertThat(store.keyedState().count(connectorNamespace())).as("the shared connector notes").isZero();
+            assertThat(store.keyedState().count(migrationNamespace())).as("the note migration markers").isZero();
+        }
+
+        private String connectorNamespace() {
+            return ConnectorStateNamespace.ofShared(chainId());
+        }
+
+        private String migrationNamespace() {
+            return "pdk.notes-migration." + connectorNamespace();
         }
 
         /**

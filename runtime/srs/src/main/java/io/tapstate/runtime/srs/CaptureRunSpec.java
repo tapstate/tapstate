@@ -5,7 +5,6 @@ import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.spi.store.WorkloadClaimFence;
 
-import java.util.List;
 import java.util.Objects;
 
 /**
@@ -24,10 +23,10 @@ import java.util.Objects;
  *       generation assigned to a bounded read that has no change chain of its own.</li>
  *   <li>{@code captureFence} — the cluster claim generation a durable append must still match, or null on
  *       the unchanged single-member path.</li>
- *   <li>{@code selectedChainTables} — the full table selection of this pipeline on the mining chain,
- *       across its source run units; null when a standalone caller selects only this source's streams.</li>
- *   <li>{@code cursorWriterToken} — one internal cursor-writer fence shared by this pipeline's source run
- *       units during one start, distinct from the product's execution identity.</li>
+ *   <li>{@code consumerId} — this source node's independent progress record; compatibility callers default
+ *       to the pipeline id. The pipeline id still names the job and snapshot handoff.</li>
+ *   <li>{@code snapshotWriterToken} — an optional member-local snapshot buffer session, never a
+ *       durable cursor, source position or execution identity.</li>
  * </ul>
  *
  * <p>No connector position is carried here. Both a run's seam and its per-change positions are the
@@ -49,9 +48,28 @@ public record CaptureRunSpec(
         long schemaVer,
         long snapshotEpoch,
         WorkloadClaimFence captureFence,
-        List<String> selectedChainTables,
-        String cursorWriterToken) {
+        String consumerId,
+        String snapshotWriterToken) {
 
+    /** The same source protocol without an explicitly bound member-local snapshot session. */
+    public CaptureRunSpec(
+            CaptureConfig config,
+            ReadMode readMode,
+            String srsKey,
+            boolean srsEnabled,
+            String sourceId,
+            String pipelineId,
+            StartFrom startFrom,
+            String retention,
+            long schemaVer,
+            long snapshotEpoch,
+            WorkloadClaimFence captureFence,
+            String consumerId) {
+        this(config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
+                startFrom, retention, schemaVer, snapshotEpoch, captureFence, consumerId, null);
+    }
+
+    /** Compatibility construction for a caller whose pipeline has one consumption record. */
     public CaptureRunSpec(
             CaptureConfig config,
             ReadMode readMode,
@@ -65,7 +83,7 @@ public record CaptureRunSpec(
             long snapshotEpoch,
             WorkloadClaimFence captureFence) {
         this(config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
-                startFrom, retention, schemaVer, snapshotEpoch, captureFence, null, null);
+                startFrom, retention, schemaVer, snapshotEpoch, captureFence, pipelineId);
     }
 
     /**
@@ -110,24 +128,26 @@ public record CaptureRunSpec(
     public CaptureRunSpec withCaptureFence(WorkloadClaimFence fence) {
         return new CaptureRunSpec(
                 config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
-                startFrom, retention, schemaVer, snapshotEpoch, fence, selectedChainTables,
-                cursorWriterToken);
+                startFrom, retention, schemaVer, snapshotEpoch, fence, consumerId, snapshotWriterToken);
     }
 
-    /** The same run with its caller's cursor-writer fence and unchanged table selection. */
-    public CaptureRunSpec withCursorWriterToken(String runId) {
-        return new CaptureRunSpec(
-                config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
-                startFrom, retention, schemaVer, snapshotEpoch, captureFence,
-                selectedChainTables, Objects.requireNonNull(runId, "runId"));
+    /** The same run using {@code id} as this source node's independent progress record. */
+    public CaptureRunSpec withConsumerId(String id) {
+        return new CaptureRunSpec(config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
+                startFrom, retention, schemaVer, snapshotEpoch, captureFence, id, snapshotWriterToken);
     }
 
-    /** The same run with its pipeline's complete table selection and cursor-writer fence. */
-    public CaptureRunSpec withChainSelection(List<String> tables, String runId) {
-        return new CaptureRunSpec(
-                config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
-                startFrom, retention, schemaVer, snapshotEpoch, captureFence,
-                List.copyOf(tables), Objects.requireNonNull(runId, "runId"));
+    /** Binds the prepared source and DAG to the same member-local snapshot buffer session. */
+    public CaptureRunSpec withSnapshotWriterToken(String token) {
+        return new CaptureRunSpec(config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
+                startFrom, retention, schemaVer, snapshotEpoch, captureFence, consumerId,
+                Objects.requireNonNull(token, "token"));
+    }
+
+    /** Shared capture state follows the physical source; direct recovery state follows its own channel. */
+    public MiningChainId miningChainId() {
+        return srsEnabled ? MiningChainId.resolve(config, srsKey)
+                : MiningChainId.forChannel(config, srsKey, pipelineId, sourceId);
     }
 
     public CaptureRunSpec {
@@ -136,13 +156,16 @@ public record CaptureRunSpec(
         Objects.requireNonNull(sourceId, "sourceId");
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(startFrom, "startFrom");
+        consumerId = consumerId == null ? pipelineId : consumerId;
+        if (consumerId.isBlank()) {
+            throw new IllegalArgumentException("a source consumer id must be non-blank");
+        }
+        if (snapshotWriterToken != null && snapshotWriterToken.isBlank()) {
+            throw new IllegalArgumentException("a snapshot writer token must be non-blank");
+        }
         if (snapshotEpoch < 0) {
             throw new IllegalArgumentException(
                     "a chainless snapshot generation must not be negative, got " + snapshotEpoch);
-        }
-        selectedChainTables = selectedChainTables == null ? null : List.copyOf(selectedChainTables);
-        if (cursorWriterToken != null && cursorWriterToken.isBlank()) {
-            throw new IllegalArgumentException("cursorWriterToken must be non-blank");
         }
         // The connector doing this read files notes it has to find again on a later drive, and which node
         // they belong to is the pair named right here. Scoped from those two rather than accepted on the

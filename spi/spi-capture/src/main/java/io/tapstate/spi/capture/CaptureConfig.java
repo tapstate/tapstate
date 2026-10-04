@@ -29,16 +29,26 @@ import java.util.Objects;
  * once - so folding a per-pipeline id into it would give every pipeline its own stream and mine the
  * same log as many times as there are readers.
  *
+ * <p>{@code sharedNotes}, when present, scopes native connector notes to the physical capture while
+ * {@code node} still identifies the pipeline whose run and logs opened it. Ordinary and direct reads
+ * keep the node's existing private notes.
+ *
  * <p>{@code settings} and {@code streams} are held as unmodifiable defensive copies; a null map or
  * list is normalized to empty.
  */
 public record CaptureConfig(
-        String connectorId, Map<String, Object> settings, List<String> streams, PipelineNode node) {
+        String connectorId, Map<String, Object> settings, List<String> streams, PipelineNode node,
+        SharedNotes sharedNotes) {
 
     public CaptureConfig {
         Objects.requireNonNull(connectorId, "connectorId");
         settings = settings == null ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(settings));
         streams = streams == null ? List.of() : List.copyOf(streams);
+    }
+
+    /** A capture using its node's own notes, preserving the ordinary connector configuration contract. */
+    public CaptureConfig(String connectorId, Map<String, Object> settings, List<String> streams, PipelineNode node) {
+        this(connectorId, settings, streams, node, null);
     }
 
     /** A config for a read that names no node — the read-only drives, which have none. */
@@ -48,6 +58,11 @@ public record CaptureConfig(
 
     /** The same config, read on behalf of {@code node}. */
     public CaptureConfig at(PipelineNode node) {
-        return new CaptureConfig(connectorId, settings, streams, node);
+        return new CaptureConfig(connectorId, settings, streams, node, sharedNotes);
+    }
+
+    /** The same owner and source configuration, with native notes belonging to one physical capture. */
+    public CaptureConfig sharing(SharedNotes notes) {
+        return new CaptureConfig(connectorId, settings, streams, node, notes);
     }
 }

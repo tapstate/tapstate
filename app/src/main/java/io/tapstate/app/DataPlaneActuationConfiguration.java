@@ -263,18 +263,14 @@ class DataPlaneActuationConfiguration {
             StorePort storePort, CaptureRunUnit captureRunUnit, SrsCoordinator srsCoordinator,
             SnapshotBuffer snapshotBuffer, CaptureOwnership captureOwnership,
             ClusterProperties clusterProperties) {
-        CaptureAttacher attacher = new CaptureAttacher() {
-            @Override
-            public CaptureRun start(CaptureRunSpec spec, io.tapstate.runtime.srs.CaptureHandoff handoff,
-                    boolean startTail) {
-                return captureRunUnit.begin(spec, handoff, startTail);
-            }
-
-            @Override
-            public CaptureRun reopenPhysicalTail(CaptureRunSpec spec, CaptureRun previous) {
-                return captureRunUnit.reopenPhysicalTail(spec, previous);
-            }
-        };
+        // Begun rather than started: a run comes back as soon as its load is open, and the load is read while
+        // the pipeline's job takes it. Read to the end first, it would have to fit on the heap whole.
+        // The attacher's widening path invokes the handler installed on the runtime's shared reader.
+        CaptureAttacher attacher = captureRunUnit::begin;
+        if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
+            return new StoreBackedPipelineCaptureCoordinator(
+                    storePort, attacher, srsCoordinator, snapshotBuffer);
+        }
         return new StoreBackedPipelineCaptureCoordinator(
                 storePort, attacher, srsCoordinator, snapshotBuffer, captureOwnership,
                 clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE

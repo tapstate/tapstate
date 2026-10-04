@@ -4,7 +4,6 @@ import io.tapstate.core.event.ChainPosition;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.OptionalLong;
 
 /**
  * The durable SRS coordination store: one {@link SrsMeta} record per mining chain — the offset, consumer
@@ -26,63 +25,53 @@ import java.util.OptionalLong;
  */
 public interface SrsMetaStore {
 
-    /** The selected streams of the one physical CDC reader in this ring generation. */
-    record PhysicalSelection(long epoch, long revision, List<String> tables) {
-        public PhysicalSelection(long epoch, List<String> tables) {
-            this(epoch, 1L, tables);
-        }
-
-        public PhysicalSelection {
-            if (epoch < 1 || revision < 1 || tables == null || tables.isEmpty()) {
-                throw new IllegalArgumentException("physical capture selection needs a generation and tables");
-            }
-            if (tables.stream().anyMatch(table -> table == null || table.isBlank())) {
-                throw new IllegalArgumentException("physical capture tables must be named");
-            }
-            tables = tables.stream().distinct().sorted().toList();
-        }
+    /** Records a requested table union for one physical capture without broadening any consumer. */
+    default void requestCaptureTables(String miningChainId, List<String> tables) {
     }
 
-    /** The table union the current physical owner actually subscribed to, if it has opened a tail. */
-    default Optional<PhysicalSelection> physicalSelection(String miningChainId) {
-        return Optional.empty();
-    }
-
-    /** Publishes that union only while this chain still has the generation the owner opened. */
-    default boolean publishPhysicalSelection(String miningChainId, PhysicalSelection selection) {
-        throw new UnsupportedOperationException("physical capture selection is unavailable");
-    }
-
-    /** Tables requested by attachments while the current physical subscription does not include them. */
-    default List<String> requestedPhysicalTables(String miningChainId) {
+    /** The physical capture's durable requested table set, independent of source-node consumption. */
+    default List<String> captureTables(String miningChainId) {
         return List.of();
     }
 
-    /** Persists an expansion request before a new attachment begins a snapshot or a Jet reader. */
-    default boolean requestPhysicalTables(String miningChainId, long epoch, List<String> tables) {
-        throw new UnsupportedOperationException("physical capture expansion requests are unavailable");
+    /** Tables actually served by the current physical capture, not merely requested by a consumer. */
+    default List<String> captureServingTables(String miningChainId) {
+        return List.of();
     }
 
-    /** Publishes a later subscription in the same ring generation after the earlier one has closed. */
-    default boolean replacePhysicalSelection(
-            String miningChainId, PhysicalSelection expected, PhysicalSelection replacement) {
-        throw new UnsupportedOperationException("physical capture expansion is unavailable");
+    /** Publishes a same-generation subscription only when it covers every current request. */
+    default boolean publishCaptureTables(String miningChainId, long epoch, List<String> tables) {
+        return true;
     }
 
-    /** Removes requests satisfied by a published physical subscription without dropping newer requests. */
-    default void clearPhysicalRequests(String miningChainId, long epoch, List<String> tables) {
-        throw new UnsupportedOperationException("physical capture request cleanup is unavailable");
+    /**
+     * Checkpoints the physical capture after every change in its source batch was written to recoverable
+     * SRS. Consumer confirmations are independent; they never certify this source-database position.
+     */
+    default void advanceCaptureCheckpoint(String miningChainId, ChainPosition position) {
+        throw new UnsupportedOperationException("a durable capture checkpoint requires its served table selection");
     }
 
-    /** The last sequence from before this table's current ring generation began admitting changes. */
-    default OptionalLong ringGenerationStartAfter(String miningChainId, String table, long epoch) {
-        return OptionalLong.empty();
+    /**
+     * Checkpoints only while this callback's immutable served selection covers every requested table.
+     * An older narrow callback cannot certify a position after a wider subscription is published.
+     * Backends must make the selection check atomic with the checkpoint write.
+     */
+    default void advanceCaptureCheckpoint(
+            String miningChainId, ChainPosition position, List<String> servedTables) {
+        throw new UnsupportedOperationException("durable capture checkpoints are not implemented by this store");
     }
 
-    /** Establishes that boundary once per table and generation, before the first source batch can append. */
-    default OptionalLong establishRingGenerationStartAfter(
-            String miningChainId, String table, long epoch, long proposedSeq) {
-        throw new UnsupportedOperationException("ring generation start boundaries are unavailable");
+    /** Starts one isolated direct stream without carrying pending batches into a new source generation. */
+    default void beginDirectCapture(String miningChainId, String consumerId, long epoch, String anchor) {
+    }
+
+    /**
+     * Records the source-stream batch boundary and the last event each selected table must confirm.
+     * Orders here belong to one direct channel; quiet tables with no event do not pin its checkpoint.
+     */
+    default void recordDirectBatch(String miningChainId, String consumerId, ChainPosition position,
+            Map<String, Long> targets) {
     }
 
     /** Returns the meta record for a mining chain, or empty if the chain has not been seeded. */
@@ -131,29 +120,6 @@ public interface SrsMetaStore {
      */
     void advanceSourceReadOffset(String miningChainId, ChainPosition position);
 
-    /** Advances a physical batch only while its owner still holds this ring generation. */
-    default boolean advancePhysicalSourceReadOffset(
-            String miningChainId, long epoch, ChainPosition position) {
-        throw new UnsupportedOperationException("generation-fenced physical source advances are unavailable");
-    }
-
-    /**
-     * Whether this chain's stored read position was established by a physical source boundary or an
-     * explicit position repair. An older multi-table scalar has no such proof and must not be resumed.
-     */
-    default boolean physicalPrefixTrusted(String miningChainId) {
-        return false;
-    }
-
-    /**
-     * Atomically persists the connector's position immediately before its first delivered change and
-     * marks the chain's physical prefix trusted. Returns false if an existing untrusted offset or a newer
-     * generation prevents this anchor. A trusted chain may retain its earlier safe offset unchanged.
-     */
-    default boolean establishPhysicalAnchor(String miningChainId, ChainPosition position) {
-        throw new UnsupportedOperationException("physical source anchors are unavailable");
-    }
-
     /**
      * Puts the chain's source read offset at exactly {@code token}, forward or back, and drops the order
      * recorded beside it.
@@ -193,30 +159,6 @@ public interface SrsMetaStore {
     void advanceConsumerReadSeq(String miningChainId, String pipelineId, String table, long lastReadSeq);
 
     /**
-     * Replaces one pipeline's selected tables for this chain and identifies the generation whose read
-     * cursors are valid. Repeating the exact selection with the same cursor-writer token retains read
-     * progress. A new token, changed selection, or older generation starts unread, since a new reader may
-     * resume below the old reader's progress. The selection and cursor change must be atomic with respect
-     * to concurrent cursor reports. A missing selection on an older consumer record remains conservatively
-     * unknown until this method succeeds. {@code cursorWriterToken} fences reports from an earlier reader.
-     */
-    default void selectConsumerTables(
-            String miningChainId, String pipelineId, List<String> tables, long epoch, String cursorWriterToken) {
-        throw new UnsupportedOperationException("consumer table selection is not implemented");
-    }
-
-    /**
-     * Reports a reader cursor only while the consumer still belongs to the same ring generation and
-     * selects this table and run. A late report from a previous reader must not raise the current run's
-     * headroom bound.
-     */
-    default void advanceConsumerReadSeq(
-            String miningChainId, String pipelineId, String table, long epoch,
-            String cursorWriterToken, long lastReadSeq) {
-        throw new UnsupportedOperationException("generation-fenced consumer cursor is not implemented");
-    }
-
-    /**
      * Advances one consumer pipeline's durable sink-acked source position on the chain — a scoped set of
      * that consumer's {@code sinkAckedSrcpos} alone. It touches only the sink-ack, so a sink advancing here
      * never clobbers the {@code perTableSeq} read cursor the pipeline's reader writes to the same consumer
@@ -231,12 +173,6 @@ public interface SrsMetaStore {
      * sink.
      */
     void advanceSinkAcked(String miningChainId, String pipelineId, ChainPosition position);
-
-    /** Publishes a consumer's confirmed physical prefix without reviving a detached or newer reader. */
-    default boolean advancePhysicalSinkAcked(
-            String miningChainId, String pipelineId, long epoch, ChainPosition position) {
-        throw new UnsupportedOperationException("generation-fenced physical sink acknowledgements are unavailable");
-    }
 
     /**
      * The store-fenced form of {@link #advanceSinkAcked(String, String, ChainPosition)}. The consumer must
@@ -294,6 +230,18 @@ public interface SrsMetaStore {
             String miningChainId, String pipelineId, Map<String, List<String>> writerIdsByTable) {
     }
 
+    /** Installs the writer plan and its source node's recovery coordinate system together. */
+    default void configureSinkWriters(String miningChainId, String consumerId,
+            Map<String, List<String>> writerIdsByTable, ConsumerProgressKind kind) {
+        configureSinkWriters(miningChainId, consumerId, writerIdsByTable);
+    }
+
+    /** The same plan and coordinate-system write under the source node's current execution fence. */
+    default void configureSinkWriters(String miningChainId, String consumerId,
+            Map<String, List<String>> writerIdsByTable, ConsumerProgressKind kind, WorkloadClaimFence fence) {
+        configureSinkWriters(miningChainId, consumerId, writerIdsByTable, fence);
+    }
+
     /**
      * Records the writer plan and binds its later durable sink effects to {@code fence}. The binding and
      * proof that the workload claim is still live are one store operation.
@@ -331,17 +279,6 @@ public interface SrsMetaStore {
     }
 
     /**
-     * Records only this table's durable acknowledgement in its own ring generation, without moving the
-     * chain-level acknowledgement. A capture owner releases the latter only after every table and consumer
-     * affected by an ordered physical source batch has confirmed it. The table update also raises its
-     * {@code ringDoneThrough} cursor in the same atomic write. Older or equal table positions are ignored.
-     */
-    default void advanceTableSinkAcked(
-            String miningChainId, String pipelineId, String table, ChainPosition position) {
-        throw new UnsupportedOperationException("per-table sink acknowledgements are unavailable");
-    }
-
-    /**
      * Per table, the ring sequence up to which this pipeline has nothing left to receive from that table's
      * change ring: the last change its sink confirmed there, or where the ring stood when the pipeline
      * arrived on it, whichever {@link #advanceSinkAcked(String, String, String, ChainPosition)} and
@@ -373,16 +310,6 @@ public interface SrsMetaStore {
     }
 
     /**
-     * Records an arrival marker only while this pipeline still selects the table in {@code epoch}. A
-     * delayed marker from a replaced reader must not seed completion in a newer ring generation, where
-     * it could authorize a cut of changes the new reader has not seen.
-     */
-    default void startRingAfter(
-            String miningChainId, String pipelineId, String table, long epoch, long seq) {
-        throw new UnsupportedOperationException("generation-fenced ring arrival is unavailable");
-    }
-
-    /**
      * Records one pipeline's snapshot-to-cdc seam: the opaque position its cdc tail starts from, together
      * with the ring generation that pipeline's snapshot began in. A mutate on an unseeded chain is a
      * caller ordering error. The consumer entry is created when the pipeline has none yet, and only these
@@ -395,17 +322,6 @@ public interface SrsMetaStore {
      * that then took the current generation would overwrite changes the earlier one had already applied.
      */
     void setCdcStart(String miningChainId, String pipelineId, String cdcStartPosition, long snapshotEpoch);
-
-    /**
-     * Records a snapshot seam only while this pipeline's selected-table reader still owns the current
-     * cursor token and ring generation. A stale asynchronous reader returns false without changing either
-     * half of the seam. The legacy unscoped method remains for callers without a prepared run token.
-     */
-    default boolean setCdcStartIfCurrent(String miningChainId, String pipelineId,
-            String cursorWriterToken, long selectedTablesEpoch,
-            String cdcStartPosition, long snapshotEpoch) {
-        throw new UnsupportedOperationException("scoped snapshot seam writes are unavailable");
-    }
 
     /**
      * Opens the chain's next ring generation and returns it — the monotonic counter every order on this

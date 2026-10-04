@@ -10,21 +10,12 @@ import java.util.Map;
  * One consumer pipeline's own state on a mining chain — everything the chain records that belongs to a
  * single pipeline rather than to the chain. It carries quantities of three lifetimes: {@code perTableSeq}
  * — the run-local read cursor into each per-table ring (a table-to-sequence map; not stable across a
- * restart, because a re-mine can allocate a fresh sequence space) — {@code sinkAcked} — the source position
+ * restart, because a re-mine allocates a fresh sequence space) — {@code sinkAcked} — the source position
  * durably acked to the pipeline's sink (stable across a restart; the quantity a source-read-offset advance
  * is bounded by) — and the snapshot state: {@code snapshotCompletedTables}, the tables whose initial load
  * this pipeline's sink has confirmed, plus {@code cdcStartPosition} and {@code snapshotEpoch}, the seam and
- * generation at which this pipeline's load began. {@code selectedTables} is the pipeline's current table
- * selection; absent means an older record whose selection is unknown, so every chain table remains
- * protected as unread until that pipeline attaches again. {@code selectedTablesEpoch} identifies the ring
- * generation those cursors belong to; a cursor from another generation cannot authorize overwriting this
- * one's unread changes.
- * {@code cursorWriterToken} fences cursor writes from an earlier reader after a pipeline is reassembled in
- * the same generation; it is internal to the read cursor and is not a pipeline execution identity.
- * The chain ack is absent until a capture owner proves a contiguous physical prefix. Table acknowledgements
- * retain their own ring generation and sequence; a table's sequence never ranks another table's change.
- * {@code ringDoneThrough} exposes the per-table completion stored alongside those acknowledgements and
- * arrival markers, so a cut can use only consumers selecting that table in the current ring generation.
+ * generation at which this pipeline's load began. The acked position is absent until the pipeline's sink
+ * first acks a change.
  *
  * <p>The acked position is a pair, and both halves are needed for different reasons. The token is what
  * a read resumes from and the only half a connector understands. The order is the engine's own record of
@@ -65,11 +56,8 @@ public record ConsumerOffset(
         List<String> snapshotCompletedTables,
         String cdcStartPosition,
         long snapshotEpoch,
-        List<String> selectedTables,
-        Long selectedTablesEpoch,
-        String cursorWriterToken,
         Map<String, ChainPosition> sinkAckedByTable,
-        Map<String, Long> ringDoneThrough) {
+        ConsumerProgressKind progressKind) {
 
     public ConsumerOffset {
         if (pipelineId == null || pipelineId.isBlank()) {
@@ -85,71 +73,25 @@ public record ConsumerOffset(
             throw new IllegalArgumentException(
                     "consumer offset snapshotEpoch must not be negative, got " + snapshotEpoch);
         }
-        if (selectedTablesEpoch != null && selectedTablesEpoch < 1) {
-            throw new IllegalArgumentException("consumer offset selectedTablesEpoch must be positive");
-        }
-        if (selectedTables == null && selectedTablesEpoch != null) {
-            throw new IllegalArgumentException("consumer offset selectedTablesEpoch requires selectedTables");
-        }
-        if (cursorWriterToken != null && cursorWriterToken.isBlank()) {
-            throw new IllegalArgumentException("consumer offset cursorWriterToken must be non-blank");
-        }
-        if (selectedTables == null && cursorWriterToken != null) {
-            throw new IllegalArgumentException("consumer offset cursorWriterToken requires selectedTables");
-        }
-        if (selectedTables != null && (selectedTablesEpoch == null || cursorWriterToken == null)) {
-            throw new IllegalArgumentException("consumer offset selection requires an epoch and cursor writer token");
-        }
-        if (sinkAckedByTable == null || sinkAckedByTable.keySet().stream().anyMatch(table -> table == null || table.isBlank())
-                || sinkAckedByTable.values().stream().anyMatch(position -> position == null || position.order() == null)) {
-            throw new IllegalArgumentException("consumer table acks require named tables and ordered positions");
-        }
-        if (ringDoneThrough == null || ringDoneThrough.keySet().stream().anyMatch(table -> table == null || table.isBlank())
-                || ringDoneThrough.values().stream().anyMatch(seq -> seq == null || seq < -1L)) {
-            throw new IllegalArgumentException("consumer ring completion requires named tables and valid sequences");
-        }
         perTableSeq = Collections.unmodifiableMap(new LinkedHashMap<>(perTableSeq));
         snapshotCompletedTables = List.copyOf(snapshotCompletedTables);
-        selectedTables = selectedTables == null ? null : List.copyOf(selectedTables);
-        sinkAckedByTable = Collections.unmodifiableMap(new LinkedHashMap<>(sinkAckedByTable));
-        ringDoneThrough = Collections.unmodifiableMap(new LinkedHashMap<>(ringDoneThrough));
+        sinkAckedByTable = Collections.unmodifiableMap(new LinkedHashMap<>(
+                java.util.Objects.requireNonNull(sinkAckedByTable, "sinkAckedByTable")));
+        java.util.Objects.requireNonNull(progressKind, "progressKind");
     }
 
-    public ConsumerOffset(
-            String pipelineId, Map<String, Long> perTableSeq, ChainPosition sinkAcked,
+    /** Older callers do not establish a shared ordering between their table cursors. */
+    public ConsumerOffset(String pipelineId, Map<String, Long> perTableSeq, ChainPosition sinkAcked,
+            List<String> snapshotCompletedTables, String cdcStartPosition, long snapshotEpoch) {
+        this(pipelineId, perTableSeq, sinkAcked, snapshotCompletedTables, cdcStartPosition,
+                snapshotEpoch, Map.of(), ConsumerProgressKind.LEGACY);
+    }
+
+    public ConsumerOffset(String pipelineId, Map<String, Long> perTableSeq, ChainPosition sinkAcked,
             List<String> snapshotCompletedTables, String cdcStartPosition, long snapshotEpoch,
-            List<String> selectedTables, Long selectedTablesEpoch, String cursorWriterToken,
             Map<String, ChainPosition> sinkAckedByTable) {
         this(pipelineId, perTableSeq, sinkAcked, snapshotCompletedTables, cdcStartPosition,
-                snapshotEpoch, selectedTables, selectedTablesEpoch, cursorWriterToken,
-                sinkAckedByTable, Map.of());
-    }
-
-    /** Pre-vector constructor for stored consumers and callers that have not confirmed a table yet. */
-    public ConsumerOffset(
-            String pipelineId,
-            Map<String, Long> perTableSeq,
-            ChainPosition sinkAcked,
-            List<String> snapshotCompletedTables,
-            String cdcStartPosition,
-            long snapshotEpoch,
-            List<String> selectedTables,
-            Long selectedTablesEpoch,
-            String cursorWriterToken) {
-        this(pipelineId, perTableSeq, sinkAcked, snapshotCompletedTables, cdcStartPosition,
-                snapshotEpoch, selectedTables, selectedTablesEpoch, cursorWriterToken, Map.of());
-    }
-
-    /** A consumer whose selected tables were not recorded by its writer. */
-    public ConsumerOffset(
-            String pipelineId,
-            Map<String, Long> perTableSeq,
-            ChainPosition sinkAcked,
-            List<String> snapshotCompletedTables,
-            String cdcStartPosition,
-            long snapshotEpoch) {
-        this(pipelineId, perTableSeq, sinkAcked, snapshotCompletedTables, cdcStartPosition,
-                snapshotEpoch, null, null, null);
+                snapshotEpoch, sinkAckedByTable, ConsumerProgressKind.LEGACY);
     }
 
     /** A cursor with completion state but no snapshot seam recorded yet. */
@@ -169,12 +111,5 @@ public record ConsumerOffset(
     /** The acked token, or null when the sink has acked nothing yet — what a read resumes from. */
     public String sinkAckedSrcpos() {
         return sinkAcked == null ? null : sinkAcked.token();
-    }
-
-    /** The same consumer after its physical chain prefix is durably confirmed. */
-    public ConsumerOffset withSinkAcked(ChainPosition position) {
-        return new ConsumerOffset(pipelineId, perTableSeq, position, snapshotCompletedTables,
-                cdcStartPosition, snapshotEpoch, selectedTables, selectedTablesEpoch,
-                cursorWriterToken, sinkAckedByTable, ringDoneThrough);
     }
 }

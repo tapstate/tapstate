@@ -8,6 +8,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.RingbufferConfig;
+import com.hazelcast.config.RingbufferStoreConfig;
 import com.hazelcast.config.SerializerConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
@@ -42,6 +43,7 @@ import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.runtime.scheduler.PipelineConverger;
 import io.tapstate.runtime.srs.CaptureRunUnit;
+import io.tapstate.runtime.srs.SrsLogRingbufferStoreFactory;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.SrsItem;
@@ -103,7 +105,6 @@ class LifecycleVerbsOnRealChainE2ETest {
 
     @Test
     void slowSnapshotLeavesAnotherCdcPipelinesConvergenceAndObservationCadenceLive() throws Exception {
-        store = seedPipelineAndSchema();
         addFastCdcPipeline();
         makeMemberCapable(store);
         CountDownLatch slowRead = new CountDownLatch(1);
@@ -123,7 +124,9 @@ class LifecycleVerbsOnRealChainE2ETest {
                 }, releaseSlow::countDown);
             }
             @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
-                listener.onStart(safeStart(start));
+                if (listener instanceof io.tapstate.spi.capture.CaptureStartedListener started) {
+                    safeStart(start).ifPresent(started::onStart);
+                }
                 if (config.streams().contains("fast_orders")) {
                     listener.onBatch(List.of(Envelope.insert(100L, "fast_orders",
                                     Map.of("id", 100L, "amount", "fast"), Map.of())),
@@ -161,7 +164,6 @@ class LifecycleVerbsOnRealChainE2ETest {
 
     @Test
     void streamingSnapshotAdvancesRowsDoneBeforeCompletionAndKeepsCdcBehindIt() throws Exception {
-        store = seedPipelineAndSchema();
         makeMemberCapable(store);
         CountDownLatch firstRead = new CountDownLatch(1);
         CountDownLatch releaseRead = new CountDownLatch(1);
@@ -180,7 +182,9 @@ class LifecycleVerbsOnRealChainE2ETest {
                 }, releaseRead::countDown);
             }
             @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
-                listener.onStart(safeStart(start));
+                if (listener instanceof io.tapstate.spi.capture.CaptureStartedListener started) {
+                    safeStart(start).ifPresent(started::onStart);
+                }
                 listener.onBatch(List.of(insert(4)), Optional.of(new SourcePosition("src-4")));
                 return () -> { };
             }
@@ -220,7 +224,6 @@ class LifecycleVerbsOnRealChainE2ETest {
 
     @Test
     void stoppingAMidReadSnapshotCancelsItsWorkerAndReleasesItsSession() throws Exception {
-        store = seedPipelineAndSchema();
         makeMemberCapable(store);
         CountDownLatch reading = new CountDownLatch(1);
         CountDownLatch exited = new CountDownLatch(1);
@@ -284,6 +287,7 @@ class LifecycleVerbsOnRealChainE2ETest {
 
     @BeforeEach
     void startMember() {
+        store = seedPipelineAndSchema();
         Config config = new Config();
         config.setClusterName("lifecycle-real-chain-" + System.nanoTime());
         config.setProperty("hazelcast.phone.home.enabled", "false");
@@ -298,7 +302,9 @@ class LifecycleVerbsOnRealChainE2ETest {
                 .setCapacity(16)
                 .setInMemoryFormat(InMemoryFormat.OBJECT)
                 .setTimeToLiveSeconds(0)
-                .setBackupCount(0));
+                .setBackupCount(0)
+                .setRingbufferStoreConfig(new RingbufferStoreConfig().setEnabled(true)
+                        .setFactoryImplementation(new SrsLogRingbufferStoreFactory(store.srsLog()))));
         config.getSerializationConfig().addSerializerConfig(
                 new SerializerConfig().setImplementation(new SrsItemSerializer()).setTypeClass(SrsItem.class));
         member = Hazelcast.newHazelcastInstance(config);
@@ -318,7 +324,6 @@ class LifecycleVerbsOnRealChainE2ETest {
     @Test
     @DisplayName("start -> pause -> resume -> stop drives the real capture->transform->sink Jet job and the read faces reflect every transition")
     void theFourVerbsDriveTheRealAssembledPipeline() {
-        store = seedPipelineAndSchema();
         makeMemberCapable(store);
         FakeSource source = new FakeSource(
                 List.of(read(1), read(2), read(3)),
@@ -331,6 +336,11 @@ class LifecycleVerbsOnRealChainE2ETest {
         assertThat(job).as("start submits the pipeline's Jet job").isNotNull();
         awaitStatus(job, JobStatus.RUNNING);
         awaitKeys("1", "2", "3", "4", "5", "6");
+        String persistedRing = SourceCaptureResolution.of(
+                StoredArtifacts.requireSource(store.artifacts(), SOURCE_ID)).ringName(TABLE);
+        assertThat(store.srsLog().bounds(persistedRing).largestSequence())
+                .as("every delivered CDC row is recoverable before the capture checkpoint advances")
+                .isEqualTo(2L);
         assertActualState(RUNNING, 1);
         assertReadFaceReports(PIPELINE, RUNNING);
         // The assembled path stamps when the reading was taken. Without it a run whose publisher stopped
@@ -362,7 +372,6 @@ class LifecycleVerbsOnRealChainE2ETest {
     @Test
     @DisplayName("the assembly-built publisher surfaces recordCount from the real live job")
     void theWiredPublisherSurfacesRecordCountFromTheLiveJob() {
-        store = seedPipelineAndSchema();
         makeMemberCapable(store);
         FakeSource source = new FakeSource(
                 List.of(read(1), read(2), read(3)),
@@ -396,7 +405,6 @@ class LifecycleVerbsOnRealChainE2ETest {
         // actually wired into the publisher (or a publisher wired to a no-op stand-in) would still leave
         // the whole reactor green. Wiring the real StoreBackedPipelineCaptureCoordinator all the way
         // through -- the same one wireConvergeChain hands to the publisher -- closes that gap.
-        store = seedPipelineAndSchema();
         makeMemberCapable(store);
         FakeSource source = new FakeSource(List.of(read(1), read(2), read(3)), List.of());
         wireConvergeChain(source);
@@ -489,6 +497,7 @@ class LifecycleVerbsOnRealChainE2ETest {
 
     private void makeMemberCapable(InMemoryStorePort seeded) {
         member.getUserContext().put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY, seeded.meta());
+        member.getUserContext().put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY, seeded.srsLog());
         ConnectorProvisioner provisioner = connectorId -> {
             throw new UnsupportedOperationException("not resolved by this lifecycle test");
         };
@@ -623,7 +632,9 @@ class LifecycleVerbsOnRealChainE2ETest {
 
         @Override
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
-            listener.onStart(safeStart(start));
+            if (listener instanceof io.tapstate.spi.capture.CaptureStartedListener started) {
+                    safeStart(start).ifPresent(started::onStart);
+                }
             for (Envelope change : changes) {
                 listener.onBatch(java.util.List.of(change), java.util.Optional.of(new SourcePosition("src-" + change.ts())));
             }

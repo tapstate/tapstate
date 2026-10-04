@@ -5,12 +5,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.RingbufferConfig;
+import com.hazelcast.config.RingbufferStoreConfig;
 import com.hazelcast.config.SerializerConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
-import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
-import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
@@ -29,9 +28,11 @@ import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.SrsItem;
 import io.tapstate.runtime.srs.SrsItemSerializer;
+import io.tapstate.runtime.srs.SrsLogRingbufferStoreFactory;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
+import io.tapstate.spi.capture.CaptureStartedListener;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.ConnectionReport;
@@ -79,13 +80,10 @@ import org.junit.jupiter.api.Test;
  * - the cross-member half, which a single member cannot show because a member-local record and a
  * durable one behave identically until somebody else has to read it.
  *
- * <p><b>What stands in, and what does not.</b> The consumer's acknowledgement is stood in for: these
- * runs have no sink, and the frontier only advances as far as the slowest consumer has confirmed, so
- * with nothing confirming, nothing would ever be recorded to resume from - and the case would assert
- * a resume against a position the product never wrote. The acknowledgement is put far ahead, which
- * leaves the recorded position decided by how far the capture actually read. Everything else is the
- * product: the claim that moves ownership, the record the capture keeps, and the start the run that
- * takes over resolves from it.
+ * <p>The in-memory store is shared by both members and keeps the durable SRS log across the first
+ * member's termination. These runs have no sink: the capture checkpoint can advance after its batch
+ * is recoverable in that log, while the source node's confirmed consumption remains separate. The
+ * claim that moves ownership, the capture's checkpoint and the successor's resume are the product path.
  */
 class CaptureOwnershipMovesWhenItsMemberLeavesTest {
 
@@ -101,13 +99,15 @@ class CaptureOwnershipMovesWhenItsMemberLeavesTest {
 
     private HazelcastInstance first;
     private HazelcastInstance second;
+    private InMemorySrsLogStore log;
 
     @BeforeEach
     void startTwoMembers() throws IOException {
+        log = new InMemorySrsLogStore();
         int[] ports = twoFreePorts();
         String cluster = "capture-handover-" + System.nanoTime();
-        first = Hazelcast.newHazelcastInstance(config(cluster, ports[0], ports));
-        second = Hazelcast.newHazelcastInstance(config(cluster, ports[1], ports));
+        first = Hazelcast.newHazelcastInstance(config(cluster, ports[0], ports, log));
+        second = Hazelcast.newHazelcastInstance(config(cluster, ports[1], ports, log));
         awaitMembers(first, 2);
     }
 
@@ -122,8 +122,10 @@ class CaptureOwnershipMovesWhenItsMemberLeavesTest {
 
     @Test
     void theMemberThatTakesTheCaptureOverResumesWhereTheOneThatLeftHadReached() {
-        InMemoryStorePort store = new InMemoryStorePort(artifacts());
+        InMemoryStorePort store = new InMemoryStorePort(artifacts(), log);
         SrsMetaStore meta = store.meta();
+        first.getUserContext().put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY, store.srsLog());
+        second.getUserContext().put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY, store.srsLog());
         InMemoryWorkloadClaimStore claims = new InMemoryWorkloadClaimStore();
         ClusterMembershipGate gate = eligibleGate();
 
@@ -146,20 +148,10 @@ class CaptureOwnershipMovesWhenItsMemberLeavesTest {
         onFirst.startCapture(PIPELINE);
         String chain = runOnTheMemberThatLeaves.get().chainId().orElseThrow().value();
 
-        // A consumer that has confirmed everything it will ever be sent. Without one the frontier has
-        // nothing to be bounded by and the capture records no position at all, which would leave the
-        // assertion below comparing a resume against nothing.
+        // Capture checkpoints follow durable log writes; this consumer has not confirmed either change.
         leaving.feed(change(1));
         await("the chain to be opened by the capture that started", () -> meta.read(chain).isPresent());
-        SrsMeta opened = meta.read(chain).orElseThrow();
-        meta.advanceSinkAcked(chain, PIPELINE,
-                new ChainPosition(new SourceOrder(opened.epoch(), Long.MAX_VALUE / 2), "src-far"));
-
         leaving.feed(change(2));
-        // Waited for rather than read at the first position that appears. The source hands its changes over
-        // on a thread of its own, so the first change can be taken after the confirmation above and record
-        // its own position first; reading then is a race with the tail rather than a finding about where
-        // it got to. Measured: with the source slowed down, the first reading was the first change every time.
         await("the durable record to hold the position this member read up to, which is the last change "
                         + "it took rather than where the chain was opened",
                 () -> "src-2".equals(meta.read(chain).map(SrsMeta::sourceReadOffset).orElse(null)));
@@ -256,7 +248,7 @@ class CaptureOwnershipMovesWhenItsMemberLeavesTest {
         }
     }
 
-    private static Config config(String cluster, int port, int[] ports) {
+    private static Config config(String cluster, int port, int[] ports, InMemorySrsLogStore log) {
         Config config = new Config();
         config.setClusterName(cluster);
         config.setProperty("hazelcast.phone.home.enabled", "false");
@@ -274,7 +266,9 @@ class CaptureOwnershipMovesWhenItsMemberLeavesTest {
                 .setCapacity(64)
                 .setInMemoryFormat(InMemoryFormat.OBJECT)
                 .setTimeToLiveSeconds(0)
-                .setBackupCount(1));
+                .setBackupCount(1)
+                .setRingbufferStoreConfig(new RingbufferStoreConfig().setEnabled(true)
+                        .setFactoryImplementation(new SrsLogRingbufferStoreFactory(log))));
         config.getSerializationConfig().addSerializerConfig(
                 new SerializerConfig().setImplementation(new SrsItemSerializer()).setTypeClass(SrsItem.class));
         return config;
@@ -314,8 +308,10 @@ class CaptureOwnershipMovesWhenItsMemberLeavesTest {
         @Override
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
             started.set(start);
-            listener.onStart(Optional.of(start instanceof CaptureStart.Resume resume
-                    ? resume.position() : new SourcePosition("src-start")));
+            if (listener instanceof CaptureStartedListener startedListener) {
+                startedListener.onStart(start instanceof CaptureStart.Resume resume
+                        ? resume.position() : new SourcePosition("src-start"));
+            }
             running = true;
             daemon = new Thread(() -> {
                 while (running) {

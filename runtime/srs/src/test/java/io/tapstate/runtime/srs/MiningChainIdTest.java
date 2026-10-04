@@ -105,6 +105,41 @@ class MiningChainIdTest {
         assertThat(MiningChainId.resolve(cfg, "  ")).isEqualTo(MiningChainId.of(cfg));
     }
 
+    @Test
+    void directChannelsOnOneDatabaseKeepIndependentRecoveryRecords() {
+        CaptureConfig root = config(Map.of("host", "db1"), List.of("orders"));
+        CaptureConfig mail = config(root.settings(), List.of("emailmessage"));
+        MiningChainId first = MiningChainId.forChannel(root, null, "pipeline-a", "source");
+        MiningChainId second = MiningChainId.forChannel(root, null, "pipeline-b", "source");
+        MiningChainId otherNode = MiningChainId.forChannel(mail, null, "pipeline-a", "other-source");
+
+        assertThat(List.of(first, second, otherNode, MiningChainId.resolve(root, null)))
+                .doesNotHaveDuplicates();
+        assertThat(MiningChainId.forChannel(mail, null, "pipeline-a", "source"))
+                .as("a channel retains its recovery record when its table selection changes")
+                .isEqualTo(first);
+    }
+
+    @Test
+    void anExplicitPhysicalKeyDoesNotMergeIndependentDirectChannels() {
+        CaptureConfig source = config(Map.of("host", "db1"), List.of("orders"));
+
+        assertThat(MiningChainId.forChannel(source, "shared-db", "pipeline-a", "source"))
+                .isNotEqualTo(MiningChainId.forChannel(source, "shared-db", "pipeline-b", "source"))
+                .isNotEqualTo(MiningChainId.ofKey("shared-db"));
+    }
+
+    @Test
+    void channelIdentityKeepsEachPartOfItsNodePairDistinct() {
+        CaptureConfig source = config(Map.of("host", "db1"), List.of("orders"));
+
+        assertThat(MiningChainId.forChannel(source, null, "a", "bc"))
+                .isNotEqualTo(MiningChainId.forChannel(source, null, "ab", "c"));
+        assertThat(MiningChainId.forChannel(source, null, "pipeline", "source"))
+                .isNotEqualTo(MiningChainId.forChannel(
+                        config(Map.of("host", "db2"), List.of("orders")), null, "pipeline", "source"));
+    }
+
     /**
      * The node a config is read for is not part of what the chain is keyed by, and this is the case that
      * says so. Two pipelines reading one database through one set of settings differ in exactly that

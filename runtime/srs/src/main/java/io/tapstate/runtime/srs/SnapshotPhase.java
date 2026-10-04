@@ -96,16 +96,6 @@ public final class SnapshotPhase {
         }
     }
 
-    /** Reads a prepared load while retaining the exact consumer-selection fence on its seam. */
-    public static Outcome run(CapturePort port, CaptureConfig config, String miningChainId, String pipelineId,
-            List<String> tables, long ringEpoch, SrsMetaStore meta, String cursorWriterToken, Consumer<Envelope> sink) {
-        Objects.requireNonNull(sink, "sink");
-        try (Load load = open(port, config, miningChainId, pipelineId, tables, ringEpoch, meta, cursorWriterToken)) {
-            long count = load.read(sink, table -> { });
-            return new Outcome(count, load.tailSeam());
-        }
-    }
-
     /**
      * The half of {@link #run} that has to happen before the job taking the rows exists: works out which
      * tables this run still owes and, where one is owed, opens the read of the first of them and records
@@ -125,12 +115,6 @@ public final class SnapshotPhase {
             List<String> tables,
             long ringEpoch,
             SrsMetaStore meta) {
-        return open(port, config, miningChainId, pipelineId, tables, ringEpoch, meta, null);
-    }
-
-    /** Opens and records the seam only while the selected reader still owns its exact cursor token. */
-    public static Load open(CapturePort port, CaptureConfig config, String miningChainId, String pipelineId,
-            List<String> tables, long ringEpoch, SrsMetaStore meta, String cursorWriterToken) {
         Objects.requireNonNull(port, "port");
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(miningChainId, "miningChainId");
@@ -161,12 +145,7 @@ public final class SnapshotPhase {
             String tailSeam = resumedStart != null ? resumedStart : seam.token();
             // A resume writes back the pair it read, unchanged; a new load writes the pair it sampled. Both
             // are scoped to this pipeline, so neither can move another pipeline's tail or generation.
-            if (cursorWriterToken == null) {
-                meta.setCdcStart(miningChainId, pipelineId, tailSeam, epoch);
-            } else if (!meta.setCdcStartIfCurrent(miningChainId, pipelineId,
-                    cursorWriterToken, ringEpoch, tailSeam, epoch)) {
-                throw new CancellationException("snapshot cursor token was replaced before its seam");
-            }
+            meta.setCdcStart(miningChainId, pipelineId, tailSeam, epoch);
             return new Load(session, miningChainId, tables, owed, order, tailSeam, first, false);
         } catch (RuntimeException | Error failure) {
             if (first != null) {
@@ -230,7 +209,7 @@ public final class SnapshotPhase {
      * narrows each bounded read to one table when that read opens.
      */
     private static CaptureConfig readOf(CaptureConfig config, List<String> tables) {
-        return new CaptureConfig(config.connectorId(), config.settings(), tables, config.node());
+        return new CaptureConfig(config.connectorId(), config.settings(), tables, config.node(), config.sharedNotes());
     }
 
     /**
@@ -443,9 +422,7 @@ public final class SnapshotPhase {
             long count = 0;
             try {
                 while (batch.hasNext()) {
-                    Envelope row = batch.next().withOrder(order);
-                    requireOpen();
-                    sink.accept(row);
+                    sink.accept(batch.next().withOrder(order));
                     count++;
                 }
             } finally {

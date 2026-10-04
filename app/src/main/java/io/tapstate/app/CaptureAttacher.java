@@ -14,13 +14,13 @@ interface CaptureAttacher extends CaptureStarter {
 
     CaptureRun start(CaptureRunSpec spec, CaptureHandoff handoff, boolean startTail);
 
+    /** Has the existing physical reader serve table selections registered since it opened. */
+    default void widen(CaptureRun run) {
+        run.widen();
+    }
+
     @Override
     default CaptureRun start(CaptureRunSpec spec, CaptureHandoff handoff) {
         return start(spec, handoff, true);
-    }
-
-    /** Replaces only the physical tail while retaining each attached pipeline reader. */
-    default CaptureRun reopenPhysicalTail(CaptureRunSpec spec, CaptureRun previous) {
-        throw new UnsupportedOperationException("physical capture expansion is unavailable");
     }
 }

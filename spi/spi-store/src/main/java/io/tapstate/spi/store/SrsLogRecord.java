@@ -13,7 +13,6 @@ import java.util.Objects;
  * the log's key rather than a field of the record -- the ring assigns it, and the store writes it as
  * half of the key. A clustered record also carries the capture fence copied from the hot-buffer item;
  * the store validates it in the same transaction as the append instead of trusting an old process to stop.
- * New records also carry the ring epoch; legacy records have none and are retained by generation-scoped cuts.
  *
  * <p>The position travels as its opaque token, never as a connector object. A record written by one run
  * is read back by another, possibly a later build, and only the connector that issued the offset can
@@ -24,6 +23,8 @@ import java.util.Objects;
  * {@code before}, an update both, a ddl neither. An absent image is null; a present one is a
  * shallow-unmodifiable defensive copy. A snapshot read (op {@code r}) never enters the change log and is
  * rejected here by construction, the same way the ring rejects it: the log holds what the ring held.
+ * The original capture {@code epoch} survives restart; zero means an older record never stored it and
+ * must not be interpreted as a proven replay generation.
  */
 public record SrsLogRecord(
         String srcToken,
@@ -33,13 +34,7 @@ public record SrsLogRecord(
         Map<String, Object> after,
         long schemaVer,
         WorkloadClaimFence captureFence,
-        Long ringEpoch) {
-
-    public SrsLogRecord(
-            String srcToken, Op op, long ts, Map<String, Object> before,
-            Map<String, Object> after, long schemaVer, WorkloadClaimFence captureFence) {
-        this(srcToken, op, ts, before, after, schemaVer, captureFence, null);
-    }
+        long epoch) {
 
     public SrsLogRecord(
             String srcToken,
@@ -48,7 +43,31 @@ public record SrsLogRecord(
             Map<String, Object> before,
             Map<String, Object> after,
             long schemaVer) {
-        this(srcToken, op, ts, before, after, schemaVer, null, null);
+        this(srcToken, op, ts, before, after, schemaVer, null, 0L);
+    }
+
+    /** A record carrying its capture fence but no recorded original generation. */
+    public SrsLogRecord(
+            String srcToken,
+            Op op,
+            long ts,
+            Map<String, Object> before,
+            Map<String, Object> after,
+            long schemaVer,
+            WorkloadClaimFence captureFence) {
+        this(srcToken, op, ts, before, after, schemaVer, captureFence, 0L);
+    }
+
+    /** A record with its original capture generation and no capture fence. */
+    public SrsLogRecord(
+            String srcToken,
+            Op op,
+            long ts,
+            Map<String, Object> before,
+            Map<String, Object> after,
+            long schemaVer,
+            long epoch) {
+        this(srcToken, op, ts, before, after, schemaVer, null, epoch);
     }
 
     public SrsLogRecord {
@@ -59,8 +78,8 @@ public record SrsLogRecord(
         if (schemaVer < 0) {
             throw new IllegalArgumentException("schemaVer must be non-negative");
         }
-        if (ringEpoch != null && ringEpoch < 1) {
-            throw new IllegalArgumentException("ringEpoch must be positive when present");
+        if (epoch < 0) {
+            throw new IllegalArgumentException("epoch must be non-negative");
         }
         before = copyOrNull(before);
         after = copyOrNull(after);

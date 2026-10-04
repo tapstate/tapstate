@@ -6,6 +6,7 @@ import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.CaptureStart;
+import io.tapstate.spi.capture.CaptureStartedListener;
 import io.tapstate.spi.capture.SourcePosition;
 import java.io.IOException;
 import java.lang.reflect.Method;
@@ -26,7 +27,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 /**
- * Where a read starts, and where a snapshot hands its change tail off, are carried by four types on the
+ * Where a read starts, and where a snapshot hands its change tail off, are carried by the types on the
  * capture port. Every connector adapter implements them and the runtime calls them, so their shape is a
  * contract rather than an internal detail — and a second capture path is going to be built against
  * exactly this shape, which is why it is written down before that path exists rather than after.
@@ -53,7 +54,7 @@ class CapturePositionContractGateTest {
      */
     private static final List<Class<?>> CONTRACT = List.of(
             CapturePort.class, CaptureBatch.class, CaptureStart.class, SourcePosition.class,
-            CaptureListener.class);
+            CaptureListener.class, CaptureStartedListener.class);
 
     private static final Path GOLDEN = Path.of("src", "test", "resources", "capture-position-contract.golden");
 

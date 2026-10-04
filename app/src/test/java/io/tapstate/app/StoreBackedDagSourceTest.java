@@ -39,6 +39,9 @@ import io.tapstate.spi.store.ConnectionTester;
 import io.tapstate.spi.store.DerivedSchema;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.ConsumerProgressKind;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.SchemaStore;
@@ -64,6 +67,73 @@ import org.junit.jupiter.api.Test;
  * - the leaves (SRS source vertex, transform port, sink writer) are built but never opened here.
  */
 class StoreBackedDagSourceTest {
+
+    @Test
+    void aKeepStateRestartDoesNotAnnounceANewSnapshotBoundBeforeOlderPendingChanges() {
+        FakeStorePort store = new FakeStorePort();
+        String consumer = SrsConsumerId.of("p", "crm_source").value();
+        store.meta().create("crm", null);
+        store.meta().openEpoch("crm");
+        store.meta().upsertConsumerOffset("crm", new ConsumerOffset(consumer,
+                Map.of("support_case", 2L), null, List.of("support_case"), "before-batch", 1L,
+                Map.of("support_case", new ChainPosition(new SourceOrder(1, 1), "low")),
+                ConsumerProgressKind.SRS));
+        store.meta().openEpoch("crm");
+
+        assertThat(new StoreBackedDagSource(store).sourceContextEpoch("crm", consumer, "support_case"))
+                .isEqualTo(1L);
+        assertThat(store.meta().read("crm").orElseThrow().epoch()).isEqualTo(2L);
+    }
+
+    @Test
+    void cdcOnlyRestartUsesItsTablesConfirmedEpochWithoutBorrowingAnotherTable() {
+        FakeStorePort store = new FakeStorePort();
+        String consumer = SrsConsumerId.of("p", "crm_source").value();
+        store.meta().create("crm", null);
+        store.meta().openEpoch("crm");
+        store.meta().openEpoch("crm");
+        store.meta().upsertConsumerOffset("crm", new ConsumerOffset(consumer,
+                Map.of("support_case", 2L, "emailmessage", 1_000L), null, List.of(), null, 0L,
+                Map.of("support_case", new ChainPosition(new SourceOrder(1, 1), "low"),
+                        "emailmessage", new ChainPosition(new SourceOrder(2, 1_000), "mail")),
+                ConsumerProgressKind.SRS));
+
+        StoreBackedDagSource source = new StoreBackedDagSource(store);
+        assertThat(source.sourceContextEpoch("crm", consumer, "support_case")).isEqualTo(1L);
+        assertThat(source.sourceContextEpoch("crm", consumer, "emailmessage")).isEqualTo(2L);
+    }
+
+    @Test
+    void aFullReloadUsesItsNewSnapshotEpochOverRetainedOlderChanges() {
+        FakeStorePort store = new FakeStorePort();
+        String consumer = SrsConsumerId.of("p", "crm_source").value();
+        store.meta().create("crm", null);
+        store.meta().openEpoch("crm");
+        store.meta().openEpoch("crm");
+        store.meta().upsertConsumerOffset("crm", new ConsumerOffset(consumer,
+                Map.of("support_case", 2L), null, List.of(), "fresh-seam", 2L,
+                Map.of("support_case", new ChainPosition(new SourceOrder(1, 1), "low")),
+                ConsumerProgressKind.SRS));
+
+        assertThat(new StoreBackedDagSource(store).sourceContextEpoch("crm", consumer, "support_case"))
+                .isEqualTo(2L);
+    }
+
+    @Test
+    void aResumedTableUsesItsNewerConfirmedGenerationAfterTheSnapshot() {
+        FakeStorePort store = new FakeStorePort();
+        String consumer = SrsConsumerId.of("p", "crm_source").value();
+        store.meta().create("crm", null);
+        store.meta().openEpoch("crm");
+        store.meta().openEpoch("crm");
+        store.meta().upsertConsumerOffset("crm", new ConsumerOffset(consumer,
+                Map.of("support_case", 2L), null, List.of("support_case"), "old-seam", 1L,
+                Map.of("support_case", new ChainPosition(new SourceOrder(2, 1), "high")),
+                ConsumerProgressKind.SRS));
+
+        assertThat(new StoreBackedDagSource(store).sourceContextEpoch("crm", consumer, "support_case"))
+                .isEqualTo(2L);
+    }
 
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(strings = {"qualified", "source", "multiple", "regex"})

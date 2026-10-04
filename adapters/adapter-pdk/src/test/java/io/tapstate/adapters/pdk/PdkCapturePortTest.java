@@ -471,11 +471,11 @@ class PdkCapturePortTest {
         Path jar = Synthetic.timestampEchoingSource(dir);
         PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.TimestampEchoingSource", null));
         List<String> callbacks = new CopyOnWriteArrayList<>();
-        AtomicReference<Optional<SourcePosition>> start = new AtomicReference<>();
+        AtomicReference<SourcePosition> start = new AtomicReference<>();
         CountDownLatch firstBatch = new CountDownLatch(1);
-        CaptureListener listener = new CaptureListener() {
+        io.tapstate.spi.capture.CaptureStartedListener listener = new io.tapstate.spi.capture.CaptureStartedListener() {
             @Override
-            public void onStart(Optional<SourcePosition> position) {
+            public void onStart(SourcePosition position) {
                 start.set(position);
                 callbacks.add("start");
             }
@@ -489,7 +489,7 @@ class PdkCapturePortTest {
         try (Subscription ignored = port.cdc(config("t1"), CaptureStart.present(), listener)) {
             assertThat(firstBatch.await(5, TimeUnit.SECONDS)).isTrue();
         }
-        assertThat(start.get()).isPresent();
+        assertThat(start.get()).isNotNull();
         assertThat(callbacks).startsWith("start", "batch");
     }
 

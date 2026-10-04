@@ -110,17 +110,23 @@ final class TwoMemberCluster implements AutoCloseable {
         int memberPortB = RealProcessServer.reservePort();
         String seeds = bindAddress + ":" + memberPortA + "," + bindAddress + ":" + memberPortB;
 
-        RealProcessServer first = RealProcessServer.start(storeUri, "0.0.0.0",
-                httpPort -> arguments(
-                        clusterId, NODE_A, memberPortA, seeds, httpPort, bindAddress, nodeSessionTtl));
+        RealProcessServer first = null;
         RealProcessServer second;
         try {
+            first = RealProcessServer.start(storeUri, "0.0.0.0",
+                    httpPort -> arguments(
+                            clusterId, NODE_A, memberPortA, seeds, httpPort, bindAddress, nodeSessionTtl));
             second = RealProcessServer.start(storeUri, "0.0.0.0",
                     httpPort -> arguments(
                             clusterId, NODE_B, memberPortB, seeds, httpPort, bindAddress, nodeSessionTtl));
         } catch (RuntimeException | Error failure) {
-            first.close();
+            if (first != null) {
+                first.close();
+            }
             throw failure;
+        } finally {
+            RealProcessServer.releasePort(memberPortA);
+            RealProcessServer.releasePort(memberPortB);
         }
         TwoMemberCluster cluster = new TwoMemberCluster(
                 first, second, storeUri, clusterId, bindAddress, seeds, nodeSessionTtl);

@@ -23,6 +23,7 @@ import io.tapstate.spi.capture.DiscoveredSchema;
 import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.ConsumerProgressKind;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
@@ -32,16 +33,11 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Optional;
-import java.util.OptionalLong;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -229,9 +225,13 @@ class CaptureRunUnitJetSmokeTest {
     /** This consumer's last read sequence on {@code table}, read back from the chain's durable consumer offsets. */
     private static long perTableSeq(SrsMetaStore meta, CaptureRun run, String pipelineId, String table) {
         String chainId = run.chainId().orElseThrow().value();
-        return meta.read(chainId).orElseThrow().consumerOffsets().stream()
-                .filter(c -> c.pipelineId().equals(pipelineId)).findFirst().orElseThrow()
-                .perTableSeq().getOrDefault(table, -1L);
+        ConsumerOffset consumer = meta.read(chainId).orElseThrow().consumerOffset(pipelineId).orElseThrow();
+        // These compatibility specs use one pipeline-owned record. Draining a Jet source must not
+        // invent target confirmations or promote that record into independent-table progress.
+        assertThat(consumer.sinkAcked()).isNull();
+        assertThat(consumer.sinkAckedByTable()).isEmpty();
+        assertThat(consumer.progressKind()).isEqualTo(ConsumerProgressKind.LEGACY);
+        return consumer.perTableSeq().getOrDefault(table, -1L);
     }
 
     private static void awaitSize(IList<?> list, int size) throws InterruptedException {
@@ -264,8 +264,10 @@ class CaptureRunUnitJetSmokeTest {
         @Override
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
             cdcStarted = true;
-            listener.onStart(Optional.of(start instanceof CaptureStart.Resume resume
-                    ? resume.position() : new SourcePosition("src-start")));
+            if (listener instanceof io.tapstate.spi.capture.CaptureStartedListener started) {
+                started.onStart(start instanceof CaptureStart.Resume resume
+                        ? resume.position() : new SourcePosition("src-start"));
+            }
             for (Envelope e : changes) {
                 listener.onBatch(java.util.List.of(e), Optional.of(new SourcePosition("src-" + e.ts())));
             }
@@ -340,83 +342,20 @@ class CaptureRunUnitJetSmokeTest {
 
         final List<String> created = new ArrayList<>();
         private final Map<String, SrsMeta> records = new LinkedHashMap<>();
-        private final Map<String, PhysicalSelection> physicalSelections = new LinkedHashMap<>();
-        private final java.util.Set<String> trustedPhysicalPrefixes = new java.util.HashSet<>();
-        private final Map<String, Map<String, Long>> ringDone = new LinkedHashMap<>();
-        private final Map<String, Map<String, Long>> ringStarts = new LinkedHashMap<>();
-
-        @Override
-        public synchronized OptionalLong ringGenerationStartAfter(String miningChainId, String table, long epoch) {
-            SrsMeta current = records.get(miningChainId);
-            Long start = current == null || current.epoch() != epoch ? null
-                    : ringStarts.getOrDefault(miningChainId, Map.of()).get(table);
-            return start == null ? OptionalLong.empty() : OptionalLong.of(start);
-        }
-
-        @Override
-        public synchronized OptionalLong establishRingGenerationStartAfter(
-                String miningChainId, String table, long epoch, long proposedSeq) {
-            if (require(miningChainId).epoch() != epoch) {
-                return OptionalLong.empty();
-            }
-            long start = ringStarts.computeIfAbsent(miningChainId, ignored -> new LinkedHashMap<>())
-                    .computeIfAbsent(table, ignored -> proposedSeq);
-            return OptionalLong.of(start);
-        }
-
-        @Override
-        public synchronized Optional<PhysicalSelection> physicalSelection(String miningChainId) {
-            return Optional.ofNullable(physicalSelections.get(miningChainId));
-        }
-
-        @Override
-        public synchronized boolean publishPhysicalSelection(String miningChainId, PhysicalSelection selection) {
-            if (require(miningChainId).epoch() != selection.epoch()) {
-                return false;
-            }
-            PhysicalSelection previous = physicalSelections.get(miningChainId);
-            if (previous != null && !previous.equals(selection)) {
-                return false;
-            }
-            physicalSelections.put(miningChainId, selection);
-            return true;
-        }
-
-        @Override
-        public synchronized boolean physicalPrefixTrusted(String miningChainId) {
-            return trustedPhysicalPrefixes.contains(miningChainId);
-        }
-
-        @Override
-        public synchronized boolean establishPhysicalAnchor(String miningChainId, ChainPosition position) {
-            SrsMeta current = require(miningChainId);
-            if (current.epoch() != position.order().epoch()) {
-                return false;
-            }
-            if (current.sourceRead() != null) {
-                return trustedPhysicalPrefixes.contains(miningChainId);
-            }
-            advanceSourceReadOffset(miningChainId, position);
-            trustedPhysicalPrefixes.add(miningChainId);
-            return true;
-        }
+        private final Map<String, Map<String, Long>> arrivals = new LinkedHashMap<>();
 
         @Override
         public synchronized Map<String, Long> ringDoneThrough(String miningChainId, String pipelineId) {
-            return Map.copyOf(ringDone.getOrDefault(miningChainId + "/" + pipelineId, Map.of()));
+            return Map.copyOf(arrivals.getOrDefault(miningChainId + "/" + pipelineId, Map.of()));
         }
 
         @Override
         public synchronized void startRingAfter(
-                String miningChainId, String pipelineId, String table, long epoch, long seq) {
-            SrsMeta current = require(miningChainId);
-            ConsumerOffset consumer = current.consumerOffset(pipelineId).orElse(null);
-            if (current.epoch() == epoch && consumer != null
-                    && Objects.equals(consumer.selectedTablesEpoch(), epoch)
-                    && consumer.selectedTables().contains(table)) {
-                ringDone.computeIfAbsent(miningChainId + "/" + pipelineId, ignored -> new LinkedHashMap<>())
-                        .putIfAbsent(table, seq);
-            }
+                String miningChainId, String pipelineId, String table, long seq) {
+            require(miningChainId);
+            long arrival = arrivals.computeIfAbsent(miningChainId + "/" + pipelineId,
+                    ignored -> new LinkedHashMap<>()).computeIfAbsent(table, ignored -> seq);
+            advanceConsumerReadSeq(miningChainId, pipelineId, table, arrival);
         }
 
         @Override
@@ -444,7 +383,7 @@ class CaptureRunUnitJetSmokeTest {
             SrsMeta m = require(miningChainId);
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), position, m.consumerOffsets(),
-                    m.schemaHistory(), m.retention(), m.epoch()));
+                    m.schemaHistory(), m.retention(), m.epoch(), m.sourceReadAt(), m.sourceReadDurable()));
         }
 
         @Override
@@ -455,7 +394,7 @@ class CaptureRunUnitJetSmokeTest {
             next.add(offset);
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), next,
-                    m.schemaHistory(), m.retention(), m.epoch()));
+                    m.schemaHistory(), m.retention(), m.epoch(), m.sourceReadAt(), m.sourceReadDurable()));
         }
 
         @Override
@@ -471,7 +410,7 @@ class CaptureRunUnitJetSmokeTest {
                 }
             }
             Map<String, Long> perTable = new LinkedHashMap<>(existing == null ? Map.of() : existing.perTableSeq());
-            perTable.put(table, lastReadSeq);
+            perTable.merge(table, lastReadSeq, Math::max);
             ChainPosition ack = existing == null ? null : existing.sinkAcked();
             next.add(new ConsumerOffset(
                     pipelineId,
@@ -480,43 +419,11 @@ class CaptureRunUnitJetSmokeTest {
                     existing == null ? List.of() : existing.snapshotCompletedTables(),
                     existing == null ? null : existing.cdcStartPosition(),
                     existing == null ? 0L : existing.snapshotEpoch(),
-                    existing == null ? null : existing.selectedTables(),
-                    existing == null ? null : existing.selectedTablesEpoch(),
-                    existing == null ? null : existing.cursorWriterToken()));
+                    existing == null ? Map.of() : existing.sinkAckedByTable(),
+                    existing == null ? ConsumerProgressKind.LEGACY : existing.progressKind()));
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), next,
-                    m.schemaHistory(), m.retention(), m.epoch()));
-        }
-
-        @Override
-        public synchronized void selectConsumerTables(
-                String miningChainId, String pipelineId, List<String> tables, long epoch,
-                String cursorWriterToken) {
-            SrsMeta m = require(miningChainId);
-            ConsumerOffset previous = m.consumerOffset(pipelineId).orElse(null);
-            Map<String, Long> cursors = previous != null
-                    && Objects.equals(previous.selectedTablesEpoch(), epoch)
-                    && Objects.equals(previous.cursorWriterToken(), cursorWriterToken)
-                    && tables.equals(previous.selectedTables())
-                    ? previous.perTableSeq() : Map.of();
-            upsertConsumerOffset(miningChainId, new ConsumerOffset(
-                    pipelineId, cursors, previous == null ? null : previous.sinkAcked(),
-                    previous == null ? List.of() : previous.snapshotCompletedTables(),
-                    previous == null ? null : previous.cdcStartPosition(),
-                    previous == null ? 0L : previous.snapshotEpoch(),
-                    tables, epoch, cursorWriterToken));
-        }
-
-        @Override
-        public synchronized void advanceConsumerReadSeq(
-                String miningChainId, String pipelineId, String table, long epoch,
-                String cursorWriterToken, long lastReadSeq) {
-            ConsumerOffset current = require(miningChainId).consumerOffset(pipelineId).orElse(null);
-            if (current != null && Objects.equals(current.selectedTablesEpoch(), epoch)
-                    && Objects.equals(current.cursorWriterToken(), cursorWriterToken)
-                    && current.selectedTables().contains(table)) {
-                advanceConsumerReadSeq(miningChainId, pipelineId, table, lastReadSeq);
-            }
+                    m.schemaHistory(), m.retention(), m.epoch(), m.sourceReadAt(), m.sourceReadDurable()));
         }
 
         @Override
@@ -539,12 +446,11 @@ class CaptureRunUnitJetSmokeTest {
                     existing == null ? List.of() : existing.snapshotCompletedTables(),
                     existing == null ? null : existing.cdcStartPosition(),
                     existing == null ? 0L : existing.snapshotEpoch(),
-                    existing == null ? null : existing.selectedTables(),
-                    existing == null ? null : existing.selectedTablesEpoch(),
-                    existing == null ? null : existing.cursorWriterToken()));
+                    existing == null ? Map.of() : existing.sinkAckedByTable(),
+                    existing == null ? ConsumerProgressKind.LEGACY : existing.progressKind()));
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), next,
-                    m.schemaHistory(), m.retention(), m.epoch()));
+                    m.schemaHistory(), m.retention(), m.epoch(), m.sourceReadAt(), m.sourceReadDurable()));
         }
 
         @Override
@@ -567,37 +473,21 @@ class CaptureRunUnitJetSmokeTest {
                     existing == null ? List.of() : existing.snapshotCompletedTables(),
                     cdcStartPosition,
                     snapshotEpoch,
-                    existing == null ? null : existing.selectedTables(),
-                    existing == null ? null : existing.selectedTablesEpoch(),
-                    existing == null ? null : existing.cursorWriterToken()));
+                    existing == null ? Map.of() : existing.sinkAckedByTable(),
+                    existing == null ? ConsumerProgressKind.LEGACY : existing.progressKind()));
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), next,
-                    m.schemaHistory(), m.retention(), m.epoch()));
+                    m.schemaHistory(), m.retention(), m.epoch(), m.sourceReadAt(), m.sourceReadDurable()));
         }
 
         @Override
         public synchronized long openEpoch(String miningChainId) {
             SrsMeta m = require(miningChainId);
             long opened = m.epoch() + 1;
-            ringStarts.remove(miningChainId);
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), m.consumerOffsets(),
-                    m.schemaHistory(), m.retention(), opened));
+                    m.schemaHistory(), m.retention(), opened, m.sourceReadAt(), m.sourceReadDurable()));
             return opened;
-        }
-
-        @Override
-        public synchronized boolean setCdcStartIfCurrent(String miningChainId, String pipelineId,
-                String cursorWriterToken, long selectedTablesEpoch, String cdcStartPosition, long snapshotEpoch) {
-            SrsMeta current = require(miningChainId);
-            ConsumerOffset consumer = current.consumerOffset(pipelineId).orElse(null);
-            if (current.epoch() != selectedTablesEpoch || consumer == null
-                    || !Objects.equals(consumer.selectedTablesEpoch(), selectedTablesEpoch)
-                    || !Objects.equals(consumer.cursorWriterToken(), cursorWriterToken)) {
-                return false;
-            }
-            setCdcStart(miningChainId, pipelineId, cdcStartPosition, snapshotEpoch);
-            return true;
         }
 
         @Override
@@ -607,7 +497,7 @@ class CaptureRunUnitJetSmokeTest {
             next.add(version);
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), m.consumerOffsets(),
-                    next, m.retention(), m.epoch()));
+                    next, m.retention(), m.epoch(), m.sourceReadAt(), m.sourceReadDurable()));
         }
 
         @Override
@@ -633,11 +523,10 @@ class CaptureRunUnitJetSmokeTest {
                     mine == null ? null : mine.sinkAcked(), completed,
                     mine == null ? null : mine.cdcStartPosition(),
                     mine == null ? 0L : mine.snapshotEpoch(),
-                    mine == null ? null : mine.selectedTables(),
-                    mine == null ? null : mine.selectedTablesEpoch(),
-                    mine == null ? null : mine.cursorWriterToken()));
+                    mine == null ? Map.of() : mine.sinkAckedByTable(),
+                    mine == null ? ConsumerProgressKind.LEGACY : mine.progressKind()));
             records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), consumers,
-                    m.schemaHistory(), m.retention(), m.epoch()));
+                    m.schemaHistory(), m.retention(), m.epoch(), m.sourceReadAt(), m.sourceReadDurable()));
         }
 
         private SrsMeta require(String miningChainId) {

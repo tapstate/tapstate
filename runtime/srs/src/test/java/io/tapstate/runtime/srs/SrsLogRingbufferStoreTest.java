@@ -7,8 +7,20 @@ import com.hazelcast.config.RingbufferStoreConfig;
 import com.hazelcast.config.SerializerConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.jet.Job;
+import com.hazelcast.jet.core.DAG;
+import com.hazelcast.jet.core.JobStatus;
+import com.hazelcast.jet.core.Vertex;
+import com.hazelcast.jet.core.processor.Processors;
+import com.hazelcast.jet.core.processor.SinkProcessors;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.capture.SourcePosition;
+import io.tapstate.spi.store.SrsLogBatch;
+import io.tapstate.spi.store.SrsLogBounds;
 import io.tapstate.spi.store.SrsLogRecord;
 import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.WorkloadClaimFence;
@@ -18,6 +30,8 @@ import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
@@ -26,6 +40,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static com.hazelcast.jet.core.Edge.between;
 
 @DisplayName("the change ring backed by the durable change log")
 class SrsLogRingbufferStoreTest {
@@ -34,6 +50,7 @@ class SrsLogRingbufferStoreTest {
 
     /** The ring the harness builds. Named rather than repeated: one case writes past it on purpose. */
     private static final int CAPACITY = 16;
+    private static final String PROGRESS_KEY = "test.durable-source-progress";
 
     @Test
     @DisplayName("writes a change down before it is in the ring, so the ring never holds an unwritten one")
@@ -115,12 +132,10 @@ class SrsLogRingbufferStoreTest {
                 new WorkloadOwner("node-a", "boot-a"), 3, 0, 2);
         withMember(log, member -> {
             member.getRingbuffer(RING).add(new SrsItem(
-                    new SourcePosition("a"), Op.INSERT, 1L, null, Map.of("id", 1), 0L, fence, 4L));
+                    new SourcePosition("a"), Op.INSERT, 1L, null, Map.of("id", 1), 0L, fence));
 
             assertThat(log.load(RING, 0L).orElseThrow().captureFence()).isEqualTo(fence);
-            assertThat(log.load(RING, 0L).orElseThrow().ringEpoch()).isEqualTo(4L);
             assertThat(new SrsRingbuffer(member.getRingbuffer(RING)).readOne(0).captureFence()).isEqualTo(fence);
-            assertThat(new SrsRingbuffer(member.getRingbuffer(RING)).readOne(0).ringEpoch()).isEqualTo(4L);
         });
     }
 
@@ -218,6 +233,270 @@ class SrsLogRingbufferStoreTest {
         });
     }
 
+    @Test
+    void aRestartReplaysTheUnconfirmedHighEvenWhenMailConfirmedAndTheReadCursorRanAhead() {
+        RecordingLog log = new RecordingLog();
+        String rootRing = "srs.shared.support_case";
+        String mailRing = "srs.shared.emailmessage";
+        Progress progress = new Progress();
+        withMember(log, member -> {
+            SrsRingbuffer root = new SrsRingbuffer(member.getRingbuffer(rootRing));
+            SrsRingbuffer mail = new SrsRingbuffer(member.getRingbuffer(mailRing));
+            root.append(change("low", "Low", 7L));
+            root.append(change("high", "High", 7L));
+            for (int i = 0; i < CAPACITY; i++) {
+                root.append(change("later-" + i, "High", 7L));
+            }
+            mail.appendAll(List.of(change("mail-0", "sent", 7L), change("mail-1", "sent", 7L),
+                    change("mail-2", "sent", 7L), change("mail-3", "sent", 7L)));
+            progress.confirmed.put(rootRing, new ChainPosition(new SourceOrder(7L, 0L), "low"));
+            progress.confirmed.put(mailRing, new ChainPosition(new SourceOrder(7L, 3L), "mail-3"));
+            SrsRingReader.from(root, StartFrom.earliest(),
+                    seq -> progress.read.put(rootRing, seq), null, rootRing, log).fill((item, seq) -> { }, 64);
+            assertThat(progress.read.get(rootRing)).isEqualTo(CAPACITY + 1L);
+            assertThat(progress.confirmed.get(rootRing).order().seq()).isZero();
+        });
+
+        log.readBatchCalls = 0;
+        withMember(log, member -> {
+            member.getUserContext().put(PROGRESS_KEY, progress);
+            SrsRingbuffer root = new SrsRingbuffer(member.getRingbuffer(rootRing));
+            assertThat(root.headSequence()).isEqualTo(CAPACITY + 2L);
+            List<String> out = runSource(member, rootRing, 0L, 11L, new TableProgress(rootRing),
+                    "recovered-root", CAPACITY + 1);
+            assertThat(out.getFirst()).isEqualTo("high|High|7:1");
+            assertThat(out).hasSize(CAPACITY + 1).noneMatch(value -> value.startsWith("low|"));
+            assertThat(progress.confirmed.get(rootRing).order()).isEqualTo(new SourceOrder(7L, 0L));
+            assertThat(progress.confirmed.get(mailRing).order()).isEqualTo(new SourceOrder(7L, 3L));
+            assertThat(progress.read.get(rootRing)).isEqualTo(CAPACITY + 1L);
+
+            SrsRingReader resumedMail = SrsRingReader.resumingAfter(
+                    new SrsRingbuffer(member.getRingbuffer(mailRing)), 3L, progress.confirmed.get(mailRing),
+                    seq -> progress.read.put(mailRing, seq), mailRing, log);
+            assertThat(resumedMail.fill((item, seq) -> { }, 64)).isZero();
+        });
+        assertThat(log.readBatchCalls)
+                .as("one confirmation lookup and one backlog query for root, one confirmation lookup for mail")
+                .isEqualTo(3);
+    }
+
+    @Test
+    void aDurableReaderRefusesAHoleInsteadOfAdvancingOverIt() {
+        RecordingLog log = new RecordingLog();
+        withMember(log, member -> {
+            new SrsRingbuffer(member.getRingbuffer(RING)).appendAll(
+                    List.of(change("low", "Low", 5L), change("high", "High", 5L),
+                            change("later", "Medium", 5L)));
+        });
+        log.rings.get(RING).remove(1L);
+
+        withMember(log, member -> {
+            List<Long> published = new ArrayList<>();
+            List<String> delivered = new ArrayList<>();
+            SrsRingReader reader = SrsRingReader.resumingAfter(
+                    new SrsRingbuffer(member.getRingbuffer(RING)), 0L,
+                    new ChainPosition(new SourceOrder(5L, 0L), "low"), published::add, RING, log);
+            assertGap(() -> reader.fill((item, seq) -> delivered.add(item.srcPos().token()), 32),
+                    1L, "no record");
+            assertThat(delivered).isEmpty();
+            assertThat(published).isEmpty();
+        });
+    }
+
+    @Test
+    void trimmingExactlyThroughConfirmationAllowsRecoveryAndTrimmingPastItRefusesRecovery() {
+        RecordingLog log = new RecordingLog();
+        withMember(log, member -> new SrsRingbuffer(member.getRingbuffer(RING)).appendAll(
+                List.of(change("low", "Low", 4L), change("high", "High", 4L),
+                        change("last", "Medium", 4L))));
+        log.trim(RING, 0L);
+
+        withMember(log, member -> {
+            SrsRingbuffer ring = new SrsRingbuffer(member.getRingbuffer(RING));
+            List<String> out = new ArrayList<>();
+            SrsRingReader reader = SrsRingReader.resumingAfter(ring, 0L,
+                    new ChainPosition(new SourceOrder(4L, 0L), "low"), seq -> { }, RING, log);
+            reader.fill((item, seq) -> out.add(item.after().get("priority").toString()), 32);
+            assertThat(out).containsExactly("High", "Medium");
+
+            log.trim(RING, 1L);
+            assertGap(() -> SrsRingReader.resumingAfter(ring, 0L,
+                            new ChainPosition(new SourceOrder(4L, 0L), "low"), seq -> { }, RING, log),
+                    1L, "trimmed");
+        });
+    }
+
+    @Test
+    void aRecordWithNoOriginalGenerationCannotBeReplayedAfterRestart() {
+        RecordingLog log = new RecordingLog();
+        withMember(log, member -> member.getRingbuffer(RING).add(item("legacy", 1L)));
+
+        withMember(log, member -> {
+            SrsRingReader reader = SrsRingReader.resumingAfter(
+                    new SrsRingbuffer(member.getRingbuffer(RING)), -1L, null, seq -> { }, RING, log);
+            assertGap(() -> reader.fill((item, seq) -> { }, 32), 0L, "original capture generation");
+        });
+    }
+
+    @Test
+    void aFullyTrimmedLogRetainsItsSequenceAndRecoveryTailsTheNextGeneration() {
+        RecordingLog log = new RecordingLog();
+        withMember(log, member -> new SrsRingbuffer(member.getRingbuffer(RING)).appendAll(
+                List.of(change("low", "Low", 4L), change("high", "High", 4L))));
+        log.trim(RING, 1L);
+
+        withMember(log, member -> {
+            SrsRingbuffer ring = new SrsRingbuffer(member.getRingbuffer(RING));
+            assertThat(ring.headSequence()).isEqualTo(2L);
+            SrsRingReader reader = SrsRingReader.resumingAfter(ring, 1L,
+                    new ChainPosition(new SourceOrder(4L, 1L), "high"), seq -> { }, RING, log);
+            assertThat(reader.fill((item, seq) -> { }, 32)).isZero();
+            assertThat(ring.append(change("next", "Medium", 5L))).isEqualTo(2L);
+            List<SourceOrder> out = new ArrayList<>();
+            reader.fill((item, seq) -> out.add(new SourceOrder(item.epoch(), seq)), 32);
+            assertThat(out).containsExactly(new SourceOrder(5L, 2L));
+        });
+    }
+
+    @Test
+    void anInstantStartSearchesTheRetainedLogBelowTheRebuiltHotHead() {
+        RecordingLog log = new RecordingLog();
+        withMember(log, member -> new SrsRingbuffer(member.getRingbuffer(RING)).appendAll(List.of(
+                new SrsItem(new SourcePosition("a"), Op.UPDATE, 10L, null,
+                        Map.of("priority", "Low"), 0L, null, 4L),
+                new SrsItem(new SourcePosition("b"), Op.UPDATE, 20L, null,
+                        Map.of("priority", "High"), 0L, null, 4L),
+                new SrsItem(new SourcePosition("c"), Op.UPDATE, 30L, null,
+                        Map.of("priority", "Medium"), 0L, null, 4L))));
+
+        withMember(log, member -> {
+            SrsRingbuffer ring = new SrsRingbuffer(member.getRingbuffer(RING));
+            assertThat(ring.headSequence()).isEqualTo(3L);
+            SrsRingReader reader = SrsRingReader.from(ring,
+                    StartFrom.at(java.time.Instant.ofEpochMilli(15L)), seq -> { }, "1h", RING, log);
+            List<String> out = new ArrayList<>();
+            assertThat(reader.fill((item, seq) -> out.add(item.srcPos().token()), 1)).isEqualTo(1);
+            assertThat(reader.fill((item, seq) -> out.add(item.srcPos().token()), 1)).isEqualTo(1);
+            assertThat(out).containsExactly("b", "c");
+        });
+    }
+
+    @Test
+    void aRetainedConfirmationMustNameTheOriginalGenerationAndToken() {
+        RecordingLog log = new RecordingLog();
+        withMember(log, member -> {
+            SrsRingbuffer ring = new SrsRingbuffer(member.getRingbuffer(RING));
+            ring.append(change("low", "Low", 4L));
+            assertGap(() -> SrsRingReader.resumingAfter(ring, 0L,
+                            new ChainPosition(new SourceOrder(9L, 0L), "low"), seq -> { }, RING, log),
+                    0L, "generation or token");
+            assertGap(() -> SrsRingReader.resumingAfter(ring, 0L,
+                            new ChainPosition(new SourceOrder(4L, 0L), "different"), seq -> { }, RING, log),
+                    0L, "generation or token");
+        });
+    }
+
+    @Test
+    void aFirstArrivalMarkerIsNotRelabelledAsAConfirmation() {
+        RecordingLog log = new RecordingLog();
+        withMember(log, member -> {
+            SrsRingbuffer ring = new SrsRingbuffer(member.getRingbuffer(RING));
+            ring.append(change("before-joining", "Low", 4L));
+            SrsRingReader reader = SrsRingReader.resumingAfter(ring, 0L, null, seq -> { }, RING, log);
+            ring.append(change("after-joining", "High", 4L));
+            List<String> out = new ArrayList<>();
+            reader.fill((item, seq) -> out.add(item.srcPos().token()), 32);
+            assertThat(out).containsExactly("after-joining");
+        });
+    }
+
+    @Test
+    void replayAfterANewSnapshotKeepsTheOldValueOlderThanTheSnapshot() {
+        RecordingLog log = new RecordingLog();
+        withMember(log, member -> member.getRingbuffer(RING).add(change("old-low", "Low", 4L)));
+
+        withMember(log, member -> {
+            SnapshotBuffer snapshots = new SnapshotBuffer();
+            snapshots.append("pipeline", RING, new Envelope(Op.READ, 1L, "support_case", null,
+                    Map.of("priority", "High"), null,
+                    Map.of("support_case", new ChainPosition(SourceOrder.snapshotRow(8L), null))));
+            member.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, snapshots);
+            List<String> out = runSource(member, RING, -1L, 8L, SrsReadCursorPublisherFactory.NONE,
+                    "reload-values", 2);
+            assertThat(out).containsExactly("null|High|8:" + SourceOrder.SNAPSHOT_SEQ, "old-low|Low|4:0");
+            assertThat(new SourceOrder(4L, 0L)).isLessThan(SourceOrder.snapshotRow(8L));
+        });
+    }
+
+    private static void assertGap(Runnable operation, long sequence, String reason) {
+        assertThatThrownBy(operation::run).isInstanceOfSatisfying(TapstateException.class, fault -> {
+            assertThat(fault.code()).isEqualTo(CaptureError.RECOVERY_LOG_GAP);
+            assertThat(fault.args()).containsEntry("ring", RING).containsEntry("sequence", sequence);
+            assertThat(fault.args().get("reason").toString()).contains(reason);
+        });
+    }
+
+    private static List<String> runSource(HazelcastInstance member, String ring, long confirmedSeq,
+            long contextEpoch, SrsReadCursorPublisherFactory publisher, String output, int count) {
+        DAG dag = new DAG();
+        Vertex source = dag.newVertex("source", SrsSourceProcessor.metaSupplier(
+                "pipeline", ring, "support_case", StartFrom.earliest(), confirmedSeq, contextEpoch,
+                publisher, null, SourcePlacement.anyMember()));
+        Vertex projection = dag.newVertex("describe", Processors.mapP(SrsLogRingbufferStoreTest::describe))
+                .localParallelism(1);
+        Vertex sink = dag.newVertex("sink", SinkProcessors.writeListP(output)).localParallelism(1);
+        dag.edge(between(source, projection)).edge(between(projection, sink));
+        Job job = member.getJet().newJob(dag);
+        List<String> values = member.getList(output);
+        long deadline = System.nanoTime() + Duration.ofSeconds(15).toNanos();
+        try {
+            while (values.size() < count && System.nanoTime() < deadline) {
+                if (job.getStatus() == JobStatus.FAILED) {
+                    job.join();
+                }
+                try {
+                    Thread.sleep(10L);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("interrupted waiting for durable replay", interrupted);
+                }
+            }
+            assertThat(values).as("the live source delivers the expected recoverable backlog").hasSize(count);
+            return List.copyOf(values);
+        } finally {
+            job.cancel();
+        }
+    }
+
+    private static String describe(Envelope envelope) {
+        ChainPosition at = envelope.position();
+        return at.token() + "|" + envelope.after().get("priority") + "|"
+                + at.order().epoch() + ":" + at.order().seq();
+    }
+
+    private static SrsItem change(String token, String priority, long epoch) {
+        return new SrsItem(new SourcePosition(token), Op.UPDATE, 1L,
+                Map.of("priority", "Low"), Map.of("priority", priority), 0L, null, epoch);
+    }
+
+    private record TableProgress(String ring) implements SrsReadCursorPublisherFactory {
+        @Override
+        public java.util.function.LongConsumer resolve(HazelcastInstance member) {
+            Progress progress = (Progress) member.getUserContext().get(PROGRESS_KEY);
+            return seq -> progress.read.put(ring, seq);
+        }
+
+        @Override
+        public Optional<ChainPosition> confirmedPosition(HazelcastInstance member) {
+            return Optional.ofNullable(((Progress) member.getUserContext().get(PROGRESS_KEY)).confirmed.get(ring));
+        }
+    }
+
+    private static final class Progress {
+        private final Map<String, Long> read = new ConcurrentHashMap<>();
+        private final Map<String, ChainPosition> confirmed = new ConcurrentHashMap<>();
+    }
+
     private static SrsItem item(String token, long ts) {
         return new SrsItem(new SourcePosition(token), Op.INSERT, ts, null, Map.of("id", ts), 0L);
     }
@@ -226,6 +505,14 @@ class SrsLogRingbufferStoreTest {
     private static void withMember(SrsLogStore log, java.util.function.Consumer<HazelcastInstance> body) {
         Config config = new Config();
         config.setClusterName("srs-log-" + System.nanoTime());
+        config.setProperty("hazelcast.phone.home.enabled", "false");
+        config.setProperty("hazelcast.shutdownhook.enabled", "false");
+        config.setProperty("hazelcast.operation.thread.count", "2");
+        config.setProperty("hazelcast.operation.generic.thread.count", "2");
+        config.setProperty("hazelcast.io.input.thread.count", "1");
+        config.setProperty("hazelcast.io.output.thread.count", "1");
+        config.getJetConfig().setEnabled(true).setCooperativeThreadCount(2);
+        config.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");
         config.getNetworkConfig().getJoin().getAutoDetectionConfig().setEnabled(false);
         config.getNetworkConfig().getJoin().getMulticastConfig().setEnabled(false);
         config.getSerializationConfig().addSerializerConfig(new SerializerConfig()
@@ -241,6 +528,7 @@ class SrsLogRingbufferStoreTest {
                         .setFactoryImplementation(new SrsLogRingbufferStoreFactory(log))));
         HazelcastInstance member = Hazelcast.newHazelcastInstance(config);
         try {
+            member.getUserContext().put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY, log);
             body.accept(member);
         } finally {
             member.getLifecycleService().terminate();
@@ -251,13 +539,17 @@ class SrsLogRingbufferStoreTest {
     private static final class RecordingLog implements SrsLogStore {
 
         private final Map<String, NavigableMap<Long, SrsLogRecord>> rings = new ConcurrentHashMap<>();
+        private final Map<String, Long> largest = new ConcurrentHashMap<>();
+        private final Map<String, Long> trimmed = new ConcurrentHashMap<>();
         private int storeCalls;
         private int storeAllCalls;
+        private volatile int readBatchCalls;
 
         @Override
         public void store(String ring, long seq, SrsLogRecord record) {
             storeCalls++;
             rings.computeIfAbsent(ring, name -> new ConcurrentSkipListMap<>()).put(seq, record);
+            largest.merge(ring, seq, Math::max);
         }
 
         @Override
@@ -266,6 +558,9 @@ class SrsLogRingbufferStoreTest {
             long seq = firstSeq;
             for (SrsLogRecord record : records) {
                 rings.computeIfAbsent(ring, name -> new ConcurrentSkipListMap<>()).put(seq++, record);
+            }
+            if (!records.isEmpty()) {
+                largest.merge(ring, seq - 1L, Math::max);
             }
         }
 
@@ -277,17 +572,28 @@ class SrsLogRingbufferStoreTest {
 
         @Override
         public long largestSequence(String ring) {
-            NavigableMap<Long, SrsLogRecord> entries = rings.get(ring);
-            return entries == null || entries.isEmpty() ? -1L : entries.lastKey();
+            return largest.getOrDefault(ring, -1L);
         }
 
         @Override
-        public void trim(String ring, long throughSeq, long ringEpoch) {
+        public SrsLogBounds bounds(String ring) {
+            return new SrsLogBounds(largestSequence(ring), trimmed.getOrDefault(ring, -1L));
+        }
+
+        @Override
+        public SrsLogBatch readBatch(String ring, long firstSeq, int maxSize) {
+            readBatchCalls++;
+            NavigableMap<Long, SrsLogRecord> records = rings.get(ring);
+            return new SrsLogBatch(bounds(ring), records == null ? Map.of()
+                    : records.subMap(firstSeq, true, firstSeq + maxSize, false));
+        }
+
+        @Override
+        public void trim(String ring, long throughSeq) {
+            trimmed.merge(ring, Math.min(throughSeq, largestSequence(ring)), Math::max);
             NavigableMap<Long, SrsLogRecord> entries = rings.get(ring);
-            if (entries != null && !entries.isEmpty()) {
-                long last = entries.lastKey();
-                entries.headMap(Math.min(throughSeq, last - 1), true).entrySet()
-                        .removeIf(entry -> Long.valueOf(ringEpoch).equals(entry.getValue().ringEpoch()));
+            if (entries != null) {
+                entries.headMap(throughSeq, true).clear();
             }
         }
     }

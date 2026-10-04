@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import com.hazelcast.core.HazelcastInstance;
+import io.tapstate.adapters.pdk.ConnectorStateNamespace;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.lifecycle.CaptureReading;
@@ -35,6 +36,7 @@ import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
@@ -42,7 +44,6 @@ import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
-import io.tapstate.spi.store.SrsMetaStore;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
@@ -60,7 +61,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
-import java.util.function.Predicate;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -146,19 +146,24 @@ class CaptureOwnershipTest {
         InMemoryStorePort store = new InMemoryStorePort(artifactsWith(ReadMode.SNAPSHOT_ONLY, "p", "q"));
         HeldSnapshots source = new HeldSnapshots(true);
         SnapshotBuffer buffer = new SnapshotBuffer();
-        StoreBackedPipelineCaptureCoordinator node = managed(store, reading(source, store), buffer);
-        node.startCapture("p");
-        node.startCapture("q");
+        Map<String, CaptureRun> runs = new java.util.concurrent.ConcurrentHashMap<>();
+        StoreBackedPipelineCaptureCoordinator node = managed(store, reading(source, store, runs), buffer);
+        try {
+            node.startCapture("p");
+            node.startCapture("q");
 
-        node.stopCapture("p", false);
-        source.rest.countDown();
-        awaitLoadLetGo("p");
+            node.stopCapture("p", false);
+            source.rest.countDown();
+            awaitLoadLetGo(runs.get("p"));
 
-        assertThat(buffer.drain("p", SourceCaptureResolution.of(SOURCE).ringName()))
-                .as("rows of the stopped pipeline's load, handed over after the stop").isEmpty();
-        assertThat(node.captureFailure("q")).isEmpty();
-        node.stopCapture("q", false);
-        node.close();
+            assertThat(buffer.drain("p", SourceCaptureResolution.of(SOURCE).ringName()))
+                    .as("rows of the stopped pipeline's load, handed over after the stop").isEmpty();
+            assertThat(node.captureFailure("q")).isEmpty();
+        } finally {
+            node.stopCapture("p", false);
+            node.stopCapture("q", false);
+            node.close();
+        }
     }
 
     /**
@@ -171,47 +176,54 @@ class CaptureOwnershipTest {
         InMemoryStorePort store = new InMemoryStorePort(artifactsWith(ReadMode.SNAPSHOT_ONLY, "p", "q"));
         // Room for one row, so the second of each load waits for room nobody is making.
         SnapshotBuffer buffer = new SnapshotBuffer(1);
+        HeldSnapshots source = new HeldSnapshots(false);
+        Map<String, CaptureRun> runs = new java.util.concurrent.ConcurrentHashMap<>();
         StoreBackedPipelineCaptureCoordinator node =
-                managed(store, reading(new HeldSnapshots(false), store), buffer);
-        node.startCapture("p");
-        node.startCapture("q");
-        awaitLoadWaitingForRoom("p");
+                managed(store, reading(source, store, runs), buffer);
+        try {
+            node.startCapture("p");
+            node.startCapture("q");
+            awaitLoadWaitingForRoom(source, "p");
 
-        node.stopCapture("p", false);
-        awaitLoadLetGo("p");
+            node.stopCapture("p", false);
+            awaitLoadLetGo(runs.get("p"));
 
-        assertThat(node.captureFailure("q")).isEmpty();
-        node.stopCapture("q", false);
-        node.close();
+            assertThat(node.captureFailure("q")).isEmpty();
+        } finally {
+            node.stopCapture("p", false);
+            node.stopCapture("q", false);
+            node.close();
+        }
     }
 
     /** The run unit reading {@code source}, with nothing of a ring to open: its loads are snapshot-only. */
-    private static CaptureAttacher reading(CapturePort source, InMemoryStorePort store) {
+    private static CaptureAttacher reading(
+            CapturePort source, InMemoryStorePort store, Map<String, CaptureRun> runs) {
         CaptureRunUnit unit = new CaptureRunUnit(
                 source, new SrsCoordinator(store.meta()), store.meta(), mock(HazelcastInstance.class));
-        return unit::begin;
+        return (spec, handoff, startTail) -> {
+            CaptureRun run = unit.begin(spec, handoff, startTail);
+            runs.put(spec.pipelineId(), run);
+            return run;
+        };
     }
 
-    /** Waits for the thread reading {@code pipelineId}'s load to be gone, so what it did is all it did. */
-    private static void awaitLoadLetGo(String pipelineId) throws InterruptedException {
-        awaitLoadThread(pipelineId, "let go", List::isEmpty);
+    /** Waits for this capture's task to finish, independently of the worker it used. */
+    private static void awaitLoadLetGo(CaptureRun run) throws InterruptedException {
+        assertThat(run.awaitLoaded(Duration.ofSeconds(10))).as("the cancelled load has finished").isTrue();
     }
 
     /** Waits for the thread reading {@code pipelineId}'s load to be parked, waiting for room. */
-    private static void awaitLoadWaitingForRoom(String pipelineId) throws InterruptedException {
-        awaitLoadThread(pipelineId, "wait for room",
-                threads -> threads.stream().anyMatch(thread -> thread.getState() == Thread.State.WAITING));
-    }
-
-    private static void awaitLoadThread(String pipelineId, String what, Predicate<List<Thread>> reached)
+    private static void awaitLoadWaitingForRoom(HeldSnapshots source, String pipelineId)
             throws InterruptedException {
-        String name = "tapstate-load-" + pipelineId + "-" + SOURCE.id();
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-        while (!reached.test(Thread.getAllStackTraces().keySet().stream()
-                .filter(thread -> thread.getName().equals(name) && thread.isAlive())
-                .toList())) {
+        while (true) {
+            Thread reader = source.readingThreads.get(pipelineId);
+            if (reader != null && reader.getState() == Thread.State.WAITING) {
+                return;
+            }
             if (System.nanoTime() > deadline) {
-                throw new AssertionError("the load of " + pipelineId + " did not " + what);
+                throw new AssertionError("the load of " + pipelineId + " did not wait for room");
             }
             Thread.sleep(20);
         }
@@ -354,8 +366,9 @@ class CaptureOwnershipTest {
 
             assertThat(opened).containsExactly(List.of("orders"), List.of("customers", "orders"));
             assertThat(active).hasValue(1);
-            assertThat(store.meta().physicalSelection(CHAIN)).contains(
-                    new SrsMetaStore.PhysicalSelection(1L, 2L, List.of("customers", "orders")));
+            assertThat(store.meta().read(CHAIN).orElseThrow().epoch()).isEqualTo(1L);
+            assertThat(store.meta().captureTables(CHAIN)).containsExactly("orders", "customers");
+            assertThat(store.meta().captureServingTables(CHAIN)).containsExactly("customers", "orders");
             assertThat(coordinator.isActive("customers-reader")).isTrue();
             coordinator.stopCapture("orders-reader", false);
             assertThat(active).as("the remaining pipeline still reads the shared tail").hasValue(1);
@@ -393,14 +406,17 @@ class CaptureOwnershipTest {
                     .as("the new pipeline starts no reader before its table is in the physical subscription")
                     .isInstanceOf(RingNotOpenYet.class);
             assertThat(joiner.isActive("customers-reader")).isFalse();
-            assertThat(store.meta().requestedPhysicalTables(CHAIN)).containsExactly("customers");
+            assertThat(store.meta().captureTables(CHAIN)).containsExactly("orders", "customers");
+            assertThat(store.meta().captureServingTables(CHAIN)).containsExactly("orders");
 
-            owner.reconfigureRequestedCaptures();
+            owner.widenTheReadersHere();
             joiner.startCapture("customers-reader");
             assertThat(joiner.isActive("customers-reader")).isTrue();
             assertThat(opened).containsExactly(List.of("orders"), List.of("customers", "orders"));
             assertThat(active).hasValue(1);
-            assertThat(store.meta().requestedPhysicalTables(CHAIN)).isEmpty();
+            assertThat(store.meta().captureTables(CHAIN)).containsExactly("orders", "customers");
+            assertThat(store.meta().captureServingTables(CHAIN)).containsExactly("customers", "orders");
+            assertThat(store.meta().read(CHAIN).orElseThrow().epoch()).isEqualTo(1L);
         } finally {
             joiner.stopCapture("customers-reader", false);
             owner.stopCapture("orders-reader", false);
@@ -433,47 +449,48 @@ class CaptureOwnershipTest {
             } else {
                 chains.joinSource(spec.sourceId(), chain, spec.config().streams());
             }
-            chains.attachConsumer(chain, spec.pipelineId());
+            chains.attachConsumer(chain, spec.consumerId());
             if (!startTail) {
                 return new CaptureRun(Optional.of(chain), true, 0L,
                         Optional.empty(), Optional.empty(), new CaptureHealth());
             }
+            return reader(chain, new CaptureHealth());
+        }
+
+        private CaptureRun reader(MiningChainId chain, CaptureHealth health) {
             long epoch = store.meta().read(chain.value()).orElseThrow().epoch();
-            if (!store.meta().publishPhysicalSelection(chain.value(),
-                    new SrsMetaStore.PhysicalSelection(epoch, spec.config().streams()))) {
-                throw new AssertionError("the first physical selection was not published");
-            }
-            return opened(chain, spec.config().streams(), new CaptureHealth());
-        }
-
-        @Override
-        public CaptureRun reopenPhysicalTail(CaptureRunSpec spec, CaptureRun previous) {
-            MiningChainId chain = previous.chainId().orElseThrow();
-            SrsMetaStore.PhysicalSelection current = store.meta().physicalSelection(chain.value()).orElseThrow();
-            List<String> requested = store.meta().requestedPhysicalTables(chain.value());
-            java.util.Set<String> union = new java.util.LinkedHashSet<>(current.tables());
-            union.addAll(requested);
-            List<String> tables = union.stream().sorted().toList();
-            previous.close();
-            if (!store.meta().replacePhysicalSelection(chain.value(), current,
-                    new SrsMetaStore.PhysicalSelection(current.epoch(), current.revision() + 1L, tables))) {
-                throw new AssertionError("the physical selection replacement was not published");
-            }
-            store.meta().clearPhysicalRequests(chain.value(), current.epoch(), tables);
-            return opened(chain, tables, previous.health());
-        }
-
-        private CaptureRun opened(MiningChainId chain, List<String> tables, CaptureHealth health) {
-            if (active.incrementAndGet() != 1) {
-                throw new AssertionError("two physical subscriptions opened for one mining chain");
-            }
-            opened.add(List.copyOf(tables));
             java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
+            AtomicReference<Runnable> stopSubscription = new AtomicReference<>(() -> { });
+            Runnable openSubscription = () -> {
+                List<String> tables = store.meta().captureTables(chain.value()).stream().sorted().toList();
+                if (active.incrementAndGet() != 1) {
+                    throw new AssertionError("two physical subscriptions opened for one mining chain");
+                }
+                opened.add(tables);
+                AtomicBoolean subscriptionClosed = new AtomicBoolean();
+                Runnable stop = () -> {
+                    if (subscriptionClosed.compareAndSet(false, true)) {
+                        active.decrementAndGet();
+                    }
+                };
+                stopSubscription.set(stop);
+                if (!store.meta().publishCaptureTables(chain.value(), epoch, tables)) {
+                    stop.run();
+                    throw new AssertionError("the reader's current table selection was not published");
+                }
+            };
+            openSubscription.run();
             return new CaptureRun(Optional.of(chain), false, 0L, Optional.empty(), Optional.of(() -> {
                 if (closed.compareAndSet(false, true)) {
-                    active.decrementAndGet();
+                    stopSubscription.get().run();
                 }
-            }), health);
+            }), health).withWidening(() -> {
+                if (!closed.get() && !store.meta().captureServingTables(chain.value())
+                        .containsAll(store.meta().captureTables(chain.value()))) {
+                    stopSubscription.get().run();
+                    openSubscription.run();
+                }
+            });
         }
     }
 
@@ -586,6 +603,10 @@ class CaptureOwnershipTest {
         });
         try {
             assertThat(snapshotEntered.await(5, TimeUnit.SECONDS)).isTrue();
+            var requested = store.meta().read(CHAIN).orElseThrow();
+            assertThat(requested.epoch()).isZero();
+            assertThat(requested.sourceReadOffset()).isNull();
+            assertThat(requested.consumerOffsets()).isEmpty();
             WorkloadClaim initial = claims.read(key).orElseThrow().claim();
             assertThat(claims.release(initial)).isTrue();
             assertThat(challenger.acquire(captureId).acquired()).isTrue();
@@ -597,7 +618,9 @@ class CaptureOwnershipTest {
             assertThat(starting.isAlive()).isFalse();
             assertThat(startFailure.get()).isInstanceOf(RuntimeException.class);
             assertThat(coordinator.capturedRows("p")).isEqualTo(CaptureReading.NONE);
-            assertThat(store.meta().read(CHAIN)).isEmpty();
+            assertThat(store.meta().read(CHAIN)).contains(requested);
+            assertThat(store.meta().captureTables(CHAIN)).containsExactly("orders");
+            assertThat(store.meta().captureServingTables(CHAIN)).isEmpty();
             assertThat(claims.read(key).orElseThrow().claim().owner())
                     .isEqualTo(Member.owner("node-b"));
         } finally {
@@ -964,20 +987,31 @@ class CaptureOwnershipTest {
         a.captures.startCapture("p");
         b.captures.startCapture("q");
         // What q's own run leaves on the record as it reads: its cursor, and its place on the chain with it.
-        store.meta().upsertConsumerOffset(CHAIN, new ConsumerOffset("q", Map.of(), null));
+        String remainingConsumer = SrsConsumerId.of("q", SOURCE.id()).value();
+        store.meta().upsertConsumerOffset(CHAIN, new ConsumerOffset(remainingConsumer, Map.of(), null));
+        String connectorNamespace = ConnectorStateNamespace.ofShared(CHAIN);
+        String migrationNamespace = "pdk.notes-migration." + connectorNamespace;
+        store.keyedState().save(connectorNamespace, "slot", new byte[]{11, 12});
+        store.keyedState().save(migrationNamespace, "removed:expired", new byte[]{1});
 
         a.captures.stopCapture("p", true);
 
         assertThat(store.meta().read(CHAIN))
                 .as("the chain is still there for the pipeline reading it on the other member")
                 .isPresent();
-        assertThat(consumersOn(store)).containsExactly("q");
+        assertThat(consumersOn(store)).containsExactly(remainingConsumer);
+        assertThat(store.keyedState().load(connectorNamespace, "slot"))
+                .hasValueSatisfying(value -> assertThat(value).containsExactly((byte) 11, (byte) 12));
+        assertThat(store.keyedState().load(migrationNamespace, "removed:expired"))
+                .hasValueSatisfying(value -> assertThat(value).containsExactly((byte) 1));
 
         b.captures.stopCapture("q", true);
 
         assertThat(store.meta().read(CHAIN))
                 .as("and it goes with the last pipeline on it, whichever member ran that one")
                 .isEmpty();
+        assertThat(store.keyedState().count(connectorNamespace)).isZero();
+        assertThat(store.keyedState().count(migrationNamespace)).isZero();
     }
 
     /**
@@ -1293,6 +1327,7 @@ class CaptureOwnershipTest {
     private static final class HeldSnapshots implements CapturePort {
         private final boolean holds;
         final CountDownLatch rest = new CountDownLatch(1);
+        final Map<String, Thread> readingThreads = new java.util.concurrent.ConcurrentHashMap<>();
 
         HeldSnapshots(boolean holds) {
             this.holds = holds;
@@ -1306,6 +1341,9 @@ class CaptureOwnershipTest {
 
                 @Override
                 public boolean hasNext() {
+                    if (config.node() != null) {
+                        readingThreads.put(config.node().pipelineId(), Thread.currentThread());
+                    }
                     if (next == 2 && holds) {
                         awaitRest();
                     }
@@ -1400,7 +1438,9 @@ class CaptureOwnershipTest {
         if (store.meta().read(CHAIN).isEmpty()) {
             store.meta().create(CHAIN, null);
         }
-        store.meta().openEpoch(CHAIN);
+        store.meta().requestCaptureTables(CHAIN, SourceCaptureResolution.of(SOURCE).tables());
+        long epoch = store.meta().openEpoch(CHAIN);
+        store.meta().publishCaptureTables(CHAIN, epoch, store.meta().captureTables(CHAIN));
     }
 
     private static List<String> consumersOn(InMemoryStorePort store) {
@@ -1424,6 +1464,7 @@ class CaptureOwnershipTest {
         private final String node;
         private final List<String> starts;
         private final SrsCoordinator chains;
+        private final InMemoryStorePort store;
         private final StoreBackedPipelineCaptureCoordinator captures;
         private final AtomicInteger tailsClosed = new AtomicInteger();
 
@@ -1436,6 +1477,7 @@ class CaptureOwnershipTest {
                 List<String> starts) {
             this.node = node;
             this.starts = starts;
+            this.store = store;
             this.chains = new SrsCoordinator(store.meta());
             ClusterMembershipGate gate = eligibleGate();
             CaptureOwnership ownership = new CaptureOwnership(
@@ -1455,13 +1497,14 @@ class CaptureOwnershipTest {
                 return new CaptureRun(Optional.empty(), false, 0, Optional.empty(), Optional.of(subscription),
                         new CaptureHealth());
             }
-            MiningChainId chain = MiningChainId.resolve(spec.config(), spec.srsKey());
+            MiningChainId chain = spec.miningChainId();
             if (startTail) {
-                chains.provisionSource(spec.sourceId(), chain, spec.config().streams(), spec.retention());
+                long epoch = chains.provisionSource(spec.sourceId(), chain, spec.config().streams(), spec.retention()).epoch();
+                store.meta().publishCaptureTables(chain.value(), epoch, store.meta().captureTables(chain.value()));
             } else {
                 chains.joinSource(spec.sourceId(), chain, spec.config().streams());
             }
-            chains.attachConsumer(chain, spec.pipelineId());
+            chains.attachConsumer(chain, spec.consumerId());
             return new CaptureRun(Optional.of(chain), !startTail, 0, Optional.empty(), Optional.of(subscription),
                     new CaptureHealth());
         }

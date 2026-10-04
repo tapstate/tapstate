@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.pdk.ConnectorStateNamespace;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
@@ -22,6 +23,7 @@ import io.tapstate.runtime.srs.StartFrom;
 import io.tapstate.spi.capture.CapturePlan;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.SrsMeta;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.StorePort;
@@ -108,8 +110,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     /** Looks for captures pipelines here read and nobody tails; started with the first capture joined. */
     private volatile ScheduledExecutorService takeovers;
 
-    /** One member-wide poll of durable expansion requests for captures this member owns. */
-    private volatile ScheduledExecutorService physicalReconfigurations;
+    private final Map<CaptureId, RingWait> servingWaits = new ConcurrentHashMap<>();
 
     /** How far each running pipeline's load has got, keyed by pipeline; dropped when it stops. */
     private final Map<String, PipelineLoad> loadsByPipeline = new ConcurrentHashMap<>();
@@ -338,7 +339,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         // Every source's capture is settled before any source is opened, so a start that has to be given
         // back is given back having opened nothing: a source opened first would otherwise read its whole
         // load again on every pass until the last one was ready.
-        List<SourcePlan> plans = withCompleteChainSelections(
+        List<SourcePlan> plans = withSnapshotTokens(
                 plan(pipelineId, pipeline, captured, snapshotEpoch),
                 Objects.requireNonNull(cursorWriterToken, "cursorWriterToken"));
         pending.covers(plans.stream().map(SourcePlan::captureId).toList());
@@ -347,81 +348,15 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         List<KeyedLocks.Hold<CaptureId>> captureHolds = lockCaptures(plans.stream()
                 .map(SourcePlan::captureId).distinct().toList(), true);
         try {
-            ensurePhysicalSelections(plans);
-            try {
-                startPlannedCapture(pipelineId, plans, pending);
-            } catch (TapstateException refused) {
-                if (refused.code() != CaptureError.SHARED_SELECTION_RESTART_REQUIRED) {
-                    throw refused;
-                }
-                // The first publication and a remote request can cross after preflight. Register the
-                // demand again against the now-published selection and retry on a later pass.
-                ensurePhysicalSelections(plans);
-                throw new RingNotOpenYet(plans.getFirst().captureId());
-            }
+            startPlannedCapture(pipelineId, plans, pending);
         } finally {
             releaseCaptures(captureHolds);
         }
     }
 
-    /** Registers missing tables before any new snapshot or reader can rely on the physical tail. */
-    private void ensurePhysicalSelections(List<SourcePlan> plans) {
-        for (SourcePlan plan : plans) {
-            CaptureRunSpec spec = plan.spec();
-            if (!spec.srsEnabled() || spec.readMode() == ReadMode.SNAPSHOT_ONLY) {
-                continue;
-            }
-            MiningChainId chain = MiningChainId.resolve(spec.config(), spec.srsKey());
-            SrsMeta record = storePort.meta().read(chain.value()).orElse(null);
-            if (record == null || record.epoch() < 1) {
-                continue;
-            }
-            List<String> wanted = spec.selectedChainTables() == null
-                    ? spec.config().streams() : spec.selectedChainTables();
-            var selection = storePort.meta().physicalSelection(chain.value()).orElse(null);
-            if (selection != null && selection.epoch() == record.epoch()
-                    && selection.tables().containsAll(wanted)) {
-                continue;
-            }
-            if (!storePort.meta().requestPhysicalTables(chain.value(), record.epoch(), wanted)) {
-                throw new RingNotOpenYet(plan.captureId());
-            }
-            if (selection == null || selection.epoch() < record.epoch()) {
-                // An abandoned preparation can leave the preceding generation's published selection.
-                // This generation's first subscription must include every request; its conditional
-                // publication refuses a union that raced this request.
-                continue;
-            }
-            OwnedCapture owned = ownedCaptures.get(plan.captureId());
-            if (owned != null && selection.epoch() == record.epoch()) {
-                reopenOwnedPhysicalTail(plan.captureId(), owned);
-                var expanded = storePort.meta().physicalSelection(chain.value()).orElse(null);
-                if (expanded != null && expanded.epoch() == record.epoch()
-                        && expanded.tables().containsAll(wanted)) {
-                    continue;
-                }
-            }
-            throw new RingNotOpenYet(plan.captureId());
-        }
-    }
 
-    /** Called under this capture's lock; the old subscription must be closed before the new one opens. */
-    private void reopenOwnedPhysicalTail(CaptureId captureId, OwnedCapture owned) {
-        owned.reconfiguring = Thread.currentThread();
-        try {
-            CaptureRun replacement = captureAttacher.reopenPhysicalTail(owned.spec, owned.run);
-            if (ownedCaptures.get(captureId) != owned) {
-                replacement.close();
-                throw new CancellationException("capture owner changed during physical expansion");
-            }
-            owned.run = replacement;
-        } catch (RuntimeException | Error failure) {
-            owned.run.health().fail(failure);
-            throw failure;
-        } finally {
-            owned.reconfiguring = null;
-        }
-    }
+
+
 
     private void startPlannedCapture(String pipelineId, List<SourcePlan> plans, PendingStart pending) {
         Map<CaptureId, OpeningClaim> permits = new LinkedHashMap<>();
@@ -439,6 +374,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         PipelineLoad load = PipelineLoad.of(plans, loadBegan);
         try {
             settlePermits(pipelineId, plans, permits, pending);
+            requestSharedSelections(plans);
+            requireRemoteSelections(pipelineId, plans, permits);
             for (SourcePlan plan : plans) {
                 pending.check();
                 SourceCaptureResolution resolution = plan.resolution();
@@ -457,10 +394,11 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 CaptureRun run;
                 if (!managedOwnership) {
                     run = captureStarter.start(spec, handoff);
-                    runs.add(PipelineRun.unmanaged(run));
+                    runs.add(PipelineRun.unmanaged(run, spec.consumerId()));
                 } else {
                     OwnedCapture existing = ownedCaptures.get(captureId);
                     if (existing != null) {
+                        serveFromTheReaderHere(existing, spec);
                         run = captureAttacher.start(spec.withCaptureFence(existing.permit.fence()), handoff, false);
                         existing.pipelines.add(pipelineId);
                     } else {
@@ -517,7 +455,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                         }
                     }
                     runs.add(PipelineRun.managed(
-                            captureId, run, spec.srsEnabled() && spec.readMode() != ReadMode.SNAPSHOT_ONLY));
+                            captureId, run, spec.srsEnabled() && spec.readMode() != ReadMode.SNAPSHOT_ONLY,
+                            spec.consumerId()));
                 }
                 pending.check();
                 if (run.loadOverWhenHandedBack()) {
@@ -593,10 +532,10 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     private void saveLoadCountIfOwed(CaptureRunSpec spec, Optional<String> chainId, String table, long count) {
         chainId.ifPresent(chain -> {
             boolean completed = storePort.meta().read(chain)
-                    .map(record -> record.snapshotCompletedTables(spec.pipelineId()).contains(table))
+                    .map(record -> record.snapshotCompletedTables(spec.consumerId()).contains(table))
                     .orElse(false);
             if (!completed) {
-                SnapshotLoadCounts.save(storePort.keyedState(), spec.pipelineId(), chain, table, count);
+                SnapshotLoadCounts.save(storePort.keyedState(), spec.consumerId(), chain, table, count);
             }
         });
     }
@@ -666,27 +605,83 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         }
     }
 
-    /** Every source of one pipeline on a mining chain publishes the same complete table selection. */
-    private static List<SourcePlan> withCompleteChainSelections(
-            List<SourcePlan> plans, String cursorWriterToken) {
-        Map<MiningChainId, LinkedHashSet<String>> selected = new LinkedHashMap<>();
+    /** Binds every source to the same prepared, bounded snapshot-buffer session. */
+    private static List<SourcePlan> withSnapshotTokens(List<SourcePlan> plans, String snapshotWriterToken) {
+        List<SourcePlan> bound = new ArrayList<>(plans.size());
+        for (SourcePlan plan : plans) {
+            bound.add(new SourcePlan(plan.sourceId(), plan.discovered(), plan.resolution(),
+                    plan.spec().withSnapshotWriterToken(snapshotWriterToken), plan.captureId()));
+        }
+        return List.copyOf(bound);
+    }
+
+    private void requestSharedSelections(List<SourcePlan> plans) {
+        Map<MiningChainId, Set<String>> tablesByChain = new LinkedHashMap<>();
+        Map<MiningChainId, String> retentionByChain = new LinkedHashMap<>();
         for (SourcePlan plan : plans) {
             CaptureRunSpec spec = plan.spec();
-            if (spec.srsEnabled() && spec.readMode() != ReadMode.SNAPSHOT_ONLY) {
-                selected.computeIfAbsent(MiningChainId.resolve(spec.config(), spec.srsKey()),
-                        ignored -> new LinkedHashSet<>()).addAll(spec.config().streams());
+            if (!spec.srsEnabled() || spec.readMode() == ReadMode.SNAPSHOT_ONLY) {
+                continue;
             }
+            MiningChainId chainId = spec.miningChainId();
+            tablesByChain.computeIfAbsent(chainId, ignored -> new LinkedHashSet<>()).addAll(spec.config().streams());
+            retentionByChain.putIfAbsent(chainId, spec.retention());
         }
-        List<SourcePlan> complete = new ArrayList<>(plans.size());
+        tablesByChain.forEach((chain, tables) -> {
+            if (storePort.meta().read(chain.value()).isEmpty()) {
+                try {
+                    storePort.meta().create(chain.value(), retentionByChain.get(chain));
+                } catch (IllegalStateException alreadySeeded) {
+                    // Another member can seed the same physical chain between the read and insert.
+                    // Keep its accumulated state; an absent record is the original ordering failure.
+                    if (storePort.meta().read(chain.value()).isEmpty()) {
+                        throw alreadySeeded;
+                    }
+                }
+            }
+            storePort.meta().requestCaptureTables(chain.value(), List.copyOf(tables));
+        });
+    }
+
+    private void requireRemoteSelections(
+            String pipelineId, List<SourcePlan> plans, Map<CaptureId, OpeningClaim> permits) {
+        if (!managedOwnership) {
+            return;
+        }
+        Map<CaptureId, Set<String>> selectedByCapture = new LinkedHashMap<>();
+        Map<CaptureId, MiningChainId> chains = new LinkedHashMap<>();
         for (SourcePlan plan : plans) {
             CaptureRunSpec spec = plan.spec();
-            LinkedHashSet<String> tables = spec.srsEnabled() && spec.readMode() != ReadMode.SNAPSHOT_ONLY
-                    ? selected.get(MiningChainId.resolve(spec.config(), spec.srsKey())) : null;
-            CaptureRunSpec bound = tables == null ? spec.withCursorWriterToken(cursorWriterToken)
-                    : spec.withChainSelection(List.copyOf(tables), cursorWriterToken);
-            complete.add(new SourcePlan(plan.sourceId(), plan.discovered(), plan.resolution(), bound, plan.captureId()));
+            OpeningClaim opening = permits.get(plan.captureId());
+            CaptureOwnership.Permit permit = opening == null ? null : opening.permit;
+            if (!spec.srsEnabled() || spec.readMode() == ReadMode.SNAPSHOT_ONLY
+                    || ownedCaptures.containsKey(plan.captureId()) || permit == null || permit.acquired()) {
+                continue;
+            }
+            selectedByCapture.computeIfAbsent(plan.captureId(), ignored -> new LinkedHashSet<>())
+                    .addAll(spec.config().streams());
+            chains.put(plan.captureId(), spec.miningChainId());
         }
-        return List.copyOf(complete);
+        selectedByCapture.forEach((capture, tables) -> {
+            if (storePort.meta().captureServingTables(chains.get(capture).value()).containsAll(tables)) {
+                servingWaits.remove(capture);
+                return;
+            }
+            Duration bound = ownership.ttl();
+            long now = System.nanoTime();
+            RingWait prior = servingWaits.get(capture);
+            RingWait wait = prior == null || now - prior.lastLooked() > bound.toNanos()
+                    ? new RingWait(now, now) : prior;
+            if (now - wait.since() >= bound.toNanos()) {
+                servingWaits.remove(capture);
+                throw new TapstateException(CaptureError.NO_RING_TO_ATTACH, Map.of(
+                        "captureId", capture.value(), "seconds", bound.toSeconds()), null);
+            }
+            servingWaits.put(capture, new RingWait(wait.since(), now));
+            LOG.info("Capture {} does not serve tables {} yet; pipeline {} starts once it does",
+                    capture.value(), tables, pipelineId);
+            throw new RingNotOpenYet(capture);
+        });
     }
 
     /**
@@ -704,14 +699,15 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         permits.clear();
     }
 
-    private record PipelineRun(CaptureId captureId, CaptureRun run, boolean managed, boolean sharedTail) {
+    private record PipelineRun(
+            CaptureId captureId, CaptureRun run, boolean managed, boolean sharedTail, String consumerId) {
 
-        static PipelineRun unmanaged(CaptureRun run) {
-            return new PipelineRun(null, run, false, false);
+        static PipelineRun unmanaged(CaptureRun run, String consumerId) {
+            return new PipelineRun(null, run, false, false, consumerId);
         }
 
-        static PipelineRun managed(CaptureId captureId, CaptureRun run, boolean sharedTail) {
-            return new PipelineRun(captureId, run, true, sharedTail);
+        static PipelineRun managed(CaptureId captureId, CaptureRun run, boolean sharedTail, String consumerId) {
+            return new PipelineRun(captureId, run, true, sharedTail, consumerId);
         }
     }
 
@@ -767,7 +763,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             owned.lease = lease;
             published = owned;
             ownedCaptures.put(captureId, owned);
-            watchPhysicalRequests();
+            lookForCapturesNobodyTails();
             openingPending = null;
         }
 
@@ -814,64 +810,15 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             this.tailSpec = new CaptureRunSpec(
                     joinedWith.config(), ReadMode.CDC_ONLY, joinedWith.srsKey(), joinedWith.srsEnabled(),
                     joinedWith.sourceId(), joinedWith.pipelineId(), joinedWith.startFrom(),
-                    joinedWith.retention(), joinedWith.schemaVer(), joinedWith.snapshotEpoch());
+                    joinedWith.retention(), joinedWith.schemaVer(), joinedWith.snapshotEpoch())
+                    .withConsumerId(joinedWith.consumerId());
             this.tailPassthrough = passthrough;
         }
     }
 
-    /** A remote attachment records its table demand in the chain document; only the owner replaces it. */
-    void reconfigureRequestedCaptures() {
-        for (CaptureId captureId : List.copyOf(ownedCaptures.keySet())) {
-            KeyedLocks.Hold<CaptureId> hold = captureLocks.tryAcquire(captureId);
-            if (hold == null) {
-                continue;
-            }
-            try (hold) {
-                OwnedCapture owned = ownedCaptures.get(captureId);
-                if (owned == null || !owned.spec.srsEnabled()
-                        || owned.spec.readMode() == ReadMode.SNAPSHOT_ONLY) {
-                    continue;
-                }
-                MiningChainId chain = owned.run.chainId().orElse(null);
-                if (chain == null) {
-                    continue;
-                }
-                List<String> requested = storePort.meta().requestedPhysicalTables(chain.value());
-                if (requested.isEmpty()) {
-                    continue;
-                }
-                var selection = storePort.meta().physicalSelection(chain.value()).orElse(null);
-                if (selection == null) {
-                    // A reserved snapshot has not opened its tail yet. Its first subscription reads
-                    // these durable requests, so there is no running subscription to replace.
-                    continue;
-                }
-                if (selection.tables().containsAll(requested)) {
-                    storePort.meta().clearPhysicalRequests(chain.value(), selection.epoch(), requested);
-                    continue;
-                }
-                reopenOwnedPhysicalTail(captureId, owned);
-            }
-        }
-    }
 
-    private synchronized void watchPhysicalRequests() {
-        if (physicalReconfigurations != null || claimRenewInterval.isZero()) {
-            return;
-        }
-        physicalReconfigurations = Executors.newSingleThreadScheduledExecutor(runnable -> {
-            Thread thread = new Thread(runnable, "tapstate-capture-selection");
-            thread.setDaemon(true);
-            return thread;
-        });
-        physicalReconfigurations.scheduleWithFixedDelay(() -> {
-            try {
-                reconfigureRequestedCaptures();
-            } catch (RuntimeException failure) {
-                LOG.warn("Could not expand a requested physical capture subscription", failure);
-            }
-        }, 1000, 1000, TimeUnit.MILLISECONDS);
-    }
+
+
 
     /**
      * Opens, here, the tail of every capture pipelines here read that nobody tails any more.
@@ -957,7 +904,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     private synchronized void lookForCapturesNobodyTails() {
-        if (takeovers != null || claimRenewInterval.isZero()) {
+        if (takeovers != null) {
             return;
         }
         takeovers = Executors.newSingleThreadScheduledExecutor(runnable -> {
@@ -965,25 +912,60 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             thread.setDaemon(true);
             return thread;
         });
-        long every = claimRenewInterval.toMillis();
+        // Shared readers retire confirmed history even when a single member has no claim to renew.
+        long every = claimRenewInterval.isZero() ? TimeUnit.SECONDS.toMillis(1) : claimRenewInterval.toMillis();
         takeovers.scheduleWithFixedDelay(() -> {
             try {
                 tailWhatNobodyTails();
+                widenTheReadersHere();
             } catch (RuntimeException failure) {
                 LOG.warn("Looking for captures nobody tails failed; asking again later", failure);
             }
         }, every, every, TimeUnit.MILLISECONDS);
     }
 
-    /** Stops looking for captures to take over. What this member already tails is its stops' to close. */
+    /** Table requests are recorded before this pipeline attaches to the physical reader it joins. */
+    private void serveFromTheReaderHere(OwnedCapture owned, CaptureRunSpec spec) {
+        if (!spec.srsEnabled() || spec.readMode() == ReadMode.SNAPSHOT_ONLY) {
+            return;
+        }
+        try {
+            owned.reconfiguring = Thread.currentThread();
+            captureAttacher.widen(owned.run);
+        } catch (RuntimeException | Error failure) {
+            owned.run.health().fail(failure);
+            throw failure;
+        } finally {
+            owned.reconfiguring = null;
+        }
+    }
+
+    /** Serves requested tables and retires confirmed history on every owner's maintenance schedule. */
+    void widenTheReadersHere() {
+        for (CaptureId captureId : List.copyOf(ownedCaptures.keySet())) {
+            KeyedLocks.Hold<CaptureId> hold = captureLocks.tryAcquire(captureId);
+            if (hold == null) { continue; }
+            try (hold) {
+                OwnedCapture owned = ownedCaptures.get(captureId);
+                if (owned == null) { continue; }
+                try {
+                    owned.reconfiguring = Thread.currentThread();
+                    captureAttacher.widen(owned.run);
+                } catch (RuntimeException failure) {
+                    owned.run.health().fail(failure);
+                    LOG.warn("Could not have a shared reader serve its requested tables", failure);
+                } finally {
+                    owned.reconfiguring = null;
+                }
+            }
+        }
+    }
+
+    /** Stops capture maintenance. What this member already tails is its stops' to close. */
     public synchronized void close() {
         if (takeovers != null) {
             takeovers.shutdownNow();
             takeovers = null;
-        }
-        if (physicalReconfigurations != null) {
-            physicalReconfigurations.shutdownNow();
-            physicalReconfigurations = null;
         }
     }
 
@@ -1009,7 +991,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     private CaptureOwnership.Permit permitOrNotYet(String pipelineId, CaptureId captureId, CaptureRunSpec spec) {
         CaptureOwnership.Permit permit = ownership.acquire(captureId);
         if (permit.acquired() || spec.readMode() == ReadMode.SNAPSHOT_ONLY
-                || aRingIsOpen(MiningChainId.resolve(spec.config(), spec.srsKey()).value())) {
+                || aRingIsOpen(spec.miningChainId().value())) {
             ringWaits.remove(captureId);
             return permit;
         }
@@ -1086,7 +1068,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     /** One source run's snapshot: its completion chain, if any, and the tables it covers. */
-    private record SnapshotOnChain(String sourceId, Optional<String> chainId, List<String> tables) {
+    private record SnapshotOnChain(
+            String sourceId, String consumerId, Optional<String> chainId, List<String> tables) {
     }
 
     /**
@@ -1102,7 +1085,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             return Optional.empty();
         }
         return Optional.of(new SnapshotOnChain(
-                sourceId, run.chainId().map(MiningChainId::value), spec.config().streams()));
+                sourceId, spec.consumerId(), run.chainId().map(MiningChainId::value), spec.config().streams()));
     }
 
     private record SnapshotTableKey(String sourceId, String table) {
@@ -1329,7 +1312,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 continue;
             }
             List<String> confirmed = storePort.meta().read(source.chainId().orElseThrow())
-                    .map(record -> record.snapshotCompletedTables(pipelineId)).orElse(List.of());
+                    .map(record -> record.snapshotCompletedTables(source.consumerId())).orElse(List.of());
             for (String table : source.tables()) {
                 if (!confirmed.contains(table)) {
                     continue;
@@ -1339,7 +1322,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                     continue;
                 }
                 TableSnapshot reading = completed.get(key);
-                OptionalLong saved = SnapshotLoadCounts.read(storePort.keyedState(), pipelineId,
+                OptionalLong saved = SnapshotLoadCounts.read(storePort.keyedState(), source.consumerId(),
                         source.chainId().orElseThrow(), table);
                 Long rows = saved.isPresent() ? saved.getAsLong()
                         : reading != null && reading.rowsDone() > 0L ? reading.rowsDone()
@@ -1427,7 +1410,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     @Override
     public boolean loadDelivered(String pipelineId) {
         for (SnapshotOnChain snapshot : snapshotTablesByPipeline.getOrDefault(pipelineId, List.of())) {
-            if (!SnapshotPhase.stillOwed(snapshot.chainId().flatMap(storePort.meta()::read), pipelineId,
+            if (!SnapshotPhase.stillOwed(snapshot.chainId().flatMap(storePort.meta()::read), snapshot.consumerId(),
                     snapshot.tables()).isEmpty()) {
                 return false;
             }
@@ -1495,7 +1478,9 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     private RuntimeException closeRuns(List<PipelineRun> runs, String pipelineId, boolean purgeState) {
         RuntimeException firstFailure = null;
         boolean capturesStopped = true;
-        Set<MiningChainId> chains = new LinkedHashSet<>();
+        Map<MiningChainId, Set<String>> consumersByChain = new LinkedHashMap<>();
+        Set<String> progressIds = new LinkedHashSet<>();
+        progressIds.add(pipelineId);
         for (PipelineRun pipelineRun : runs) {
             CaptureRun run = pipelineRun.run;
             try {
@@ -1510,7 +1495,9 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             }
             // Collected whether or not the close succeeded: a daemon that refused to stop does not make the
             // consumer membership this pipeline holds any less this pipeline's to give back.
-            run.chainId().ifPresent(chains::add);
+            progressIds.add(pipelineRun.consumerId);
+            run.chainId().ifPresent(chain -> consumersByChain.computeIfAbsent(chain, ignored -> new LinkedHashSet<>())
+                    .add(pipelineRun.consumerId));
         }
         // A live drain cannot detach an empty queue: capture may already hold that queue and append into it
         // after the drain returns. Lifecycle teardown has no such race once every capture close returned, so
@@ -1519,17 +1506,17 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         if (capturesStopped) {
             snapshotBuffer.release(pipelineId);
         }
-        // Once per chain, never once per run. Two sources reading one connection are one chain with a ring
-        // per table, which is what a pipeline over a parent and a child table is; releasing it per run would
-        // have the second source release a chain the first already closed, and the release refuses that.
-        for (MiningChainId chainId : chains) {
+        // A whole-pipeline stop releases all of its source and legacy memberships atomically, then
+        // decides whether the shared record can be removed after the final membership leaves.
+        for (Map.Entry<MiningChainId, Set<String>> entry : consumersByChain.entrySet()) {
+            MiningChainId chainId = entry.getKey();
             // Whether this pipeline was the last one on the chain, which decides how much of the chain's
             // record is this stop's to take. Read from the release itself rather than asked again after
             // it: a consumer attaching in between would make a second reading stale, and the two answers
             // would then disagree about a record one of them is about to delete.
             boolean chainClosed = false;
             try {
-                chainClosed = srsCoordinator.releaseConsumer(chainId, pipelineId);
+                chainClosed = srsCoordinator.releasePipelineConsumers(chainId, pipelineId);
             } catch (RuntimeException failure) {
                 if (firstFailure == null) {
                     firstFailure = failure;
@@ -1557,15 +1544,17 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 // resumes from, the schema history, and which tables finished their initial load. This
                 // is what makes the next run of this pipeline read its source from the beginning, which
                 // is what asking for the state to be cleared meant.
-                firstFailure = runCleanup(() -> storePort.meta().dropChain(chainId.value()), firstFailure);
+                firstFailure = runCleanup(() -> purgeChain(chainId.value()), firstFailure);
             } else {
                 // Others are still reading it, so only this pipeline's own cursor is its to give back.
                 // Run whether or not the release above succeeded, and safe to run twice: the detach
                 // states the end condition "this consumer holds nothing here", which an absent chain and
                 // an absent cursor already satisfy. Skipping it after one failure is what leaves a cursor
                 // nobody will ever advance holding back every pipeline still on the chain.
-                firstFailure = runCleanup(
-                        () -> storePort.meta().detachConsumer(chainId.value(), pipelineId), firstFailure);
+                for (String consumerId : entry.getValue()) {
+                    firstFailure = runCleanup(
+                            () -> storePort.meta().detachConsumer(chainId.value(), consumerId), firstFailure);
+                }
             }
         }
         if (purgeState) {
@@ -1581,11 +1570,17 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             // pipeline. The loop keeps deciding from the release itself for the chains it holds, where
             // that reading is the one that cannot go stale under a consumer attaching in between.
             for (String chainId : storePort.meta().miningChainIdsWithConsumer(pipelineId)) {
+                storePort.meta().consumerOffsets(chainId).stream()
+                        .map(offset -> offset.pipelineId())
+                        .filter(consumer -> SrsConsumerId.belongsTo(consumer, pipelineId))
+                        .forEach(progressIds::add);
                 firstFailure = purgeWhatTheRecordStillHolds(chainId, pipelineId, firstFailure);
             }
-            firstFailure = runCleanup(
-                    () -> storePort.keyedState().dropNamespace(SnapshotLoadCounts.namespaceOf(pipelineId)),
-                    firstFailure);
+            for (String progressId : progressIds) {
+                firstFailure = runCleanup(
+                        () -> storePort.keyedState().dropNamespace(SnapshotLoadCounts.namespaceOf(progressId)),
+                        firstFailure);
+            }
         }
         return firstFailure;
     }
@@ -1605,7 +1600,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             return true;
         }
         return storePort.meta().consumerOffsets(chainId.value()).stream()
-                .allMatch(offset -> offset.pipelineId().equals(pipelineId));
+                .allMatch(offset -> SrsConsumerId.belongsTo(offset.pipelineId(), pipelineId));
     }
 
     private void closeRun(PipelineRun pipelineRun, String pipelineId) {
@@ -1669,17 +1664,26 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     private RuntimeException purgeWhatTheRecordStillHolds(
             String chainId, String pipelineId, RuntimeException firstFailure) {
         boolean lastOneOff = storePort.meta().consumerOffsets(chainId).stream()
-                        .allMatch(offset -> offset.pipelineId().equals(pipelineId))
+                        .allMatch(offset -> SrsConsumerId.belongsTo(offset.pipelineId(), pipelineId))
                 && !srsCoordinator.isProvisioned(new MiningChainId(chainId));
         return runCleanup(
                 () -> {
                     if (lastOneOff) {
-                        storePort.meta().dropChain(chainId);
+                        purgeChain(chainId);
                     } else {
                         storePort.meta().detachConsumer(chainId, pipelineId);
                     }
                 },
                 firstFailure);
+    }
+
+    private void purgeChain(String chainId) {
+        String connectorNamespace = ConnectorStateNamespace.ofShared(chainId);
+        // Keep the record until both namespaces are gone so a failed drop remains discoverable
+        // by a later purge, including after this process has lost its live capture handles.
+        storePort.keyedState().dropNamespace(connectorNamespace);
+        storePort.keyedState().dropNamespace(ConnectorStateNamespace.migrationOf(connectorNamespace));
+        storePort.meta().dropChain(chainId);
     }
 
     /** Runs one release step, keeping the first failure and hanging any later one off it as suppressed. */
@@ -1734,7 +1738,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 StartFrom.parse(startFromRaw),
                 retention,
                 MOCK_SCHEMA_VER,
-                snapshotEpoch);
+                snapshotEpoch).withConsumerId(SrsConsumerId.of(pipelineId, source.id()).value());
     }
 
     private static ReadMode readModeOf(Settings settings) {
@@ -1819,7 +1823,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         CaptureRunSpec spec = plan.spec();
         CapturePlan phases = CapturePlan.forReadMode(spec.readMode());
         Optional<String> chainId = phases.snapshot() && phases.cdc()
-                ? Optional.of(MiningChainId.resolve(spec.config(), spec.srsKey()).value()) : Optional.empty();
+                ? Optional.of(spec.miningChainId().value()) : Optional.empty();
         return new CaptureHandoff() {
             @Override
             public void accept(Envelope event) {
@@ -1832,7 +1836,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                     observedSnapshotCounts.merge(event.src(), 1L, Long::sum);
                     if (liveSnapshot != null) { liveSnapshot.received(plan.sourceId(), event.src()); }
                     if (snapshotBuffer.hasSnapshot(pipelineId, ring)) {
-                        if (!snapshotBuffer.hasSnapshot(pipelineId, ring, spec.cursorWriterToken())) {
+                        if (!snapshotBuffer.hasSnapshot(pipelineId, ring, spec.snapshotWriterToken())) {
                             throw new CancellationException("snapshot row belongs to an obsolete capture run");
                         }
                         // The deferred reader has already appended this row to its exact bounded session.
@@ -1846,7 +1850,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             public void loaded(String table) {
                 String ring = resolution.ringName(table);
                 if (snapshotBuffer.hasSnapshot(pipelineId, ring)
-                        && !snapshotBuffer.hasSnapshot(pipelineId, ring, spec.cursorWriterToken())) {
+                        && !snapshotBuffer.hasSnapshot(pipelineId, ring, spec.snapshotWriterToken())) {
                     throw new CancellationException("snapshot completion belongs to an obsolete capture run");
                 }
                 saveLoadCountIfOwed(spec, chainId, table, observedSnapshotCounts.getOrDefault(table, 0L));

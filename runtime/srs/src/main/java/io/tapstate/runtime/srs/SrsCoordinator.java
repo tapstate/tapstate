@@ -2,6 +2,7 @@ package io.tapstate.runtime.srs;
 
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
+import io.tapstate.spi.store.SrsConsumerId;
 
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
@@ -203,6 +204,18 @@ public final class SrsCoordinator {
             if (!state.consumers.isEmpty()) {
                 return false;
             }
+            slot.state = null;
+            return true;
+        });
+    }
+
+    /** Releases every source membership of a stopped pipeline, including its legacy membership. */
+    public boolean releasePipelineConsumers(MiningChainId chainId, String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        return onChain(chainId, slot -> {
+            ChainState state = require(slot, chainId);
+            state.consumers.removeIf(consumer -> SrsConsumerId.belongsTo(consumer, pipelineId));
+            if (!state.consumers.isEmpty()) { return false; }
             slot.state = null;
             return true;
         });

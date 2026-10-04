@@ -11,7 +11,6 @@ import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 
 import java.io.IOException;
-import java.io.EOFException;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -44,7 +43,7 @@ public final class SrsItemSerializer implements StreamSerializer<SrsItem> {
         writeRow(out, item.after());
         out.writeLong(item.schemaVer());
         writeFence(out, item.captureFence());
-        out.writeLong(item.ringEpoch() == null ? 0L : item.ringEpoch());
+        out.writeLong(item.epoch());
     }
 
     @Override
@@ -57,14 +56,13 @@ public final class SrsItemSerializer implements StreamSerializer<SrsItem> {
         Map<String, Object> after = readRow(in);
         long schemaVer = in.readLong();
         WorkloadClaimFence fence = readFence(in);
-        long ringEpoch;
+        long epoch;
         try {
-            ringEpoch = in.readLong();
-        } catch (EOFException oldItem) {
-            ringEpoch = 0L;
+            epoch = in.readLong();
+        } catch (java.io.EOFException legacy) {
+            epoch = 0L;
         }
-        return new SrsItem(srcPos, op, ts, before, after, schemaVer, fence,
-                ringEpoch == 0L ? null : ringEpoch);
+        return new SrsItem(srcPos, op, ts, before, after, schemaVer, fence, epoch);
     }
 
     private static void writeFence(ObjectDataOutput out, WorkloadClaimFence fence) throws IOException {

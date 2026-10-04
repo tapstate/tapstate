@@ -40,6 +40,7 @@ import org.junit.jupiter.api.Test;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -48,6 +49,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
@@ -67,123 +69,6 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * per-event position threading from the connector is a later concern.
  */
 class CdcPhaseTest {
-
-    @Test
-    void physicalPrefixWaitsForTheEarlierTableEvenWhenTheLaterTableAckedFirst() {
-        RecordingMeta meta = new RecordingMeta();
-        meta.consumers = List.of(prefixConsumer(Map.of()));
-        CaptureHealth health = new CaptureHealth();
-        try (PhysicalSourcePrefix prefix = new PhysicalSourcePrefix(meta, "shared-chain", 1L, health)) {
-            prefix.anchor(Optional.of(new SourcePosition("t0")));
-            prefix.admitted(Map.of("orders", 4L), "t1");
-            prefix.admitted(Map.of("customers", 0L), "t2");
-
-            meta.consumers = List.of(prefixConsumer(Map.of(
-                    "customers", new ChainPosition(new SourceOrder(1L, 0L), "t2"))));
-            prefix.tick();
-            assertThat(meta.advances).isEmpty();
-            assertThat(meta.physicalAcks).isEmpty();
-
-            meta.consumers = List.of(prefixConsumer(Map.of(
-                    "orders", new ChainPosition(new SourceOrder(1L, 4L), "t1"),
-                    "customers", new ChainPosition(new SourceOrder(1L, 0L), "t2"))));
-            prefix.tick();
-            assertThat(meta.advances).containsExactly("t1", "t2");
-            assertThat(meta.physicalAcks).containsExactly(
-                    new ChainPosition(new SourceOrder(1L, 0L), "t1"),
-                    new ChainPosition(new SourceOrder(1L, 1L), "t2"));
-            assertThat(health.failure()).isEmpty();
-        }
-    }
-
-    @Test
-    void aLateOldPhysicalPrefixCannotPublishAfterANewerRingGenerationOpens() {
-        RecordingMeta meta = new RecordingMeta();
-        meta.consumers = List.of(prefixConsumer(Map.of()));
-        try (PhysicalSourcePrefix prefix = new PhysicalSourcePrefix(meta, "shared-chain", 1L,
-                new CaptureHealth())) {
-            prefix.anchor(Optional.of(new SourcePosition("t0")));
-            prefix.admitted(Map.of("orders", 0L), "t1");
-            meta.currentEpoch = 2L;
-            meta.consumers = List.of(prefixConsumer(Map.of(
-                    "orders", new ChainPosition(new SourceOrder(1L, 0L), "t1"))));
-
-            assertThatThrownBy(prefix::tick)
-                    .as("an old owner cannot publish a prefix over the new generation")
-                    .isInstanceOf(java.util.concurrent.CancellationException.class);
-            assertThat(meta.physicalAcks).isEmpty();
-            assertThat(meta.advances).isEmpty();
-        }
-    }
-
-    @Test
-    void multiTableAdmissionReportsEachTablesOwnRingSequenceForTrimming() {
-        RecordingMeta meta = new RecordingMeta();
-        meta.consumers = List.of(prefixConsumer(Map.of()));
-        CaptureHealth health = new CaptureHealth();
-        List<Long> orders = new ArrayList<>();
-        List<Long> customers = new ArrayList<>();
-        Map<String, CdcPhase.TableRoute> routes = Map.of(
-                "orders", new CdcPhase.TableRoute(new CdcChain(
-                        new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.trim.orders"))),
-                        meta, "shared-chain", 1L, 0L), () -> meta.consumers, orders::add),
-                "customers", new CdcPhase.TableRoute(new CdcChain(
-                        new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.trim.customers"))),
-                        meta, "shared-chain", 1L, 0L), () -> meta.consumers, customers::add));
-        FakeCdcPort port = new FakeCdcPort(List.of(
-                Envelope.insert(1L, "orders", Map.of("id", 1), Map.of()),
-                Envelope.insert(2L, "customers", Map.of("id", 2), Map.of())));
-
-        try (PhysicalSourcePrefix prefix = new PhysicalSourcePrefix(meta, "shared-chain", 1L, health)) {
-            CdcPhase.run(port, config(), CaptureStart.present(), routes, health, prefix).close();
-        }
-
-        assertThat(orders).containsExactly(0L);
-        assertThat(customers).containsExactly(0L);
-    }
-
-    @Test
-    void aQuietSourceStillInvokesTableTrimmingWhenAcknowledgementsArrive() {
-        RecordingMeta meta = new RecordingMeta();
-        meta.consumers = List.of(prefixConsumer(Map.of()));
-        AtomicInteger trims = new AtomicInteger();
-        try (PhysicalSourcePrefix prefix = new PhysicalSourcePrefix(
-                meta, "shared-chain", 1L, new CaptureHealth(), offsets -> trims.incrementAndGet())) {
-            prefix.anchor(Optional.of(new SourcePosition("t0")));
-            prefix.admitted(Map.of("orders", 0L), "t1");
-            prefix.tick();
-            assertThat(trims.get()).isEqualTo(1);
-        }
-    }
-
-    @Test
-    void physicalPrefixRefusesAnUnanchoredStartAndAnOldUnverifiedScalar() {
-        RecordingMeta fresh = new RecordingMeta();
-        try (PhysicalSourcePrefix prefix = new PhysicalSourcePrefix(
-                fresh, "shared-chain", 1L, new CaptureHealth())) {
-            assertThatThrownBy(() -> prefix.anchor(Optional.empty()))
-                    .isInstanceOf(TapstateException.class)
-                    .extracting(error -> ((TapstateException) error).code())
-                    .isEqualTo(CaptureError.RESUME_ANCHOR_UNAVAILABLE);
-            assertThatThrownBy(() -> prefix.admitted(Map.of("orders", 0L), "t1"))
-                    .isInstanceOf(TapstateException.class)
-                    .extracting(error -> ((TapstateException) error).code())
-                    .isEqualTo(CaptureError.RESUME_ANCHOR_UNAVAILABLE);
-        }
-
-        RecordingMeta legacy = new RecordingMeta();
-        legacy.anchorPosition = new ChainPosition(new SourceOrder(1L, 4L), "possibly-unsafe");
-        assertThatThrownBy(() -> new PhysicalSourcePrefix(
-                legacy, "shared-chain", 1L, new CaptureHealth()))
-                .isInstanceOf(TapstateException.class)
-                .extracting(error -> ((TapstateException) error).code())
-                .isEqualTo(CaptureError.SHARED_POSITION_UNVERIFIED);
-    }
-
-    private static ConsumerOffset prefixConsumer(Map<String, ChainPosition> acks) {
-        return new ConsumerOffset("pipeline", Map.of(), null, List.of(), null, 0L,
-                List.of("orders", "customers"), 1L, "reader", acks);
-    }
 
     private static HazelcastInstance hz;
 
@@ -223,6 +108,31 @@ class CdcPhaseTest {
         return new CaptureConfig("mysql", Map.of(), List.of("orders"));
     }
 
+    @Test
+    void aLateDurableCallbackRetainsItsOwnSelectionAfterTheRoutesAreWidened() {
+        RecordingMeta meta = new RecordingMeta();
+        SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.chain.late-selection")));
+        CdcChain chain = new CdcChain(gate, meta, "chain", RING_GENERATION, 0L);
+        Map<String, CdcPhase.TableRoute> routes = new LinkedHashMap<>();
+        routes.put("orders", new CdcPhase.TableRoute(chain, List::of, ignored -> { }));
+        AtomicReference<CaptureListener> callback = new AtomicReference<>();
+        FakeCdcPort source = new FakeCdcPort(List.of()) {
+            @Override
+            public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+                callback.set(listener);
+                return () -> { };
+            }
+        };
+        CdcPhase.runDurable(source, config(), CaptureStart.present(), routes, new CaptureHealth(), new AtomicLong());
+
+        routes.put("customers", new CdcPhase.TableRoute(chain, List::of, ignored -> { }));
+        callback.get().onBatch(List.of(Envelope.insert(1, "orders", Map.of("id", 1), Map.of())),
+                Optional.of(new SourcePosition("late-narrow-batch")));
+
+        assertThat(meta.captureSelections).containsExactly(List.of("orders"));
+        assertThat(meta.advances).containsExactly("late-narrow-batch");
+    }
+
     /**
      * The positions this fake source states for the changes it streams: w1, w2, ... one per change.
      *
@@ -254,22 +164,19 @@ class CdcPhaseTest {
 
     @Test
     void disjointTableConsumerDoesNotPinHeadroom() {
-        ConsumerOffset nest = selected("nest",
-                Map.of("bench_nest_orders", 7L, "bench_nest_items", 7L), "bench_nest_items", RING_GENERATION);
-        ConsumerOffset unreadNest = selected("unread-nest",
-                Map.of("bench_nest_items", -1L), "bench_nest_items", RING_GENERATION);
-        ConsumerOffset join = selected("join",
-                Map.of("bench_join_orders", -1L), "bench_join_orders", RING_GENERATION);
+        ConsumerOffset nest = new ConsumerOffset("nest",
+                Map.of("bench_nest_orders", 7L, "bench_nest_items", 7L), null);
+        ConsumerOffset unreadNest = new ConsumerOffset("unread-nest",
+                Map.of("bench_nest_items", -1L), null);
+        ConsumerOffset join = new ConsumerOffset("join",
+                Map.of("bench_join_orders", -1L), null);
 
-        assertThat(CdcPhase.headroomBound(List.of(nest, unreadNest), "bench_nest_items", RING_GENERATION))
+        assertThat(CdcPhase.headroomBound(List.of(nest, unreadNest), "bench_nest_items"))
                 .as("a subscribed consumer that has read nothing still protects its table")
                 .isEqualTo(-1L);
-        assertThat(CdcPhase.headroomBound(List.of(nest, join), "bench_nest_items", RING_GENERATION))
+        assertThat(CdcPhase.headroomBound(List.of(nest, join), "bench_nest_items"))
                 .as("a Join-only consumer cannot hold back Nest's item ring")
                 .isEqualTo(7L);
-        assertThat(CdcPhase.headroomBound(List.of(nest, join), "bench_nest_items", RING_GENERATION + 1))
-                .as("an earlier selected generation cannot grant room in a newer ring")
-                .isEqualTo(-1L);
     }
 
     @Test
@@ -499,9 +406,8 @@ class CdcPhaseTest {
         // has to move eventually: one that never did would park the writer for the length of the run.
         Supplier<Collection<ConsumerOffset>> reader = () -> {
             long readTo = looks.incrementAndGet() < 5 ? 0L : burst;
-            return List.of(selected("p1", Map.of("orders", readTo),
-                    new ChainPosition(new SourceOrder(RING_GENERATION, readTo), "w" + readTo),
-                    "orders", RING_GENERATION));
+            return List.of(new ConsumerOffset("p1", Map.of("orders", readTo),
+                    new ChainPosition(new SourceOrder(RING_GENERATION, readTo), "w" + readTo)));
         };
 
         CdcPhase.run(new BatchingCdcPort(burst, burst), config(), chain, reader, new CaptureHealth());
@@ -520,77 +426,8 @@ class CdcPhaseTest {
 
     /** A consumer acked far past anything these cases deliver, so the clamp never decides the reading. */
     private static ConsumerOffset keepingUp() {
-        return selected("p1", Map.of("orders", 99_999L),
-                new ChainPosition(new SourceOrder(RING_GENERATION, 99_999), "w99999"),
-                "orders", RING_GENERATION);
-    }
-
-    @Test
-    void aConsumerOfAnotherTableCannotPinThisSharedChainsRing() {
-        SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer("srs.chain.disjoint-consumers"));
-        SrsWriteGate gate = new SrsWriteGate(ring);
-        for (int i = 0; i < ring.capacity(); i++) {
-            assertThat(gate.append(cdcItem("initial-" + i), -1L)).isPresent();
-        }
-        // Both pipelines share the mining chain. Only Nest reads this table; Join's cursor belongs
-        // to another table and cannot hold back a ring it never reads.
-        List<ConsumerOffset> consumers = List.of(
-                selected("nest", Map.of("bench_nest_items", 7L), "bench_nest_items", RING_GENERATION),
-                selected("join", Map.of("bench_join_orders", 7L), "bench_join_orders", RING_GENERATION));
-
-        long readThrough = CdcPhase.headroomBound(consumers, "bench_nest_items", RING_GENERATION);
-
-        assertThat(readThrough).as("only readers subscribed to bench_nest_items bound its ring")
-                .isEqualTo(7L);
-        assertThat(gate.append(cdcItem("after-nest-read"), readThrough))
-                .as("Nest freed room even though Join is still on the shared mining chain")
-                .hasValue(8L);
-    }
-
-    @Test
-    void aSubscriberThatHasReadNothingStillProtectsThisSharedChainsRing() {
-        SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer("srs.chain.unread-subscriber"));
-        SrsWriteGate gate = new SrsWriteGate(ring);
-        for (int i = 0; i < ring.capacity(); i++) {
-            assertThat(gate.append(cdcItem("initial-" + i), -1L)).isPresent();
-        }
-        // A subscribed-but-unread cursor is absent. Ignoring it would overwrite the first
-        // change before this pipeline has read anything from its own table.
-        List<ConsumerOffset> consumers = List.of(
-                selected("nest", Map.of("bench_nest_items", 7L), "bench_nest_items", RING_GENERATION),
-                selected("new-nest-reader", Map.of(), "bench_nest_items", RING_GENERATION),
-                selected("join", Map.of("bench_join_orders", 7L), "bench_join_orders", RING_GENERATION));
-
-        long readThrough = CdcPhase.headroomBound(consumers, "bench_nest_items", RING_GENERATION);
-
-        assertThat(readThrough).as("the slowest subscribed reader has read no item yet").isEqualTo(-1L);
-        assertThat(gate.append(cdcItem("must-wait"), readThrough))
-                .as("the ring must not evict an unread item").isEmpty();
-        assertThat(ring.tailSequence()).isEqualTo(7L);
-    }
-
-    @Test
-    void anUnknownLegacySelectionAndAnOlderGenerationCannotGrantHeadroom() {
-        ConsumerOffset legacy = new ConsumerOffset("legacy", Map.of("bench_join_orders", 7L), null);
-        ConsumerOffset previousGeneration = selected(
-                "nest", Map.of("bench_nest_items", 99L), "bench_nest_items", RING_GENERATION);
-
-        assertThat(CdcPhase.headroomBound(List.of(legacy), "bench_nest_items", RING_GENERATION))
-                .isEqualTo(-1L);
-        assertThat(CdcPhase.headroomBound(
-                List.of(previousGeneration), "bench_nest_items", RING_GENERATION + 1))
-                .isEqualTo(-1L);
-    }
-
-    private static ConsumerOffset selected(
-            String pipelineId, Map<String, Long> cursors, String table, long epoch) {
-        return selected(pipelineId, cursors, null, table, epoch);
-    }
-
-    private static ConsumerOffset selected(
-            String pipelineId, Map<String, Long> cursors, ChainPosition acked, String table, long epoch) {
-        return new ConsumerOffset(pipelineId, cursors, acked, List.of(), null, 0L,
-                List.of(table), epoch, "run-1");
+        return new ConsumerOffset("p1", Map.of("orders", 99_999L),
+                new ChainPosition(new SourceOrder(RING_GENERATION, 99_999), "w99999"));
     }
 
     /**
@@ -779,9 +616,8 @@ class CdcPhaseTest {
         // The bound is read off the consumer cursors, so this is a consumer that has read nothing of orders
         // on the first poll and has reached seq 0 by the next. It has acked nothing, which is why no offset
         // is written here: this case is about the refused write being retried, not about the frontier.
-        Supplier<Collection<ConsumerOffset>> minRead = () -> List.of(selected(
-                "p1", Map.of("orders", polls.getAndIncrement() == 0 ? -1L : 0L),
-                "orders", RING_GENERATION));
+        Supplier<Collection<ConsumerOffset>> minRead = () -> List.of(new ConsumerOffset(
+                "p1", Map.of("orders", polls.getAndIncrement() == 0 ? -1L : 0L), null));
         CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of(Envelope.insert(9, "orders", Map.of("id", 9), Map.of())));
 
@@ -804,8 +640,8 @@ class CdcPhaseTest {
         }
         // The slowest consumer reads nothing until the test frees a slot: the write stays backpressured.
         AtomicBoolean freed = new AtomicBoolean(false);
-        Supplier<Collection<ConsumerOffset>> minRead = () -> List.of(selected(
-                "p1", Map.of("orders", freed.get() ? 0L : -1L), "orders", RING_GENERATION));
+        Supplier<Collection<ConsumerOffset>> minRead = () -> List.of(new ConsumerOffset(
+                "p1", Map.of("orders", freed.get() ? 0L : -1L), null));
         CdcChain chain = new CdcChain(gate, new RecordingMeta(), "chain", RING_GENERATION, 0L);
         FakeCdcPort port = new FakeCdcPort(List.of(Envelope.insert(9, "orders", Map.of("id", 9), Map.of())));
 
@@ -1056,7 +892,7 @@ class CdcPhaseTest {
      * A cdc port that drives a fixed list of change events into the listener when the stream starts,
      * stating a position for each one the way a source does.
      */
-    private static final class FakeCdcPort implements CapturePort {
+    private static class FakeCdcPort implements CapturePort {
         private final List<Envelope> events;
         private final Throwable error;
         private final Supplier<SourcePosition> positions = sourceStatedPositions();
@@ -1084,7 +920,6 @@ class CdcPhaseTest {
                 listener.onError(error);
                 return () -> closed = true;
             }
-            listener.onStart(Optional.of(new SourcePosition("t0")));
             // Each change is handed over as a run of its own, each with its own position -- the shape a
             // source that names a position per change produces.
             for (Envelope e : events) {
@@ -1255,30 +1090,14 @@ class CdcPhaseTest {
             throw new UnsupportedOperationException("consumer detachment is not exercised by this double");
         }
 
-        final List<String> advances = new java.util.concurrent.CopyOnWriteArrayList<>();
-        final List<ChainPosition> physicalAcks = new java.util.concurrent.CopyOnWriteArrayList<>();
-        volatile List<ConsumerOffset> consumers = List.of();
-        volatile ChainPosition anchorPosition;
-        volatile boolean trusted;
-        volatile long currentEpoch = 1L;
+        final List<String> advances = new ArrayList<>();
+        final List<List<String>> captureSelections = new ArrayList<>();
 
         @Override
-        public boolean physicalPrefixTrusted(String miningChainId) {
-            return trusted;
-        }
-
-        @Override
-        public boolean establishPhysicalAnchor(String miningChainId, ChainPosition position) {
-            if (anchorPosition == null) {
-                anchorPosition = position;
-            }
-            trusted = true;
-            return true;
-        }
-
-        @Override
-        public List<ConsumerOffset> consumerOffsets(String miningChainId) {
-            return consumers;
+        public void advanceCaptureCheckpoint(
+                String miningChainId, ChainPosition position, List<String> servedTables) {
+            captureSelections.add(servedTables);
+            advances.add(position.token());
         }
 
         @Override
@@ -1293,19 +1112,8 @@ class CdcPhaseTest {
         }
 
         @Override
-        public boolean advancePhysicalSourceReadOffset(
-                String miningChainId, long epoch, ChainPosition position) {
-            if (epoch != currentEpoch) {
-                return false;
-            }
-            advanceSourceReadOffset(miningChainId, position);
-            return true;
-        }
-
-        @Override
         public Optional<SrsMeta> read(String miningChainId) {
-            return Optional.of(new SrsMeta(miningChainId, anchorPosition, consumers, List.of(), null,
-                    currentEpoch));
+            throw new UnsupportedOperationException();
         }
 
         @Override
@@ -1325,17 +1133,7 @@ class CdcPhaseTest {
 
         @Override
         public void advanceSinkAcked(String miningChainId, String pipelineId, ChainPosition position) {
-            physicalAcks.add(position);
-        }
-
-        @Override
-        public boolean advancePhysicalSinkAcked(
-                String miningChainId, String pipelineId, long epoch, ChainPosition position) {
-            if (epoch != currentEpoch) {
-                return false;
-            }
-            advanceSinkAcked(miningChainId, pipelineId, position);
-            return true;
+            throw new UnsupportedOperationException();
         }
 
         @Override

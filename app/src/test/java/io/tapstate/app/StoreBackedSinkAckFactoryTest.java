@@ -7,6 +7,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -19,7 +20,9 @@ import io.tapstate.core.event.SourceOrder;
 import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.ConsumerProgressKind;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.SrsMetaStore;
 import java.util.List;
 import java.util.Map;
@@ -35,6 +38,183 @@ import org.mockito.AdditionalAnswers;
  * the store member-side, so nothing store-bound crosses the wire.
  */
 class StoreBackedSinkAckFactoryTest {
+
+    @Test
+    void anUnusedTableMappingDoesNotHoldASingleTableLegacyCheckpoint() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        store.create("mc-mail", null);
+        Map<String, List<String>> plan = Map.of(
+                "orders", List.of("view"), "mail", List.of("view"));
+        StoreBackedSinkAckFactory factory = new StoreBackedSinkAckFactory(
+                Map.of("orders", "mc-orders", "items", "mc-orders", "mail", "mc-mail"),
+                "pipe-1", store);
+        factory.prepareWriterPlan(plan);
+        SinkAck ack = factory.forWriter("view", List.copyOf(plan.keySet()), plan).resolve(memberWith(store));
+
+        ack.advance("orders", at(7, "w7"));
+        ack.advance("mail", at(11, "mail-11"));
+
+        assertThat(store.read("mc-orders").orElseThrow().sourceReadOffset()).isEqualTo("w7");
+        assertThat(store.read("mc-mail").orElseThrow().sourceReadOffset()).isEqualTo("mail-11");
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1"))
+                .containsExactlyEntriesOf(Map.of("orders", 7L));
+    }
+
+    @Test
+    void separateWritersCannotRankTheLegacyTablesInTheirCompletePlan() {
+        InMemorySrsMetaStore backing = new InMemorySrsMetaStore();
+        backing.create("mc-orders", null);
+        SrsMetaStore store = mock(SrsMetaStore.class, AdditionalAnswers.delegatesTo(backing));
+        Map<String, List<String>> plan = Map.of(
+                "orders", List.of("orders-view"), "mail", List.of("mail-view"));
+        StoreBackedSinkAckFactory factory = new StoreBackedSinkAckFactory(
+                Map.of("orders", "mc-orders", "mail", "mc-orders"), "pipe-1", store);
+        factory.prepareWriterPlan(plan);
+        SinkAck orders = factory.forWriter("orders-view", List.of("orders"), plan).resolve(memberWith(store));
+        SinkAck mail = factory.forWriter("mail-view", List.of("mail"), plan).resolve(memberWith(store));
+
+        orders.advance("orders", at(1, "low"));
+        backing.advanceConsumerReadSeq("mc-orders", "pipe-1", "orders", 2L);
+        mail.advance("mail", at(1_000, "mail-after-high"));
+
+        assertThat(backing.ringDoneThrough("mc-orders", "pipe-1"))
+                .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 1L, "mail", 1_000L));
+        assertThat(backing.read("mc-orders").orElseThrow().sourceReadOffset()).isNull();
+        verify(store, never()).consumerOffsets(anyString());
+        verify(store, never()).advanceSourceReadOffset(anyString(), any());
+    }
+
+    @Test
+    void sharedCaptureKeepsEachSourceNodesConfirmedTablesSeparate() {
+        InMemorySrsMetaStore backing = new InMemorySrsMetaStore();
+        backing.create("crm", null);
+        backing.openEpoch("crm");
+        backing.publishCaptureTables("crm", 1L,
+                List.of("support_case", "casehistory__c", "emailmessage"));
+        backing.advanceCaptureCheckpoint("crm", at(30, "capture-30"));
+        SrsMetaStore store = mock(SrsMetaStore.class, AdditionalAnswers.delegatesTo(backing));
+        String cases = SrsConsumerId.of("pipe", "cases").value();
+        String mail = SrsConsumerId.of("pipe", "mail").value();
+        Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = Map.of(
+                "support_case", srsProgress("crm", cases),
+                "casehistory__c", srsProgress("crm", cases),
+                "emailmessage", srsProgress("crm", mail));
+        Map<String, List<String>> plan = Map.of(
+                "support_case", List.of("view"), "casehistory__c", List.of("view"),
+                "emailmessage", List.of("view"));
+        StoreBackedSinkAckFactory factory = new StoreBackedSinkAckFactory(progress, store);
+        factory.prepareWriterPlan(plan);
+        SinkAck ack = factory.forWriter("view", List.copyOf(plan.keySet()), plan).resolve(memberWith(store));
+
+        ack.advance("support_case", at(1, "low"));
+        backing.advanceConsumerReadSeq("crm", cases, "support_case", 2);
+        ack.advance("emailmessage", at(1_000, "mail-after-high"));
+        ack.advance("casehistory__c", at(4, "history-4"));
+
+        ConsumerOffset caseOffset = backing.read("crm").orElseThrow().consumerOffset(cases).orElseThrow();
+        ConsumerOffset mailOffset = backing.read("crm").orElseThrow().consumerOffset(mail).orElseThrow();
+        assertThat(caseOffset.sinkAckedByTable())
+                .containsExactlyInAnyOrderEntriesOf(Map.of("support_case", at(1, "low"),
+                        "casehistory__c", at(4, "history-4")));
+        assertThat(mailOffset.sinkAckedByTable()).containsExactlyEntriesOf(Map.of(
+                "emailmessage", at(1_000, "mail-after-high")));
+        assertThat(backing.ringDoneThrough("crm", cases)).containsEntry("support_case", 1L)
+                .doesNotContainKey("emailmessage");
+        assertThat(backing.read("crm").orElseThrow().sourceReadOffset()).isEqualTo("capture-30");
+        assertThat(backing.read("crm").orElseThrow().sourceReadDurable()).isTrue();
+        verify(store, atLeastOnce()).configureSinkWriters("crm", cases,
+                Map.of("support_case", List.of("view"), "casehistory__c", List.of("view")),
+                ConsumerProgressKind.SRS);
+        verify(store, atLeastOnce()).configureSinkWriters("crm", mail,
+                Map.of("emailmessage", List.of("view")), ConsumerProgressKind.SRS);
+        verify(store, never()).configureSinkWriters("crm", cases, plan, ConsumerProgressKind.SRS);
+        verify(store, never()).configureSinkWriters("crm", mail, plan, ConsumerProgressKind.SRS);
+        verify(store, never()).advanceSourceReadOffset(anyString(), any());
+        verify(store, never()).consumerOffsets(anyString());
+    }
+
+    @Test
+    void mailConfirmedAfterAnUnconfirmedHighCannotRaiseTheRootTablesReplayFloor() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("crm", null);
+        String consumer = SrsConsumerId.of("pipe", "crm_source").value();
+        Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = Map.of(
+                "support_case", srsProgress("crm", consumer),
+                "emailmessage", srsProgress("crm", consumer));
+        Map<String, List<String>> plan = Map.of(
+                "support_case", List.of("view"), "emailmessage", List.of("view"));
+        StoreBackedSinkAckFactory factory = new StoreBackedSinkAckFactory(progress, store);
+        factory.prepareWriterPlan(plan);
+        SinkAck ack = factory.forWriter("view", List.copyOf(plan.keySet()), plan).resolve(memberWith(store));
+        ack.advance("support_case", at(1, "low"));
+        store.advanceConsumerReadSeq("crm", consumer, "support_case", 2);
+
+        ack.advance("emailmessage", at(1_000, "mail-after-high"));
+
+        var floor = new StoreBackedReplayFloorFactory(progress).resolve(memberWith(store));
+        assertThat(floor.of("support_case")).contains(new SourceOrder(1, 1));
+        assertThat(floor.of("emailmessage")).contains(new SourceOrder(1, 1_000));
+        assertThat(store.ringDoneThrough("crm", consumer)).containsEntry("support_case", 1L);
+        assertThat(store.read("crm").orElseThrow().consumerOffset(consumer).orElseThrow().sinkAcked()).isNull();
+
+        ack.advance("support_case", at(2, "high"));
+        assertThat(floor.of("support_case")).contains(new SourceOrder(1, 2));
+    }
+
+    @Test
+    void independentDirectChannelsConfirmTheirOwnDatabaseOffsets() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("crm-channel-a", null);
+        store.create("crm-channel-b", null);
+        String first = SrsConsumerId.of("pipe", "cases").value();
+        String second = SrsConsumerId.of("pipe", "mail").value();
+        Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = Map.of(
+                "support_case", new StoreBackedSinkAckFactory.SourceProgress(
+                        "crm-channel-a", first, ConsumerProgressKind.DIRECT_SOURCE),
+                "emailmessage", new StoreBackedSinkAckFactory.SourceProgress(
+                        "crm-channel-b", second, ConsumerProgressKind.DIRECT_SOURCE));
+        Map<String, List<String>> plan = Map.of(
+                "support_case", List.of("view"), "emailmessage", List.of("view"));
+        StoreBackedSinkAckFactory factory = new StoreBackedSinkAckFactory(progress, store);
+        factory.prepareWriterPlan(plan);
+        SinkAck ack = factory.forWriter("view", List.copyOf(plan.keySet()), plan).resolve(memberWith(store));
+
+        ack.advance("support_case", at(1, "case-1"));
+        ack.advance("emailmessage", at(50, "mail-50"));
+
+        assertThat(store.read("crm-channel-a").orElseThrow().sourceReadOffset()).isEqualTo("case-1");
+        assertThat(store.read("crm-channel-b").orElseThrow().sourceReadOffset()).isEqualTo("mail-50");
+        assertThat(store.read("crm-channel-a").orElseThrow().consumerOffset(second)).isEmpty();
+        assertThat(store.read("crm-channel-b").orElseThrow().consumerOffset(first)).isEmpty();
+    }
+
+    @Test
+    void aDirectChannelWaitsForEveryTableInItsOwnSourceWideOrder() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("crm-channel", null);
+        String consumer = SrsConsumerId.of("pipe", "crm_source").value();
+        var source = new StoreBackedSinkAckFactory.SourceProgress(
+                "crm-channel", consumer, ConsumerProgressKind.DIRECT_SOURCE);
+        Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = Map.of(
+                "support_case", source, "emailmessage", source);
+        Map<String, List<String>> plan = Map.of(
+                "support_case", List.of("view"), "emailmessage", List.of("view"));
+        StoreBackedSinkAckFactory factory = new StoreBackedSinkAckFactory(progress, store);
+        factory.prepareWriterPlan(plan);
+        SinkAck ack = factory.forWriter("view", List.copyOf(plan.keySet()), plan).resolve(memberWith(store));
+        ack.advance("support_case", at(20, "low"));
+
+        ack.advance("emailmessage", at(22, "mail-after-high"));
+
+        assertThat(store.read("crm-channel").orElseThrow().sourceReadOffset()).isEqualTo("low");
+        ack.advance("support_case", at(21, "high"));
+        assertThat(store.read("crm-channel").orElseThrow().sourceReadOffset()).isEqualTo("high");
+    }
+
+    private static StoreBackedSinkAckFactory.SourceProgress srsProgress(String chain, String consumer) {
+        return new StoreBackedSinkAckFactory.SourceProgress(chain, consumer, ConsumerProgressKind.SRS);
+    }
 
     @Test
     void advancesTheDurableSinkAckedPositionForTheChainThatMapsToTheTable() {
@@ -154,32 +334,6 @@ class StoreBackedSinkAckFactoryTest {
     }
 
     @Test
-    void aQuietTableAckCannotAdvanceTheSharedSourcePastAnotherTablesPendingChange() {
-        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
-        store.create("mc-shop", null);
-        store.advanceSourceReadOffset("mc-shop", at(-1, "t0"));
-        store.upsertConsumerOffset("mc-shop", new ConsumerOffset("pipe-1", Map.of(), null,
-                List.of(), null, 0L, List.of("orders", "customers"), 1L, "reader-1"));
-        SinkAck ack = new StoreBackedSinkAckFactory(
-                Map.of("orders", "mc-shop", "customers", "mc-shop"), "pipe-1")
-                .resolve(memberWith(store));
-
-        // Orders at physical token t1 is still in flight. The later customers change at t2 has no
-        // target row and may settle independently, but a restart must still be able to re-mine orders.
-        ack.advance("customers", at(0, "t2"));
-
-        assertThat(store.ringDoneThrough("mc-shop", "pipe-1"))
-                .containsExactlyInAnyOrderEntriesOf(Map.of("customers", 0L));
-        ConsumerOffset consumer = store.read("mc-shop").orElseThrow()
-                .consumerOffset("pipe-1").orElseThrow();
-        assertThat(consumer.sinkAckedByTable()).containsEntry("customers", at(0, "t2"));
-        assertThat(consumer.sinkAcked()).isNull();
-        assertThat(store.read("mc-shop").orElseThrow().sourceReadOffset())
-                .as("a physical source read offset cannot cross an unacknowledged table")
-                .isEqualTo("t0");
-    }
-
-    @Test
     void durableRingPositionWaitsForTheSlowestSink() {
         InMemorySrsMetaStore store = new InMemorySrsMetaStore();
         store.create("mc-orders", null);
@@ -221,20 +375,13 @@ class StoreBackedSinkAckFactoryTest {
         StoreBackedSinkAckFactory factory = new StoreBackedSinkAckFactory(
                 Map.of("orders", "mc-orders"), "pipe-1", store);
 
-        ConsumerOffset initial = store.read("mc-orders").orElseThrow()
-                .consumerOffset("pipe-1").orElseThrow();
-        assertThat(initial.perTableSeq()).containsExactlyEntriesOf(Map.of("orders", 40L));
-        assertThat(initial.sinkAcked()).as("a read cursor is not a sink acknowledgement").isNull();
-
         factory.prepareWriterPlan(Map.of("orders", List.of("fast", "slow")));
         store.advanceSinkWriterAcked("mc-orders", "pipe-1", "fast", "orders", at(41, "w41"));
 
         assertThat(store.ringDoneThrough("mc-orders", "pipe-1"))
                 .containsEntry("orders", 40L);
-        ConsumerOffset waitingForSlowWriter = store.read("mc-orders").orElseThrow()
-                .consumerOffset("pipe-1").orElseThrow();
-        assertThat(waitingForSlowWriter.perTableSeq()).containsExactlyEntriesOf(Map.of("orders", 40L));
-        assertThat(waitingForSlowWriter.sinkAcked()).isNull();
+        assertThat(store.read("mc-orders").orElseThrow().consumerOffset("pipe-1").orElseThrow().sinkAcked())
+                .isNull();
     }
 
     @Test

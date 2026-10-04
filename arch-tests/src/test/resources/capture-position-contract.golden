@@ -1,6 +1,6 @@
 # The read-side capture contract, at the points that carry a source position.
 #
-# These five types are what every connector adapter implements and what the runtime calls, so a change
+# These read-side types are what connector adapters implement and the runtime calls, so a change
 # here reaches code that is not in this repository. The failure this file exists to catch is narrower
 # than "the contract changed": it is a position, or the run it belongs to, quietly ceasing to be
 # threaded.
@@ -26,7 +26,6 @@ io.tapstate.spi.capture.CaptureBatch :: method :: close() -> void
 io.tapstate.spi.capture.CaptureBatch :: method :: seam() -> java.util.Optional<io.tapstate.spi.capture.SourcePosition>
 io.tapstate.spi.capture.CaptureListener :: method :: onBatch(java.util.List<io.tapstate.core.event.Envelope>, java.util.Optional<io.tapstate.spi.capture.SourcePosition>) -> void
 io.tapstate.spi.capture.CaptureListener :: method :: onError(java.lang.Throwable) -> void
-io.tapstate.spi.capture.CaptureListener :: method :: onStart(java.util.Optional<io.tapstate.spi.capture.SourcePosition>) -> void
 io.tapstate.spi.capture.CapturePort :: method :: cdc(io.tapstate.spi.capture.CaptureConfig, io.tapstate.spi.capture.CaptureStart, io.tapstate.spi.capture.CaptureListener) -> io.tapstate.spi.capture.Subscription
 io.tapstate.spi.capture.CapturePort :: method :: discoverSchema(io.tapstate.spi.capture.CaptureConfig) -> io.tapstate.spi.capture.DiscoveredSchema
 io.tapstate.spi.capture.CapturePort :: method :: snapshot(io.tapstate.spi.capture.CaptureConfig) -> io.tapstate.spi.capture.CaptureBatch
@@ -42,4 +41,5 @@ io.tapstate.spi.capture.CaptureStart :: permits :: io.tapstate.spi.capture.Captu
 io.tapstate.spi.capture.CaptureStart :: permits :: io.tapstate.spi.capture.CaptureStart$Resume
 io.tapstate.spi.capture.CaptureStart$At :: component :: instant :: java.time.Instant
 io.tapstate.spi.capture.CaptureStart$Resume :: component :: position :: io.tapstate.spi.capture.SourcePosition
+io.tapstate.spi.capture.CaptureStartedListener :: method :: onStart(io.tapstate.spi.capture.SourcePosition) -> void
 io.tapstate.spi.capture.SourcePosition :: component :: token :: java.lang.String

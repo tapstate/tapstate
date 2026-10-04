@@ -2,6 +2,7 @@ package io.tapstate.e2e;
 
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.testsupport.DockerGate;
 
 import org.junit.jupiter.api.BeforeAll;
@@ -98,7 +99,8 @@ class StopClearsEverythingButTheTargetIT {
             Await.until(
                     "the pipeline to hold a cursor on its mining chain",
                     () -> documents.miningChainIds().size() == 1
-                            && documents.consumersOf(onlyChain(documents)).contains(pipelineId),
+                            && documents.consumersOf(onlyChain(documents))
+                                    .contains(SrsConsumerId.of(pipelineId, SOURCE_ID).value()),
                     () -> "chains=" + documents.miningChainIds() + " consumers="
                             + documents.miningChainIds().stream().map(documents::consumersOf).toList());
             String chainId = onlyChain(documents);

@@ -39,6 +39,7 @@ import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.StopAuthority;
 import io.tapstate.spi.store.StopReservation;
+import io.tapstate.spi.store.SrsConsumerId;
 import org.junit.jupiter.api.Test;
 
 import java.time.Clock;
@@ -56,6 +57,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class SnapshotContinuationPreparationTest {
     private static final String PIPE = "partial_load";
     private static final String SOURCE = "source_rows";
+    private static final String CONSUMER = SrsConsumerId.of(PIPE, SOURCE).value();
     private static final ObservationStore.Scope OLD = new ObservationStore.Scope("inc-a", 17);
     private static final ObservationStore.Scope NEXT = new ObservationStore.Scope("inc-a", 18);
     private static final StopReservation.JobIdentity NEXT_JOB = new StopReservation.JobIdentity("single", 88, "next-boot");
@@ -146,7 +148,7 @@ class SnapshotContinuationPreparationTest {
             var first = publisher(capture, observedAt).prepareScoped(PIPE, null, OLD).orElseThrow();
             originalAlpha = snapshot(scopes.continueFrame(first, OLD).observation(), "alpha");
             assertThat(originalAlpha.value()).isEqualTo(2);
-            store.meta().markSnapshotComplete(chain.value(), PIPE, "alpha");
+            store.meta().markSnapshotComplete(chain.value(), CONSUMER, "alpha");
             assertThat(capture.loadDelivered(PIPE)).as("beta has not been confirmed by its target").isFalse();
             var running = store.state().read(PIPE).orElseThrow();
             store.state().compareAndSwap(PIPE, running.epoch(), StateJson.of(PipelineState.PAUSED), observedAt.plusSeconds(1));
@@ -155,10 +157,11 @@ class SnapshotContinuationPreparationTest {
 
         private StoreBackedPipelineCaptureCoordinator coordinator() {
             CaptureStarter starter = (spec, handoff) -> {
-                chain = MiningChainId.resolve(spec.config(), spec.srsKey());
+                chain = spec.miningChainId();
                 srs.provisionSource(spec.sourceId(), chain, spec.config().streams(), spec.retention());
-                srs.attachConsumer(chain, spec.pipelineId());
-                List<String> owed = SnapshotPhase.stillOwed(store.meta().read(chain.value()), PIPE, spec.config().streams());
+                srs.attachConsumer(chain, spec.consumerId());
+                List<String> owed = SnapshotPhase.stillOwed(
+                        store.meta().read(chain.value()), spec.consumerId(), spec.config().streams());
                 Map<String, Long> actualReads = new LinkedHashMap<>();
                 for (String table : spec.config().streams()) {
                     long rows = owed.contains(table) ? table.equals("alpha") ? 2 : 3 : 0;

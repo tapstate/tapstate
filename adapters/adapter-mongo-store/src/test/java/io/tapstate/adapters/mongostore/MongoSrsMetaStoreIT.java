@@ -12,10 +12,11 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.ConsumerProgressKind;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SchemaVersion;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.SrsMeta;
-import io.tapstate.spi.store.SrsMetaStore.PhysicalSelection;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -90,213 +91,6 @@ class MongoSrsMetaStoreIT {
 
     @Container
     private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
-
-    @Test
-    void tableAcksPersistIndependentlyAndOldRingGenerationsCannotConfirmTheNewOne() {
-        withStore(store -> {
-            store.create(CHAIN, null);
-            long first = store.openEpoch(CHAIN);
-            store.selectConsumerTables(CHAIN, "pipe", List.of("orders", "customers"), first, "reader-one");
-
-            store.advanceTableSinkAcked(CHAIN, "pipe", "customers",
-                    new ChainPosition(new SourceOrder(first, 0), "t2"));
-            store.advanceTableSinkAcked(CHAIN, "pipe", "orders",
-                    new ChainPosition(new SourceOrder(first, 4), "t1"));
-            store.advanceTableSinkAcked(CHAIN, "pipe", "customers",
-                    new ChainPosition(new SourceOrder(first, 0), "stale"));
-
-            ConsumerOffset persisted = store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow();
-            assertThat(persisted.sinkAcked()).isNull();
-            assertThat(persisted.sinkAckedByTable()).containsExactlyInAnyOrderEntriesOf(Map.of(
-                    "orders", new ChainPosition(new SourceOrder(first, 4), "t1"),
-                    "customers", new ChainPosition(new SourceOrder(first, 0), "t2")));
-            assertThat(store.ringDoneThrough(CHAIN, "pipe"))
-                    .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 4L, "customers", 0L));
-            assertThat(store.consumerOffsets(CHAIN).getFirst().ringDoneThrough())
-                    .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 4L, "customers", 0L));
-
-            long second = store.openEpoch(CHAIN);
-            store.selectConsumerTables(CHAIN, "pipe", List.of("orders", "customers"), second, "reader-two");
-            store.advanceTableSinkAcked(CHAIN, "pipe", "orders",
-                    new ChainPosition(new SourceOrder(first, 99), "old-run"));
-            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow()
-                    .sinkAckedByTable()).isEmpty();
-            assertThat(store.ringDoneThrough(CHAIN, "pipe")).isEmpty();
-            assertThat(store.consumerOffsets(CHAIN).getFirst().ringDoneThrough()).isEmpty();
-
-            store.advanceTableSinkAcked(CHAIN, "pipe", "orders",
-                    new ChainPosition(new SourceOrder(second, 0), "replayed"));
-            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("pipe").orElseThrow()
-                    .sinkAckedByTable()).containsOnlyKeys("orders");
-            assertThat(store.ringDoneThrough(CHAIN, "pipe")).containsEntry("orders", 0L);
-        });
-    }
-
-    @Test
-    void delayedArrivalMarkerCannotSeedTheNextRingGeneration() {
-        withStore(store -> {
-            store.create(CHAIN, null);
-            long first = store.openEpoch(CHAIN);
-            store.selectConsumerTables(CHAIN, "pipe", List.of("orders"), first, "reader-one");
-            store.startRingAfter(CHAIN, "pipe", "orders", first, 7L);
-            assertThat(store.ringDoneThrough(CHAIN, "pipe")).containsEntry("orders", 7L);
-
-            long second = store.openEpoch(CHAIN);
-            store.selectConsumerTables(CHAIN, "pipe", List.of("orders"), second, "reader-two");
-            store.startRingAfter(CHAIN, "pipe", "orders", first, 99L);
-            store.startRingAfter(CHAIN, "pipe", "orders", 999L);
-            assertThat(store.ringDoneThrough(CHAIN, "pipe")).isEmpty();
-
-            store.startRingAfter(CHAIN, "pipe", "orders", second, 0L);
-            store.startRingAfter(CHAIN, "pipe", "orders", second, 50L);
-            assertThat(store.ringDoneThrough(CHAIN, "pipe")).containsEntry("orders", 0L);
-        });
-    }
-
-    @Test
-    void physicalStartAnchorSurvivesReopenAndAnUnverifiedOldOffsetRequiresRepair() {
-        withStore(store -> {
-            store.create(CHAIN, null);
-            long epoch = store.openEpoch(CHAIN);
-            ChainPosition anchor = new ChainPosition(new SourceOrder(epoch, -1L), "t0");
-            assertThat(store.establishPhysicalAnchor(CHAIN, anchor)).isTrue();
-            assertThat(store.physicalPrefixTrusted(CHAIN)).isTrue();
-            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("t0");
-
-            try (MongoClient reopened = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-                MongoSrsMetaStore recovered = new MongoSrsMetaStore(reopened,
-                        reopened.getDatabase("tapstate").getCollection("srs_meta"));
-                assertThat(recovered.physicalPrefixTrusted(CHAIN)).isTrue();
-                assertThat(recovered.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("t0");
-            }
-
-            String legacy = CHAIN + "-legacy";
-            store.create(legacy, null);
-            long oldEpoch = store.openEpoch(legacy);
-            store.advanceSourceReadOffset(legacy,
-                    new ChainPosition(new SourceOrder(oldEpoch, 4L), "possibly-past-pending-data"));
-            assertThat(store.physicalPrefixTrusted(legacy)).isFalse();
-            assertThat(store.establishPhysicalAnchor(legacy,
-                    new ChainPosition(new SourceOrder(oldEpoch, -1L), "new-present"))).isFalse();
-            assertThat(store.read(legacy).orElseThrow().sourceReadOffset())
-                    .isEqualTo("possibly-past-pending-data");
-            store.rewindSourceReadOffset(legacy, "verified-repair");
-            assertThat(store.physicalPrefixTrusted(legacy)).isTrue();
-            assertThat(store.establishPhysicalAnchor(legacy,
-                    new ChainPosition(new SourceOrder(oldEpoch, -1L), "verified-repair"))).isTrue();
-        });
-    }
-
-    @Test
-    void onePhysicalSelectionIsPublishedPerRingGeneration() {
-        withStore(store -> {
-            store.create(CHAIN, null);
-            long first = store.openEpoch(CHAIN);
-            PhysicalSelection orders = new PhysicalSelection(first, List.of("orders"));
-            assertThat(store.publishPhysicalSelection(CHAIN, orders)).isTrue();
-            assertThat(store.physicalPrefixTrusted(CHAIN))
-                    .as("publishing a table list does not prove where its source read begins")
-                    .isFalse();
-            assertThat(store.establishPhysicalAnchor(CHAIN,
-                    new ChainPosition(new SourceOrder(first, -1L), "first-safe-start"))).isTrue();
-            assertThat(store.physicalPrefixTrusted(CHAIN)).isTrue();
-            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("first-safe-start");
-            assertThat(store.physicalSelection(CHAIN)).contains(orders);
-            assertThat(store.publishPhysicalSelection(CHAIN, orders)).isTrue();
-            assertThat(store.publishPhysicalSelection(CHAIN,
-                    new PhysicalSelection(first, List.of("orders", "customers")))).isFalse();
-            assertThat(store.physicalSelection(CHAIN)).contains(orders);
-
-            long second = store.openEpoch(CHAIN);
-            PhysicalSelection union = new PhysicalSelection(second, List.of("customers", "orders"));
-            assertThat(store.publishPhysicalSelection(CHAIN, union)).isTrue();
-            assertThat(store.physicalSelection(CHAIN)).contains(
-                    new PhysicalSelection(second, List.of("customers", "orders")));
-        });
-    }
-
-    @Test
-    void aPendingTableRequestRequiresAnOrderedPhysicalSubscriptionReplacement() {
-        withStore(store -> {
-            store.create(CHAIN, null);
-            long epoch = store.openEpoch(CHAIN);
-            PhysicalSelection orders = new PhysicalSelection(epoch, List.of("orders"));
-            assertThat(store.publishPhysicalSelection(CHAIN, orders)).isTrue();
-            assertThat(store.requestPhysicalTables(CHAIN, epoch, List.of("customers"))).isTrue();
-            assertThat(store.requestedPhysicalTables(CHAIN)).containsExactly("customers");
-            assertThat(store.publishPhysicalSelection(CHAIN, orders))
-                    .as("the old table set cannot be republished over a pending new request")
-                    .isFalse();
-
-            PhysicalSelection expanded = new PhysicalSelection(epoch, 2L, List.of("orders", "customers"));
-            assertThat(store.replacePhysicalSelection(CHAIN, orders, expanded)).isTrue();
-            assertThat(store.physicalSelection(CHAIN)).contains(expanded);
-            assertThat(store.replacePhysicalSelection(CHAIN, orders,
-                    new PhysicalSelection(epoch, 2L, List.of("orders", "customers", "items"))))
-                    .as("a stale physical owner cannot overwrite the replacement")
-                    .isFalse();
-            store.clearPhysicalRequests(CHAIN, epoch, expanded.tables());
-            assertThat(store.requestedPhysicalTables(CHAIN)).isEmpty();
-
-            long next = store.openEpoch(CHAIN);
-            assertThat(store.requestPhysicalTables(CHAIN, epoch, List.of("items")))
-                    .as("an old attachment cannot request a table in the next ring generation")
-                    .isFalse();
-            assertThat(store.publishPhysicalSelection(CHAIN,
-                    new PhysicalSelection(next, List.of("orders", "customers")))).isTrue();
-        });
-    }
-
-    @Test
-    void ringStartBoundaryIsWriteOnceWithinAnEpochAndOldOwnersCannotSeedTheNext() {
-        withStore(store -> {
-            store.create(CHAIN, null);
-            long first = store.openEpoch(CHAIN);
-            assertThat(store.establishRingGenerationStartAfter(CHAIN, "orders", first, -1L))
-                    .hasValue(-1L);
-            assertThat(store.establishRingGenerationStartAfter(CHAIN, "orders", first, 8L))
-                    .as("a later attachment cannot move the start past an already admitted change")
-                    .hasValue(-1L);
-            assertThat(store.ringGenerationStartAfter(CHAIN, "orders", first)).hasValue(-1L);
-
-            long second = store.openEpoch(CHAIN);
-            assertThat(store.ringGenerationStartAfter(CHAIN, "orders", second)).isEmpty();
-            assertThat(store.establishRingGenerationStartAfter(CHAIN, "orders", first, 99L))
-                    .as("the old owner cannot set a boundary for the new generation")
-                    .isEmpty();
-            assertThat(store.establishRingGenerationStartAfter(CHAIN, "orders", second, 12L))
-                    .hasValue(12L);
-            assertThat(store.ringGenerationStartAfter(CHAIN, "orders", second)).hasValue(12L);
-        });
-    }
-
-    @Test
-    void aLateOldPhysicalOwnerCannotMoveEitherScalarAfterTheRingChangesGeneration() {
-        withStore(store -> {
-            store.create(CHAIN, null);
-            long first = store.openEpoch(CHAIN);
-            store.selectConsumerTables(CHAIN, "reader", List.of("orders", "customers"), first, "old-job");
-            assertThat(store.establishPhysicalAnchor(CHAIN,
-                    new ChainPosition(new SourceOrder(first, -1L), "t0"))).isTrue();
-            ChainPosition safe = new ChainPosition(new SourceOrder(first, 0L), "t1");
-            assertThat(store.advancePhysicalSinkAcked(CHAIN, "reader", first, safe)).isTrue();
-            assertThat(store.advancePhysicalSourceReadOffset(CHAIN, first, safe)).isTrue();
-
-            long second = store.openEpoch(CHAIN);
-            store.selectConsumerTables(CHAIN, "reader", List.of("orders", "customers"), second, "new-job");
-            ChainPosition late = new ChainPosition(new SourceOrder(first, 1L), "t2");
-            assertThat(store.advancePhysicalSinkAcked(CHAIN, "reader", first, late)).isFalse();
-            assertThat(store.advancePhysicalSourceReadOffset(CHAIN, first, late)).isFalse();
-            SrsMeta unchanged = store.read(CHAIN).orElseThrow();
-            assertThat(unchanged.sourceReadOffset()).isEqualTo("t1");
-            assertThat(unchanged.consumerOffset("reader").orElseThrow().sinkAckedSrcpos()).isEqualTo("t1");
-
-            ChainPosition current = new ChainPosition(new SourceOrder(second, 0L), "t3");
-            assertThat(store.advancePhysicalSinkAcked(CHAIN, "reader", second, current)).isTrue();
-            assertThat(store.advancePhysicalSourceReadOffset(CHAIN, second, current)).isTrue();
-            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("t3");
-        });
-    }
 
     @Test
     void createSeedsAnEmptyRecordAndReadReturnsIt() {
@@ -489,42 +283,6 @@ class MongoSrsMetaStoreIT {
     }
 
     @Test
-    void selectedTablesPreserveOnlyContinuouslySelectedCursorsInOneGeneration() {
-        withStore(store -> {
-            store.create(CHAIN, null);
-            assertThat(store.openEpoch(CHAIN)).isEqualTo(1L);
-            store.selectConsumerTables(CHAIN, "p1", List.of("orders", "customers"), 1L, "run-1");
-            store.advanceConsumerReadSeq(CHAIN, "p1", "orders", 1L, "run-1", 42L);
-            store.advanceConsumerReadSeq(CHAIN, "p1", "customers", 1L, "run-1", 7L);
-            store.advanceSinkAcked(CHAIN, "p1", new ChainPosition(new SourceOrder(1, 7), "w7"));
-            store.selectConsumerTables(CHAIN, "p1", List.of("orders", "customers"), 1L, "run-1");
-            assertThat(onlyConsumer(store).perTableSeq())
-                    .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 42L, "customers", 7L));
-
-            store.selectConsumerTables(CHAIN, "p1", List.of("orders"), 1L, "run-2");
-            assertThat(onlyConsumer(store).perTableSeq()).isEmpty();
-            assertThat(onlyConsumer(store).selectedTables()).containsExactly("orders");
-            assertThat(onlyConsumer(store).sinkAcked()).isEqualTo(new ChainPosition(new SourceOrder(1, 7), "w7"));
-
-            store.selectConsumerTables(CHAIN, "p1", List.of("orders", "customers"), 1L, "run-3");
-            assertThat(onlyConsumer(store).perTableSeq()).isEmpty();
-            assertThat(onlyConsumer(store).selectedTables()).containsExactly("orders", "customers");
-            store.advanceConsumerReadSeq(CHAIN, "p1", "customers", 1L, "run-1", 99L);
-            assertThat(onlyConsumer(store).perTableSeq()).isEmpty();
-            store.advanceConsumerReadSeq(CHAIN, "p1", "customers", 1L, "run-3", 0L);
-            assertThat(onlyConsumer(store).perTableSeq()).containsExactly(Map.entry("customers", 0L));
-
-            assertThat(store.openEpoch(CHAIN)).isEqualTo(2L);
-            store.selectConsumerTables(CHAIN, "p1", List.of("orders", "customers"), 2L, "run-4");
-            assertThat(onlyConsumer(store).perTableSeq()).isEmpty();
-            store.advanceConsumerReadSeq(CHAIN, "p1", "orders", 1L, "run-3", 99L);
-            assertThat(onlyConsumer(store).perTableSeq()).isEmpty();
-            store.advanceConsumerReadSeq(CHAIN, "p1", "orders", 2L, "run-4", 0L);
-            assertThat(onlyConsumer(store).perTableSeq()).containsExactly(Map.entry("orders", 0L));
-        });
-    }
-
-    @Test
     void unreadRegistrationKeepsAdvancedCursorsAndNamesOnlySelectedTables() {
         withStore(store -> {
             store.create(CHAIN, null);
@@ -619,6 +377,585 @@ class MongoSrsMetaStoreIT {
     }
 
     @Test
+    void aLaterQuietTableConfirmationDoesNotSkipAnUnconfirmedRootChange() {
+        withStore(store -> {
+            String chain = "crm@postgres-526";
+            String pipeline = "support_case_state";
+            String writer = "view";
+            store.create(chain, null);
+            store.configureSinkWriters(chain, pipeline, Map.of(
+                    "support_case", List.of(writer), "emailmessage", List.of(writer)));
+            ChainPosition seam = new ChainPosition(SourceOrder.snapshotRow(1), "before-batch");
+            for (String table : List.of("support_case", "emailmessage")) {
+                store.advanceSinkWriterAcked(chain, pipeline, writer, table, seam);
+                store.markSinkWriterSnapshotComplete(chain, pipeline, writer, table);
+            }
+
+            // Source order: two root changes, priority Low, priority High, then an email change.
+            // The root ring has reached sequence 3, but its sink has confirmed only Low at sequence 2.
+            store.advanceConsumerReadSeq(chain, pipeline, "support_case", 3L);
+            store.advanceSinkWriterAcked(chain, pipeline, writer, "support_case",
+                    new ChainPosition(new SourceOrder(1, 2), "after-low"));
+
+            // This is the quiet table's first change: its independent ring sequence is 0 even though
+            // its source position follows the root's still-unconfirmed High update at sequence 3.
+            store.advanceConsumerReadSeq(chain, pipeline, "emailmessage", 0L);
+            store.advanceSinkWriterAcked(chain, pipeline, writer, "emailmessage",
+                    new ChainPosition(new SourceOrder(1, 0), "after-email"));
+            assertThat(store.ringDoneThrough(chain, pipeline))
+                    .containsExactlyInAnyOrderEntriesOf(Map.of("support_case", 2L, "emailmessage", 0L));
+
+            // With one consumer, the sink's aggregate is the source-read frontier used on restart.
+            ChainPosition confirmed = store.read(chain).orElseThrow()
+                    .consumerOffset(pipeline).orElseThrow().sinkAcked();
+            store.advanceSourceReadOffset(chain, confirmed);
+            assertThat(store.read(chain).orElseThrow().sourceReadOffset())
+                    .as("a keep-state restart must resume before the unconfirmed priority High update; "
+                            + "resuming after the later email change permanently skips it")
+                    .isIn("before-batch", "after-low");
+        });
+    }
+
+    @Test
+    void sharedSourceNodesKeepTheirOwnConfirmedTablePositionsAfterTheStoreReopens() {
+        withCollection((store, collection) -> {
+            String first = SrsConsumerId.of("support_case_state", "case_source").value();
+            String second = SrsConsumerId.of("support_case_state", "second_case_source").value();
+            String other = SrsConsumerId.of("opportunity_state", "opportunity_source").value();
+            Map<String, List<String>> plan = Map.of(
+                    "support_case", List.of("view"), "emailmessage", List.of("view"));
+            store.create(CHAIN, null);
+            long generation = store.openEpoch(CHAIN);
+            for (String consumer : List.of(first, second, other)) {
+                store.configureSinkWriters(CHAIN, consumer, plan, ConsumerProgressKind.SRS);
+            }
+
+            // Mail is confirmed after High was read but before High's downstream effects finish.
+            store.advanceConsumerReadSeq(CHAIN, first, "support_case", 3);
+            store.advanceConsumerReadSeq(CHAIN, first, "emailmessage", 0);
+            store.advanceSinkWriterAcked(CHAIN, first, "view", "support_case",
+                    new ChainPosition(new SourceOrder(generation, 2), "after-low"));
+            store.advanceSinkWriterAcked(CHAIN, first, "view", "emailmessage",
+                    new ChainPosition(new SourceOrder(generation, 0), "after-mail"));
+            store.advanceConsumerReadSeq(CHAIN, second, "support_case", 90);
+            store.advanceSinkWriterAcked(CHAIN, second, "view", "support_case",
+                    new ChainPosition(new SourceOrder(generation, 80), "second-source-confirmed"));
+            store.advanceConsumerReadSeq(CHAIN, other, "emailmessage", 20);
+            store.advanceSinkWriterAcked(CHAIN, other, "view", "emailmessage",
+                    new ChainPosition(new SourceOrder(generation, 10), "other-pipeline-confirmed"));
+
+            try (MongoClient reopenedClient = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+                MongoSrsMetaStore reopened = new MongoSrsMetaStore(reopenedClient,
+                        reopenedClient.getDatabase(collection.getNamespace().getDatabaseName())
+                                .getCollection(collection.getNamespace().getCollectionName()));
+                SrsMeta persisted = reopened.read(CHAIN).orElseThrow();
+                ConsumerOffset held = persisted.consumerOffset(first).orElseThrow();
+                assertThat(held.progressKind()).isEqualTo(ConsumerProgressKind.SRS);
+                assertThat(held.perTableSeq()).containsExactlyInAnyOrderEntriesOf(
+                        Map.of("support_case", 3L, "emailmessage", 0L));
+                assertThat(held.sinkAckedByTable()).containsExactlyInAnyOrderEntriesOf(Map.of(
+                        "support_case", new ChainPosition(new SourceOrder(generation, 2), "after-low"),
+                        "emailmessage", new ChainPosition(new SourceOrder(generation, 0), "after-mail")));
+                assertThat(held.sinkAcked())
+                        .as("CDC-only table counters do not certify a single database recovery position")
+                        .isNull();
+                assertThat(reopened.ringDoneThrough(CHAIN, first))
+                        .containsExactlyInAnyOrderEntriesOf(Map.of("support_case", 2L, "emailmessage", 0L));
+                assertThat(persisted.consumerOffset(second).orElseThrow().sinkAckedByTable())
+                        .containsExactly(Map.entry("support_case",
+                                new ChainPosition(new SourceOrder(generation, 80), "second-source-confirmed")));
+                assertThat(persisted.consumerOffset(other).orElseThrow().sinkAckedByTable())
+                        .containsExactly(Map.entry("emailmessage",
+                                new ChainPosition(new SourceOrder(generation, 10), "other-pipeline-confirmed")));
+                assertThat(reopened.consumerOffsets(CHAIN)).containsExactlyInAnyOrderElementsOf(
+                        persisted.consumerOffsets());
+            }
+        });
+    }
+
+    @Test
+    void independentTableConfirmationsRetainOnlyAJointlyConfirmedSnapshotSeam() {
+        withStore(store -> {
+            for (ConsumerProgressKind kind : List.of(ConsumerProgressKind.LEGACY, ConsumerProgressKind.SRS)) {
+                String chain = "snapshot-" + kind.name();
+                String consumer = SrsConsumerId.of("support_case_state", "source-" + kind.name()).value();
+                store.create(chain, null);
+                store.configureSinkWriters(chain, consumer, Map.of(
+                        "support_case", List.of("view"), "emailmessage", List.of("view")), kind);
+                ChainPosition seam = new ChainPosition(SourceOrder.snapshotRow(7), "snapshot-seam");
+                for (String table : List.of("support_case", "emailmessage")) {
+                    store.advanceSinkWriterAcked(chain, consumer, "view", table, seam);
+                    store.markSinkWriterSnapshotComplete(chain, consumer, "view", table);
+                }
+                store.advanceSinkWriterAcked(chain, consumer, "view", "support_case",
+                        new ChainPosition(new SourceOrder(7, 2), "after-low"));
+                store.advanceSinkWriterAcked(chain, consumer, "view", "emailmessage",
+                        new ChainPosition(new SourceOrder(7, 0), "after-mail"));
+
+                ConsumerOffset confirmed = store.read(chain).orElseThrow().consumerOffset(consumer).orElseThrow();
+                assertThat(confirmed.sinkAcked()).as("coordinate system %s", kind).isEqualTo(seam);
+                assertThat(confirmed.sinkAckedByTable()).containsExactlyInAnyOrderEntriesOf(Map.of(
+                        "support_case", new ChainPosition(new SourceOrder(7, 2), "after-low"),
+                        "emailmessage", new ChainPosition(new SourceOrder(7, 0), "after-mail")));
+            }
+        });
+    }
+
+    @Test
+    void isolatedDirectChannelsAdvanceTheirSourceOrderWithoutMixingRecoveryRecords() {
+        withStore(store -> {
+            String firstChain = "crm@same-postgres:channel-one";
+            String secondChain = "crm@same-postgres:channel-two";
+            String first = SrsConsumerId.of("support_case_state", "case_source").value();
+            String second = SrsConsumerId.of("support_case_state", "second_case_source").value();
+            Map<String, List<String>> plan = Map.of(
+                    "support_case", List.of("view"), "emailmessage", List.of("view"));
+            store.create(firstChain, null);
+            store.create(secondChain, null);
+            store.configureSinkWriters(firstChain, first, plan, ConsumerProgressKind.DIRECT_SOURCE);
+            store.configureSinkWriters(secondChain, second, plan, ConsumerProgressKind.DIRECT_SOURCE);
+
+            store.advanceSinkWriterAcked(firstChain, first, "view", "support_case",
+                    new ChainPosition(new SourceOrder(1, 1), "first-after-low"));
+            store.advanceSinkWriterAcked(firstChain, first, "view", "emailmessage",
+                    new ChainPosition(new SourceOrder(1, 3), "first-after-mail"));
+            store.advanceSinkWriterAcked(secondChain, second, "view", "support_case",
+                    new ChainPosition(new SourceOrder(1, 80), "second-root"));
+            store.advanceSinkWriterAcked(secondChain, second, "view", "emailmessage",
+                    new ChainPosition(new SourceOrder(1, 90), "second-mail"));
+            store.advanceSourceReadOffset(firstChain, store.read(firstChain).orElseThrow()
+                    .consumerOffset(first).orElseThrow().sinkAcked());
+            store.advanceSourceReadOffset(secondChain, store.read(secondChain).orElseThrow()
+                    .consumerOffset(second).orElseThrow().sinkAcked());
+
+            assertThat(store.read(firstChain).orElseThrow().sourceReadOffset()).isEqualTo("first-after-low");
+            assertThat(store.read(secondChain).orElseThrow().sourceReadOffset()).isEqualTo("second-root");
+            store.advanceSinkWriterAcked(firstChain, first, "view", "support_case",
+                    new ChainPosition(new SourceOrder(1, 2), "first-after-high"));
+            store.advanceSourceReadOffset(firstChain, store.read(firstChain).orElseThrow()
+                    .consumerOffset(first).orElseThrow().sinkAcked());
+
+            assertThat(store.read(firstChain).orElseThrow().sourceReadOffset()).isEqualTo("first-after-high");
+            assertThat(store.read(secondChain).orElseThrow().sourceReadOffset()).isEqualTo("second-root");
+            assertThat(store.consumerOffsets(firstChain)).extracting(ConsumerOffset::pipelineId).containsExactly(first);
+            assertThat(store.consumerOffsets(secondChain)).extracting(ConsumerOffset::pipelineId).containsExactly(second);
+        });
+    }
+
+    @Test
+    void directBatchRecoveryRetainsUnconfirmedHighAcrossStoreReopenAndAdvancesPastAQuietTable() {
+        withCollection((store, collection) -> {
+            String consumer = SrsConsumerId.of("support_case_state", "case_source").value();
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            store.configureSinkWriters(CHAIN, consumer, Map.of(
+                    "support_case", List.of("view"), "emailmessage", List.of("view")),
+                    ConsumerProgressKind.DIRECT_SOURCE);
+            store.beginDirectCapture(CHAIN, consumer, epoch, "before-batch");
+            ChainPosition low = new ChainPosition(new SourceOrder(epoch, 0), "after-low");
+            ChainPosition high = new ChainPosition(new SourceOrder(epoch, 1), "after-high");
+            ChainPosition mail = new ChainPosition(new SourceOrder(epoch, 2), "after-mail");
+            store.recordDirectBatch(CHAIN, consumer, low, Map.of("support_case", 0L));
+            store.advanceSinkWriterAcked(CHAIN, consumer, "view", "support_case", low);
+            store.recordDirectBatch(CHAIN, consumer, high, Map.of("support_case", 1L));
+            store.recordDirectBatch(CHAIN, consumer, mail,
+                    Map.of("support_case", 1L, "emailmessage", 2L));
+            store.advanceSinkWriterAcked(CHAIN, consumer, "view", "emailmessage", mail);
+
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("after-low");
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset(consumer).orElseThrow().sinkAcked())
+                    .isEqualTo(low);
+            try (MongoClient reopenedClient = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+                MongoSrsMetaStore reopened = new MongoSrsMetaStore(reopenedClient,
+                        reopenedClient.getDatabase(collection.getNamespace().getDatabaseName())
+                                .getCollection(collection.getNamespace().getCollectionName()));
+                // A repeated same-generation startup must keep both pending batch manifests.
+                reopened.beginDirectCapture(CHAIN, consumer, epoch, "before-batch");
+                assertThat(reopened.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("after-low");
+                reopened.advanceSinkWriterAcked(CHAIN, consumer, "view", "support_case", high);
+                assertThat(reopened.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("after-mail");
+
+                ChainPosition laterRoot = new ChainPosition(new SourceOrder(epoch, 3), "later-root");
+                reopened.recordDirectBatch(CHAIN, consumer, laterRoot,
+                        Map.of("support_case", 3L, "emailmessage", 2L));
+                reopened.advanceSinkWriterAcked(CHAIN, consumer, "view", "support_case", laterRoot);
+                assertThat(reopened.read(CHAIN).orElseThrow().sourceReadOffset())
+                        .as("mail need not change again to confirm a later root-only batch")
+                        .isEqualTo("later-root");
+                assertThat(reopened.read(CHAIN).orElseThrow().consumerOffset(consumer).orElseThrow().sinkAcked())
+                        .isEqualTo(laterRoot);
+            }
+        });
+    }
+
+    @Test
+    void directStreamGenerationRefusesOldProducersAndCannotCertifyNewBatchesWithOldWriterProgress() {
+        withStore(store -> {
+            String consumer = SrsConsumerId.of("support_case_state", "case_source").value();
+            store.create(CHAIN, null);
+            long oldEpoch = store.openEpoch(CHAIN);
+            store.configureSinkWriters(CHAIN, consumer, Map.of(
+                    "support_case", List.of("view"), "emailmessage", List.of("view")),
+                    ConsumerProgressKind.DIRECT_SOURCE);
+            store.beginDirectCapture(CHAIN, consumer, oldEpoch, "before-batch");
+            ChainPosition low = new ChainPosition(new SourceOrder(oldEpoch, 0), "after-low");
+            store.recordDirectBatch(CHAIN, consumer, low, Map.of("support_case", 0L));
+            store.advanceSinkWriterAcked(CHAIN, consumer, "view", "support_case", low);
+            store.recordDirectBatch(CHAIN, consumer,
+                    new ChainPosition(new SourceOrder(oldEpoch, 1), "unconfirmed-high"),
+                    Map.of("support_case", 1L));
+
+            long epoch = store.openEpoch(CHAIN);
+            store.beginDirectCapture(CHAIN, consumer, epoch, "after-low");
+            ChainPosition replayedHigh = new ChainPosition(new SourceOrder(epoch, 0), "after-high");
+            store.recordDirectBatch(CHAIN, consumer, replayedHigh, Map.of("support_case", 0L));
+            ChainPosition mail = new ChainPosition(new SourceOrder(epoch, 1), "after-mail");
+            store.recordDirectBatch(CHAIN, consumer, mail,
+                    Map.of("support_case", 0L, "emailmessage", 1L));
+            store.advanceSinkWriterAcked(CHAIN, consumer, "view", "emailmessage", mail);
+            store.advanceSinkWriterAcked(CHAIN, consumer, "view", "support_case",
+                    new ChainPosition(new SourceOrder(oldEpoch, 9), "old-late-confirmation"));
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("after-low");
+
+            assertThatThrownBy(() -> store.beginDirectCapture(CHAIN, consumer, oldEpoch, "old-anchor"))
+                    .isInstanceOf(TapstateException.class)
+                    .satisfies(thrown -> assertThat(((TapstateException) thrown).code())
+                            .isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+            assertThatThrownBy(() -> store.recordDirectBatch(CHAIN, consumer,
+                    new ChainPosition(new SourceOrder(oldEpoch, 10), "old-late-batch"),
+                    Map.of("support_case", 10L)))
+                    .isInstanceOf(TapstateException.class)
+                    .satisfies(thrown -> assertThat(((TapstateException) thrown).code())
+                            .isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("after-low");
+            store.advanceSinkWriterAcked(CHAIN, consumer, "view", "support_case", replayedHigh);
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("after-mail");
+        });
+    }
+
+    @Test
+    void directStartRegistersItsInitialBoundaryAtomicallyWithoutResettingTheActiveStream() {
+        withStore(store -> {
+            String consumer = SrsConsumerId.of("support_case_state", "case_source").value();
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            store.configureSinkWriters(CHAIN, consumer, Map.of("support_case", List.of("view")),
+                    ConsumerProgressKind.DIRECT_SOURCE);
+            store.beginDirectCapture(CHAIN, consumer, epoch, null);
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isNull();
+            store.beginDirectCapture(CHAIN, consumer, epoch, "initial-boundary");
+            SrsMeta initial = store.read(CHAIN).orElseThrow();
+            assertThat(initial.sourceReadOffset()).isEqualTo("initial-boundary");
+            assertThat(initial.sourceRead()).isEqualTo(initial.consumerOffset(consumer).orElseThrow().sinkAcked());
+            assertThat(initial.sourceReadDurable()).isFalse();
+
+            ChainPosition pending = new ChainPosition(new SourceOrder(epoch, 0), "after-high");
+            store.recordDirectBatch(CHAIN, consumer, pending, Map.of("support_case", 0L));
+            store.beginDirectCapture(CHAIN, consumer, epoch, "later-unconfirmed-boundary");
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("initial-boundary");
+            store.advanceSinkWriterAcked(CHAIN, consumer, "view", "support_case", pending);
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("after-high");
+        });
+    }
+
+    @Test
+    void malformedDirectBatchLedgerRefusesProgressWithoutPublishingARecoveryCheckpoint() {
+        withCollection((store, collection) -> {
+            String consumer = SrsConsumerId.of("support_case_state", "case_source").value();
+            List<Object> malformed = List.of("not-a-batch",
+                    new Document("epoch", 1L).append("seq", 0L).append("token", "unconfirmed")
+                            .append("targets", "not-a-document"),
+                    new Document("epoch", 1L).append("token", "unconfirmed")
+                            .append("targets", new Document()),
+                    new Document("epoch", 1L).append("seq", 0L).append("token", "unconfirmed")
+                            .append("targets", new Document("support_case", 1L)));
+            for (int index = 0; index < malformed.size(); index++) {
+                String chain = "malformed-direct-" + index;
+                store.create(chain, null);
+                long epoch = store.openEpoch(chain);
+                store.configureSinkWriters(chain, consumer, Map.of("support_case", List.of("view")),
+                        ConsumerProgressKind.DIRECT_SOURCE);
+                store.beginDirectCapture(chain, consumer, epoch, "initial-boundary");
+                collection.updateOne(new Document("miningChainId", chain).append("pipelineId", consumer),
+                        new Document("$set", new Document("directBatches", List.of(malformed.get(index)))));
+
+                assertThatThrownBy(() -> store.advanceSinkWriterAcked(chain, consumer, "view", "support_case",
+                        new ChainPosition(new SourceOrder(epoch, 0), "after-high")))
+                        .isInstanceOf(TapstateException.class)
+                        .satisfies(thrown -> {
+                            TapstateException refused = (TapstateException) thrown;
+                            assertThat(refused.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+                            assertThat(refused.args()).containsEntry("field", "directBatches");
+                        });
+                SrsMeta persisted = store.read(chain).orElseThrow();
+                assertThat(persisted.sourceReadOffset()).isEqualTo("initial-boundary");
+                assertThat(persisted.consumerOffset(consumer).orElseThrow().sinkAckedByTable()).isEmpty();
+            }
+        });
+    }
+
+    @Test
+    void aCaptureCheckpointWaitsForTheRequestedTableUnionToBeServed() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            store.requestCaptureTables(CHAIN, List.of("support_case"));
+            assertThat(store.publishCaptureTables(CHAIN, epoch, List.of("support_case"))).isTrue();
+            store.advanceCaptureCheckpoint(CHAIN, new ChainPosition(new SourceOrder(epoch, 1), "before-union"),
+                    List.of("support_case"));
+
+            store.requestCaptureTables(CHAIN, List.of("emailmessage", "support_case"));
+            assertThat(store.captureTables(CHAIN)).containsExactlyInAnyOrder("support_case", "emailmessage");
+            assertThat(store.captureServingTables(CHAIN)).containsExactly("support_case");
+            assertThat(store.publishCaptureTables(CHAIN, epoch, List.of("support_case"))).isFalse();
+            store.advanceCaptureCheckpoint(CHAIN, new ChainPosition(new SourceOrder(epoch, 2), "narrow-read"),
+                    List.of("support_case"));
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("before-union");
+
+            assertThat(store.publishCaptureTables(CHAIN, epoch, List.of("support_case", "emailmessage"))).isTrue();
+            store.advanceCaptureCheckpoint(CHAIN, new ChainPosition(new SourceOrder(epoch, 3), "union-durable"),
+                    List.of("support_case", "emailmessage"));
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("union-durable");
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadDurable()).isTrue();
+        });
+    }
+
+    @Test
+    void aLateNarrowCallbackCannotCheckpointAfterTheWiderSubscriptionIsPublished() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            List<String> narrow = List.of("support_case");
+            List<String> union = List.of("support_case", "emailmessage");
+            store.requestCaptureTables(CHAIN, narrow);
+            assertThat(store.publishCaptureTables(CHAIN, epoch, narrow)).isTrue();
+            store.advanceCaptureCheckpoint(CHAIN,
+                    new ChainPosition(new SourceOrder(epoch, 1), "before-union"), narrow);
+
+            store.requestCaptureTables(CHAIN, union);
+            assertThat(store.publishCaptureTables(CHAIN, epoch, union)).isTrue();
+            store.advanceCaptureCheckpoint(CHAIN,
+                    new ChainPosition(new SourceOrder(epoch, 2), "late-narrow-batch"), narrow);
+
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset())
+                    .as("publishing the new selection cannot certify an old callback's missing table")
+                    .isEqualTo("before-union");
+            store.advanceCaptureCheckpoint(CHAIN,
+                    new ChainPosition(new SourceOrder(epoch, 3), "whole-union-batch"), union);
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("whole-union-batch");
+        });
+    }
+
+    @Test
+    void malformedRingRecoveryMarkersAreRefusedBeforeTheyCanBecomeFreshArrivals() {
+        withCollection((store, collection) -> {
+            String consumer = SrsConsumerId.of("support_case_state", "case_source").value();
+            List<Object> malformed = new ArrayList<>(List.of("not-a-map",
+                    new Document("support_case", "not-a-sequence"),
+                    new Document("support_case", 2.5), new Document("support_case", -2L)));
+            malformed.add(null);
+            for (int index = 0; index < malformed.size(); index++) {
+                String chain = "malformed-ring-marker-" + index;
+                store.create(chain, null);
+                long epoch = store.openEpoch(chain);
+                store.configureSinkWriters(chain, consumer, Map.of("support_case", List.of("view")),
+                        ConsumerProgressKind.SRS);
+                store.advanceSinkWriterAcked(chain, consumer, "view", "support_case",
+                        new ChainPosition(new SourceOrder(epoch, 2), "after-low"));
+                Document key = new Document("miningChainId", chain).append("pipelineId", consumer);
+                collection.updateOne(key,
+                        new Document("$set", new Document("perTableRingDone", malformed.get(index))));
+
+                assertThatThrownBy(() -> store.startRingAfter(chain, consumer, "support_case", 99L))
+                        .isInstanceOf(TapstateException.class)
+                        .satisfies(thrown -> {
+                            TapstateException refused = (TapstateException) thrown;
+                            assertThat(refused.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+                            assertThat(refused.args()).containsEntry("field", "perTableRingDone");
+                        });
+                assertThat(collection.find(key).first().get("perTableRingDone"))
+                        .as("a refusal keeps the unverified stored marker intact")
+                        .isEqualTo(malformed.get(index));
+            }
+        });
+    }
+
+    @Test
+    void aMissingRingMarkerUsesItsOwnConfirmedTablePositionInsteadOfTheCurrentTail() {
+        withCollection((store, collection) -> {
+            String consumer = SrsConsumerId.of("support_case_state", "case_source").value();
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            store.configureSinkWriters(CHAIN, consumer,
+                    Map.of("support_case", List.of("view"), "emailmessage", List.of("view")),
+                    ConsumerProgressKind.SRS);
+            store.advanceSinkWriterAcked(CHAIN, consumer, "view", "support_case",
+                    new ChainPosition(new SourceOrder(epoch, 2), "after-low"));
+            store.advanceSinkWriterAcked(CHAIN, consumer, "view", "emailmessage",
+                    new ChainPosition(new SourceOrder(epoch, 0), "after-mail"));
+            Document key = new Document("miningChainId", CHAIN).append("pipelineId", consumer);
+            collection.updateOne(key,
+                    new Document("$unset", new Document("perTableRingDone.support_case", "")));
+
+            store.startRingAfter(CHAIN, consumer, "support_case", 99L);
+
+            assertThat(store.ringDoneThrough(CHAIN, consumer)).containsExactlyInAnyOrderEntriesOf(
+                    Map.of("support_case", 2L, "emailmessage", 0L));
+            assertThat(collection.find(key).first().get("perTableRingDone", Document.class))
+                    .as("the real confirmation is used without inventing an arrival at the current tail")
+                    .containsExactly(Map.entry("emailmessage", 0L));
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset(consumer).orElseThrow()
+                    .sinkAckedByTable().get("support_case").token()).isEqualTo("after-low");
+        });
+    }
+
+    @Test
+    void anOldCaptureCannotPublishOrCheckpointAfterANewGenerationOpens() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.requestCaptureTables(CHAIN, List.of("support_case", "emailmessage"));
+            long oldEpoch = store.openEpoch(CHAIN);
+            assertThat(store.publishCaptureTables(CHAIN, oldEpoch,
+                    List.of("support_case", "emailmessage"))).isTrue();
+            store.advanceCaptureCheckpoint(CHAIN, new ChainPosition(new SourceOrder(oldEpoch, 1), "old-durable"),
+                    List.of("support_case", "emailmessage"));
+
+            long newEpoch = store.openEpoch(CHAIN);
+            assertThat(store.captureServingTables(CHAIN)).isEmpty();
+            assertThat(store.publishCaptureTables(CHAIN, oldEpoch,
+                    List.of("support_case", "emailmessage"))).isFalse();
+            store.advanceCaptureCheckpoint(CHAIN, new ChainPosition(new SourceOrder(oldEpoch, 2), "old-late-write"),
+                    List.of("support_case", "emailmessage"));
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("old-durable");
+
+            assertThat(store.publishCaptureTables(CHAIN, newEpoch,
+                    List.of("support_case", "emailmessage"))).isTrue();
+            store.advanceCaptureCheckpoint(CHAIN, new ChainPosition(new SourceOrder(newEpoch, 0), "new-durable"),
+                    List.of("support_case", "emailmessage"));
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("new-durable");
+        });
+    }
+
+    @Test
+    void onlyRecoverableCaptureWritesCertifyTheSourceCheckpointAsDurable() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            store.requestCaptureTables(CHAIN, List.of("orders"));
+            store.publishCaptureTables(CHAIN, epoch, List.of("orders"));
+            store.advanceCaptureCheckpoint(CHAIN, new ChainPosition(new SourceOrder(epoch, 1), "durable-one"),
+                    List.of("orders"));
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadDurable()).isTrue();
+
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(epoch, 0), "earlier-read"));
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadDurable()).isTrue();
+            store.advanceSourceReadOffset(CHAIN, new ChainPosition(new SourceOrder(epoch, 2), "direct-read"));
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadDurable()).isFalse();
+
+            store.advanceCaptureCheckpoint(CHAIN, new ChainPosition(new SourceOrder(epoch, 3), "durable-three"),
+                    List.of("orders"));
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadDurable()).isTrue();
+            store.rewindSourceReadOffset(CHAIN, "operator-selected-token");
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadDurable()).isFalse();
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("operator-selected-token");
+        });
+    }
+
+    @Test
+    void oldEmbeddedPipelineProgressIsRefusedInsteadOfGuessedToBelongToASourceNode() {
+        withCollection((store, collection) -> {
+            ConsumerOffset legacy = new ConsumerOffset("support_case_state",
+                    Map.of("support_case", 3L, "emailmessage", 0L),
+                    new ChainPosition(new SourceOrder(1, 0), "after-mail"),
+                    List.of("support_case", "emailmessage"), "snapshot-seam", 1);
+            collection.insertOne(MongoSrsMetaStore.toDocument(
+                    new SrsMeta(CHAIN, null, List.of(legacy), List.of(), null)));
+            String consumer = SrsConsumerId.of("support_case_state", "case_source").value();
+
+            assertThatThrownBy(() -> store.configureSinkWriters(CHAIN, consumer, Map.of(
+                    "support_case", List.of("view"), "emailmessage", List.of("view")), ConsumerProgressKind.SRS))
+                    .isInstanceOf(TapstateException.class)
+                    .satisfies(thrown -> {
+                        TapstateException refused = (TapstateException) thrown;
+                        assertThat(refused.code()).isEqualTo(IoError.SRS_PROGRESS_UNPROVEN);
+                        assertThat(refused.args()).containsEntry("pipeline", "support_case_state");
+                    });
+
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffsets()).containsExactly(legacy);
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset(consumer)).isEmpty();
+        });
+    }
+
+    @Test
+    void oldWriterAmbiguityIsNotHiddenByAChangeToSourceScopedProgress() {
+        withCollection((store, collection) -> {
+            ConsumerOffset legacy = new ConsumerOffset("support_case_state", Map.of("support_case", 10L),
+                    new ChainPosition(new SourceOrder(1, 10), "only-fast-writer-may-have-confirmed"));
+            collection.insertOne(MongoSrsMetaStore.toDocument(
+                    new SrsMeta(CHAIN, null, List.of(legacy), List.of(), null)));
+            String consumer = SrsConsumerId.of("support_case_state", "case_source").value();
+
+            assertThatThrownBy(() -> store.configureSinkWriters(CHAIN, consumer,
+                    Map.of("support_case", List.of("fast", "slow")), ConsumerProgressKind.SRS))
+                    .isInstanceOf(TapstateException.class)
+                    .satisfies(thrown -> assertThat(((TapstateException) thrown).code())
+                            .isEqualTo(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS));
+
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffsets()).containsExactly(legacy);
+        });
+    }
+
+    @Test
+    void anOldUnreadRegistrationDoesNotFabricateConfirmedProgressForANewSourceNode() {
+        withCollection((store, collection) -> {
+            collection.insertOne(MongoSrsMetaStore.toDocument(new SrsMeta(CHAIN, null,
+                    List.of(new ConsumerOffset("support_case_state", Map.of("support_case", -1L), null)),
+                    List.of(), null)));
+            String consumer = SrsConsumerId.of("support_case_state", "case_source").value();
+
+            store.configureSinkWriters(CHAIN, consumer,
+                    Map.of("support_case", List.of("view")), ConsumerProgressKind.SRS);
+
+            ConsumerOffset registered = store.read(CHAIN).orElseThrow().consumerOffset(consumer).orElseThrow();
+            assertThat(registered.progressKind()).isEqualTo(ConsumerProgressKind.SRS);
+            assertThat(registered.perTableSeq()).isEmpty();
+            assertThat(registered.sinkAcked()).isNull();
+            assertThat(registered.sinkAckedByTable()).isEmpty();
+            assertThat(store.ringDoneThrough(CHAIN, consumer)).isEmpty();
+        });
+    }
+
+    @Test
+    void scopedDetachRemovesOneNodeAndPipelineDetachRemovesAllOfItsRemainingNodes() {
+        withCollection((store, collection) -> {
+            String first = SrsConsumerId.of("support_case_state", "case_source").value();
+            String second = SrsConsumerId.of("support_case_state", "case_copy").value();
+            String other = SrsConsumerId.of("support_case_state_extra", "case_source").value();
+            String otherChain = "other@postgres";
+            // Embedded scoped records also have to acquire their owner identity during migration.
+            collection.insertOne(MongoSrsMetaStore.toDocument(new SrsMeta(CHAIN, null,
+                    List.of(new ConsumerOffset(first, Map.of("support_case", 2L), null),
+                            new ConsumerOffset(second, Map.of("support_case", 3L), null),
+                            new ConsumerOffset(other, Map.of("support_case", 4L), null)), List.of(), null)));
+            store.create(otherChain, null);
+            store.advanceConsumerReadSeq(otherChain, first, "support_case", 5);
+            store.advanceConsumerReadSeq(otherChain, other, "support_case", 6);
+
+            assertThat(store.miningChainIdsWithConsumer("support_case_state"))
+                    .containsExactlyInAnyOrder(CHAIN, otherChain);
+            store.detachConsumer(CHAIN, first);
+            assertThat(store.consumerOffsets(CHAIN)).extracting(ConsumerOffset::pipelineId)
+                    .containsExactlyInAnyOrder(second, other);
+            store.detachConsumer(CHAIN, "support_case_state");
+            assertThat(store.consumerOffsets(CHAIN)).extracting(ConsumerOffset::pipelineId).containsExactly(other);
+            assertThat(store.miningChainIdsWithConsumer("support_case_state")).containsExactly(otherChain);
+            store.detachConsumer(otherChain, "support_case_state");
+            assertThat(store.miningChainIdsWithConsumer("support_case_state")).isEmpty();
+            assertThat(store.consumerOffsets(otherChain)).extracting(ConsumerOffset::pipelineId).containsExactly(other);
+        });
+    }
+
+    @Test
     void legacyAggregateProgressCannotStandForTwoDivergentSinkWriters() {
         withStore(store -> {
             store.create(CHAIN, null);
@@ -667,6 +1004,123 @@ class MongoSrsMetaStoreIT {
                     .as("the initial cursor belongs to both writers until the slower writer advances")
                     .containsEntry("orders", 40L);
             assertThat(onlyConsumer(store).sinkAcked()).isNull();
+        });
+    }
+
+    @Test
+    void aNewSinkWriterCannotInheritAnEstablishedWritersConfirmedEffects() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.configureSinkWriters(CHAIN, "p1", Map.of("orders", List.of("old")));
+            store.advanceSinkWriterAcked(CHAIN, "p1", "old", "orders",
+                    new ChainPosition(new SourceOrder(1, 4), "old-writer-confirmed"));
+
+            assertThatThrownBy(() -> store.configureSinkWriters(CHAIN, "p1",
+                    Map.of("orders", List.of("old", "new"))))
+                    .isInstanceOf(TapstateException.class)
+                    .satisfies(thrown -> assertThat(((TapstateException) thrown).code())
+                            .isEqualTo(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS));
+            assertThat(onlyConsumer(store).sinkAckedSrcpos()).isEqualTo("old-writer-confirmed");
+            assertThatThrownBy(() -> store.advanceSinkWriterAcked(CHAIN, "p1", "new", "orders",
+                    new ChainPosition(new SourceOrder(1, 5), "new-writer")))
+                    .isInstanceOf(IllegalStateException.class);
+            store.advanceSinkWriterAcked(CHAIN, "p1", "old", "orders",
+                    new ChainPosition(new SourceOrder(1, 5), "old-writer-next"));
+            assertThat(onlyConsumer(store).sinkAckedSrcpos()).isEqualTo("old-writer-next");
+        });
+    }
+
+    @Test
+    void wideningATableSelectionKeepsConfirmedTablesAndLeavesTheAddedTableUnconfirmed() {
+        withCollection((store, collection) -> {
+            String consumer = SrsConsumerId.of("pipeline", "source").value();
+            store.create(CHAIN, null);
+            store.configureSinkWriters(CHAIN, consumer,
+                    Map.of("alpha", List.of("sink"), "beta", List.of("sink")), ConsumerProgressKind.SRS);
+            ChainPosition snapshot = new ChainPosition(new SourceOrder(1, SourceOrder.SNAPSHOT_SEQ), "seam");
+            for (String table : List.of("alpha", "beta")) {
+                store.advanceSinkWriterAcked(CHAIN, consumer, "sink", table, snapshot);
+                store.markSinkWriterSnapshotComplete(CHAIN, consumer, "sink", table);
+            }
+            store.startRingAfter(CHAIN, consumer, "gamma", 40);
+
+            store.configureSinkWriters(CHAIN, consumer,
+                    Map.of("alpha", List.of("sink"), "beta", List.of("sink"), "gamma", List.of("sink")),
+                    ConsumerProgressKind.SRS);
+
+            ConsumerOffset offset = store.read(CHAIN).orElseThrow().consumerOffset(consumer).orElseThrow();
+            assertThat(offset.snapshotCompletedTables()).containsExactlyInAnyOrder("alpha", "beta");
+            assertThat(offset.sinkAckedByTable()).containsExactlyInAnyOrderEntriesOf(
+                    Map.of("alpha", snapshot, "beta", snapshot));
+            assertThat(store.ringDoneThrough(CHAIN, consumer)).containsEntry("gamma", 40L);
+            Document gamma = collection.find(new Document("miningChainId", CHAIN).append("pipelineId", consumer))
+                    .first().get("sinkWriterProgress", Document.class)
+                    .get("sink", Document.class).get("gamma", Document.class);
+            assertThat(gamma).containsEntry("ringDone", 40L)
+                    .doesNotContainKeys("sinkAckedEpoch", "sinkAckedSeq", "snapshotComplete");
+            store.markSinkWriterSnapshotComplete(CHAIN, consumer, "sink", "gamma");
+            assertThat(store.read(CHAIN).orElseThrow().snapshotCompletedTables(consumer))
+                    .containsExactlyInAnyOrder("alpha", "beta", "gamma");
+        });
+    }
+
+    @Test
+    void aWriterPlanDoesNotTreatLegacyReadingOrItsSeamAsConfirmedSourceNodeProgress() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.advanceConsumerReadSeq(CHAIN, "pipeline", "orders", 7);
+            store.setCdcStart(CHAIN, "pipeline", "old-seam", 1);
+            ConsumerOffset legacy = store.read(CHAIN).orElseThrow().consumerOffset("pipeline").orElseThrow();
+            String consumer = SrsConsumerId.of("pipeline", "source").value();
+
+            store.configureSinkWriters(CHAIN, consumer, Map.of("orders", List.of("sink")), ConsumerProgressKind.SRS);
+
+            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("pipeline")).contains(legacy);
+            ConsumerOffset configured = store.read(CHAIN).orElseThrow().consumerOffset(consumer).orElseThrow();
+            assertThat(configured.perTableSeq()).isEmpty();
+            assertThat(configured.sinkAcked()).isNull();
+            assertThat(configured.sinkAckedByTable()).isEmpty();
+            assertThat(configured.cdcStartPosition()).isNull();
+            assertThat(configured.snapshotCompletedTables()).isEmpty();
+            assertThat(store.ringDoneThrough(CHAIN, consumer)).isEmpty();
+        });
+    }
+
+    @Test
+    void partialWriterConfirmationCannotSeedANewWriterBeforeTheAggregateExists() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.configureSinkWriters(CHAIN, "p1", Map.of("orders", List.of("fast", "slow")));
+            store.advanceSinkWriterAcked(CHAIN, "p1", "fast", "orders",
+                    new ChainPosition(new SourceOrder(1, 4), "fast-only-confirmed"));
+            assertThat(onlyConsumer(store).sinkAcked()).isNull();
+
+            assertThatThrownBy(() -> store.configureSinkWriters(CHAIN, "p1",
+                    Map.of("orders", List.of("fast", "slow", "new"))))
+                    .isInstanceOf(TapstateException.class)
+                    .satisfies(thrown -> assertThat(((TapstateException) thrown).code())
+                            .isEqualTo(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS));
+            store.advanceSinkWriterAcked(CHAIN, "p1", "slow", "orders",
+                    new ChainPosition(new SourceOrder(1, 3), "slow-confirmed"));
+            assertThat(onlyConsumer(store).sinkAckedSrcpos()).isEqualTo("slow-confirmed");
+        });
+    }
+
+    @Test
+    void anUnprocessedInitialRingBaselineCanBeSharedWithANewWriter() {
+        withStore(store -> {
+            store.create(CHAIN, null);
+            store.startRingAfter(CHAIN, "p1", "orders", 40);
+            store.configureSinkWriters(CHAIN, "p1", Map.of("orders", List.of("old")));
+            store.configureSinkWriters(CHAIN, "p1", Map.of("orders", List.of("old", "new")));
+            store.advanceSinkWriterAcked(CHAIN, "p1", "old", "orders",
+                    new ChainPosition(new SourceOrder(1, 41), "old-confirmed"));
+
+            assertThat(onlyConsumer(store).sinkAcked()).isNull();
+            assertThat(store.ringDoneThrough(CHAIN, "p1")).containsEntry("orders", 40L);
+            store.advanceSinkWriterAcked(CHAIN, "p1", "new", "orders",
+                    new ChainPosition(new SourceOrder(1, 41), "both-confirmed"));
+            assertThat(onlyConsumer(store).sinkAckedSrcpos()).isEqualTo("old-confirmed");
         });
     }
 
@@ -735,25 +1189,6 @@ class MongoSrsMetaStoreIT {
             ConsumerOffset p2 = record.consumerOffset("p2").orElseThrow();
             assertThat(p2.cdcStartPosition()).isEqualTo("binlog.000099:2048");
             assertThat(p2.snapshotEpoch()).isEqualTo(7L);
-        });
-    }
-
-    @Test
-    void anOldSnapshotWorkerCannotReplaceTheNewReadersSeam() {
-        withStore(store -> {
-            store.create(CHAIN, null);
-            long epoch = store.openEpoch(CHAIN);
-            store.selectConsumerTables(CHAIN, "p1", List.of("orders"), epoch, "run-a");
-            assertThat(store.setCdcStartIfCurrent(
-                    CHAIN, "p1", "run-a", epoch, "seam-a", epoch)).isTrue();
-            store.selectConsumerTables(CHAIN, "p1", List.of("orders"), epoch, "run-b");
-            assertThat(store.setCdcStartIfCurrent(
-                    CHAIN, "p1", "run-b", epoch, "seam-b", epoch)).isTrue();
-
-            assertThat(store.setCdcStartIfCurrent(
-                    CHAIN, "p1", "run-a", epoch, "late-old-seam", epoch)).isFalse();
-            assertThat(store.read(CHAIN).orElseThrow().consumerOffset("p1").orElseThrow()
-                    .cdcStartPosition()).isEqualTo("seam-b");
         });
     }
 

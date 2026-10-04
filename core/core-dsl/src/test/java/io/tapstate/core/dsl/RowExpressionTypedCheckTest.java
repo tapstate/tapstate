@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.tapstate.core.common.TapstateType;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -103,6 +104,26 @@ class RowExpressionTypedCheckTest {
     @DisplayName("carrying an exact fixed-point column through unchanged is not a loss, so it passes")
     void decimalCarriedUnchangedIsAccepted() {
         assertThat(RowExpressions.typedValueError("after.amount", columns())).isNull();
+    }
+
+    @Test
+    void aComputedDecimalResultNeedsABareColumnRead() {
+        Map<String, TapstateType> decimals = Map.of("a", TapstateType.DECIMAL, "b", TapstateType.DECIMAL);
+        for (String expression : List.of(
+                "has(after.a) ? after.a : after.b",
+                "op == 'i' ? after.a : before.b",
+                "has(after.a) ? after.a : (has(after.b) ? after.b : before.a)",
+                "[after.a, after.b][0]")) {
+            assertThat(RowExpressions.typedValueType(expression, decimals))
+                    .as("the computed result of %s", expression).isEqualTo(TapstateType.DECIMAL);
+            assertThat(RowExpressions.typedValueError(expression, decimals))
+                    .as("a decimal without a source column's descriptor: %s", expression).isNotNull();
+        }
+        assertThat(RowExpressions.typedValueError("(after.a)", decimals)).isNull();
+        assertThat(RowExpressions.typedValueError("before.b", decimals)).isNull();
+        assertThat(RowExpressions.typedValueError("has(after.a)", decimals)).isNull();
+        assertThat(RowExpressions.typedValueError("has(after.a) ? after.a : after.b",
+                Map.of("a", TapstateType.INT64, "b", TapstateType.INT64))).isNull();
     }
 
     @Test

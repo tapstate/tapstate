@@ -15,9 +15,9 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
 /**
- * One capture run's initial load, read on a thread of its own, and the tail that has to wait for it.
+ * One capture run's initial load, read by a bounded worker, and the tail that has to wait for it.
  *
- * <p><b>Its own thread because the load waits for the job and the job waits for the start.</b> Rows go
+ * <p><b>A data worker because the load waits for the job and the job waits for the start.</b> Rows go
  * into a hand-off that holds a few thousand of them, and room is made only by the job taking them; the job
  * is submitted once the start has returned. A load read on the thread that starts the pipeline would fill
  * the hand-off and then wait for a job that is only submitted once it returns. That thread is also the one
@@ -55,7 +55,21 @@ final class BackgroundLoad {
     private final AtomicLong rows = new AtomicLong();
     private final Map<String, Long> rowsByTable = new ConcurrentHashMap<>();
     private final CountDownLatch finished = new CountDownLatch(1);
-    private final Thread thread;
+    private final SnapshotWorkers.Reservation reservation;
+
+    /** The worker running this task, or null before it starts and after it ends; guarded by this. */
+    private Thread runner;
+
+    /** Whether this task has entered its reserved worker; guarded by this. */
+    private boolean entered;
+
+    /** Whether the reservation has been activated; guarded by this. */
+    private boolean started;
+
+    private static final class SharedWorkers {
+        private static final SnapshotWorkers WORKERS = new SnapshotWorkers(
+                SnapshotWorkers.DEFAULT_CONCURRENCY, SnapshotWorkers.DEFAULT_QUEUE_CAPACITY);
+    }
 
     /** Set once, by an abandonment; guarded by this. */
     private boolean cancelled;
@@ -71,16 +85,33 @@ final class BackgroundLoad {
 
     BackgroundLoad(SnapshotPhase.Load load, CaptureHandoff handoff, Supplier<Optional<Subscription>> tail,
             CaptureHealth health, String threadName) {
+        this(load, handoff, tail, health, reserveShared(threadName));
+    }
+
+    BackgroundLoad(SnapshotPhase.Load load, CaptureHandoff handoff, Supplier<Optional<Subscription>> tail,
+            CaptureHealth health, SnapshotWorkers.Reservation reservation) {
         this.load = Objects.requireNonNull(load, "load");
         this.handoff = Objects.requireNonNull(handoff, "handoff");
         this.tail = Objects.requireNonNull(tail, "tail");
         this.health = Objects.requireNonNull(health, "health");
-        this.thread = new Thread(this::run, Objects.requireNonNull(threadName, "threadName"));
-        this.thread.setDaemon(true);
+        this.reservation = Objects.requireNonNull(reservation, "reservation");
     }
 
-    void start() {
-        thread.start();
+    static SnapshotWorkers.Reservation reserveShared() {
+        return SharedWorkers.WORKERS.reserve().orElseThrow(SnapshotCapacityUnavailable::new);
+    }
+
+    private static SnapshotWorkers.Reservation reserveShared(String threadName) {
+        Objects.requireNonNull(threadName, "threadName");
+        return reserveShared();
+    }
+
+    synchronized void start() {
+        if (started || cancelled) {
+            throw new IllegalStateException("the background load was started or closed already");
+        }
+        started = true;
+        reservation.activate(this::run);
     }
 
     long rows() {
@@ -108,29 +139,47 @@ final class BackgroundLoad {
      * already had. Returns once the reading thread has let go, or once it has been given its chance to.
      */
     void cancel() {
+        boolean queued;
+        Thread reading;
         synchronized (this) {
             cancelled = true;
+            queued = !entered;
+            reading = runner;
+            // The worker cannot leave this task while this lock is held, so the wake cannot reach a
+            // different run that later uses the same worker.
+            if (reading != null && reading != Thread.currentThread()) {
+                reading.interrupt();
+            }
+            if (queued) {
+                // A worker entering run() must take this lock before it can leave the cancelled task.
+                reservation.close();
+            }
         }
         // The batch being read is closed under the reader and a wait for room is interrupted: those are the
         // two places the thread can be parked for a long time, and neither ends by itself.
-        load.close();
-        if (Thread.currentThread() != thread) {
-            // Closed from outside. Closed from the reading thread itself -- by something it calls on the way
-            // -- there is nothing to wake and nobody else to wait for: it sees the abandonment as it returns.
-            thread.interrupt();
-            try {
-                thread.join(ABANDON_WAIT_MILLIS);
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
+        try {
+            load.close();
+        } finally {
+            if (queued) {
+                // A removed queued task never enters run(), so its close completes the handle here.
+                finished.countDown();
             }
-        }
-        Subscription subscription;
-        synchronized (this) {
-            subscription = opened;
-            opened = null;
-        }
-        if (subscription != null) {
-            subscription.close();
+            if (Thread.currentThread() != reading) {
+                // A worker closing its own run must not wait for itself.
+                try {
+                    finished.await(ABANDON_WAIT_MILLIS, TimeUnit.MILLISECONDS);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            Subscription subscription;
+            synchronized (this) {
+                subscription = opened;
+                opened = null;
+            }
+            if (subscription != null) {
+                subscription.close();
+            }
         }
     }
 
@@ -146,13 +195,22 @@ final class BackgroundLoad {
                 return;
             }
             loadLetGo = true;
-            thread.interrupt();
+            if (runner != null) {
+                runner.interrupt();
+            }
         }
         load.close();
     }
 
     private void run() {
+        synchronized (this) {
+            entered = true;
+            runner = Thread.currentThread();
+        }
         try {
+            if (isCancelled()) {
+                return;
+            }
             readLoad();
             synchronized (this) {
                 loadOver = true;
@@ -181,8 +239,18 @@ final class BackgroundLoad {
                 health.fail(failure);
             }
         } finally {
-            load.close();
-            finished.countDown();
+            try {
+                load.close();
+            } finally {
+                synchronized (this) {
+                    runner = null;
+                    if (cancelled || loadLetGo) {
+                        // A wake for this load must not leak into the next task on the shared worker.
+                        Thread.interrupted();
+                    }
+                }
+                finished.countDown();
+            }
         }
     }
 

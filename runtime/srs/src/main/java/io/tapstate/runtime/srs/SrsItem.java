@@ -15,8 +15,6 @@ import java.util.Objects;
  * assigns each item a monotonic sequence on append — that sequence is the consumers' read cursor, held
  * by the ring itself and not carried in the item. A clustered item also carries the expected capture claim
  * generation so the durable store can reject an append from a fenced owner before the ring admits it.
- * The ring epoch accompanies the item into the durable log, where a delayed cut from an older epoch must
- * not delete it even if the ring reused a sequence.
  *
  * <p>The ring holds only cdc mutations: ops {@code i} / {@code u} / {@code d} / {@code ddl}. A snapshot
  * read (op {@code r}) goes straight to the sink and is rejected here by construction. Which row image is
@@ -43,12 +41,11 @@ public record SrsItem(
         Map<String, Object> after,
         long schemaVer,
         WorkloadClaimFence captureFence,
-        Long ringEpoch) {
+        long epoch) {
 
-    public SrsItem(
-            SourcePosition srcPos, Op op, long ts, Map<String, Object> before,
+    public SrsItem(SourcePosition srcPos, Op op, long ts, Map<String, Object> before,
             Map<String, Object> after, long schemaVer, WorkloadClaimFence captureFence) {
-        this(srcPos, op, ts, before, after, schemaVer, captureFence, null);
+        this(srcPos, op, ts, before, after, schemaVer, captureFence, 0L);
     }
 
     public SrsItem(
@@ -58,7 +55,7 @@ public record SrsItem(
             Map<String, Object> before,
             Map<String, Object> after,
             long schemaVer) {
-        this(srcPos, op, ts, before, after, schemaVer, null, null);
+        this(srcPos, op, ts, before, after, schemaVer, null);
     }
 
     public SrsItem {
@@ -69,8 +66,8 @@ public record SrsItem(
         if (schemaVer < 0) {
             throw new IllegalArgumentException("schemaVer must be non-negative");
         }
-        if (ringEpoch != null && ringEpoch < 1) {
-            throw new IllegalArgumentException("ringEpoch must be positive when present");
+        if (epoch < 0) {
+            throw new IllegalArgumentException("capture epoch must not be negative");
         }
         before = copyOrNull(before);
         after = copyOrNull(after);

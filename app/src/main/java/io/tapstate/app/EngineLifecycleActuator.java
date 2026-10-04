@@ -13,7 +13,6 @@ import io.tapstate.spi.store.HandoffIdentity;
 import io.tapstate.runtime.engine.EngineError;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.srs.SnapshotCapacityUnavailable;
-import io.tapstate.runtime.srs.PhysicalRingNotReady;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -172,7 +171,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
                     () -> captureCoordinator.startCapture(pipelineId));
         } catch (SnapshotCapacityUnavailable unavailable) {
             throw new StartDeferred(StartDeferred.Reason.CAPACITY);
-        } catch (RingNotOpenYet | PhysicalRingNotReady notYet) {
+        } catch (RingNotOpenYet notYet) {
             throw new StartDeferred(StartDeferred.Reason.DEPENDENCY);
         }
         if (Thread.currentThread().isInterrupted()) {

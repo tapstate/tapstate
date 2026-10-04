@@ -3,6 +3,7 @@ package io.tapstate.app;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.RingbufferConfig;
+import com.hazelcast.config.RingbufferStoreConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.event.ChainPosition;
@@ -24,6 +25,8 @@ import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SnapshotWorkers;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.SrsRingbuffer;
+import io.tapstate.runtime.srs.SrsLogRingbufferStoreFactory;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
@@ -56,6 +59,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class AbandonedCapturePreparationTest {
     private static final String PIPELINE = "pipeline", SOURCE = "source", TABLE = "orders";
     private static HazelcastInstance member;
+    private static final InMemorySrsLogStore LOG = new InMemorySrsLogStore();
 
     @BeforeAll
     static void startMember() throws Exception {
@@ -72,8 +76,11 @@ class AbandonedCapturePreparationTest {
             config.getNetworkConfig().setPort(socket.getLocalPort()).setPortAutoIncrement(false);
         }
         config.addRingBufferConfig(new RingbufferConfig("srs.*").setCapacity(8)
-                .setBackupCount(0).setInMemoryFormat(InMemoryFormat.OBJECT));
+                .setBackupCount(0).setInMemoryFormat(InMemoryFormat.OBJECT)
+                .setRingbufferStoreConfig(new RingbufferStoreConfig().setEnabled(true)
+                        .setFactoryImplementation(new SrsLogRingbufferStoreFactory(LOG))));
         member = Hazelcast.newHazelcastInstance(config);
+        member.getUserContext().put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY, LOG);
     }
 
     @AfterAll
@@ -84,11 +91,11 @@ class AbandonedCapturePreparationTest {
         try (SnapshotWorkers workers = new SnapshotWorkers(1, 1)) {
             Fixture fixture = new Fixture("abandoned-reservation", workers);
             long previousEpoch = fixture.seedTrustedPreviousRun(List.of(TABLE));
-            SrsMetaStore.PhysicalSelection published = fixture.meta.physicalSelection(fixture.chain.value()).orElseThrow();
+            List<String> published = fixture.meta.captureServingTables(fixture.chain.value());
             ChainPosition sourceRead = fixture.meta.read(fixture.chain.value()).orElseThrow().sourceRead();
-            fixture.meta.upsertConsumerOffset(fixture.chain.value(), new ConsumerOffset(PIPELINE,
+            fixture.meta.upsertConsumerOffset(fixture.chain.value(), new ConsumerOffset(SrsConsumerId.of(PIPELINE, SOURCE).value(),
                     Map.of(TABLE, -1L), sourceRead, List.of(TABLE), "retained-snapshot-seam", previousEpoch,
-                    List.of(TABLE), previousEpoch, "previous-cursor", Map.of(TABLE, sourceRead), Map.of(TABLE, -1L)));
+                    Map.of(TABLE, sourceRead), io.tapstate.spi.store.ConsumerProgressKind.SRS));
             ConsumerOffset previous = fixture.meta.consumerOffsets(fixture.chain.value()).getFirst();
             StoreBackedPipelineCaptureCoordinator captures = fixture.captures(CaptureOwnership.single());
             try {
@@ -97,16 +104,15 @@ class AbandonedCapturePreparationTest {
                 assertThat(fixture.starts).hasValue(1);
                 assertThat(fixture.meta.read(fixture.chain.value()).orElseThrow().epoch()).isEqualTo(previousEpoch + 1);
                 assertThat(fixture.buffer.hasSnapshot(PIPELINE, fixture.ringName(), "aborted-cursor")).isTrue();
-                assertThat(fixture.meta.physicalSelection(fixture.chain.value())).contains(published);
+                assertThat(fixture.meta.captureServingTables(fixture.chain.value())).isEqualTo(published);
 
                 // Admission failed after preparation, before submission could activate the reserved snapshot.
                 captures.stopCapture(PIPELINE, false);
                 assertThat(captures.isActive(PIPELINE)).isFalse();
                 assertThat(fixture.chains.isProvisioned(fixture.chain)).isFalse();
                 assertThat(fixture.buffer.hasSnapshot(PIPELINE, fixture.ringName())).isFalse();
-                assertThat(fixture.meta.physicalSelection(fixture.chain.value())).contains(published);
+                assertThat(fixture.meta.captureServingTables(fixture.chain.value())).isEqualTo(published);
                 assertThat(fixture.meta.read(fixture.chain.value()).orElseThrow().sourceRead()).isEqualTo(sourceRead);
-                assertThat(fixture.meta.physicalPrefixTrusted(fixture.chain.value())).isTrue();
                 ConsumerOffset retained = fixture.meta.consumerOffsets(fixture.chain.value()).getFirst();
                 assertThat(retained.sinkAcked()).isEqualTo(previous.sinkAcked());
                 assertThat(retained.snapshotCompletedTables()).isEqualTo(previous.snapshotCompletedTables());
@@ -121,8 +127,8 @@ class AbandonedCapturePreparationTest {
                 assertThat(fixture.starts).hasValue(2);
                 assertThat(fixture.meta.read(fixture.chain.value()).orElseThrow().epoch()).isEqualTo(previousEpoch + 2);
                 assertThat(fixture.buffer.hasSnapshot(PIPELINE, fixture.ringName(), "recovery-cursor")).isTrue();
-                assertThat(fixture.meta.physicalSelection(fixture.chain.value()))
-                        .as("preparation has not falsely published a physical tail").contains(published);
+                assertThat(fixture.meta.captureServingTables(fixture.chain.value()))
+                        .as("preparation has not falsely published a physical tail").isEqualTo(published);
                 assertThat(fixture.meta.read(fixture.chain.value()).orElseThrow().sourceRead()).isEqualTo(sourceRead);
                 assertThat(fixture.reads).hasValue(0);
             } finally {
@@ -133,11 +139,11 @@ class AbandonedCapturePreparationTest {
     }
 
     @Test
-    void aCurrentPhysicalSelectionMissingATableStillWaitsForItsOtherOwner() {
+    void anUnservedRequestedTableStillWaitsForItsOtherOwner() {
         try (SnapshotWorkers workers = new SnapshotWorkers(1, 1)) {
             Fixture fixture = new Fixture("current-selection-other-owner", workers);
             long epoch = fixture.seedTrustedPreviousRun(List.of("customers"));
-            SrsMetaStore.PhysicalSelection published = fixture.meta.physicalSelection(fixture.chain.value()).orElseThrow();
+            List<String> published = fixture.meta.captureServingTables(fixture.chain.value());
             ClusterProperties properties = new ClusterProperties();
             properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
             ClusterMembershipGate gate = new ClusterMembershipGate(properties);
@@ -159,8 +165,10 @@ class AbandonedCapturePreparationTest {
                 assertThat(fixture.starts).as("production preflight refused before the run unit was entered").hasValue(0);
                 assertThat(fixture.reads).hasValue(0);
                 assertThat(fixture.meta.read(fixture.chain.value()).orElseThrow().epoch()).isEqualTo(epoch);
-                assertThat(fixture.meta.physicalSelection(fixture.chain.value())).contains(published);
-                assertThat(fixture.meta.requestedPhysicalTables(fixture.chain.value())).containsExactly(TABLE);
+                assertThat(fixture.meta.captureServingTables(fixture.chain.value())).isEqualTo(published);
+                assertThat(fixture.meta.captureTables(fixture.chain.value()))
+                        .as("the request adds this table without dropping the owner's prior selection")
+                        .containsExactly("customers", TABLE);
                 assertThat(claims.read(key).orElseThrow().claim()).isEqualTo(remote);
             } finally {
                 captures.stopCapture(PIPELINE, false);
@@ -187,7 +195,7 @@ class AbandonedCapturePreparationTest {
                     new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "latest"), null);
             InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
             artifacts.save(source); artifacts.save(pipeline);
-            store = new InMemoryStorePort(artifacts); meta = store.meta(); chains = new SrsCoordinator(meta);
+            store = new InMemoryStorePort(artifacts, LOG); meta = store.meta(); chains = new SrsCoordinator(meta);
             chain = MiningChainId.resolve(SourceCaptureResolution.of(source).config(), key);
             CapturePort neverRead = new CapturePort() {
                 @Override public CaptureBatch snapshot(CaptureConfig config) {
@@ -206,9 +214,9 @@ class AbandonedCapturePreparationTest {
             meta.create(chain.value(), null);
             long epoch = meta.openEpoch(chain.value());
             ChainPosition anchor = new ChainPosition(new SourceOrder(epoch, -1L), "trusted-source-position");
-            assertThat(meta.establishPhysicalAnchor(chain.value(), anchor)).isTrue();
-            assertThat(meta.publishPhysicalSelection(chain.value(), new SrsMetaStore.PhysicalSelection(epoch, physicalTables)))
-                    .isTrue();
+            meta.requestCaptureTables(chain.value(), physicalTables);
+            assertThat(meta.publishCaptureTables(chain.value(), epoch, physicalTables)).isTrue();
+            meta.advanceCaptureCheckpoint(chain.value(), anchor, physicalTables);
             return epoch;
         }
 

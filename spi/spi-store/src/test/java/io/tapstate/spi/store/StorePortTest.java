@@ -1039,13 +1039,9 @@ class StorePortTest {
             }
 
             @Override
-            public void trim(String ring, long throughSeq, long ringEpoch) {
+            public void trim(String ring, long throughSeq) {
                 NavigableMap<Long, SrsLogRecord> entries = srsLogRings.get(ring);
-                if (entries != null && !entries.isEmpty()) {
-                    long last = entries.lastKey();
-                    entries.headMap(Math.min(throughSeq, last - 1), true).entrySet()
-                            .removeIf(entry -> Long.valueOf(ringEpoch).equals(entry.getValue().ringEpoch()));
-                }
+                if (entries != null) { entries.headMap(throughSeq, true).clear(); }
             }
         };
         private final Map<String, byte[]> keyedState = new HashMap<>();

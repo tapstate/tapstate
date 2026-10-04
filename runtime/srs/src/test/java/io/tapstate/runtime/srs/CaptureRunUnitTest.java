@@ -5,6 +5,7 @@ import io.tapstate.core.event.ChainPosition;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.RingbufferConfig;
+import com.hazelcast.config.RingbufferStoreConfig;
 import com.hazelcast.config.SerializerConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
@@ -12,6 +13,7 @@ import com.hazelcast.ringbuffer.Ringbuffer;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
@@ -21,11 +23,16 @@ import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
 import io.tapstate.spi.capture.SourcePosition;
+import io.tapstate.spi.capture.SnapshotSession;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.ConsumerProgressKind;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
+import io.tapstate.spi.store.SrsLogStore;
+import io.tapstate.spi.store.SrsLogRecord;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
@@ -41,12 +48,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.OptionalLong;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
@@ -99,20 +107,20 @@ class CaptureRunUnitTest {
         SnapshotBuffer buffer = new SnapshotBuffer(2, 1, 1_024, 512);
         InMemoryMeta meta = new InMemoryMeta();
         String ringName = SrsRingbuffer.ringName(
-                MiningChainId.resolve(config(), "deferred-snapshot-test").value(), "orders");
+                spec(ReadMode.SNAPSHOT_ONLY, false, "deferred-snapshot-test").miningChainId().value(), "orders");
         List<Envelope> observed = new java.util.concurrent.CopyOnWriteArrayList<>();
         try (SnapshotWorkers workers = new SnapshotWorkers(1, 1);
                 var caller = Executors.newSingleThreadExecutor()) {
             CaptureRunUnit unit = new CaptureRunUnit(source, new SrsCoordinator(meta), meta, hz,
                     buffer, workers);
             CaptureRunSpec request = spec(ReadMode.SNAPSHOT_ONLY, false, "deferred-snapshot-test")
-                    .withChainSelection(List.of("orders"), "run-a");
+                    .withSnapshotWriterToken("run-a");
             CaptureRun run = caller.submit(() -> unit.start(request, observed::add)).get(5, TimeUnit.SECONDS);
             try {
                 assertThat(firstRow.getCount()).isEqualTo(1);
                 assertThat(buffer.hasSnapshot("pipe-1", ringName, "run-a")).isTrue();
                 assertThat(buffer.drainSnapshot("pipe-1", ringName,
-                        request.cursorWriterToken(), 1).state())
+                        request.snapshotWriterToken(), 1).state())
                         .isEqualTo(SnapshotBuffer.SessionState.ACTIVE);
                 run.activateSnapshot();
                 assertThat(firstRow.await(5, TimeUnit.SECONDS)).isTrue();
@@ -136,6 +144,189 @@ class CaptureRunUnitTest {
             } finally {
                 releaseRead.countDown();
                 run.close();
+            }
+        }
+    }
+
+    @Test
+    void aReservedTailFailureAfterLoadAbandonmentIsStillReported() throws Exception {
+        InMemoryMeta meta = new InMemoryMeta();
+        IllegalStateException refused = new IllegalStateException("the source refused the tail after load abandonment");
+        LoadThenTailSource source = new LoadThenTailSource(List.of(row(1), row(2)), () -> { throw refused; });
+        CountDownLatch entered = new CountDownLatch(1), released = new CountDownLatch(1);
+        CaptureHandoff handoff = new CaptureHandoff() {
+            @Override public void accept(Envelope row) {
+                entered.countDown();
+                awaitRoom(released);
+                throw new CancellationException("the load was explicitly abandoned");
+            }
+            @Override public void loaded(String table) { throw new AssertionError("an abandoned table is not complete"); }
+        };
+        SnapshotBuffer buffer = new SnapshotBuffer(2, 1, 1_024, 512);
+        try (SnapshotWorkers workers = new SnapshotWorkers(1, 1)) {
+            CaptureRunUnit unit = new CaptureRunUnit(source, new SrsCoordinator(meta), meta, hz, buffer, workers);
+            CaptureRun run = unit.begin(spec(ReadMode.SNAPSHOT_AND_CDC, false, "reserved-abandoned-tail"), handoff);
+            try {
+                run.activateSnapshot();
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                run.abandonLoad();
+                released.countDown();
+                assertThat(run.awaitLoaded(Duration.ofSeconds(10))).isTrue();
+                assertThat(run.failure()).containsSame(refused);
+            } finally {
+                released.countDown();
+                run.close();
+            }
+        }
+    }
+
+    @Test
+    void aVolatileCompatibilityTailTreatsAnExplicitUnreadSubscriptionAsHavingReadNothing() {
+        InMemoryMeta meta = new InMemoryMeta();
+        meta.create("chain-other", null);
+        meta.openEpoch("chain-other");
+        // The consumer has a cursor on another selected table but none on orders. Its orders selection
+        // still protects the ring's first change.
+        meta.advanceConsumerReadSeq("chain-other", "p1", "orders", -1L);
+        meta.advanceConsumerReadSeq("chain-other", "p1", "customers", 9L);
+
+        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-other"), "orders")).isEqualTo(-1L);
+    }
+
+    @Test
+    void aConfiguredChainedSnapshotDoesNotOpenItsFirstTableBeforeActivation() throws Exception {
+        AtomicInteger reads = new AtomicInteger();
+        AtomicBoolean activated = new AtomicBoolean();
+        CountDownLatch reading = new CountDownLatch(1), releaseRead = new CountDownLatch(1);
+        class Source implements CapturePort, SnapshotSession.Provider {
+            @Override public SnapshotSession snapshotSession(CaptureConfig config) {
+                return new SnapshotSession() {
+                    @Override public CaptureBatch read(String table) {
+                        reads.incrementAndGet();
+                        reading.countDown();
+                        if (activated.get()) {
+                            try {
+                                if (!releaseRead.await(5, TimeUnit.SECONDS)) {
+                                    throw new AssertionError("the activated first-table read was not released");
+                                }
+                            } catch (InterruptedException interrupted) {
+                                Thread.currentThread().interrupt();
+                                throw new IllegalStateException("the first-table read was interrupted", interrupted);
+                            }
+                        }
+                        return new FakeBatch(List.of(row(1)), "controlled-first-table-seam");
+                    }
+                    @Override public void close() { }
+                };
+            }
+            @Override public CaptureBatch snapshot(CaptureConfig config) {
+                throw new AssertionError("the chained source must use its actual snapshot session");
+            }
+            @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+                return () -> { };
+            }
+            @Override public ConnectionReport testConnection(CaptureConfig config) {
+                throw new UnsupportedOperationException();
+            }
+            @Override public DiscoveredSchema discoverSchema(CaptureConfig config) {
+                throw new UnsupportedOperationException();
+            }
+        }
+        InMemoryMeta meta = new InMemoryMeta();
+        SnapshotBuffer buffer = new SnapshotBuffer(2, 1, 1_024, 512);
+        CaptureRunSpec request = spec(ReadMode.SNAPSHOT_AND_CDC, false, "activated-chained-snapshot")
+                .withSnapshotWriterToken("activated-run");
+        String ringName = SrsRingbuffer.ringName(request.miningChainId().value(), "orders");
+        List<Envelope> observed = new CopyOnWriteArrayList<>();
+        try (SnapshotWorkers workers = new SnapshotWorkers(1, 1);
+                var caller = Executors.newSingleThreadExecutor()) {
+            CaptureRunUnit unit = new CaptureRunUnit(new Source(), new SrsCoordinator(meta), meta, hz, buffer, workers);
+            CaptureRun run = caller.submit(() -> unit.begin(request, CaptureHandoff.of(observed::add))).get(5, TimeUnit.SECONDS);
+            try {
+                assertThat(reads).as("provisioning cannot read a table before its real consumer activates").hasValue(0);
+                assertThat(buffer.hasSnapshot(request.pipelineId(), ringName, request.snapshotWriterToken())).isTrue();
+                activated.set(true);
+                run.activateSnapshot();
+                assertThat(reading.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(reads).hasValue(1);
+                assertThat(observed).isEmpty();
+                releaseRead.countDown();
+                assertThat(run.awaitLoaded(Duration.ofSeconds(5))).isTrue();
+                assertThat(run.failure()).isEmpty();
+                assertThat(observed).hasSize(1);
+                assertThat(buffer.drainSnapshot(request.pipelineId(), ringName, request.snapshotWriterToken(), 2).state())
+                        .isEqualTo(SnapshotBuffer.SessionState.DONE);
+            } finally {
+                releaseRead.countDown();
+                run.close();
+            }
+        }
+    }
+
+    @Test
+    void closingAQueuedCompatibilityLoadReleasesItsSlotWithoutInterruptingTheRunningLoad() throws Exception {
+        CountDownLatch reading = new CountDownLatch(1), releaseRead = new CountDownLatch(1);
+        AtomicReference<Thread> firstWorker = new AtomicReference<>(), nextWorker = new AtomicReference<>();
+        AtomicInteger tails = new AtomicInteger();
+        CaptureHealth firstHealth = new CaptureHealth(), queuedHealth = new CaptureHealth(), nextHealth = new CaptureHealth();
+        List<Envelope> firstRows = new CopyOnWriteArrayList<>(), queuedRows = new CopyOnWriteArrayList<>(),
+                nextRows = new CopyOnWriteArrayList<>();
+        Supplier<Optional<Subscription>> tail = () -> {
+            tails.incrementAndGet();
+            return Optional.empty();
+        };
+        try (SnapshotWorkers workers = new SnapshotWorkers(1, 1)) {
+            SnapshotPhase.Load firstLoad = SnapshotPhase.openChainless(
+                    new FakeSource(List.of(row(1)), List.of()), config(), 1);
+            BackgroundLoad first = new BackgroundLoad(firstLoad, CaptureHandoff.of(event -> {
+                firstWorker.set(Thread.currentThread());
+                reading.countDown();
+                awaitRoom(releaseRead);
+                firstRows.add(event);
+            }), tail, firstHealth, workers.reserve().orElseThrow());
+            SnapshotPhase.Load queuedLoad = SnapshotPhase.openChainless(
+                    new FakeSource(List.of(row(2)), List.of()), config(), 2);
+            BackgroundLoad queued = new BackgroundLoad(queuedLoad, CaptureHandoff.of(queuedRows::add),
+                    tail, queuedHealth, workers.reserve().orElseThrow());
+            BackgroundLoad next = null;
+            try {
+                first.start();
+                assertThat(reading.await(5, TimeUnit.SECONDS)).isTrue();
+                queued.start();
+                assertThat(workers.reserve()).as("the running and queued loads occupy the bounded capacity").isEmpty();
+
+                queued.cancel();
+
+                assertThat(queued.awaitFinished(Duration.ofSeconds(5))).isTrue();
+                assertThat(queuedRows).isEmpty();
+                assertThat(queuedHealth.failure()).isEmpty();
+                assertThat(tails).hasValue(0);
+                SnapshotWorkers.Reservation replacement = workers.reserve().orElseThrow();
+                SnapshotPhase.Load nextLoad = SnapshotPhase.openChainless(
+                        new FakeSource(List.of(row(3)), List.of()), config(), 3);
+                next = new BackgroundLoad(nextLoad, CaptureHandoff.of(event -> {
+                    nextWorker.set(Thread.currentThread());
+                    nextRows.add(event);
+                }), tail, nextHealth, replacement);
+                next.start();
+                assertThat(first.awaitFinished(Duration.ZERO)).isFalse();
+                releaseRead.countDown();
+
+                assertThat(first.awaitFinished(Duration.ofSeconds(5))).isTrue();
+                assertThat(next.awaitFinished(Duration.ofSeconds(5))).isTrue();
+                assertThat(firstHealth.failure()).isEmpty();
+                assertThat(nextHealth.failure()).isEmpty();
+                assertThat(firstRows).extracting(event -> event.after().get("id")).containsExactly(1);
+                assertThat(nextRows).extracting(event -> event.after().get("id")).containsExactly(3);
+                assertThat(nextWorker.get()).isSameAs(firstWorker.get());
+                assertThat(tails).hasValue(2);
+            } finally {
+                releaseRead.countDown();
+                queued.cancel();
+                first.cancel();
+                if (next != null) {
+                    next.cancel();
+                }
             }
         }
     }
@@ -180,6 +371,52 @@ class CaptureRunUnitTest {
 
     private static Envelope change(int id) {
         return Envelope.insert(id, "orders", Map.of("id", id), Map.of());
+    }
+
+    @Test
+    void aBoundLogCannotCertifyCaptureThroughAMemoryOnlyRing() {
+        SrsLogStore unusedLog = new SrsLogStore() {
+            @Override
+            public void store(String ring, long sequence, SrsLogRecord record) {
+                throw new AssertionError("unsafe capture must stop before writing any change");
+            }
+
+            @Override
+            public void storeAll(String ring, long sequence, List<SrsLogRecord> records) {
+                throw new AssertionError("unsafe capture must stop before writing a batch");
+            }
+
+            @Override
+            public Optional<SrsLogRecord> load(String ring, long sequence) {
+                throw new AssertionError("a memory-only ring cannot recover from the bound log");
+            }
+
+            @Override
+            public long largestSequence(String ring) {
+                throw new AssertionError("unsafe capture must stop before sampling a durable arrival");
+            }
+
+            @Override
+            public void trim(String ring, long sequence) {
+                throw new AssertionError("unsafe capture must not trim any history");
+            }
+        };
+        hz.getUserContext().put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY, unusedLog);
+        try {
+            for (ReadMode mode : List.of(ReadMode.SNAPSHOT_AND_CDC, ReadMode.CDC_ONLY)) {
+                FakeSource source = new FakeSource(List.of(row(1)), List.of(change(2)));
+                List<Envelope> handedOff = new ArrayList<>();
+
+                TapstateException failure = catchThrowableOfType(() -> runUnit(source, new InMemoryMeta())
+                        .start(spec(mode, true, "memory-only-" + mode), handedOff::add), TapstateException.class);
+
+                assertThat(failure.code()).isEqualTo(CaptureError.SRS_NOT_RECOVERABLE);
+                assertThat(source.cdcStarted).isFalse();
+                assertThat(handedOff).isEmpty();
+            }
+        } finally {
+            hz.getUserContext().remove(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY);
+        }
     }
 
 
@@ -517,38 +754,6 @@ class CaptureRunUnitTest {
         assertThat(run.cdcSubscription()).isEmpty();
     }
 
-    @Test
-    void aReservedTailFailureAfterLoadAbandonmentIsStillReported() throws Exception {
-        InMemoryMeta meta = new InMemoryMeta();
-        IllegalStateException refused = new IllegalStateException("the source refused the tail after load abandonment");
-        LoadThenTailSource source = new LoadThenTailSource(List.of(row(1), row(2)), () -> { throw refused; });
-        CountDownLatch entered = new CountDownLatch(1), released = new CountDownLatch(1);
-        CaptureHandoff handoff = new CaptureHandoff() {
-            @Override public void accept(Envelope row) {
-                entered.countDown();
-                awaitRoom(released);
-                throw new CancellationException("the load was explicitly abandoned");
-            }
-            @Override public void loaded(String table) { throw new AssertionError("an abandoned table is not complete"); }
-        };
-        SnapshotBuffer buffer = new SnapshotBuffer(2, 1, 1_024, 512);
-        try (SnapshotWorkers workers = new SnapshotWorkers(1, 1)) {
-            CaptureRunUnit unit = new CaptureRunUnit(source, new SrsCoordinator(meta), meta, hz, buffer, workers);
-            CaptureRun run = unit.begin(spec(ReadMode.SNAPSHOT_AND_CDC, false, "reserved-abandoned-tail"), handoff);
-            try {
-                run.activateSnapshot();
-                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
-                run.abandonLoad();
-                released.countDown();
-                assertThat(run.awaitLoaded(Duration.ofSeconds(10))).isTrue();
-                assertThat(run.failure()).containsSame(refused);
-            } finally {
-                released.countDown();
-                run.close();
-            }
-        }
-    }
-
     /** Closed by something the tail's opening calls, the run closes the tail that opening hands back. */
     @Test
     void aRunClosedWhileItsTailOpensClosesThatTail() throws Exception {
@@ -810,70 +1015,62 @@ class CaptureRunUnitTest {
      * every change before its own seam is already covered by that read.
      */
     @Test
-    void aPipelineNewToAChainKeepsItsOwnSeamWithoutOpeningAnotherPhysicalTail() {
+    void aPipelineNewToAChainBeginsItsTailAtItsOwnSeamNotTheOneTheChainWasCreatedAt() {
         InMemoryMeta meta = new InMemoryMeta();
-        SrsCoordinator coordinator = new SrsCoordinator(meta);
         FakeSource first = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-the-chain-began-at");
-        CaptureRun firstRun = new CaptureRunUnit(first, coordinator, meta, hz)
+        CaptureRun firstRun = runUnit(first, meta)
                 .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-joined"), e -> { });
         String chainId = firstRun.chainId().orElseThrow().value();
         // Stands in for pipe-a's sink confirming the table -- the only thing that ever marks one done.
         meta.markSnapshotComplete(chainId, "pipe-a", "orders");
 
         FakeSource joiner = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-the-joiner-began-at");
-        new CaptureRunUnit(joiner, coordinator, meta, hz)
-                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-joined"), e -> { }, false);
+        runUnit(joiner, meta)
+                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-joined"), e -> { });
 
-        assertThat(joiner.cdcStarted).as("the joiner reads the existing physical tail").isFalse();
-        assertThat(meta.read(chainId).orElseThrow().consumerOffset("pipe-b").orElseThrow().cdcStartPosition())
-                .as("the joiner's load retains its own seam for recovery")
-                .isEqualTo("seam-the-joiner-began-at");
+        assertThat(joiner.cdcStart)
+                .as("the joiner's tail begins where its own load began, not where the chain did")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("seam-the-joiner-began-at")));
     }
 
     @Test
     void aPipelineWhoseCompletedLoadSamplesNoSeamRestartsAtItsOwnSeam() {
         InMemoryMeta meta = new InMemoryMeta();
-        SrsCoordinator coordinator = new SrsCoordinator(meta);
         FakeSource first = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-chain-birth");
-        CaptureRun firstRun = new CaptureRunUnit(first, coordinator, meta, hz)
+        CaptureRun firstRun = runUnit(first, meta)
                 .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-completed-join"), e -> { });
         String chainId = firstRun.chainId().orElseThrow().value();
         meta.markSnapshotComplete(chainId, "pipe-a", "orders");
 
         FakeSource joiner = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-join");
-        new CaptureRunUnit(joiner, coordinator, meta, hz)
-                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-completed-join"), e -> { }, false);
+        runUnit(joiner, meta)
+                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-completed-join"), e -> { });
         meta.markSnapshotComplete(chainId, "pipe-b", "orders");
 
         FakeSource restarted = new FakeSource(List.of(row(1), row(2)), List.of(), "seam-not-sampled");
-        CaptureRun resumed = new CaptureRunUnit(restarted, coordinator, meta, hz)
-                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-completed-join"), e -> { }, false);
+        runUnit(restarted, meta)
+                .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-completed-join"), e -> { });
 
-        assertThat(resumed.snapshotCount()).as("pipe-b owes no second load").isZero();
-        assertThat(restarted.cdcStarted).as("the existing physical tail stays unique").isFalse();
-        assertThat(meta.read(chainId).orElseThrow().consumerOffset("pipe-b").orElseThrow().cdcStartPosition())
-                .as("pipe-b keeps its own seam instead of adopting pipe-a's")
-                .isEqualTo("seam-join");
+        assertThat(restarted.cdcStart)
+                .as("pipe-b owes no table on restart, so its tail must not adopt pipe-a's older seam")
+                .isEqualTo(CaptureStart.resume(new SourcePosition("seam-join")));
     }
 
     @Test
     void aCdcOnlyPipelineDoesNotAdoptAnotherPipelinesSnapshotSeam() {
         InMemoryMeta meta = new InMemoryMeta();
-        SrsCoordinator coordinator = new SrsCoordinator(meta);
         FakeSource loader = new FakeSource(List.of(row(1)), List.of(), "seam-loader");
-        CaptureRun first = new CaptureRunUnit(loader, coordinator, meta, hz)
+        runUnit(loader, meta)
                 .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-cdc-only-join"), e -> { });
 
         FakeSource cdcOnly = new FakeSource(List.of(), List.of(), "seam-never-sampled");
-        CaptureRun run = new CaptureRunUnit(cdcOnly, coordinator, meta, hz)
-                .start(specFor("pipe-b", ReadMode.CDC_ONLY, "chain-cdc-only-join"), e -> { }, false);
+        CaptureRun run = runUnit(cdcOnly, meta)
+                .start(specFor("pipe-b", ReadMode.CDC_ONLY, "chain-cdc-only-join"), e -> { });
 
         assertThat(run.snapshotCount()).as("cdc_only has no load from which to sample a seam").isZero();
-        assertThat(cdcOnly.cdcStarted).as("joining does not open another physical reader").isFalse();
-        assertThat(meta.read(first.chainId().orElseThrow().value()).orElseThrow()
-                .consumerOffset("pipe-b").orElseThrow().cdcStartPosition())
-                .as("cdc_only does not inherit another pipeline's load seam")
-                .isNull();
+        assertThat(cdcOnly.cdcStart)
+                .as("with no shared read or seam of its own, pipe-b uses the start for this run")
+                .isEqualTo(CaptureStart.present());
     }
 
     /**
@@ -970,9 +1167,6 @@ class CaptureRunUnitTest {
         assertThat(run.cdcSubscription()).isPresent();
 
         String chainId = run.chainId().get().value();
-        assertThat(meta.read(chainId).orElseThrow().consumerOffset("pipe-1"))
-                .get().extracting(ConsumerOffset::selectedTables)
-                .isEqualTo(List.of("orders"));
         ConsumerOffset offset = meta.read(chainId).orElseThrow().consumerOffset("pipe-1").orElseThrow();
         assertThat(offset.perTableSeq()).containsEntry("orders", -1L);
         assertThat(offset.cdcStartPosition()).isNull();
@@ -999,35 +1193,24 @@ class CaptureRunUnitTest {
         assertThat(meta.created).containsExactly(run.chainId().orElseThrow().value());
     }
 
-    /**
-     * A direct tail -- {@code srs.enabled:false} -- begins where the durable record says, exactly as a
-     * shared-ring tail does.
-     *
-     * <p>{@code srs.enabled} chooses whether the tail is buffered through the shared replay ring. It does
-     * not choose whether the position is written down: the position never lived in the ring, so a pipeline
-     * that turns the buffering off keeps the position it had, and one that turns it back on finds it still
-     * there. That symmetry is the whole reason nothing has to be migrated when the flag changes -- there is
-     * no second account to move a position into, and a move is the step that loses one.
-     *
-     * <p>Taking the present here instead is the silent loss this exists to prevent: the tail comes up
-     * healthy, reports healthy, and every change between where it had reached and now is simply gone.
-     */
+    /** A direct tail resumes from its own channel's durable recovery record rather than the present. */
     @Test
     void aDirectTailBeginsWhereTheRecordSaysRatherThanAtThePresent() {
         InMemoryMeta meta = new InMemoryMeta();
-        MiningChainId chainId = MiningChainId.resolve(config(), "chain-direct-resume");
+        CaptureRunSpec spec = spec(ReadMode.CDC_ONLY, false, "chain-direct-resume");
+        MiningChainId chainId = spec.miningChainId();
         meta.create(chainId.value(), null);
         meta.advanceSourceReadOffset(chainId.value(), new ChainPosition(new SourceOrder(1L, 7L), "src-11"));
 
         FakeSource port = new FakeSource(List.of(), List.of(change(12)));
         CaptureRun run = runUnit(port, meta)
-                .start(spec(ReadMode.CDC_ONLY, false, "chain-direct-resume"), e -> { });
+                .start(spec, e -> { });
 
         assertThat(port.cdcStart)
                 .as("the direct tail picks up at the recorded position, not at the source's present moment")
                 .isEqualTo(CaptureStart.resume(new SourcePosition("src-11")));
         assertThat(run.chainId())
-                .as("the chain is there either way -- srs.enabled only decides the buffering")
+                .as("the independent channel retains its own recovery record")
                 .contains(chainId);
         assertThat(run.ringSource())
                 .as("no ring: that half of it does follow the flag")
@@ -1035,9 +1218,8 @@ class CaptureRunUnitTest {
     }
 
     /**
-     * A direct tail writes down how far the source has been read, into the same account a buffered tail
-     * keeps. That account is the whole point of keeping the chain when the ring is off: without it the run
-     * after this one has nothing to start from and takes the present, losing everything in between.
+     * A direct tail writes down how far the source has been safely processed in its own channel's account.
+     * Without that account the next run has no recovery position and loses changes in between.
      *
      * <p>The offset only ever moves to a position a consumer has durably landed. Reading is not writing,
      * and an offset that ran ahead of the sink would skip, on the way back, changes no sink ever took. A
@@ -1047,22 +1229,22 @@ class CaptureRunUnitTest {
     @Test
     void aDirectTailRecordsHowFarTheSourceHasBeenReadOnceASinkHasLandedIt() {
         InMemoryMeta meta = new InMemoryMeta();
-        MiningChainId chainId = MiningChainId.resolve(config(), "chain-direct-offset");
+        CaptureRunSpec spec = spec(ReadMode.CDC_ONLY, false, "chain-direct-offset");
+        MiningChainId chainId = spec.miningChainId();
         meta.create(chainId.value(), null);
         meta.advanceSinkAcked(chainId.value(), "pipe-1",
                 new ChainPosition(new SourceOrder(Long.MAX_VALUE, Long.MAX_VALUE), "landed"));
 
         FakeSource port = new FakeSource(List.of(), List.of(change(10), change(11)));
-        runUnit(port, meta).start(spec(ReadMode.CDC_ONLY, false, "chain-direct-offset"), e -> { });
+        runUnit(port, meta).start(spec, e -> { });
 
         assertThat(meta.read(chainId.value()).orElseThrow().sourceReadOffset())
-                .as("the direct tail wrote down where it read to, in the account a buffered tail also keeps")
+                .as("the direct tail retains its own safely processed recovery position")
                 .isEqualTo("src-11");
     }
 
     /**
-     * The case above with its stand-in removed: no consumer has landed a change, so only the connector's
-     * safe start boundary is written down.
+     * The case above with its stand-in removed: no consumer has landed anything, so nothing is written down.
      *
      * <p>The two are one rule seen from both sides, and only together do they discriminate. An offset is a
      * claim that everything below it is safely out of the source's reach -- true only once a sink has taken
@@ -1071,16 +1253,17 @@ class CaptureRunUnitTest {
      * and fails here, which is the only place that difference is visible.
      */
     @Test
-    void aDirectTailKeepsOnlyItsSafeStartUntilASinkLandsAnything() {
+    void aDirectTailRecordsNothingWhileNoSinkHasLandedAnything() {
         InMemoryMeta meta = new InMemoryMeta();
-        MiningChainId chainId = MiningChainId.resolve(config(), "chain-direct-unacked");
+        CaptureRunSpec spec = spec(ReadMode.CDC_ONLY, false, "chain-direct-unacked");
+        MiningChainId chainId = spec.miningChainId();
 
         FakeSource port = new FakeSource(List.of(), List.of(change(10), change(11)));
-        runUnit(port, meta).start(spec(ReadMode.CDC_ONLY, false, "chain-direct-unacked"), e -> { });
+        runUnit(port, meta).start(spec, e -> { });
 
         assertThat(meta.read(chainId.value()).orElseThrow().sourceReadOffset())
-                .as("the start boundary precedes every forwarded change and remains safe for replay")
-                .isEqualTo("src-start");
+                .as("read is not written: an offset ahead of the sink would skip changes on the way back")
+                .isNull();
     }
 
     /**
@@ -1345,14 +1528,11 @@ class CaptureRunUnitTest {
         new CaptureRunUnit(new FakeSource(List.of(row(1)), List.of()), new SrsCoordinator(meta), meta, hz)
                 .start(specFor("pipe-a", ReadMode.SNAPSHOT_AND_CDC, "chain-return"), e -> { }, true);
         SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer(SrsRingbuffer.ringName(chain, "orders")));
-        long epoch = meta.read(chain).orElseThrow().epoch();
         long hadReached = ring.append(buffered(1));
-        meta.selectConsumerTables(chain, "pipe-b", List.of("orders"), epoch, "previous-job");
-        meta.startRingAfter(chain, "pipe-b", "orders", epoch, hadReached);
-        meta.markSnapshotComplete(chain, "pipe-b", "orders");
+        meta.startRingAfter(chain, "pipe-b", "orders", hadReached);
+        meta.advanceConsumerReadSeq(chain, "pipe-b", "orders", hadReached);
         ring.append(buffered(2));
         ring.append(buffered(3));
-        meta.advanceConsumerReadSeq(chain, "pipe-b", "orders", epoch, "previous-job", 1L);
 
         new CaptureRunUnit(new FakeSource(List.of(row(1)), List.of()), new SrsCoordinator(meta), meta, hz)
                 .start(specFor("pipe-b", ReadMode.SNAPSHOT_AND_CDC, "chain-return"), e -> { }, false);
@@ -1360,11 +1540,9 @@ class CaptureRunUnitTest {
         assertThat(meta.ringDoneThrough(chain, "pipe-b"))
                 .as("the two changes written while it was away are still owed to it")
                 .containsExactly(Map.entry("orders", hadReached));
-        assertThat(meta.consumerOffsets(chain).stream()
-                .filter(offset -> offset.pipelineId().equals("pipe-b"))
-                .findFirst().orElseThrow().perTableSeq())
-                .as("a new ring generation cannot trust an earlier generation's read cursor")
-                .containsExactly(Map.entry("orders", -1L));
+        assertThat(meta.read(chain).orElseThrow().consumerOffset("pipe-b").orElseThrow().perTableSeq())
+                .as("attaching on another member leaves the returning reader's cursor advanced")
+                .containsEntry("orders", hadReached);
     }
 
     @Test
@@ -1390,11 +1568,10 @@ class CaptureRunUnitTest {
         assertThat(meta.ringDoneThrough(chain, "pipe-earliest"))
                 .as("a read from the earliest change is owed everything the ring holds, so nothing is marked")
                 .isEmpty();
-        assertThat(meta.consumerOffsets(chain)).filteredOn(offset ->
-                        offset.pipelineId().equals("pipe-present") || offset.pipelineId().equals("pipe-earliest"))
-                .allSatisfy(offset -> assertThat(offset.selectedTables())
-                        .as("both selected readers are subscribed before their Jet readers open")
-                        .containsExactly("orders"));
+        assertThat(meta.read(chain).orElseThrow().consumerOffset("pipe-present").orElseThrow().perTableSeq())
+                .containsEntry("orders", held);
+        assertThat(meta.read(chain).orElseThrow().consumerOffset("pipe-earliest").orElseThrow().perTableSeq())
+                .containsEntry("orders", held);
     }
 
     private static SrsItem buffered(int id) {
@@ -1420,9 +1597,6 @@ class CaptureRunUnitTest {
         assertThat(run.chainId()).isPresent();
         assertThat(run.cdcSubscription()).isPresent();
         assertThat(run.snapshotCounts()).containsExactlyInAnyOrderEntriesOf(Map.of("orders", 1L, "customers", 1L));
-        assertThat(meta.read(run.chainId().orElseThrow().value()).orElseThrow()
-                .consumerOffset("pipe-1").orElseThrow().selectedTables())
-                .containsExactlyInAnyOrder("orders", "customers");
         assertThat(passthrough).extracting(Envelope::src).containsExactly("orders", "customers");
         String chainId = run.chainId().orElseThrow().value();
         assertThat(hz.getRingbuffer(SrsRingbuffer.ringName(chainId, "orders")).tailSequence()).isEqualTo(0L);
@@ -1432,232 +1606,13 @@ class CaptureRunUnitTest {
     }
 
     @Test
-    void physicalTailSubscribesToTheUnionOfPreviouslyAttachedConsumers() {
-        InMemoryMeta meta = new InMemoryMeta();
-        CaptureConfig orders = new CaptureConfig("mysql", Map.of(), List.of("orders"));
-        String chain = MiningChainId.resolve(orders, "shared-union").value();
-        meta.create(chain, null);
-        long earlier = meta.openEpoch(chain);
-        meta.selectConsumerTables(chain, "customer-reader", List.of("customers"), earlier, "old-reader");
-        assertThat(meta.establishPhysicalAnchor(chain,
-                new ChainPosition(new SourceOrder(earlier, -1L), "previous-safe-start"))).isTrue();
-        FakeSource source = new FakeSource(List.of(), List.of());
-        CaptureRunSpec spec = new CaptureRunSpec(orders, ReadMode.CDC_ONLY, "shared-union", true,
-                "orders-source", "orders-reader", StartFrom.latest(), null, 0L);
-
-        try (CaptureRun ignored = runUnit(source, meta).start(spec, event -> { })) {
-            assertThat(source.cdcStreams).containsExactly("customers", "orders");
-            assertThat(meta.physicalSelection(chain)).contains(new SrsMetaStore.PhysicalSelection(
-                    meta.read(chain).orElseThrow().epoch(), List.of("customers", "orders")));
-        }
-    }
-
-    @Test
-    void aLateNewTableCannotAttachToAnOldPhysicalSubscription() {
-        InMemoryMeta meta = new InMemoryMeta();
-        SrsCoordinator coordinator = new SrsCoordinator(meta);
-        FakeSource source = new FakeSource(List.of(), List.of());
-        CaptureRunUnit unit = new CaptureRunUnit(source, coordinator, meta, hz);
-        CaptureConfig orders = new CaptureConfig("mysql", Map.of(), List.of("orders"));
-        CaptureConfig customers = new CaptureConfig("mysql", Map.of(), List.of("customers"));
-        CaptureRunSpec first = new CaptureRunSpec(orders, ReadMode.CDC_ONLY, "shared-expand", true,
-                "orders-source", "orders-reader", StartFrom.latest(), null, 0L);
-        CaptureRunSpec late = new CaptureRunSpec(customers, ReadMode.CDC_ONLY, "shared-expand", true,
-                "customers-source", "customers-reader", StartFrom.latest(), null, 0L);
-
-        try (CaptureRun ignored = unit.start(first, event -> { })) {
-            assertThatThrownBy(() -> unit.start(late, event -> { }, false))
-                    .isInstanceOfSatisfying(TapstateException.class,
-                            coded -> assertThat(coded.code())
-                                    .isEqualTo(CaptureError.SHARED_SELECTION_RESTART_REQUIRED));
-            assertThat(source.cdcStarts).isEqualTo(1);
-        }
-    }
-
-    @Test
-    void aReopenedChainWithoutAProvenStartCannotResumeAtThePresent() {
-        InMemoryMeta meta = new InMemoryMeta();
-        CaptureConfig orders = new CaptureConfig("mysql", Map.of(), List.of("orders"));
-        String chain = MiningChainId.resolve(orders, "legacy-no-anchor").value();
-        meta.create(chain, null);
-        meta.openEpoch(chain);
-        FakeSource source = new FakeSource(List.of(), List.of(change(10)));
-        CaptureRunSpec spec = new CaptureRunSpec(orders, ReadMode.CDC_ONLY, "legacy-no-anchor", true,
-                "orders-source", "orders-reader", StartFrom.latest(), null, 0L);
-
-        assertThatThrownBy(() -> runUnit(source, meta).start(spec, event -> { }))
-                .isInstanceOfSatisfying(TapstateException.class,
-                        refused -> assertThat(refused.code()).isEqualTo(CaptureError.SHARED_POSITION_UNVERIFIED));
-        assertThat(source.cdcStarted).as("a present start would skip previously forwarded work").isFalse();
-    }
-
-    @Test
-    void aPhysicalTableExpansionClosesTheOldSubscriptionBeforeOpeningTheUnion() {
-        InMemoryMeta meta = new InMemoryMeta();
-        java.util.concurrent.atomic.AtomicInteger active = new java.util.concurrent.atomic.AtomicInteger();
-        List<List<String>> opened = new ArrayList<>();
-        CapturePort source = new CapturePort() {
-            @Override public CaptureBatch snapshot(CaptureConfig config) {
-                throw new AssertionError("this case opens only CDC subscriptions");
-            }
-            @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
-                assertThat(active.incrementAndGet()).as("only one physical subscription may read this chain")
-                        .isEqualTo(1);
-                opened.add(config.streams());
-                listener.onStart(Optional.of(start instanceof CaptureStart.Resume resume
-                        ? resume.position() : new SourcePosition("safe-start")));
-                return active::decrementAndGet;
-            }
-            @Override public ConnectionReport testConnection(CaptureConfig config) {
-                throw new UnsupportedOperationException();
-            }
-            @Override public DiscoveredSchema discoverSchema(CaptureConfig config) {
-                throw new UnsupportedOperationException();
-            }
-        };
-        CaptureConfig orders = new CaptureConfig("mysql", Map.of(), List.of("orders"));
-        CaptureRunSpec spec = new CaptureRunSpec(orders, ReadMode.CDC_ONLY, "expand-live", true,
-                "orders-source", "orders-reader", StartFrom.latest(), null, 0L);
-        CaptureRunUnit unit = new CaptureRunUnit(source, new SrsCoordinator(meta), meta, hz);
-
-        CaptureRun first = unit.start(spec, event -> { });
-        String chain = first.chainId().orElseThrow().value();
-        long epoch = meta.read(chain).orElseThrow().epoch();
-        assertThat(meta.requestPhysicalTables(chain, epoch, List.of("customers"))).isTrue();
-        CaptureRun expanded = unit.reopenPhysicalTail(spec, first);
-        try {
-            assertThat(opened).containsExactly(List.of("orders"), List.of("customers", "orders"));
-            assertThat(active).hasValue(1);
-            assertThat(meta.read(chain).orElseThrow().epoch()).isEqualTo(epoch);
-            assertThat(meta.physicalSelection(chain)).contains(
-                    new SrsMetaStore.PhysicalSelection(epoch, 2L, List.of("customers", "orders")));
-            assertThat(meta.requestedPhysicalTables(chain)).isEmpty();
-            assertThat(meta.read(chain).orElseThrow().sourceReadOffset()).isEqualTo("safe-start");
-        } finally {
-            expanded.close();
-        }
-        assertThat(active).hasValue(0);
-    }
-
-    @Test
-    void aReturningTableReadsChangesReminedBeforeItsNewJobAttaches() {
-        InMemoryMeta meta = new InMemoryMeta();
-        SrsCoordinator coordinator = new SrsCoordinator(meta);
-        CaptureConfig orders = new CaptureConfig("mysql", Map.of(), List.of("orders"));
-        CaptureConfig customers = new CaptureConfig("mysql", Map.of(), List.of("customers"));
-        String chain = MiningChainId.resolve(orders, "restart-backlog").value();
-        meta.create(chain, null);
-        long oldEpoch = meta.openEpoch(chain);
-        assertThat(meta.establishPhysicalAnchor(chain,
-                new ChainPosition(new SourceOrder(oldEpoch, -1L), "safe-before-downtime"))).isTrue();
-        meta.selectConsumerTables(chain, "customer-reader", List.of("customers"), oldEpoch, "old-job");
-        meta.startRingAfter(chain, "customer-reader", "customers", oldEpoch, -1L);
-
-        Envelope downtimeChange = Envelope.insert(10L, "customers", Map.of("id", 10), Map.of());
-        CaptureRunUnit owner = new CaptureRunUnit(
-                new FakeSource(List.of(), List.of(downtimeChange)), coordinator, meta, hz);
-        CaptureRunSpec ownerSpec = new CaptureRunSpec(orders, ReadMode.CDC_ONLY, "restart-backlog", true,
-                "orders-source", "orders-reader", StartFrom.latest(), null, 0L);
-        CaptureRunSpec returningSpec = new CaptureRunSpec(customers, ReadMode.CDC_ONLY, "restart-backlog", true,
-                "customers-source", "customer-reader", StartFrom.latest(), null, 0L);
-        try (CaptureRun ignored = owner.start(ownerSpec, event -> { })) {
-            long currentEpoch = meta.read(chain).orElseThrow().epoch();
-            assertThat(currentEpoch).isGreaterThan(oldEpoch);
-            assertThat(hz.getRingbuffer(SrsRingbuffer.ringName(chain, "customers")).tailSequence())
-                    .as("the new physical owner already re-mined a customer change")
-                    .isEqualTo(0L);
-
-            new CaptureRunUnit(new FakeSource(List.of(), List.of()), coordinator, meta, hz)
-                    .start(returningSpec, event -> { }, false);
-            assertThat(meta.ringDoneThrough(chain, "customer-reader"))
-                    .as("a returning reader must start at the new generation's beginning, before the backlog")
-                    .containsEntry("customers", -1L);
-        }
-    }
-
-    @Test
-    void aQuietLaterTableCannotReleaseThePhysicalPrefixBeforeAnEarlierTableSettles() {
-        InMemoryMeta meta = new InMemoryMeta();
-        String chain = "physical-prefix-inverse-ack";
-        meta.create(chain, null);
-        long epoch = meta.openEpoch(chain);
-        assertThat(meta.establishPhysicalAnchor(chain,
-                new ChainPosition(new SourceOrder(epoch, -1L), "t0"))).isTrue();
-        meta.selectConsumerTables(chain, "reader", List.of("orders", "customers"), epoch, "reader-run");
-
-        try (PhysicalSourcePrefix prefix = new PhysicalSourcePrefix(meta, chain, epoch, new CaptureHealth())) {
-            prefix.anchor(Optional.of(new SourcePosition("t0")));
-            prefix.admitted(Map.of("orders", 0L), "t1");
-            prefix.admitted(Map.of("customers", 0L), "t2");
-
-            ConsumerOffset selected = meta.read(chain).orElseThrow().consumerOffset("reader").orElseThrow();
-            meta.upsertConsumerOffset(chain, new ConsumerOffset(
-                    selected.pipelineId(), selected.perTableSeq(), selected.sinkAcked(),
-                    selected.snapshotCompletedTables(), selected.cdcStartPosition(), selected.snapshotEpoch(),
-                    selected.selectedTables(), selected.selectedTablesEpoch(), selected.cursorWriterToken(),
-                    Map.of("customers", new ChainPosition(new SourceOrder(epoch, 0L), "t2"))));
-            prefix.tick();
-            assertThat(meta.read(chain).orElseThrow().sourceReadOffset())
-                    .as("the later table cannot skip pending orders work")
-                    .isEqualTo("t0");
-
-            meta.upsertConsumerOffset(chain, new ConsumerOffset(
-                    selected.pipelineId(), selected.perTableSeq(), selected.sinkAcked(),
-                    selected.snapshotCompletedTables(), selected.cdcStartPosition(), selected.snapshotEpoch(),
-                    selected.selectedTables(), selected.selectedTablesEpoch(), selected.cursorWriterToken(),
-                    Map.of("orders", new ChainPosition(new SourceOrder(epoch, 0L), "t1"),
-                            "customers", new ChainPosition(new SourceOrder(epoch, 0L), "t2"))));
-            prefix.tick();
-            assertThat(meta.read(chain).orElseThrow().sourceReadOffset())
-                    .as("an idle source releases both batches only after the earlier one lands")
-                    .isEqualTo("t2");
-        }
-    }
-
-    @Test
-    void aFullPhysicalBarrierWaitsForDurableSinkProgressInsteadOfDroppingABatch() throws Exception {
-        InMemoryMeta meta = new InMemoryMeta();
-        String chain = "physical-prefix-backpressure";
-        meta.create(chain, null);
-        long epoch = meta.openEpoch(chain);
-        assertThat(meta.establishPhysicalAnchor(chain,
-                new ChainPosition(new SourceOrder(epoch, -1L), "t0"))).isTrue();
-        meta.selectConsumerTables(chain, "reader", List.of("orders"), epoch, "reader-run");
-        var caller = Executors.newSingleThreadExecutor();
-        try (PhysicalSourcePrefix prefix = new PhysicalSourcePrefix(meta, chain, epoch, new CaptureHealth())) {
-            prefix.anchor(Optional.of(new SourcePosition("t0")));
-            for (long seq = 0; seq < PhysicalSourcePrefix.MAX_PENDING_BATCHES; seq++) {
-                prefix.admitted(Map.of("orders", seq), "t" + (seq + 1L));
-            }
-            var waiting = caller.submit(prefix::awaitRoom);
-            assertThatThrownBy(() -> waiting.get(100, TimeUnit.MILLISECONDS))
-                    .as("the full queue retains its recovery barriers while the sink is behind")
-                    .isInstanceOf(java.util.concurrent.TimeoutException.class);
-
-            ConsumerOffset selected = meta.read(chain).orElseThrow().consumerOffset("reader").orElseThrow();
-            meta.upsertConsumerOffset(chain, new ConsumerOffset(
-                    selected.pipelineId(), selected.perTableSeq(), selected.sinkAcked(),
-                    selected.snapshotCompletedTables(), selected.cdcStartPosition(), selected.snapshotEpoch(),
-                    selected.selectedTables(), selected.selectedTablesEpoch(), selected.cursorWriterToken(),
-                    Map.of("orders", new ChainPosition(new SourceOrder(epoch, 0L), "t1"))));
-            prefix.tick();
-            waiting.get(5, TimeUnit.SECONDS);
-            assertThat(meta.read(chain).orElseThrow().sourceReadOffset()).isEqualTo("t1");
-        } finally {
-            caller.shutdownNow();
-        }
-    }
-
-    @Test
     void theReadCursorPublisherResolvesTheStoreMemberSideAndAdvancesTheConsumerCursor() {
         InMemoryMeta meta = new InMemoryMeta();
         meta.create("chain-pub", null);
         hz.getUserContext().put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY, meta);
         try {
-            meta.openEpoch("chain-pub");
-            meta.selectConsumerTables("chain-pub", "pipe-7", List.of("orders"), 1L, "run-1");
             SrsReadCursorPublisherFactory factory =
-                    CaptureRunUnit.readCursorPublisher("chain-pub", "pipe-7", "orders", 1L, "run-1");
+                    CaptureRunUnit.readCursorPublisher("chain-pub", "pipe-7", "orders");
 
             factory.resolve(hz).accept(7L);
 
@@ -1677,11 +1632,9 @@ class CaptureRunUnitTest {
         meta.create("chain-pub", null);
         hz.getUserContext().put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY, meta);
         try {
-            meta.openEpoch("chain-pub");
-            meta.selectConsumerTables("chain-pub", "pipe-7", List.of("orders", "customers"), 1L, "run-1");
-            CaptureRunUnit.readCursorPublisher("chain-pub", "pipe-7", "orders", 1L, "run-1")
+            CaptureRunUnit.readCursorPublisher("chain-pub", "pipe-7", "orders")
                     .resolve(hz).accept(7L);
-            CaptureRunUnit.readCursorPublisher("chain-pub", "pipe-7", "customers", 1L, "run-1")
+            CaptureRunUnit.readCursorPublisher("chain-pub", "pipe-7", "customers")
                     .resolve(hz).accept(11L);
 
             ConsumerOffset offset = meta.read("chain-pub").orElseThrow().consumerOffsets().stream()
@@ -1730,8 +1683,7 @@ class CaptureRunUnitTest {
 
         // No store bound on the member: the factory resolves to a no-op sink, so a source still runs before
         // the assembly layer makes the member SRS-capable. Resolving and calling it does not throw.
-        SrsReadCursorPublisherFactory factory = CaptureRunUnit.readCursorPublisher(
-                "chain-x", "pipe-x", "orders", 1L, "run-1");
+        SrsReadCursorPublisherFactory factory = CaptureRunUnit.readCursorPublisher("chain-x", "pipe-x", "orders");
         factory.resolve(hz).accept(3L);
     }
 
@@ -1778,14 +1730,11 @@ class CaptureRunUnitTest {
     void theHeadroomBoundIsTheSlowestCursorAcrossTheChainsConsumers() {
         InMemoryMeta meta = new InMemoryMeta();
         meta.create("chain-min", null);
-        meta.openEpoch("chain-min");
         // Two consumers on the chain: one has read orders up to 5, the other only to 2 -- the slowest bounds it.
-        meta.selectConsumerTables("chain-min", "p1", List.of("orders"), 1L, "run-p1");
-        meta.selectConsumerTables("chain-min", "p2", List.of("orders"), 1L, "run-p2");
         meta.advanceConsumerReadSeq("chain-min", "p1", "orders", 5L);
         meta.advanceConsumerReadSeq("chain-min", "p2", "orders", 2L);
 
-        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-min"), "orders", 1L)).isEqualTo(2L);
+        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-min"), "orders")).isEqualTo(2L);
     }
 
     @Test
@@ -1794,103 +1743,18 @@ class CaptureRunUnitTest {
         meta.create("chain-none", null);
 
         // No consumer has published a cursor: nothing constrains the ring, so the write gate sees no bound.
-        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-none"), "orders", 1L))
+        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-none"), "orders"))
                 .isEqualTo(Long.MAX_VALUE);
-    }
-
-    @Test
-    void theHeadroomBoundTreatsAnExplicitUnreadSubscriptionAsHavingReadNothing() {
-        InMemoryMeta meta = new InMemoryMeta();
-        meta.create("chain-other", null);
-        meta.openEpoch("chain-other");
-        // The consumer has a cursor on another selected table but none on orders. Its orders selection
-        // still protects the ring's first change.
-        meta.selectConsumerTables("chain-other", "p1", List.of("customers", "orders"), 1L, "run-1");
-        meta.advanceConsumerReadSeq("chain-other", "p1", "customers", 9L);
-
-        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-other"), "orders", 1L)).isEqualTo(-1L);
-    }
-
-    @Test
-    void aSelectionChangeClearsRemovedTablesBeforeTheyCanBeReadded() {
-        InMemoryMeta meta = new InMemoryMeta();
-        meta.create("chain-selection", null);
-        meta.openEpoch("chain-selection");
-        meta.selectConsumerTables("chain-selection", "p1", List.of("orders", "items"), 1L, "run-1");
-        meta.advanceConsumerReadSeq("chain-selection", "p1", "orders", 7L);
-        meta.advanceConsumerReadSeq("chain-selection", "p1", "items", 99L);
-        meta.selectConsumerTables("chain-selection", "p1", List.of("orders", "items"), 1L, "run-1");
-        assertThat(meta.consumerOffsets("chain-selection").getFirst().perTableSeq())
-                .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 7L, "items", 99L));
-
-        meta.selectConsumerTables("chain-selection", "p1", List.of("orders"), 1L, "run-2");
-        assertThat(meta.consumerOffsets("chain-selection").getFirst().perTableSeq())
-                .isEmpty();
-        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-selection"), "items", 1L))
-                .isEqualTo(Long.MAX_VALUE);
-
-        meta.selectConsumerTables("chain-selection", "p1", List.of("orders", "items"), 1L, "run-3");
-        assertThat(meta.consumerOffsets("chain-selection").getFirst().perTableSeq())
-                .isEmpty();
-        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-selection"), "items", 1L))
-                .as("the earlier items cursor is not valid for the renewed subscription")
-                .isEqualTo(-1L);
-        meta.advanceConsumerReadSeq("chain-selection", "p1", "items", 1L, "run-1", 100L);
-        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-selection"), "items", 1L))
-                .as("a reader from the previous run cannot raise the new run's headroom")
-                .isEqualTo(-1L);
-    }
-
-    @Test
-    void anOldReaderCannotPublishIntoTheNewRingGeneration() {
-        InMemoryMeta meta = new InMemoryMeta();
-        meta.create("chain-generation", null);
-        meta.openEpoch("chain-generation");
-        meta.selectConsumerTables("chain-generation", "p1", List.of("orders"), 1L, "run-1");
-        meta.advanceConsumerReadSeq("chain-generation", "p1", "orders", 99L);
-
-        meta.openEpoch("chain-generation");
-        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-generation"), "orders", 2L))
-                .isEqualTo(-1L);
-        meta.selectConsumerTables("chain-generation", "p1", List.of("orders"), 2L, "run-2");
-        meta.advanceConsumerReadSeq("chain-generation", "p1", "orders", 1L, "run-1", 100L);
-        assertThat(meta.consumerOffsets("chain-generation").getFirst().perTableSeq()).isEmpty();
-        meta.advanceConsumerReadSeq("chain-generation", "p1", "orders", 2L, "run-2", 0L);
-        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-generation"), "orders", 2L))
-                .isEqualTo(0L);
-    }
-
-    @Test
-    void aSameGenerationReassemblyStartsUnreadBelowTheOldReadersProgress() {
-        InMemoryMeta meta = new InMemoryMeta();
-        meta.create("chain-reassembly", null);
-        meta.openEpoch("chain-reassembly");
-        meta.selectConsumerTables("chain-reassembly", "p1", List.of("orders"), 1L, "old-reader");
-        meta.advanceConsumerReadSeq("chain-reassembly", "p1", "orders", 1L, "old-reader", 99L);
-        ChainPosition acked = new ChainPosition(new SourceOrder(1, 7), "w7");
-        meta.advanceSinkAcked("chain-reassembly", "p1", acked);
-
-        meta.selectConsumerTables("chain-reassembly", "p1", List.of("orders"), 1L, "new-reader");
-
-        ConsumerOffset current = meta.consumerOffsets("chain-reassembly").getFirst();
-        assertThat(current.sinkAcked()).isEqualTo(acked);
-        assertThat(current.perTableSeq()).isEmpty();
-        assertThat(CdcPhase.headroomBound(List.of(current), "orders", 1L)).isEqualTo(-1L);
-        meta.advanceConsumerReadSeq("chain-reassembly", "p1", "orders", 1L, "old-reader", 100L);
-        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-reassembly"), "orders", 1L))
-                .isEqualTo(-1L);
     }
 
     @Test
     void theHeadroomBoundIgnoresAConsumerWithoutThatTable() {
         InMemoryMeta meta = new InMemoryMeta();
         meta.create("chain-other", null);
-        meta.openEpoch("chain-other");
-        meta.selectConsumerTables("chain-other", "p1", List.of("customers"), 1L, "customers-reader");
         // A cursor for customers alone does not say this consumer subscribes to orders.
         meta.advanceConsumerReadSeq("chain-other", "p1", "customers", 9L);
 
-        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-other"), "orders", 1L))
+        assertThat(CdcPhase.headroomBound(meta.consumerOffsets("chain-other"), "orders"))
                 .isEqualTo(Long.MAX_VALUE);
     }
 
@@ -1903,9 +1767,9 @@ class CaptureRunUnitTest {
         private Throwable cdcError;
         boolean cdcStarted;
         int cdcStarts;
-        List<String> cdcStreams;
         /** Where the run asked this source to begin -- the whole of what a resume is observable as. */
         CaptureStart cdcStart;
+        CaptureConfig cdcConfig;
         boolean cdcClosed;
 
         FakeSource(List<Envelope> snapshotRows, List<Envelope> changes) {
@@ -1937,16 +1801,14 @@ class CaptureRunUnitTest {
 
         @Override
         public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+            cdcConfig = config;
             cdcStarted = true;
             cdcStarts++;
             cdcStart = start;
-            cdcStreams = config.streams();
             if (cdcError != null) {
                 listener.onError(cdcError);
                 return () -> cdcClosed = true;
             }
-            listener.onStart(Optional.of(start instanceof CaptureStart.Resume resume
-                    ? resume.position() : new SourcePosition("src-start")));
             for (Envelope e : changes) {
                 listener.onBatch(java.util.List.of(e), Optional.of(new SourcePosition("src-" + e.ts())));
             }
@@ -2054,17 +1916,6 @@ class CaptureRunUnitTest {
         }
 
         @Override
-        public void startRingAfter(String miningChainId, String pipelineId, String table, long epoch, long seq) {
-            SrsMeta current = require(miningChainId);
-            ConsumerOffset consumer = current.consumerOffset(pipelineId).orElse(null);
-            if (current.epoch() == epoch && consumer != null
-                    && Objects.equals(consumer.selectedTablesEpoch(), epoch)
-                    && consumer.selectedTables().contains(table)) {
-                startRingAfter(miningChainId, pipelineId, table, seq);
-            }
-        }
-
-        @Override
         public synchronized void startRingAfter(String miningChainId, String pipelineId, String table, long seq) {
             Long done = ringDone.computeIfAbsent(miningChainId + "/" + pipelineId,
                             key -> new LinkedHashMap<>())
@@ -2108,88 +1959,6 @@ class CaptureRunUnitTest {
         int wholeRecordReads;
         int cursorReads;
         private final Map<String, SrsMeta> records = new LinkedHashMap<>();
-        private final java.util.Set<String> trustedPhysicalPrefixes = new java.util.HashSet<>();
-        private final Map<String, PhysicalSelection> physicalSelections = new LinkedHashMap<>();
-        private final Map<String, java.util.Set<String>> physicalRequests = new LinkedHashMap<>();
-        private final Map<String, Map<String, Long>> ringStarts = new LinkedHashMap<>();
-
-        @Override
-        public OptionalLong ringGenerationStartAfter(String miningChainId, String table, long epoch) {
-            SrsMeta current = records.get(miningChainId);
-            Long start = current == null || current.epoch() != epoch ? null
-                    : ringStarts.getOrDefault(miningChainId, Map.of()).get(table);
-            return start == null ? OptionalLong.empty() : OptionalLong.of(start);
-        }
-
-        @Override
-        public OptionalLong establishRingGenerationStartAfter(
-                String miningChainId, String table, long epoch, long proposedSeq) {
-            if (require(miningChainId).epoch() != epoch) {
-                return OptionalLong.empty();
-            }
-            long start = ringStarts.computeIfAbsent(miningChainId, ignored -> new LinkedHashMap<>())
-                    .computeIfAbsent(table, ignored -> proposedSeq);
-            return OptionalLong.of(start);
-        }
-
-        @Override
-        public Optional<PhysicalSelection> physicalSelection(String miningChainId) {
-            return Optional.ofNullable(physicalSelections.get(miningChainId));
-        }
-
-        @Override
-        public boolean publishPhysicalSelection(String miningChainId, PhysicalSelection selection) {
-            if (require(miningChainId).epoch() != selection.epoch()
-                    || !selection.tables().containsAll(requestedPhysicalTables(miningChainId))) {
-                return false;
-            }
-            PhysicalSelection previous = physicalSelections.get(miningChainId);
-            if (previous != null && previous.epoch() == selection.epoch()
-                    && !java.util.Set.copyOf(previous.tables()).equals(java.util.Set.copyOf(selection.tables()))) {
-                return false;
-            }
-            physicalSelections.put(miningChainId, selection);
-            return true;
-        }
-
-        @Override
-        public List<String> requestedPhysicalTables(String miningChainId) {
-            return physicalRequests.getOrDefault(miningChainId, java.util.Set.of()).stream().sorted().toList();
-        }
-
-        @Override
-        public boolean requestPhysicalTables(String miningChainId, long epoch, List<String> tables) {
-            if (require(miningChainId).epoch() != epoch) {
-                return false;
-            }
-            physicalRequests.computeIfAbsent(miningChainId, ignored -> new java.util.LinkedHashSet<>())
-                    .addAll(tables);
-            return true;
-        }
-
-        @Override
-        public boolean replacePhysicalSelection(
-                String miningChainId, PhysicalSelection expected, PhysicalSelection replacement) {
-            if (require(miningChainId).epoch() != expected.epoch()
-                    || !Objects.equals(physicalSelections.get(miningChainId), expected)
-                    || replacement.revision() != expected.revision() + 1L
-                    || !replacement.tables().containsAll(expected.tables())
-                    || !replacement.tables().containsAll(requestedPhysicalTables(miningChainId))) {
-                return false;
-            }
-            physicalSelections.put(miningChainId, replacement);
-            return true;
-        }
-
-        @Override
-        public void clearPhysicalRequests(String miningChainId, long epoch, List<String> tables) {
-            if (require(miningChainId).epoch() == epoch) {
-                java.util.Set<String> requested = physicalRequests.get(miningChainId);
-                if (requested != null) {
-                    requested.removeAll(tables);
-                }
-            }
-        }
 
         @Override
         public synchronized Optional<SrsMeta> read(String miningChainId) {
@@ -2224,7 +1993,7 @@ class CaptureRunUnitTest {
         }
 
         @Override
-        public synchronized void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
+        public void advanceSourceReadOffset(String miningChainId, ChainPosition position) {
             SrsMeta m = require(miningChainId);
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), position, m.consumerOffsets(),
@@ -2232,39 +2001,7 @@ class CaptureRunUnitTest {
         }
 
         @Override
-        public synchronized boolean advancePhysicalSourceReadOffset(
-                String miningChainId, long epoch, ChainPosition position) {
-            if (require(miningChainId).epoch() != epoch) {
-                return false;
-            }
-            advanceSourceReadOffset(miningChainId, position);
-            return true;
-        }
-
-        @Override
-        public boolean physicalPrefixTrusted(String miningChainId) {
-            return trustedPhysicalPrefixes.contains(miningChainId);
-        }
-
-        @Override
-        public boolean establishPhysicalAnchor(String miningChainId, ChainPosition position) {
-            SrsMeta current = require(miningChainId);
-            if (current.epoch() != position.order().epoch()) {
-                return false;
-            }
-            if (trustedPhysicalPrefixes.contains(miningChainId)) {
-                return true;
-            }
-            if (current.sourceRead() != null) {
-                return false;
-            }
-            advanceSourceReadOffset(miningChainId, position);
-            trustedPhysicalPrefixes.add(miningChainId);
-            return true;
-        }
-
-        @Override
-        public synchronized void upsertConsumerOffset(String miningChainId, ConsumerOffset offset) {
+        public void upsertConsumerOffset(String miningChainId, ConsumerOffset offset) {
             SrsMeta m = require(miningChainId);
             List<ConsumerOffset> next = new ArrayList<>(m.consumerOffsets());
             next.removeIf(c -> c.pipelineId().equals(offset.pipelineId()));
@@ -2276,6 +2013,10 @@ class CaptureRunUnitTest {
 
         @Override
         public void advanceConsumerReadSeq(String miningChainId, String pipelineId, String table, long lastReadSeq) {
+            if (lastReadSeq == -1L && pipelineId.equals(pausedPipeline)) {
+                registrationReached.countDown();
+                awaitRoom(allowRegistration);
+            }
             synchronized (this) {
                 advanceConsumerReadSeqNow(miningChainId, pipelineId, table, lastReadSeq);
             }
@@ -2302,61 +2043,10 @@ class CaptureRunUnitTest {
                     ack,
                     existing == null ? List.of() : existing.snapshotCompletedTables(),
                     existing == null ? null : existing.cdcStartPosition(),
-                    existing == null ? 0L : existing.snapshotEpoch(),
-                    existing == null ? null : existing.selectedTables(),
-                    existing == null ? null : existing.selectedTablesEpoch(),
-                    existing == null ? null : existing.cursorWriterToken()));
+                    existing == null ? 0L : existing.snapshotEpoch()));
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), next,
                     m.schemaHistory(), m.retention(), m.epoch()));
-        }
-
-        @Override
-        public void selectConsumerTables(
-                String miningChainId, String pipelineId, List<String> tables, long epoch,
-                String cursorWriterToken) {
-            if (pipelineId.equals(pausedPipeline)) {
-                // Selection is now the first visible subscription; hold it before publication.
-                registrationReached.countDown();
-                awaitRoom(allowRegistration);
-            }
-            SrsMeta m = require(miningChainId);
-            if (m.epoch() != epoch) {
-                throw new IllegalStateException("consumer selection must match the open ring generation");
-            }
-            ConsumerOffset previous = m.consumerOffset(pipelineId).orElse(null);
-            if (previous != null && !Objects.equals(previous.selectedTablesEpoch(), epoch)) {
-                ringDone.remove(miningChainId + "/" + pipelineId);
-            }
-            Map<String, Long> retained = new LinkedHashMap<>();
-            if (previous != null && Objects.equals(previous.selectedTablesEpoch(), epoch)
-                    && Objects.equals(previous.cursorWriterToken(), cursorWriterToken)
-                    && previous.selectedTables() != null) {
-                for (String table : tables) {
-                    if (previous.selectedTables().contains(table)
-                            && previous.perTableSeq().containsKey(table)) {
-                        retained.put(table, previous.perTableSeq().get(table));
-                    }
-                }
-            }
-            upsertConsumerOffset(miningChainId, new ConsumerOffset(
-                    pipelineId, retained, previous == null ? null : previous.sinkAcked(),
-                    previous == null ? List.of() : previous.snapshotCompletedTables(),
-                    previous == null ? null : previous.cdcStartPosition(),
-                    previous == null ? 0L : previous.snapshotEpoch(), tables, epoch,
-                    cursorWriterToken));
-        }
-
-        @Override
-        public void advanceConsumerReadSeq(
-                String miningChainId, String pipelineId, String table, long epoch,
-                String cursorWriterToken, long lastReadSeq) {
-            ConsumerOffset current = require(miningChainId).consumerOffset(pipelineId).orElse(null);
-            if (current != null && Objects.equals(current.selectedTablesEpoch(), epoch)
-                    && Objects.equals(current.cursorWriterToken(), cursorWriterToken)
-                    && current.selectedTables() != null && current.selectedTables().contains(table)) {
-                advanceConsumerReadSeq(miningChainId, pipelineId, table, lastReadSeq);
-            }
         }
 
         @Override
@@ -2378,27 +2068,10 @@ class CaptureRunUnitTest {
                     position,
                     existing == null ? List.of() : existing.snapshotCompletedTables(),
                     existing == null ? null : existing.cdcStartPosition(),
-                    existing == null ? 0L : existing.snapshotEpoch(),
-                    existing == null ? null : existing.selectedTables(),
-                    existing == null ? null : existing.selectedTablesEpoch(),
-                    existing == null ? null : existing.cursorWriterToken()));
+                    existing == null ? 0L : existing.snapshotEpoch()));
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), next,
                     m.schemaHistory(), m.retention(), m.epoch()));
-        }
-
-        @Override
-        public synchronized boolean advancePhysicalSinkAcked(
-                String miningChainId, String pipelineId, long epoch, ChainPosition position) {
-            SrsMeta current = require(miningChainId);
-            if (current.epoch() != epoch) {
-                return false;
-            }
-            ConsumerOffset consumer = current.consumerOffset(pipelineId).orElse(null);
-            if (consumer != null && Objects.equals(consumer.selectedTablesEpoch(), epoch)) {
-                advanceSinkAcked(miningChainId, pipelineId, position);
-            }
-            return true;
         }
 
         @Override
@@ -2420,32 +2093,16 @@ class CaptureRunUnitTest {
                     existing == null ? null : existing.sinkAcked(),
                     existing == null ? List.of() : existing.snapshotCompletedTables(),
                     cdcStartPosition,
-                    snapshotEpoch,
-                    existing == null ? null : existing.selectedTables(),
-                    existing == null ? null : existing.selectedTablesEpoch(),
-                    existing == null ? null : existing.cursorWriterToken()));
+                    snapshotEpoch));
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), next,
                     m.schemaHistory(), m.retention(), m.epoch()));
         }
 
         @Override
-        public synchronized boolean setCdcStartIfCurrent(String miningChainId, String pipelineId,
-                String cursorWriterToken, long selectedTablesEpoch, String cdcStartPosition, long snapshotEpoch) {
-            SrsMeta record = require(miningChainId);
-            ConsumerOffset consumer = record.consumerOffset(pipelineId).orElse(null);
-            if (record.epoch() != selectedTablesEpoch || consumer == null
-                    || !Objects.equals(consumer.selectedTablesEpoch(), selectedTablesEpoch)
-                    || !Objects.equals(consumer.cursorWriterToken(), cursorWriterToken)) { return false; }
-            setCdcStart(miningChainId, pipelineId, cdcStartPosition, snapshotEpoch);
-            return true;
-        }
-
-        @Override
         public long openEpoch(String miningChainId) {
             SrsMeta m = require(miningChainId);
             long opened = m.epoch() + 1;
-            ringStarts.remove(miningChainId);
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), m.consumerOffsets(),
                     m.schemaHistory(), m.retention(), opened));
@@ -2484,10 +2141,7 @@ class CaptureRunUnitTest {
             consumers.add(new ConsumerOffset(pipelineId, mine == null ? Map.of() : mine.perTableSeq(),
                     mine == null ? null : mine.sinkAcked(), completed,
                     mine == null ? null : mine.cdcStartPosition(),
-                    mine == null ? 0L : mine.snapshotEpoch(),
-                    mine == null ? null : mine.selectedTables(),
-                    mine == null ? null : mine.selectedTablesEpoch(),
-                    mine == null ? null : mine.cursorWriterToken()));
+                    mine == null ? 0L : mine.snapshotEpoch()));
             records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), consumers,
                     m.schemaHistory(), m.retention(), m.epoch()));
         }
@@ -2540,13 +2194,13 @@ class CaptureRunUnitTest {
     @Test
     void aRecordedPositionOutranksStartFromOnADirectTail() {
         InMemoryMeta meta = new InMemoryMeta();
-        MiningChainId chainId = MiningChainId.resolve(config(), "chain-start-from-outranked");
+        CaptureRunSpec spec = spec(ReadMode.CDC_ONLY, false, "chain-start-from-outranked", StartFrom.earliest());
+        MiningChainId chainId = spec.miningChainId();
         meta.create(chainId.value(), null);
         meta.advanceSourceReadOffset(chainId.value(), new ChainPosition(new SourceOrder(1L, 7L), "src-11"));
 
         FakeSource port = new FakeSource(List.of(), List.of());
-        runUnit(port, meta).start(
-                spec(ReadMode.CDC_ONLY, false, "chain-start-from-outranked", StartFrom.earliest()), e -> { });
+        runUnit(port, meta).start(spec, e -> { });
 
         assertThat(port.cdcStart)
                 .as("the position the last run reached wins; start_from named where the first one began")
@@ -2602,6 +2256,188 @@ class CaptureRunUnitTest {
         assertThat(port.cdcStarted)
                 .as("it refuses before opening the source's stream, not after")
                 .isFalse();
+    }
+
+    private static HazelcastInstance emptyDurableMember() {
+        SrsLogStore log = new SrsLogStore() {
+            @Override
+            public void store(String ring, long sequence, SrsLogRecord record) {
+                throw new AssertionError("an empty capture must not append a change");
+            }
+
+            @Override
+            public void storeAll(String ring, long sequence, List<SrsLogRecord> records) {
+                throw new AssertionError("an empty capture must not append a batch");
+            }
+
+            @Override
+            public Optional<SrsLogRecord> load(String ring, long sequence) {
+                return Optional.empty();
+            }
+
+            @Override
+            public long largestSequence(String ring) {
+                return -1L;
+            }
+
+            @Override
+            public void trim(String ring, long sequence) {
+                throw new AssertionError("an empty log has no confirmed history to trim");
+            }
+        };
+        Config memberConfig = new Config();
+        memberConfig.setClusterName("srs-durable-instant-test-" + System.nanoTime());
+        memberConfig.setProperty("hazelcast.phone.home.enabled", "false");
+        memberConfig.setProperty("hazelcast.shutdownhook.enabled", "false");
+        memberConfig.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");
+        memberConfig.getNetworkConfig().getJoin().getAutoDetectionConfig().setEnabled(false);
+        memberConfig.getNetworkConfig().getJoin().getMulticastConfig().setEnabled(false);
+        memberConfig.getJetConfig().setEnabled(false);
+        memberConfig.addRingBufferConfig(new RingbufferConfig("srs.*")
+                .setCapacity(8)
+                .setInMemoryFormat(InMemoryFormat.OBJECT)
+                .setTimeToLiveSeconds(0)
+                .setBackupCount(0)
+                .setRingbufferStoreConfig(new RingbufferStoreConfig().setEnabled(true)
+                        .setFactoryImplementation(new SrsLogRingbufferStoreFactory(log))));
+        HazelcastInstance durableMember = Hazelcast.newHazelcastInstance(memberConfig);
+        durableMember.getUserContext().put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY, log);
+        return durableMember;
+    }
+
+    @Test
+    void aFreshDurableChainRefusesAPastInstantAndAcceptsAReachableInstant() {
+        HazelcastInstance durableMember = emptyDurableMember();
+        try {
+            FakeSource past = new FakeSource(List.of(), List.of());
+            InMemoryMeta pastMeta = new InMemoryMeta();
+            CaptureRunUnit pastUnit = new CaptureRunUnit(past, new SrsCoordinator(pastMeta), pastMeta,
+                    durableMember);
+
+            TapstateException refused = catchThrowableOfType(() -> pastUnit.start(
+                    spec(ReadMode.CDC_ONLY, true, "chain-durable-past-instant",
+                            StartFrom.at(Instant.parse("2020-01-01T00:00:00Z"))), e -> { }),
+                    TapstateException.class);
+
+            assertThat(refused.code()).isEqualTo(CaptureError.START_FROM_OUTSIDE_WINDOW);
+            assertThat(refused.args()).containsEntry("requested", "2020-01-01T00:00:00Z")
+                    .containsEntry("retention", "unset").containsKey("earliest");
+            assertThat(past.cdcStarted).isFalse();
+
+            FakeSource reachable = new FakeSource(List.of(), List.of());
+            InMemoryMeta reachableMeta = new InMemoryMeta();
+            CaptureRunSpec reachableSpec = spec(ReadMode.CDC_ONLY, true, "chain-durable-reachable-instant",
+                    StartFrom.at(Instant.now().plusSeconds(3600)));
+            String chain = reachableSpec.miningChainId().value();
+            reachableMeta.create(chain, null);
+            String previousConsumer = SrsConsumerId.of("previous_pipeline", "previous_source").value();
+            String directConsumer = SrsConsumerId.of("direct_pipeline", "direct_source").value();
+            reachableMeta.upsertConsumerOffset(chain, new ConsumerOffset(previousConsumer, Map.of("orders", -1L),
+                    null, List.of(), null, 0L, Map.of(), ConsumerProgressKind.SRS));
+            reachableMeta.upsertConsumerOffset(chain, new ConsumerOffset(directConsumer, Map.of("orders", -1L),
+                    null, List.of(), null, 0L, Map.of(), ConsumerProgressKind.DIRECT_SOURCE));
+            reachableMeta.upsertConsumerOffset(chain, new ConsumerOffset("unknown_previous_pipeline",
+                    Map.of("orders", -1L), null));
+            CaptureRunUnit reachableUnit = new CaptureRunUnit(reachable, new SrsCoordinator(reachableMeta),
+                    reachableMeta, durableMember);
+            CaptureRun run = reachableUnit.start(reachableSpec, e -> { });
+            try {
+                assertThat(reachable.cdcStarted).isTrue();
+                assertThat(reachable.cdcStart).isEqualTo(CaptureStart.present());
+                assertThat(reachable.cdcConfig.node()).isEqualTo(reachableSpec.config().node());
+                assertThat(reachable.cdcConfig.sharedNotes().sharedBy()).isEqualTo(chain);
+                assertThat(reachable.cdcConfig.sharedNotes().carriedFrom()).containsExactly(
+                        reachableSpec.config().node(), new PipelineNode("previous_pipeline", "previous_source"));
+            } finally {
+                run.close();
+            }
+        } finally {
+            durableMember.shutdown();
+        }
+    }
+
+    @Test
+    void aSharedCdcOnlyProducerRestartRequiresItsAnchorWhileLiveAndRemoteAttachmentsKeepFollowing() {
+        HazelcastInstance member = emptyDurableMember();
+        try {
+            InMemoryMeta meta = new InMemoryMeta();
+            String key = "chain-scoped-unanchored-cdc";
+            CaptureRunSpec owner = new CaptureRunSpec(config(), ReadMode.CDC_ONLY, key, true,
+                    "root_source", "root_pipeline", StartFrom.latest(), null, 0L)
+                    .withConsumerId(SrsConsumerId.of("root_pipeline", "root_source").value());
+            CaptureRunSpec joining = new CaptureRunSpec(config(), ReadMode.CDC_ONLY, key, true,
+                    "mail_source", "mail_pipeline", StartFrom.latest(), null, 0L)
+                    .withConsumerId(SrsConsumerId.of("mail_pipeline", "mail_source").value());
+            CaptureRunSpec remoteSpec = new CaptureRunSpec(config(), ReadMode.CDC_ONLY, key, true,
+                    "remote_source", "remote_pipeline", StartFrom.latest(), null, 0L)
+                    .withConsumerId(SrsConsumerId.of("remote_pipeline", "remote_source").value());
+            String chain = owner.miningChainId().value();
+            meta.create(chain, null);
+            assertThat(meta.read(chain).orElseThrow().epoch()).isZero();
+            FakeSource source = new FakeSource(List.of(), List.of());
+            CaptureRunUnit producer = new CaptureRunUnit(source, new SrsCoordinator(meta), meta, member);
+            CaptureRun initial = producer.start(owner, e -> { });
+            CaptureRun local = producer.start(joining, e -> { });
+            FakeSource remoteSource = new FakeSource(List.of(), List.of());
+            CaptureRun remote = new CaptureRunUnit(remoteSource, new SrsCoordinator(meta), meta, member)
+                    .start(remoteSpec, e -> { }, false);
+            try {
+                assertThat(source.cdcStarts).as("a fresh chain and a live attachment share one physical read")
+                        .isOne();
+                assertThat(remoteSource.cdcStarted).isFalse();
+                assertThat(meta.read(chain).orElseThrow().sourceReadOffset()).isNull();
+            } finally {
+                remote.close();
+                local.close();
+                initial.close();
+            }
+            long retainedEpoch = meta.read(chain).orElseThrow().epoch();
+            meta.setCdcStart(chain, joining.consumerId(), "another-nodes-seam", retainedEpoch);
+            FakeSource restarted = new FakeSource(List.of(), List.of());
+            CaptureRunUnit replacement = new CaptureRunUnit(restarted, new SrsCoordinator(meta), meta, member);
+
+            TapstateException failure = catchThrowableOfType(() -> replacement.start(owner, e -> { }),
+                    TapstateException.class);
+
+            assertThat(failure.code()).isEqualTo(CaptureError.RECOVERY_PROGRESS_UNPROVEN);
+            assertThat(failure.args()).containsEntry("pipeline", owner.pipelineId())
+                    .containsEntry("source", owner.sourceId());
+            assertThat(restarted.cdcStarted).isFalse();
+            assertThat(meta.read(chain).orElseThrow().epoch()).isEqualTo(retainedEpoch);
+            assertThat(meta.read(chain).orElseThrow().sourceReadOffset()).isNull();
+            assertThat(meta.ringDoneThrough(chain, owner.consumerId())).containsEntry("orders", -1L);
+
+            meta.setCdcStart(chain, owner.consumerId(), "this-nodes-proven-snapshot-seam", retainedEpoch);
+            try (CaptureRun resumed = replacement.start(owner, e -> { })) {
+                assertThat(restarted.cdcStart)
+                        .isEqualTo(CaptureStart.resume(new SourcePosition("this-nodes-proven-snapshot-seam")));
+            }
+        } finally {
+            member.shutdown();
+        }
+    }
+
+    @Test
+    void anIndependentChannelRefusesLegacyProgressStillStoredUnderTheSharedChain() {
+        for (ReadMode mode : List.of(ReadMode.SNAPSHOT_AND_CDC, ReadMode.CDC_ONLY)) {
+            InMemoryMeta meta = new InMemoryMeta();
+            CaptureRunSpec direct = spec(mode, false, "legacy-shared-" + mode.name(), StartFrom.latest())
+                    .withConsumerId(SrsConsumerId.of("pipe-1", "src-1").value());
+            String shared = MiningChainId.resolve(direct.config(), direct.srsKey()).value();
+            meta.create(shared, null);
+            meta.advanceConsumerReadSeq(shared, direct.pipelineId(), "orders", 7);
+            meta.setCdcStart(shared, direct.pipelineId(), "legacy-seam", 1);
+            SrsMeta retained = meta.read(shared).orElseThrow();
+            FakeSource source = new FakeSource(List.of(), List.of());
+
+            TapstateException failure = catchThrowableOfType(
+                    () -> runUnit(source, meta).start(direct, event -> { }), TapstateException.class);
+
+            assertThat(failure.code()).isEqualTo(CaptureError.RECOVERY_PROGRESS_UNPROVEN);
+            assertThat(source.cdcStarted).isFalse();
+            assertThat(meta.read(shared)).contains(retained);
+            assertThat(meta.read(direct.miningChainId().value())).isEmpty();
+        }
     }
 
     /**

@@ -6,12 +6,14 @@ import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
+import io.tapstate.spi.capture.CaptureStartedListener;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
 import io.tapstate.spi.capture.FieldSchema;
 import io.tapstate.spi.capture.SourcePosition;
+import io.tapstate.spi.capture.SharedNotes;
 import io.tapstate.spi.capture.SnapshotSession;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.KeyedStateStore;
@@ -457,7 +459,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
      * so the full load and the change tail of one run file under one name and read each other's.
      */
     private PdkConnector open(CaptureConfig config) {
-        return open(config, config.node());
+        return open(config, config.node(), config.sharedNotes());
     }
 
     /**
@@ -468,14 +470,14 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
      * happened to put on the config.
      */
     private PdkConnector openUnscoped(CaptureConfig config) {
-        return open(config, null);
+        return open(config, null, null);
     }
 
-    private PdkConnector open(CaptureConfig config, PipelineNode node) {
+    private PdkConnector open(CaptureConfig config, PipelineNode node, SharedNotes notes) {
         // Capture can open before the durable execution generation exists, and one physical change
         // stream can serve several pipelines. A caller's MDC cannot prove ownership for this handle.
         return PdkConnector.open(config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(),
-                node, stateStore);
+                node, stateStore, notes);
     }
 
     /**
@@ -672,7 +674,9 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
                 // schema-only recovery with no stored offset to recover from. Which position it names is
                 // the instant it is handed: none for the present, the caller's for an instant start.
                 Object startOffset = resumeAt != null ? resumeAt : startOffset(connector, startAt);
-                listener.onStart(position(connector, startOffset));
+                if (listener instanceof CaptureStartedListener started) {
+                    position(connector, startOffset).ifPresent(started::onStart);
+                }
                 Map<String, Map<String, String>> declared = declaredTypes(tables);
                 StreamReadConsumer consumer = StreamReadConsumer.create((events, offset) -> delivery.accept(() -> {
                     // A change stream also carries control events (heartbeats and the like) that signal

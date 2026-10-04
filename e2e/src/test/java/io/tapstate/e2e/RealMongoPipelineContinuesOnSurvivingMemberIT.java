@@ -122,9 +122,7 @@ class RealMongoPipelineContinuesOnSurvivingMemberIT {
                         () -> "rows at target = " + mongo.count(target, TABLE) + ", was " + rowsAtTheKill
                                 + " when the member was killed; " + reading(mongo, target, survivor));
 
-                assertThat(survivor.state(PIPELINE))
-                        .describedAs("the pipeline is running again, and nobody asked it to be")
-                        .contains(PipelineState.RUNNING);
+                PipelineContinuesOnSurvivingMemberIT.assertRunningAgain(() -> survivor.state(PIPELINE));
                 String stillHere = TwoMemberCluster.NODE_A.equals(driver)
                         ? TwoMemberCluster.NODE_B
                         : TwoMemberCluster.NODE_A;
