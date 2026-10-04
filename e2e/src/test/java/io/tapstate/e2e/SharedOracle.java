@@ -16,6 +16,7 @@ import java.util.Map;
 final class SharedOracle {
     private static final String PASSWORD = "Tapstate_Test_42";
     private static final String USER = "C##TAPSTATE";
+    private static final Duration STARTUP_BUDGET = Duration.ofMinutes(5);
     private static OracleContainer container;
 
     private SharedOracle() {
@@ -70,12 +71,14 @@ final class SharedOracle {
         DockerGate.require();
         OracleContainer starting = new OracleContainer("gvenzl/oracle-free:23-slim-faststart")
                 .withPassword(PASSWORD)
-                .withStartupTimeout(Duration.ofMinutes(5));
+                .withStartupTimeout(STARTUP_BUDGET);
         long began = System.nanoTime();
         starting.start();
         try {
+            // Supplemental logging waits for in-flight transactions after the database reopens.
+            // Give that wait the same bounded budget as container startup.
             var result = starting.execInContainer("bash", "-c", """
-                    timeout 120 sqlplus -s / as sysdba <<'SQL'
+                    timeout %d sqlplus -s / as sysdba <<'SQL'
                     WHENEVER SQLERROR EXIT SQL.SQLCODE
                     SHUTDOWN IMMEDIATE;
                     STARTUP MOUNT;
@@ -94,7 +97,7 @@ final class SharedOracle {
                     ALTER SYSTEM REGISTER;
                     EXIT;
                     SQL
-                    """);
+                    """.formatted(STARTUP_BUDGET.toSeconds()));
             if (result.getExitCode() != 0) {
                 throw new EnvelopeException("cannot enable Oracle change capture: " + result.getStdout() + result.getStderr());
             }
