@@ -254,6 +254,42 @@ class StoppingOnePipelineDoesNotClearTheChainTest {
         assertThat(fixture.store.meta().miningChainIdsWithConsumer("p")).isEmpty();
         assertThat(fixture.store.keyedState().count(fixture.migrationNamespace()))
                 .as("what the failed drop left, which nothing finds through the record any more").isEqualTo(1L);
+
+        fixture.coordinator.startCapture("p");
+
+        assertThat(fixture.notesAtStart).as("the next run starts afresh, and what the failed drop left goes first")
+                .containsExactly(0L);
+    }
+
+    /**
+     * A chain started afresh -- with no record -- does not read the notes an earlier chain under its name left:
+     * a clearing that stopped before its notes were dropped leaves them naming a slot that is gone, and a
+     * connector that knows a slot's name creates it again only when its stream starts, after the first load.
+     */
+    @Test
+    void aChainStartedAfreshDropsTheNotesAnEarlierOneLeft() {
+        Fixture fixture = new Fixture();
+        fixture.store.keyedState().save(fixture.connectorNamespace(), "slot", new byte[]{11, 12});
+        fixture.store.keyedState().save(fixture.migrationNamespace(), "removed:expired", new byte[]{1});
+
+        fixture.coordinator.startCapture("p");
+
+        assertThat(fixture.notesAtStart).as("none of the earlier chain's notes is there as the run starts")
+                .containsExactly(0L);
+        assertThat(fixture.chainRecord()).isPresent();
+    }
+
+    /** A chain that still has its record keeps its notes across a start: they are what a resume reads. */
+    @Test
+    void aChainThatKeptItsRecordKeepsItsNotesAcrossAStart() {
+        Fixture fixture = new Fixture();
+        fixture.seedAChainNobodyIsRunning();
+        fixture.leaveWhatTheChainAccumulated();
+
+        fixture.coordinator.startCapture("p");
+
+        assertThat(fixture.notesAtStart).containsExactly(2L);
+        fixture.assertConnectorNotesKept();
     }
 
     @Test
@@ -332,6 +368,8 @@ class StoppingOnePipelineDoesNotClearTheChainTest {
         private final StoreBackedPipelineCaptureCoordinator coordinator;
         private final SourceResource source = new SourceResource("orders_src", null, "mysql",
                 Map.of("host", "h"), SourceMode.CDC, List.of(TableRef.literal("orders")), null, null);
+        /** How many connector notes, and migration markers, the chain held as each run started. */
+        private final List<Long> notesAtStart = new ArrayList<>();
 
         Fixture() {
             InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
@@ -345,6 +383,8 @@ class StoppingOnePipelineDoesNotClearTheChainTest {
         }
 
         private CaptureRun start(CaptureRunSpec spec, java.util.function.Consumer<Envelope> passthrough) {
+            notesAtStart.add(store.keyedState().count(connectorNamespace())
+                    + store.keyedState().count(migrationNamespace()));
             MiningChainId chainId = MiningChainId.resolve(spec.config(), spec.srsKey());
             srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
             srsCoordinator.attachConsumer(chainId, spec.pipelineId());

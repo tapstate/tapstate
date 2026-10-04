@@ -39,12 +39,19 @@ import java.util.function.Supplier;
  * wait on the store.
  *
  * <p>A read that fails is tried again at the next interval. It costs the source some log for a while longer and
- * nothing else, so it is counted on the run's health as a failed acknowledgement and never fails the run.
+ * nothing else, so it is counted on the run's health as a failed acknowledgement and never fails the run. It is
+ * also said, at most once a minute for a tail: a source that is never told anything keeps its whole log, and the
+ * health readings are not where anybody watching the source would look.
  */
 final class SourceAcknowledgements {
 
     /** How often each followed tail's chain is read for a new durable position. */
     static final Duration INTERVAL = Duration.ofSeconds(5);
+
+    private static final System.Logger LOG = System.getLogger(SourceAcknowledgements.class.getName());
+
+    /** The least time between two warnings about one tail's reads failing; each failure is still counted. */
+    private static final long WARNING_INTERVAL_NANOS = Duration.ofMinutes(1).toNanos();
 
     private static final Set<Followed> FOLLOWED = ConcurrentHashMap.newKeySet();
     private static final ScheduledExecutorService READER = Executors.newSingleThreadScheduledExecutor(task -> {
@@ -72,7 +79,7 @@ final class SourceAcknowledgements {
             boolean writtenThroughOnly) {
         Objects.requireNonNull(meta, "meta");
         Objects.requireNonNull(chainId, "chainId");
-        Followed followed = new Followed(() -> meta.durableSourceRead(chainId)
+        Followed followed = new Followed(chainId, () -> meta.durableSourceRead(chainId)
                 .filter(read -> !writtenThroughOnly || read.writtenThrough())
                 .map(DurableSourceRead::position), tail, health);
         FOLLOWED.add(followed);
@@ -83,13 +90,18 @@ final class SourceAcknowledgements {
     /** One tail being told its durable position. */
     static final class Followed implements Subscription {
 
+        private final String chainId;
         private final Supplier<Optional<ChainPosition>> durablePosition;
         private final Subscription tail;
         private final CaptureHealth health;
         private ChainPosition handed;
         private volatile boolean closed;
+        private long lastWarnedNanos;
+        private boolean warned;
 
-        private Followed(Supplier<Optional<ChainPosition>> durablePosition, Subscription tail, CaptureHealth health) {
+        private Followed(String chainId, Supplier<Optional<ChainPosition>> durablePosition, Subscription tail,
+                CaptureHealth health) {
+            this.chainId = chainId;
             this.durablePosition = Objects.requireNonNull(durablePosition, "durablePosition");
             this.tail = Objects.requireNonNull(tail, "tail");
             this.health = Objects.requireNonNull(health, "health");
@@ -108,13 +120,29 @@ final class SourceAcknowledgements {
             handed = durable.get();
         }
 
-        /** One read of the schedule: {@link #handOver}, with a failed read counted on the run's health. */
+        /**
+         * One read of the schedule: {@link #handOver}, with a failed read counted on the run's health and said at
+         * most once a minute.
+         */
         void handOverQuietly() {
             try {
                 handOver();
             } catch (RuntimeException failure) {
                 health.acknowledgeFailed(failure);
+                warn(failure);
             }
+        }
+
+        private synchronized void warn(RuntimeException failure) {
+            long now = System.nanoTime();
+            if (warned && now - lastWarnedNanos < WARNING_INTERVAL_NANOS) {
+                return;
+            }
+            warned = true;
+            lastWarnedNanos = now;
+            LOG.log(System.Logger.Level.WARNING, "Could not read how far the source of chain " + chainId
+                    + " may release its change log; it keeps that log until a read succeeds: "
+                    + failure.getMessage(), failure);
         }
 
         @Override

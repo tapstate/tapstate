@@ -144,6 +144,55 @@ class PdkCaptureReleaseTest {
     }
 
     /**
+     * A release given up on can no longer touch its notes: what it would still write there would come back after
+     * the caller dropped them, and what it would still read could be what a run started since keeps there.
+     */
+    @Test
+    void aReleaseGivenUpOnCanNoLongerTouchItsNotes() throws InterruptedException {
+        port = new PdkCapturePort(connectorId -> ref, store, PdkCapturePort.DEFAULT_PREFLIGHT_TIMEOUT,
+                Duration.ofSeconds(5), System::nanoTime, Duration.ofMillis(300));
+        slotReadBy(config().at(P1));
+        channel.put("hang", true);
+        channel.put("writeAfterInterrupt", true);
+
+        assertThat(port.release(config().at(P1))).isPresent();
+
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        while (!channel.containsKey("lateWrite") && System.nanoTime() < deadline) {
+            Thread.sleep(20);
+        }
+        assertThat(channel).as("the late write was refused").containsEntry("lateWrite", "refused");
+        assertThat(store.load(ConnectorStateNamespace.of(P1), "late")).isEmpty();
+    }
+
+    /** A connector built on the postgres connector keeps its slot under the same note, and is answered for alike. */
+    @Test
+    void aSlotIsNamedWhateverTheConnectorIsCalled() {
+        CaptureConfig highgo = new CaptureConfig("highgo", Map.of(), List.of("t1")).at(P1);
+        String created = slotReadBy(highgo);
+        channel.put("unreachable", true);
+
+        assertThat(port.release(highgo)).hasValueSatisfying(refusal ->
+                assertThat(refusal.args()).containsEntry("connector", "highgo").containsEntry("resources", created));
+    }
+
+    /**
+     * What notes name on the source can be read without a connector -- for a clearing whose capture nothing defined
+     * reads any more -- each name once, and a note that cannot be read is passed over.
+     */
+    @Test
+    void whatNotesNameIsReadWithoutAConnector() {
+        store.save("pdk.chain.c1", "tapdata_pg_slot", ConnectorStateCodec.encode("slot-a"));
+        store.save(ConnectorStateNamespace.of(P1), "tapdata_pg_slot", ConnectorStateCodec.encode("slot-a"));
+        store.save(ConnectorStateNamespace.of(new PipelineNode("p2", "src")), "tapdata_pg_slot",
+                new byte[]{9, 9});
+
+        assertThat(PdkCapturePort.namedIn(store, List.of("pdk.chain.c1", ConnectorStateNamespace.of(P1),
+                ConnectorStateNamespace.of(new PipelineNode("p2", "src")), "pdk.chain.empty")))
+                .containsExactly("slot-a");
+    }
+
+    /**
      * A drive that kept no notes anywhere a later one could read set nothing up through them, so nothing is
      * asked of the connector: neither a config naming no node nor a port with no store to keep notes in.
      */

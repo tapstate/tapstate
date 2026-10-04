@@ -572,7 +572,9 @@ final class Synthetic {
      * the slot's name in its notes under {@code tapdata_pg_slot}; each read answers one row naming the slot it
      * read through. Its release function reports the slot its notes name under {@code released} in the
      * {@code channel} map. With {@code unreachable} in the map it then throws, as a source that cannot be
-     * reached does; with {@code hang} it waits until interrupted, and reports that under {@code interrupted}.
+     * reached does; with {@code hang} it waits until interrupted, and reports that under {@code interrupted} --
+     * having first, with {@code writeAfterInterrupt}, tried to write a note, reporting under {@code lateWrite}
+     * whether the write was taken.
      */
     static Path slotKeepingSource(Path dir, String channel) {
         String register = ""
@@ -596,6 +598,14 @@ final class Synthetic {
                 + "      Thread.sleep(Long.MAX_VALUE);"
                 + "    } catch (InterruptedException e) {"
                 + "      channel().put(\"interrupted\", true);"
+                + "      if (channel().containsKey(\"writeAfterInterrupt\")) {"
+                + "        try {"
+                + "          context.getStateMap().put(\"late\", \"written after the release was given up on\");"
+                + "          channel().put(\"lateWrite\", \"written\");"
+                + "        } catch (RuntimeException refused) {"
+                + "          channel().put(\"lateWrite\", \"refused\");"
+                + "        }"
+                + "      }"
                 + "      throw e;"
                 + "    }"
                 + "  }"

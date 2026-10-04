@@ -1,8 +1,10 @@
 package io.tapstate.app;
 
 import io.tapstate.adapters.pdk.ConnectorStateNamespace;
+import io.tapstate.adapters.pdk.PdkCapturePort;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.Settings;
@@ -21,6 +23,7 @@ import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.StartFrom;
 import io.tapstate.spi.capture.CapturePlan;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.SourceModel;
@@ -381,6 +384,15 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         }
         tablesByChain.forEach((chain, tables) -> {
             if (storePort.meta().read(chain.value()).isEmpty()) {
+                // A chain with no record has no position, so connector notes still filed under its name are left
+                // over from an earlier one whose clearing stopped part way -- after the record and the release,
+                // before the notes (see purgeChain). Read as this chain's own they would name a slot that is
+                // gone, and a connector that knows a slot's name creates it again only when its stream starts:
+                // whatever is written to the source while the first load runs would never be read. They go
+                // before the record is created, while nothing can have opened a connector over them yet; another
+                // member seeding the same chain at the same moment is the one ordering this cannot give, as for
+                // the record itself.
+                dropChainNotes(chain.value());
                 try {
                     storePort.meta().create(chain.value(), retentionByChain.get(chain));
                 } catch (IllegalStateException alreadySeeded) {
@@ -1237,23 +1249,42 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      *
      * <p>In that order because of what each way of stopping part way leaves behind. Stopped after the record,
      * a clearing leaves a slot nothing needs, or notes naming one that is gone, and the next run on the chain
-     * starts from a record with no position: it reads its source as a first run does, and its connector picks
-     * the slot back up or creates it again. Dropped last, the record would outlive a slot that is gone, and the
-     * next run would resume from a position the source no longer keeps -- quietly skipping whatever happened
-     * in between. What this order gives up is finding left-behind notes again: once the record is gone, a
-     * later clearing has nothing to look them up by, and a run started afresh on the same source reads them as
-     * its own. No order avoids both, because the release needs the notes to find what it lets go of.
+     * starts from a record with no position: it reads its source as a first run does, and the notes left over
+     * are dropped before that record is created (see requestSharedSelections). Dropped last, the record would
+     * outlive a slot that is gone, and the next run would resume from a position the source no longer keeps --
+     * quietly skipping whatever happened in between. The notes cannot go first either, because the release
+     * needs them to find what it lets go of.
      *
      * <p>A source that refuses is said and left as it is. The state is cleared either way: a clearing that
      * failed over a source it cannot reach would leave a pipeline that can neither keep its state nor let go of
      * it. What cannot be let go of on this side -- the record, the notes -- fails the step like any other.
      */
     private void purgeChain(String chainId, String pipelineId, SourceReaders readers) {
+        List<CaptureRunSpec> read = readers.of(new MiningChainId(chainId));
+        // Read while the record still says who was on the chain: where no source defined now reads it, what the
+        // notes name on the source is all there is to point at.
+        List<String> named = read.isEmpty() ? namedInTheNotesOf(chainId) : List.of();
         storePort.meta().dropChain(chainId);
-        releaseOnTheSource(pipelineId, chainId, readers.of(new MiningChainId(chainId)));
+        releaseOnTheSource(pipelineId, chainId, read, named);
+        dropChainNotes(chainId);
+    }
+
+    /** Drops the connector notes filed under a physical capture, and the markers their migration keeps. */
+    private void dropChainNotes(String chainId) {
         String connectorNamespace = ConnectorStateNamespace.ofShared(chainId);
         storePort.keyedState().dropNamespace(connectorNamespace);
         storePort.keyedState().dropNamespace(ConnectorStateNamespace.migrationOf(connectorNamespace));
+    }
+
+    /** What the chain's notes, and the notes of each source recorded on it, name on the source. */
+    private List<String> namedInTheNotesOf(String chainId) {
+        List<String> namespaces = new ArrayList<>();
+        namespaces.add(ConnectorStateNamespace.ofShared(chainId));
+        for (ConsumerOffset consumer : storePort.meta().consumerOffsets(chainId)) {
+            SrsConsumerId.sourceOf(consumer.pipelineId()).ifPresent(source -> namespaces.add(ConnectorStateNamespace.of(
+                    new PipelineNode(SrsConsumerId.pipelineOf(consumer.pipelineId()), source))));
+        }
+        return PdkCapturePort.namedIn(storePort.keyedState(), namespaces);
     }
 
     /**
@@ -1261,14 +1292,15 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      * go of what it set up on the source for the chain. Once per chain, never once per source: every source
      * on a chain reads it through the same notes, and a chain read directly has one source.
      */
-    private void releaseOnTheSource(String pipelineId, String chainId, List<CaptureRunSpec> read) {
+    private void releaseOnTheSource(String pipelineId, String chainId, List<CaptureRunSpec> read, List<String> named) {
         Optional<CaptureRunSpec> reader = read.stream()
                 .filter(spec -> CapturePlan.forReadMode(spec.readMode()).cdc())
                 .findFirst();
         if (reader.isEmpty()) {
             LOG.warn("Cleared chain {} of pipeline {}, but no source the pipeline is defined to read reads it any "
-                    + "more, so whatever its connector set up on the source to read it is left there", chainId,
-                    pipelineId);
+                    + "more, so what its connector set up on the source to read it is left there; remove it on "
+                    + "the source by hand: {}", chainId, pipelineId,
+                    named.isEmpty() ? "nothing its notes name" : String.join(", ", named));
             return;
         }
         CaptureRunSpec spec = reader.get();

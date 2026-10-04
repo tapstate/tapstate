@@ -115,14 +115,6 @@ public final class CaptureHealth {
     }
 
     /**
-     * Counts one row this run received, and what its payload weighed. Called at every point a source hands
-     * one over, and nowhere else.
-     *
-     * <p>Both readings are taken off the one event in the one call, so neither can drift onto a different
-     * set of arrivals than the other. What is added for weight is the product's own definition of a row's
-     * payload and not a figure read off a driver or a serializer, so it does not move when either does.
-     */
-    /**
      * How many acknowledgements in a row have failed to reach the source: each failure counts one more, and
      * the next one that goes through puts it back to nought. A count that keeps climbing says the source is
      * not being released at all.
@@ -169,6 +161,14 @@ public final class CaptureHealth {
                 acknowledgeFailure instanceof TapstateException coded ? coded.code().code() : null);
     }
 
+    /**
+     * Counts one row this run received, and what its payload weighed. Called at every point a source hands
+     * one over, and nowhere else.
+     *
+     * <p>Both readings are taken off the one event in the one call, so neither can drift onto a different
+     * set of arrivals than the other. What is added for weight is the product's own definition of a row's
+     * payload and not a figure read off a driver or a serializer, so it does not move when either does.
+     */
     void received(Envelope event) {
         received.computeIfAbsent(event.src(), table -> new ConcurrentHashMap<>())
                 .merge(event.op().symbol(), 1L, Long::sum);

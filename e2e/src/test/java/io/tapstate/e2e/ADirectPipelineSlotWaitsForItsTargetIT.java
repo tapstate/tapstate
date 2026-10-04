@@ -23,9 +23,9 @@ import org.junit.jupiter.api.Test;
  * replay from here, which is why the slot has to wait for the target.
  *
  * <p>The target is a MongoDB of its own that the case freezes -- its processes stop while its connections
- * stay open, which is what a target going away looks like from the pipeline. Fifty rows are written while it
+ * stay open, which is what a target going away looks like from the pipeline. Five rows are written while it
  * is frozen: they are read, and none of them lands. A source told how far it had been read rather than how
- * far that had landed would be let go of past all fifty; killed then, the restarted process would ask for
+ * far that had landed would be let go of past all five; killed then, the restarted process would ask for
  * what comes after them, the source would never send them again, and the target would stay short with
  * nothing reported.
  *

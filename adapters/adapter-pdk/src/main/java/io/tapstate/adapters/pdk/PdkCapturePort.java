@@ -96,19 +96,21 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
     private static final long ACKNOWLEDGE_WARNING_INTERVAL_NANOS = Duration.ofMinutes(1).toNanos();
 
     /**
-     * The longest a release waits for its connector to let go of what it set up on the source. A source that
-     * cannot be reached usually says so within its driver's connect timeout; one that accepts a connection and
-     * then never answers would otherwise hold the clearing that asked -- and everything waiting behind it --
-     * for as long as it stays silent.
+     * The longest a release waits for its connector to let go of what it set up on the source. Clearing a
+     * pipeline waits on it, on the thread that also keeps renewing this member's claims on the pipelines it
+     * drives -- every 10 s on a 30 s lease by default -- so a release has to leave that room. Ten seconds is
+     * long enough for a source that answers, where letting go of a slot takes well under one, and for a
+     * PostgreSQL driver's own 10 s connect timeout to answer for a source that cannot be reached.
      */
-    private static final Duration DEFAULT_RELEASE_TIMEOUT = Duration.ofSeconds(60);
+    private static final Duration DEFAULT_RELEASE_TIMEOUT = Duration.ofSeconds(10);
 
     /**
-     * Per connector, the notes naming something it set up on its source that its release function lets go of.
-     * Read only to say what is left there when a release fails.
+     * The notes a connector keeps to name something it set up on its source that its release function lets go
+     * of: the postgres connector, and the connectors built on it, keep their replication slot's name under
+     * this key. Read for any connector, only to say what a release asks to let go of, and what is left there
+     * when it fails.
      */
-    static final Map<String, List<String>> NOTES_NAMING_SOURCE_RESOURCES =
-            Map.of("postgres", List.of("tapdata_pg_slot"));
+    static final List<String> NOTES_NAMING_SOURCE_RESOURCES = List.of("tapdata_pg_slot");
 
     private final ConnectorProvisioner provisioner;
     private final KeyedStateStore stateStore;
@@ -468,14 +470,16 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
      * name, say, and lets go of that on the source. A connector that registered no release function set
      * nothing up there that it knows to let go of.
      *
-     * <p>What the notes name on the source is read before the connector is asked, so that a release the source
-     * refuses can still say what is left there to remove by hand. Which notes name such a thing is the
-     * connector's own knowledge; {@link #NOTES_NAMING_SOURCE_RESOURCES} lists what is known of it, and a
-     * connector it does not list is still released and still answered for, only without the names.
+     * <p>What the notes name on the source is read before the connector is asked, so that the release can be
+     * said, and a release the source refuses can still say what is left there to remove by hand. Which notes
+     * name such a thing is the connector's own knowledge; {@link #NOTES_NAMING_SOURCE_RESOURCES} lists what is
+     * known of it, and a connector keeping nothing under it is still released and answered for, only without
+     * the names.
      *
      * <p>The connector is driven on a thread of its own and waited for a bounded time. One that has not
-     * answered by then is answered for as a refusal and left to finish, or not, by itself: the clearing that
-     * asked goes on either way.
+     * answered by then is answered for as a refusal and left to finish, or not, by itself -- without its notes:
+     * from then on they refuse it, because they are the caller's to drop, and a run started over the same
+     * source since may be keeping its own in them.
      */
     @Override
     public Optional<TapstateException> release(CaptureConfig config) {
@@ -484,15 +488,22 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
             // Nothing was kept anywhere a later drive could read it, so nothing was set up through it either.
             return Optional.empty();
         }
+        FencedStateStore notes = new FencedStateStore(stateStore);
         AtomicReference<List<String>> named = new AtomicReference<>();
         CompletableFuture<Void> released = new CompletableFuture<>();
         Thread thread = new Thread(() -> {
             try {
-                PdkConnector connector = open(config);
+                PdkConnector connector = PdkConnector.open(config.connectorId(),
+                        provisioner.resolve(config.connectorId()), config.settings(), config.node(), notes,
+                        config.sharedNotes());
                 try {
-                    named.set(namedOnTheSource(connector, config.connectorId()));
+                    List<String> names = namedOnTheSource(connector);
+                    named.set(names);
                     ReleaseExternalFunction release = connector.functions().getReleaseExternalFunction();
                     if (release != null) {
+                        LOG.info("connector {} is letting go of what it set up on its source to read changes ({})",
+                                config.connectorId(),
+                                names.isEmpty() ? "nothing its notes name" : String.join(", ", names));
                         connector.underLoader(() -> {
                             release.release(connector.context());
                             return null;
@@ -522,9 +533,11 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
                 throw fatal;
             }
         } catch (TimeoutException silent) {
+            notes.fence();
             thread.interrupt();
-            failure = new TimeoutException("the source did not answer within " + releaseTimeout.toSeconds() + "s");
+            failure = new TimeoutException("the source did not answer within " + releaseTimeout.toMillis() + " ms");
         } catch (InterruptedException interrupted) {
+            notes.fence();
             thread.interrupt();
             Thread.currentThread().interrupt();
             failure = interrupted;
@@ -537,10 +550,31 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
                 failure));
     }
 
+    /**
+     * What the notes kept under {@code namespaces} name on the source, for a caller that has no connector to open
+     * over them -- one clearing a capture nothing defined reads any more. Best effort: a value that cannot be read
+     * is passed over, because this only ever feeds what is said.
+     */
+    public static List<String> namedIn(KeyedStateStore store, List<String> namespaces) {
+        Objects.requireNonNull(store, "store");
+        java.util.LinkedHashSet<String> named = new java.util.LinkedHashSet<>();
+        for (String namespace : namespaces) {
+            for (String key : NOTES_NAMING_SOURCE_RESOURCES) {
+                try {
+                    store.load(namespace, key).map(ConnectorStateCodec::decode).map(String::valueOf)
+                            .ifPresent(named::add);
+                } catch (RuntimeException unreadable) {
+                    // Only the warning loses this name.
+                }
+            }
+        }
+        return List.copyOf(named);
+    }
+
     /** What {@code connector}'s notes name on its source, read as its own drive would read them. */
-    private static List<String> namedOnTheSource(PdkConnector connector, String connectorId) {
+    private static List<String> namedOnTheSource(PdkConnector connector) {
         List<String> named = new ArrayList<>();
-        for (String key : NOTES_NAMING_SOURCE_RESOURCES.getOrDefault(connectorId, List.of())) {
+        for (String key : NOTES_NAMING_SOURCE_RESOURCES) {
             try {
                 Object value = connector.context().getStateMap().get(key);
                 if (value != null) {
@@ -551,6 +585,67 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
             }
         }
         return List.copyOf(named);
+    }
+
+    /**
+     * The notes a release reads and writes through, for as long as its caller waits on it. Once the caller has
+     * given up, every access refuses, so a connector still running past that point can neither bring back
+     * notes the caller has dropped since nor read ones a later run has started keeping.
+     */
+    private static final class FencedStateStore implements KeyedStateStore {
+
+        private final KeyedStateStore store;
+        private volatile boolean fenced;
+
+        private FencedStateStore(KeyedStateStore store) {
+            this.store = store;
+        }
+
+        void fence() {
+            fenced = true;
+        }
+
+        private KeyedStateStore store() {
+            if (fenced) {
+                throw new IllegalStateException("the release was given up on, and its notes are no longer its own");
+            }
+            return store;
+        }
+
+        @Override
+        public Optional<byte[]> load(String namespace, String key) {
+            return store().load(namespace, key);
+        }
+
+        @Override
+        public Map<String, byte[]> loadAll(String namespace, java.util.Collection<String> keys) {
+            return store().loadAll(namespace, keys);
+        }
+
+        @Override
+        public void save(String namespace, String key, byte[] state) {
+            store().save(namespace, key, state);
+        }
+
+        @Override
+        public Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state) {
+            return store().saveIfAbsent(namespace, key, state);
+        }
+
+        @Override
+        public void delete(String namespace, String key) {
+            store().delete(namespace, key);
+        }
+
+        @Override
+        public void dropNamespace(String namespace) {
+            store().dropNamespace(namespace);
+        }
+
+        @Override
+        public long count(String namespace) {
+            return store().count(namespace);
+        }
     }
 
     // ---- drive helpers ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@ import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import io.tapstate.adapters.pdk.ConnectorError;
+import io.tapstate.adapters.pdk.ConnectorNotes;
 import io.tapstate.adapters.pdk.ConnectorStateNamespace;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.FromRef;
@@ -92,6 +93,26 @@ class ClearingLetsGoOfWhatTheSourceSetUpTest {
     }
 
     /**
+     * The same where this process owns the captures it tails, which is how a server always runs: the release
+     * goes through the attacher that starts its runs.
+     */
+    @Test
+    void theLastPipelineToClearItsStateLetsGoOfTheSlotWhereCapturesAreOwned() {
+        Fixture fixture = new Fixture(true, true, true);
+        fixture.coordinator.startCapture("p");
+        fixture.coordinator.startCapture("q");
+
+        fixture.coordinator.stopCapture("p", true);
+        assertThat(fixture.released).as("q still reads through the slot").isEmpty();
+
+        fixture.coordinator.stopCapture("q", true);
+        assertThat(fixture.released).singleElement().satisfies(released -> {
+            assertThat(released.pipelineId()).isEqualTo("q");
+            assertThat(released.chainRecordGone()).isTrue();
+        });
+    }
+
+    /**
      * A stop asked to keep the state lets go of nothing, last one off or not -- and the same pipeline's
      * clearing stop afterwards does, so this cannot pass for an implementation that never releases.
      */
@@ -161,6 +182,8 @@ class ClearingLetsGoOfWhatTheSourceSetUpTest {
         fixture.store.meta().create(elsewhere, null);
         fixture.store.meta().upsertConsumerOffset(elsewhere, new ConsumerOffset(
                 SrsConsumerId.of("p", "orders_src").value(), Map.of(), null));
+        fixture.store.keyedState().save(ConnectorStateNamespace.ofShared(elsewhere), "tapdata_pg_slot",
+                ConnectorNotes.encode("slot-of-the-old-settings"));
 
         fixture.coordinator.stopCapture("p", true);
 
@@ -168,7 +191,10 @@ class ClearingLetsGoOfWhatTheSourceSetUpTest {
         assertThat(fixture.released).as("nothing defined reads it, so nothing is released through it").isEmpty();
         assertThat(written.list).filteredOn(event -> event.getLevel() == Level.WARN)
                 .singleElement()
-                .satisfies(event -> assertThat(event.getFormattedMessage()).contains(elsewhere).contains("p"));
+                .satisfies(event -> assertThat(event.getFormattedMessage())
+                        .contains(elsewhere).contains("p").contains("slot-of-the-old-settings"));
+        assertThat(fixture.store.keyedState().count(ConnectorStateNamespace.ofShared(elsewhere)))
+                .as("the notes went with the chain once their slot was named").isZero();
     }
 
     /**
@@ -210,14 +236,30 @@ class ClearingLetsGoOfWhatTheSourceSetUpTest {
         private Optional<TapstateException> refusal = Optional.empty();
 
         Fixture(boolean pThroughTheChain, boolean qThroughTheChain) {
+            this(pThroughTheChain, qThroughTheChain, false);
+        }
+
+        /** With {@code owned}, the coordinator owns the captures it tails, as a server's does. */
+        Fixture(boolean pThroughTheChain, boolean qThroughTheChain, boolean owned) {
             InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
             artifacts.save(source);
             artifacts.save(pipeline("p", pThroughTheChain));
             artifacts.save(pipeline("q", qThroughTheChain));
             store = new InMemoryStorePort(artifacts);
             srsCoordinator = new SrsCoordinator(store.meta());
-            coordinator = new StoreBackedPipelineCaptureCoordinator(
-                    store, new CaptureStarter() {
+            coordinator = owned
+                    ? new StoreBackedPipelineCaptureCoordinator(store, new CaptureAttacher() {
+                        @Override
+                        public CaptureRun start(CaptureRunSpec spec, CaptureHandoff handoff, boolean startTail) {
+                            return Fixture.this.start(spec);
+                        }
+
+                        @Override
+                        public Optional<TapstateException> release(CaptureRunSpec spec) {
+                            return Fixture.this.release(spec);
+                        }
+                    }, srsCoordinator, new SnapshotBuffer())
+                    : new StoreBackedPipelineCaptureCoordinator(store, new CaptureStarter() {
                         @Override
                         public CaptureRun start(CaptureRunSpec spec, CaptureHandoff handoff) {
                             return Fixture.this.start(spec);
@@ -225,11 +267,14 @@ class ClearingLetsGoOfWhatTheSourceSetUpTest {
 
                         @Override
                         public Optional<TapstateException> release(CaptureRunSpec spec) {
-                            released.add(new Released(spec.pipelineId(), spec.srsEnabled(), chainRecordGone(),
-                                    sharedNotes() > 0));
-                            return refusal;
+                            return Fixture.this.release(spec);
                         }
                     }, srsCoordinator, new SnapshotBuffer());
+        }
+
+        private Optional<TapstateException> release(CaptureRunSpec spec) {
+            released.add(new Released(spec.pipelineId(), spec.srsEnabled(), chainRecordGone(), sharedNotes() > 0));
+            return refusal;
         }
 
         void refuseWith(TapstateException refused) {

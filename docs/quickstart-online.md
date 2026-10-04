@@ -777,7 +777,7 @@ This clears what the pipeline accumulated:
   - what its connectors had kept for a later drive
   - the position it had read and confirmed up to
   - what the shared mining chain had read, once this is the last pipeline reading it
-  - any replication slot its source connector created on the source database, once this is the last pipeline reading through it
+  - what its source connector set up on the source to read changes, such as a replication slot, once this is the last pipeline reading through it
 The run after this one has no position to carry on from.
 Your target database is not touched either way.
 Clear order_pipeline? Type yes to go ahead [no]: yes

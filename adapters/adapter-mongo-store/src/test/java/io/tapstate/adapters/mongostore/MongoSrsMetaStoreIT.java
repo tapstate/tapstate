@@ -1995,7 +1995,6 @@ class MongoSrsMetaStoreIT {
         void run(MongoSrsMetaStore store, MongoCollection<Document> collection) throws Exception;
     }
 
-    /** Runs a test body against a fresh meta store over a clean srs_meta collection on the replica-set. */
     /**
      * The position a source may be told to release up to is read with a majority read concern, and nothing but
      * that position: a write only the old primary had, rolled back in a failover, must never reach a source
@@ -2043,6 +2042,7 @@ class MongoSrsMetaStoreIT {
         }
     }
 
+    /** Runs a test body against a fresh meta store over a clean srs_meta collection on the replica-set. */
     private static void withStore(StoreTest test) {
         withStoreAt(Clock.systemUTC(), test);
     }

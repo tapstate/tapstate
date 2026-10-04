@@ -21,8 +21,10 @@ public interface Subscription extends AutoCloseable {
      *       with a majority read concern: it is the position tapstate itself would resume from. A source
      *       told anything less could release changes that a restart then asks it for again, and they
      *       would be gone.</li>
-     *   <li><b>Never backwards.</b> Within one subscription, no position is passed that is behind one
-     *       passed before it. The same one may be passed again.</li>
+     *   <li><b>Forward, but not checked.</b> Positions are passed in the order tapstate came to hold them,
+     *       which is forward as a pipeline runs. A position written back by hand is the one exception: it can
+     *       be behind one passed before it, and a source keeps whatever it has already released. The same one
+     *       may be passed again.</li>
      * </ul>
      *
      * <p>What the call promises back:

@@ -78,15 +78,16 @@ public final class PipelineStateInventory {
             PipelineStateHolding.Scope.CHAIN);
 
     /**
-     * What a source connector set up on the source database to read the chain's changes -- a PostgreSQL
-     * replication slot -- which the source keeps its change log for until it is let go of. It goes with the
-     * chain, once this is the last pipeline reading through it; a pipeline reading its source directly has a
-     * chain of its own, so its slot goes with the pipeline. A source that cannot be reached at the time keeps
-     * it, and the clearing goes on and says which one is left to remove there by hand.
+     * What a source connector set up on the source to read the chain's changes -- a PostgreSQL replication
+     * slot above all, which the source keeps its change log for until it is let go of; another connector may
+     * have set up a change feed, or kept a cache of its own. It goes with the chain, once this is the last
+     * pipeline reading through it; a pipeline reading its source directly has a chain of its own, so what was
+     * set up for it goes with the pipeline. A source that cannot be reached at the time keeps it, and the
+     * clearing goes on and says what is left to remove there by hand.
      */
     public static final PipelineStateHolding SOURCE_RESOURCES = PipelineStateHolding.named(
-            "any replication slot its source connector created on the source database, once this is the last "
-                    + "pipeline reading through it",
+            "what its source connector set up on the source to read changes, such as a replication slot, once "
+                    + "this is the last pipeline reading through it",
             PipelineStateHolding.Scope.CHAIN);
 
     private static final List<PipelineStateHolding> VOCABULARY =

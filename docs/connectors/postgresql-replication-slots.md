@@ -45,6 +45,11 @@ goes on moving with the log, the other pipelines go on reading, and the paused p
 log when it runs again. What it has not read takes up room in Tapstate's metadata store instead of your
 database's WAL.
 
+That holds while some pipeline is still reading the source. Pausing keeps the source being read even when the
+paused pipeline is the only one, but stopping the last pipeline that reads a source stops reading it: with
+its state kept, the slot stays where it was until that pipeline starts again, and holds your database's WAL
+in the meantime, as a direct pipeline's does (see below).
+
 ## Tapstate's metadata store holds changes your database has let go of
 
 Once a change is confirmed, PostgreSQL may recycle the WAL that held it, and the only copy of a change a
@@ -100,12 +105,20 @@ from it.
   slot stays after clearing and is yours to drop.
 - A slot you named yourself with `customSlotName` is dropped the same way when `autoClearSlot` is on.
   Turn `autoClearSlot` off to keep it.
+- Set both before the source's pipelines first run. A source's change log is keyed by its connection
+  settings, so editing any of them moves its pipelines onto a new log and a new slot: they read the source
+  again, and the old slot is left for you to drop. Clearing such a pipeline afterwards logs the old slot's
+  name.
+- Deleting a pipeline does not drop its slot, and neither does anything after that. Clear a pipeline's state
+  with `stop <pipeline>` before deleting it if nothing else reads its source.
 - A pipeline that only loads its source (`read_mode: snapshot_only`) still creates a slot when its load
   starts, reads nothing through it afterwards, and clearing it does not drop that slot yet. Drop it by hand
   as below once the load is done.
-- If the source cannot be reached at that moment, or does not answer within a minute, the clearing still
+- If the source cannot be reached at that moment, or does not answer within ten seconds, the clearing still
   completes, and the server logs a warning, `connector.release-failed`, naming the source and the slot.
-  Drop the slot on the source once nothing is using it:
+  The same applies when the session that read through the slot has not ended yet: PostgreSQL drops only a
+  slot nobody holds, and the server logs, before every release, which slot it asked to drop. Drop a slot left
+  behind on the source once nothing is using it:
 
   ```sql
   SELECT pg_drop_replication_slot('<slot_name>');

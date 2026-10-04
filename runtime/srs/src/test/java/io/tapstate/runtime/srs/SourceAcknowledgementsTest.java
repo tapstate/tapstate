@@ -19,6 +19,9 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -82,7 +85,8 @@ class SourceAcknowledgementsTest {
         followed = SourceAcknowledgements.follow(meta, CHAIN, tail, health, false);
         handOver();
 
-        assertThat(meta.durableReads.get()).isEqualTo(2);
+        // At least the two asked for here; the process-wide schedule may add one of its own meanwhile.
+        assertThat(meta.durableReads.get()).isGreaterThanOrEqualTo(2);
         assertThat(meta.recordReads.get()).isEqualTo(recordReads);
         assertThat(tail.told).containsExactly("t2");
     }
@@ -133,7 +137,7 @@ class SourceAcknowledgementsTest {
         followed = SourceAcknowledgements.follow(meta, CHAIN, tail, health, false);
         handOver();
 
-        assertThat(health.consecutiveAcknowledgeFailures()).isEqualTo(2);
+        assertThat(health.consecutiveAcknowledgeFailures()).isGreaterThanOrEqualTo(2);
         assertThat(health.lastAcknowledgeFailureCode()).contains(IoError.STORE_UNAVAILABLE.code());
         assertThat(health.failure()).isEmpty();
         assertThat(tail.told).isEmpty();
@@ -141,6 +145,46 @@ class SourceAcknowledgementsTest {
         meta.failDurableReads.set(false);
         handOver();
         assertThat(tail.told).containsExactly("t2");
+    }
+
+    /**
+     * A read that fails is also said -- the health readings are not where anybody watching the source looks --
+     * but at most once a minute for a tail, however often the schedule finds it failing.
+     */
+    @Test
+    void aReadThatFailsIsSaidAtMostOnceAMinute() {
+        java.util.logging.Logger log = java.util.logging.Logger.getLogger(SourceAcknowledgements.class.getName());
+        List<LogRecord> said = new CopyOnWriteArrayList<>();
+        Handler listening = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                said.add(record);
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        log.addHandler(listening);
+        try {
+            meta.advanceSourceReadOffset(CHAIN, at(2, "t2"));
+            meta.failDurableReads.set(true);
+
+            followed = SourceAcknowledgements.follow(meta, CHAIN, tail, health, false);
+            handOver();
+            handOver();
+
+            assertThat(said).filteredOn(record -> record.getLevel() == Level.WARNING)
+                    .singleElement()
+                    .satisfies(record -> assertThat(record.getMessage())
+                            .contains(CHAIN).contains(IoError.STORE_UNAVAILABLE.code()));
+        } finally {
+            log.removeHandler(listening);
+        }
     }
 
     /** Once the tail is closed nothing more is read for it, and the tail itself is closed. */
