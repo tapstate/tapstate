@@ -12,8 +12,19 @@ import io.tapstate.adapters.mongostore.StoreError;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.RateSample;
+import io.tapstate.core.lifecycle.CheckpointDoc;
+import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.event.Op;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.ConnectorRegistration;
+import io.tapstate.spi.store.SrsLogRecord;
+import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.StorePort;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
+import io.tapstate.spi.store.WorkloadOwner;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
@@ -33,13 +44,16 @@ import org.testcontainers.images.builder.Transferable;
 import org.testcontainers.utility.DockerImageName;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.HexFormat;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
@@ -97,7 +111,7 @@ class ManagedMongoStoreIsolationIT {
     }
 
     @Test
-    void twoClusterUsersCanUseOnlyTheirOwnThreeDatabasesAndRecoverAfterRestart() {
+    void twoClusterUsersCanUseOnlyTheirOwnThreeDatabasesAndRecoverAfterRestart() throws Exception {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         String a = "isolation_a_" + suffix;
         String b = "isolation_b_" + suffix;
@@ -116,8 +130,11 @@ class ManagedMongoStoreIsolationIT {
 
                 for (String metadata : List.of(a, b)) {
                     String user = metadata.equals(a) ? userA : userB;
+                    StorageProof proof;
                     try (ConfigurableApplicationContext first = start(uri(user, metadata), metadata)) {
                         StorePort store = first.getBean(StorePort.class);
+                        proof = writeStorageProof(store, metadata);
+                        assertStorageProof(admin.getDatabase(metadata), store, proof);
                         store.keyedState().save("permissions-proof", "same-key", metadata.getBytes(StandardCharsets.UTF_8));
                         SourceResource views = (SourceResource) store.artifacts().get("views").orElseThrow();
                         try (MongoClient view = MongoClients.create(String.valueOf(views.config().get("uri")))) {
@@ -130,6 +147,7 @@ class ManagedMongoStoreIsolationIT {
                         assertNoProbes(admin, metadata);
                     }
                     try (ConfigurableApplicationContext restarted = start(uri(user, metadata), metadata)) {
+                        assertStorageProof(admin.getDatabase(metadata), restarted.getBean(StorePort.class), proof);
                         assertThat(restarted.getBean(StorePort.class).keyedState().load("permissions-proof", "same-key"))
                                 .hasValueSatisfying(value -> assertThat(value).isEqualTo(metadata.getBytes(StandardCharsets.UTF_8)));
                         assertThat(admin.getDatabase(metadata + "_views").getCollection("proof")
@@ -139,6 +157,85 @@ class ManagedMongoStoreIsolationIT {
                 }
             }
         }
+    }
+
+    private record StorageProof(CheckpointDoc checkpoint, SrsMeta meta, List<SrsLogRecord> log,
+            RateSample sample, List<ConnectorRegistration> connectors) { }
+
+    private static StorageProof writeStorageProof(StorePort store, String cluster) {
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+        store.state().create("permissions-proof", "{\"cluster\":\"" + cluster + "\"}", now);
+        store.meta().create("permissions-chain", "7d");
+        long epoch = store.meta().openEpoch("permissions-chain");
+        ChainPosition position = new ChainPosition(new SourceOrder(epoch, 3), cluster + "/position-3");
+        var claim = store.workloadClaims().acquire(
+                new WorkloadClaimKey(cluster, WorkloadClaimType.CAPTURE, "permissions-capture"),
+                new WorkloadOwner("permissions-node", "permissions-boot"), 1, Duration.ofMinutes(5)).claim();
+        WorkloadClaimFence fence = WorkloadClaimFence.from(claim);
+        List<SrsLogRecord> log = List.of(
+                new SrsLogRecord(cluster + "/position-1", Op.INSERT, 1, null,
+                        Map.of("id", 1, "owner", cluster), 0, fence),
+                new SrsLogRecord(cluster + "/position-2", Op.UPDATE, 2,
+                        Map.of("id", 1, "owner", cluster), Map.of("id", 1, "owner", cluster, "changed", true), 0, fence),
+                new SrsLogRecord(cluster + "/position-3", Op.DELETE, 3,
+                        Map.of("id", 1, "owner", cluster, "changed", true), null, 0, fence));
+        store.srsLog().storeAll("srs.permissions", 1, log);
+        store.meta().advanceSourceReadOffset("permissions-chain", position);
+        assertThat(store.workloadClaims().release(claim)).isTrue();
+        assertThatThrownBy(() -> store.srsLog().storeAll("srs.permissions", 4, List.of(
+                new SrsLogRecord("released-owner-position", Op.INSERT, 4, null, Map.of("id", 2), 0, fence))))
+                .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+        assertThat(store.srsLog().load("srs.permissions", 4)).isEmpty();
+        RateSample sample = new RateSample("permissions-proof", now, Map.of("records.out", 3L), Map.of(), now.minusSeconds(60));
+        store.rateHistory().append(sample);
+        SrsMeta meta = store.meta().read("permissions-chain").orElseThrow();
+        assertThat(meta.sourceRead()).isEqualTo(position);
+        assertThat(meta.epoch()).isEqualTo(epoch).isEqualTo(1);
+        assertThat(meta.retention()).isEqualTo("7d");
+        assertThat(meta.consumerOffsets()).isEmpty();
+        assertThat(meta.schemaHistory()).isEmpty();
+        assertThat(meta.sourceReadAt()).isNotNull().isAfterOrEqualTo(now.minusSeconds(2))
+                .isBeforeOrEqualTo(Instant.now().plusSeconds(2));
+        return new StorageProof(CheckpointDoc.initial("permissions-proof", "{\"cluster\":\"" + cluster + "\"}", now),
+                meta, log, sample, store.connectors().list());
+    }
+
+    private static void assertStorageProof(MongoDatabase database, StorePort store, StorageProof proof) throws Exception {
+        assertThat(store.state().read("permissions-proof")).contains(proof.checkpoint());
+        assertThat(store.meta().read("permissions-chain")).contains(proof.meta());
+        assertThat(store.srsLog().largestSequence("srs.permissions")).isEqualTo(3);
+        for (int index = 0; index < proof.log().size(); index++) {
+            assertThat(store.srsLog().load("srs.permissions", index + 1)).contains(proof.log().get(index));
+        }
+        assertThat(store.srsLog().load("srs.permissions", 4)).isEmpty();
+        assertThat(store.rateHistory().readPage("permissions-proof", proof.sample().observedAt().minusSeconds(1),
+                proof.sample().observedAt().plusSeconds(1), null, 1).entries())
+                .singleElement().satisfies(entry -> assertThat(entry.sample()).isEqualTo(proof.sample()));
+        assertThat(store.connectors().list()).containsExactlyInAnyOrderElementsOf(proof.connectors());
+        assertThat(proof.connectors()).extracting(ConnectorRegistration::connectorId).containsExactlyInAnyOrder(
+                "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql");
+        for (ConnectorRegistration registration : proof.connectors()) {
+            byte[] bytes = store.connectors().artifact(registration.contentHash()).orElseThrow();
+            Path seed = CloudConnectorTestInputs.seedDirectory().resolve(registration.connectorId() + "-connector.jar");
+            assertThat(bytes.length).isEqualTo(Files.size(seed));
+            assertThat(HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes)))
+                    .isEqualTo(registration.contentHash());
+            MessageDigest expected = MessageDigest.getInstance("SHA-256");
+            try (var input = Files.newInputStream(seed)) {
+                byte[] buffer = new byte[8192];
+                for (int length; (length = input.read(buffer)) != -1;) expected.update(buffer, 0, length);
+            }
+            assertThat(HexFormat.of().formatHex(expected.digest())).isEqualTo(registration.contentHash());
+        }
+        assertThat(SystemCollections.PIPELINE_STATE.on(database).countDocuments(new Document("_id", "permissions-proof"))).isEqualTo(1);
+        assertThat(SystemCollections.SRS_META.on(database).countDocuments(new Document("_id", "permissions-chain"))).isEqualTo(1);
+        assertThat(SystemCollections.SRS_LOG.on(database).countDocuments()).isEqualTo(3);
+        Document history = SystemCollections.PIPELINE_RATE_HISTORY.on(database)
+                .find(new Document("pipelineId", "permissions-proof")).first();
+        assertThat(history.getDate("observedAt").toInstant()).isEqualTo(proof.sample().observedAt());
+        assertThat(database.getCollection("connector_artifacts.files").countDocuments()).isEqualTo(7);
+        assertThat(database.getCollection("connector_artifacts.chunks").countDocuments()).isGreaterThan(7);
+        assertThat(historyIndex(database).get("expireAfterSeconds", Number.class).longValue()).isEqualTo(Duration.ofDays(15).toSeconds());
     }
 
     private ConfigurableApplicationContext start(String metadataUri, String clusterId) {
