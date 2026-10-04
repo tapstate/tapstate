@@ -472,9 +472,12 @@ public final class CaptureRunUnit {
         private final AtomicLong batchOrder;
         private volatile boolean closed;
         private List<String> serving = List.of();
-        private Subscription subscription;
+        /** The stream running now; read without the lock, so an acknowledgement never waits on a widening. */
+        private volatile Subscription subscription;
         private final String firstSeam;
         private long nextTrim;
+        /** Tells the source how far it may release, through whichever stream is running when it is told. */
+        private final Subscription acknowledgements;
 
         private SharedTail(CaptureRunSpec spec, String chain, long epoch, String seam,
                 CaptureHealth health, SrsLogStore log) {
@@ -489,6 +492,21 @@ public final class CaptureRunUnit {
                     .map(position -> Math.max(0L, position.order().seq())).orElse(0L);
             this.batchOrder = new AtomicLong(recorded);
             open();
+            // A write-through checkpoint only: on this capture a restart resumes from nothing else. A widening
+            // replaces the stream, and the stream that replaced it is the one told from then on.
+            this.acknowledgements = SourceAcknowledgements.follow(meta, chain, new Subscription() {
+                @Override
+                public void acknowledge(SourcePosition durable) {
+                    Subscription current = subscription;
+                    if (current != null) {
+                        current.acknowledge(durable);
+                    }
+                }
+
+                @Override
+                public void close() {
+                }
+            }, health, true);
         }
 
         private synchronized void open() {
@@ -585,6 +603,7 @@ public final class CaptureRunUnit {
             }
             closed = true;
             sharedTails.remove(chain, this);
+            acknowledgements.close();
             if (subscription != null) {
                 subscription.close();
             }
@@ -672,7 +691,8 @@ public final class CaptureRunUnit {
             }
             CaptureStart minerStart = tailStart(meta, cid, spec.consumerId(), ownSeam, CaptureStart.present());
             refuseAnInstantThisBufferWillNeverReach(spec.startFrom(), minerStart, spec.retention());
-            return Optional.of(CdcPhase.run(port, spec.config(), minerStart, routes, health));
+            return Optional.of(SourceAcknowledgements.follow(
+                    meta, cid, CdcPhase.run(port, spec.config(), minerStart, routes, health), health, false));
         }
         if (plan.directTail()) {
             // Direct capture has no shared replay log. It resumes from this channel's safely processed
@@ -686,7 +706,7 @@ public final class CaptureRunUnit {
             String anchor = start instanceof CaptureStart.Resume resume ? resume.position().token() : null;
             meta.beginDirectCapture(directChain, spec.consumerId(), epoch, anchor);
             Map<String, Long> targets = new LinkedHashMap<>();
-            return Optional.of(port.cdc(
+            Subscription direct = port.cdc(
                     spec.config(), start, health.recording(new CaptureStartedListener() {
                         @Override
                         public void onStart(SourcePosition position) {
@@ -714,7 +734,9 @@ public final class CaptureRunUnit {
                                     Map.copyOf(targets)));
                             ordered.forEach(passthrough);
                         }
-                    })));
+                    }));
+            // Bounded by what this channel's targets confirmed: a direct channel has no log to replay from.
+            return Optional.of(SourceAcknowledgements.follow(meta, directChain, direct, health, false));
         }
         return Optional.empty();
     }
