@@ -25,7 +25,7 @@ import java.util.zip.ZipInputStream;
 /** Passive, artifact-pinned observation of one native pipeline; fault actions belong to its caller. */
 final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     interface OwnedLauncher { RealProcessServer launch(Path jar, List<String> jvmArguments) throws Exception; }
-    enum Target { JOB, ADMISSION, SUBMIT, LOG, OFFER, VISIBLE, PRODUCE, PREPARE, FOLDER_FORGET, EXPORT_FORGET, EXPORT_INCARNATION,
+    enum Target { JOB, ADMISSION, REPLACEMENT_ADMISSION, SUBMIT, LOG, OFFER, VISIBLE, PRODUCE, PREPARE, FOLDER_FORGET, EXPORT_FORGET, EXPORT_INCARNATION,
         PUBLISHER_SWEEP, EXPORT_SWEEP, FOLDER_SWEEP }
     record Binding(String type, String method, String descriptor, String origin,
             String codeSha256, long loaderId, List<Integer> returns) { }
@@ -48,11 +48,15 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             fence = Map.copyOf(fence); members = List.copyOf(members); claim = Map.copyOf(claim);
         }
     }
+    record ClaimedReplacement(ClaimedSubmission submission, long successorAdmissionObjectId,
+            long reservationObjectId, long advancedClaimObjectId, Map<String, Object> reservation) {
+        ClaimedReplacement { reservation = Map.copyOf(reservation); }
+    }
     record Boundary(String phase, long sequence, String jarSha256, String pipelineId,
             Map<Target, Binding> bindings, Map<Target, Counts> counts, List<Map<String, Object>> records,
             List<AuthorityReceipt> authorityReceipts, Set<String> unverified, Set<String> decodedLayouts,
             String vmVersion, long events, long handlingNanos, int openCalls, boolean queueDrained,
-            boolean ownedVmDeath, boolean ownedVmDisconnected) {
+            boolean ownedVmDeath, boolean ownedVmDisconnected, boolean replacementObservationEnabled) {
         Boundary {
             bindings = Map.copyOf(bindings); counts = Map.copyOf(counts); records = List.copyOf(records);
             authorityReceipts = List.copyOf(authorityReceipts); unverified = Set.copyOf(unverified);
@@ -63,7 +67,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                     count.inFlight() == 0 && count.entries() == count.normalReturns() + count.exceptionalExits());
         }
         boolean decodedAndAuthorityBound() {
-            return unverified.isEmpty() && bindings.size() == Target.values().length
+            return unverified.isEmpty() && bindings.size() == Target.values().length - (replacementObservationEnabled ? 0 : 1)
                     && invocationDrainComplete() && !authorityReceipts.isEmpty();
         }
         Map<String, Object> evidence() {
@@ -88,7 +92,9 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             out.put("vmVersion", vmVersion); out.put("events", events); out.put("handlingNanos", handlingNanos);
             out.put("openCalls", openCalls); out.put("queueDrained", queueDrained);
             out.put("ownedVmDeath", ownedVmDeath); out.put("ownedVmDisconnected", ownedVmDisconnected);
-            out.put("submissionObservationMode", "ORDINARY_ADMISSION_ONLY");
+            out.put("submissionObservationMode", replacementObservationEnabled
+                    ? "ORDINARY_AND_REPLACEMENT_ADMISSION" : "ORDINARY_ADMISSION_ONLY");
+            out.put("replacementObservationEnabled", replacementObservationEnabled);
             out.put("passiveObserver", true); out.put("performanceAcceptanceEligible", false);
             return Map.copyOf(out);
         }
@@ -97,8 +103,9 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     private record Image(String origin, Map<String, byte[]> methods, Map<String, String> fields) { }
     private record Site(Target target, boolean entry) { }
     private record UnqualifiedEntry(Target target, long thread, long receiver, int depth, long eventOrder) { }
+    private record Replacement(long argumentId, long reservationId, Long advancedClaimId, Map<String, Object> reservation) { }
     private record Admission(long objectId, long ownershipReceiverId, Map<String, Object> fence,
-            List<String> members, Map<String, Object> claim) { }
+            List<String> members, Map<String, Object> claim, Optional<Replacement> replacement) { }
     private static final class Totals { long entries, normal, exceptional; }
     private static final class Call {
         final long id;
@@ -144,6 +151,8 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                     "(Ljava/lang/String;Lcom/hazelcast/jet/Job;)Lio/tapstate/runtime/engine/Engine$ExecutionJob;", 2, 0),
             new Spec(Target.ADMISSION, "io.tapstate.app.PipelineActuationOwnership", "beginExecution",
                     "(Ljava/lang/String;)" + EXECUTION, 1, 0),
+            new Spec(Target.REPLACEMENT_ADMISSION, "io.tapstate.app.PipelineActuationOwnership", "adoptAdmission",
+                    "(Lio/tapstate/spi/store/SuccessorAdmission;)" + EXECUTION, 1, -1),
             new Spec(Target.SUBMIT, "io.tapstate.app.EngineLifecycleActuator$2", "submit", "()V", 0, -1),
             new Spec(Target.LOG, "io.tapstate.core.logging.RingBufferLogSink", "append",
                     "(Ljava/lang/String;Lio/tapstate/core/logging/LogSink$Scope;Lio/tapstate/core/logging/LogLine;)V", 3, 0),
@@ -172,6 +181,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
 
     private final Path jar;
     private final String sha, pipeline;
+    private final boolean replacementObservationEnabled;
     private final RealProcessServer server;
     private final VirtualMachine vm;
     private final String vmVersion;
@@ -189,6 +199,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     private final Map<Long, CapturedJob> jobs = new LinkedHashMap<>();
     private final Map<Long, Admission> admissions = new LinkedHashMap<>();
     private final Map<Long, ClaimedSubmission> claimedSubmissions = new LinkedHashMap<>();
+    private final Map<Long, ClaimedReplacement> claimedReplacements = new LinkedHashMap<>();
     private final List<Map<String, Object>> records = new ArrayList<>();
     private final List<AuthorityReceipt> authorities = new ArrayList<>();
     private final Set<String> unverified = new LinkedHashSet<>(), layouts = new LinkedHashSet<>();
@@ -204,10 +215,12 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     private UnqualifiedEntry lastUnqualifiedEntry;
 
     private NativeTelemetryIdentityJdiSession(Path jar, String sha, String pipeline,
-            Map<String, Image> images, RealProcessServer server, VirtualMachine vm) throws Exception {
+            Map<String, Image> images, RealProcessServer server, VirtualMachine vm, boolean replacementObservationEnabled) throws Exception {
         this.jar = jar; this.sha = sha; this.pipeline = pipeline; this.images = images;
         this.server = server; this.vm = vm; this.vmVersion = vm.version();
+        this.replacementObservationEnabled = replacementObservationEnabled;
         for (Spec spec : SPECS) {
+            if (spec.target() == Target.REPLACEMENT_ADMISSION && !replacementObservationEnabled) { continue; }
             totals.put(spec.target(), new Totals());
             Image image = images.get(spec.type());
             if (image == null || !image.methods().containsKey(spec.method() + spec.descriptor())) {
@@ -233,6 +246,17 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     /** A cluster caller can supply its existing routable owned launch without changing debug ownership. */
     static NativeTelemetryIdentityJdiSession start(Path input, String expectedSha256, String pipelineId,
             OwnedLauncher launcher) throws Exception {
+        return start(input, expectedSha256, pipelineId, launcher, false);
+    }
+
+    /** A single owned debugger also observes the actual atomic replacement admission and native binding. */
+    static NativeTelemetryIdentityJdiSession startWithReplacementObservation(Path input, String expectedSha256,
+            String pipelineId, OwnedLauncher launcher) throws Exception {
+        return start(input, expectedSha256, pipelineId, launcher, true);
+    }
+
+    private static NativeTelemetryIdentityJdiSession start(Path input, String expectedSha256, String pipelineId,
+            OwnedLauncher launcher, boolean replacementObservationEnabled) throws Exception {
         Objects.requireNonNull(expectedSha256); Objects.requireNonNull(pipelineId);
         Objects.requireNonNull(launcher);
         if (!expectedSha256.matches("[0-9a-f]{64}") || pipelineId.isBlank() || pipelineId.length() > 256) {
@@ -263,7 +287,8 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             vm = connector.accept(options);
             if (!vm.canGetBytecodes() || !vm.canGetMethodReturnValues()) { throw invalid("required mirror capability missing"); }
             connector.stopListening(options); listening = false;
-            session = new NativeTelemetryIdentityJdiSession(jar, expectedSha256, pipelineId, images, server, vm);
+            session = new NativeTelemetryIdentityJdiSession(jar, expectedSha256, pipelineId, images, server, vm,
+                    replacementObservationEnabled);
             server.awaitHealthy(); session.check();
             return session;
         } catch (Throwable problem) {
@@ -337,6 +362,22 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                             && receipt.clusterId().equals(submission.job().job().get("clusterId")))
                     .reduce((first, second) -> {
                         if (!first.equals(second)) { throw invalid("multiple claimed submissions match one authority scope"); }
+                        return first;
+                    });
+        }
+    }
+
+    Optional<ClaimedReplacement> claimedReplacement(AuthorityReceipt receipt) {
+        synchronized (lock) {
+            check();
+            if (!replacementObservationEnabled || !authorities.contains(receipt)) {
+                throw invalid("replacement requested without its observation mode and authority receipt");
+            }
+            return claimedReplacements.values().stream().filter(replacement ->
+                    replacement.submission().job().scope().equals(receipt.scope())
+                            && receipt.clusterId().equals(replacement.submission().job().job().get("clusterId")))
+                    .reduce((first, second) -> {
+                        if (!first.equals(second)) { throw invalid("multiple replacements match one authority scope"); }
                         return first;
                     });
         }
@@ -470,7 +511,10 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         NativeTelemetryMirror mirror = mirror();
         boolean qualified = site.target() == Target.SUBMIT
                 ? pipeline.equals(mirror.text(mirror.field(receiver, "val$pipelineId", "Ljava/lang/String;")))
-                        && mirror.field(receiver, "val$accepted", "Lio/tapstate/spi/store/SuccessorAdmission;") == null
+                        && (replacementObservationEnabled
+                                || mirror.field(receiver, "val$accepted", "Lio/tapstate/spi/store/SuccessorAdmission;") == null)
+                : site.target() == Target.REPLACEMENT_ADMISSION
+                        ? pipeline.equals(replacementPipeline(arguments.getFirst(), mirror))
                 : site.target() == Target.PUBLISHER_SWEEP ? publishers.contains(receiver.uniqueID())
                 : site.target() == Target.FOLDER_SWEEP ? publisherFolders.contains(receiver.uniqueID())
                 : spec.pipeline() < 0 ? producers.contains(receiver.uniqueID())
@@ -556,16 +600,38 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
 
     private void entry(Spec spec, ObjectReference receiver, List<Value> arguments,
             NativeTelemetryMirror mirror, Map<String, Object> out) throws Exception {
-        if (spec.target() == Target.ADMISSION) {
+        if (spec.target() == Target.ADMISSION || spec.target() == Target.REPLACEMENT_ADMISSION) {
             out.put("claimed", mirror.scalar(mirror.field(receiver, "fenced", "Z")));
             out.put("clusterId", mirror.text(mirror.field(receiver, "clusterId", "Ljava/lang/String;")));
             Value owner = mirror.field(receiver, "owner", "Lio/tapstate/spi/store/WorkloadOwner;");
             if (owner != null) { out.put("owner", workloadOwner(owner, mirror)); }
+            if (spec.target() == Target.REPLACEMENT_ADMISSION) {
+                out.putAll(replacementArgument(arguments.getFirst(), mirror));
+            }
         } else if (spec.target() == Target.SUBMIT) {
             ObjectReference execution = requiredObject(mirror.field(receiver, "val$execution", EXECUTION),
                     "io.tapstate.app.PipelineActuationOwnership$Execution", mirror);
             Admission admission = admissions.get(execution.uniqueID());
             if (admission == null) { throw new NativeTelemetryMirror.Unavailable("SUBMIT_HAS_NO_OBSERVED_ADMISSION"); }
+            Value accepted = mirror.field(receiver, "val$accepted", "Lio/tapstate/spi/store/SuccessorAdmission;");
+            if (admission.replacement().isPresent()) {
+                Replacement replacement = admission.replacement().orElseThrow();
+                ObjectReference actual = requiredObject(accepted, "io.tapstate.spi.store.SuccessorAdmission", mirror);
+                Map<String, Object> evidence = replacementArgument(actual, mirror);
+                if (actual.uniqueID() != replacement.argumentId()
+                        || !Long.valueOf(replacement.reservationId()).equals(evidence.get("reservationObject"))
+                        || !Objects.equals(replacement.advancedClaimId(), evidence.get("advancedClaimObject"))
+                        || !replacement.reservation().equals(evidence.get("reservation"))
+                        || !admission.claim().equals(evidence.get("claim"))) {
+                    throw new NativeTelemetryMirror.Unavailable("SUBMIT_HAS_DIFFERENT_REPLACEMENT_ARGUMENT");
+                }
+                out.put("successorAdmissionObject", actual.uniqueID());
+                out.put("reservationObject", replacement.reservationId());
+                out.put("advancedClaimObject", replacement.advancedClaimId());
+                out.put("reservation", replacement.reservation());
+            } else if (accepted != null) {
+                throw new NativeTelemetryMirror.Unavailable("REPLACEMENT_HAS_NO_OBSERVED_ADOPTION");
+            }
             ObjectReference actuator = requiredObject(mirror.field(receiver, "this$0", "Lio/tapstate/app/EngineLifecycleActuator;"),
                     "io.tapstate.app.EngineLifecycleActuator", mirror);
             ObjectReference owner = requiredObject(mirror.field(actuator, "actuation",
@@ -588,6 +654,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             out.put("submissionBootId", mirror.text(mirror.field(engine, "bootId", "Ljava/lang/String;")));
             out.put("requestScope", scope); out.put("fence", admission.fence());
             out.put("members", admission.members()); out.put("claim", admission.claim());
+            out.put("admissionKind", admission.replacement().isPresent() ? "REPLACEMENT" : "ORDINARY");
         } else if (spec.target() == Target.OFFER) {
             producers.add(receiver.uniqueID());
             out.put("scope", mirror.scope(arguments.get(1))); out.put("state", mirror.enumName(arguments.get(2)));
@@ -685,9 +752,49 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                     throw invalid("captured admission budget exceeded");
                 }
                 admissions.put(execution.uniqueID(), new Admission(execution.uniqueID(), call.receiver.uniqueID(),
-                        fence, members, claim));
+                        fence, members, claim, Optional.empty()));
                 out.put("fence", fence); out.put("members", members); out.put("claim", claim);
                 out.put("admissionStatus", claimed ? "CLAIMED" : "STANDALONE");
+            }
+            case REPLACEMENT_ADMISSION -> {
+                if (call.entry.containsKey("decoderStatus")) {
+                    throw new NativeTelemetryMirror.Unavailable("REPLACEMENT_ENTRY_UNVERIFIED");
+                }
+                Map<String, Object> argument = replacementArgument(call.arguments.getFirst(), mirror);
+                for (String key : List.of("successorAdmissionObject", "reservationObject", "advancedClaimObject", "reservation", "claim")) {
+                    if (!Objects.equals(argument.get(key), call.entry.get(key))) {
+                        throw new NativeTelemetryMirror.Unavailable("REPLACEMENT_ARGUMENT_CHANGED_DURING_ADOPTION");
+                    }
+                }
+                ObjectReference execution = requiredObject(returned,
+                        "io.tapstate.app.PipelineActuationOwnership$Execution", mirror);
+                out.put("admissionObject", execution.uniqueID());
+                Object allowed = mirror.scalar(mirror.field(execution, "allowed", "Z"));
+                out.put("allowed", allowed);
+                if (!Boolean.TRUE.equals(allowed)) { out.put("admissionStatus", "REFUSED"); break; }
+                Map<String, Object> fence = executionFence(mirror.field(execution, "fence", "Lio/tapstate/app/ExecutionFence;"), mirror);
+                List<String> members = executionMembers(mirror.field(execution, "executionNodeIds", "Ljava/util/Set;"), mirror);
+                ObjectReference returnedClaim = requiredObject(mirror.field(execution, "admittedClaim", "Ljava/util/Optional;"),
+                        "java.util.Optional", mirror);
+                if (mirror.field(returnedClaim, "value", "Ljava/lang/Object;") != null) {
+                    throw new NativeTelemetryMirror.Unavailable("REPLACEMENT_RETURN_CARRIES_UNEXPECTED_CLAIM");
+                }
+                out.put("returnedAdmittedClaimStatus", "ABSENT");
+                out.put("claimSource", "SUCCESSOR_ADMISSION_ARGUMENT");
+                @SuppressWarnings("unchecked") Map<String, Object> claim = (Map<String, Object>) argument.get("claim");
+                @SuppressWarnings("unchecked") Map<String, Object> reservation = (Map<String, Object>) argument.get("reservation");
+                qualifyAdmission(fence, members, claim, Boolean.TRUE.equals(call.entry.get("claimed")), call.entry);
+                qualifyReplacement(fence, claim, reservation, call.entry);
+                if (admissions.size() >= 8 && !admissions.containsKey(execution.uniqueID())) {
+                    throw invalid("captured admission budget exceeded");
+                }
+                Replacement replacement = new Replacement(((Number) argument.get("successorAdmissionObject")).longValue(),
+                        ((Number) argument.get("reservationObject")).longValue(),
+                        claim.isEmpty() ? null : ((Number) argument.get("advancedClaimObject")).longValue(), reservation);
+                admissions.put(execution.uniqueID(), new Admission(execution.uniqueID(), call.receiver.uniqueID(),
+                        fence, members, claim, Optional.of(replacement)));
+                out.put("fence", fence); out.put("members", members);
+                out.put("admissionStatus", claim.isEmpty() ? "STANDALONE_REPLACEMENT" : "CLAIMED_REPLACEMENT");
             }
             case SUBMIT -> {
                 if (call.entry.containsKey("decoderStatus")) {
@@ -707,20 +814,53 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                         || !actual.job().get("bootId").equals(call.entry.get("submissionBootId"))) {
                     throw new NativeTelemetryMirror.Unavailable("SUBMIT_JOB_ADMISSION_MISMATCH");
                 }
+                if (admission.replacement().isPresent()) {
+                    Replacement expected = admission.replacement().orElseThrow();
+                    ObjectReference execution = requiredObject(mirror.field(call.receiver, "val$execution", EXECUTION),
+                            "io.tapstate.app.PipelineActuationOwnership$Execution", mirror);
+                    Map<String, Object> returnedArgument = replacementArgument(mirror.field(call.receiver, "val$accepted",
+                            "Lio/tapstate/spi/store/SuccessorAdmission;"), mirror);
+                    if (execution.uniqueID() != admission.objectId()
+                            || !Long.valueOf(expected.argumentId()).equals(returnedArgument.get("successorAdmissionObject"))
+                            || !Long.valueOf(expected.reservationId()).equals(returnedArgument.get("reservationObject"))
+                            || !Objects.equals(expected.advancedClaimId(), returnedArgument.get("advancedClaimObject"))
+                            || !expected.reservation().equals(returnedArgument.get("reservation"))
+                            || !admission.claim().equals(returnedArgument.get("claim"))) {
+                        throw new NativeTelemetryMirror.Unavailable("SUBMIT_REPLACEMENT_ARGUMENT_CHANGED");
+                    }
+                    Map<?, ?> slot = (Map<?, ?>) admission.replacement().orElseThrow().reservation().get("successor");
+                    if (!actual.scope().equals(slot.get("scope"))
+                            || !actual.job().get("bootId").equals(slot.get("submissionBootId"))) {
+                        throw new NativeTelemetryMirror.Unavailable("SUBMIT_JOB_REPLACEMENT_SLOT_MISMATCH");
+                    }
+                }
                 if (!admission.claim().isEmpty()) {
                     Map<?, ?> key = (Map<?, ?>) admission.claim().get("key");
                     if (!actual.job().get("clusterId").equals(key.get("clusterId"))) {
                         throw new NativeTelemetryMirror.Unavailable("SUBMIT_JOB_CLAIM_CLUSTER_MISMATCH");
                     }
                     long jobId = ((Number) actual.job().get("jobId")).longValue();
-                    if (claimedSubmissions.size() >= 8 && !claimedSubmissions.containsKey(jobId)) {
+                    if (claimedSubmissions.size() + claimedReplacements.size() >= 8
+                            && !claimedSubmissions.containsKey(jobId) && !claimedReplacements.containsKey(jobId)) {
                         throw invalid("claimed submission budget exceeded");
                     }
                     ClaimedSubmission observed = new ClaimedSubmission(actual, admission.objectId(),
                             admission.ownershipReceiverId(), call.receiver.uniqueID(), admission.fence(),
                             admission.members(), admission.claim());
-                    ClaimedSubmission previous = claimedSubmissions.putIfAbsent(jobId, observed);
-                    if (previous != null && !previous.equals(observed)) { throw invalid("one Job has conflicting claimed admissions"); }
+                    if (admission.replacement().isPresent()) {
+                        Replacement replacement = admission.replacement().orElseThrow();
+                        ClaimedReplacement captured = new ClaimedReplacement(observed, replacement.argumentId(),
+                                replacement.reservationId(), replacement.advancedClaimId(), replacement.reservation());
+                        ClaimedReplacement previous = claimedReplacements.putIfAbsent(jobId, captured);
+                        if (previous != null && !previous.equals(captured) || claimedSubmissions.containsKey(jobId)) {
+                            throw invalid("one Job has conflicting replacement admissions");
+                        }
+                    } else {
+                        ClaimedSubmission previous = claimedSubmissions.putIfAbsent(jobId, observed);
+                        if (previous != null && !previous.equals(observed) || claimedReplacements.containsKey(jobId)) {
+                            throw invalid("one Job has conflicting claimed admissions");
+                        }
+                    }
                 }
                 out.put("registered", true); out.put("scope", actual.scope()); out.put("job", actual.job());
                 out.put("proxy", actual.proxyId()); out.put("executionJobObject", registered.uniqueID());
@@ -831,6 +971,127 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             throw new NativeTelemetryMirror.Unavailable("OBJECT_TYPE:" + type);
         }
         return object;
+    }
+
+    private static String replacementPipeline(Value value, NativeTelemetryMirror mirror) throws Exception {
+        ObjectReference admission = requiredObject(value, "io.tapstate.spi.store.SuccessorAdmission", mirror);
+        ObjectReference marker = requiredObject(mirror.field(admission, "reservation", "Lio/tapstate/spi/store/StopReservation;"),
+                "io.tapstate.spi.store.StopReservation", mirror);
+        return mirror.text(mirror.field(marker, "pipelineId", "Ljava/lang/String;"));
+    }
+
+    private static Map<String, Object> replacementArgument(Value value, NativeTelemetryMirror mirror) throws Exception {
+        ObjectReference admission = requiredObject(value, "io.tapstate.spi.store.SuccessorAdmission", mirror);
+        ObjectReference marker = requiredObject(mirror.field(admission, "reservation", "Lio/tapstate/spi/store/StopReservation;"),
+                "io.tapstate.spi.store.StopReservation", mirror);
+        ObjectReference optional = requiredObject(mirror.field(admission, "advancedClaim", "Ljava/util/Optional;"),
+                "java.util.Optional", mirror);
+        Value advanced = mirror.field(optional, "value", "Ljava/lang/Object;");
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("successorAdmissionObject", admission.uniqueID()); result.put("reservationObject", marker.uniqueID());
+        result.put("advancedClaimObject", advanced == null ? null : mirror.object(advanced).uniqueID());
+        result.put("advancedClaimStatus", advanced == null ? "ABSENT" : "PRESENT");
+        result.put("reservation", reservation(marker, mirror));
+        result.put("claim", advanced == null ? Map.of() : workloadClaim(advanced, mirror));
+        return Collections.unmodifiableMap(result);
+    }
+
+    private static Map<String, Object> reservation(ObjectReference marker, NativeTelemetryMirror mirror) throws Exception {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("pipelineId", mirror.text(mirror.field(marker, "pipelineId", "Ljava/lang/String;")));
+        result.put("token", mirror.text(mirror.field(marker, "token", "Ljava/lang/String;")));
+        result.put("sourceEpoch", mirror.integral(mirror.field(marker, "sourceEpoch", "J")));
+        result.put("reservedEpoch", mirror.integral(mirror.field(marker, "reservedEpoch", "J")));
+        result.put("formatVersion", mirror.integral(mirror.field(marker, "formatVersion", "I")));
+        result.put("phase", mirror.enumName(mirror.field(marker, "phase", "Lio/tapstate/spi/store/StopReservation$Phase;")));
+        result.put("counterPolicy", mirror.enumName(mirror.field(marker, "counterPolicy", "Lio/tapstate/spi/store/StopReservation$CounterPolicy;")));
+        ObjectReference desired = requiredObject(mirror.field(marker, "originalDesired", "Lio/tapstate/core/lifecycle/DesiredState;"),
+                "io.tapstate.core.lifecycle.DesiredState", mirror);
+        Map<String, Object> intent = new LinkedHashMap<>();
+        for (String field : List.of("pipelineId", "revision", "assemblyRevision")) {
+            intent.put(field, mirror.scalar(mirror.field(desired, field, "Ljava/lang/String;")));
+        }
+        intent.put("targetState", mirror.enumName(mirror.field(desired, "targetState", "Lio/tapstate/core/lifecycle/PipelineState;")));
+        intent.put("purgeState", mirror.scalar(mirror.field(desired, "purgeState", "Z")));
+        intent.put("reassemble", mirror.scalar(mirror.field(desired, "reassemble", "Z")));
+        intent.put("rebuiltAtStateEpoch", mirror.scalar(mirror.field(desired, "rebuiltAtStateEpoch", "Ljava/lang/Long;")));
+        result.put("originalDesired", Collections.unmodifiableMap(intent));
+        ObjectReference source = requiredObject(mirror.field(marker, "source", "Lio/tapstate/spi/store/StopReservation$Source;"),
+                "io.tapstate.spi.store.StopReservation$Source", mirror);
+        Value sourceScope = mirror.field(source, "scope", SCOPE);
+        Value oldJob = mirror.field(source, "oldJob", "Lio/tapstate/spi/store/StopReservation$JobIdentity;");
+        Map<String, Object> old = new LinkedHashMap<>();
+        old.put("clusterId", mirror.text(mirror.field(source, "clusterId", "Ljava/lang/String;")));
+        old.put("scope", sourceScope == null ? null : mirror.scope(sourceScope));
+        old.put("oldJob", oldJob == null ? null : mirror.job(oldJob));
+        result.put("source", Collections.unmodifiableMap(old));
+        ObjectReference authority = requiredObject(mirror.field(marker, "writerAuthority", "Lio/tapstate/spi/store/StopAuthority;"),
+                "io.tapstate.spi.store.StopAuthority", mirror);
+        Value claimed = mirror.field(authority, "claim", "Lio/tapstate/spi/store/WorkloadClaimFence;");
+        result.put("writerAuthority", Map.of("clusterId", mirror.text(mirror.field(authority, "clusterId", "Ljava/lang/String;")),
+                "executionGeneration", mirror.integral(mirror.field(authority, "executionGeneration", "J")),
+                "claim", claimed == null ? Map.of() : workloadFence(claimed, mirror)));
+        ObjectReference successor = requiredObject(mirror.field(marker, "successor", "Lio/tapstate/spi/store/StopReservation$Successor;"),
+                "io.tapstate.spi.store.StopReservation$Successor", mirror);
+        Map<String, Object> slot = new LinkedHashMap<>();
+        slot.put("scope", mirror.scope(mirror.field(successor, "scope", SCOPE)));
+        slot.put("submissionBootId", mirror.text(mirror.field(successor, "submissionBootId", "Ljava/lang/String;")));
+        Value job = mirror.field(successor, "job", "Lio/tapstate/spi/store/StopReservation$JobIdentity;");
+        slot.put("job", job == null ? null : mirror.job(job));
+        result.put("successor", Collections.unmodifiableMap(slot));
+        return Collections.unmodifiableMap(result);
+    }
+
+    private static Map<String, Object> workloadFence(Value value, NativeTelemetryMirror mirror) throws Exception {
+        ObjectReference fence = requiredObject(value, "io.tapstate.spi.store.WorkloadClaimFence", mirror);
+        ObjectReference key = requiredObject(mirror.field(fence, "key", "Lio/tapstate/spi/store/WorkloadClaimKey;"),
+                "io.tapstate.spi.store.WorkloadClaimKey", mirror);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("key", Map.of("clusterId", mirror.text(mirror.field(key, "clusterId", "Ljava/lang/String;")),
+                "resourceId", mirror.text(mirror.field(key, "resourceId", "Ljava/lang/String;")),
+                "type", mirror.enumName(mirror.field(key, "type", "Lio/tapstate/spi/store/WorkloadClaimType;"))));
+        result.put("owner", workloadOwner(mirror.field(fence, "owner", "Lio/tapstate/spi/store/WorkloadOwner;"), mirror));
+        for (String field : List.of("claimGeneration", "executionGeneration", "topologyRevision")) {
+            result.put(field, mirror.integral(mirror.field(fence, field, "J")));
+        }
+        return Map.copyOf(result);
+    }
+
+    private void qualifyReplacement(Map<String, Object> fence, Map<String, Object> claim,
+            Map<String, Object> reservation, Map<String, Object> ownerEntry) throws NativeTelemetryMirror.Unavailable {
+        Map<?, ?> slot = (Map<?, ?>) reservation.get("successor");
+        Map<?, ?> scope = (Map<?, ?>) slot.get("scope");
+        Map<?, ?> writer = (Map<?, ?>) reservation.get("writerAuthority");
+        Map<?, ?> source = (Map<?, ?>) reservation.get("source");
+        Map<?, ?> intent = (Map<?, ?>) reservation.get("originalDesired");
+        String token = (String) reservation.get("token");
+        if (!pipeline.equals(reservation.get("pipelineId")) || !pipeline.equals(intent.get("pipelineId"))
+                || !"RUNNING".equals(intent.get("targetState")) || !"SUCCESSOR_ADMITTED".equals(reservation.get("phase"))
+                || ((Number) reservation.get("formatVersion")).longValue() != 16
+                || !List.of("CONTINUE", "RESET").contains(reservation.get("counterPolicy"))
+                || token.isBlank() || token.length() > 256 || ((Number) reservation.get("sourceEpoch")).longValue() < 0
+                || ((Number) reservation.get("reservedEpoch")).longValue() <= ((Number) reservation.get("sourceEpoch")).longValue()
+                || !fence.get("executionGeneration").equals(scope.get("generation"))
+                || !fence.get("executionGeneration").equals(writer.get("executionGeneration"))
+                || !source.get("clusterId").equals(writer.get("clusterId"))
+                || !Objects.equals(ownerEntry.get("clusterId"), writer.get("clusterId"))
+                || slot.get("job") != null || ((String) slot.get("submissionBootId")).isBlank()
+                || source.get("scope") instanceof Map<?, ?> old && !old.get("incarnation").equals(scope.get("incarnation"))) {
+            throw new NativeTelemetryMirror.Unavailable("REPLACEMENT_RESERVATION_EXECUTION_MISMATCH");
+        }
+        Map<?, ?> authorityClaim = (Map<?, ?>) writer.get("claim");
+        if (claim.isEmpty()) {
+            if (!authorityClaim.isEmpty()) { throw new NativeTelemetryMirror.Unavailable("STANDALONE_REPLACEMENT_HAS_A_CLAIM"); }
+        } else {
+            for (String key : List.of("key", "owner", "claimGeneration", "executionGeneration", "topologyRevision")) {
+                if (!Objects.equals(claim.get(key), authorityClaim.get(key))) {
+                    throw new NativeTelemetryMirror.Unavailable("REPLACEMENT_ADVANCED_CLAIM_AUTHORITY_MISMATCH");
+                }
+            }
+            if (!writer.get("clusterId").equals(((Map<?, ?>) claim.get("key")).get("clusterId"))) {
+                throw new NativeTelemetryMirror.Unavailable("REPLACEMENT_ADVANCED_CLAIM_CLUSTER_MISMATCH");
+            }
+        }
     }
 
     private static Map<String, Object> workloadOwner(Value value, NativeTelemetryMirror mirror) throws Exception {
@@ -1238,6 +1499,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         Map<Target, Counts> counts = new EnumMap<>(Target.class);
         Set<String> missing = new LinkedHashSet<>(unverified);
         for (Target target : Target.values()) {
+            if (target == Target.REPLACEMENT_ADMISSION && !replacementObservationEnabled) { continue; }
             if (!bindings.containsKey(target)) { missing.add("LIVE_BINDING_UNAVAILABLE:" + target); }
             else if (!disconnected) {
                 Method method = methods.get(target);
@@ -1257,7 +1519,8 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         for (Map<String, Object> record : records) { qualifyScopes(record, missing, 0); }
         return new Boundary(phase, ++sequence, sha, pipeline, bindings, counts, records, authorities,
                 missing, layouts, vmVersion, events, handlingNanos,
-                threads.values().stream().mapToInt(state -> state.calls.size()).sum(), drained, vmDeath, disconnected);
+                threads.values().stream().mapToInt(state -> state.calls.size()).sum(), drained, vmDeath, disconnected,
+                replacementObservationEnabled);
     }
     private void qualifyScopes(Object value, Set<String> missing, int depth) {
         if (depth > 16) { throw invalid("scope qualification depth exceeded"); }
@@ -1350,6 +1613,11 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                 "io.tapstate.app.ExecutionFence", "io.tapstate.spi.store.WorkloadClaim",
                 "io.tapstate.spi.store.WorkloadClaimKey", "io.tapstate.spi.store.WorkloadOwner",
                 "io.tapstate.spi.store.WorkloadClaimType",
+                "io.tapstate.spi.store.SuccessorAdmission", "io.tapstate.spi.store.StopReservation",
+                "io.tapstate.spi.store.StopReservation$Source", "io.tapstate.spi.store.StopReservation$Successor",
+                "io.tapstate.spi.store.StopReservation$Phase", "io.tapstate.spi.store.StopReservation$CounterPolicy",
+                "io.tapstate.spi.store.StopAuthority", "io.tapstate.spi.store.WorkloadClaimFence",
+                "io.tapstate.core.lifecycle.DesiredState",
                 "io.tapstate.runtime.engine.Engine$ExecutionJob", "io.tapstate.spi.store.StopReservation$JobIdentity",
                 "io.tapstate.spi.store.ObservationStore$Scope", "io.tapstate.core.logging.LogSink$Scope",
                 "io.tapstate.core.logging.LogLine", "io.tapstate.spi.metrics.MetricsExport$ScopeToken",
