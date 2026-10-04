@@ -585,6 +585,114 @@ class ConvergenceDriverTest {
         assertThat(applied).hasValue(2);
     }
 
+    @Test
+    void aBoundRunningJobKeepsItsNoActionDecisionWhileTelemetryCompletionWaits() throws Exception {
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        var scope = scopes.begin("orders", "inc-a", 2);
+        DesiredState intent = new DesiredState("orders", RUNNING, "rev-1");
+        desired.save(intent);
+        state.create("orders", StateJson.of(RUNNING), T0);
+        state.compareAndSwap("orders", 0, StateJson.of(RUNNING), T0);
+        state.compareAndSwap("orders", 1, StateJson.of(RUNNING), T0);
+        var checkpoint = state.read("orders").orElseThrow();
+        var authority = io.tapstate.spi.store.StopAuthority.standalone("cluster-a", 2);
+        var job = new io.tapstate.spi.store.StopReservation.JobIdentity("cluster-a", 102, "successor-boot");
+        var marker = new io.tapstate.spi.store.StopReservation("orders", "handoff-a", 0, 2, intent,
+                new io.tapstate.spi.store.StopReservation.Source("cluster-a", new ObservationStore.Scope("inc-a", 1),
+                        new io.tapstate.spi.store.StopReservation.JobIdentity("cluster-a", 101, "source-boot")),
+                io.tapstate.spi.store.StopReservation.Phase.SUCCESSOR_BOUND,
+                io.tapstate.spi.store.StopReservation.CounterPolicy.CONTINUE, authority,
+                new io.tapstate.spi.store.StopReservation.Successor(scope, "successor-boot", job),
+                io.tapstate.spi.store.StopReservation.CURRENT_FORMAT);
+        io.tapstate.spi.store.StateStore handoff = new io.tapstate.spi.store.StateStore() {
+            @Override public Optional<io.tapstate.core.lifecycle.CheckpointDoc> read(String id) { return state.read(id); }
+            @Override public void create(String id, String json, Instant at) { state.create(id, json, at); }
+            @Override public void delete(String id) { state.delete(id); }
+            @Override public io.tapstate.core.lifecycle.CasOutcome compareAndSwap(
+                    String id, long epoch, String json, Instant at) { return state.compareAndSwap(id, epoch, json, at); }
+            @Override public boolean supportsStopReservations() { return true; }
+            @Override public Optional<io.tapstate.spi.store.StopReservation> readStopReservation(String id) {
+                return id.equals("orders") ? Optional.of(marker) : Optional.empty();
+            }
+        };
+        CountDownLatch adopting = new CountDownLatch(1);
+        CountDownLatch releaseAdoption = new CountDownLatch(1);
+        AtomicInteger starts = new AtomicInteger();
+        LifecycleActuator actuator = new LifecycleActuator() {
+            @Override public void start(String id) { starts.incrementAndGet(); }
+            @Override public void pause(String id) { throw new AssertionError("unexpected pause"); }
+            @Override public void resume(String id) { throw new AssertionError("unexpected resume"); }
+            @Override public void stop(String id, boolean purgeState) { throw new AssertionError("unexpected stop"); }
+            @Override public boolean isCarryingAJob(String id) { return true; }
+            @Override public Optional<Throwable> failure(String id) { return Optional.empty(); }
+            @Override public Optional<Throwable> lost(String id) { return Optional.empty(); }
+            @Override public Optional<io.tapstate.spi.store.StopAuthority> stopAuthority(String id) {
+                return Optional.of(authority);
+            }
+            @Override public Optional<SuccessorInspection> inspectSuccessor(
+                    io.tapstate.spi.store.StopReservation expected, java.util.function.BooleanSupplier current) {
+                assertThat(expected).isEqualTo(marker);
+                return current.getAsBoolean() ? Optional.of(new SuccessorInspection(Optional.of(job), Optional.empty()))
+                        : Optional.empty();
+            }
+            @Override public boolean adoptSuccessor(
+                    io.tapstate.spi.store.StopReservation expected, java.util.function.BooleanSupplier current) {
+                adopting.countDown();
+                try {
+                    if (!releaseAdoption.await(5, TimeUnit.SECONDS)) {
+                        throw new AssertionError("the running successor's adoption was not released");
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("the controlled adoption was interrupted", interrupted);
+                }
+                return current.getAsBoolean();
+            }
+            @Override public Optional<io.tapstate.spi.store.HandoffIdentity> continuationReady(
+                    io.tapstate.spi.store.StopReservation expected, java.util.function.BooleanSupplier current) {
+                return Optional.empty();
+            }
+        };
+        LifecyclePendingRegistry pending = new LifecyclePendingRegistry();
+        ObservationStore scopedLatest = new ObservationStore() {
+            @Override public void save(Observation observation) { observations.save(observation); }
+            @Override public boolean saveScoped(Observation observation, Scope owner) {
+                assertThat(owner).isEqualTo(scope);
+                observations.save(observation);
+                return true;
+            }
+            @Override public Optional<Observation> read(String id) { return observations.read(id); }
+            @Override public void delete(String id) { observations.delete(id); }
+        };
+        try (LifecycleWorkDispatcher work = new LifecycleWorkDispatcher(1, 1)) {
+            ConvergenceDriver isolated = new ConvergenceDriver(
+                    new PipelineConverger(desired, handoff, actuator, Clock.fixed(T0, ZoneOffset.UTC)), desired,
+                    new ObservationPublisher(handoff, scopedLatest), null, MetricsExport.none(), () -> true,
+                    PipelineActuationOwnership.single(), work, scopes, null, pending);
+            isolated.reconcile();
+            assertThat(adopting.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(work.activeCount()).isEqualTo(1);
+
+            isolated.reconcile();
+
+            assertThat(state.read("orders")).contains(checkpoint);
+            assertThat(handoff.readStopReservation("orders")).contains(marker);
+            assertThat(scopes.current("orders")).contains(scope);
+            assertThat(desired.read("orders")).contains(intent);
+            assertThat(starts).hasValue(0);
+            Observation latest = observations.read("orders").orElseThrow();
+            assertThat(latest.state()).isEqualTo(RUNNING);
+            assertThat(latest.failure()).as("a telemetry fixture failure cannot erase pending and make this pass")
+                    .isNull();
+            assertThat(pending.pending("orders"))
+                    .as("a coalesced tick cannot invent start while a known bound job waits only for telemetry")
+                    .isEmpty();
+            releaseAdoption.countDown();
+        } finally {
+            releaseAdoption.countDown();
+        }
+    }
+
     private enum PendingChange { REBUILD, RECOVERY, INCARNATION }
 
     private void verifyTerminalNoopChange(PendingChange change) throws Exception {

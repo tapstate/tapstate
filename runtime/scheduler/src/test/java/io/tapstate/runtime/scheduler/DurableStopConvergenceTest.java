@@ -63,6 +63,123 @@ class DurableStopConvergenceTest {
     }
 
     @Test
+    void rebuildingResumeReportsTheOldStopBeforeItWaitsForNativeCompletion() {
+        PipelineConverger loop = rebuildingResume();
+        actuator.over.set(false);
+        AtomicReference<PipelineConverger.PendingAction> latest = new AtomicReference<>();
+        AtomicReference<PipelineConverger.PendingAction> duringStop = new AtomicReference<>();
+        actuator.onFinish = () -> duringStop.set(latest.get());
+
+        ConvergeResult waiting = loop.converge("orders", decision -> latest.set(decision.action()));
+
+        assertThat(waiting.status()).isEqualTo(ConvergeStatus.STOP_PENDING);
+        assertThat(state.read("orders").orElseThrow().stateJson()).isEqualTo(StateJson.of(PAUSED));
+        assertThat(actuator.starts).hasValue(0);
+        assertThat(duringStop.get()).as("the admitted resume is still ending its old physical job")
+                .isEqualTo(PipelineConverger.PendingAction.STOP);
+    }
+
+    @Test
+    void oneWorkerReportsStartAfterTheOldStopAndBeforeReplacementCapacityAdmission() {
+        PipelineConverger loop = rebuildingResume();
+        actuator.capacityUnavailable = true;
+        AtomicReference<PipelineConverger.PendingAction> latest = new AtomicReference<>();
+        List<PipelineConverger.PendingAction> actualActions = new ArrayList<>();
+        actuator.onFinish = () -> actualActions.add(latest.get());
+        actuator.onPrepareReplacement = () -> actualActions.add(latest.get());
+
+        ConvergeResult waiting = loop.converge("orders", decision -> latest.set(decision.action()));
+
+        assertThat(waiting.status()).isEqualTo(ConvergeStatus.START_CAPACITY);
+        assertThat(state.readStopReservation("orders").orElseThrow().phase())
+                .isEqualTo(StopReservation.Phase.REPLACEMENT_PENDING);
+        assertThat(state.advances).isZero();
+        assertThat(actuator.starts).hasValue(0);
+        assertThat(actualActions).as("one accepted worker crosses from teardown to start admission")
+                .containsExactly(PipelineConverger.PendingAction.STOP, PipelineConverger.PendingAction.START);
+    }
+
+    @Test
+    void supersedingAReplacementPendingMarkerReportsItsActualRetirementAsStop() {
+        PipelineConverger loop = rebuildingResume();
+        actuator.capacityUnavailable = true;
+        assertThat(loop.converge("orders").status()).isEqualTo(ConvergeStatus.START_CAPACITY);
+        StopReservation marker = state.readStopReservation("orders").orElseThrow();
+        desired.save(new DesiredState("orders", RUNNING, "rev-2"));
+        actuator.over.set(false);
+        AtomicReference<PipelineConverger.PendingAction> latest = new AtomicReference<>();
+        AtomicReference<PipelineConverger.PendingAction> duringStop = new AtomicReference<>();
+        actuator.onFinish = () -> duringStop.set(latest.get());
+
+        ConvergeResult waiting = loop.converge("orders", decision -> latest.set(decision.action()));
+
+        assertThat(waiting.status()).isEqualTo(ConvergeStatus.STOP_PENDING);
+        assertThat(state.readStopReservation("orders")).contains(marker);
+        assertThat(actuator.retiring).hasValue(1);
+        assertThat(state.advances).isZero();
+        assertThat(duringStop.get()).as("the superseded phase does not classify the new worker's native action")
+                .isEqualTo(PipelineConverger.PendingAction.STOP);
+    }
+
+    @Test
+    void anAbsentBoundSuccessorReportsItsFloorAndCaptureRetirementAsStop() {
+        PipelineConverger loop = rebuildingResume();
+        actuator.telemetryReady = false;
+        assertThat(loop.converge("orders").status()).isEqualTo(ConvergeStatus.CONVERGED);
+        StopReservation marker = state.readStopReservation("orders").orElseThrow();
+        assertThat(marker.phase()).isEqualTo(StopReservation.Phase.SUCCESSOR_BOUND);
+        actuator.nativeJob = null;
+        actuator.carrying = false;
+        actuator.over.set(false);
+        AtomicReference<PipelineConverger.PendingAction> latest = new AtomicReference<>();
+        AtomicReference<PipelineConverger.PendingAction> duringStop = new AtomicReference<>();
+        actuator.onFinish = () -> duringStop.set(latest.get());
+
+        ConvergeResult waiting = loop.converge("orders", decision -> latest.set(decision.action()));
+
+        assertThat(waiting.status()).isEqualTo(ConvergeStatus.STOP_PENDING);
+        assertThat(state.readStopReservation("orders")).contains(marker);
+        assertThat(state.advances).isEqualTo(1);
+        assertThat(actuator.starts).hasValue(1);
+        assertThat(duringStop.get()).as("retiring a missing bound successor cannot be labeled as a fresh start")
+                .isEqualTo(PipelineConverger.PendingAction.STOP);
+    }
+
+    @Test
+    void anAlreadyRunningBoundJobWaitingOnlyForTelemetryDoesNotReportStart() {
+        PipelineConverger loop = rebuildingResume();
+        actuator.telemetryReady = false;
+        assertThat(loop.converge("orders").status()).isEqualTo(ConvergeStatus.CONVERGED);
+        StopReservation marker = state.readStopReservation("orders").orElseThrow();
+        AtomicReference<PipelineConverger.PendingAction> latest = new AtomicReference<>();
+        AtomicReference<PipelineConverger.PendingAction> duringAdoption = new AtomicReference<>();
+        actuator.onAdopt = () -> duringAdoption.set(latest.get());
+
+        ConvergeResult running = loop.converge("orders", decision -> latest.set(decision.action()));
+
+        assertThat(running.status()).isEqualTo(ConvergeStatus.CONVERGED);
+        assertThat(state.read("orders").orElseThrow().stateJson()).isEqualTo(StateJson.of(RUNNING));
+        assertThat(state.readStopReservation("orders")).contains(marker);
+        assertThat(state.advances).isEqualTo(1);
+        assertThat(actuator.starts).hasValue(1);
+        assertThat(duringAdoption.get()).as("telemetry completion cannot relabel an existing running job")
+                .isEqualTo(PipelineConverger.PendingAction.NONE);
+    }
+
+    @Test
+    void anOrdinaryNewRunReportsStartBeforeItsActualSubmission() {
+        state.create("orders", StateJson.of(NEW), AT);
+        desired.save(new DesiredState("orders", RUNNING, "rev-1"));
+        List<PipelineConverger.PendingAction> decisions = new ArrayList<>();
+
+        assertThat(loop().converge("orders", decision -> decisions.add(decision.action())).status())
+                .isEqualTo(ConvergeStatus.CONVERGED);
+
+        assertThat(decisions).contains(PipelineConverger.PendingAction.START);
+        assertThat(actuator.starts).hasValue(1);
+    }
+
+    @Test
     void anUnfinishedStopKeepsActualAndOneDurableTokenWithoutStartingAnything() {
         state.create("orders", StateJson.of(RUNNING), AT);
         desired.save(new DesiredState("orders", STOPPED, "rev-1", true));
@@ -1022,6 +1139,9 @@ class DurableStopConvergenceTest {
         private StopReservation.JobIdentity existingJob;
         private BooleanSupplier lastCurrent;
         private StopReservation lastReservation;
+        private Runnable onFinish = () -> { };
+        private Runnable onPrepareReplacement = () -> { };
+        private Runnable onAdopt = () -> { };
 
         @Override public void start(String id) { starts.incrementAndGet(); carrying = true; }
         @Override public void pause(String id) { throw new AssertionError("unexpected pause"); }
@@ -1038,6 +1158,7 @@ class DurableStopConvergenceTest {
         @Override public Optional<StopAuthority> stopAuthority(String id) { return Optional.ofNullable(authority); }
         @Override public PreparedReplacement prepareReplacement(StopReservation pending, ReplacementAdmission admission,
                 Predicate<StopReservation> current) {
+            onPrepareReplacement.run();
             replacementPreparations.incrementAndGet();
             if (capacityUnavailable) { throw new StartDeferred(StartDeferred.Reason.CAPACITY); }
             if (beforeAdmissionRefusal != null) { throw beforeAdmissionRefusal; }
@@ -1070,6 +1191,7 @@ class DurableStopConvergenceTest {
                     : Optional.empty();
         }
         @Override public boolean adoptSuccessor(StopReservation marker, BooleanSupplier current) {
+            onAdopt.run();
             if (!current.getAsBoolean() || nativeJob == null || !nativeJob.equals(marker.successor().job())) { return false; }
             adoptions.incrementAndGet(); carrying = true; return true;
         }
@@ -1079,6 +1201,7 @@ class DurableStopConvergenceTest {
 
         @Override public boolean finishStop(StopReservation reservation, boolean carry, boolean first,
                 boolean retire, BooleanSupplier current) {
+            onFinish.run();
             finishes.incrementAndGet();
             if (carry) { continuing.incrementAndGet(); }
             if (first) { firstAttempts.incrementAndGet(); }

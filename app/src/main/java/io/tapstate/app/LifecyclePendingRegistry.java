@@ -82,8 +82,9 @@ final class LifecyclePendingRegistry {
             }
             CheckpointDoc checkpoint = decision.checkpoint().orElse(null);
             PipelineState actual = checkpoint == null ? null : StateJson.parse(checkpoint.stateJson());
-            return actual == PipelineState.FAILED || actual == PipelineState.COMPLETED
-                    ? new Entry(null, null, 0L, new TerminalNoop(decision.intent(), checkpoint, context), null) : null;
+            TerminalNoop terminal = actual == PipelineState.FAILED || actual == PipelineState.COMPLETED
+                    ? new TerminalNoop(decision.intent(), checkpoint, context) : null;
+            return new Entry(null, null, 0L, terminal, new ActiveDecision(decision.intent(), context, workIdentity));
         });
     }
 

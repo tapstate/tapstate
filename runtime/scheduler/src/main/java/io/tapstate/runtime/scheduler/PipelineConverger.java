@@ -79,11 +79,8 @@ public final class PipelineConverger {
         Optional<StopReservation> stopping = state.supportsStopReservations()
                 ? state.readStopReservation(pipelineId) : Optional.empty();
         if (stopping.isPresent()) {
-            intent.ifPresent(value -> decisions.accept(new PendingDecision(value, Optional.empty(),
-                    stopping.orElseThrow().phase() == StopReservation.Phase.STOPPING
-                            ? PendingAction.STOP : PendingAction.START)));
             return intent.isEmpty() ? ConvergeResult.superseded()
-                    : resumeStop(stopping.orElseThrow(), intent.orElseThrow(), false);
+                    : resumeStop(stopping.orElseThrow(), intent.orElseThrow(), false, decisions);
         }
         if (intent.isEmpty()) {
             return ConvergeResult.nothingToDo();
@@ -190,7 +187,7 @@ public final class PipelineConverger {
             // a yes that never runs out is a restart loop wearing the word "recovery".
             if (target == PipelineState.RUNNING && rebuilds.admits(pipelineId)) {
                 decisions.accept(new PendingDecision(intent.orElseThrow(), actualDoc, PendingAction.START));
-                return driveTo(pipelineId, target, false, actualDoc.orElse(null), false, true, false, intent.get())
+                return driveTo(pipelineId, target, false, actualDoc.orElse(null), false, true, false, intent.get(), decisions)
                         .recoveringExecution();
             }
             // Otherwise a failed run stays failed: re-driving it toward RUNNING would restart the dead job
@@ -219,7 +216,8 @@ public final class PipelineConverger {
                 ? PendingAction.START : target == PipelineState.STOPPED && actual != target
                         ? PendingAction.STOP : PendingAction.NONE;
         decisions.accept(new PendingDecision(intent.orElseThrow(), actualDoc, action));
-        return driveTo(pipelineId, target, true, actualDoc.orElse(null), purgeState, rebuild, rebuildOwed, intent.get());
+        return driveTo(pipelineId, target, true, actualDoc.orElse(null), purgeState, rebuild, rebuildOwed,
+                intent.get(), decisions);
     }
 
     /**
@@ -253,6 +251,14 @@ public final class PipelineConverger {
     private ConvergeResult driveTo(
             String pipelineId, PipelineState target, boolean seedIfAbsent, CheckpointDoc current,
             boolean purgeState, boolean rebuild, boolean evenIfAlreadyThere, DesiredState stopIntent) {
+        return driveTo(pipelineId, target, seedIfAbsent, current, purgeState, rebuild, evenIfAlreadyThere,
+                stopIntent, ignored -> { });
+    }
+
+    private ConvergeResult driveTo(
+            String pipelineId, PipelineState target, boolean seedIfAbsent, CheckpointDoc current,
+            boolean purgeState, boolean rebuild, boolean evenIfAlreadyThere, DesiredState stopIntent,
+            Consumer<PendingDecision> decisions) {
         String targetJson = StateJson.of(target);
         if (current == null) {
             if (!seedIfAbsent) {
@@ -262,14 +268,14 @@ public final class PipelineConverger {
             current = requireCheckpoint(pipelineId);
         }
         if (target == PipelineState.RUNNING && rebuild) {
-            return rebuildToRunning(pipelineId, current, stopIntent);
+            return rebuildToRunning(pipelineId, current, stopIntent, decisions);
         }
         // A requested rebuild was handled above; an ordinary state match needs no further actuation.
         if (current.stateJson().equals(targetJson) && !evenIfAlreadyThere) {
             return ConvergeResult.converged(current);
         }
         if (target == PipelineState.STOPPED) {
-            return beginStop(pipelineId, current, false, stopIntent);
+            return beginStop(pipelineId, current, false, stopIntent, decisions);
         }
         for (int attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
             PipelineState from = StateJson.parse(current.stateJson());
@@ -279,6 +285,7 @@ public final class PipelineConverger {
                 // A prepared run still submits only after the fenced checkpoint write succeeds.
                 if (target == PipelineState.RUNNING && from != PipelineState.PAUSED && !rebuild) {
                     try {
+                        noteAction(decisions, stopIntent, current, PendingAction.START);
                         prepared = actuator.prepareStart(pipelineId);
                     } catch (StartDeferred waiting) {
                         return ConvergeResult.startDeferred(current, waiting.reason());
@@ -327,20 +334,22 @@ public final class PipelineConverger {
     }
 
     /** Completes the reserved stop before one replacement submission can be admitted. */
-    private ConvergeResult rebuildToRunning(String pipelineId, CheckpointDoc current, DesiredState stopIntent) {
+    private ConvergeResult rebuildToRunning(String pipelineId, CheckpointDoc current, DesiredState stopIntent,
+            Consumer<PendingDecision> decisions) {
         if (StateJson.parse(current.stateJson()) == PipelineState.STOPPED && !actuator.isCarryingAJob(pipelineId)) {
-            return driveTo(pipelineId, PipelineState.RUNNING, false, current, false, false, false);
+            return driveTo(pipelineId, PipelineState.RUNNING, false, current, false, false, false, stopIntent, decisions);
         }
-        return beginStop(pipelineId, current, true, stopIntent);
+        return beginStop(pipelineId, current, true, stopIntent, decisions);
     }
 
-    private ConvergeResult beginStop(String pipelineId, CheckpointDoc current, boolean replacement, DesiredState intent) {
+    private ConvergeResult beginStop(String pipelineId, CheckpointDoc current, boolean replacement, DesiredState intent,
+            Consumer<PendingDecision> decisions) {
         if (intent == null || desired.read(pipelineId).filter(intent::equals).isEmpty()
                 || Thread.currentThread().isInterrupted()) {
             return ConvergeResult.superseded();
         }
         if (!state.supportsStopReservations()) {
-            return legacyStop(current, intent, replacement);
+            return legacyStop(current, intent, replacement, decisions);
         }
         StopAuthority authority = actuator.stopAuthority(pipelineId).orElse(null);
         StopReservation.Source source = actuator.stopSource(pipelineId)
@@ -353,10 +362,11 @@ public final class PipelineConverger {
         StopReservation proposal = StopReservation.stopping(pipelineId, UUID.randomUUID().toString(), current.epoch(),
                 intent, source, StopReservation.CounterPolicy.freeze(current, intent), authority);
         return state.reserveStop(current, proposal, clock.instant())
-                .map(accepted -> resumeStop(accepted, intent, true)).orElseGet(ConvergeResult::superseded);
+                .map(accepted -> resumeStop(accepted, intent, true, decisions)).orElseGet(ConvergeResult::superseded);
     }
 
-    private ConvergeResult resumeStop(StopReservation marker, DesiredState intent, boolean firstAttempt) {
+    private ConvergeResult resumeStop(StopReservation marker, DesiredState intent, boolean firstAttempt,
+            Consumer<PendingDecision> decisions) {
         String id = marker.pipelineId();
         StopAuthority authority = actuator.stopAuthority(id).orElse(null);
         if (marker.writerAuthority() != null && authority == null) { return ConvergeResult.superseded(); }
@@ -375,6 +385,7 @@ public final class PipelineConverger {
         CheckpointDoc before = requireCheckpoint(id);
         if (StateJson.parse(before.stateJson()) == PipelineState.FAILED) { rebuilds.recordFailure(id); }
         if (retiring) {
+            noteAction(decisions, intent, before, PendingAction.STOP);
             boolean continuing = continuesCounters(before, intent);
             if (!actuator.finishStop(expected, continuing, firstAttempt, true, current)) {
                 return pendingOrSuperseded(id, current);
@@ -389,13 +400,14 @@ public final class PipelineConverger {
                 StopReservation replacement = StopReservation.stopping(id, UUID.randomUUID().toString(),
                         marker.reservedEpoch(), intent, source, StopReservation.CounterPolicy.freeze(before, intent), authority);
                 return state.replaceStop(marker, replacement, clock.instant())
-                        .map(accepted -> resumeStop(accepted, intent, true)).orElseGet(ConvergeResult::superseded);
+                        .map(accepted -> resumeStop(accepted, intent, true, decisions)).orElseGet(ConvergeResult::superseded);
             }
             state.retireStop(expected, intent, authority, clock.instant());
             return ConvergeResult.superseded();
         }
         return switch (expected.phase()) {
             case STOPPING -> {
+                noteAction(decisions, intent, before, PendingAction.STOP);
                 boolean continuing = expected.counterPolicy() == StopReservation.CounterPolicy.CONTINUE;
                 if (!actuator.finishStop(expected, continuing, firstAttempt, false, current)) {
                     yield pendingOrSuperseded(id, current);
@@ -403,16 +415,24 @@ public final class PipelineConverger {
                 if (!current.getAsBoolean()) { yield ConvergeResult.superseded(); }
                 if (intent.targetState() == PipelineState.RUNNING) {
                     yield state.markReplacementPending(expected, clock.instant())
-                            .map(accepted -> resumeStop(accepted, intent, false))
+                            .map(accepted -> resumeStop(accepted, intent, false, decisions))
                             .orElseGet(ConvergeResult::superseded);
                 }
                 yield state.completeStop(expected, clock.instant())
                         .map(done -> ConvergeResult.converged(done, StateJson.parse(before.stateJson())))
                         .orElseGet(ConvergeResult::superseded);
             }
-            case REPLACEMENT_PENDING -> admitReplacement(expected, intent, current);
-            case SUCCESSOR_ADMITTED, SUCCESSOR_BOUND -> recoverSuccessor(expected, intent, current);
+            case REPLACEMENT_PENDING -> {
+                noteAction(decisions, intent, before, PendingAction.START);
+                yield admitReplacement(expected, intent, current, decisions);
+            }
+            case SUCCESSOR_ADMITTED, SUCCESSOR_BOUND -> recoverSuccessor(expected, intent, current, decisions);
         };
+    }
+
+    private static void noteAction(Consumer<PendingDecision> decisions, DesiredState intent,
+            CheckpointDoc checkpoint, PendingAction action) {
+        if (intent != null) { decisions.accept(new PendingDecision(intent, Optional.ofNullable(checkpoint), action)); }
     }
 
     private boolean currentMarker(StopReservation marker, DesiredState intent, StopAuthority authority) {
@@ -428,7 +448,7 @@ public final class PipelineConverger {
     }
 
     private ConvergeResult admitReplacement(StopReservation marker, DesiredState intent,
-            java.util.function.BooleanSupplier current) {
+            java.util.function.BooleanSupplier current, Consumer<PendingDecision> decisions) {
         String id = marker.pipelineId();
         var admittedAttempt = new java.util.concurrent.atomic.AtomicReference<StopReservation>();
         try (LifecycleActuator.PreparedReplacement prepared = actuator.prepareReplacement(marker,
@@ -443,7 +463,7 @@ public final class PipelineConverger {
             if (!currentMarker(admitted, intent, admitted.writerAuthority())) { return ConvergeResult.superseded(); }
             prepared.submit();
             return prepared.submittedJob()
-                    .flatMap(job -> bindSuccessorWithBoundary(admitted, job, intent))
+                    .flatMap(job -> bindSuccessorWithBoundary(admitted, job, intent, decisions))
                     .orElseGet(() -> ConvergeResult.stopPending(requireCheckpoint(id)));
         } catch (StartDeferred waiting) {
             return ConvergeResult.startDeferred(requireCheckpoint(id), waiting.reason());
@@ -469,7 +489,7 @@ public final class PipelineConverger {
     }
 
     private ConvergeResult recoverSuccessor(StopReservation marker, DesiredState intent,
-            java.util.function.BooleanSupplier current) {
+            java.util.function.BooleanSupplier current, Consumer<PendingDecision> decisions) {
         String id = marker.pipelineId();
         var actual = actuator.inspectSuccessor(marker, current).orElse(null);
         if (actual == null || !current.getAsBoolean()) { return ConvergeResult.superseded(); }
@@ -478,6 +498,7 @@ public final class PipelineConverger {
             PipelineState concludedState = StateJson.parse(concluded.stateJson());
             if (marker.phase() == StopReservation.Phase.SUCCESSOR_BOUND
                     && (concludedState == PipelineState.FAILED || concludedState == PipelineState.COMPLETED)) {
+                noteAction(decisions, intent, concluded, PendingAction.NONE);
                 var ready = marker.counterPolicy() == StopReservation.CounterPolicy.RESET
                         ? Optional.of(marker.handoffIdentity()) : actuator.continuationReady(marker, current);
                 return ready.isPresent() ? state.completeHandoff(marker, ready.orElseThrow(), clock.instant())
@@ -489,6 +510,7 @@ public final class PipelineConverger {
                 end = new SuccessorEnd.Absent(marker.successor().scope(), marker.successor().submissionBootId());
             } else {
                 // Preserve the last bound target's floor before retiring its now absent physical job.
+                noteAction(decisions, intent, concluded, PendingAction.STOP);
                 if (!actuator.finishStop(marker, marker.counterPolicy() == StopReservation.CounterPolicy.CONTINUE,
                         false, false, current)) { return pendingOrSuperseded(id, current); }
                 end = new SuccessorEnd.Terminal(marker.successor().scope(), marker.successor().job());
@@ -498,7 +520,9 @@ public final class PipelineConverger {
                     .orElseGet(ConvergeResult::superseded);
         }
         if (marker.phase() == StopReservation.Phase.SUCCESSOR_ADMITTED) {
-            return bindSuccessorWithBoundary(marker, actual.job().orElseThrow(), intent).orElseGet(ConvergeResult::superseded);
+            noteAction(decisions, intent, requireCheckpoint(id), PendingAction.START);
+            return bindSuccessorWithBoundary(marker, actual.job().orElseThrow(), intent, decisions)
+                    .orElseGet(ConvergeResult::superseded);
         }
         CheckpointDoc before = requireCheckpoint(id);
         if (actual.terminalState().isPresent()
@@ -508,7 +532,7 @@ public final class PipelineConverger {
                     new SuccessorEnd.Terminal(marker.successor().scope(), actual.job().orElseThrow()),
                     terminal, clock.instant()).orElse(null);
             if (ended == null) { return ConvergeResult.superseded(); }
-            ConvergeResult driven = resumeStop(ended, intent, false);
+            ConvergeResult driven = resumeStop(ended, intent, false, decisions);
             if (driven.checkpoint().isPresent()) {
                 Optional<Throwable> cause = terminal == PipelineState.FAILED ? actuator.failure(id) : Optional.empty();
                 if (cause.isPresent()) {
@@ -519,6 +543,7 @@ public final class PipelineConverger {
             }
             return driven;
         }
+        noteAction(decisions, intent, before, PendingAction.NONE);
         if (!actuator.adoptSuccessor(marker, current) || !current.getAsBoolean()) {
             return ConvergeResult.superseded();
         }
@@ -533,7 +558,7 @@ public final class PipelineConverger {
     }
 
     private Optional<ConvergeResult> bindSuccessorWithBoundary(StopReservation admitted, StopReservation.JobIdentity job,
-            DesiredState intent) {
+            DesiredState intent, Consumer<PendingDecision> decisions) {
         String id = admitted.pipelineId();
         CheckpointDoc before = requireCheckpoint(id);
         if (before.epoch() != admitted.reservedEpoch() || StateJson.parse(before.stateJson()) != PipelineState.STOPPED) {
@@ -543,7 +568,7 @@ public final class PipelineConverger {
         var bound = state.bindSuccessor(admitted, admitted.successor().scope(), job, boundAt);
         if (bound.isEmpty()) { return Optional.empty(); }
         StopReservation receipt = bound.orElseThrow();
-        ConvergeResult continued = resumeStop(receipt, intent, false);
+        ConvergeResult continued = resumeStop(receipt, intent, false, decisions);
         if (continued.status() == ConvergeStatus.SUPERSEDED) { return Optional.of(continued); }
         return Optional.of(continued.withExecutionBoundary(new ConvergeResult.ExecutionBoundary(receipt.successor().scope(),
                 receipt.reservedEpoch(), StateJson.parse(before.stateJson()), boundAt, false)));
@@ -557,10 +582,12 @@ public final class PipelineConverger {
     }
 
     /** Compatibility for a binding that explicitly has no durable reservation capability. */
-    private ConvergeResult legacyStop(CheckpointDoc before, DesiredState intent, boolean replacement) {
+    private ConvergeResult legacyStop(CheckpointDoc before, DesiredState intent, boolean replacement,
+            Consumer<PendingDecision> decisions) {
         String id = before.pipelineId();
         CasOutcome reserved = state.compareAndSwap(id, before.epoch(), before.stateJson(), clock.instant());
         if (!(reserved instanceof CasOutcome.Applied admitted)) { return ConvergeResult.superseded(); }
+        noteAction(decisions, intent, admitted.next(), PendingAction.STOP);
         boolean continuing = replacement && continuesCounters(before, intent);
         if (continuing) {
             actuator.stopForRebuildingResume(id, intent.purgeState());
@@ -574,7 +601,7 @@ public final class PipelineConverger {
                 clock.instant());
         if (!(finished instanceof CasOutcome.Applied applied)) { return ConvergeResult.superseded(); }
         if (replacement) {
-            return driveTo(id, PipelineState.RUNNING, false, applied.next(), false, false, false);
+            return driveTo(id, PipelineState.RUNNING, false, applied.next(), false, false, false, intent, decisions);
         }
         return ConvergeResult.converged(applied.next(), StateJson.parse(before.stateJson()));
     }
