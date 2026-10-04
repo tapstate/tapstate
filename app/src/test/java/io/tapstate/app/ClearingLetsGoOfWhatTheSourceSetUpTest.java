@@ -26,6 +26,7 @@ import io.tapstate.runtime.srs.CaptureRunSpec;
 import io.tapstate.runtime.srs.MiningChainId;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SrsCoordinator;
+import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SrsConsumerId;
 import java.nio.charset.StandardCharsets;
@@ -145,6 +146,29 @@ class ClearingLetsGoOfWhatTheSourceSetUpTest {
             assertThat(released.pipelineId()).isEqualTo("p");
             assertThat(released.chainRecordGone()).isTrue();
         });
+    }
+
+    /**
+     * A chain the pipeline left a cursor on but that no source in its definition reads any more -- the source
+     * was pointed elsewhere since -- is cleared all the same, and what was set up there to read it is said to
+     * be left on the source rather than released through a source that reads something else.
+     */
+    @Test
+    void aChainNoDefinedSourceReadsAnyMoreIsClearedAndSaysWhatItLeaves() {
+        Fixture fixture = new Fixture(true, true);
+        String elsewhere = MiningChainId.resolve(
+                new CaptureConfig("mysql", Map.of("host", "elsewhere"), List.of("orders")), null).value();
+        fixture.store.meta().create(elsewhere, null);
+        fixture.store.meta().upsertConsumerOffset(elsewhere, new ConsumerOffset(
+                SrsConsumerId.of("p", "orders_src").value(), Map.of(), null));
+
+        fixture.coordinator.stopCapture("p", true);
+
+        assertThat(fixture.store.meta().read(elsewhere)).as("the chain was cleared all the same").isEmpty();
+        assertThat(fixture.released).as("nothing defined reads it, so nothing is released through it").isEmpty();
+        assertThat(written.list).filteredOn(event -> event.getLevel() == Level.WARN)
+                .singleElement()
+                .satisfies(event -> assertThat(event.getFormattedMessage()).contains(elsewhere).contains("p"));
     }
 
     /**

@@ -100,6 +100,9 @@ from it.
   slot stays after clearing and is yours to drop.
 - A slot you named yourself with `customSlotName` is dropped the same way when `autoClearSlot` is on.
   Turn `autoClearSlot` off to keep it.
+- A pipeline that only loads its source (`read_mode: snapshot_only`) still creates a slot when its load
+  starts, reads nothing through it afterwards, and clearing it does not drop that slot yet. Drop it by hand
+  as below once the load is done.
 - If the source cannot be reached at that moment, or does not answer within a minute, the clearing still
   completes, and the server logs a warning, `connector.release-failed`, naming the source and the slot.
   Drop the slot on the source once nothing is using it:
