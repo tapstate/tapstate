@@ -28,10 +28,12 @@ import io.tapstate.spi.sink.OnFullLoad;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.spi.sink.WriteMode;
+import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.StartLoad;
 import org.junit.jupiter.api.Test;
 
@@ -51,6 +53,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 class StartLoadAgreementTest {
 
     private static final String PIPE = "pipe";
+    /** The consumer id a run records this pipeline's progress on its source under. */
+    private static final String NODE = SrsConsumerId.of(PIPE, "src").value();
 
     @Test
     void aFirstStartIsANewFullLoad() {
@@ -68,14 +72,31 @@ class StartLoadAgreementTest {
     @Test
     void eachKindOfProgressMakesTheStartAResume() {
         List<Consumer<Cell>> progress = List.of(
-                c -> c.store.meta().advanceConsumerReadSeq(c.chain, PIPE, "orders", 4L),
-                c -> c.store.meta().advanceSinkAcked(c.chain, PIPE, new ChainPosition(new SourceOrder(1, 9), "pos-9")),
-                c -> c.store.meta().markSnapshotComplete(c.chain, PIPE, "orders"));
+                c -> c.store.meta().advanceConsumerReadSeq(c.chain, NODE, "orders", 4L),
+                c -> c.store.meta().advanceSinkAcked(c.chain, NODE, new ChainPosition(new SourceOrder(1, 9), "pos-9")),
+                c -> c.store.meta().markSnapshotComplete(c.chain, NODE, "orders"),
+                c -> c.store.meta().upsertConsumerOffset(c.chain, new ConsumerOffset(
+                        NODE, Map.of(), null, List.of(), null, 0L,
+                        Map.of("orders", new ChainPosition(new SourceOrder(1, 9), "pos-9")))));
         for (Consumer<Cell> seed : progress) {
             Cell cell = cell(ReadMode.SNAPSHOT_AND_CDC, false);
             seed.accept(cell);
             assertThat(cell.agree(Optional.empty(), StartIntent.START, false)).isEqualTo(StartLoad.RESUME);
         }
+    }
+
+    /**
+     * A direct capture reads a channel of its own, and recorded its progress on the shared chain under the
+     * pipeline id before it did: a start must still see the run that already loaded its target.
+     */
+    @Test
+    void aDirectSourcesProgressFromBeforeItHadAChannelIsAResume() {
+        Cell first = directCell();
+        assertThat(first.agree(Optional.empty(), StartIntent.START, false)).isEqualTo(StartLoad.FULL_LOAD);
+
+        Cell legacy = directCell();
+        legacy.seed(store -> store.meta().markSnapshotComplete(legacy.chain, PIPE, "orders"));
+        assertThat(legacy.agree(Optional.empty(), StartIntent.START, false)).isEqualTo(StartLoad.RESUME);
     }
 
     @Test
@@ -175,9 +196,20 @@ class StartLoadAgreementTest {
         return new Cell(store, chain);
     }
 
+    /** The same pipeline reading its source directly; the cell's chain is the shared one it recorded on before. */
+    private static Cell directCell() {
+        Cell cell = cell(ReadMode.SNAPSHOT_AND_CDC, false);
+        cell.store.artifacts().save(pipeline(PIPE, ReadMode.SNAPSHOT_AND_CDC, false));
+        return cell;
+    }
+
     private static PipelineResource pipeline(String id, ReadMode mode) {
+        return pipeline(id, mode, true);
+    }
+
+    private static PipelineResource pipeline(String id, ReadMode mode, boolean srs) {
         return new PipelineResource(
-                id, null, List.of(SourceRef.spec("src", true)), null, null,
+                id, null, List.of(SourceRef.spec("src", srs)), null, null,
                 new ServeBlock.Inline(null, FromRef.literal("src"), List.of(
                         new SyncElement("sink", "dest", null, null, null, null)), null, null),
                 new Settings(null, null, null, null, mode, null), null);
@@ -198,9 +230,9 @@ class StartLoadAgreementTest {
 
         /** The records an earlier run that finished its load leaves behind. */
         void loaded() {
-            store.meta().setCdcStart(chain, PIPE, "seam-0", 1L);
-            store.meta().advanceConsumerReadSeq(chain, PIPE, "orders", 7L);
-            store.meta().markSnapshotComplete(chain, PIPE, "orders");
+            store.meta().setCdcStart(chain, NODE, "seam-0", 1L);
+            store.meta().advanceConsumerReadSeq(chain, NODE, "orders", 7L);
+            store.meta().markSnapshotComplete(chain, NODE, "orders");
         }
 
         /** A clearing stop, carried out by the capture side's own teardown. */

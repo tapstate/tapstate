@@ -16,11 +16,13 @@ import java.util.Objects;
  * themselves they would eventually disagree, and the disagreement is silent in both directions: a start
  * that was told "this resumes" and then clears a target, or one that asked about a full load nobody runs.
  *
- * <p>The answer reads nothing but the pipeline's own consumer records on the chains it reads. Any durable
- * progress on any of them -- a read cursor into a ring, a position its sink acknowledged, a table whose
- * initial load landed, the seam a load began at -- makes the start a resume. Each of the four is written
- * by a run that already began, and a run that began has either loaded what it owed or recorded where it
- * stopped; reading that run's target as fresh would clear or refuse rows it wrote itself.
+ * <p>The answer reads nothing but the pipeline's own consumer records on the chains it reads: each of its
+ * source nodes records under a consumer id of its own, and a record from before that is keyed by the
+ * pipeline id alone. Any durable progress on any of them -- a read cursor into a ring, a position its sink
+ * acknowledged, as a whole or per table, a table whose initial load landed, the seam a load began at --
+ * makes the start a resume. Each is written by a run that already began, and a run that began has either
+ * loaded what it owed or recorded where it stopped; reading that run's target as fresh would clear or
+ * refuse rows it wrote itself.
  *
  * <p>Another pipeline's record on a shared chain says nothing about this one: snapshot completion and the
  * seam belong to the pipeline that recorded them, never to the chain.
@@ -39,8 +41,8 @@ public enum StartLoad {
      *
      * @param readMode     the pipeline's read mode, null for the default
      * @param pipelineId   the pipeline being started
-     * @param chainRecords the durable records of the chains the pipeline reads; records of chains it does
-     *                     not read must not be passed, and a record that carries no entry for this
+     * @param chainRecords the durable records of every chain that can hold the pipeline's progress; records
+     *                     of other chains must not be passed, and a record that carries no entry for this
      *                     pipeline contributes nothing
      */
     public static StartLoad of(ReadMode readMode, String pipelineId, Collection<SrsMeta> chainRecords) {
@@ -50,7 +52,8 @@ public enum StartLoad {
             return CDC_ONLY;
         }
         boolean progressed = chainRecords.stream()
-                .flatMap(record -> record.consumerOffset(pipelineId).stream())
+                .flatMap(record -> record.consumerOffsets().stream())
+                .filter(consumer -> SrsConsumerId.belongsTo(consumer.pipelineId(), pipelineId))
                 .anyMatch(StartLoad::hasDurableProgress);
         return progressed ? RESUME : FULL_LOAD;
     }
@@ -59,6 +62,7 @@ public enum StartLoad {
     static boolean hasDurableProgress(ConsumerOffset consumer) {
         return !consumer.perTableSeq().isEmpty()
                 || consumer.sinkAcked() != null
+                || !consumer.sinkAckedByTable().isEmpty()
                 || !consumer.snapshotCompletedTables().isEmpty()
                 || consumer.cdcStartPosition() != null;
     }

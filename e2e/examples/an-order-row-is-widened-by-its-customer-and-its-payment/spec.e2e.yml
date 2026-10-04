@@ -66,7 +66,8 @@ steps:
   - await: { count: { views.order_state: 3 } }
   # Both dimensions on one row, read together.
   - await: { doc: { views.order_state: { where: { order_id: 10 }, expect: { qty: 2, customer_name: ada, payment_method: card } } } }
-  - assert: { doc: { views.order_state: { where: { order_id: 11 }, expect: { qty: 5, customer_name: bo, payment_method: transfer } } } }
+  # Order 10 settling does not settle order 11's independently delivered payment.
+  - await: { doc: { views.order_state: { where: { order_id: 11 }, expect: { qty: 5, customer_name: bo, payment_method: transfer } } } }
   # Present and waiting for a payment, not present because it matched one.
   - assert: { doc: { views.order_state: { where: { order_id: 12 }, expect: { qty: 7, customer_name: ada } } } }
   # The far dimension changes. Neither orders nor payments produces an event of its own here.

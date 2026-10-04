@@ -1,16 +1,22 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.ReadConcern;
+import com.mongodb.TransactionOptions;
+import com.mongodb.WriteConcern;
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.model.BulkWriteOptions;
-import com.mongodb.client.model.ReplaceOneModel;
-import com.mongodb.client.model.ReplaceOptions;
+import com.mongodb.client.model.DeleteManyModel;
+import com.mongodb.client.model.UpdateOneModel;
+import com.mongodb.client.model.UpdateOptions;
 import com.mongodb.client.model.WriteModel;
 import com.mongodb.client.result.UpdateResult;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Op;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.SrsLogBatch;
+import io.tapstate.spi.store.SrsLogBounds;
 import io.tapstate.spi.store.SrsLogRecord;
 import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.WorkloadClaimFence;
@@ -20,6 +26,7 @@ import io.tapstate.spi.store.WorkloadOwner;
 import org.bson.Document;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -31,12 +38,12 @@ import java.util.Optional;
  * is looked up by exact key and cannot be written twice at the same position, both on the index Mongo
  * maintains for every collection.
  *
- * <p><strong>The same index answers the two questions that are not exact lookups</strong>, which is why
- * this store adds none of its own. BSON compares documents field by field in declaration order, so every
- * key of one ring forms a contiguous run of the {@code _id} index ordered by sequence, and a bounded
- * range over {@code _id} selects exactly that run: the largest sequence is its last entry, and a trim is
- * a range delete over its front. This holds only while every key is built with {@code ring} before
- * {@code seq}, so exactly one place builds one.
+ * <p>BSON compares documents field by field in declaration order, so every change key of one ring forms a
+ * contiguous run of the {@code _id} index ordered by sequence. Bounded reads and trimming use that run;
+ * this holds only while every key is built with {@code ring} before {@code seq}, so exactly one place
+ * builds one. Independent string-keyed bounds documents in the same collection preserve the largest
+ * written sequence and retired prefix even when every change is trimmed. They use the existing index
+ * and are outside every change-key range.
  *
  * <p>Driver IO failures are translated into coded io diagnostics, so no driver type escapes the module
  * (rule R3). A stored document that cannot be read back into its model is coded
@@ -51,6 +58,14 @@ public final class MongoSrsLogStore implements SrsLogStore {
 
     private static final String RING = "ring";
     private static final String SEQ = "seq";
+    private static final String LARGEST_SEQUENCE = "largestSequence";
+    private static final String TRIMMED_THROUGH = "trimmedThrough";
+    private static final String BOUNDS_PREFIX = "srs-log-bounds:";
+
+    private static final TransactionOptions DURABLE_APPEND = TransactionOptions.builder()
+            .readConcern(ReadConcern.SNAPSHOT)
+            .writeConcern(WriteConcern.MAJORITY.withJournal(true))
+            .build();
 
     /**
      * What a fenced append writes to its claim to prove it. A counter, so that the write always changes the
@@ -72,7 +87,9 @@ public final class MongoSrsLogStore implements SrsLogStore {
             MongoCollection<Document> collection,
             MongoCollection<Document> workloadClaims) {
         this.client = client;
-        this.collection = Objects.requireNonNull(collection, "collection");
+        this.collection = Objects.requireNonNull(collection, "collection")
+                .withReadConcern(ReadConcern.MAJORITY)
+                .withWriteConcern(WriteConcern.MAJORITY.withJournal(true));
         this.workloadClaims = workloadClaims;
         if ((client == null) != (workloadClaims == null)) {
             throw new IllegalArgumentException("client and workloadClaims must be supplied together");
@@ -81,16 +98,7 @@ public final class MongoSrsLogStore implements SrsLogStore {
 
     @Override
     public void store(String ring, long seq, SrsLogRecord record) {
-        Objects.requireNonNull(ring, "ring");
-        Objects.requireNonNull(record, "record");
-        Document key = key(ring, seq);
-        if (record.captureFence() == null) {
-            StoreIo.run(() -> collection.replaceOne(
-                    new Document("_id", key), toDocument(key, record), new ReplaceOptions().upsert(true)));
-            return;
-        }
-        fenced(record.captureFence(), session -> collection.replaceOne(
-                session, new Document("_id", key), toDocument(key, record), new ReplaceOptions().upsert(true)));
+        storeAll(ring, seq, List.of(Objects.requireNonNull(record, "record")));
     }
 
     @Override
@@ -101,7 +109,8 @@ public final class MongoSrsLogStore implements SrsLogStore {
             return;
         }
         WorkloadClaimFence fence = records.getFirst().captureFence();
-        List<WriteModel<Document>> writes = new ArrayList<>(records.size());
+        List<WriteModel<Document>> writes = new ArrayList<>(records.size() + 1);
+        long lastSeq = Math.addExact(firstSeq, records.size() - 1L);
         long seq = firstSeq;
         for (SrsLogRecord record : records) {
             Objects.requireNonNull(record, "record");
@@ -109,9 +118,15 @@ public final class MongoSrsLogStore implements SrsLogStore {
                 throw new IllegalArgumentException("one SRS log batch must carry one workload claim fence");
             }
             Document key = key(ring, seq++);
-            writes.add(new ReplaceOneModel<>(
-                    new Document("_id", key), toDocument(key, record), new ReplaceOptions().upsert(true)));
+            // A literal replacement pipeline preserves replacement semantics while keeping these
+            // statements in the same driver UPDATE batch as the monotonic bounds update below.
+            writes.add(new UpdateOneModel<>(new Document("_id", key),
+                    List.of(new Document("$replaceWith", new Document("$literal", toDocument(key, record)))),
+                    new UpdateOptions().upsert(true)));
         }
+        // The high-water mark shares the append's existing bulk write and, for fenced capture, its
+        // transaction. It survives deletion of every retained row without allocating a sequence remotely.
+        writes.add(appendBounds(ring, lastSeq));
         // Ordered, so the run lands in the order the ring assigned it rather than in whatever order the
         // driver finds convenient. The run occupies consecutive sequences, and a reader that meets a gap
         // cannot tell a write still in flight from one that failed.
@@ -131,7 +146,27 @@ public final class MongoSrsLogStore implements SrsLogStore {
 
     @Override
     public long largestSequence(String ring) {
+        return bounds(ring).largestSequence();
+    }
+
+    @Override
+    public SrsLogBounds bounds(String ring) {
         Objects.requireNonNull(ring, "ring");
+        Document bounds = StoreIo.call(() -> collection.find(new Document("_id", boundsId(ring))).first());
+        if (bounds != null) {
+            try {
+                return new SrsLogBounds(bounds.getLong(LARGEST_SEQUENCE), bounds.getLong(TRIMMED_THROUGH));
+            } catch (RuntimeException e) {
+                throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                        Map.of("id", boundsId(ring)), e);
+            }
+        }
+        // Older logs have no independent bounds record. Their surviving highest sequence is known,
+        // while nothing proves a retired prefix or the original generation of those records.
+        return new SrsLogBounds(largestRetainedSequence(ring), -1L);
+    }
+
+    private long largestRetainedSequence(String ring) {
         Document last = StoreIo.call(() -> collection.find(ringRange(ring, Long.MAX_VALUE))
                 .sort(new Document("_id", -1))
                 .limit(1)
@@ -139,18 +174,68 @@ public final class MongoSrsLogStore implements SrsLogStore {
         if (last == null) {
             return -1L;
         }
-        Object id = last.get("_id");
-        if (!(id instanceof Document key) || !(key.get(SEQ) instanceof Number seq)) {
-            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
-                    Map.of("id", String.valueOf(id)), null);
+        return sequenceOf(last);
+    }
+
+    @Override
+    public SrsLogBatch readBatch(String ring, long firstSeq, int maxSize) {
+        Objects.requireNonNull(ring, "ring");
+        if (firstSeq < 0 || maxSize < 1) {
+            throw new IllegalArgumentException("an SRS log read requires a non-negative sequence and positive size");
         }
-        return seq.longValue();
+        SrsLogBounds observed = bounds(ring);
+        if (firstSeq > observed.largestSequence()) {
+            return new SrsLogBatch(observed, Map.of());
+        }
+        long room = Long.MAX_VALUE - firstSeq;
+        long lastSeq = Math.min(observed.largestSequence(), firstSeq + Math.min(room, maxSize - 1L));
+        Document range = new Document("_id", new Document("$gte", key(ring, firstSeq))
+                .append("$lte", key(ring, lastSeq)));
+        List<Document> documents = StoreIo.call(() -> collection.find(range)
+                .sort(new Document("_id", 1)).into(new ArrayList<>()));
+        Map<Long, SrsLogRecord> records = new LinkedHashMap<>();
+        for (Document document : documents) {
+            records.put(sequenceOf(document), toRecord(document));
+        }
+        return new SrsLogBatch(observed, records);
     }
 
     @Override
     public void trim(String ring, long throughSeq) {
         Objects.requireNonNull(ring, "ring");
-        StoreIo.run(() -> collection.deleteMany(ringRange(ring, throughSeq)));
+        SrsLogBounds observed = bounds(ring);
+        long cut = Math.min(throughSeq, observed.largestSequence());
+        if (cut < 0) {
+            return;
+        }
+        // Publish the safe retired prefix before deleting it, in the same ordered bulk call. If deletion
+        // fails, keeping already-confirmed rows costs space; losing the high-water mark would reuse keys.
+        List<WriteModel<Document>> writes = List.of(
+                new UpdateOneModel<>(new Document("_id", boundsId(ring)),
+                        new Document("$max", new Document(LARGEST_SEQUENCE, observed.largestSequence())
+                                .append(TRIMMED_THROUGH, cut)), new UpdateOptions().upsert(true)),
+                new DeleteManyModel<>(ringRange(ring, cut)));
+        StoreIo.run(() -> collection.bulkWrite(writes, new BulkWriteOptions().ordered(true)));
+    }
+
+    private static UpdateOneModel<Document> appendBounds(String ring, long lastSeq) {
+        return new UpdateOneModel<>(new Document("_id", boundsId(ring)),
+                new Document("$max", new Document(LARGEST_SEQUENCE, lastSeq))
+                        .append("$setOnInsert", new Document(TRIMMED_THROUGH, -1L)),
+                new UpdateOptions().upsert(true));
+    }
+
+    private static String boundsId(String ring) {
+        return BOUNDS_PREFIX + ring;
+    }
+
+    private static long sequenceOf(Document document) {
+        Object id = document.get("_id");
+        if (!(id instanceof Document key) || !(key.get(SEQ) instanceof Number seq)) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", String.valueOf(id)), null);
+        }
+        return seq.longValue();
     }
 
     /**
@@ -176,6 +261,9 @@ public final class MongoSrsLogStore implements SrsLogStore {
                 .append("op", record.op().symbol())
                 .append("ts", record.ts())
                 .append("schemaVer", record.schemaVer());
+        if (record.epoch() > 0) {
+            document.append("epoch", record.epoch());
+        }
         if (record.captureFence() != null) {
             document.append("captureFence", WorkloadClaimDocuments.stored(record.captureFence()));
         }
@@ -202,7 +290,8 @@ public final class MongoSrsLogStore implements SrsLogStore {
                     rowImage(document, "before"),
                     rowImage(document, "after"),
                     document.getLong("schemaVer"),
-                    readFence(document.get("captureFence", Document.class)));
+                    readFence(document.get("captureFence", Document.class)),
+                    document.containsKey("epoch") ? document.getLong("epoch") : 0L);
         } catch (RuntimeException e) {
             throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
                     Map.of("id", String.valueOf(document.get("_id"))), e);
@@ -242,7 +331,7 @@ public final class MongoSrsLogStore implements SrsLogStore {
                     }
                     write.accept(session);
                     return null;
-                });
+                }, DURABLE_APPEND);
             }
         });
     }

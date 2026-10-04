@@ -51,10 +51,12 @@ import io.tapstate.spi.sink.TargetField;
 import io.tapstate.spi.sink.TargetIndex;
 import io.tapstate.spi.sink.WriteMode;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.ConsumerProgressKind;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceIndex;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.StartLoad;
 import io.tapstate.spi.store.StorePort;
@@ -453,6 +455,9 @@ final class StoreBackedDagSource implements DagSource {
 
     private record SourceVertex(
             String pipelineId, String sourceId, String table, SourceCaptureResolution resolution) {
+        String consumerId() {
+            return SrsConsumerId.of(pipelineId, sourceId).value();
+        }
     }
 
     /**
@@ -1283,7 +1288,7 @@ final class StoreBackedDagSource implements DagSource {
         if (readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY) {
             return SinkAckFactory.NONE;
         }
-        return new StoreBackedSinkAckFactory(chainIdByTable(pipeline), pipelineId, storePort.meta());
+        return new StoreBackedSinkAckFactory(progressByTable(pipeline), storePort.meta());
     }
 
     /**
@@ -1292,15 +1297,17 @@ final class StoreBackedDagSource implements DagSource {
      * reads that position back - so both are resolved the same way, from the same source resolution the
      * source vertex itself is built from.
      */
-    private Map<String, String> chainIdByTable(PipelineResource pipeline) {
-        Map<String, String> chainIdByTable = new LinkedHashMap<>();
-        for (String sourceId : pipeline.sourceIds()) {
-            SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
-            SourceCaptureResolution.forPipeline(pipeline, source, SourceDiscovery.model(storePort, source))
-                    .ifPresent(resolution -> resolution.tables().forEach(table ->
-                            chainIdByTable.put(table, resolution.chainId().value())));
+    private Map<String, StoreBackedSinkAckFactory.SourceProgress> progressByTable(PipelineResource pipeline) {
+        Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = new LinkedHashMap<>();
+        for (SourceVertex vertex : sourceVertices(pipeline).values()) {
+            boolean direct = pipeline.sources().stream().anyMatch(ref ->
+                    ref.id().equals(vertex.sourceId())
+                            && ref instanceof io.tapstate.core.model.SourceRef.Spec spec && !spec.srs());
+            progress.put(vertex.table(), new StoreBackedSinkAckFactory.SourceProgress(
+                    vertex.resolution().chainId().value(), vertex.consumerId(),
+                    direct ? ConsumerProgressKind.DIRECT_SOURCE : ConsumerProgressKind.SRS));
         }
-        return chainIdByTable;
+        return progress;
     }
 
     /**
@@ -1330,8 +1337,10 @@ final class StoreBackedDagSource implements DagSource {
         Map<String, Step.Inline> stepsById = inlineStepsById(pipeline);
         Map<String, String> sourceIdByTable = sourceIdByTable(sourceVertices);
         StartFrom freshStart = freshRingStart(pipeline);
+        Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = progressByTable(pipeline);
         return new DagBindings(
-                key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch, freshStart),
+                key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch, freshStart,
+                        progress.get(sourceVertices.get(key).table()).kind() == ConsumerProgressKind.DIRECT_SOURCE),
                 step -> transformBinding(step, stepsById, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds),
                 element -> FencedSinkWriterFactory.heldTo(
                         sinkWriter(pipeline, element, targets, serveStreams, sourceIdByTable, freshFullLoad), fence),
@@ -2211,7 +2220,7 @@ final class StoreBackedDagSource implements DagSource {
         var operatorStateStores = storePort.operatorStateStores();
         return new NestBinding(byAlias::get, NestBinding.onMap(),
                 new LoggingNestDeadLetter(new DurableNestDeadLetter()),
-                new StoreBackedReplayFloorFactory(chainIdByTable(pipeline), pipeline.id()),
+                new StoreBackedReplayFloorFactory(progressByTable(pipeline)),
                 new StoreBackedNestStateLedger(operatorStateStores,
                         PipelineDagBuilder.nestStateDatabasesByStep(
                                 pipeline, operatorStateStores.defaultDatabase())),
@@ -2307,7 +2316,8 @@ final class StoreBackedDagSource implements DagSource {
      * writer fills.
      */
     private ProcessorMetaSupplier sourceVertex(
-            SourceVertex vertex, ChainAxes axes, boolean snapshotOnly, long snapshotEpoch, StartFrom freshStart) {
+            SourceVertex vertex, ChainAxes axes, boolean snapshotOnly, long snapshotEpoch, StartFrom freshStart,
+            boolean direct) {
         if (vertex == null) {
             throw new IllegalStateException("source vertex binding is missing");
         }
@@ -2321,32 +2331,53 @@ final class StoreBackedDagSource implements DagSource {
                     vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.table(), snapshotEpoch,
                     order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement);
         }
+        if (direct) {
+            return SrsSourceProcessor.directMetaSupplier(vertex.pipelineId(),
+                    vertex.resolution().ringName(vertex.table()), vertex.table(),
+                    sourceContextEpoch(vertex.resolution().chainId().value(), vertex.consumerId(), vertex.table()),
+                    order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement);
+        }
         // Where in the ring this run starts. Not the head as such: a ring outlives the runs that read it, so
         // after one run dies the head can sit far below what this pipeline already landed, and starting there
         // hands its target every change the ring still holds again. The record says how far the pipeline is
         // done in this table's ring -- confirmed by its sink, or marked when it arrived -- and the run carries
         // on just past that. With nothing recorded, the pipeline's own start decides.
         Long doneThrough = storePort.meta()
-                .ringDoneThrough(vertex.resolution().chainId().value(), vertex.pipelineId())
+                .ringDoneThrough(vertex.resolution().chainId().value(), vertex.consumerId())
                 .get(vertex.table());
         return SrsSourceProcessor.metaSupplier(
                 vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.table(), freshStart,
-                doneThrough, ringGeneration(vertex.resolution()),
+                doneThrough, sourceContextEpoch(
+                        vertex.resolution().chainId().value(), vertex.consumerId(), vertex.table()),
                 CaptureRunUnit.readCursorPublisher(
-                        vertex.resolution().chainId().value(), vertex.pipelineId(), vertex.table()),
+                        vertex.resolution().chainId().value(), vertex.consumerId(), vertex.table()),
                 order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement);
     }
 
     /**
-     * The generation the source's ring is open under, read once while the job is assembled, and zero where
-     * no ring-backed tail was opened.
+     * The epoch of this source node's snapshot bound, read once while the job is assembled. A keep-state
+     * restart must not announce a newer snapshot bound before replaying pending log records from the old
+     * generation. The log records retain their own capture epoch; this value only anchors the load and its
+     * initial bound. A full reload records its new snapshot epoch and therefore supersedes older entries.
      *
      * <p>A snapshot-only read does not use this value: its durable per-run generation is selected before
-     * this method is reached. Reading the record for every other mode rather than re-deriving the plan keeps
-     * one answer to which ring generation is running: the capture opens it before this job is assembled.
+     * this method is reached. With no load recorded, a table's own confirmed epoch anchors it; only a source
+     * with no recovery progress falls back to the current capture generation.
      */
-    private long ringGeneration(SourceCaptureResolution resolution) {
-        return storePort.meta().read(resolution.chainId().value()).map(SrsMeta::epoch).orElse(0L);
+    long sourceContextEpoch(String miningChainId, String consumerId, String table) {
+        return storePort.meta().read(miningChainId).map(meta -> {
+            var consumer = meta.consumerOffset(consumerId).orElse(null);
+            if (consumer != null) {
+                var confirmed = consumer.sinkAckedByTable().get(table);
+                long confirmedEpoch = confirmed == null || confirmed.order() == null
+                        ? 0L : confirmed.order().epoch();
+                long ownEpoch = Math.max(consumer.snapshotEpoch(), confirmedEpoch);
+                if (ownEpoch > 0) {
+                    return ownEpoch;
+                }
+            }
+            return meta.epoch();
+        }).orElse(0L);
     }
 
     /**
@@ -2447,11 +2478,12 @@ final class StoreBackedDagSource implements DagSource {
     /**
      * Whether this start is a new full load, by the same judgement the start verb predicts it with: a
      * CDC-only read never is, and any durable state this pipeline recorded on a chain it reads makes it a
-     * resume, which suppresses target preparation.
+     * resume, which suppresses target preparation. A direct capture's older progress, recorded on the shared
+     * chain before it read a channel of its own, counts as well.
      */
     private boolean freshFullLoad(PipelineResource pipeline) {
         List<SrsMeta> records = sourceVertices(pipeline).values().stream()
-                .map(vertex -> vertex.resolution().chainId().value())
+                .flatMap(vertex -> vertex.resolution().progressChainIds(pipeline.id()).stream())
                 .distinct()
                 .map(chainId -> storePort.meta().read(chainId))
                 .flatMap(Optional::stream)

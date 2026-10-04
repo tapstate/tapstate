@@ -33,8 +33,10 @@ class StartLoadTest {
                 new ChainPosition(new SourceOrder(1, 7), "pos-7"), List.of(), null, 0L);
         ConsumerOffset loaded = new ConsumerOffset(PIPE, Map.of(), null, List.of("orders"), null, 0L);
         ConsumerOffset seam = new ConsumerOffset(PIPE, Map.of(), null, List.of(), "seam-0", 1L);
+        ConsumerOffset ackedPerTable = new ConsumerOffset(PIPE, Map.of(), null, List.of(), null, 0L,
+                Map.of("orders", new ChainPosition(new SourceOrder(1, 7), "pos-7")));
 
-        for (ConsumerOffset progressed : List.of(cursor, acked, loaded, seam)) {
+        for (ConsumerOffset progressed : List.of(cursor, acked, loaded, seam, ackedPerTable)) {
             assertThat(StartLoad.of(ReadMode.SNAPSHOT_AND_CDC, PIPE, List.of(chain(progressed))))
                     .as("progress %s", progressed)
                     .isEqualTo(StartLoad.RESUME);
@@ -48,9 +50,22 @@ class StartLoadTest {
     }
 
     @Test
+    void progressASourceNodeRecordsUnderItsOwnConsumerIdIsThePipelines() {
+        ConsumerOffset loaded = new ConsumerOffset(SrsConsumerId.of(PIPE, "orders_src").value(),
+                Map.of(), null, List.of("orders"), null, 0L);
+        assertThat(StartLoad.of(null, PIPE, List.of(chain(loaded)))).isEqualTo(StartLoad.RESUME);
+    }
+
+    @Test
     void anotherPipelinesProgressOnASharedChainSaysNothingAboutThisOne() {
         ConsumerOffset other = new ConsumerOffset("other", Map.of("orders", 3L), null, List.of("orders"), "seam", 1L);
-        assertThat(StartLoad.of(null, PIPE, List.of(chain(other)))).isEqualTo(StartLoad.FULL_LOAD);
+        ConsumerOffset otherNode = new ConsumerOffset(SrsConsumerId.of("other", "orders_src").value(),
+                Map.of("orders", 3L), null, List.of("orders"), "seam", 1L);
+        // A pipeline whose id merely begins with this one's is another pipeline all the same.
+        ConsumerOffset longerName = new ConsumerOffset(SrsConsumerId.of(PIPE + "2", "orders_src").value(),
+                Map.of("orders", 3L), null, List.of("orders"), "seam", 1L);
+        assertThat(StartLoad.of(null, PIPE, List.of(chain(other, otherNode, longerName))))
+                .isEqualTo(StartLoad.FULL_LOAD);
     }
 
     @Test

@@ -63,9 +63,7 @@ public final class StartPlanner {
         if (clearsFirst(prior, intent)) {
             return List.of();
         }
-        return chains.of(definition.id()).stream()
-                .map(PipelineChains.Chain::chainId)
-                .distinct()
+        return chains.progressChainsOf(definition.id()).stream()
                 .map(meta::read)
                 .flatMap(Optional::stream)
                 .toList();
