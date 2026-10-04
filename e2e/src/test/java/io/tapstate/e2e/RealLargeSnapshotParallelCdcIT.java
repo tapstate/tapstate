@@ -76,9 +76,10 @@ class RealLargeSnapshotParallelCdcIT {
             Await.until("parallel CDC baseline", Duration.ofMinutes(2),
                     () -> "before".equals(fastStatus(mongo, target)),
                     () -> "state=" + control.state(FAST_PIPELINE) + ", target=" + fastStatus(mongo, target));
-            assertThat(control.state(FAST_PIPELINE)).contains(PipelineState.RUNNING);
             long firstFastRecords = Await.answered("parallel CDC records-out baseline",
-                    () -> control.recordsOut(FAST_PIPELINE).filter(count -> count > 0));
+                    () -> control.state(FAST_PIPELINE).filter(PipelineState.RUNNING::equals)
+                            .flatMap(ignored -> control.recordsOut(FAST_PIPELINE).filter(count -> count > 0)));
+            assertThat(control.state(FAST_PIPELINE)).contains(PipelineState.RUNNING);
             Instant firstFastObserved = control.statusObservedAt(FAST_PIPELINE);
 
             control.lifecycle(BULK_PIPELINE, LifecycleVerb.START);

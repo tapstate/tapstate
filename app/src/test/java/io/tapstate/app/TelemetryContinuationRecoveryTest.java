@@ -43,6 +43,7 @@ import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -151,6 +152,144 @@ class TelemetryContinuationRecoveryTest {
                         assertThat(point.histogram()).isEqualTo(quarterSecondHistogram(9));
                         assertThat(point.startTime()).isEqualTo(AT.minusSeconds(60));
                     }));
+        }
+    }
+
+    @Test
+    void aRetiredUnsubmittedSlotKeepsItsPreviouslyBoundFloorAcrossAnotherAdmission() {
+        var fixture = new UnsubmittedOriginFixture(false);
+        var original = fixture.store.privateState.get();
+
+        assertThat(fixture.recovery.prepareHandoff(PIPELINE, fixture.unsubmittedScope, () -> true))
+                .as("a known unbound carrier keeps the real origin from the previous bound target").isTrue();
+        assertThat(fixture.store.privateState.get()).isEqualTo(original);
+        assertThat(fixture.store.saveAttempts).hasValue(0);
+        assertThat(fixture.scopes.activeContinuationTarget(PIPELINE)).isEmpty();
+        verifyNoInteractions(fixture.engine);
+
+        var nextScope = new ObservationStore.Scope("inc-a", 44);
+        var nextJob = new StopReservation.JobIdentity("single", 88, "boot-next");
+        fixture.authority.set(StopAuthority.standalone("single", nextScope.executionGeneration()));
+        fixture.marker.set(new StopReservation(PIPELINE, original.continuation().token(), 0, 7, fixture.intent,
+                fixture.source, StopReservation.Phase.SUCCESSOR_BOUND, StopReservation.CounterPolicy.CONTINUE,
+                fixture.authority.get(), new StopReservation.Successor(nextScope, nextJob.bootId(), nextJob),
+                StopReservation.CURRENT_FORMAT));
+        fixture.actual.set(new CheckpointDoc(PIPELINE, StateJson.of(PipelineState.RUNNING), 7, AT));
+        fixture.actualJob.set(new Engine.ExecutionJob(nextJob, nextScope));
+        fixture.scopes.begin(PIPELINE, "inc-a", nextScope.executionGeneration());
+        assertThat(fixture.recovery.prepareHandoff(PIPELINE, nextScope, () -> true)).isTrue();
+        var retained = fixture.store.privateState.get().continuation();
+        assertThat(retained.target()).contains(new ObservationContinuation.Target(nextScope, Optional.of(nextJob)));
+        assertThat(retained.baselineOrigin()).isEqualTo(original.continuation().baselineOrigin());
+        assertThat(retained.baselineFacts()).isEqualTo(original.continuation().baselineFacts());
+
+        MetricFact records = retained.baselineFacts().getFirst();
+        MetricFact duration = retained.baselineFacts().get(1);
+        for (Instant sample : List.of(AT.plusSeconds(1), AT.plusSeconds(2))) {
+            var raw = new ObservationPublisher.Prepared(new Observation(PIPELINE, PipelineState.RUNNING,
+                    Map.of("records.out", 2L), Map.of(), Map.of(), null, sample, List.of(
+                            new MetricFact(records.name(), records.type(), records.unit(), List.of(
+                                    MetricPoint.accumulated(records.points().getFirst().attributes(), AT.plusSeconds(1), sample, 2))),
+                            new MetricFact(duration.name(), duration.type(), duration.unit(), List.of(
+                                    MetricPoint.distribution(duration.points().getFirst().attributes(), AT.plusSeconds(1), sample,
+                                            quarterSecondHistogram(2)))))), false, Map.of(), Map.of(), Map.of());
+            var packet = fixture.scopes.prepareContinuationPublication(raw,
+                    new ObservationScopeRegistry.ActualTarget(nextScope, nextJob), () -> true).orElseThrow();
+            assertThat(packet.projected().observation().facts()).filteredOn(fact -> fact.type() == MetricType.COUNTER)
+                    .singleElement().satisfies(fact -> assertThat(fact.points()).singleElement().satisfies(point -> {
+                        assertThat(point.value()).isEqualTo(9);
+                        assertThat(point.startTime()).isEqualTo(AT.minusSeconds(60));
+                    }));
+            assertThat(packet.projected().observation().facts()).filteredOn(fact -> fact.type() == MetricType.HISTOGRAM)
+                    .singleElement().satisfies(fact -> assertThat(fact.points()).singleElement().satisfies(point -> {
+                        assertThat(point.histogram()).isEqualTo(quarterSecondHistogram(9));
+                        assertThat(point.startTime()).isEqualTo(AT.minusSeconds(60));
+                    }));
+        }
+    }
+
+    @Test
+    void aClaimBootAndGenerationChangeDuringTheSameExecutionReadRejectsTheOldPendingCarrier() throws Exception {
+        var fixture = new UnsubmittedOriginFixture(true);
+        var original = fixture.store.privateState.get().continuation();
+        // This control uses the original source role so the unchanged-authority read is otherwise admissible.
+        var sourceRole = new ObservationContinuation(original.token(), original.sourceScope(), original.target(),
+                Optional.empty(), original.baselineFacts(), original.producerStates());
+        fixture.store.privateState.set(new ObservationStore.StoredContinuation(sourceRole,
+                MemoryContinuationStore.receipt(sourceRole, "guarded-source-role")));
+        var expected = fixture.store.privateState.get();
+        fixture.store.blockRead.set(true);
+        try (var worker = Executors.newSingleThreadExecutor()) {
+            var pending = worker.submit(() -> fixture.recovery.prepareHandoff(PIPELINE, fixture.unsubmittedScope, () -> true));
+            try {
+                assertThat(fixture.store.readEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                StopAuthority old = fixture.authority.get();
+                StopAuthority next = StopAuthority.claimed(new WorkloadClaimFence(old.claim().key(),
+                        new WorkloadOwner("owner-a", "boot-owner-a-restarted"), old.claim().claimGeneration() + 1,
+                        old.executionGeneration(), old.claim().topologyRevision()));
+                assertThat(next.executionGeneration()).isEqualTo(old.executionGeneration());
+                assertThat(next.claim().owner().bootId()).isNotEqualTo(old.claim().owner().bootId());
+                fixture.authority.set(next);
+                fixture.store.readRelease.countDown();
+                assertThat(pending.get(5, TimeUnit.SECONDS)).isFalse();
+                assertThat(fixture.store.saveAttempts).hasValue(0);
+                assertThat(fixture.store.committed).hasValue(0);
+                assertThat(fixture.store.privateState.get()).isEqualTo(expected);
+                assertThat(fixture.scopes.activeContinuationTarget(PIPELINE)).isEmpty();
+                verifyNoInteractions(fixture.engine);
+            } finally {
+                fixture.store.readRelease.countDown();
+            }
+        }
+    }
+
+    /** Controlled native and authority doubles; all continuation selection is the real recovery and registry. */
+    private static final class UnsubmittedOriginFixture {
+        private final ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        private final MemoryContinuationStore store = new MemoryContinuationStore();
+        private final Engine engine = mock(Engine.class);
+        private final ObservationStore.Scope unsubmittedScope = new ObservationStore.Scope("inc-a", 43);
+        private final DesiredState intent = new DesiredState(PIPELINE, PipelineState.RUNNING, "rev-1");
+        private final StopReservation.Source source = new StopReservation.Source("single", SOURCE,
+                new StopReservation.JobIdentity("single", 70, "boot-source"));
+        private final AtomicReference<StopAuthority> authority = new AtomicReference<>();
+        private final AtomicReference<StopReservation> marker;
+        private final AtomicReference<CheckpointDoc> actual = new AtomicReference<>(
+                new CheckpointDoc(PIPELINE, StateJson.of(PipelineState.STOPPED), 6, AT));
+        private final AtomicReference<Engine.ExecutionJob> actualJob = new AtomicReference<>();
+        private final ObservationContinuationRecovery recovery;
+
+        private UnsubmittedOriginFixture(boolean claimed) {
+            authority.set(claimed ? StopAuthority.claimed(new WorkloadClaimFence(
+                    new WorkloadClaimKey("single", WorkloadClaimType.PIPELINE_ACTUATION, PIPELINE),
+                    new WorkloadOwner("owner-a", "boot-owner-a"), 5, unsubmittedScope.executionGeneration(), 7))
+                    : StopAuthority.standalone("single", unsubmittedScope.executionGeneration()));
+            MetricFact records = store.privateState.get().continuation().baselineFacts().getFirst();
+            MetricFact duration = MetricFact.single("tapstate.pipeline.record.delivery.duration", MetricType.HISTOGRAM, "s",
+                    MetricPoint.distribution(Map.of(MetricAttributes.PIPELINE_ID, PIPELINE, MetricAttributes.TABLE_ID, "orders"),
+                            AT.minusSeconds(60), AT, quarterSecondHistogram(7)));
+            var floor = new ObservationContinuation("resumed-42", SOURCE,
+                    Optional.of(new ObservationContinuation.Target(unsubmittedScope, Optional.empty())),
+                    Optional.of(new ObservationContinuation.Target(TARGET, Optional.of(JOB))), List.of(records, duration), List.of());
+            store.privateState.set(new ObservationStore.StoredContinuation(floor,
+                    MemoryContinuationStore.receipt(floor, "previous-bound-floor")));
+            marker = new AtomicReference<>(new StopReservation(PIPELINE, floor.token(), 0, 6, intent, source,
+                    StopReservation.Phase.REPLACEMENT_PENDING, StopReservation.CounterPolicy.CONTINUE, authority.get(),
+                    null, StopReservation.CURRENT_FORMAT));
+            StateStore state = mock(StateStore.class);
+            InMemoryDesiredStore desired = new InMemoryDesiredStore();
+            desired.save(intent);
+            LifecycleActuator actuator = mock(LifecycleActuator.class);
+            ArtifactStore artifacts = mock(ArtifactStore.class);
+            when(state.supportsStopReservations()).thenReturn(true);
+            when(state.readStopReservation(PIPELINE)).thenAnswer(call -> Optional.of(marker.get()));
+            when(state.read(PIPELINE)).thenAnswer(call -> Optional.of(actual.get()));
+            when(actuator.stopAuthority(PIPELINE)).thenAnswer(call -> Optional.of(authority.get()));
+            when(artifacts.pipelineIncarnationId(PIPELINE)).thenReturn(Optional.of("inc-a"));
+            when(engine.executionJob(PIPELINE)).thenAnswer(call -> Optional.ofNullable(actualJob.get()));
+            when(engine.noUnfinishedJob(PIPELINE)).thenAnswer(call -> actualJob.get() == null);
+            recovery = new ObservationContinuationRecovery(scopes, store, state, desired, artifacts, actuator, engine);
+            scopes.begin(PIPELINE, "inc-a", unsubmittedScope.executionGeneration());
         }
     }
 
@@ -456,6 +595,7 @@ class TelemetryContinuationRecoveryTest {
         private final CountDownLatch readEntered = new CountDownLatch(1);
         private final CountDownLatch readRelease = new CountDownLatch(1);
         private final AtomicInteger committed = new AtomicInteger();
+        private final AtomicInteger saveAttempts = new AtomicInteger();
         private final AtomicInteger revisions = new AtomicInteger();
         private final AtomicReference<Stored> current = new AtomicReference<>();
         private final AtomicReference<StoredContinuation> privateState;
@@ -482,6 +622,7 @@ class TelemetryContinuationRecoveryTest {
         }
         @Override public synchronized Optional<ContinuationReceipt> saveContinuation(String id, StopReservation marker,
                 Optional<ContinuationReceipt> expected, ObservationContinuation next) {
+            saveAttempts.incrementAndGet();
             if (!expected.equals(Optional.of(privateState.get().receipt()))) { return Optional.empty(); }
             assertThat(marker.pipelineId()).isEqualTo(id);
             assertThat(next.token()).isEqualTo(marker.token());

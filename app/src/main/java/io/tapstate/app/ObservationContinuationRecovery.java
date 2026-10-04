@@ -80,11 +80,14 @@ final class ObservationContinuationRecovery {
                 && saved.receipt().matches(marker.handoffIdentity())).isPresent();
         Optional<ObservationScopeRegistry.SourceSnapshot> frozen = Optional.empty();
         if (!sameBound) {
-            // The exact verified carrier pins one prior real target across admission in this same handoff.
+            // The verified carrier pins a prior real target, including the measured origin retained
+            // by a later unsubmitted slot. An unsubmitted slot contributes no native producer state.
             Optional<ObservationScopeRegistry.ActualTarget> previous = stored
                     .filter(saved -> saved.continuation().token().equals(marker.token())
                             && Objects.equals(saved.continuation().sourceScope(), marker.source().scope()))
-                    .flatMap(saved -> saved.continuation().target())
+                    .flatMap(saved -> saved.continuation().target().filter(bound -> bound.realJob().isPresent())
+                            .or(() -> saved.continuation().target().filter(bound -> bound.realJob().isEmpty())
+                                    .flatMap(ignored -> saved.continuation().baselineOrigin())))
                     .filter(bound -> bound.realJob().isPresent()
                             && marker.writerAuthority() != null
                             && bound.scope().executionGeneration() <= marker.writerAuthority().executionGeneration()
