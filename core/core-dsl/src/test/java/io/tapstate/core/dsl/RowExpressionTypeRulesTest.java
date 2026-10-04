@@ -118,6 +118,117 @@ class RowExpressionTypeRulesTest {
                 batch(pipeline), model("amount", TapstateType.DECIMAL))).doesNotThrowAnyException();
     }
 
+    @Test
+    void aDecimalReplacedByAnIntegerBeforeAChoicePasses() {
+        String pipeline = """
+                version: tapstate/v1
+                kind: pipeline
+                id: orders_out
+                source: src_orders
+                transforms:
+                  - { id: numbers, from: [orders], type: map, fields: { a: 1, b: 2 } }
+                  - id: choose
+                    from: [numbers]
+                    type: map
+                    fields: { chosen: "=has(after.a) ? after.a : after.b" }
+                serve:
+                  from: choose
+                  sync: [ { id: out, source: src_orders, write_mode: upsert } ]
+                """;
+
+        assertThatCode(() -> RowExpressionTypeRules.validate(batch(pipeline),
+                model("a", TapstateType.DECIMAL, "b", TapstateType.DECIMAL)))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    void aParallelIntegerMapDoesNotHideADecimalChoice() {
+        String pipeline = """
+                version: tapstate/v1
+                kind: pipeline
+                id: orders_out
+                source: src_orders
+                transforms:
+                  - { id: base, from: [orders], type: filter, expr: "op == 'i'" }
+                  - { id: numbers, from: [base], type: map, fields: { a: 1, b: 2 } }
+                  - { id: unchanged, from: [base], type: filter, expr: "op == 'i'" }
+                  - { id: merge, from: [numbers, unchanged], type: union }
+                  - id: choose
+                    from: [merge]
+                    type: map
+                    fields: { chosen: "=has(after.a) ? after.a : after.b" }
+                serve:
+                  from: choose
+                  sync: [ { id: out, source: src_orders, write_mode: upsert } ]
+                """;
+
+        DslException thrown = catchThrowableOfType(DslException.class,
+                () -> RowExpressionTypeRules.validate(batch(pipeline),
+                        model("a", TapstateType.DECIMAL, "b", TapstateType.DECIMAL)));
+
+        assertThat(thrown).isNotNull();
+        assertThat(thrown.code()).isEqualTo(DslError.ROW_EXPRESSION_TYPE_UNSUPPORTED);
+        assertThat(thrown.path()).isEqualTo("transforms[4].fields.chosen");
+        assertThat(thrown.args()).containsEntry("type", "DECIMAL").containsEntry("table", "orders");
+    }
+
+    @Test
+    void reusedMapsUseTheirInputsComputedTypes() {
+        String numbers = """
+                version: tapstate/v1
+                kind: transform
+                id: integer_fields
+                type: map
+                fields: { a: "=1", b: "=2" }
+                """;
+        String choose = """
+                version: tapstate/v1
+                kind: transform
+                id: choose_integer
+                type: map
+                fields: { chosen: "=has(after.a) ? after.a : after.b" }
+                """;
+        String pipeline = """
+                version: tapstate/v1
+                kind: pipeline
+                id: orders_out
+                source: src_orders
+                transforms:
+                  - { id: numbers, from: [orders], use: integer_fields }
+                  - { id: choose, from: [numbers], use: choose_integer }
+                serve:
+                  from: choose
+                  sync: [ { id: out, source: src_orders, write_mode: upsert } ]
+                """;
+
+        assertThatCode(() -> RowExpressionTypeRules.validate(batch(numbers, choose, pipeline),
+                model("a", TapstateType.DECIMAL, "b", TapstateType.DECIMAL)))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    void filtersAndBothPushFormatsReadTheProjectedTypes() {
+        String expression = "has(after.a) ? after.a : after.b";
+        for (String format : List.of("\"=" + expression + "\"", "{ chosen: \"=" + expression + "\" }")) {
+            String pipeline = """
+                    version: tapstate/v1
+                    kind: pipeline
+                    id: orders_out
+                    source: src_orders
+                    transforms:
+                      - { id: numbers, from: [orders], type: map, fields: { a: 1, b: 2 } }
+                      - { id: keep, from: [numbers], type: filter, expr: "after.a > 0" }
+                    serve:
+                      from: keep
+                      push: [ { id: topic_out, source: src_orders, topic: t, format: %s } ]
+                    """.formatted(format);
+
+            assertThatCode(() -> RowExpressionTypeRules.validate(batch(pipeline),
+                    model("a", TapstateType.DECIMAL, "b", TapstateType.DECIMAL)))
+                    .doesNotThrowAnyException();
+        }
+    }
+
     // ---- a column whose type nothing resolved -------------------------------------------
 
     @Test

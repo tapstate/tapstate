@@ -9,6 +9,7 @@ import io.tapstate.core.model.Step;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.ViewBlock;
 
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -32,6 +33,7 @@ final class Wiring {
     private final Map<String, Resource> byId;
     private final Set<String> allSources;
     private final Map<String, FromClause> nodeFrom = new LinkedHashMap<>();
+    private final Map<String, Step> stepsById = new LinkedHashMap<>();
     private final Map<String, Set<String>> tablesBySelector = new LinkedHashMap<>();
     /** Sources whose table set cannot be enumerated offline, so any table name may come from them. */
     private final Set<String> openSources = new LinkedHashSet<>();
@@ -43,6 +45,7 @@ final class Wiring {
         if (pipeline.transforms() != null) {
             for (Step step : pipeline.transforms()) {
                 nodeFrom.put(step.id(), step.from());
+                stepsById.put(step.id(), step);
             }
         }
         indexView(pipeline.view());
@@ -79,8 +82,31 @@ final class Wiring {
 
     Set<Upstream> reaching(FromClause from) {
         Set<Upstream> reached = new LinkedHashSet<>();
-        collect(from, reached, new HashSet<>());
+        collect(from, reached, new HashSet<>(), null, List.of());
         return attributed(reached);
+    }
+
+    /** One source-table path, with its transforms in the order rows encounter them. */
+    record Route(Upstream upstream, List<Step> steps) {
+    }
+
+    /**
+     * Keeps each path distinct so a map on one branch cannot change the types of another branch's
+     * rows, even when both branches read the same source table. Uses the shared wiring traversal.
+     */
+    List<Route> routesReaching(FromClause from) {
+        List<Route> routes = new ArrayList<>();
+        collect(from, new LinkedHashSet<>(), new HashSet<>(), routes, new ArrayList<>());
+        if (routes.isEmpty()) {
+            for (Upstream upstream : whole(allSources)) {
+                routes.add(new Route(upstream, List.of()));
+            }
+        }
+        return List.copyOf(routes);
+    }
+
+    List<Route> routesReaching(FromRef ref) {
+        return routesReaching(new FromClause.Flow(List.of(ref)));
     }
 
     /**
@@ -95,14 +121,14 @@ final class Wiring {
      */
     Set<String> nodesReaching(FromClause from) {
         Set<String> followed = new LinkedHashSet<>();
-        collect(from, new LinkedHashSet<>(), followed);
+        collect(from, new LinkedHashSet<>(), followed, null, List.of());
         return followed;
     }
 
     /** A serve or view block is wired by a single reference rather than a list of them. */
     Set<Upstream> reaching(FromRef ref) {
         Set<Upstream> reached = new LinkedHashSet<>();
-        collect(ref, reached, new HashSet<>());
+        collect(ref, reached, new HashSet<>(), null, List.of());
         return attributed(reached);
     }
 
@@ -118,21 +144,24 @@ final class Wiring {
         return reached.isEmpty() ? whole(allSources) : reached;
     }
 
-    private void collect(FromClause from, Set<Upstream> reached, Set<String> visiting) {
+    private void collect(FromClause from, Set<Upstream> reached, Set<String> visiting,
+            List<Route> routes, List<Step> steps) {
         switch (from) {
             case null -> {
             }
-            case FromClause.Flow flow -> flow.refs().forEach(ref -> collect(ref, reached, visiting));
+            case FromClause.Flow flow ->
+                    flow.refs().forEach(ref -> collect(ref, reached, visiting, routes, steps));
             // nest / join: the alias map's values are what the node reads
             case FromClause.Aliases aliases ->
-                    aliases.aliases().values().forEach(ref -> collect(ref, reached, visiting));
+                    aliases.aliases().values().forEach(ref -> collect(ref, reached, visiting, routes, steps));
         }
     }
 
-    private void collect(FromRef ref, Set<Upstream> reached, Set<String> visiting) {
+    private void collect(FromRef ref, Set<Upstream> reached, Set<String> visiting,
+            List<Route> routes, List<Step> steps) {
         if (ref instanceof FromRef.Regex) {
             // which tables it selects needs a connection to answer, so every table is in play
-            reached.addAll(whole(allSources));
+            arrive(whole(allSources), reached, routes, steps);
             return;
         }
         String token = ((FromRef.Literal) ref).ref();
@@ -141,15 +170,27 @@ final class Wiring {
             String prefix = token.substring(0, dot);
             String table = token.substring(dot + 1);
             if (allSources.contains(prefix)) {
-                reached.add(new Upstream(prefix, table));
+                arrive(Set.of(new Upstream(prefix, table)), reached, routes, steps);
             } else {
-                reached.addAll(whole(allSources));
+                arrive(whole(allSources), reached, routes, steps);
             }
             return;
         }
         if (nodeFrom.containsKey(token)) {
             if (visiting.add(token)) {
-                collect(nodeFrom.get(token), reached, visiting);
+                Step step = stepsById.get(token);
+                if (routes != null && step != null) {
+                    steps.add(step);
+                }
+                collect(nodeFrom.get(token), reached, visiting, routes, steps);
+                if (routes != null) {
+                    if (step != null) {
+                        steps.removeLast();
+                    }
+                    // Route collection follows shared nodes once per path; source-only collection
+                    // keeps its global visited set, which also backs nodesReaching.
+                    visiting.remove(token);
+                }
             }
             return;
         }
@@ -163,7 +204,18 @@ final class Wiring {
         });
         // A name nothing claims cannot be attributed, so no source may be ruled out.
         for (String sourceId : supplying.isEmpty() ? allSources : supplying) {
-            reached.add(new Upstream(sourceId, token));
+            arrive(Set.of(new Upstream(sourceId, token)), reached, routes, steps);
+        }
+    }
+
+    private static void arrive(Set<Upstream> upstream, Set<Upstream> reached,
+            List<Route> routes, List<Step> steps) {
+        reached.addAll(upstream);
+        if (routes != null) {
+            List<Step> ordered = List.copyOf(steps.reversed());
+            for (Upstream up : upstream) {
+                routes.add(new Route(up, ordered));
+            }
         }
     }
 
