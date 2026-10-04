@@ -54,13 +54,24 @@ outside the catalog remain the operator's responsibility. This deployment allowa
 certification claim: this preview certifies MongoDB write support only. Applying a cloud pipeline
 whose sync names another connector is refused; reading through it is unaffected.
 
-Reads are verified on Oracle Free 23 and SQL Server 2022, and across the other
-kinds, with snapshot and CDC inserts, updates and deletes. Decimal validation includes a persisted MySQL DECIMAL(18,4) model, large values,
+Db2 is accepted as a source-only **unverified preview**, outside the certified table: no
+release lane reads a live Db2 database, and Db2 reads have not yet been verified against one.
+Db2 is supported as a source only. Its connector can write, but its catalog row is not
+sink-capable, so a `serve.sync` naming a `db2` connection is refused on-prem as well as in
+the cloud profile, and no authoring surface offers it as a target. Db2 LUW reads take a
+snapshot and then capture changes through the connector's raw log server mode: a Db2 log
+reader service reachable from the runtime at the configured `rawLogServerHost` and
+`rawLogServerPort`, with `DATA CAPTURE CHANGES` enabled on each captured table. The published
+jar does not carry the runtime the connector's native log reader mode needs, so that mode is
+not supported.
+
+Reads are verified on Oracle Free 23 and SQL Server 2022, and across MySQL, PostgreSQL
+and MongoDB, with snapshot and CDC inserts, updates and deletes. Decimal validation includes a persisted MySQL DECIMAL(18,4) model, large values,
 negative fractions and CDC updates. This is not an exhaustive cross-version or
-all-data-type matrix. The default accepted set contains 16 connector ids
-across these five database kinds, including existing managed variants of MySQL,
+all-data-type matrix. The default accepted set contains 17 connector ids: the Db2 preview,
+and 16 across these five database kinds, including existing managed variants of MySQL,
 PostgreSQL and MongoDB. Those managed variants have not been live-verified individually.
-Other managed variants of Oracle and SQL Server are outside the default accepted set.
+Other managed variants of Oracle, SQL Server and Db2 are outside the default accepted set.
 
 `tapstate.connectors.also-accept-ids` lets an operator accept additional connector ids
 on this server. Configuring it puts that server outside the supported configuration;
@@ -76,13 +87,14 @@ stored by an older build need schema rediscovery before automatic target creatio
 Missing or inconsistent decimal metadata is refused before writing; computed decimal
 outputs without a declared numeric domain cannot be auto-created safely.
 
-Oracle and SQL Server connector jars are published as separate assets on the floating
+Oracle, SQL Server and Db2 connector jars are published as separate assets on the floating
 `connectors-preview` release. They remain outside versioned Tapstate releases and are not
-downloaded by the three-database quickstart unless you explicitly run `register oracle` or
-`register sqlserver`. The Oracle jar bundles `ojdbc8`, `orai18n`, and `xdb` 21.5.0.0 under
+downloaded by the three-database quickstart unless you explicitly run `register oracle`,
+`register sqlserver` or `register db2`. The Oracle jar bundles `ojdbc8`, `orai18n`, and `xdb` 21.5.0.0 under
 the Oracle Free Use Terms; the SQL Server jar bundles Microsoft JDBC Driver 12.2.0 under
-the MIT License. Those dependency terms govern only the bundled drivers and do not change
-Tapstate's Apache-2.0 license. The Oracle and SQL Server implementations are paid connector
+the MIT License; the Db2 jar bundles IBM Data Server Driver for JDBC and SQLJ 4.25.13 under
+IBM's International Program License Agreement. Those dependency terms govern only the bundled drivers and do not change
+Tapstate's Apache-2.0 license. The Oracle, SQL Server and Db2 implementations are paid connector
 implementations; their use remains subject to the applicable Tapdata agreement. The upstream
 enterprise connector repository has no LICENSE file;
 publishing these binary assets does not relicense that source repository.
@@ -294,12 +306,13 @@ The jars are shaded and carry their own drivers on an isolated loader;
 `mysql-connector.jar` bundles Oracle MySQL Connector/J under GPL-2.0 with the Universal
 FOSS Exception (see [`NOTICE`](../NOTICE)).
 
-The same release carries Oracle and SQL Server for an explicit registration. From an
+The same release carries Oracle, SQL Server and Db2 for an explicit registration. From an
 authenticated CLI session, give `register` the published connector id instead of a local path:
 
 ```console
 tapstate(admin@127.0.0.1:8080)> register oracle
 tapstate(admin@127.0.0.1:8080)> register sqlserver
+tapstate(admin@127.0.0.1:8080)> register db2
 ```
 
 The CLI downloads `<id>-connector.jar` from `connectors-preview` and uploads the bytes to

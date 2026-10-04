@@ -139,6 +139,25 @@ class TargetConnectorRulesTest {
     }
 
     @Test
+    void db2IsReadButRefusedAsASyncTargetInEveryDeployment() {
+        // The connector's own jar can write; this release supports it as a source only, and that
+        // boundary has to hold on-prem too, where any sink-capable catalog connector is otherwise allowed.
+        String db2Source = READ_SOURCE.replace("connector: mysql", "connector: db2");
+        assertThatCode(() -> validate(false, db2Source, target("tgt_mg", "mongodb"),
+                pipelineWritingTo("tgt_mg"))).doesNotThrowAnyException();
+
+        for (boolean cloud : new boolean[] {false, true}) {
+            Throwable thrown = catchThrowable(() -> validate(cloud, READ_SOURCE, target("tgt_db2", "db2"),
+                    pipelineWritingTo("tgt_db2")));
+            assertThat(thrown).as("cloud=%s", cloud).isInstanceOf(DslException.class);
+            DslException error = (DslException) thrown;
+            assertThat(error.code()).isEqualTo(DslError.UNSUPPORTED_TARGET_CONNECTOR);
+            assertThat(error.path()).isEqualTo("serve.sync[0].source");
+            assertThat(error.args()).containsEntry("connector", "db2").containsEntry("source", "tgt_db2");
+        }
+    }
+
+    @Test
     void judgesTargetsResolvedFromStoredResources() {
         Throwable thrown = catchThrowable(() -> validate(false,
                 List.of(READ_SOURCE, pipelineWritingTo("tgt")), List.of(target("tgt", "ai-chat"))));

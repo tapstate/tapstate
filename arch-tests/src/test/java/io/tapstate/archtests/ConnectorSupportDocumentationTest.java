@@ -58,6 +58,9 @@ class ConnectorSupportDocumentationTest {
                             "| MongoDB | `mongodb` | Read and write |",
                             "| Oracle | `oracle` | Read |",
                             "| SQL Server | `sqlserver` | Read |",
+                            "source-only **unverified preview**", "outside the certified table",
+                            "Db2 is supported as a source only", "refused on-prem as well as in",
+                            "raw log server mode", "DATA CAPTURE CHANGES", "native log reader mode",
                             "cloud deployment profile installs only onto MongoDB Atlas",
                             "On-prem deployments may write to any catalog connector marked sink-capable",
                             "private connectors",
@@ -68,12 +71,14 @@ class ConnectorSupportDocumentationTest {
                             "Applying a cloud pipeline",
                             "whose sync names another connector is refused",
                             "Oracle Free 23", "SQL Server 2022", "DECIMAL(18,4)", "schema rediscovery",
-                            "16 connector ids", "managed variants", "not been live-verified",
+                            "17 connector ids", "16 across these five database kinds", "managed variants",
+                            "not been live-verified",
                             "on this server", "outside the supported configuration",
                             "server's actual accepted set", "including any additional ids",
                             "separate assets", "`connectors-preview`", "versioned Tapstate releases",
-                            "register oracle", "register sqlserver", "Oracle Free Use Terms",
-                            "Microsoft JDBC Driver 12.2.0", "no LICENSE file");
+                            "register oracle", "register sqlserver", "register db2", "Oracle Free Use Terms",
+                            "Microsoft JDBC Driver 12.2.0", "IBM Data Server Driver for JDBC and SQLJ 4.25.13",
+                            "International Program License Agreement", "no LICENSE file");
         }
     }
 
