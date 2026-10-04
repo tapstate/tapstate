@@ -560,7 +560,7 @@ public final class CaptureRunUnit {
         /** The stream running now; read without the lock, so an acknowledgement never waits on a widening. */
         private final AtomicReference<Subscription> stream = new AtomicReference<>();
         /** The last position the source was told it may release, for a stream that replaces the one told. */
-        private volatile SourcePosition acknowledged;
+        private final AtomicReference<SourcePosition> acknowledged = new AtomicReference<>();
         /** The account of the stream running now. */
         private PhysicalSourcePrefix account;
         /** A wider selection whose publication the store has not yet said it took, and where its stream begins. */
@@ -761,7 +761,7 @@ public final class CaptureRunUnit {
             account = prefix;
             // Told at once where the chain stands, as the stream it replaces was: on a quiet chain that position
             // may not change again for a long while, and a source never told it keeps its log.
-            SourcePosition told = acknowledged;
+            SourcePosition told = acknowledged.get();
             if (told != null) {
                 begun.acknowledge(told);
             }
@@ -794,7 +794,7 @@ public final class CaptureRunUnit {
          */
         @Override
         public void acknowledge(SourcePosition durable) {
-            acknowledged = durable;
+            acknowledged.set(durable);
             Subscription current = stream.get();
             if (current != null) {
                 current.acknowledge(durable);
