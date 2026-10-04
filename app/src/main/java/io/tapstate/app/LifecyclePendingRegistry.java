@@ -95,6 +95,17 @@ final class LifecyclePendingRegistry {
                                 previous.capacitySinceNanos(), null, previous.activeDecision()));
     }
 
+    /** Invalid evidence can retire only the projection of this still accepted worker. */
+    void invalidateDecision(String pipelineId, Object workIdentity) {
+        byPipeline.computeIfPresent(pipelineId, (ignored, previous) -> {
+            if (previous.activeDecision() == null || previous.activeDecision().workIdentity() != workIdentity) {
+                return previous;
+            }
+            return previous.pending() == null && previous.capacityTarget() == null ? null
+                    : new Entry(previous.pending(), previous.capacityTarget(), previous.capacitySinceNanos(), null, null);
+        });
+    }
+
     Optional<Pending> pending(String pipelineId) {
         return Optional.ofNullable(byPipeline.get(pipelineId)).map(Entry::pending);
     }

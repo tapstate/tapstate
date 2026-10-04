@@ -363,27 +363,49 @@ final class ConvergenceDriver {
                 || !lifecycleWork.current(pipelineId, offered)) {
             return;
         }
+        LifecyclePendingRegistry.Context qualified = context;
         try {
             if (!businessEligible.getAsBoolean() || !desired.read(pipelineId).filter(offered::equals).isPresent()) {
                 pendingWork.discardDecision(pipelineId);
                 return;
             }
             PipelineActuationOwnership.Permit current = actuation.permit(pipelineId);
-            if (!current.granted() || !Objects.equals(context, pendingContext(pipelineId, current))) {
+            if (!current.granted()) {
+                pendingWork.discardDecision(pipelineId);
+                return;
+            }
+            LifecyclePendingRegistry.Context fresh = pendingContext(pipelineId, current);
+            var receipt = decision.boundHandoff().orElse(null);
+            if (receipt != null) {
+                if (fresh.binding() == null || !fresh.binding().matchesScope(receipt.successor().scope())
+                        || current.claim() == null && !receipt.writerAuthority().standalone()
+                        || current.claim() != null && !io.tapstate.spi.store.WorkloadClaimFence.from(current.claim())
+                                .equals(receipt.writerAuthority().claim())
+                        || actuation.stopAuthority(pipelineId).filter(receipt.writerAuthority()::equals).isEmpty()
+                        || !converger.currentHandoffDecision(decision)) {
+                    lifecycleWork.withCurrentDecision(pipelineId, offered,
+                            identity -> pendingWork.invalidateDecision(pipelineId, identity));
+                    return;
+                }
+                qualified = fresh;
+            } else if (!Objects.equals(context, fresh)) {
                 pendingWork.discardDecision(pipelineId);
                 return;
             }
         } catch (TapstateException unavailable) {
+            lifecycleWork.withCurrentDecision(pipelineId, offered,
+                    identity -> pendingWork.invalidateDecision(pipelineId, identity));
             pendingWork.discardDecision(pipelineId);
             LOG.debug("Could not qualify the local lifecycle decision for pipeline {}", pipelineId, unavailable);
             return;
         }
+        LifecyclePendingRegistry.Context accepted = qualified;
         lifecycleWork.withCurrentDecision(pipelineId, offered, workIdentity -> {
             if (observationScopes == null) {
-                pendingWork.decided(decision, context, workIdentity);
+                pendingWork.decided(decision, accepted, workIdentity);
             } else {
-                observationScopes.withBindingIdentity(pipelineId, context.binding(),
-                        () -> pendingWork.decided(decision, context, workIdentity));
+                observationScopes.withBindingIdentity(pipelineId, accepted.binding(),
+                        () -> pendingWork.decided(decision, accepted, workIdentity));
             }
         });
     }

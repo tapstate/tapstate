@@ -587,8 +587,68 @@ class ConvergenceDriverTest {
 
     @Test
     void aBoundRunningJobKeepsItsNoActionDecisionWhileTelemetryCompletionWaits() throws Exception {
+        verifyBoundPendingDecision(BoundPendingChange.UNCHANGED);
+    }
+
+    @Test
+    void aRestoredSuccessorReportsNoStartAfterItsOwnBindingChangesGeneration() throws Exception {
+        verifyBoundPendingDecision(BoundPendingChange.RESTORE);
+    }
+
+    @Test
+    void aRestoredSuccessorCannotClearPendingForAnotherIncarnation() throws Exception {
+        verifyBoundPendingDecision(BoundPendingChange.INCARNATION);
+    }
+
+    @Test
+    void aRestoredSuccessorCannotClearPendingAfterItsDurableGenerationAdvancesAgain() throws Exception {
+        verifyBoundPendingDecision(BoundPendingChange.GENERATION);
+    }
+
+    @Test
+    void aRestoredSuccessorCannotClearPendingAfterItsMarkerIsReplaced() throws Exception {
+        verifyBoundPendingDecision(BoundPendingChange.MARKER);
+    }
+
+    @Test
+    void anUnchangedLocalBindingCannotHideANewerAuthoritativeGeneration() throws Exception {
+        verifyBoundPendingDecision(BoundPendingChange.GENERATION_WITH_SAME_BINDING);
+    }
+
+    @Test
+    void aMarkerReplacedDuringAuthorityQualificationCannotClearTheAcceptedWorkersPending() throws Exception {
+        verifyBoundPendingDecision(BoundPendingChange.MARKER_DURING_PROOF);
+    }
+
+    private enum BoundPendingChange {
+        UNCHANGED, RESTORE, INCARNATION, GENERATION, MARKER, GENERATION_WITH_SAME_BINDING, MARKER_DURING_PROOF
+    }
+
+    private void verifyBoundPendingDecision(BoundPendingChange change) throws Exception {
         ObservationScopeRegistry scopes = new ObservationScopeRegistry();
-        var scope = scopes.begin("orders", "inc-a", 2);
+        var scope = new ObservationStore.Scope("inc-a", 2);
+        boolean sameBinding = change == BoundPendingChange.UNCHANGED
+                || change == BoundPendingChange.GENERATION_WITH_SAME_BINDING
+                || change == BoundPendingChange.MARKER_DURING_PROOF;
+        scopes.begin("orders", "inc-a", sameBinding ? 2 : 1);
+        InMemoryWorkloadClaimStore generations = new InMemoryWorkloadClaimStore();
+        assertThat(generations.advanceStandalone("cluster-a", "orders")).hasValue(1);
+        assertThat(generations.advanceStandalone("cluster-a", "orders")).hasValue(2);
+        var onAuthorityRead = new java.util.concurrent.atomic.AtomicReference<Runnable>(() -> { });
+        io.tapstate.spi.store.ExecutionGenerationStore qualifiedGenerations = new io.tapstate.spi.store.ExecutionGenerationStore() {
+            @Override public Optional<io.tapstate.spi.store.WorkloadClaim> advanceUnderClaim(
+                    io.tapstate.spi.store.WorkloadClaim expected, long revision) {
+                return generations.advanceUnderClaim(expected, revision);
+            }
+            @Override public OptionalLong advanceStandalone(String cluster, String id) {
+                return generations.advanceStandalone(cluster, id);
+            }
+            @Override public OptionalLong currentGeneration(String cluster, String id) {
+                onAuthorityRead.getAndSet(() -> { }).run();
+                return generations.currentGeneration(cluster, id);
+            }
+        };
+        var ownership = PipelineActuationOwnership.single("cluster-a", qualifiedGenerations);
         DesiredState intent = new DesiredState("orders", RUNNING, "rev-1");
         desired.save(intent);
         state.create("orders", StateJson.of(RUNNING), T0);
@@ -604,6 +664,7 @@ class ConvergenceDriverTest {
                 io.tapstate.spi.store.StopReservation.CounterPolicy.CONTINUE, authority,
                 new io.tapstate.spi.store.StopReservation.Successor(scope, "successor-boot", job),
                 io.tapstate.spi.store.StopReservation.CURRENT_FORMAT);
+        var savedMarker = new java.util.concurrent.atomic.AtomicReference<>(marker);
         io.tapstate.spi.store.StateStore handoff = new io.tapstate.spi.store.StateStore() {
             @Override public Optional<io.tapstate.core.lifecycle.CheckpointDoc> read(String id) { return state.read(id); }
             @Override public void create(String id, String json, Instant at) { state.create(id, json, at); }
@@ -612,7 +673,7 @@ class ConvergenceDriverTest {
                     String id, long epoch, String json, Instant at) { return state.compareAndSwap(id, epoch, json, at); }
             @Override public boolean supportsStopReservations() { return true; }
             @Override public Optional<io.tapstate.spi.store.StopReservation> readStopReservation(String id) {
-                return id.equals("orders") ? Optional.of(marker) : Optional.empty();
+                return id.equals("orders") ? Optional.of(savedMarker.get()) : Optional.empty();
             }
         };
         CountDownLatch adopting = new CountDownLatch(1);
@@ -637,6 +698,19 @@ class ConvergenceDriverTest {
             }
             @Override public boolean adoptSuccessor(
                     io.tapstate.spi.store.StopReservation expected, java.util.function.BooleanSupplier current) {
+                scopes.begin("orders", "inc-a", 2);
+                if (change == BoundPendingChange.GENERATION_WITH_SAME_BINDING) {
+                    assertThat(generations.advanceStandalone("cluster-a", "orders")).hasValue(3);
+                } else if (change == BoundPendingChange.MARKER_DURING_PROOF) {
+                    onAuthorityRead.set(() -> savedMarker.set(new io.tapstate.spi.store.StopReservation(
+                            marker.pipelineId(), "handoff-b", marker.sourceEpoch(), marker.reservedEpoch(),
+                            marker.originalDesired(), marker.source(), marker.phase(), marker.counterPolicy(),
+                            marker.writerAuthority(), marker.successor(), marker.formatVersion())));
+                }
+                return current.getAsBoolean();
+            }
+            @Override public Optional<io.tapstate.spi.store.HandoffIdentity> continuationReady(
+                    io.tapstate.spi.store.StopReservation expected, java.util.function.BooleanSupplier current) {
                 adopting.countDown();
                 try {
                     if (!releaseAdoption.await(5, TimeUnit.SECONDS)) {
@@ -646,10 +720,6 @@ class ConvergenceDriverTest {
                     Thread.currentThread().interrupt();
                     throw new IllegalStateException("the controlled adoption was interrupted", interrupted);
                 }
-                return current.getAsBoolean();
-            }
-            @Override public Optional<io.tapstate.spi.store.HandoffIdentity> continuationReady(
-                    io.tapstate.spi.store.StopReservation expected, java.util.function.BooleanSupplier current) {
                 return Optional.empty();
             }
         };
@@ -657,7 +727,6 @@ class ConvergenceDriverTest {
         ObservationStore scopedLatest = new ObservationStore() {
             @Override public void save(Observation observation) { observations.save(observation); }
             @Override public boolean saveScoped(Observation observation, Scope owner) {
-                assertThat(owner).isEqualTo(scope);
                 observations.save(observation);
                 return true;
             }
@@ -668,25 +737,48 @@ class ConvergenceDriverTest {
             ConvergenceDriver isolated = new ConvergenceDriver(
                     new PipelineConverger(desired, handoff, actuator, Clock.fixed(T0, ZoneOffset.UTC)), desired,
                     new ObservationPublisher(handoff, scopedLatest), null, MetricsExport.none(), () -> true,
-                    PipelineActuationOwnership.single(), work, scopes, null, pending);
+                    ownership, work, scopes, null, pending);
             isolated.reconcile();
             assertThat(adopting.await(5, TimeUnit.SECONDS)).isTrue();
             assertThat(work.activeCount()).isEqualTo(1);
 
+            if (change == BoundPendingChange.INCARNATION) {
+                scopes.forgetIncarnation("orders", "inc-a");
+                scopes.begin("orders", "inc-b", 2);
+            } else if (change == BoundPendingChange.GENERATION) {
+                assertThat(generations.advanceStandalone("cluster-a", "orders")).hasValue(3);
+                scopes.begin("orders", "inc-a", 3);
+            } else if (change == BoundPendingChange.MARKER) {
+                savedMarker.set(new io.tapstate.spi.store.StopReservation(marker.pipelineId(), "handoff-b",
+                        marker.sourceEpoch(), marker.reservedEpoch(), marker.originalDesired(), marker.source(),
+                        marker.phase(), marker.counterPolicy(), marker.writerAuthority(), marker.successor(),
+                        marker.formatVersion()));
+                scopes.beginResetExecution("orders", scope);
+            }
+
             isolated.reconcile();
 
             assertThat(state.read("orders")).contains(checkpoint);
-            assertThat(handoff.readStopReservation("orders")).contains(marker);
-            assertThat(scopes.current("orders")).contains(scope);
+            assertThat(handoff.readStopReservation("orders")).contains(savedMarker.get());
             assertThat(desired.read("orders")).contains(intent);
             assertThat(starts).hasValue(0);
             Observation latest = observations.read("orders").orElseThrow();
             assertThat(latest.state()).isEqualTo(RUNNING);
             assertThat(latest.failure()).as("a telemetry fixture failure cannot erase pending and make this pass")
                     .isNull();
-            assertThat(pending.pending("orders"))
-                    .as("a coalesced tick cannot invent start while a known bound job waits only for telemetry")
-                    .isEmpty();
+            if (change == BoundPendingChange.UNCHANGED || change == BoundPendingChange.RESTORE) {
+                assertThat(scopes.current("orders")).contains(scope);
+                assertThat(pending.pending("orders"))
+                        .as("a coalesced tick cannot invent start while a known bound job waits only for telemetry")
+                        .isEmpty();
+            } else {
+                assertThat(pending.pending("orders"))
+                        .as("an old handoff decision cannot erase the new context's provisional pending")
+                        .contains(new io.tapstate.control.core.PipelineExplanation.Pending(PendingReason.START_PENDING));
+            }
+            assertThat(generations.currentGeneration("cluster-a", "orders"))
+                    .hasValue(change == BoundPendingChange.GENERATION
+                            || change == BoundPendingChange.GENERATION_WITH_SAME_BINDING ? 3 : 2);
             releaseAdoption.countDown();
         } finally {
             releaseAdoption.countDown();

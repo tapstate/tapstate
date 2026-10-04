@@ -57,11 +57,26 @@ public final class PipelineConverger {
     }
 
     /** One factual worker-side decision, before any corresponding lifecycle action is attempted. */
-    public record PendingDecision(DesiredState intent, Optional<CheckpointDoc> checkpoint, PendingAction action) {
+    public record PendingDecision(DesiredState intent, Optional<CheckpointDoc> checkpoint, PendingAction action,
+            Optional<StopReservation> boundHandoff) {
         public PendingDecision {
             Objects.requireNonNull(intent, "intent");
             Objects.requireNonNull(checkpoint, "checkpoint");
             Objects.requireNonNull(action, "action");
+            Objects.requireNonNull(boundHandoff, "boundHandoff");
+            if (boundHandoff.isPresent()) {
+                StopReservation receipt = boundHandoff.orElseThrow();
+                if (action != PendingAction.NONE || receipt.phase() != StopReservation.Phase.SUCCESSOR_BOUND
+                        || !intent.equals(receipt.originalDesired())
+                        || checkpoint.isEmpty() || !intent.pipelineId().equals(checkpoint.orElseThrow().pipelineId())
+                        || checkpoint.orElseThrow().epoch() != receipt.reservedEpoch()) {
+                    throw new IllegalArgumentException("a pending receipt must describe the exact bound handoff");
+                }
+            }
+        }
+
+        public PendingDecision(DesiredState intent, Optional<CheckpointDoc> checkpoint, PendingAction action) {
+            this(intent, checkpoint, action, Optional.empty());
         }
     }
 
@@ -435,6 +450,20 @@ public final class PipelineConverger {
         if (intent != null) { decisions.accept(new PendingDecision(intent, Optional.ofNullable(checkpoint), action)); }
     }
 
+    /** Rechecks a local projection receipt without granting or repeating any lifecycle action. */
+    public boolean currentHandoffDecision(PendingDecision decision) {
+        StopReservation receipt = decision.boundHandoff().orElse(null);
+        return receipt != null && !Thread.currentThread().isInterrupted()
+                && desired.read(receipt.pipelineId()).filter(decision.intent()::equals).isPresent()
+                && state.readStopReservation(receipt.pipelineId()).filter(receipt::equals).isPresent()
+                && state.read(receipt.pipelineId()).equals(decision.checkpoint());
+    }
+
+    private static void noteBoundHandoff(Consumer<PendingDecision> decisions, DesiredState intent,
+            CheckpointDoc checkpoint, StopReservation receipt) {
+        decisions.accept(new PendingDecision(intent, Optional.of(checkpoint), PendingAction.NONE, Optional.of(receipt)));
+    }
+
     private boolean currentMarker(StopReservation marker, DesiredState intent, StopAuthority authority) {
         return !Thread.currentThread().isInterrupted()
                 && desired.read(marker.pipelineId()).filter(intent::equals).isPresent()
@@ -543,10 +572,11 @@ public final class PipelineConverger {
             }
             return driven;
         }
-        noteAction(decisions, intent, before, PendingAction.NONE);
+        noteBoundHandoff(decisions, intent, before, marker);
         if (!actuator.adoptSuccessor(marker, current) || !current.getAsBoolean()) {
             return ConvergeResult.superseded();
         }
+        noteBoundHandoff(decisions, intent, before, marker);
         var ready = marker.counterPolicy() == StopReservation.CounterPolicy.RESET
                 ? Optional.of(marker.handoffIdentity()) : actuator.continuationReady(marker, current);
         if (ready.isPresent()) {

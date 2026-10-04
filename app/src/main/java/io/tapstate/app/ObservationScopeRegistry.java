@@ -1028,6 +1028,8 @@ final class ObservationScopeRegistry {
 
         boolean known() { return scope != null; }
 
+        boolean matchesScope(ObservationStore.Scope expected) { return Objects.equals(scope, expected); }
+
         @Override public boolean equals(Object other) {
             return other instanceof BindingIdentity identity && entry == identity.entry
                     && revision == identity.revision && Objects.equals(scope, identity.scope);
