@@ -1,5 +1,11 @@
 package io.tapstate.e2e;
 
+import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
+import com.mongodb.client.MongoClients;
+import io.tapstate.adapters.mongostore.MongoKeyedStateStore;
+import io.tapstate.adapters.mongostore.SystemCollections;
+import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.DockerGate;
@@ -16,10 +22,13 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -128,6 +137,8 @@ class NestHoldsMoreThanItsMemoryBudgetIT {
                             + System.lineSeparator() + "  logs: " + control.logs(pipelineId));
                 }
 
+                Instant physicalCompletedAt = Instant.now();
+
                 assertThat(control.state(pipelineId))
                         .as("exceeding the working set is the design, not a limit to die on")
                         .contains(PipelineState.RUNNING);
@@ -135,7 +146,7 @@ class NestHoldsMoreThanItsMemoryBudgetIT {
                         .as("nor a reason to count an error")
                         .contains(0L);
                 assertLayerBehindMemoryWasRead(control);
-                assertOnlyTheBudgetIsHeldInMemory(control);
+                assertOnlyTheBudgetIsHeldInMemory(control, physicalCompletedAt, storeUri);
             }
         }
     }
@@ -190,26 +201,60 @@ class NestHoldsMoreThanItsMemoryBudgetIT {
      * <p>Read as the entries beside what the layer behind them holds, because either alone is satisfied by
      * a run that lost data: nothing resident and nothing stored is a pipeline that assembled nothing.
      */
-    private void assertOnlyTheBudgetIsHeldInMemory(ControlPlane control) {
-        // Read once the two have stopped moving, not once. The metrics face publishes on its own cadence
-        // and these climb as the run fills, so a single read lands somewhere on the way up - and a number
-        // on the way up is under the bound below whether or not anything was ever evicted. Measured: read
-        // that way, one of the two tiers passed a run in which every entry was resident.
+    private void assertOnlyTheBudgetIsHeldInMemory(ControlPlane control, Instant physicalCompletedAt,
+            String storeUri) {
         long[] settled = {-1L, -1L};
-        long[] unchangedSince = {System.nanoTime()};
-        Await.until("the state readings to stop moving for " + STILL, TIMEOUT,
-                () -> {
-                    long entries = control.metricTotal(pipelineId, "nestStateEntries.").orElse(0L);
-                    long behind = control.metricTotal(pipelineId, "nestStateStored.").orElse(0L);
-                    if (entries != settled[0] || behind != settled[1]) {
-                        settled[0] = entries;
-                        settled[1] = behind;
-                        unchangedSince[0] = System.nanoTime();
-                        return false;
-                    }
-                    return behind > 0 && System.nanoTime() - unchangedSince[0] >= STILL.toNanos();
-                },
-                () -> "resident " + settled[0] + ", behind the map " + settled[1]);
+        long[] unchangedSince = {-1L};
+        MemoryReading[] last = {null};
+        String namespace = "nest." + pipelineId + ".order_doc.$root";
+        try {
+            // Freshness qualification and the original stability check share this one existing window.
+            Await.until("a post-delivery stored count of " + ROOTS + " and stable state readings for " + STILL,
+                    TIMEOUT, () -> {
+                        Optional<MemoryReading> current = memoryReading(control, namespace);
+                        if (current.isEmpty()) {
+                            unchangedSince[0] = -1L;
+                            return false;
+                        }
+                        MemoryReading reading = current.orElseThrow();
+                        last[0] = reading;
+                        if (reading.stored() != ROOTS || !reading.storedObservedAt().isAfter(physicalCompletedAt)) {
+                            unchangedSince[0] = -1L;
+                            return false;
+                        }
+                        if (unchangedSince[0] < 0 || reading.resident() != settled[0] || reading.stored() != settled[1]) {
+                            settled[0] = reading.resident();
+                            settled[1] = reading.stored();
+                            unchangedSince[0] = System.nanoTime();
+                            return false;
+                        }
+                        return System.nanoTime() - unchangedSince[0] >= STILL.toNanos();
+                    }, () -> "physicalCompletedAt=" + physicalCompletedAt + ", latest actual reading=" + last[0]);
+        } catch (RuntimeException | AssertionError failure) {
+            // Read the owned namespace while the server is still alive and keep the primary failure.
+            Map<String, Object> diagnostic = new LinkedHashMap<>();
+            diagnostic.put("namespace", namespace);
+            diagnostic.put("operatorDatabase", SharedMongo.OPERATOR_STATE_DATABASE);
+            diagnostic.put("physicalCompletedAt", physicalCompletedAt.toString());
+            if (last[0] != null) { diagnostic.put("lastMetricsReading", last[0].toString()); }
+            diagnostic.put("samplerHealth", "UNVERIFIED: no existing process exporter is enabled by this fixture");
+            try {
+                MongoClientSettings settings = MongoClientSettings.builder()
+                        .applyConnectionString(new ConnectionString(storeUri))
+                        .applyToClusterSettings(cluster -> cluster.serverSelectionTimeout(5, TimeUnit.SECONDS))
+                        .applyToSocketSettings(socket -> socket.readTimeout(5, TimeUnit.SECONDS)).build();
+                try (var client = MongoClients.create(settings)) {
+                    var collection = SystemCollections.OPERATOR_STATE.on(client.getDatabase(SharedMongo.OPERATOR_STATE_DATABASE));
+                    diagnostic.put("actualNamespaceCount", new MongoKeyedStateStore(collection).count(namespace));
+                    diagnostic.put("namespaceCountCompletedAt", Instant.now().toString());
+                }
+            } catch (RuntimeException | AssertionError unavailable) {
+                diagnostic.put("namespaceCountUnavailableType", unavailable.getClass().getName());
+                if (unavailable != failure) { failure.addSuppressed(unavailable); }
+            }
+            failure.addSuppressed(new AssertionError("bounded live stored-count receipt: " + diagnostic));
+            throw failure;
+        }
         long resident = settled[0];
         long stored = settled[1];
 
@@ -237,6 +282,56 @@ class NestHoldsMoreThanItsMemoryBudgetIT {
                         + "a budget that was applied.%n  metrics: %s",
                         ROOTS, MEMORY_BUDGET, control.metrics(pipelineId))
                 .isPositive();
+    }
+
+    private record MemoryReading(long resident, long stored, Instant residentObservedAt, Instant storedObservedAt) { }
+
+    /** Takes both gauges and their real measurement times from one current HTTP metrics envelope. */
+    private Optional<MemoryReading> memoryReading(ControlPlane control, String namespace) {
+        String response = control.metrics(pipelineId);
+        int separator = response.indexOf(' ');
+        if (separator < 1) { throw new AssertionError("metrics response has no HTTP status prefix"); }
+        int status = Integer.parseInt(response.substring(0, separator));
+        String body = response.substring(separator + 1);
+        if (ControlPlane.interpretErrorCount(status, body, pipelineId).isEmpty()) { return Optional.empty(); }
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> envelope) || !(envelope.get("facts") instanceof List<?> facts)) {
+            throw new AssertionError("current metrics response has no facts");
+        }
+        if (!pipelineId.equals(envelope.get("pipelineId"))) { throw new AssertionError("metrics belong to another pipeline"); }
+        Optional<Map<?, ?>> resident = memoryPoint(facts, "tapstate.pipeline.nest.entries", namespace);
+        Optional<Map<?, ?>> stored = memoryPoint(facts, "tapstate.pipeline.nest.stored", namespace);
+        if (resident.isEmpty() || stored.isEmpty()) { return Optional.empty(); }
+        Map<?, ?> inMemory = resident.orElseThrow(), behind = stored.orElseThrow();
+        if (!(inMemory.get("value") instanceof Number entries) || !(behind.get("value") instanceof Number count)
+                || !(inMemory.get("observedAt") instanceof String entriesAt) || !(behind.get("observedAt") instanceof String storedAt)) {
+            throw new AssertionError("a namespace gauge has no actual value or sampling timestamp");
+        }
+        if (entries.doubleValue() != entries.longValue() || count.doubleValue() != count.longValue()) {
+            throw new AssertionError("namespace counts are not exact integers");
+        }
+        return Optional.of(new MemoryReading(entries.longValue(), count.longValue(),
+                Instant.parse(entriesAt), Instant.parse(storedAt)));
+    }
+
+    private Optional<Map<?, ?>> memoryPoint(List<?> facts, String instrument, String namespace) {
+        Map<?, ?> found = null;
+        for (Object item : facts) {
+            if (!(item instanceof Map<?, ?> fact) || !instrument.equals(fact.get("name"))) { continue; }
+            if (!"gauge".equals(fact.get("type")) || !"{entry}".equals(fact.get("unit"))) {
+                throw new AssertionError("namespace fact changed its declared gauge type or unit");
+            }
+            if (!(fact.get("points") instanceof List<?> points)) { throw new AssertionError("namespace fact has no points"); }
+            for (Object value : points) {
+                if (!(value instanceof Map<?, ?> point) || !(point.get("attributes") instanceof Map<?, ?> attributes)) {
+                    throw new AssertionError("namespace fact contains a malformed point");
+                }
+                if (!pipelineId.equals(attributes.get("tapstate.pipeline.id"))
+                        || !namespace.equals(attributes.get("tapstate.nest.namespace"))) { continue; }
+                if (found != null) { throw new AssertionError("one namespace gauge has more than one matching point"); }
+                found = point;
+            }
+        }
+        return Optional.ofNullable(found);
     }
 
     private static List<Document> await(
