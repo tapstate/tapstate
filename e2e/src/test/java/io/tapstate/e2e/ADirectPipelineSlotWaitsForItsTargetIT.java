@@ -137,9 +137,17 @@ class ADirectPipelineSlotWaitsForItsTargetIT {
     /**
      * Inserts row {@code id} in a transaction of its own, answering where the server was about to write
      * before the transaction began and inside it, before its commit.
+     *
+     * <p>An empty transaction is committed first, so the row never begins exactly where the position the
+     * restarted run resumes from ends. A capture resuming from a position recorded after a commit skips a change
+     * that begins there (tapstate/tapstate#639), and the first row written while the target is frozen would be
+     * that change: the run resumes from the heartbeat that confirmed the warm-up row.
      */
     private static String[] write(Map<String, Object> source, int id) throws Exception {
         try (Connection connection = SharedPostgres.connect(source)) {
+            try (Statement statement = connection.createStatement()) {
+                statement.execute("SELECT pg_current_xact_id()");
+            }
             String before = PostgresSlots.insertPosition(connection);
             connection.setAutoCommit(false);
             try (Statement statement = connection.createStatement()) {
