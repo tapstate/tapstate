@@ -1,6 +1,7 @@
 package io.tapstate.runtime.srs;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.logging.LogSink;
 import io.tapstate.core.event.ChainPosition;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
@@ -19,6 +20,7 @@ import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CapturePort;
+import io.tapstate.spi.capture.LogScopedCapturePort;
 import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
@@ -71,6 +73,185 @@ import static org.assertj.core.api.Assertions.catchThrowableOfType;
  * connector (a fixed snapshot batch and a fixed change stream) standing in for a real PDK source.
  */
 class CaptureRunUnitTest {
+
+    @Test
+    void anActivatedReaderFreezesOneExplicitOwnerForItsSnapshotAndInitialTail() throws Exception {
+        CaptureRunSpec request = spec(ReadMode.SNAPSHOT_AND_CDC, false, "explicit-log-owner")
+                .withSnapshotWriterToken("explicit-owner-run");
+        LogSink.Scope admitted = new LogSink.Scope("resource-a", 7);
+        List<LogSink.Scope> views = new CopyOnWriteArrayList<>();
+        List<LogSink.Scope> snapshotOwners = new CopyOnWriteArrayList<>();
+        List<LogSink.Scope> tailOwners = new CopyOnWriteArrayList<>();
+        class Source implements CapturePort, SnapshotSession.Provider, LogScopedCapturePort {
+            private final LogSink.Scope owner;
+            Source(LogSink.Scope owner) { this.owner = owner; }
+            @Override public CapturePort forLogOwner(PipelineNode node, LogSink.Scope scope) {
+                assertThat(node).isEqualTo(request.config().node());
+                views.add(scope);
+                return new Source(scope);
+            }
+            @Override public SnapshotSession snapshotSession(CaptureConfig config) {
+                assertThat(owner).as("no source handle may open before the explicit owner arrives").isEqualTo(admitted);
+                snapshotOwners.add(owner);
+                return table -> new FakeBatch(List.of(), "explicit-owner-seam");
+            }
+            @Override public CaptureBatch snapshot(CaptureConfig config) {
+                throw new AssertionError("the shared session must retain its scoped port view");
+            }
+            @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+                assertThat(owner).isEqualTo(admitted);
+                tailOwners.add(owner);
+                return () -> { };
+            }
+            @Override public ConnectionReport testConnection(CaptureConfig config) { throw new UnsupportedOperationException(); }
+            @Override public DiscoveredSchema discoverSchema(CaptureConfig config) { throw new UnsupportedOperationException(); }
+        }
+        InMemoryMeta meta = new InMemoryMeta();
+        SnapshotBuffer buffer = new SnapshotBuffer(2, 1, 1_024, 512);
+        try (SnapshotWorkers workers = new SnapshotWorkers(1, 1)) {
+            CaptureRunUnit unit = new CaptureRunUnit(new Source(null), new SrsCoordinator(meta), meta, hz, buffer, workers);
+            try (CaptureRun run = unit.begin(request, CaptureHandoff.of(row -> { }))) {
+                assertThat(views).isEmpty();
+                assertThat(snapshotOwners).isEmpty();
+                assertThat(tailOwners).isEmpty();
+                run.activateSnapshot(admitted);
+                assertThat(run.awaitLoaded(Duration.ofSeconds(5))).isTrue();
+                assertThat(run.failure()).isEmpty();
+                assertThat(views).containsExactly(admitted);
+                assertThat(snapshotOwners).containsExactly(admitted);
+                assertThat(tailOwners).containsExactly(admitted);
+                run.activateSnapshot(admitted);
+                assertThatThrownBy(() -> run.activateSnapshot(new LogSink.Scope("resource-a", 8)))
+                        .isInstanceOf(IllegalStateException.class)
+                        .hasMessage("an activated capture cannot change its admitted log owner");
+                assertThat(views).containsExactly(admitted);
+                assertThat(snapshotOwners).containsExactly(admitted);
+                assertThat(tailOwners).containsExactly(admitted);
+            }
+        }
+    }
+
+    @Test
+    void aDurableSharedTailKeepsItsFirstScopedReaderWhenAnotherConsumerWidensIt() throws Exception {
+        String key = "shared-tail-log-owner";
+        CaptureConfig originalConfig = new CaptureConfig("demo", Map.of("host", "h"), List.of("orders"));
+        CaptureConfig joiningConfig = new CaptureConfig("demo", Map.of("host", "h"), List.of("customers"));
+        CaptureRunSpec original = new CaptureRunSpec(originalConfig, ReadMode.SNAPSHOT_AND_CDC, key, true,
+                "original_source", "original_pipeline", StartFrom.latest(), null, 0L)
+                .withConsumerId(SrsConsumerId.of("original_pipeline", "original_source").value())
+                .withSnapshotWriterToken("original-load");
+        CaptureRunSpec joining = new CaptureRunSpec(joiningConfig, ReadMode.SNAPSHOT_AND_CDC, key, true,
+                "joining_source", "joining_pipeline", StartFrom.latest(), null, 0L)
+                .withConsumerId(SrsConsumerId.of("joining_pipeline", "joining_source").value())
+                .withSnapshotWriterToken("joining-load");
+        assertThat(joining.miningChainId()).isEqualTo(original.miningChainId());
+        // Typed activation scopes exercise handle attribution, not native execution admission.
+        LogSink.Scope originalScope = new LogSink.Scope("original-resource", 7);
+        LogSink.Scope joiningScope = new LogSink.Scope("joining-resource", 19);
+        record Opening(CapturePort reader, PipelineNode node, LogSink.Scope scope,
+                       List<String> tables, AtomicInteger closeCalls) { }
+        List<Opening> snapshots = new CopyOnWriteArrayList<>();
+        List<Opening> physicalTails = new CopyOnWriteArrayList<>();
+        CountDownLatch firstTail = new CountDownLatch(1), widenedTail = new CountDownLatch(1);
+        class Source implements CapturePort, SnapshotSession.Provider, LogScopedCapturePort {
+            private final PipelineNode node;
+            private final LogSink.Scope scope;
+            Source(PipelineNode node, LogSink.Scope scope) { this.node = node; this.scope = scope; }
+            @Override public CapturePort forLogOwner(PipelineNode owner, LogSink.Scope admitted) {
+                if (scope != null) { throw new AssertionError("a frozen reader cannot be rebound"); }
+                return new Source(owner, admitted);
+            }
+            @Override public SnapshotSession snapshotSession(CaptureConfig config) {
+                assertThat(node).isNotNull().isEqualTo(config.node());
+                assertThat(scope).isNotNull();
+                snapshots.add(new Opening(this, node, scope, config.streams(), new AtomicInteger()));
+                return table -> new FakeBatch(List.of(), "seam-" + node.nodeId());
+            }
+            @Override public CaptureBatch snapshot(CaptureConfig config) {
+                throw new AssertionError("the scoped snapshot must use its actual shared session");
+            }
+            @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+                assertThat(node).isNotNull().isEqualTo(config.node());
+                assertThat(scope).isNotNull();
+                assertThat(config.sharedNotes().sharedBy()).isEqualTo(original.miningChainId().value());
+                AtomicInteger closeCalls = new AtomicInteger();
+                physicalTails.add(new Opening(this, config.node(), scope, config.streams(), closeCalls));
+                if (physicalTails.size() == 1) { firstTail.countDown(); }
+                if (physicalTails.size() == 2) { widenedTail.countDown(); }
+                AtomicBoolean closed = new AtomicBoolean();
+                return () -> { if (closed.compareAndSet(false, true)) { closeCalls.incrementAndGet(); } };
+            }
+            @Override public ConnectionReport testConnection(CaptureConfig config) { throw new UnsupportedOperationException(); }
+            @Override public DiscoveredSchema discoverSchema(CaptureConfig config) { throw new UnsupportedOperationException(); }
+        }
+        class SelectingMeta extends InMemoryMeta {
+            private final Map<String, List<String>> requested = new LinkedHashMap<>();
+            @Override public synchronized void requestCaptureTables(String chain, List<String> tables) {
+                java.util.LinkedHashSet<String> union = new java.util.LinkedHashSet<>(
+                        requested.getOrDefault(chain, List.of()));
+                union.addAll(tables);
+                requested.put(chain, List.copyOf(union));
+            }
+            @Override public synchronized List<String> captureTables(String chain) {
+                return requested.getOrDefault(chain, List.of());
+            }
+            @Override public synchronized boolean publishCaptureTables(String chain, long epoch, List<String> tables) {
+                return read(chain).filter(record -> record.epoch() == epoch).isPresent()
+                        && tables.containsAll(captureTables(chain));
+            }
+        }
+        HazelcastInstance member = emptyDurableMember();
+        try (SnapshotWorkers workers = new SnapshotWorkers(1, 1)) {
+            SelectingMeta meta = new SelectingMeta();
+            SnapshotBuffer buffer = new SnapshotBuffer(2, 1, 1_024, 512);
+            CaptureRunUnit unit = new CaptureRunUnit(new Source(null, null), new SrsCoordinator(meta), meta,
+                    member, buffer, workers);
+            try (CaptureRun first = unit.begin(original, CaptureHandoff.of(row -> { }))) {
+                assertThat(physicalTails).isEmpty();
+                assertThat(snapshots).isEmpty();
+                first.activateSnapshot(originalScope);
+                assertThat(firstTail.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(first.awaitLoaded(Duration.ofSeconds(5))).isTrue();
+                assertThat(first.failure()).isEmpty();
+                assertThat(physicalTails).hasSize(1);
+                Opening initial = physicalTails.getFirst();
+                assertThat(initial.reader()).isSameAs(snapshots.getFirst().reader());
+                assertThat(initial.node()).isEqualTo(original.config().node());
+                assertThat(initial.scope()).isEqualTo(originalScope);
+                assertThat(initial.tables()).containsExactly("orders");
+                try (CaptureRun second = unit.begin(joining, CaptureHandoff.of(row -> { }))) {
+                    assertThat(second.merged()).isTrue();
+                    assertThat(meta.consumerOffsets(original.miningChainId().value()))
+                            .extracting(ConsumerOffset::pipelineId)
+                            .containsExactlyInAnyOrder(original.consumerId(), joining.consumerId());
+                    assertThat(physicalTails).hasSize(1);
+                    second.activateSnapshot(joiningScope);
+                    assertThat(widenedTail.await(5, TimeUnit.SECONDS)).isTrue();
+                    assertThat(second.awaitLoaded(Duration.ofSeconds(5))).isTrue();
+                    assertThat(second.failure()).isEmpty();
+                    assertThat(first.failure()).isEmpty();
+                    assertThat(snapshots).hasSize(2);
+                    Opening joiningSnapshot = snapshots.getLast();
+                    assertThat(joiningSnapshot.node()).isEqualTo(joining.config().node());
+                    assertThat(joiningSnapshot.scope()).isEqualTo(joiningScope);
+                    assertThat(joiningSnapshot.reader()).isNotSameAs(initial.reader());
+                    assertThat(physicalTails).hasSize(2);
+                    Opening reopened = physicalTails.getLast();
+                    assertThat(initial.closeCalls()).hasValue(1);
+                    assertThat(reopened.reader()).isSameAs(initial.reader());
+                    assertThat(reopened.node()).isEqualTo(original.config().node())
+                            .isNotEqualTo(joining.config().node());
+                    assertThat(reopened.scope()).isEqualTo(originalScope).isNotEqualTo(joiningScope);
+                    assertThat(reopened.tables()).containsExactlyInAnyOrder("orders", "customers");
+                    assertThat(reopened.closeCalls()).hasValue(0);
+                    first.close();
+                    assertThat(reopened.closeCalls()).as("the joined consumer still holds the original physical reader")
+                            .hasValue(0);
+                }
+                assertThat(physicalTails.getLast().closeCalls()).hasValue(1);
+            }
+        } finally { member.shutdown(); }
+    }
 
     @Test
     void reservedSnapshotReturnsBeforeReadingAndStartsOnlyAfterActivation() throws Exception {
@@ -1902,7 +2083,7 @@ class CaptureRunUnitTest {
      * clobbering its sink-ack — enough to exercise the run unit's provision, cdc-start, offset and cursor
      * wiring without a store backend.
      */
-    private static final class InMemoryMeta implements SrsMetaStore {
+    private static class InMemoryMeta implements SrsMetaStore {
         /** Per chain and pipeline, how far each table's ring is done with -- kept once, never raised here. */
         final Map<String, Map<String, Long>> ringDone = new LinkedHashMap<>();
         private volatile String pausedPipeline;

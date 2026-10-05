@@ -15,6 +15,13 @@
   <description>Source Replica Store write surface: the per-table change ring and the mining-chain meta model</description>
 
   <dependencies>
+    <!-- An admitted capture carries its immutable, process-local diagnostic owner. -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-logging</artifactId>
+      <version>${revision}</version>
+    </dependency>
+
     <dependency>
       <groupId>io.tapstate</groupId>
       <artifactId>core-event</artifactId>

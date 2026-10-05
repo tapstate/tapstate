@@ -126,9 +126,9 @@ final class PdkConnector implements AutoCloseable {
         return open(connectorId, ref, settings, node, stateStore, notes, null);
     }
 
-    private static PdkConnector open(String connectorId, ConnectorRef ref, Map<String, Object> settings,
-                                    PipelineNode node, KeyedStateStore stateStore, SharedNotes notes,
-                                    LogSink.Scope logScope) {
+    static PdkConnector open(String connectorId, ConnectorRef ref, Map<String, Object> settings,
+                             PipelineNode node, KeyedStateStore stateStore, SharedNotes notes,
+                             LogSink.Scope logScope) {
         if (node == null && logScope != null) {
             throw new IllegalArgumentException("a log scope requires a pipeline node");
         }

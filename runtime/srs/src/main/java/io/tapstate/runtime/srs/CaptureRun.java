@@ -1,6 +1,7 @@
 package io.tapstate.runtime.srs;
 
 import com.hazelcast.jet.pipeline.StreamSource;
+import io.tapstate.core.logging.LogSink;
 import io.tapstate.spi.capture.Subscription;
 
 import java.time.Duration;
@@ -190,6 +191,12 @@ public final class CaptureRun implements AutoCloseable {
 
     /** Activates the reserved bounded load after its native consumer has been submitted. */
     public void activateSnapshot() { activation().ifPresent(SnapshotActivation::activateSnapshot); }
+
+    /** Freezes the admitted execution owner before its reserved reader opens any source handle. */
+    public void activateSnapshot(LogSink.Scope scope) {
+        Objects.requireNonNull(scope, "scope");
+        activation().ifPresent(activation -> activation.activateSnapshot(scope));
+    }
 
     private Optional<SnapshotActivation> activation() {
         return cdcSubscription.filter(SnapshotActivation.class::isInstance).map(SnapshotActivation.class::cast);

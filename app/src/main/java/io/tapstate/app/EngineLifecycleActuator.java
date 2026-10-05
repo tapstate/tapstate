@@ -311,7 +311,12 @@ final class EngineLifecycleActuator implements LifecycleActuator {
                                         () -> new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED,
                                                 Map.of("pipeline", pipelineId), null));
                     }
-                    captureCoordinator.activateSnapshot(pipelineId);
+                    if (observationScope == null) {
+                        captureCoordinator.activateSnapshot(pipelineId);
+                    } else {
+                        captureCoordinator.activateSnapshot(pipelineId, new io.tapstate.core.logging.LogSink.Scope(
+                                observationScope.pipelineIncarnationId(), observationScope.executionGeneration()));
+                    }
                 } catch (RuntimeException | Error failure) {
                     // A submitted job or reserved snapshot may already exist. Give both back before
                     // another convergence pass retries.

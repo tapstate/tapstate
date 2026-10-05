@@ -485,6 +485,12 @@ class EngineLifecycleActuatorTest {
         state.enableStops(desired, id -> ownership.stopAuthority(id).orElse(null), generations);
         var capture = new RecordingCaptureCoordinator(calls);
         var engine = new Engine(member);
+        capture.activationProbe = (pipelineId, scope) -> {
+            var actual = engine.executionJob(pipelineId).orElseThrow();
+            assertThat(scope).isEqualTo(new io.tapstate.core.logging.LogSink.Scope(
+                    actual.scope().pipelineIncarnationId(), actual.scope().executionGeneration()));
+            assertThat(engine.isCurrentOrAbsent(pipelineId, actual)).isTrue();
+        };
         var actuator = new EngineLifecycleActuator(engine, new RecordingDagSource(calls), capture, teardown(),
                 ownership, incarnations, scopes);
         var allowance = new java.util.concurrent.atomic.AtomicBoolean(true);
@@ -513,6 +519,11 @@ class EngineLifecycleActuatorTest {
         assertThat(target.job().jobId()).isNotEqualTo(source.job().jobId());
         assertThat(target.scope().pipelineIncarnationId()).isEqualTo(source.scope().pipelineIncarnationId());
         assertThat(target.scope().executionGeneration()).isEqualTo(source.scope().executionGeneration() + 1);
+        assertThat(capture.activatedLogScopes).containsExactly(
+                new io.tapstate.core.logging.LogSink.Scope(source.scope().pipelineIncarnationId(),
+                        source.scope().executionGeneration()),
+                new io.tapstate.core.logging.LogSink.Scope(target.scope().pipelineIncarnationId(),
+                        target.scope().executionGeneration()));
         assertThat(StateJson.parse(state.read(PIPE).orElseThrow().stateJson())).isEqualTo(PipelineState.RUNNING);
         assertThat(state.stopReservations()).isEqualTo(1);
         assertThat(state.readStopReservation(PIPE)).isEmpty();
@@ -1243,13 +1254,29 @@ class EngineLifecycleActuatorTest {
                 return Optional.of("inc-a");
             }
         };
-        EngineLifecycleActuator actuator = new EngineLifecycleActuator(new Engine(member),
-                new RecordingDagSource(events), new RecordingCaptureCoordinator(events), teardown(),
+        Engine engine = new Engine(member);
+        RecordingCaptureCoordinator capture = new RecordingCaptureCoordinator(events);
+        capture.activationProbe = (pipelineId, scope) -> {
+            var actual = engine.executionJob(pipelineId).orElseThrow();
+            assertThat(scope).isEqualTo(new io.tapstate.core.logging.LogSink.Scope(
+                    actual.scope().pipelineIncarnationId(), actual.scope().executionGeneration()));
+            assertThat(actual.job().jobId()).isEqualTo(member.getJet().getJob(pipelineId).getId());
+        };
+        EngineLifecycleActuator actuator = new EngineLifecycleActuator(engine,
+                new RecordingDagSource(events), capture, teardown(),
                 PipelineActuationOwnership.single("single", new InMemoryWorkloadClaimStore()),
                 new PipelineIncarnationService(artifacts), scopes);
+        PipelineLogContext savedContext = PipelineLogContext.capture();
+        try {
+            org.slf4j.MDC.put(io.tapstate.core.logging.PipelineAttribution.MDC_KEY, "other_pipeline");
+            org.slf4j.MDC.put(io.tapstate.core.logging.PipelineAttribution.INCARNATION_MDC_KEY, "other-resource");
+            org.slf4j.MDC.put(io.tapstate.core.logging.PipelineAttribution.EXECUTION_MDC_KEY, "91");
+            PipelineLogContext caller = PipelineLogContext.capture();
+            actuator.start(PIPE);
+            assertThat(PipelineLogContext.capture()).isEqualTo(caller);
+        } finally { savedContext.restore(); }
 
-        actuator.start(PIPE);
-
+        assertThat(capture.activatedLogScopes).containsExactly(new io.tapstate.core.logging.LogSink.Scope("inc-a", 1));
         assertThat(scopes.current(PIPE)).contains(new io.tapstate.spi.store.ObservationStore.Scope("inc-a", 1));
         assertThat(events).containsExactly("startCapture:" + PIPE, "buildDag:" + PIPE);
     }
@@ -1882,6 +1909,9 @@ class EngineLifecycleActuatorTest {
         private boolean interruptAfterStart;
         private boolean activeCapture;
         private final List<String> captureTokens = new CopyOnWriteArrayList<>();
+        private final List<io.tapstate.core.logging.LogSink.Scope> activatedLogScopes = new CopyOnWriteArrayList<>();
+        private java.util.function.BiConsumer<String, io.tapstate.core.logging.LogSink.Scope> activationProbe =
+                (pipelineId, scope) -> { };
 
         RecordingCaptureCoordinator(List<String> events) {
             this.events = events;
@@ -1915,6 +1945,12 @@ class EngineLifecycleActuatorTest {
         public void startCapture(String pipelineId, ArtifactStore artifactSnapshot, String cursorWriterToken) {
             captureTokens.add(cursorWriterToken);
             startCapture(pipelineId, artifactSnapshot);
+        }
+
+        @Override
+        public void activateSnapshot(String pipelineId, io.tapstate.core.logging.LogSink.Scope scope) {
+            activationProbe.accept(pipelineId, scope);
+            activatedLogScopes.add(scope);
         }
 
         @Override

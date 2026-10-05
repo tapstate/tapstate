@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.core.logging.LogSink;
 import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.spi.store.ArtifactStore;
@@ -47,6 +48,12 @@ interface PipelineCaptureCoordinator {
 
     /** Activates reserved snapshot readers only after the consuming Jet job has been submitted. */
     default void activateSnapshot(String pipelineId) {
+    }
+
+    /** Carries the explicit admitted execution owner into deferred source-handle creation. */
+    default void activateSnapshot(String pipelineId, LogSink.Scope scope) {
+        java.util.Objects.requireNonNull(scope, "scope");
+        activateSnapshot(pipelineId);
     }
 
     /** Whether this member still holds capture handles for the pipeline after its Jet job has ended. */

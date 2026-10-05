@@ -1,5 +1,6 @@
 package io.tapstate.runtime.srs;
 
+import io.tapstate.core.logging.LogSink;
 import io.tapstate.spi.capture.Subscription;
 import java.time.Duration;
 import java.util.Map;
@@ -7,6 +8,13 @@ import java.util.Map;
 /** A reserved snapshot read activated only after the job that drains its buffer has been submitted. */
 public interface SnapshotActivation extends Subscription {
     void activateSnapshot();
+
+    /** Activates with the explicit owner admitted for the consuming job. */
+    default void activateSnapshot(LogSink.Scope scope) {
+        java.util.Objects.requireNonNull(scope, "scope");
+        activateSnapshot();
+    }
+
     default long snapshotRows() { return 0; }
     default Map<String, Long> snapshotRowsByTable() { return Map.of(); }
     default boolean loading() { return false; }

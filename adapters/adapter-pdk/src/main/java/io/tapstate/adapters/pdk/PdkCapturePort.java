@@ -1,6 +1,7 @@
 package io.tapstate.adapters.pdk;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.logging.LogSink;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.core.model.PipelineNode;
@@ -8,6 +9,7 @@ import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CaptureStartedListener;
 import io.tapstate.spi.capture.CapturePort;
+import io.tapstate.spi.capture.LogScopedCapturePort;
 import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
@@ -65,7 +67,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * stream failure reaches the caller and the backpressure that bounds the stream belong to the runtime that
  * owns stream execution, not to this port.
  */
-public final class PdkCapturePort implements CapturePort, SnapshotSession.Provider {
+public final class PdkCapturePort implements CapturePort, SnapshotSession.Provider, LogScopedCapturePort {
 
     private static final Logger LOG = LoggerFactory.getLogger(PdkCapturePort.class);
 
@@ -81,6 +83,8 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
     private final KeyedStateStore stateStore;
     private final Duration preflightTimeout;
     private final PdkExternalCallStats externalCalls;
+    private final PipelineNode logOwner;
+    private final LogSink.Scope logScope;
 
     /** For the drives that keep nothing: no store, so nothing a connector writes is filed anywhere. */
     public PdkCapturePort(ConnectorProvisioner provisioner) {
@@ -98,10 +102,31 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
 
     public PdkCapturePort(ConnectorProvisioner provisioner, KeyedStateStore stateStore,
             Duration preflightTimeout, PdkExternalCallStats externalCalls) {
+        this(provisioner, stateStore, preflightTimeout, externalCalls, null, null);
+    }
+
+    private PdkCapturePort(ConnectorProvisioner provisioner, KeyedStateStore stateStore,
+            Duration preflightTimeout, PdkExternalCallStats externalCalls,
+            PipelineNode logOwner, LogSink.Scope logScope) {
         this.provisioner = provisioner;
         this.stateStore = stateStore;
         this.preflightTimeout = requirePositive(preflightTimeout);
         this.externalCalls = Objects.requireNonNull(externalCalls, "externalCalls");
+        this.logOwner = logOwner;
+        this.logScope = logScope;
+    }
+
+    @Override
+    public CapturePort forLogOwner(PipelineNode node, LogSink.Scope scope) {
+        Objects.requireNonNull(node, "node");
+        Objects.requireNonNull(scope, "scope");
+        if (logOwner != null) {
+            if (!logOwner.equals(node) || !logScope.equals(scope)) {
+                throw new IllegalStateException("a capture view cannot change its admitted log owner");
+            }
+            return this;
+        }
+        return new PdkCapturePort(provisioner, stateStore, preflightTimeout, externalCalls, node, scope);
     }
 
     private static Duration requirePositive(Duration timeout) {
@@ -459,6 +484,9 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
      * so the full load and the change tail of one run file under one name and read each other's.
      */
     private PdkConnector open(CaptureConfig config) {
+        if (logOwner != null && !logOwner.equals(config.node())) {
+            throw new IllegalArgumentException("a scoped capture must open its admitted pipeline node");
+        }
         return open(config, config.node(), config.sharedNotes());
     }
 
@@ -474,10 +502,10 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
     }
 
     private PdkConnector open(CaptureConfig config, PipelineNode node, SharedNotes notes) {
-        // Capture can open before the durable execution generation exists, and one physical change
-        // stream can serve several pipelines. A caller's MDC cannot prove ownership for this handle.
+        // Only the immutable admitted view supplies execution ownership. An ordinary capture or a
+        // read-only probe has none and must not borrow the driving thread's diagnostic context.
         return PdkConnector.open(config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(),
-                node, stateStore, notes);
+                node, stateStore, notes, node == null ? null : logScope);
     }
 
     /**

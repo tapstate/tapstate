@@ -1800,6 +1800,15 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         }
     }
 
+    @Override
+    public void activateSnapshot(String pipelineId, io.tapstate.core.logging.LogSink.Scope scope) {
+        Objects.requireNonNull(scope, "scope");
+        List<PipelineRun> runs = runsByPipeline.get(pipelineId);
+        if (runs != null) {
+            runs.forEach(pipelineRun -> pipelineRun.run.activateSnapshot(scope));
+        }
+    }
+
     private ArtifactStore artifacts() {
         return storePort.artifacts();
     }
