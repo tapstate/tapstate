@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.classic.spi.ThrowableProxyUtil;
@@ -9,6 +10,7 @@ import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.SystemCollections;
+import io.tapstate.control.core.CloudRuntimeStatusProvider;
 import io.tapstate.cli.Cli;
 import io.tapstate.control.core.StoredArtifact;
 import io.tapstate.core.common.JsonReader;
@@ -277,6 +279,59 @@ class SourceConfigClientTransportsIT {
             assertThat(fixture.audit()).isEqualTo(audit);
             encrypted(fixture, id, config("mysql", SECRET));
             safe(logs.text());
+        }
+    }
+
+    @Test
+    void cloudCookieDraftReturnsOnlyCurrentInputWithoutChangingEncryptedArtifactsOrAudit() throws Exception {
+        try (Fixture fixture = start(true);
+                Logs logs = new Logs()) {
+            Level previousLevel = logs.root.getLevel();
+            logs.root.setLevel(Level.INFO);
+            try {
+                logs.root.info("Cloud draft boundary observation started");
+                String id = "cloud_draft_source";
+                Map<String, Object> storedConfig = config("mysql", SECRET);
+                fixture.store.save(PARSER.parse(source(id, "mysql", storedConfig)));
+                StoredArtifact displayed = fixture.view(id);
+                List<Document> artifacts = fixture.snapshot();
+                List<Document> audit = fixture.audit();
+                Map<String, Object> callerConfig = config("mysql", CALLER);
+                callerConfig.put("username", "caller-owned-user");
+
+                String response = fixture.client.post().uri("/api/sources:draft")
+                        .header(HttpHeaders.ORIGIN, fixture.baseUrl)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .body(Map.of("id", id, "connector", "mysql", "config", callerConfig))
+                        .retrieve().body(String.class);
+                assertThat(response).doesNotContain(SECRET);
+                String yaml = JSON.readTree(response).path("yaml").asText();
+                assertThat(yaml).contains("id: " + id, CALLER).doesNotContain(SECRET);
+                SourceResource drafted = (SourceResource) PARSER.parse(yaml);
+                sameConfig(drafted.config(), callerConfig);
+
+                for (String path : List.of("/api/sources/" + id, "/api/sources",
+                        "/api/artifacts/" + id, "/api/artifacts?kind=source")) {
+                    assertThat(fixture.client.get().uri(path).retrieve().body(String.class))
+                            .as("stored reads do not inherit the draft's authoring exception")
+                            .doesNotContain(SECRET, CALLER);
+                }
+                assertThat(fixture.view(id)).isEqualTo(displayed);
+                safeProjection(fixture.view(id).canonicalForm());
+                assertThat(fixture.snapshot()).isEqualTo(artifacts);
+                assertThat(fixture.audit()).isEqualTo(audit);
+                encrypted(fixture, id, storedConfig);
+                safe(JSON.writeValueAsString(fixture.context
+                        .getBean(CloudRuntimeStatusProvider.class).snapshot()));
+                var probes = fixture.context.getBean(SharedConnectorSourceModesIT.RecordingProbes.class);
+                assertThat(probes.validations.get()).as("drafting does not revalidate a Cloud JWT").isEqualTo(1);
+                assertThat(probes.testCalls.get()).as("drafting does not test a stored connection").isZero();
+                assertThat(probes.discovered).isNull();
+                assertThat(logs.text()).contains("Cloud draft boundary observation started");
+                safe(logs.text());
+            } finally {
+                logs.root.setLevel(previousLevel);
+            }
         }
     }
 
