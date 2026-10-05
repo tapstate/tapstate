@@ -91,12 +91,27 @@ public final class CaptureRunUnit {
     /** The fallback for direct callers that do not supply the product's durable per-pipeline generation. */
     private final AtomicLong chainlessSnapshotEpoch = new AtomicLong();
     private final ConcurrentMap<String, SharedTail> sharedTails = new ConcurrentHashMap<>();
+    /** Tells each tail's source how far it may release, for as long as this unit is open. */
+    private final SourceAcknowledgements sourceAcknowledgements = new SourceAcknowledgements();
 
     public CaptureRunUnit(CapturePort port, SrsCoordinator coordinator, SrsMetaStore meta, HazelcastInstance hz) {
         this.port = Objects.requireNonNull(port, "port");
         this.coordinator = Objects.requireNonNull(coordinator, "coordinator");
         this.meta = Objects.requireNonNull(meta, "meta");
         this.hz = Objects.requireNonNull(hz, "hz");
+    }
+
+    /**
+     * Stops telling the sources of this unit's tails how far they may release: the reads that follow each tail
+     * end, with the thread that makes them. The tails themselves are closed by the runs that hold them.
+     */
+    public void close() {
+        sourceAcknowledgements.close();
+    }
+
+    /** Whether this unit still tells its tails' sources how far they may release. */
+    boolean acknowledging() {
+        return !sourceAcknowledgements.stopped();
     }
 
     /**
@@ -518,7 +533,7 @@ public final class CaptureRunUnit {
             open();
             // A write-through checkpoint only: on this capture a restart resumes from nothing else. A widening
             // replaces the stream, and the stream that replaced it is the one told from then on.
-            this.acknowledgements = SourceAcknowledgements.follow(meta, chain, new Subscription() {
+            this.acknowledgements = sourceAcknowledgements.follow(meta, chain, new Subscription() {
                 @Override
                 public void acknowledge(SourcePosition durable) {
                     Subscription current = subscription.get();
@@ -717,7 +732,7 @@ public final class CaptureRunUnit {
             }
             CaptureStart minerStart = tailStart(meta, cid, spec.consumerId(), ownSeam, CaptureStart.present());
             refuseAnInstantThisBufferWillNeverReach(spec.startFrom(), minerStart, spec.retention());
-            return Optional.of(SourceAcknowledgements.follow(
+            return Optional.of(sourceAcknowledgements.follow(
                     meta, cid, CdcPhase.run(port, spec.config(), minerStart, routes, health), health, false));
         }
         if (plan.directTail()) {
@@ -762,7 +777,7 @@ public final class CaptureRunUnit {
                         }
                     }));
             // Bounded by what this channel's targets confirmed: a direct channel has no log to replay from.
-            return Optional.of(SourceAcknowledgements.follow(meta, directChain, direct, health, false));
+            return Optional.of(sourceAcknowledgements.follow(meta, directChain, direct, health, false));
         }
         return Optional.empty();
     }

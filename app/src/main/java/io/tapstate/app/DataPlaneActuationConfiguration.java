@@ -90,7 +90,7 @@ class DataPlaneActuationConfiguration {
         return new SnapshotBuffer();
     }
 
-    @Bean
+    @Bean(destroyMethod = "close")
     CaptureRunUnit captureRunUnit(CapturePort capturePort, SrsCoordinator srsCoordinator,
             SrsMetaStore srsMetaStore, HazelcastInstance hazelcastMember) {
         return new CaptureRunUnit(capturePort, srsCoordinator, srsMetaStore, hazelcastMember);

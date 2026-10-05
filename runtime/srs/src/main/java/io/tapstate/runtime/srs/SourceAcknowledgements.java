@@ -17,7 +17,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 /**
- * Tells the source of every tail this process runs how far it may release its change log.
+ * Tells the source of every tail one capture run unit runs how far it may release its change log.
  *
  * <p>What a source is told is the chain's source read offset as it stands durably -- read with a majority read
  * concern, so a write the store could still roll back is never told to a source that would then have let go of
@@ -42,8 +42,12 @@ import java.util.function.Supplier;
  * nothing else, so it is counted on the run's health as a failed acknowledgement and never fails the run. It is
  * also said, at most once a minute for a tail: a source that is never told anything keeps its whole log, and the
  * health readings are not where anybody watching the source would look.
+ *
+ * <p>The tails followed, and the thread that reads for them, belong to the unit that made this and end when it
+ * is closed. A process that runs several units in turn -- a test JVM starting one server after another -- would
+ * otherwise go on reading, every interval, for tails whose servers and stores are gone.
  */
-final class SourceAcknowledgements {
+final class SourceAcknowledgements implements AutoCloseable {
 
     /** How often each followed tail's chain is read for a new durable position. */
     static final Duration INTERVAL = Duration.ofSeconds(5);
@@ -53,20 +57,17 @@ final class SourceAcknowledgements {
     /** The least time between two warnings about one tail's reads failing; each failure is still counted. */
     private static final long WARNING_INTERVAL_NANOS = Duration.ofMinutes(1).toNanos();
 
-    private static final Set<Followed> FOLLOWED = ConcurrentHashMap.newKeySet();
-    private static final ScheduledExecutorService READER = Executors.newSingleThreadScheduledExecutor(task -> {
+    private final Set<Followed> followed = ConcurrentHashMap.newKeySet();
+    private final ScheduledExecutorService reader = Executors.newSingleThreadScheduledExecutor(task -> {
         Thread thread = new Thread(task, "tapstate-source-acknowledge");
         thread.setDaemon(true);
         return thread;
     });
 
-    static {
+    SourceAcknowledgements() {
         long every = INTERVAL.toMillis();
-        READER.scheduleWithFixedDelay(() -> FOLLOWED.forEach(Followed::handOverQuietly),
+        reader.scheduleWithFixedDelay(() -> followed.forEach(Followed::handOverQuietly),
                 every, every, TimeUnit.MILLISECONDS);
-    }
-
-    private SourceAcknowledgements() {
     }
 
     /**
@@ -75,16 +76,30 @@ final class SourceAcknowledgements {
      * not a write-through checkpoint is not handed over. Answers the subscription to hold instead of
      * {@code tail} -- closing it stops the following as well as the tail.
      */
-    static Subscription follow(SrsMetaStore meta, String chainId, Subscription tail, CaptureHealth health,
+    Subscription follow(SrsMetaStore meta, String chainId, Subscription tail, CaptureHealth health,
             boolean writtenThroughOnly) {
         Objects.requireNonNull(meta, "meta");
         Objects.requireNonNull(chainId, "chainId");
-        Followed followed = new Followed(chainId, () -> meta.durableSourceRead(chainId)
+        Followed one = new Followed(chainId, () -> meta.durableSourceRead(chainId)
                 .filter(read -> !writtenThroughOnly || read.writtenThrough())
-                .map(DurableSourceRead::position), tail, health);
-        FOLLOWED.add(followed);
-        followed.handOverQuietly();
-        return followed;
+                .map(DurableSourceRead::position), tail, health, followed);
+        followed.add(one);
+        one.handOverQuietly();
+        return one;
+    }
+
+    /**
+     * Stops the thread that reads for every tail followed here. The tails themselves are left as they are: each
+     * is closed by the run that holds it.
+     */
+    @Override
+    public void close() {
+        reader.shutdownNow();
+    }
+
+    /** Whether the thread that reads for the tails followed here has stopped. */
+    boolean stopped() {
+        return reader.isTerminated();
     }
 
     /** One tail being told its durable position. */
@@ -94,17 +109,20 @@ final class SourceAcknowledgements {
         private final Supplier<Optional<ChainPosition>> durablePosition;
         private final Subscription tail;
         private final CaptureHealth health;
+        /** The tails followed alongside this one, which this one leaves once it is closed. */
+        private final Set<Followed> registry;
         private ChainPosition handed;
         private volatile boolean closed;
         private long lastWarnedNanos;
         private boolean warned;
 
         private Followed(String chainId, Supplier<Optional<ChainPosition>> durablePosition, Subscription tail,
-                CaptureHealth health) {
+                CaptureHealth health, Set<Followed> registry) {
             this.chainId = chainId;
             this.durablePosition = Objects.requireNonNull(durablePosition, "durablePosition");
             this.tail = Objects.requireNonNull(tail, "tail");
             this.health = Objects.requireNonNull(health, "health");
+            this.registry = Objects.requireNonNull(registry, "registry");
         }
 
         /** Reads the durable position once, and hands it over when it is one the tail was not handed. */
@@ -153,7 +171,7 @@ final class SourceAcknowledgements {
         @Override
         public void close() {
             closed = true;
-            FOLLOWED.remove(this);
+            registry.remove(this);
             tail.close();
         }
     }

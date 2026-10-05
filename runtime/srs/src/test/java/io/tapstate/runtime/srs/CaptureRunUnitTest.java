@@ -2384,4 +2384,22 @@ class CaptureRunUnitTest {
 
         assertThat(port.released).isEmpty();
     }
+
+    /**
+     * Closing the unit stops telling its tails' sources how far they may release: the thread that reads for
+     * them ends with the unit, rather than outliving the server that closed it.
+     */
+    @Test
+    void closingTheUnitStopsTellingItsSources() throws InterruptedException {
+        CaptureRunUnit unit = runUnit(new FakeSource(List.of(), List.of()), new InMemoryMeta());
+        assertThat(unit.acknowledging()).isTrue();
+
+        unit.close();
+
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (unit.acknowledging() && System.nanoTime() < deadline) {
+            Thread.sleep(20);
+        }
+        assertThat(unit.acknowledging()).as("the unit's reads stopped with it").isFalse();
+    }
 }

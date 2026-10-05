@@ -36,6 +36,7 @@ class SourceAcknowledgementsTest {
     private CountingMeta meta;
     private RecordingTail tail;
     private final CaptureHealth health = new CaptureHealth();
+    private final SourceAcknowledgements acknowledgements = new SourceAcknowledgements();
     private Subscription followed;
 
     @BeforeEach
@@ -51,6 +52,7 @@ class SourceAcknowledgementsTest {
         if (followed != null) {
             followed.close();
         }
+        acknowledgements.close();
     }
 
     /**
@@ -61,7 +63,7 @@ class SourceAcknowledgementsTest {
     @Test
     void aTailIsToldWhereItStartsAndThenEveryNewDurablePositionOnce() {
         meta.advanceSourceReadOffset(CHAIN, at(-1, "t0"));
-        followed = SourceAcknowledgements.follow(meta, CHAIN, tail, health, false);
+        followed = acknowledgements.follow(meta, CHAIN, tail, health, false);
         assertThat(tail.told).containsExactly("t0");
 
         handOver();
@@ -82,7 +84,7 @@ class SourceAcknowledgementsTest {
     void thePositionIsReadDurablyAndNeverOffTheWholeRecord() {
         meta.advanceSourceReadOffset(CHAIN, at(2, "t2"));
         int recordReads = meta.recordReads.get();
-        followed = SourceAcknowledgements.follow(meta, CHAIN, tail, health, false);
+        followed = acknowledgements.follow(meta, CHAIN, tail, health, false);
         handOver();
 
         // At least the two asked for here; the process-wide schedule may add one of its own meanwhile.
@@ -94,7 +96,7 @@ class SourceAcknowledgementsTest {
     /** A chain with no position yet tells the source nothing; there is nothing it may release. */
     @Test
     void aChainWithNoPositionTellsNothing() {
-        followed = SourceAcknowledgements.follow(meta, CHAIN, tail, health, false);
+        followed = acknowledgements.follow(meta, CHAIN, tail, health, false);
         handOver();
 
         assertThat(tail.told).isEmpty();
@@ -110,9 +112,9 @@ class SourceAcknowledgementsTest {
         meta.advanceSourceReadOffset(CHAIN, at(3, "bounded-by-confirmations"));
         meta.writtenThrough.set(false);
         RecordingTail direct = new RecordingTail();
-        Subscription followedDirect = SourceAcknowledgements.follow(meta, CHAIN, direct, health, false);
+        Subscription followedDirect = acknowledgements.follow(meta, CHAIN, direct, health, false);
         try {
-            followed = SourceAcknowledgements.follow(meta, CHAIN, tail, health, true);
+            followed = acknowledgements.follow(meta, CHAIN, tail, health, true);
             assertThat(tail.told).as("not a write-through checkpoint").isEmpty();
             assertThat(direct.told).containsExactly("bounded-by-confirmations");
 
@@ -134,7 +136,7 @@ class SourceAcknowledgementsTest {
         meta.advanceSourceReadOffset(CHAIN, at(2, "t2"));
         meta.failDurableReads.set(true);
 
-        followed = SourceAcknowledgements.follow(meta, CHAIN, tail, health, false);
+        followed = acknowledgements.follow(meta, CHAIN, tail, health, false);
         handOver();
 
         assertThat(health.consecutiveAcknowledgeFailures()).isGreaterThanOrEqualTo(2);
@@ -174,7 +176,7 @@ class SourceAcknowledgementsTest {
             meta.advanceSourceReadOffset(CHAIN, at(2, "t2"));
             meta.failDurableReads.set(true);
 
-            followed = SourceAcknowledgements.follow(meta, CHAIN, tail, health, false);
+            followed = acknowledgements.follow(meta, CHAIN, tail, health, false);
             handOver();
             handOver();
 
@@ -190,7 +192,7 @@ class SourceAcknowledgementsTest {
     /** Once the tail is closed nothing more is read for it, and the tail itself is closed. */
     @Test
     void closingStopsTheFollowingAndTheTail() {
-        followed = SourceAcknowledgements.follow(meta, CHAIN, tail, health, false);
+        followed = acknowledgements.follow(meta, CHAIN, tail, health, false);
         followed.close();
         meta.advanceSourceReadOffset(CHAIN, at(9, "t9"));
         handOver();
@@ -200,12 +202,33 @@ class SourceAcknowledgementsTest {
     }
 
     /**
+     * Closing the unit that followed a tail ends every read made for it, and the thread that made them. A
+     * process that runs one server after another would otherwise go on reading, every interval, for tails whose
+     * servers are gone, through stores that are closed.
+     */
+    @Test
+    void closingTheUnitEndsItsReadsAndTheirThread() throws Exception {
+        SourceAcknowledgements unit = new SourceAcknowledgements();
+        unit.follow(meta, CHAIN, tail, health, false);
+        assertThat(meta.durableReads).as("the read made as the tail was followed").hasValue(1);
+
+        unit.close();
+        long deadline = System.nanoTime() + SourceAcknowledgements.INTERVAL.toNanos() + TimeUnit.SECONDS.toNanos(1);
+        while (System.nanoTime() < deadline) {
+            Thread.sleep(100);
+        }
+
+        assertThat(meta.durableReads).as("nothing read once the unit is closed").hasValue(1);
+        assertThat(unit.stopped()).as("and the thread that read for it has stopped").isTrue();
+    }
+
+    /**
      * The schedule reads on a thread of its own, not the thread the source hands its changes over on, which
      * must not wait on the store.
      */
     @Test
     void theScheduledReadsRunOnAThreadOfTheirOwn() throws Exception {
-        followed = SourceAcknowledgements.follow(meta, CHAIN, tail, health, false);
+        followed = acknowledgements.follow(meta, CHAIN, tail, health, false);
         meta.advanceSourceReadOffset(CHAIN, at(3, "t3"));
 
         long deadline = System.nanoTime()
