@@ -265,8 +265,20 @@ class RealRebuildHandoffCrashIT {
                                     + ", actual=" + actual.read(PIPELINE) + ", offsets=" + sourceCheckpoint(database));
                     String coverageSha = assertFullTargetContent(target);
                     Instant targetConfirmedAt = Instant.now();
-                    Matched quiet = Await.answered("known final native delivery frame", SETUP_WAIT,
-                            () -> matched(latest, restarted, expected, savedFloor, targetConfirmedAt));
+                    MatchTrace anchorTrace = new MatchTrace();
+                    Matched quiet;
+                    try {
+                        quiet = Await.answered("known final native delivery frame", SETUP_WAIT,
+                                () -> matched(latest, restarted, expected, savedFloor, targetConfirmedAt, anchorTrace)
+                                        .filter(value -> {
+                                            assertCumulativeExactly(value, savedFloor);
+                                            boolean complete = hasCompletedRecoveryWorkload(value.raw());
+                                            anchorTrace.stage(complete ? "NATIVE_WORKLOAD_COMPLETE" : "NATIVE_WORKLOAD_INCOMPLETE");
+                                            return complete;
+                                        }));
+                    } finally {
+                        report.addFork(Map.of("action", "post-delivery-native-anchor-diagnostic", "sampling", anchorTrace.evidence()));
+                    }
                     assertCumulativeExactly(quiet, savedFloor);
                     report.addFork(Map.of("action", "post-delivery-native-anchor", "targetConfirmedAt", targetConfirmedAt.toString(),
                             "anchor", matchedEvidence(quiet)));
@@ -464,6 +476,29 @@ class RealRebuildHandoffCrashIT {
                     return Objects.equals(old.startTime(), next.startTime()) && Objects.equals(old.value(), next.value())
                             && Objects.equals(old.histogram(), next.histogram());
                 });
+    }
+
+    /** The unfinished table is read in full on recovery, then its three crash-time changes are replayed. */
+    private static boolean hasCompletedRecoveryWorkload(RebuildHandoffJdiSession.Raw raw) {
+        Map<String, Long> operations = new HashMap<>();
+        HistogramValue delivered = null;
+        for (MetricFact fact : delivery(raw.facts())) {
+            for (MetricPoint point : fact.points()) {
+                if ("tapstate.pipeline.records".equals(fact.name())) {
+                    String operation = point.attributes().get(MetricAttributes.OP);
+                    assertThat(operation).isIn("read", "insert", "update", "delete");
+                    assertThat(operations.put(operation, point.value())).as("one raw delivery counter per operation").isNull();
+                    assertThat(point.value()).as("the recovered fixture does not deliver additional %s records", operation)
+                            .isLessThanOrEqualTo("read".equals(operation) ? ROWS : 1L);
+                } else if (fact.type() == MetricType.HISTOGRAM) {
+                    assertThat(delivered).as("one raw delivery histogram for the recovered table").isNull();
+                    delivered = point.histogram();
+                    assertThat(delivered.count()).isLessThanOrEqualTo(ROWS + 3L);
+                }
+            }
+        }
+        return operations.equals(Map.of("read", (long) ROWS, "insert", 1L, "update", 1L, "delete", 1L))
+                && delivered != null && delivered.count() == ROWS + 3L;
     }
 
     private static List<MetricFact> delivery(List<MetricFact> facts) {
