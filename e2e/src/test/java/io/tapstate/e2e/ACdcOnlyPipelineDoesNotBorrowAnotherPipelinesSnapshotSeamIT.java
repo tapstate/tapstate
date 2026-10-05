@@ -6,6 +6,7 @@ import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.testsupport.DockerGate;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -14,6 +15,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.io.TempDir;
@@ -21,17 +23,16 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
 /**
- * A CDC-only pipeline starts at its own present instead of another pipeline's snapshot seam.
+ * A CDC-only pipeline starts at its own present on a cleared source and at the shared checkpoint on a held source.
  *
- * <p>The first pipeline creates the shared mining-chain record and records a snapshot seam, then stops
- * before its tail sees a change. A row written after that stream has returned and before the CDC-only
- * pipeline starts is the discriminator: replaying the first pipeline's seam delivers it, while starting
- * at the CDC-only pipeline's own present does not. A second row written after the new stream opens must
- * arrive, so an empty target or a tail that never started cannot satisfy the absence assertion.
+ * <p>Clearing the only consumer removes the actual mining-chain record. Its successor must carry only
+ * the row written after it starts. Keeping the consumer retains the chain: the newcomer carries a row
+ * written while it was stopped, but excludes an older row already behind the observed checkpoint. The
+ * original consumer is then started again and must deliver its own stopped-period change.
  *
  * <p>The two sources deliberately have different artifact ids and table selections but identical physical
  * Mongo coordinates. Mining-chain identity excludes the table subset, so they meet in the one persisted
- * chain whose pipeline-scoped seam is under test. The observed real connector is used only to place both
+ * chain whose source-qualified consumer progress is under test. The observed real connector places the
  * writes on known sides of stream teardown and startup; the result is read independently from the target.
  */
 class ACdcOnlyPipelineDoesNotBorrowAnotherPipelinesSnapshotSeamIT {
@@ -45,6 +46,9 @@ class ACdcOnlyPipelineDoesNotBorrowAnotherPipelinesSnapshotSeamIT {
     private static final String SECOND_PIPELINE = "cdc_only_pipeline";
     private static final String FIRST_COLLECTION = "seam_owner_orders";
     private static final String SECOND_COLLECTION = "cdc_only_orders";
+    private static final String PASSED_BY_THE_CHAIN = "written-before-the-chain-moved-on";
+    private static final String MOVES_THE_CHAIN_ON = "moves-the-chain-on";
+    private static final String WHILE_STOPPED = "written-while-the-seam-owner-was-stopped";
     private static final String BEFORE_START = "written-before-cdc-only-start";
     private static final String AFTER_START = "written-after-cdc-only-start";
 
@@ -58,18 +62,30 @@ class ACdcOnlyPipelineDoesNotBorrowAnotherPipelinesSnapshotSeamIT {
     @EnumSource(Tiers.class)
     void aCdcOnlyPipelineDoesNotReplayAChangeFromBeforeItsOwnStart(
             Tiers tier, @TempDir Path temporary) throws Exception {
-        String suffix = tier.name().toLowerCase(Locale.ROOT);
+        run(tier, temporary, true);
+    }
+
+    @ParameterizedTest
+    @EnumSource(Tiers.class)
+    void aCdcOnlyPipelineOnAHeldSourceCarriesOnFromTheCheckpointAndNotTheSeam(
+            Tiers tier, @TempDir Path temporary) throws Exception {
+        run(tier, temporary, false);
+    }
+
+    private static void run(Tiers tier, Path temporary, boolean clearState) throws Exception {
+        String suffix = (clearState ? "cleared_" : "held_") + tier.name().toLowerCase(Locale.ROOT);
         String sourceDatabase = "cdc_own_start_source_" + suffix;
         String sourceUri = SharedMongo.replicaSetUrl(sourceDatabase);
         String targetUri = SharedMongo.replicaSetUrl("cdc_own_start_target_" + suffix);
         Path witness = temporary.resolve("mongo-writes");
         Path tail = temporary.resolve("mongo-writes.tail");
         byte[] connector = ObservedMongoConnectorJar.build(ConnectorJars.bytesFor("mongodb"), witness);
+        String storeUri = SharedMongo.replicaSetUrl("cdc_own_start_store_" + suffix);
 
         try (MongoClient source = MongoClients.create(sourceUri);
                 MongoEndpoints mongo = new MongoEndpoints();
-                ServerHandle server = tier.launch(
-                        SharedMongo.replicaSetUrl("cdc_own_start_store_" + suffix))) {
+                ServerHandle server = tier.launch(storeUri);
+                StoreDocuments documents = StoreDocuments.at(storeUri)) {
             seed(source, sourceDatabase, FIRST_COLLECTION, "snapshot-row");
             ControlPlane control = connected(server, connector);
 
@@ -88,15 +104,49 @@ class ACdcOnlyPipelineDoesNotBorrowAnotherPipelinesSnapshotSeamIT {
                     () -> tailLines(tail).size() == 1 && tailLines(tail).getFirst().startsWith("START "),
                     () -> tailLines(tail).toString());
 
-            control.stop(FIRST_PIPELINE, false);
+            String chain = Await.answered("the seam owner's source-qualified mining chain", TIMEOUT, () -> {
+                List<String> candidates = documents.miningChainIds().stream()
+                        .filter(id -> ownerConsumer(documents, id) != null).toList();
+                return candidates.size() == 1 ? Optional.of(candidates.getFirst()) : Optional.empty();
+            });
+            if (!clearState) {
+                seed(source, sourceDatabase, SECOND_COLLECTION, PASSED_BY_THE_CHAIN);
+                Checkpoint beforeChange = Await.answered("the durable capture checkpoint before the owner's change",
+                        TIMEOUT, () -> checkpoint(documents.chain(chain)));
+                insert(source, sourceDatabase, FIRST_COLLECTION, 2, MOVES_THE_CHAIN_ON);
+                Await.until("the seam owner to land its change after the older newcomer row", TIMEOUT,
+                        () -> names(mongo, target, FIRST_COLLECTION).contains(MOVES_THE_CHAIN_ON),
+                        () -> names(mongo, target, FIRST_COLLECTION).toString());
+                Await.until("the seam owner's source-qualified table confirmation", TIMEOUT,
+                        () -> hasOwnedCdcConfirmation(documents, chain),
+                        () -> String.valueOf(ownerConsumer(documents, chain)));
+                // Compare this capture's batch checkpoints, not the table confirmation's ring sequence.
+                // The confirmed change can itself advance the checkpoint; no later heartbeat is required.
+                Await.until("the delivered owner's change to have an advanced capture checkpoint", TIMEOUT,
+                        () -> checkpoint(documents.chain(chain))
+                                .filter(next -> next.epoch() == beforeChange.epoch()
+                                        && next.sequence() > beforeChange.sequence()).isPresent(),
+                        () -> String.valueOf(documents.chain(chain)));
+            }
+
+            control.stop(FIRST_PIPELINE, clearState);
             awaitState(control, FIRST_PIPELINE, PipelineState.STOPPED);
             Await.until("the seam-owning pipeline's tail to return", TIMEOUT,
                     () -> tailLines(tail).size() == 2 && tailLines(tail).getLast().equals("END"),
                     () -> tailLines(tail).toString());
 
-            // No stream is open here. This row belongs before the second pipeline's own present, but
-            // after the older seam that pipeline must not borrow.
-            seed(source, sourceDatabase, SECOND_COLLECTION, BEFORE_START);
+            if (clearState) {
+                Await.until("clearing the sole consumer to remove its actual mining-chain record", TIMEOUT,
+                        () -> documents.chain(chain) == null,
+                        () -> String.valueOf(documents.chain(chain)));
+                seed(source, sourceDatabase, SECOND_COLLECTION, BEFORE_START);
+            } else {
+                assertThat(documents.chain(chain)).as("keeping state retains the shared checkpoint").isNotNull();
+                assertThat(ownerConsumer(documents, chain)).as("keeping state retains the source's own consumer")
+                        .isNotNull();
+                insert(source, sourceDatabase, SECOND_COLLECTION, 2, BEFORE_START);
+                insert(source, sourceDatabase, FIRST_COLLECTION, 3, WHILE_STOPPED);
+            }
             control.apply(workspace(
                     SECOND_SOURCE, SECOND_TARGET, SECOND_PIPELINE, SECOND_COLLECTION,
                     "cdc_only", sourceUri, targetUri));
@@ -108,19 +158,67 @@ class ACdcOnlyPipelineDoesNotBorrowAnotherPipelinesSnapshotSeamIT {
                     () -> tailLines(tail).size() == 3 && tailLines(tail).getLast().startsWith("START "),
                     () -> tailLines(tail).toString());
 
-            insert(source, sourceDatabase, SECOND_COLLECTION, 2, AFTER_START);
+            insert(source, sourceDatabase, SECOND_COLLECTION, clearState ? 2 : 3, AFTER_START);
             Await.until("the change written after the CDC-only start to reach the target", TIMEOUT,
                     () -> names(mongo, target, SECOND_COLLECTION).contains(AFTER_START),
                     () -> "rows=" + names(mongo, target, SECOND_COLLECTION)
                             + ", state=" + control.state(SECOND_PIPELINE)
                             + ", logs=" + control.logs(SECOND_PIPELINE));
 
-            assertThat(names(mongo, target, SECOND_COLLECTION))
-                    .as("the live CDC-only tail carries its post-start row without replaying the row "
-                            + "written before that pipeline existed")
-                    .containsExactly(AFTER_START);
+            if (clearState) {
+                assertThat(names(mongo, target, SECOND_COLLECTION))
+                        .as("the live CDC-only tail on a cleared chain carries only its post-start row")
+                        .containsExactly(AFTER_START);
+            } else {
+                assertThat(names(mongo, target, SECOND_COLLECTION))
+                        .as("the held chain replays from its checkpoint, past the older snapshot-seam row")
+                        .containsExactly(AFTER_START, BEFORE_START);
+                control.lifecycle(FIRST_PIPELINE, LifecycleVerb.START);
+                awaitState(control, FIRST_PIPELINE, PipelineState.RUNNING);
+                Await.until("the retained consumer to deliver its stopped-period change", TIMEOUT,
+                        () -> names(mongo, target, FIRST_COLLECTION).contains(WHILE_STOPPED),
+                        () -> "rows=" + names(mongo, target, FIRST_COLLECTION)
+                                + ", state=" + control.state(FIRST_PIPELINE)
+                                + ", logs=" + control.logs(FIRST_PIPELINE));
+                assertThat(names(mongo, target, FIRST_COLLECTION))
+                        .containsExactly(MOVES_THE_CHAIN_ON, "snapshot-row", WHILE_STOPPED);
+                assertThat(control.errorCount(FIRST_PIPELINE)).contains(0L);
+            }
             assertThat(control.errorCount(SECOND_PIPELINE)).contains(0L);
         }
+    }
+
+    private record Checkpoint(String token, long epoch, long sequence) { }
+
+    private static Optional<Checkpoint> checkpoint(Document chain) {
+        if (chain == null || !Boolean.TRUE.equals(chain.get("sourceReadDurable"))
+                || !(chain.get("sourceReadOffset") instanceof String token) || token.isBlank()
+                || !(chain.get("sourceReadEpoch") instanceof Number epoch) || epoch.longValue() < 1L
+                || !(chain.get("epoch") instanceof Number active) || active.longValue() != epoch.longValue()
+                || !(chain.get("sourceReadSeq") instanceof Number sequence)) {
+            return Optional.empty();
+        }
+        return Optional.of(new Checkpoint(token, epoch.longValue(), sequence.longValue()));
+    }
+
+    private static Document ownerConsumer(StoreDocuments documents, String chain) {
+        Document consumer = documents.consumerOffset(chain, SrsConsumerId.of(FIRST_PIPELINE, FIRST_SOURCE).value());
+        if (consumer == null || !FIRST_PIPELINE.equals(consumer.getString("ownerPipelineId"))
+                || !FIRST_SOURCE.equals(consumer.getString("sourceNodeId"))) {
+            return null;
+        }
+        return consumer;
+    }
+
+    private static boolean hasOwnedCdcConfirmation(StoreDocuments documents, String chain) {
+        Document consumer = ownerConsumer(documents, chain);
+        if (consumer == null || !(consumer.get("sinkAckedByTable") instanceof Document tables)
+                || !(tables.get(FIRST_COLLECTION) instanceof Document confirmed)) {
+            return false;
+        }
+        return confirmed.get("sinkAckedEpoch") instanceof Number epoch && epoch.longValue() > 0L
+                && confirmed.get("sinkAckedSeq") instanceof Number sequence && sequence.longValue() >= 0L
+                && confirmed.get("sinkAckedSrcpos") instanceof String token && !token.isBlank();
     }
 
     private static ControlPlane connected(ServerHandle server, byte[] connector) {
