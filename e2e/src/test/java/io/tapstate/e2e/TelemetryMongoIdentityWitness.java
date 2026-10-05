@@ -97,7 +97,14 @@ final class TelemetryMongoIdentityWitness {
 
     void capture(String action, ObservationStore.Stored expected, ControlPlane control, URI base,
             boolean requirePositiveRaw) {
-        deadline = System.nanoTime() + bound.toNanos();
+        capture(action, expected, control, base, requirePositiveRaw, System.nanoTime() + bound.toNanos());
+    }
+
+    /** A caller's existing phase deadline also bounds every store read, public page and retry here. */
+    void capture(String action, ObservationStore.Stored expected, ControlPlane control, URI base,
+            boolean requirePositiveRaw, long absoluteDeadline) {
+        deadline = absoluteDeadline;
+        remaining();
         ObservationStore.Scope scope = requireActualScope(expected);
         assertThat(issued.size() < MAX_SCOPES || issued.containsKey(scope))
                 .as("the finite lifecycle witness holds at most %s issued scopes", MAX_SCOPES).isTrue();

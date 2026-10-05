@@ -18,6 +18,7 @@ import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.PipelineEvent;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.ObservationContinuation;
 import io.tapstate.spi.store.ObservationStore;
@@ -112,7 +113,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                 : replacement ? requestedOutput.resolveSibling(requestedOutput.getFileName() + ".replacement.json") : requestedOutput;
         PipelineBenchmarkLiveRunIT.requireSafeOutput(output, harness);
         BenchmarkLiveReport report = new BenchmarkLiveReport(output);
-        Map<String, Object> inputs = inputHashes(harness);
+        Map<String, Object> inputs = inputHashes(harness, continuing);
         Map<String, Map<String, Object>> connectors = new LinkedHashMap<>();
         for (String connector : List.of("mysql", "postgres", "mongodb")) {
             connectors.put(connector, PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor(connector)));
@@ -219,6 +220,8 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
             for (String node : sessions.keySet()) { records.put(node, new ArrayList<>()); }
             long setupDeadline = System.nanoTime() + (continuing ? SETUP_WAIT : WAIT).toNanos();
             long nativeDeadline = setupDeadline;
+            var historyEvents = continuing ? new TelemetryMongoIdentityWitness(database, latest, report, PIPELINE,
+                    Instant.now().minusSeconds(1), WAIT) : null;
             cluster.first().lifecycle(PIPELINE, LifecycleVerb.START);
             try (var target = MongoClients.create(targetUri)) {
                 MongoDatabase targetDatabase = target.getDatabase(new ConnectionString(targetUri).getDatabase());
@@ -278,6 +281,9 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                         "claim", firstSubmission.claim(), "scope", firstReceipt.scope(), "job", firstSubmission.job().job()));
                 if (continuing) {
                     assertThat(hasKnownDelivery(first.observation().facts())).isTrue();
+                    historyEvents.capture("claimed-gen1-before-pause", first, cluster.first(),
+                            sessions.get(firstClaim.owner().nodeId()).server().baseUrl(), true, setupDeadline);
+                    captureContinueBoundaries(sessions, records, report, "claimed-gen1-history-events");
                     cluster.first().lifecycle(PIPELINE, LifecycleVerb.PAUSE);
                     TwoMemberCluster owned = cluster;
                     Await.until("actual claimed execution is paused while its snapshot remains unfinished", remaining(setupDeadline),
@@ -300,6 +306,9 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                     assertFloorAtLeast(first.observation().facts(), paused.observation().facts());
                     priorStarts = counterStarts(paused.observation());
                     pausedFacts = paused.observation().facts();
+                    historyEvents.capture("claimed-gen1-paused", paused, cluster.first(),
+                            sessions.get(firstClaim.owner().nodeId()).server().baseUrl(), false, setupDeadline);
+                    captureContinueBoundaries(sessions, records, report, "claimed-paused-history-events");
                     nativeDeadline = System.nanoTime() + WAIT.toNanos();
                     cluster.first().lifecycle(PIPELINE, LifecycleVerb.RESUME);
                 } else {
@@ -522,6 +531,33 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
             if (replacement) { assertReplacementBridge(observed, replacementProof); }
             else { assertBridge(observed, submission); }
             if (continuing) {
+                var bindEvents = new java.util.concurrent.atomic.AtomicReference<List<Document>>(List.of());
+                Await.until("actual claimed replacement bind state and execution events are readable", remaining(deadline),
+                        () -> {
+                            captureContinueBoundaries(sessions, records, report, "claimed-gen2-bind-events");
+                            List<Document> emitted = database.getCollection(MongoStorePort.PIPELINE_EVENTS)
+                                    .find(new Document("pipelineId", PIPELINE)
+                                            .append("pipelineIncarnationId", scope.pipelineIncarnationId())
+                                            .append("executionGeneration", scope.executionGeneration()))
+                                    .projection(new Document("_id", 1).append("pipelineId", 1)
+                                            .append("pipelineIncarnationId", 1).append("executionGeneration", 1)
+                                            .append("occurredAt", 1).append("kind", 1).append("beforeState", 1).append("afterState", 1))
+                                    .sort(new Document("occurredAt", 1).append("_id", 1))
+                                    .maxTime(remaining(deadline).toNanos(), TimeUnit.NANOSECONDS)
+                                    .limit(MAX_RECORDS + 1).into(new ArrayList<>());
+                            assertThat(emitted.size()).as("the actual bind event read keeps the existing row budget")
+                                    .isLessThanOrEqualTo(MAX_RECORDS);
+                            bindEvents.set(emitted);
+                            return emitted.stream().anyMatch(event -> PipelineEvent.Kind.STATE_CHANGED.name().equals(event.getString("kind"))
+                                            && PipelineState.STOPPED.name().equals(event.getString("beforeState"))
+                                            && PipelineState.RUNNING.name().equals(event.getString("afterState")))
+                                    && emitted.stream().anyMatch(event -> PipelineEvent.Kind.EXECUTION_RESTARTED.name().equals(event.getString("kind"))
+                                            && PipelineState.RUNNING.name().equals(event.getString("afterState")));
+                        }, () -> "captured bind event kinds=" + bindEvents.get().stream().map(event -> event.getString("kind")).toList());
+                historyEvents.capture("claimed-gen2-continued", current, cluster.first(), owner.server().baseUrl(), true, deadline);
+                report.addFork(Map.of("action", "actual-claimed-gen2-bind-events", "scope", receipt.scope(),
+                        "events", bindEvents.get().stream().map(Document::toJson).toList()));
+                captureContinueBoundaries(sessions, records, report, "claimed-gen2-history-events");
                 verifyContinuedSnapshotAndCdc(source, targetUri, database, latest, actual, scope, matchedJob, frozenFloor,
                         sessions, records, report, emittingNode, cluster.first());
             }
@@ -574,7 +610,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                 }
             }
             assertThat(PipelineBenchmarkLiveRunIT.sha256(jar)).isEqualTo(sha);
-            assertThat(inputHashes(harness)).isEqualTo(inputs);
+            assertThat(inputHashes(harness, continuing)).isEqualTo(inputs);
             for (var connector : connectors.entrySet()) {
                 assertThat(PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor(connector.getKey())))
                         .isEqualTo(connector.getValue());
@@ -1091,11 +1127,13 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                 """);
     }
 
-    private static Map<String, Object> inputHashes(Path root) throws Exception {
+    private static Map<String, Object> inputHashes(Path root, boolean continuing) throws Exception {
         Map<String, Object> result = new LinkedHashMap<>();
-        for (Class<?> type : List.of(NativeClaimedTelemetryPositiveCalibrationIT.class,
+        List<Class<?>> types = new ArrayList<>(List.of(NativeClaimedTelemetryPositiveCalibrationIT.class,
                 NativeTelemetryIdentityJdiSession.class, NativeTelemetryMirror.class, TwoMemberCluster.class,
-                RealProcessServer.class, NativeTelemetryPositiveCalibrationIT.class)) {
+                RealProcessServer.class, NativeTelemetryPositiveCalibrationIT.class));
+        if (continuing) { types.add(TelemetryMongoIdentityWitness.class); }
+        for (Class<?> type : types) {
             result.put(type.getSimpleName() + "Source", PipelineBenchmarkLiveRunIT.artifact(root.resolve(
                     "e2e/src/test/java/io/tapstate/e2e/" + type.getSimpleName() + ".java")));
             try (InputStream stream = type.getResourceAsStream(type.getSimpleName() + ".class")) {
