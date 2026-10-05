@@ -8,11 +8,15 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * A stretch of network in front of one member that a case can cut per peer.
@@ -47,6 +51,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 final class CuttableLink implements AutoCloseable {
 
     private static final String LOOPBACK = "127.0.0.1";
+    private static final int MAX_UNKNOWN_RECEIPTS = 32;
 
     private final int port;
     private final String targetHost;
@@ -58,12 +63,57 @@ final class CuttableLink implements AutoCloseable {
     private final AtomicInteger carried = new AtomicInteger();
     private final AtomicInteger turnedAway = new AtomicInteger();
     private final AtomicInteger unattributed = new AtomicInteger();
+    private final Object receiptLock = new Object();
+    private final List<UnknownAccept> unknownReceipts = new ArrayList<>();
+    private final AtomicInteger lostUnknownReceipts = new AtomicInteger();
     private volatile boolean closed;
     private volatile ServerSocket listener;
     private volatile Thread acceptThread;
 
     /** One connection through here, remembered by who dialled it so a cut can pick it out. */
-    private record Held(Socket inbound, Socket outbound, String dialler) { }
+    private record Held(Socket inbound, Socket outbound, String dialler, UnknownAccept receipt) { }
+
+    private static final class UnknownAccept {
+        final String acceptedAt = Instant.now().toString();
+        final String dialler, sourceAddress, linkAddress;
+        final int sourcePort, linkPort;
+        final List<String> refusedAtAccept;
+        final AtomicLong sourceBytesRead = new AtomicLong(), targetBytesRead = new AtomicLong();
+        final AtomicLong sourceBytesForwarded = new AtomicLong(), targetBytesForwarded = new AtomicLong();
+        final AtomicReference<String> closedAt = new AtomicReference<>();
+        final AtomicReference<String> closeReason = new AtomicReference<>();
+        volatile boolean connected, partialWriteUnavailable;
+        volatile AtomicInteger carriedFromCounter;
+        volatile int carriedFromAtAccept;
+        volatile String relayAddress;
+        volatile int relayPort;
+
+        UnknownAccept(Socket inbound, String dialler, List<String> refused) {
+            this.dialler = dialler; this.sourceAddress = inbound.getInetAddress().getHostAddress();
+            this.sourcePort = inbound.getPort(); this.linkAddress = inbound.getLocalAddress().getHostAddress();
+            this.linkPort = inbound.getLocalPort(); this.refusedAtAccept = List.copyOf(refused);
+        }
+
+        void ended(String reason) {
+            if (closeReason.compareAndSet(null, reason)) { closedAt.set(Instant.now().toString()); }
+        }
+
+        Map<String, Object> evidence() {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("acceptedAt", acceptedAt); row.put("dialler", dialler);
+            row.put("sourceAddress", sourceAddress); row.put("sourcePort", sourcePort);
+            row.put("linkAddress", linkAddress); row.put("linkPort", linkPort);
+            row.put("refusedAtAccept", refusedAtAccept); row.put("cutActiveAtAccept", !refusedAtAccept.isEmpty());
+            row.put("targetConnected", connected); row.put("relayLocalAddress", relayAddress); row.put("relayLocalPort", relayPort);
+            row.put("sourceBytesRead", sourceBytesRead.get()); row.put("targetBytesRead", targetBytesRead.get());
+            row.put("sourceBytesForwarded", sourceBytesForwarded.get()); row.put("targetBytesForwarded", targetBytesForwarded.get());
+            row.put("partialWriteUnavailable", partialWriteUnavailable);
+            row.put("carriedFromAtAccept", carriedFromAtAccept);
+            row.put("carriedFromCurrent", carriedFromCounter == null ? null : carriedFromCounter.get());
+            row.put("closedAt", closedAt.get()); row.put("closeReason", closeReason.get());
+            return java.util.Collections.unmodifiableMap(row);
+        }
+    }
 
     private CuttableLink(int port, String targetHost, int targetPort, Map<String, int[]> diallerPorts) {
         this.port = port;
@@ -118,6 +168,30 @@ final class CuttableLink implements AutoCloseable {
         return unattributed.get();
     }
 
+    /** Passive, bounded receipts; the total unknown counter is never reset or truncated. */
+    Map<String, Object> attributionEvidence() {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("link", address()); out.put("targetHost", targetHost); out.put("targetPort", targetPort);
+        Map<String, List<Integer>> ranges = new java.util.TreeMap<>();
+        diallerPorts.forEach((node, range) -> ranges.put(node, List.of(range[0], range[1])));
+        out.put("configuredRanges", ranges); out.put("currentlyRefused", List.copyOf(refused));
+        out.put("carried", carried.get()); out.put("turnedAway", turnedAway.get()); out.put("unattributed", unattributed.get());
+        synchronized (receiptLock) { out.put("unknownAccepts", unknownReceipts.stream().map(UnknownAccept::evidence).toList()); }
+        out.put("lostUnknownReceipts", lostUnknownReceipts.get());
+        out.put("receiptCoverage", lostUnknownReceipts.get() == 0 ? "RETAINED" : "PARTIAL_HISTORY_UNAVAILABLE");
+        out.put("snapshotConsistency", "NON_ATOMIC_LIVE_TRANSPORT_COUNTERS");
+        return java.util.Collections.unmodifiableMap(out);
+    }
+
+    private UnknownAccept retainUnknown(Socket inbound, String dialler) {
+        if (diallerPorts.containsKey(dialler)) { return null; }
+        synchronized (receiptLock) {
+            if (unknownReceipts.size() >= MAX_UNKNOWN_RECEIPTS) { lostUnknownReceipts.incrementAndGet(); return null; }
+            UnknownAccept receipt = new UnknownAccept(inbound, dialler, refused);
+            unknownReceipts.add(receipt); return receipt;
+        }
+    }
+
     /**
      * Severs one peer: its live connections through here are closed, and its later dials are refused.
      *
@@ -131,6 +205,7 @@ final class CuttableLink implements AutoCloseable {
             if (held.dialler().equals(dialler)) {
                 closeQuietly(held.inbound());
                 closeQuietly(held.outbound());
+                if (held.receipt() != null) { held.receipt().ended("PEER_REFUSED"); }
                 live.remove(held);
             }
         }
@@ -168,6 +243,7 @@ final class CuttableLink implements AutoCloseable {
         for (Held held : live) {
             closeQuietly(held.inbound());
             closeQuietly(held.outbound());
+            if (held.receipt() != null) { held.receipt().ended("FIXTURE_CLOSE"); }
         }
         live.clear();
     }
@@ -198,20 +274,29 @@ final class CuttableLink implements AutoCloseable {
                 return;
             }
             String dialler = whoDialled(inbound.getPort());
+            UnknownAccept receipt = retainUnknown(inbound, dialler);
             if (refused.contains(dialler)) {
                 turnedAway.incrementAndGet();
                 closeQuietly(inbound);
+                if (receipt != null) { receipt.ended("REFUSED_AT_ACCEPT"); }
                 continue;
             }
             carried.incrementAndGet();
-            carriedFrom.computeIfAbsent(dialler, unknown -> new AtomicInteger()).incrementAndGet();
+            AtomicInteger fromCounter = carriedFrom.computeIfAbsent(dialler, unknown -> new AtomicInteger());
+            int fromAtAccept = fromCounter.incrementAndGet();
+            if (receipt != null) { receipt.carriedFromCounter = fromCounter; receipt.carriedFromAtAccept = fromAtAccept; }
             try {
                 Socket outbound = new Socket(targetHost, targetPort);
-                live.add(new Held(inbound, outbound, dialler));
-                pump(inbound, outbound);
-                pump(outbound, inbound);
+                if (receipt != null) {
+                    receipt.relayAddress = outbound.getLocalAddress().getHostAddress(); receipt.relayPort = outbound.getLocalPort();
+                    receipt.connected = true;
+                }
+                live.add(new Held(inbound, outbound, dialler, receipt));
+                pump(inbound, outbound, receipt, true);
+                pump(outbound, inbound, receipt, false);
             } catch (IOException unreachable) {
                 closeQuietly(inbound);
+                if (receipt != null) { receipt.ended("TARGET_CONNECT_FAILED:" + unreachable.getClass().getSimpleName()); }
             }
         }
     }
@@ -227,13 +312,16 @@ final class CuttableLink implements AutoCloseable {
         return "unattributed:" + sourcePort;
     }
 
-    private void pump(Socket from, Socket to) {
+    private void pump(Socket from, Socket to, UnknownAccept receipt, boolean fromSource) {
         Thread thread = new Thread(() -> {
             byte[] buffer = new byte[8192];
             try (InputStream in = from.getInputStream(); OutputStream out = to.getOutputStream()) {
                 int read;
                 while ((read = in.read(buffer)) >= 0) {
-                    out.write(buffer, 0, read);
+                    if (receipt != null) { (fromSource ? receipt.sourceBytesRead : receipt.targetBytesRead).addAndGet(read); }
+                    try { out.write(buffer, 0, read); }
+                    catch (IOException failed) { if (receipt != null) { receipt.partialWriteUnavailable = true; } throw failed; }
+                    if (receipt != null) { (fromSource ? receipt.sourceBytesForwarded : receipt.targetBytesForwarded).addAndGet(read); }
                     out.flush();
                 }
             } catch (IOException ended) {
@@ -241,6 +329,7 @@ final class CuttableLink implements AutoCloseable {
             } finally {
                 closeQuietly(from);
                 closeQuietly(to);
+                if (receipt != null) { receipt.ended(fromSource ? "SOURCE_PUMP_CLOSED" : "TARGET_PUMP_CLOSED"); }
             }
         }, "cuttable-link-pump-" + port);
         thread.setDaemon(true);

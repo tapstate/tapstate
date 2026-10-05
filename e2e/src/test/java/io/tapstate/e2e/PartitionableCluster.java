@@ -1,5 +1,10 @@
 package io.tapstate.e2e;
 
+import io.tapstate.core.common.JsonWriter;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.time.Instant;
+
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -59,6 +64,8 @@ final class PartitionableCluster implements AutoCloseable {
     private final Map<String, CuttableLink> links;
     private final Map<String, ControlPlane> planes;
     private final String clusterId;
+    private String lastCutStartedAt, lastCutCompletedAt;
+    private List<String> lastCutSide = List.of();
 
     private final String storeUri;
     private final Map<String, IntFunction<List<String>>> launchArguments;
@@ -181,12 +188,15 @@ final class PartitionableCluster implements AutoCloseable {
             throw new AssertionError("a partition needs members on both sides; asked to separate "
                     + oneSide + " out of " + nodeIds);
         }
+        lastCutStartedAt = Instant.now().toString(); lastCutSide = List.copyOf(side);
         for (String here : side) {
             for (String there : rest) {
                 linkTo(there).refuse(here);
                 linkTo(here).refuse(there);
             }
         }
+        lastCutCompletedAt = Instant.now().toString();
+        retainAttribution();
     }
 
     /** Puts every severed pair back, for the half of a case that asks what happens once it heals. */
@@ -203,7 +213,27 @@ final class PartitionableCluster implements AutoCloseable {
      * severed by a cut aimed at its dialler, so the members might be talking through one.
      */
     int unattributedConnections() {
-        return links.values().stream().mapToInt(CuttableLink::unattributed).sum();
+        int total = links.values().stream().mapToInt(CuttableLink::unattributed).sum();
+        if (total != 0) { retainAttribution(); }
+        return total;
+    }
+
+    /** Persists only owned socket metadata; attribution failure still fails the original zero guard. */
+    private void retainAttribution() {
+        Map<String, Object> receipt = new LinkedHashMap<>();
+        receipt.put("clusterId", clusterId); receipt.put("capturedAt", Instant.now().toString());
+        receipt.put("lastCutStartedAt", lastCutStartedAt); receipt.put("lastCutCompletedAt", lastCutCompletedAt);
+        receipt.put("lastCutSide", lastCutSide); receipt.put("nodes", nodeIds);
+        Map<String, Object> capturedLinks = new LinkedHashMap<>();
+        links.forEach((node, link) -> capturedLinks.put(node, link.attributionEvidence()));
+        receipt.put("links", capturedLinks);
+        receipt.put("snapshotConsistency", "NON_ATOMIC_LIVE_TRANSPORT_COUNTERS");
+        Path file = Path.of("target", "failure-scenes", "members", clusterId, "partition-attribution.json");
+        try {
+            Files.createDirectories(file.getParent()); Files.writeString(file, JsonWriter.write(receipt));
+        } catch (IOException | RuntimeException unavailable) {
+            System.err.println("could not keep owned partition attribution on " + clusterId + ": " + unavailable.getClass().getSimpleName());
+        }
     }
 
     /**
@@ -259,6 +289,7 @@ final class PartitionableCluster implements AutoCloseable {
 
     @Override
     public void close() {
+        retainAttribution();
         List<RuntimeException> failures = new ArrayList<>();
         for (RealProcessServer server : servers.values()) {
             try {
@@ -268,6 +299,7 @@ final class PartitionableCluster implements AutoCloseable {
             }
         }
         links.values().forEach(CuttableLink::close);
+        retainAttribution();
         // After the processes are down, so what a member said on its way out is in what is kept.
         FailureScene.writeMemberLogs(clusterId, logs);
         if (!failures.isEmpty()) {
