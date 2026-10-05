@@ -140,8 +140,28 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
         pump = new Thread(this::loop, "rebuild-handoff-jdi-events"); pump.setDaemon(true);
     }
 
+    @FunctionalInterface
+    interface OwnedLauncher {
+        RealProcessServer launch(Path artifact, List<String> debugArguments) throws Exception;
+    }
+
     static RebuildHandoffJdiSession start(String storeUri, String operatorDatabase, Path selectedJar,
             String pipelineId, String table, Cut cut, Path logDirectory, String processLabel) throws Exception {
+        return startObserved(selectedJar, pipelineId, table, cut, logDirectory, processLabel, false,
+                (artifact, debug) -> RealProcessServer.launchingWithJvmArguments(storeUri, operatorDatabase,
+                        artifact, debug, List.of("--tapstate.metrics.history.sample-interval=PT2S")));
+    }
+
+    /** A claimed crash uses the same bounded event pump for its cut, genuine Job lookup and raw frame. */
+    static RebuildHandoffJdiSession startClaimed(Path selectedJar, String pipelineId, String table,
+            Path logDirectory, String processLabel, OwnedLauncher launcher) throws Exception {
+        return startObserved(selectedJar, pipelineId, table, Cut.PRE_ADMISSION, logDirectory,
+                processLabel, true, Objects.requireNonNull(launcher, "launcher"));
+    }
+
+    private static RebuildHandoffJdiSession startObserved(Path selectedJar, String pipelineId, String table,
+            Cut cut, Path logDirectory, String processLabel, boolean rawAlongsideCut,
+            OwnedLauncher launcher) throws Exception {
         Objects.requireNonNull(pipelineId); Objects.requireNonNull(table);
         Objects.requireNonNull(logDirectory); Objects.requireNonNull(processLabel);
         if (!logDirectory.isAbsolute() || !processLabel.matches("[a-z]{1,16}")) { throw invalid("owned log destination unavailable"); }
@@ -155,10 +175,19 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
         Site selectedCut = cut == null ? null : CUTS.get(cut);
         Map<Site, Image> images;
         if (cut == Cut.PRE_ADMISSION) {
-            Map<Site, Image> available = images(jar, Set.of(selectedCut, MEMBER_ADMISSION, JOB_LOOKUP),
-                    Set.of(MEMBER_ADMISSION));
+            Set<Site> requested = rawAlongsideCut
+                    ? Set.of(selectedCut, MEMBER_ADMISSION, JOB_LOOKUP, RAW)
+                    : Set.of(selectedCut, MEMBER_ADMISSION, JOB_LOOKUP);
+            Map<Site, Image> available = images(jar, requested, Set.of(MEMBER_ADMISSION));
             if (available.containsKey(MEMBER_ADMISSION)) { selectedCut = MEMBER_ADMISSION; }
-            images = Map.of(selectedCut, available.get(selectedCut), JOB_LOOKUP, available.get(JOB_LOOKUP));
+            if (rawAlongsideCut && !selectedCut.equals(MEMBER_ADMISSION)) {
+                throw invalid("the claimed crash has no factual-member admission binding");
+            }
+            Map<Site, Image> pinned = new HashMap<>();
+            pinned.put(selectedCut, available.get(selectedCut));
+            pinned.put(JOB_LOOKUP, available.get(JOB_LOOKUP));
+            if (rawAlongsideCut) { pinned.put(RAW, available.get(RAW)); }
+            images = Map.copyOf(pinned);
         } else {
             images = images(jar, selected, Set.of());
         }
@@ -176,9 +205,8 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
         try {
             String address = BenchmarkJdiCostObserver.numericLoopbackDialAddress(
                     arguments.get("localAddress").value(), reported, arguments.get("port").value());
-            server = RealProcessServer.launchingWithJvmArguments(storeUri, operatorDatabase, jar,
-                    List.of("-agentlib:jdwp=transport=dt_socket,server=n,suspend=y,address=" + address),
-                    List.of("--tapstate.metrics.history.sample-interval=PT2S"));
+            server = launcher.launch(jar,
+                    List.of("-agentlib:jdwp=transport=dt_socket,server=n,suspend=y,address=" + address));
             vm = connector.accept(arguments);
             if (!vm.canGetBytecodes()) { throw invalid("live Code unavailable"); }
             if (cut != null && !vm.canGetMethodReturnValues()) { throw invalid("genuine native Job return values unavailable"); }
