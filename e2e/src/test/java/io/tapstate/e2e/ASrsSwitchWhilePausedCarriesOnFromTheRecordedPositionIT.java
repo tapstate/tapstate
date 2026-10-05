@@ -3,8 +3,16 @@ package io.tapstate.e2e;
 import com.mongodb.ConnectionString;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoDatabase;
+import io.tapstate.adapters.mongostore.MongoDesiredStore;
+import io.tapstate.adapters.mongostore.MongoObservationStore;
+import io.tapstate.adapters.mongostore.MongoStateStore;
+import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.StateJson;
+import io.tapstate.runtime.srs.CaptureError;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.testsupport.DockerGate;
 
 import org.bson.Document;
@@ -18,33 +26,25 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
+import static org.assertj.core.api.Assertions.assertThat;
+
 /**
- * Turning the shared replay store off while a pipeline is held does not lose the window it was held for.
+ * A held shared source cannot reinterpret its retained recovery state as an independent direct channel.
  *
- * <p>The switch decides whether changes are staged for replay. It does not decide where a run begins --
- * but the two used to be the same thing, because the position a run resumed from lived on the shared
- * chain and a pipeline reading its source directly wrote nothing there. Flipping the switch mid-life is
- * the shape that puts weight on them being separate: the run that stops was buffering and recorded its
- * position on the chain, and the run that follows does not buffer and has to find that position anyway.
+ * <p>The two modes keep different recovery coordinates. A shared capture checkpoint can advance while
+ * this consumer is paused, so it cannot stand in for that consumer's confirmed direct-source boundary.
+ * Transparent migration with retained state is unsupported: the edited resume must report the precise
+ * coded refusal, preserve the user's RUNNING intent and keep the original source-qualified recovery
+ * document. It must neither clear the record nor silently open an independent channel from it.
  *
- * <p><strong>The changes made during the hold are a delete and an insert, and the delete is the one that
- * discriminates.</strong> An insert arriving proves the target moved; it does not prove how. Two things
- * could carry it: carrying on from the recorded position, and loading the collection again from the
- * start -- and the second gets the right answer for the wrong reason. A delete separates them outright.
- * A full load cannot express one (the document is simply absent from what it reads, and the row already
- * in the target stays), and a tail begun at the present moment never sees one made before it started.
- * A document that goes away is therefore something only a run that resumed where the last one stopped
- * can have done.
+ * <p>The real shared snapshot, a delivered CDC update, PAUSE and a paused-period delete and insert all
+ * execute before the switch. After refusal, the complete target documents must equal their paused
+ * baseline: the deleted source row remains at the held target and the new source row is absent there.
+ * Both source changes are verified directly, so a no-op fixture cannot satisfy that result.
  *
- * <p><strong>Why this does not count the resumed run's load instead, stated because it was measured.</strong>
- * The obvious reading -- "the resuming run read zero rows" -- is not available after a hold. Measured on
- * the sibling case that holds a direct tail: after a resume that face answers the seeded count, and the
- * figure has two readings, a run that really did read the collection again and the previous run's own
- * count still being published because a resume did not begin a new one. Nothing separates those, so
- * nothing here rests on that number. The delete does the same work and is unambiguous.
- *
- * <p>Mongo on both ends. The artifact is re-applied while the pipeline is held, changing one word in it,
- * so what the resume picks up is a pipeline that no longer buffers.
+ * <p>A clearing stop leaves the target intact. A new full snapshot therefore cannot express the held
+ * delete without a separate target reload policy, and this case makes no reset-as-migration promise.
+ * Mongo is on both ends; only the source reference's buffering flag changes in the reapplied workspace.
  *
  * <p>Gated on Docker and on a directory of real connector jars
  * ({@code -Dtapstate.e2e.connectors-dir}); the real-process tier additionally needs the app module
@@ -78,7 +78,7 @@ class ASrsSwitchWhilePausedCarriesOnFromTheRecordedPositionIT {
 
     @ParameterizedTest
     @EnumSource(Tiers.class)
-    void turningTheBufferOffWhileHeldStillCarriesTheWindowItWasHeldFor(Tiers tier) {
+    void aRetainedSharedSourceCannotBeTransparentlyResumedAsAnIndependentDirectChannel(Tiers tier) {
         String suffix = "srs_switch_paused_" + tier.name().toLowerCase(Locale.ROOT);
         String database = suffix + "_src";
         String sourceUri = SharedMongo.replicaSetUrl(database);
@@ -88,8 +88,17 @@ class ASrsSwitchWhilePausedCarriesOnFromTheRecordedPositionIT {
 
         try (MongoClient source = MongoClients.create(new ConnectionString(sourceUri));
                 MongoEndpoints mongo = new MongoEndpoints();
-                ServerHandle server = tier.launch(storeUri)) {
+                ServerHandle server = tier.launch(storeUri);
+                MongoClient stored = MongoClients.create(new ConnectionString(storeUri))) {
 
+            String stateName = new ConnectionString(storeUri).getDatabase();
+            assertThat(stateName).isNotBlank();
+            MongoDatabase state = stored.getDatabase(stateName);
+            MongoDesiredStore desired = new MongoDesiredStore(state.getCollection(MongoStorePort.PIPELINE_DESIRED));
+            MongoStateStore actual = new MongoStateStore(state.getCollection(MongoStorePort.PIPELINE_STATE));
+            MongoObservationStore latest = new MongoObservationStore(stored,
+                    state.getCollection(MongoStorePort.PIPELINE_OBSERVATION),
+                    state.getCollection(MongoStorePort.PIPELINE_OBSERVATION_CHUNKS));
             seed(source, database);
             ControlPlane control = start(server, suffix, sourceUri, targetUri);
 
@@ -99,26 +108,86 @@ class ASrsSwitchWhilePausedCarriesOnFromTheRecordedPositionIT {
             rename(source, database, CHANGED_BEFORE, BEFORE_PAUSE);
             awaitName(mongo, target, CHANGED_BEFORE, BEFORE_PAUSE, "the change the buffered tail captured");
 
+            String sharedChain = sourceChain(control, suffix);
+            Await.until("the source-qualified consumer to confirm its snapshot and CDC update", TIMEOUT,
+                    () -> settledRecovery(consumer(state, sharedChain, suffix)),
+                    () -> String.valueOf(consumer(state, sharedChain, suffix)));
             control.lifecycle(suffix, LifecycleVerb.PAUSE);
             awaitState(control, suffix, PipelineState.PAUSED);
+            var paused = latest.readStored(suffix).orElseThrow();
+            assertThat(paused.observation().pipelineId()).isEqualTo(suffix);
+            assertThat(paused.observation().state()).isEqualTo(PipelineState.PAUSED);
+            assertThat(paused.observation().failure()).isNull();
+            assertThat(paused.observation().observedAt()).isNotNull();
+            var scope = paused.scope().orElseThrow();
+            var pausedActual = actual.read(suffix).orElseThrow();
+            assertThat(StateJson.parse(pausedActual.stateJson())).isEqualTo(PipelineState.PAUSED);
+            Document savedRecovery = consumer(state, sharedChain, suffix);
+            assertThat(savedRecovery).isNotNull();
+            assertThat(settledRecovery(savedRecovery)).isTrue();
+            List<Document> pausedTarget = mongo.documents(target, COLLECTION);
+            assertThat(pausedTarget).hasSize((int) SEEDED_ROWS);
+            assertThat(namesOf(mongo, target, DELETED_WHILE_PAUSED)).containsExactly("order-" + DELETED_WHILE_PAUSED);
 
-            // Nothing is reading the source now. Both changes land in the source's own log and nowhere
-            // else -- the ring is not being written either, because the run that fed it has stopped.
+            // The logical consumer is held. Physical shared capture may still log both source changes;
+            // its checkpoint is not this paused consumer's direct-channel recovery boundary.
             delete(source, database, DELETED_WHILE_PAUSED);
             insert(source, database, ADDED_WHILE_PAUSED, ADDED_NAME);
 
-            // The one word this case turns. Applied while the pipeline is held, so the resume that
-            // follows starts a pipeline that no longer buffers, against a position written by one that did.
+            assertThat(source.getDatabase(database).getCollection(COLLECTION)
+                    .find(new Document("_id", DELETED_WHILE_PAUSED)).first()).isNull();
+            assertThat(source.getDatabase(database).getCollection(COLLECTION)
+                    .find(new Document("_id", ADDED_WHILE_PAUSED)).first())
+                    .isNotNull().satisfies(row -> assertThat(row.get("name")).isEqualTo(ADDED_NAME));
+
+            // Changing this one word selects an independent recovery record; it does not authorize
+            // interpreting the held shared consumer's progress as that record.
             // The whole workspace goes back, not just the pipeline: an apply replaces what is there rather
             // than patching it, so sending the pipeline alone leaves its source and target referring to
             // nothing and is refused outright.
             control.apply(workspace(suffix, sourceUri, targetUri, false));
 
+            String directChain = sourceChain(control, suffix);
+            assertThat(directChain).isNotEqualTo(sharedChain);
+            assertThat(state.getCollection(MongoStorePort.SRS_META)
+                    .find(new Document("_id", directChain)).first()).isNull();
+            assertThat(consumer(state, directChain, suffix)).isNull();
             control.lifecycle(suffix, LifecycleVerb.RESUME);
-            awaitState(control, suffix, PipelineState.RUNNING);
+            var resumedIntent = desired.read(suffix).orElseThrow();
+            assertThat(resumedIntent.pipelineId()).isEqualTo(suffix);
+            assertThat(resumedIntent.targetState()).isEqualTo(PipelineState.RUNNING);
+            assertThat(resumedIntent.purgeState()).isFalse();
 
-            awaitPresent(mongo, target, ADDED_WHILE_PAUSED, ADDED_NAME);
-            awaitGone(mongo, target, DELETED_WHILE_PAUSED);
+            var refused = Await.answered("the current scoped FAILED observation for the refused mode switch", TIMEOUT,
+                    () -> latest.readStored(suffix).filter(value -> value.scope().filter(scope::equals).isPresent()
+                            && value.observation().state() == PipelineState.FAILED
+                            && value.observation().failure() != null
+                            && value.observation().observedAt() != null
+                            && value.observation().observedAt().isAfter(paused.observation().observedAt())
+                            && actual.read(suffix).map(checkpoint -> StateJson.parse(checkpoint.stateJson()))
+                                    .filter(PipelineState.FAILED::equals).isPresent()
+                            && control.state(suffix).filter(PipelineState.FAILED::equals).isPresent()));
+            assertThat(refused.observation().failure().code())
+                    .isEqualTo(CaptureError.RECOVERY_PROGRESS_UNPROVEN.code());
+            assertThat(refused.observation().failure().params()).containsEntry("pipeline", suffix)
+                    .containsEntry("source", SOURCE_ID);
+            assertThat(control.failureCode(suffix)).contains(CaptureError.RECOVERY_PROGRESS_UNPROVEN.code());
+            assertThat(actual.read(suffix).orElseThrow().epoch()).isGreaterThan(pausedActual.epoch());
+            assertThat(desired.read(suffix)).contains(resumedIntent);
+            assertThat(consumer(state, sharedChain, suffix))
+                    .as("the refusal preserves the exact source-qualified consumer recovery document")
+                    .isEqualTo(savedRecovery);
+            assertThat(state.getCollection(MongoStorePort.SRS_META)
+                    .find(new Document("_id", sharedChain)).first()).isNotNull();
+            assertThat(state.getCollection(MongoStorePort.SRS_META)
+                    .find(new Document("_id", directChain)).first()).isNull();
+            assertThat(consumer(state, directChain, suffix)).isNull();
+            assertThat(mongo.documents(target, COLLECTION))
+                    .as("a refused switch must not resnapshot, replay or clear the held target")
+                    .containsExactlyInAnyOrderElementsOf(pausedTarget);
+            assertThat(namesOf(mongo, target, DELETED_WHILE_PAUSED)).containsExactly("order-" + DELETED_WHILE_PAUSED);
+            assertThat(namesOf(mongo, target, ADDED_WHILE_PAUSED)).isEmpty();
+            assertThat(namesOf(mongo, target, CHANGED_BEFORE)).containsExactly(BEFORE_PAUSE);
         }
     }
 
@@ -236,25 +305,46 @@ class ASrsSwitchWhilePausedCarriesOnFromTheRecordedPositionIT {
                 () -> namesOf(mongo, target, id).toString());
     }
 
-    private static void awaitPresent(
-            MongoEndpoints mongo, EndpointAddress target, int id, String expected) {
-        Await.until(
-                "the document inserted while the pipeline was held to reach the target after the switch "
-                        + "was turned off -- the half that says the target moved at all",
-                TIMEOUT,
-                () -> namesOf(mongo, target, id).contains(expected),
-                () -> "the target held " + namesOf(mongo, target, id));
+    /** Freezes the actual source/table chain named by the pipeline's ordinary position response. */
+    private static String sourceChain(ControlPlane control, String pipelineId) {
+        var positions = control.positionRead(pipelineId);
+        assertThat(positions.pipelineId()).isEqualTo(pipelineId);
+        var selected = positions.chains().stream().filter(chain -> SOURCE_ID.equals(chain.sourceId())
+                && chain.tables().contains(COLLECTION)).toList();
+        assertThat(selected).hasSize(1);
+        assertThat(selected.getFirst().tables()).containsExactly(COLLECTION);
+        return selected.getFirst().chainId();
     }
 
-    private static void awaitGone(MongoEndpoints mongo, EndpointAddress target, int id) {
-        Await.until(
-                "the document deleted while the pipeline was held to be gone from the target -- a load of "
-                        + "the whole collection cannot express a delete, and a tail begun at the present "
-                        + "moment never saw one made before it started, so only a run that carried on from "
-                        + "the recorded position can have done this",
-                TIMEOUT,
-                () -> namesOf(mongo, target, id).isEmpty(),
-                () -> "still holding " + namesOf(mongo, target, id));
+    /** One exact composite key; a different pipeline or source cannot provide this recovery state. */
+    private static Document consumer(MongoDatabase state, String chainId, String pipelineId) {
+        String consumerId = SrsConsumerId.of(pipelineId, SOURCE_ID).value();
+        Document record = state.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS)
+                .find(new Document("_id", new Document("chain", chainId).append("pipeline", consumerId))).first();
+        if (record != null) {
+            assertThat(record.getString("miningChainId")).isEqualTo(chainId);
+            assertThat(record.getString("pipelineId")).isEqualTo(consumerId);
+            assertThat(record.getString("ownerPipelineId")).isEqualTo(pipelineId);
+            assertThat(record.getString("sourceNodeId")).isEqualTo(SOURCE_ID);
+        }
+        return record;
+    }
+
+    /** Waits for actual completion and a settled table cursor; absent progress never means zero. */
+    private static boolean settledRecovery(Document record) {
+        if (record == null || !(record.get("snapshotCompletedTables") instanceof List<?> completed)
+                || !completed.contains(COLLECTION)
+                || !(record.get("cdcStartPosition") instanceof String seam) || seam.isBlank()
+                || !(record.get("snapshotEpoch") instanceof Number epoch) || epoch.longValue() < 1
+                || !(record.get("perTableSeq") instanceof Document read)
+                || !(read.get(COLLECTION) instanceof Number readSequence) || readSequence.longValue() < 0
+                || !(record.get("sinkAckedByTable") instanceof Document confirmed)
+                || !(confirmed.get(COLLECTION) instanceof Document table)
+                || !(table.get("sinkAckedEpoch") instanceof Number ackEpoch) || ackEpoch.longValue() < 1
+                || !(table.get("sinkAckedSeq") instanceof Number ackSequence)) {
+            return false;
+        }
+        return ackSequence.longValue() == readSequence.longValue();
     }
 
     private static List<String> namesOf(MongoEndpoints mongo, EndpointAddress target, int id) {
