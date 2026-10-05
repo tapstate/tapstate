@@ -50,6 +50,9 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
     /** The note the MySQL connector mints on a first run and looks for on every later one. */
     private static final String SERVER_NAME = "SERVER_NAME";
 
+    /** Where a shared capture's connector notes are kept, before the chain the capture reads. */
+    private static final String CHAIN_NAMESPACE_PREFIX = "pdk.chain.";
+
     /** The database connector and operator state share, and the collection that holds it. */
     private static final String STATE_DATABASE = "tapstate_nest";
     private static final String STATE_COLLECTION = "operator_state";
@@ -69,7 +72,6 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
     void theRunThatComesBackIsTheOneThatMintedTheIdentityNotANewOne(Tiers tier) throws Exception {
         String suffix = tier.name().toLowerCase(java.util.Locale.ROOT);
         String pipelineId = PIPELINE_ID + "_" + suffix;
-        String namespace = "pdk.state." + pipelineId + "." + SOURCE_ID;
         Map<String, Object> mysql = SharedMySql.settings(DATABASE + "_" + suffix);
         seedOneRow(mysql);
 
@@ -78,8 +80,10 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
         byte[] minted;
+        String namespace;
         try (MongoEndpoints mongo = new MongoEndpoints()) {
-            try (ServerHandle first = tier.launch(storeUri)) {
+            try (ServerHandle first = tier.launch(storeUri);
+                    StoreDocuments documents = StoreDocuments.at(storeUri)) {
                 ControlPlane control = new ControlPlane(first.baseUrl());
                 control.bootstrapAndLogin("e2e", "e2e-password");
                 control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
@@ -99,10 +103,16 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
                 update(mysql, BEFORE_THE_RESTART);
                 awaitCustomer(mongo, target, BEFORE_THE_RESTART, "a change made before the restart");
 
+                // A pipeline reading through the shared change log keeps its connector's notes under the
+                // physical capture it reads rather than under its own node, and this store holds that one
+                // capture's chain.
+                assertThat(documents.miningChainIds()).as("one chain in this tier's store").hasSize(1);
+                String notes = CHAIN_NAMESPACE_PREFIX + documents.miningChainIds().iterator().next();
+                namespace = notes;
                 Await.until("the connector to have filed the identity it minted",
-                        () -> note(storeUri, namespace, SERVER_NAME).isPresent(),
-                        () -> "nothing under " + namespace);
-                minted = note(storeUri, namespace, SERVER_NAME).orElseThrow();
+                        () -> note(storeUri, notes, SERVER_NAME).isPresent(),
+                        () -> "nothing under " + notes);
+                minted = note(storeUri, notes, SERVER_NAME).orElseThrow();
             }
 
             // The server is gone; on the real-process tier its whole JVM is gone. The store it wrote, the

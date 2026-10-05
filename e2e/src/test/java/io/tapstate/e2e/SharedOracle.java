@@ -19,6 +19,19 @@ final class SharedOracle {
     private static final Duration STARTUP_BUDGET = Duration.ofMinutes(5);
     private static OracleContainer container;
 
+    // DriverManager hands a caller only a driver registered from a class loader that caller can see, and it
+    // discovers drivers once, on its first use, through the context class loader of whichever thread uses it
+    // first. In a JVM that has already run a server, that thread can be a connector's, whose own loader cannot
+    // see this classpath, and the container does not load the driver either: it waits on its log, not on a
+    // connection. So the driver is registered from here, where every caller of this fixture can see it.
+    static {
+        try {
+            DriverManager.registerDriver(new oracle.jdbc.OracleDriver());
+        } catch (SQLException error) {
+            throw new ExceptionInInitializerError(error);
+        }
+    }
+
     private SharedOracle() {
     }
 
