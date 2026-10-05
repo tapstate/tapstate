@@ -1,6 +1,8 @@
 package io.tapstate.app;
 
 import ch.qos.logback.classic.Logger;
+import io.tapstate.core.lifecycle.CasOutcome;
+import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
@@ -20,6 +22,7 @@ import io.tapstate.runtime.engine.StoredCountSampler;
 import io.tapstate.spi.metrics.MetricsExport;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.PipelineEventStore;
+import io.tapstate.spi.store.StateStore;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
@@ -32,6 +35,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -125,6 +130,142 @@ class ConvergenceDriverTest {
     }
 
     @Test
+    void defaultFourWorkersFairlyRetryARefusedPipelineDespiteRecurringQueuedCompetition() throws Exception {
+        assertThat(LifecycleWorkDispatcher.DEFAULT_MAX_CONCURRENCY).isEqualTo(4);
+        for (int index = 0; index < 6; index++) {
+            String id = "fair-" + index;
+            desired.save(new DesiredState(id, RUNNING, "rev-1"));
+        }
+        List<String> order = desired.pipelineIds();
+        assertThat(order).hasSize(6);
+        Set<String> holders = Set.copyOf(order.subList(0, 4));
+        String competitor = order.get(4);
+        String victim = order.get(5);
+        CountDownLatch holdersEntered = new CountDownLatch(4);
+        CountDownLatch releaseHolders = new CountDownLatch(1);
+        CountDownLatch victimSubmitted = new CountDownLatch(1);
+        Set<String> preparing = ConcurrentHashMap.newKeySet();
+        Set<String> carrying = ConcurrentHashMap.newKeySet();
+        Map<String, AtomicInteger> calls = new ConcurrentHashMap<>();
+        AtomicInteger peakPreparing = new AtomicInteger();
+        // The fixture store uses a plain map. Serialize only its operations, never the blocked callbacks.
+        StateStore checkpoints = new StateStore() {
+            @Override public synchronized Optional<CheckpointDoc> read(String id) { return state.read(id); }
+            @Override public synchronized void create(String id, String json, Instant at) { state.create(id, json, at); }
+            @Override public synchronized void delete(String id) { state.delete(id); }
+            @Override public synchronized CasOutcome compareAndSwap(String id, long epoch, String json, Instant at) {
+                return state.compareAndSwap(id, epoch, json, at);
+            }
+        };
+        LifecycleActuator blocked = new LifecycleActuator() {
+            @Override public PreparedStart prepareStart(String id) {
+                calls.computeIfAbsent(id, ignored -> new AtomicInteger()).incrementAndGet();
+                if (!preparing.add(id)) { throw new AssertionError("one pipeline entered overlapping start callbacks"); }
+                peakPreparing.accumulateAndGet(preparing.size(), Math::max);
+                if (holders.contains(id)) {
+                    holdersEntered.countDown();
+                    try {
+                        if (!releaseHolders.await(5, TimeUnit.SECONDS)) {
+                            throw new AssertionError("the four active starts were not released");
+                        }
+                    } catch (InterruptedException interrupted) {
+                        preparing.remove(id);
+                        Thread.currentThread().interrupt();
+                        throw new StartDeferred(StartDeferred.Reason.DEPENDENCY);
+                    }
+                }
+                return new PreparedStart() {
+                    @Override public void submit() {
+                        carrying.add(id);
+                        if (id.equals(victim)) { victimSubmitted.countDown(); }
+                    }
+                    @Override public void close() { preparing.remove(id); }
+                };
+            }
+            @Override public void start(String id) { throw new AssertionError("a start was not prepared"); }
+            @Override public void pause(String id) { }
+            @Override public void resume(String id) { }
+            @Override public void stop(String id, boolean purge) { }
+            @Override public Optional<Throwable> failure(String id) { return Optional.empty(); }
+            @Override public Optional<Throwable> lost(String id) { return Optional.empty(); }
+            @Override public boolean isCarryingAJob(String id) { return carrying.contains(id); }
+        };
+        PipelineConverger loop = new PipelineConverger(desired, checkpoints, blocked, Clock.fixed(T0, ZoneOffset.UTC));
+        LifecyclePendingRegistry pending = new LifecyclePendingRegistry();
+        try (LifecycleWorkDispatcher work = new LifecycleWorkDispatcher(
+                LifecycleWorkDispatcher.DEFAULT_MAX_CONCURRENCY, 1)) {
+            ConvergenceDriver isolated = new ConvergenceDriver(loop, desired,
+                    new ObservationPublisher(checkpoints, observations), null, MetricsExport.none(),
+                    () -> true, PipelineActuationOwnership.single(), work, null, null, pending);
+            try {
+                isolated.reconcile();
+                assertThat(holdersEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(work.health().activeSlots()).isEqualTo(4);
+                assertThat(work.health().queueDepth()).isEqualTo(1);
+                assertThat(work.activeCount()).isEqualTo(5);
+                assertThat(preparing).containsExactlyInAnyOrderElementsOf(holders);
+                assertThat(work.current(competitor, desired.read(competitor).orElseThrow())).isTrue();
+                assertThat(pending.pending(victim).orElseThrow().reason()).isEqualTo(PendingReason.START_CAPACITY);
+
+                // No slot is released on this pass: all existing offers must coalesce without another callback.
+                isolated.reconcile();
+                assertThat(work.health().coalesced()).isGreaterThanOrEqualTo(5L);
+                holders.forEach(id -> assertThat(calls.get(id)).hasValue(1));
+                assertThat(calls).doesNotContainKeys(competitor, victim);
+                assertThat(work.health().activeSlots()).isEqualTo(4);
+                assertThat(work.health().queueDepth()).isEqualTo(1);
+                assertThat(releaseHolders.getCount()).isEqualTo(1L);
+
+                boolean admitted = false;
+                for (int pass = 0; pass < order.size() && !admitted; pass++) {
+                    // Replace only this real queued work. The four running callbacks never leave their slots.
+                    work.cancel(competitor);
+                    LifecycleWorkDispatcher.Outcome cancelled = work.take(competitor);
+                    assertThat(cancelled).isNotNull();
+                    assertThat(cancelled.superseded()).isTrue();
+                    assertThat(work.health().activeSlots()).isEqualTo(4);
+                    assertThat(work.health().queueDepth()).isZero();
+                    assertThat(work.activeCount()).isEqualTo(4);
+                    isolated.reconcile();
+                    assertThat(work.health().activeSlots()).isEqualTo(4);
+                    assertThat(work.health().queueDepth()).isLessThanOrEqualTo(1);
+                    assertThat(work.activeCount()).isEqualTo(5);
+                    holders.forEach(id -> assertThat(calls.get(id)).hasValue(1));
+                    holders.forEach(id -> assertThat(checkpoints.read(id)
+                            .map(doc -> StateJson.parse(doc.stateJson()))).contains(NEW));
+                    assertThat(checkpoints.read(competitor)).isEmpty();
+                    assertThat(checkpoints.read(victim)).isEmpty();
+                    order.forEach(id -> observations.read(id).ifPresent(observation ->
+                            assertThat(observation.state())
+                                    .as("preparation and capacity do not invent a running or failed observation")
+                                    .isEqualTo(NEW)));
+                    assertThat(observations.read(competitor)).isEmpty();
+                    assertThat(observations.read(victim)).isEmpty();
+                    admitted = work.current(victim, desired.read(victim).orElseThrow());
+                    assertThat(pending.pending(victim).orElseThrow().reason())
+                            .isEqualTo(admitted ? PendingReason.START_PENDING : PendingReason.START_CAPACITY);
+                }
+                assertThat(admitted)
+                        .as("a capacity-refused pipeline gets the only free slot within one complete scan turn")
+                        .isTrue();
+                assertThat(calls).doesNotContainKeys(competitor, victim);
+                assertThat(releaseHolders.getCount()).isEqualTo(1L);
+                assertThat(peakPreparing).hasValue(4);
+
+                releaseHolders.countDown();
+                awaitStateAndObservation(isolated, victim, RUNNING, checkpoints);
+                assertThat(victimSubmitted.getCount()).isZero();
+                assertThat(checkpoints.read(victim).orElseThrow().stateJson()).isEqualTo(StateJson.of(RUNNING));
+                assertThat(observations.read(victim).orElseThrow().state()).isEqualTo(RUNNING);
+                assertThat(calls.get(victim)).hasValue(1);
+                assertThat(peakPreparing.get()).isLessThanOrEqualTo(4);
+            } finally {
+                releaseHolders.countDown();
+            }
+        }
+    }
+
+    @Test
     void aStopTeardownWaitingForItsFullBudgetLeavesAnotherPipelineConverging() throws Exception {
         CountDownLatch slowStopEntered = new CountDownLatch(1);
         CountDownLatch releaseSlowStop = new CountDownLatch(1);
@@ -198,10 +339,15 @@ class ConvergenceDriverTest {
 
     private void awaitStateAndObservation(ConvergenceDriver driver, String pipelineId,
             io.tapstate.core.lifecycle.PipelineState expected) throws InterruptedException {
+        awaitStateAndObservation(driver, pipelineId, expected, state);
+    }
+
+    private void awaitStateAndObservation(ConvergenceDriver driver, String pipelineId,
+            io.tapstate.core.lifecycle.PipelineState expected, StateStore checkpoints) throws InterruptedException {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         while (System.nanoTime() - deadline < 0) {
             driver.reconcile();
-            if (state.read(pipelineId).map(checkpoint -> StateJson.parse(checkpoint.stateJson()))
+            if (checkpoints.read(pipelineId).map(checkpoint -> StateJson.parse(checkpoint.stateJson()))
                     .filter(expected::equals).isPresent()
                     && observations.read(pipelineId).map(Observation::state)
                             .filter(expected::equals).isPresent()) {
