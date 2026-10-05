@@ -497,7 +497,7 @@ public final class CaptureRunUnit {
         private volatile boolean closed;
         private List<String> serving = List.of();
         /** The stream running now; read without the lock, so an acknowledgement never waits on a widening. */
-        private volatile Subscription subscription;
+        private final AtomicReference<Subscription> subscription = new AtomicReference<>();
         private final String firstSeam;
         private long nextTrim;
         /** Tells the source how far it may release, through whichever stream is running when it is told. */
@@ -521,7 +521,7 @@ public final class CaptureRunUnit {
             this.acknowledgements = SourceAcknowledgements.follow(meta, chain, new Subscription() {
                 @Override
                 public void acknowledge(SourcePosition durable) {
-                    Subscription current = subscription;
+                    Subscription current = subscription.get();
                     if (current != null) {
                         current.acknowledge(durable);
                     }
@@ -564,7 +564,7 @@ public final class CaptureRunUnit {
                     .orElseGet(() -> tailStart(meta, chain, spec.consumerId(), firstSeam, CaptureStart.present()));
             refuseAnInstantThisBufferWillNeverReach(spec.startFrom(), start, spec.retention());
             serving = tables;
-            subscription = CdcPhase.runDurable(port, config, start, routes, health, batchOrder);
+            subscription.set(CdcPhase.runDurable(port, config, start, routes, health, batchOrder));
         }
 
         private void trim(String table, String ring, Collection<ConsumerOffset> consumers,
@@ -611,8 +611,9 @@ public final class CaptureRunUnit {
                 return;
             }
             try {
-                if (subscription != null) {
-                    subscription.close();
+                Subscription running = subscription.get();
+                if (running != null) {
+                    running.close();
                 }
                 open();
             } catch (RuntimeException | Error failure) {
@@ -628,8 +629,9 @@ public final class CaptureRunUnit {
             closed = true;
             sharedTails.remove(chain, this);
             acknowledgements.close();
-            if (subscription != null) {
-                subscription.close();
+            Subscription running = subscription.get();
+            if (running != null) {
+                running.close();
             }
         }
     }
