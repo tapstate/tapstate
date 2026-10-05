@@ -68,6 +68,11 @@ import java.util.stream.Stream;
  */
 final class Repl {
 
+    private static final String LOGIN_VERB = "login";
+    private static final String REASON_PARAM = "reason";
+    private static final String SEEDS_PARAM = "seeds";
+    private static final String SERVER_PARAM = "server";
+
     /**
      * Printed under a non-empty metrics read. The metric names are not a compatibility promise in this
      * preview: they may be renamed as the metric model settles, and the read face is where a user decides
@@ -94,7 +99,7 @@ final class Repl {
 
     /** REPL-only words handled here rather than by the command table; completed alongside the verbs. */
     static final List<String> BUILTINS =
-            List.of("help", "exit", "quit", "cd", "pwd", "connect", "disconnect", "login", "logout", ":ctx");
+            List.of("help", "exit", "quit", "cd", "pwd", "connect", "disconnect", LOGIN_VERB, "logout", ":ctx");
 
     /**
      * Registry verbs a connected session routes to the server instead of the offline command table. The
@@ -592,7 +597,7 @@ final class Repl {
             lastExitCode = disconnect();
             return true;
         }
-        if (words.get(0).equals("login")) {
+        if (words.get(0).equals(LOGIN_VERB)) {
             lastExitCode = login(words);
             return true;
         }
@@ -2151,7 +2156,7 @@ final class Repl {
                 if (residue != null) {
                     err.println("  left behind, clear by hand: " + renderReferrers(residue));
                 }
-                if ("pipeline-live".equals(String.valueOf(rejected.params().get("reason")))) {
+                if ("pipeline-live".equals(String.valueOf(rejected.params().get(REASON_PARAM)))) {
                     // Nothing was cleared here on purpose, and clearing it by hand while the job runs
                     // would discard the fencing epoch that keeps it from colliding with a later
                     // pipeline under the same id. Stopping comes first.
@@ -2816,7 +2821,7 @@ final class Repl {
     private int renderDownloadFailure(String connector, Exception failure, OutputFormat format) {
         String reason = failure.getMessage() == null || failure.getMessage().isBlank()
                 ? failure.getClass().getSimpleName() : failure.getMessage();
-        Map<String, Object> params = Map.of("connector", connector, "reason", reason);
+        Map<String, Object> params = Map.of("connector", connector, REASON_PARAM, reason);
         MessageCatalog.Rendered rendered = MessageCatalog.bundled().render(CliError.CONNECTOR_DOWNLOAD_FAILED, params);
         if (format == OutputFormat.TEXT) {
             return renderRejection(CliError.CONNECTOR_DOWNLOAD_FAILED.code(), rendered.message(), params);
@@ -3365,7 +3370,7 @@ final class Repl {
             entry.put("name", check.name());
             entry.put("status", check.status());
             putIfPresent(entry, "message", check.message());
-            putIfPresent(entry, "reason", check.reason());
+            putIfPresent(entry, REASON_PARAM, check.reason());
             putIfPresent(entry, "solution", check.solution());
             putIfPresent(entry, "connectorErrorCode", check.connectorErrorCode());
             checks.add(entry);
@@ -3699,7 +3704,7 @@ final class Repl {
     }
 
     private int renderMalformedRequest(String reason) {
-        Map<String, Object> args = Map.of("reason", reason);
+        Map<String, Object> args = Map.of(REASON_PARAM, reason);
         String message = MessageCatalog.bundled().render("control.malformed-request", args).message();
         return renderRejection("control.malformed-request", message, args);
     }
@@ -4386,7 +4391,7 @@ final class Repl {
             return reportBindFailure(options.format(), workspace, refused.code(), refused.args());
         } catch (java.io.IOException unreadable) {
             return reportBindFailure(options.format(), workspace, CliError.WORKSPACE_UNREADABLE,
-                    Map.of("path", workspace.toString(), "reason", String.valueOf(unreadable.getMessage())));
+                    Map.of("path", workspace.toString(), REASON_PARAM, String.valueOf(unreadable.getMessage())));
         }
     }
 
@@ -4538,7 +4543,7 @@ final class Repl {
             }
             if (!connectedHere && !landingAnswers()) {
                 return failure(UpCmd.STAGE_PREFLIGHT, hostPort(session.landingNode()), CliError.CONNECT_FAILED,
-                        Map.of("seeds", hostPort(session.landingNode())));
+                        Map.of(SEEDS_PARAM, hostPort(session.landingNode())));
             }
             Set<String> local = sources().stream().map(UpDraft::id).collect(Collectors.toSet());
             for (UpDraft pipeline : pipelines()) {
@@ -4624,7 +4629,7 @@ final class Repl {
                 }
                 case ConnectionTestOutcome.TimedOut ignored -> {
                     return failure(UpCmd.STAGE_PREFLIGHT, source.id(), CliError.REQUEST_TIMED_OUT,
-                            Map.of("server", hostPort(session.landingNode())));
+                            Map.of(SERVER_PARAM, hostPort(session.landingNode())));
                 }
                 case ConnectionTestOutcome.Unreachable ignored -> {
                     return unreachable(UpCmd.STAGE_PREFLIGHT, source.id());
@@ -4644,7 +4649,7 @@ final class Repl {
             } catch (IOException e) {
                 String reason = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
                 return failure(UpCmd.STAGE_PREFLIGHT, workspace.toString(), CliError.WORKSPACE_UNREADABLE,
-                        Map.of("path", workspace.toString(), "reason", reason));
+                        Map.of("path", workspace.toString(), REASON_PARAM, reason));
             } catch (DslException e) {
                 return failure(UpCmd.STAGE_PREFLIGHT, e.source(), e.code(), e.args());
             }
@@ -4766,7 +4771,7 @@ final class Repl {
                     }
                     case ConnectionDiscoverSchemaOutcome.TimedOut ignored -> {
                         return failure(UpCmd.STAGE_DISCOVER, id, CliError.REQUEST_TIMED_OUT,
-                                Map.of("server", hostPort(session.landingNode())));
+                                Map.of(SERVER_PARAM, hostPort(session.landingNode())));
                     }
                     case ConnectionDiscoverSchemaOutcome.Unreachable ignored -> {
                         return unreachable(UpCmd.STAGE_DISCOVER, id);
@@ -4840,7 +4845,7 @@ final class Repl {
 
         /** A stage that could not reach the server, after failover had its say. */
         private int unreachable(String stage, String on) {
-            return failure(stage, on, CliError.CONNECT_FAILED, Map.of("seeds", hostPort(session.landingNode())));
+            return failure(stage, on, CliError.CONNECT_FAILED, Map.of(SEEDS_PARAM, hostPort(session.landingNode())));
         }
 
         /** A stage failed on a code raised on this side, rendered from the catalog. */
@@ -5254,7 +5259,7 @@ final class Repl {
             return Cli.EXIT_DIAGNOSTIC;   // failover already reported the connection loss and went offline
         }
         printDiagnostic(commandLine.getErr(), CliError.REQUEST_TIMED_OUT,
-                Map.of("server", hostPort(session.landingNode())));
+                Map.of(SERVER_PARAM, hostPort(session.landingNode())));
         return Cli.EXIT_DIAGNOSTIC;
     }
 
@@ -5297,7 +5302,7 @@ final class Repl {
                 confirm("connected to " + hostPort(seed) + " (" + session.versions() + ")");
                 if (serverVersion != null && !serverVersion.equals(Cli.VERSION_NUMBER)) {
                     renderWarning(CliError.VERSION_MISMATCH.code(),
-                            Map.of("cli", Cli.VERSION_NUMBER, "server", serverVersion));
+                            Map.of("cli", Cli.VERSION_NUMBER, SERVER_PARAM, serverVersion));
                 }
                 return Cli.EXIT_OK;
             }
@@ -5375,7 +5380,7 @@ final class Repl {
             return machineTokenUsage("login cannot be combined with --token");
         }
         if (!session.isConnected()) {
-            printDiagnostic(err, CliError.NOT_CONNECTED, Map.of("verb", "login"));
+            printDiagnostic(err, CliError.NOT_CONNECTED, Map.of("verb", LOGIN_VERB));
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         if (words.size() < 2 || words.get(1).isBlank()) {
@@ -5586,7 +5591,7 @@ final class Repl {
             return authUsage("missing action");
         }
         return switch (words.get(1)) {
-            case "login" -> authLogin(words);
+            case LOGIN_VERB -> authLogin(words);
             case "status" -> words.size() == 2 ? authStatus() : authUsage("status takes no arguments");
             case "logout" -> authLogoutWords(words);
             default -> authUsage("unknown action '" + words.get(1) + "'");
@@ -5640,7 +5645,7 @@ final class Repl {
                 commandLine.getOut().flush();
                 yield Cli.EXIT_OK;
             }
-            case "login" -> machineTokenUsage("auth login cannot be combined with --token");
+            case LOGIN_VERB -> machineTokenUsage("auth login cannot be combined with --token");
             default -> authUsage("unknown action '" + words.get(1) + "'");
         };
     }
@@ -5736,14 +5741,14 @@ final class Repl {
     }
 
     private int authUsage(String reason) {
-        printDiagnostic(commandLine.getErr(), CliError.AUTH_USAGE, Map.of("reason", reason));
+        printDiagnostic(commandLine.getErr(), CliError.AUTH_USAGE, Map.of(REASON_PARAM, reason));
         return Cli.EXIT_USAGE;
     }
 
     private int context() {
         if (contextManager == null) {
             printDiagnostic(commandLine.getErr(), CliError.CONTEXT_USAGE,
-                    Map.of("reason", "context manager is unavailable in this session"));
+                    Map.of(REASON_PARAM, "context manager is unavailable in this session"));
             return Cli.EXIT_USAGE;
         }
         return new ContextConsole(contextManager, prompter, workdir,
@@ -5753,7 +5758,7 @@ final class Repl {
     /** Renders the {@code cli.connect-failed} diagnostic through the shared coded-error renderer. */
     private void reportConnectFailed(List<URI> seeds) {
         String display = seeds.stream().map(URI::toString).collect(Collectors.joining(", "));
-        printDiagnostic(commandLine.getErr(), CliError.CONNECT_FAILED, Map.of("seeds", display));
+        printDiagnostic(commandLine.getErr(), CliError.CONNECT_FAILED, Map.of(SEEDS_PARAM, display));
     }
 
     /**

@@ -6,6 +6,9 @@ import io.tapstate.core.lifecycle.PipelineStateInventory;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import picocli.CommandLine;
 
 import java.io.ByteArrayOutputStream;
@@ -7166,8 +7169,167 @@ class ReplTest {
         assertThat(client.lifecycleCalls).isEmpty();
         assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         String diagnostic = h.sink().toString().substring(mark);
-        assertThat(diagnostic).contains("cli.confirmation-needs-a-terminal");
-        assertThat(diagnostic).endsWith("  (" + versions + ")" + System.lineSeparator());
+        assertThat(diagnostic).contains("cli.confirmation-needs-a-terminal")
+                .endsWith("  (" + versions + ")" + System.lineSeparator());
+    }
+
+    private static Harness contextSession(Path home, FakeControlPlane client,
+                                          ContextResolver resolver, String explicitContext) {
+        CommandLine line = Cli.newCommandLine();
+        StringWriter sink = new StringWriter();
+        line.setOut(new PrintWriter(sink));
+        line.setErr(new PrintWriter(sink));
+        Repl repl = new Repl(line, home, client, new ScriptedPrompter("pw"), name -> null,
+                resolver, explicitContext, new AuthService(client, AuthFileStore.underHome(home),
+                Clock.fixed(Instant.parse("2026-08-17T10:00:00Z"), ZoneOffset.UTC)));
+        repl.terminalCheck(() -> true);
+        return new Harness(repl, sink);
+    }
+
+    private static Harness namedSession(Path home, FakeControlPlane client) {
+        ContextConfig config = new ContextConfig(1, null,
+                Map.of("dev", namedContext(URI.create("http://127.0.0.1:7900")).definition()), Map.of());
+        client.serverVersion = "9.9.9";
+        Harness h = contextSession(home, client, new ContextResolver(() -> config, name -> null), "dev");
+        h.repl().dispatch("auth status");
+        assertThat(h.repl().lastExitCode()).as("the named context must connect: %s", h.sink()).isZero();
+        return h;
+    }
+
+    private static void assertConnectedDiagnostic(Harness h, int mark, CliError code, int exitCode) {
+        assertThat(h.repl().session().isConnected()).isTrue();
+        assertThat(h.repl().lastExitCode()).isEqualTo(exitCode);
+        assertThat(h.sink().toString().substring(mark)).contains(code.code())
+                .endsWith("  (cli " + buildVersion() + ", server 9.9.9)" + System.lineSeparator());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"rejected", "unreachable", "issuer-mismatch"})
+    void persistentLoginRefusalsReportTheConnectedServersVersion(String outcome, @TempDir Path home) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://127.0.0.1:7900"));
+        client.loginOutcome = switch (outcome) {
+            case "rejected" -> new LoginOutcome.Rejected("control.auth-failed", "bad credential");
+            case "unreachable" -> new LoginOutcome.Unreachable();
+            default -> persistentLogin(Instant.parse("2026-08-17T10:00:00Z"),
+                    "urn:tapstate:cluster:other", "alice", "tss_s01.session-secret");
+        };
+        CliError code = switch (outcome) {
+            case "rejected" -> CliError.AUTH_LOGIN_REJECTED;
+            case "unreachable" -> CliError.AUTH_LOGIN_UNREACHABLE;
+            default -> CliError.AUTH_ISSUER_MISMATCH;
+        };
+        Harness h = namedSession(home, client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("auth login alice");
+
+        assertConnectedDiagnostic(h, mark, code, Cli.EXIT_DIAGNOSTIC);
+        assertThat(h.repl().session().isAuthenticated()).isFalse();
+        assertThat(client.loginCalls).containsExactly("alice:pw@http://127.0.0.1:7900 persistent=true");
+    }
+
+    @Test
+    void rejectedPersistentLogoutReportsTheConnectedServersVersionAndKeepsTheSession(@TempDir Path home) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://127.0.0.1:7900"));
+        client.loginOutcome = persistentLogin(Instant.parse("2026-08-17T10:00:00Z"),
+                "urn:tapstate:cluster:test-cluster", "alice", "tss_s01.session-secret");
+        Harness h = namedSession(home, client);
+        h.repl().dispatch("auth login alice");
+        assertThat(h.repl().lastExitCode()).isZero();
+        client.logoutOutcome = new SessionLogoutOutcome.Rejected("control.auth-failed", "bad session");
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("auth logout");
+
+        assertConnectedDiagnostic(h, mark, CliError.AUTH_SESSION_REJECTED, Cli.EXIT_DIAGNOSTIC);
+        assertThat(h.repl().session().isAuthenticated()).isTrue();
+        assertThat(AuthFileStore.underHome(home).load(TEST_AUTH_REF, TEST_CONTEXT_ID)).isPresent();
+        assertThat(client.sessionCalls).containsExactly("logout tss_s01.session-secret@http://127.0.0.1:7900");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"auth status", "auth logout"})
+    void invalidCachedAuthReportsTheConnectedServersVersion(String command, @TempDir Path home)
+            throws IOException {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://127.0.0.1:7900"));
+        client.loginOutcome = persistentLogin(Instant.parse("2026-08-17T10:00:00Z"),
+                "urn:tapstate:cluster:test-cluster", "alice", "tss_s01.session-secret");
+        Harness h = namedSession(home, client);
+        h.repl().dispatch("auth login alice");
+        assertThat(h.repl().lastExitCode()).isZero();
+        Path cache = home.resolve(".tapstate/auth/" + TEST_AUTH_REF + ".json");
+        Files.writeString(cache, "invalid session record");
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch(command);
+
+        assertConnectedDiagnostic(h, mark, CliError.AUTH_CACHE_INVALID, Cli.EXIT_DIAGNOSTIC);
+        assertThat(Files.readString(cache)).isEqualTo("invalid session record");
+        assertThat(client.sessionCalls).isEmpty();
+    }
+
+    @Test
+    void namedAuthUsageReportsTheConnectedServersVersion(@TempDir Path home) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://127.0.0.1:7900"));
+        Harness h = namedSession(home, client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("auth status extra");
+
+        assertConnectedDiagnostic(h, mark, CliError.AUTH_USAGE, Cli.EXIT_USAGE);
+        assertThat(client.sessionCalls).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"context", "auth status", "up"})
+    void connectedUsageRefusalsReportTheServersVersion(String command, @TempDir Path home) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://127.0.0.1:7900"));
+        client.serverVersion = "9.9.9";
+        Harness h = harness(home, client);
+        h.repl().dispatch("connect 127.0.0.1:7900");
+        assertThat(h.repl().lastExitCode()).isZero();
+        int mark = h.sink().toString().length();
+        CliError code = switch (command) {
+            case "context" -> CliError.CONTEXT_USAGE;
+            case "up" -> CliError.NOT_AUTHENTICATED;
+            default -> CliError.CONTEXT_REQUIRED;
+        };
+
+        h.repl().dispatch(command);
+
+        assertConnectedDiagnostic(h, mark, code,
+                command.equals("context") ? Cli.EXIT_USAGE : Cli.EXIT_VERB_UNAVAILABLE);
+        assertThat(client.loginCalls).isEmpty();
+    }
+
+    @ParameterizedTest
+    @CsvSource({"auth logout --local-only,false", "auth logout --local-only,true", "get pl1,true"})
+    void contextResolutionRefusalsKeepTheOfflineVersionStamp(
+            String command, boolean missingContext, @TempDir Path home) {
+        FakeControlPlane client = new FakeControlPlane();
+        Harness h = contextSession(home, client, new ContextResolver(ContextConfig::empty, name -> null),
+                missingContext ? "missing" : null);
+
+        h.repl().dispatch(command);
+
+        assertThat(h.repl().lastExitCode()).isEqualTo(
+                missingContext ? Cli.EXIT_DIAGNOSTIC : Cli.EXIT_VERB_UNAVAILABLE);
+        assertThat(h.repl().session().isConnected()).isFalse();
+        assertThat(h.sink().toString()).contains(
+                missingContext ? CliError.CONTEXT_NOT_FOUND.code() : CliError.CONTEXT_REQUIRED.code())
+                .endsWith("  (cli " + buildVersion() + ", server not connected)" + System.lineSeparator());
+        assertThat(client.probed).isEmpty();
+    }
+
+    @Test
+    void upWithoutATargetKeepsTheOfflineVersionStamp(@TempDir Path home) {
+        Harness h = harness(home, new FakeControlPlane());
+
+        h.repl().dispatch("up");
+
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_VERB_UNAVAILABLE);
+        assertThat(h.sink().toString()).contains(CliError.NOT_CONNECTED.code())
+                .endsWith("  (cli " + buildVersion() + ", server not connected)" + System.lineSeparator());
     }
 
     @Test
