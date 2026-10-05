@@ -59,6 +59,13 @@ public final class SourceConfigKeyringHandle implements SourceConfigCipherProvid
         return next.epoch();
     }
 
+    /** Removes unreferenced online historical keys after atomic writer and live-boot checks. */
+    public long retireReadOnlyKeys() {
+        SourceConfigKeyringStore.Loaded next = store.retireReadOnlyKeys();
+        loaded.set(next);
+        return next.epoch();
+    }
+
     /** Reloads every key for the current epoch, then binds this exact live node-session to it. */
     @Override
     public void acknowledge(WorkloadClaim session, Duration ttl) {

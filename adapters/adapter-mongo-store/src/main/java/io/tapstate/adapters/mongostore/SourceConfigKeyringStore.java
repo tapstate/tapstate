@@ -15,6 +15,7 @@ import com.mongodb.client.model.FindOneAndUpdateOptions;
 import com.mongodb.client.model.ReturnDocument;
 import com.mongodb.client.result.UpdateResult;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.ArtifactMutation;
@@ -255,6 +256,120 @@ public final class SourceConfigKeyringStore {
         Loaded activated = loadExisting();
         reencryptSources();
         return activated;
+    }
+
+    /** Retires online read-only keys only after current writers, references and live boots are fenced. */
+    Loaded retireReadOnlyKeys() {
+        if (client == null) throw new IllegalStateException("keyring retirement needs the owning store client");
+        return StoreIo.call(() -> {
+            for (int attempt = 0; attempt < 3; attempt++) {
+                try {
+                    return retireReadOnlyKeysOnce();
+                } catch (MongoException error) {
+                    if (attempt == 2 || !error.hasErrorLabel("TransientTransactionError")
+                            || error.hasErrorLabel("UnknownTransactionCommitResult")) throw error;
+                }
+            }
+            throw new IllegalStateException("keyring retirement attempts must return or throw");
+        });
+    }
+
+    private Loaded retireReadOnlyKeysOnce() {
+        try (ClientSession transaction = client.startSession()) {
+            transaction.startTransaction(ACK_TRANSACTION);
+            try {
+                Document current = systemMeta.find(transaction, new Document("_id", KEYRING_ID)).first();
+                if (current == null) throw invalid();
+                Loaded loaded = decodeStored(current);
+                if (loaded.preparedKeyId() != null) throw rotationBlocked();
+                List<Document> active = current.getList("keys", Document.class).stream()
+                        .filter(key -> loaded.activeKeyId().equals(key.getString("id")))
+                        .map(Document::new).toList();
+                if (active.size() == current.getList("keys", Document.class).size()) {
+                    transaction.abortTransaction();
+                    return loaded;
+                }
+
+                // Every supported Source writer and node ACK touches this same record. Taking its
+                // write fence before scanning prevents a committed scan from racing a late writer,
+                // another rotation, or a joining boot's admission against the previous epoch.
+                Document expected = new Document("_id", KEYRING_ID).append("epoch", loaded.epoch())
+                        .append("activeKeyId", loaded.activeKeyId())
+                        .append("preparedKeyId", new Document("$exists", false));
+                if (systemMeta.updateOne(transaction, expected,
+                        new Document("$inc", new Document("sourceWriteFence", 1L))).getModifiedCount() != 1) {
+                    throw rotationBlocked();
+                }
+                fenceAcknowledgedLiveSessions(transaction, loaded.epoch());
+                EncryptedArtifactCodec codec = new EncryptedArtifactCodec(loaded.cipher());
+                Document sources = new Document("$or", List.of(
+                        new Document("kind", "source"), new Document("body.kind", "source"),
+                        new Document("body.config", new Document("$regex", "^tscfg:"))));
+                try (MongoCursor<Document> cursor = artifacts.find(transaction, sources).iterator()) {
+                    while (cursor.hasNext()) {
+                        Document source = cursor.next();
+                        // Authenticate the full stored Source and logical hash, not just a textual
+                        // envelope prefix. Malformed or partially migrated records cannot be ignored.
+                        if (!(codec.decode(source) instanceof SourceResource)) throw rotationBlocked();
+                        String envelope = source.get("body", Document.class).getString("config");
+                        if (!loaded.activeKeyId().equals(SourceConfigCipher.envelopeKeyId(envelope))) {
+                            throw rotationBlocked();
+                        }
+                    }
+                }
+                if (systemMeta.updateOne(transaction, expected,
+                        new Document("$set", new Document("keys", active))
+                                .append("$inc", new Document("epoch", 1L))).getModifiedCount() != 1) {
+                    throw rotationBlocked();
+                }
+            } catch (RuntimeException failure) {
+                try {
+                    transaction.abortTransaction();
+                } catch (RuntimeException abortFailure) {
+                    failure.addSuppressed(abortFailure);
+                }
+                throw failure;
+            }
+            // Do not replay an ambiguous commit. Paired historical backups carry their own keyring;
+            // this operation removes keys from the online store, not from a backup or another DB.
+            transaction.commitTransaction();
+        }
+        return loadExisting();
+    }
+
+    private void fenceAcknowledgedLiveSessions(ClientSession transaction, long epoch) {
+        List<Document> live = workloadClaims.aggregate(transaction, List.of(
+                new Document("$match", new Document("resourceType", WorkloadClaimType.NODE_SESSION.name())
+                        .append("$expr", new Document("$gt", List.of("$leaseUntil", "$$NOW"))))))
+                .into(new java.util.ArrayList<>());
+        for (Document node : live) {
+            if (!(node.get("clusterId") instanceof String clusterId)
+                    || !(node.get("resourceId") instanceof String nodeId)
+                    || !(node.get("ownerNodeId") instanceof String ownerId)
+                    || !nodeId.equals(ownerId)
+                    || !(node.get("ownerBootId") instanceof String bootId)
+                    || !storedInteger(node.get("claimGeneration"))) {
+                throw rotationBlocked();
+            }
+            Document claim = new Document("_id", node.get("_id")).append("ownerNodeId", ownerId)
+                    .append("ownerBootId", bootId).append("claimGeneration", node.get("claimGeneration"))
+                    .append("$expr", new Document("$gt", List.of("$leaseUntil", "$$NOW")));
+            if (workloadClaims.updateOne(transaction, claim,
+                    new Document("$inc", new Document("sourceConfigRetirementFence", 1L)))
+                    .getModifiedCount() != 1) throw rotationBlocked();
+            Document ack = new Document("_id", new Document("kind", ACK_KIND)
+                    .append("clusterId", clusterId).append("nodeId", nodeId))
+                    .append("bootId", bootId).append("claimGeneration", node.get("claimGeneration"))
+                    .append("epoch", epoch)
+                    .append("$expr", new Document("$gt", List.of("$leaseUntil", "$$NOW")));
+            if (systemMeta.updateOne(transaction, ack,
+                    new Document("$inc", new Document("retirementFence", 1L)))
+                    .getModifiedCount() != 1) throw rotationBlocked();
+        }
+    }
+
+    private static TapstateException rotationBlocked() {
+        return new TapstateException(StoreError.SOURCE_CONFIG_KEYRING_ROTATION_BLOCKED, Map.of(), null);
     }
 
     private void reencryptSources() {
