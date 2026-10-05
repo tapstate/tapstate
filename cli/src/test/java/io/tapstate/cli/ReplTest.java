@@ -7142,6 +7142,35 @@ class ReplTest {
     }
 
     @Test
+    void stopWithoutATerminalReportsTheConnectedServersVersion(@TempDir Path workdir) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://127.0.0.1:8080"));
+        client.serverVersion = "9.9.9";
+        client.loginOutcome = new LoginOutcome.Success("jwt-tok");
+        client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
+        Harness h = harness(workdir, client, new ScriptedPrompter("pw"));
+        assertThat(h.repl().dispatch("connect 127.0.0.1:8080")).isTrue();
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(h.repl().dispatch("login alice")).isTrue();
+        assertThat(h.repl().lastExitCode())
+                .as("the connected test session must authenticate: %s", h.sink())
+                .isZero();
+        assertThat(h.repl().session().isAuthenticated()).isTrue();
+        String versions = "cli " + buildVersion() + ", server 9.9.9";
+        assertThat(h.repl().session().versions()).isEqualTo(versions);
+        h.repl().terminalCheck(() -> false);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("stop pl1")).isTrue();
+
+        assertThat(h.repl().session().isConnected()).isTrue();
+        assertThat(client.lifecycleCalls).isEmpty();
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        String diagnostic = h.sink().toString().substring(mark);
+        assertThat(diagnostic).contains("cli.confirmation-needs-a-terminal");
+        assertThat(diagnostic).endsWith("  (" + versions + ")" + System.lineSeparator());
+    }
+
+    @Test
     void stopWithTheNonInteractiveFlagClearsWithoutAsking() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");

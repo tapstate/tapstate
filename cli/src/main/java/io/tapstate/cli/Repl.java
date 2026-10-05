@@ -714,11 +714,11 @@ final class Repl {
                 namedContext = named;
                 return Cli.EXIT_OK;
             }
-            Diagnostics.printText(commandLine.getErr(), CliError.CONTEXT_REQUIRED,
+            printDiagnostic(commandLine.getErr(), CliError.CONTEXT_REQUIRED,
                     Map.of("verb", "auth"));
             return Cli.EXIT_VERB_UNAVAILABLE;
         } catch (io.tapstate.core.common.TapstateException error) {
-            Diagnostics.printText(commandLine.getErr(), error.code(), error.args());
+            printDiagnostic(commandLine.getErr(), error.code(), error.args());
             return Cli.EXIT_DIAGNOSTIC;
         }
     }
@@ -737,7 +737,7 @@ final class Repl {
         try {
             Optional<ResolvedContext> resolution = contextResolver.resolve(connect, explicitContext, workspace);
             if (resolution.isEmpty()) {
-                Diagnostics.printText(commandLine.getErr(), CliError.CONTEXT_REQUIRED, Map.of("verb", verb));
+                printDiagnostic(commandLine.getErr(), CliError.CONTEXT_REQUIRED, Map.of("verb", verb));
                 return Cli.EXIT_VERB_UNAVAILABLE;
             }
             ResolvedContext target = resolution.orElseThrow();
@@ -753,7 +753,7 @@ final class Repl {
             }
             return connected;
         } catch (io.tapstate.core.common.TapstateException error) {
-            Diagnostics.printText(commandLine.getErr(), error.code(), error.args());
+            printDiagnostic(commandLine.getErr(), error.code(), error.args());
             return Cli.EXIT_DIAGNOSTIC;
         }
     }
@@ -785,8 +785,7 @@ final class Repl {
         }
         PrintWriter err = commandLine.getErr();
         if (!session.isAuthenticated()) {
-            Diagnostics.printText(err, CliError.NOT_AUTHENTICATED,
- Map.of("verb", words.get(0)), session.versions());
+            printDiagnostic(err, CliError.NOT_AUTHENTICATED, Map.of("verb", words.get(0)));
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         // `test` and its read-back `test-result` return a structured report that is worth machine-reading, so
@@ -913,7 +912,7 @@ final class Repl {
             });
             return Cli.EXIT_OK;
         } catch (io.tapstate.core.common.TapstateException failure) {
-            Diagnostics.printText(commandLine.getErr(), failure.code(), failure.args());
+            printDiagnostic(commandLine.getErr(), failure.code(), failure.args());
             return Cli.EXIT_DIAGNOSTIC;
         }
     }
@@ -939,7 +938,7 @@ final class Repl {
             adoptAdvertisedMembers(verified.issuer());
             return Cli.EXIT_OK;
         } catch (io.tapstate.core.common.TapstateException failure) {
-            Diagnostics.printText(commandLine.getErr(), failure.code(), failure.args());
+            printDiagnostic(commandLine.getErr(), failure.code(), failure.args());
             return Cli.EXIT_DIAGNOSTIC;
         }
     }
@@ -1168,8 +1167,7 @@ final class Repl {
             }
         }
         if (!session.isConnected()) {
-            Diagnostics.printText(err, CliError.NOT_CONNECTED,
- Map.of("verb", verb), session.versions());
+            printDiagnostic(err, CliError.NOT_CONNECTED, Map.of("verb", verb));
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         int prepared = prepareCredential();
@@ -1177,8 +1175,7 @@ final class Repl {
             return prepared;
         }
         if (!session.isAuthenticated()) {
-            Diagnostics.printText(err, CliError.NOT_AUTHENTICATED,
- Map.of("verb", verb), session.versions());
+            printDiagnostic(err, CliError.NOT_AUTHENTICATED, Map.of("verb", verb));
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         return switch (call) {
@@ -1203,8 +1200,7 @@ final class Repl {
     private int watchLive(DataBrowserCall.Live live) {
         PrintWriter out = commandLine.getOut();
         if (!terminal.getAsBoolean()) {
-            Diagnostics.printText(commandLine.getErr(), CliError.WATCH_NEEDS_A_TERMINAL,
- Map.of(), session.versions());
+            printDiagnostic(commandLine.getErr(), CliError.WATCH_NEEDS_A_TERMINAL, Map.of());
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         String namespace = live.sourceId() + "." + live.collection();
@@ -1609,7 +1605,7 @@ final class Repl {
         Prompter asking = terminal.getAsBoolean() ? prompter() : null;
         if (asking == null) {
             PrintWriter err = commandLine.getErr();
-            Diagnostics.printText(err, CliError.CONFIRMATION_NEEDS_A_TERMINAL, Map.of("verb", verb));
+            printDiagnostic(err, CliError.CONFIRMATION_NEEDS_A_TERMINAL, Map.of("verb", verb));
             err.flush();
             return OptionalInt.of(Cli.EXIT_DIAGNOSTIC);
         }
@@ -4322,7 +4318,7 @@ final class Repl {
         boolean connectedHere = false;
         if (options.server() != null || !session.isConnected()) {
             if (contextResolver == null) {
-                Diagnostics.printText(err, CliError.NOT_CONNECTED, Map.of("verb", "up"), session.versions());
+                printDiagnostic(err, CliError.NOT_CONNECTED, Map.of("verb", "up"));
                 return Cli.EXIT_VERB_UNAVAILABLE;
             }
             // The workspace's first up is where the server question is asked - and the only place. All
@@ -4346,7 +4342,7 @@ final class Repl {
             return prepared;
         }
         if (!session.isAuthenticated()) {
-            Diagnostics.printText(err, CliError.NOT_AUTHENTICATED, Map.of("verb", "up"), session.versions());
+            printDiagnostic(err, CliError.NOT_AUTHENTICATED, Map.of("verb", "up"));
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         return new UpRun(workspace, options.format(), connectedHere).run();
@@ -5257,9 +5253,14 @@ final class Repl {
         if (!session.isConnected()) {
             return Cli.EXIT_DIAGNOSTIC;   // failover already reported the connection loss and went offline
         }
-        Diagnostics.printText(commandLine.getErr(), CliError.REQUEST_TIMED_OUT,
-                Map.of("server", hostPort(session.landingNode())), session.versions());
+        printDiagnostic(commandLine.getErr(), CliError.REQUEST_TIMED_OUT,
+                Map.of("server", hostPort(session.landingNode())));
         return Cli.EXIT_DIAGNOSTIC;
+    }
+
+    /** Renders every coded session diagnostic with the versions of its current connection. */
+    private void printDiagnostic(PrintWriter err, TapstateErrorCode code, Map<String, Object> args) {
+        Diagnostics.printText(err, code, args, session.versions());
     }
 
     /**
@@ -5374,8 +5375,7 @@ final class Repl {
             return machineTokenUsage("login cannot be combined with --token");
         }
         if (!session.isConnected()) {
-            Diagnostics.printText(err, CliError.NOT_CONNECTED,
- Map.of("verb", "login"), session.versions());
+            printDiagnostic(err, CliError.NOT_CONNECTED, Map.of("verb", "login"));
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         if (words.size() < 2 || words.get(1).isBlank()) {
@@ -5399,7 +5399,7 @@ final class Repl {
         try {
             verified = new IssuerBinding(controlPlane).verify(session.seeds(), null);
         } catch (io.tapstate.core.common.TapstateException failure) {
-            Diagnostics.printText(err, failure.code(), failure.args());
+            printDiagnostic(err, failure.code(), failure.args());
             return Cli.EXIT_DIAGNOSTIC;
         }
         return switch (verified.withCredential(password.get(),
@@ -5439,18 +5439,18 @@ final class Repl {
                     yield Cli.EXIT_OK;
                 }
                 case AuthService.LoginResult.Rejected rejected -> {
-                    Diagnostics.printText(err, CliError.AUTH_LOGIN_REJECTED,
+                    printDiagnostic(err, CliError.AUTH_LOGIN_REJECTED,
                             Map.of("code", rejected.code(), "principal", rejected.principal()));
                     yield Cli.EXIT_DIAGNOSTIC;
                 }
                 case AuthService.LoginResult.Unreachable ignored -> {
-                    Diagnostics.printText(err, CliError.AUTH_LOGIN_UNREACHABLE,
+                    printDiagnostic(err, CliError.AUTH_LOGIN_UNREACHABLE,
                             Map.of("context", namedContext.name()));
                     yield Cli.EXIT_DIAGNOSTIC;
                 }
             };
         } catch (io.tapstate.core.common.TapstateException failure) {
-            Diagnostics.printText(err, failure.code(), failure.args());
+            printDiagnostic(err, failure.code(), failure.args());
             return Cli.EXIT_DIAGNOSTIC;
         }
     }
@@ -5579,7 +5579,7 @@ final class Repl {
             return machineTokenAuth(words);
         }
         if (namedContext == null || authService == null) {
-            Diagnostics.printText(err, CliError.CONTEXT_REQUIRED, Map.of("verb", "auth"));
+            printDiagnostic(err, CliError.CONTEXT_REQUIRED, Map.of("verb", "auth"));
             return Cli.EXIT_VERB_UNAVAILABLE;
         }
         if (words.size() < 2) {
@@ -5676,7 +5676,7 @@ final class Repl {
                 }
             };
         } catch (io.tapstate.core.common.TapstateException failure) {
-            Diagnostics.printText(err, failure.code(), failure.args());
+            printDiagnostic(err, failure.code(), failure.args());
             return Cli.EXIT_DIAGNOSTIC;
         }
     }
@@ -5714,35 +5714,35 @@ final class Repl {
                     yield Cli.EXIT_OK;
                 }
                 case AuthService.LogoutResult.Rejected rejected -> {
-                    Diagnostics.printText(err, CliError.AUTH_SESSION_REJECTED,
+                    printDiagnostic(err, CliError.AUTH_SESSION_REJECTED,
                             Map.of("code", rejected.code(), "principal", rejected.principal()));
                     yield Cli.EXIT_DIAGNOSTIC;
                 }
                 case AuthService.LogoutResult.Unreachable ignored -> {
-                    Diagnostics.printText(err, CliError.AUTH_LOGOUT_UNREACHABLE,
+                    printDiagnostic(err, CliError.AUTH_LOGOUT_UNREACHABLE,
                             Map.of("context", namedContext.name()));
                     yield Cli.EXIT_DIAGNOSTIC;
                 }
                 case AuthService.LogoutResult.CacheChanged ignored -> {
-                    Diagnostics.printText(err, CliError.AUTH_LOGOUT_CACHE_CHANGED,
+                    printDiagnostic(err, CliError.AUTH_LOGOUT_CACHE_CHANGED,
                             Map.of("context", namedContext.name()));
                     yield Cli.EXIT_DIAGNOSTIC;
                 }
             };
         } catch (io.tapstate.core.common.TapstateException failure) {
-            Diagnostics.printText(err, failure.code(), failure.args());
+            printDiagnostic(err, failure.code(), failure.args());
             return Cli.EXIT_DIAGNOSTIC;
         }
     }
 
     private int authUsage(String reason) {
-        Diagnostics.printText(commandLine.getErr(), CliError.AUTH_USAGE, Map.of("reason", reason));
+        printDiagnostic(commandLine.getErr(), CliError.AUTH_USAGE, Map.of("reason", reason));
         return Cli.EXIT_USAGE;
     }
 
     private int context() {
         if (contextManager == null) {
-            Diagnostics.printText(commandLine.getErr(), CliError.CONTEXT_USAGE,
+            printDiagnostic(commandLine.getErr(), CliError.CONTEXT_USAGE,
                     Map.of("reason", "context manager is unavailable in this session"));
             return Cli.EXIT_USAGE;
         }
@@ -5753,8 +5753,7 @@ final class Repl {
     /** Renders the {@code cli.connect-failed} diagnostic through the shared coded-error renderer. */
     private void reportConnectFailed(List<URI> seeds) {
         String display = seeds.stream().map(URI::toString).collect(Collectors.joining(", "));
-        Diagnostics.printText(commandLine.getErr(), CliError.CONNECT_FAILED,
- Map.of("seeds", display), session.versions());
+        printDiagnostic(commandLine.getErr(), CliError.CONNECT_FAILED, Map.of("seeds", display));
     }
 
     /**
