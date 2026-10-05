@@ -94,7 +94,7 @@ class IndependentCdcRecoveryIT {
                 CdcRecoveryFixture.change(fixture.source(), 6, ROOT, "3", "", "after-restart");
                 awaitPriority(control, fixture, fixture.rootTarget(), ROOT, "3", "after-restart");
                 long writeMillis = Duration.ofNanos(System.nanoTime() - wroteFrom).toMillis();
-                assertThat(control.errorCount(ROOT_PIPELINE)).contains(0L);
+                awaitCurrentErrorCount(control, database);
                 System.out.println("Shared SRS " + readMode + " recovered the held High after a process crash in "
                         + recoveryMillis + " ms; the next source-to-sink write took " + writeMillis + " ms.");
             }
@@ -150,7 +150,7 @@ class IndependentCdcRecoveryIT {
                         String[] start = firstLine(path).split(" ");
                         return start.length >= 2 && Long.parseLong(start[1]) < 3;
                     }), () -> streamText(fixture));
-            assertThat(control.errorCount(ROOT_PIPELINE)).contains(0L);
+            awaitCurrentErrorCount(control, database);
         } finally {
             Files.writeString(fixture.signals().resolve("release"), "");
         }
@@ -202,9 +202,10 @@ class IndependentCdcRecoveryIT {
             CdcRecoveryFixture.change(fixture.source(), 2052, ROOT, "3", "", "replay-barrier");
             awaitPriority(control, fixture, fixture.rootTarget(), ROOT, "3", "replay-barrier");
             assertThat(priority(fixture.rootTarget(), ROOT, "2")).isEqualTo("High");
-            assertThat(control.errorCount(ROOT_PIPELINE)).contains(0L);
+            long replayMillis = Duration.ofNanos(System.nanoTime() - replayedFrom).toMillis();
+            awaitCurrentErrorCount(control, database);
             System.out.println("The paused SRS consumer replayed 2048 retained updates to its sink in "
-                    + Duration.ofNanos(System.nanoTime() - replayedFrom).toMillis() + " ms.");
+                    + replayMillis + " ms.");
         }
     }
 
@@ -242,7 +243,7 @@ class IndependentCdcRecoveryIT {
             assertThat(priority(fixture.rootTarget(), ROOT, "1"))
                     .as("the full load's newer row survives CDC replay even while Low remains retained")
                     .isEqualTo("High");
-            assertThat(control.errorCount(ROOT_PIPELINE)).contains(0L);
+            awaitCurrentErrorCount(control, database);
         }
     }
 
@@ -512,6 +513,39 @@ class IndependentCdcRecoveryIT {
                     && id.equals(row[idColumn])) return row[priorityColumn];
         }
         return null;
+    }
+
+    private static void awaitCurrentErrorCount(ControlPlane control, MongoDatabase database) {
+        long count;
+        try {
+            count = Await.answered("the current execution publishes its actual error count", TIMEOUT,
+                    () -> control.errorCount(ROOT_PIPELINE));
+        } catch (AssertionError unavailable) {
+            String identity = "; live identity unavailable";
+            try {
+                // Capture the live identity before server cleanup; an unavailable count is never zero.
+                Document artifact = database.getCollection(MongoStorePort.ARTIFACTS)
+                        .find(new Document("_id", ROOT_PIPELINE))
+                        .projection(new Document("pipelineIncarnationId", 1)).maxTime(1, java.util.concurrent.TimeUnit.SECONDS).first();
+                var authority = database.getCollection(MongoStorePort.WORKLOAD_CLAIMS)
+                        .find(new Document("resourceType", "PIPELINE_ACTUATION").append("resourceId", ROOT_PIPELINE))
+                        .projection(new Document("executionGeneration", 1)).maxTime(1, java.util.concurrent.TimeUnit.SECONDS)
+                        .limit(2).into(new java.util.ArrayList<>());
+                var key = new org.bson.types.Binary(java.security.MessageDigest.getInstance("SHA-256")
+                        .digest(ROOT_PIPELINE.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+                Document publication = database.getCollection(MongoStorePort.PIPELINE_OBSERVATION)
+                        .find(new Document("_id", key))
+                        .projection(new Document("current.pipelineIncarnationId", 1)
+                                .append("current.executionGeneration", 1).append("current.observedAt", 1))
+                        .maxTime(1, java.util.concurrent.TimeUnit.SECONDS).first();
+                identity = "; live artifact=" + artifact + "; live authority=" + authority
+                        + "; exact current publication=" + publication;
+            } catch (java.security.NoSuchAlgorithmException | RuntimeException diagnosticFailure) {
+                unavailable.addSuppressed(diagnosticFailure);
+            }
+            throw new AssertionError(unavailable.getMessage() + identity, unavailable);
+        }
+        assertThat(count).as("the current execution's published error count").isZero();
     }
 
     private static void awaitPriority(ControlPlane control, Fixture fixture, Path target, String table,

@@ -2,11 +2,17 @@ package io.tapstate.e2e;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.mongodb.ConnectionString;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import io.tapstate.core.lifecycle.LifecycleVerb;
+import io.tapstate.adapters.pdk.ConnectorStateNamespace;
+import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.testsupport.DockerGate;
 import java.sql.Connection;
+import java.time.Duration;
+import java.util.concurrent.TimeUnit;
 import java.sql.Statement;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -42,6 +48,7 @@ import org.junit.jupiter.params.provider.EnumSource;
  */
 class AConnectorKeepsItsIdentityAcrossARestartIT {
 
+    private static final Duration WAIT = Duration.ofSeconds(60);
     private static final String TABLE = "orders";
     private static final String DATABASE = "identity_restart_db";
     private static final String PIPELINE_ID = "identity_across_restart";
@@ -69,7 +76,8 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
     void theRunThatComesBackIsTheOneThatMintedTheIdentityNotANewOne(Tiers tier) throws Exception {
         String suffix = tier.name().toLowerCase(java.util.Locale.ROOT);
         String pipelineId = PIPELINE_ID + "_" + suffix;
-        String namespace = "pdk.state." + pipelineId + "." + SOURCE_ID;
+        String namespace;
+        String originalChain;
         Map<String, Object> mysql = SharedMySql.settings(DATABASE + "_" + suffix);
         seedOneRow(mysql);
 
@@ -78,7 +86,7 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
         byte[] minted;
-        try (MongoEndpoints mongo = new MongoEndpoints()) {
+        try (MongoEndpoints mongo = new MongoEndpoints(); MongoClient state = MongoClients.create(storeUri)) {
             try (ServerHandle first = tier.launch(storeUri)) {
                 ControlPlane control = new ControlPlane(first.baseUrl());
                 control.bootstrapAndLogin("e2e", "e2e-password");
@@ -99,10 +107,13 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
                 update(mysql, BEFORE_THE_RESTART);
                 awaitCustomer(mongo, target, BEFORE_THE_RESTART, "a change made before the restart");
 
-                Await.until("the connector to have filed the identity it minted",
-                        () -> note(storeUri, namespace, SERVER_NAME).isPresent(),
+                long noteDeadline = System.nanoTime() + WAIT.toNanos();
+                originalChain = sharedChain(control, state, storeUri, pipelineId, noteDeadline);
+                namespace = ConnectorStateNamespace.ofShared(originalChain);
+                Await.until("the connector to have filed the identity it minted", remaining(noteDeadline),
+                        () -> note(state, namespace, SERVER_NAME, noteDeadline).isPresent(),
                         () -> "nothing under " + namespace);
-                minted = note(storeUri, namespace, SERVER_NAME).orElseThrow();
+                minted = note(state, namespace, SERVER_NAME, noteDeadline).orElseThrow();
             }
 
             // The server is gone; on the real-process tier its whole JVM is gone. The store it wrote, the
@@ -114,12 +125,20 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
                 // Liveness first: a run that never started would leave the stored value untouched too, and
                 // "unchanged" would then be satisfied by nothing having happened at all.
                 update(mysql, AFTER_THE_RESTART);
-                awaitCustomer(mongo, target, AFTER_THE_RESTART, "a change made after the restart");
+                long noteDeadline = System.nanoTime() + WAIT.toNanos();
+                Await.until("a change made after the restart", remaining(noteDeadline),
+                        () -> AFTER_THE_RESTART.equals(customer(mongo, target)),
+                        () -> String.valueOf(customer(mongo, target)));
+                String resumedChain = sharedChain(control, state, storeUri, pipelineId, noteDeadline);
+                assertThat(resumedChain).as("the live restarted pipeline still consumes its actual original physical chain")
+                        .isEqualTo(originalChain);
+                assertThat(ConnectorStateNamespace.ofShared(resumedChain)).isEqualTo(namespace);
+                Optional<byte[]> restored = note(state, namespace, SERVER_NAME, noteDeadline);
 
-                assertThat(note(storeUri, namespace, SERVER_NAME))
+                assertThat(restored)
                         .as("the identity after a run that came back and is carrying changes")
                         .isPresent();
-                assertThat(note(storeUri, namespace, SERVER_NAME).orElseThrow())
+                assertThat(restored.orElseThrow())
                         .as("the run that came back is running under the identity the first one minted, "
                                 + "not one of its own: a fresh identity is what leaves a recorded position "
                                 + "filed under a name nothing looks it up by")
@@ -129,17 +148,49 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
     }
 
     /** One of the connector's own notes, read straight out of the store as the bytes it was written as. */
-    private static Optional<byte[]> note(String storeUri, String namespace, String key) {
-        try (MongoClient client = MongoClients.create(storeUri)) {
-            Document id = new Document("ns", namespace).append("k", key);
-            Document found = client.getDatabase(STATE_DATABASE)
-                    .getCollection(STATE_COLLECTION)
-                    .find(new Document("_id", id))
-                    .first();
-            return Optional.ofNullable(found)
-                    .map(document -> document.get("state", Binary.class))
-                    .map(Binary::getData);
-        }
+    private static Optional<byte[]> note(MongoClient client, String namespace, String key, long deadline) {
+        Document id = new Document("ns", namespace).append("k", key);
+        Document found = client.getDatabase(STATE_DATABASE)
+                .getCollection(STATE_COLLECTION)
+                .find(new Document("_id", id))
+                .projection(new Document("state", 1))
+                .maxTime(remaining(deadline).toNanos(), TimeUnit.NANOSECONDS)
+                .first();
+        return Optional.ofNullable(found)
+                .map(document -> document.get("state", Binary.class))
+                .map(Binary::getData);
+    }
+
+    private static String sharedChain(ControlPlane control, MongoClient client, String storeUri,
+            String pipelineId, long deadline) {
+        remaining(deadline);
+        var position = control.positionRead(pipelineId);
+        assertThat(position.pipelineId()).isEqualTo(pipelineId);
+        var matching = position.chains().stream().filter(chain -> SOURCE_ID.equals(chain.sourceId())
+                && chain.tables().contains(TABLE)).toList();
+        assertThat(matching).as("the public position names this pipeline source and table's actual chain").hasSize(1);
+        String chainId = matching.getFirst().chainId();
+        assertThat(chainId).isNotBlank();
+        String consumerId = SrsConsumerId.of(pipelineId, SOURCE_ID).value();
+        String database = new ConnectionString(storeUri).getDatabase();
+        assertThat(database).isNotBlank();
+        Document consumer = client.getDatabase(database).getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS)
+                .find(new Document("_id", new Document("chain", chainId).append("pipeline", consumerId)))
+                .projection(new Document("miningChainId", 1).append("pipelineId", 1)
+                        .append("ownerPipelineId", 1).append("sourceNodeId", 1))
+                .maxTime(remaining(deadline).toNanos(), TimeUnit.NANOSECONDS).first();
+        assertThat(consumer).as("the exact scoped consumer binds the actual pipeline and source to that chain").isNotNull();
+        assertThat(consumer.getString("miningChainId")).isEqualTo(chainId);
+        assertThat(consumer.getString("pipelineId")).isEqualTo(consumerId);
+        assertThat(consumer.getString("ownerPipelineId")).isEqualTo(pipelineId);
+        assertThat(consumer.getString("sourceNodeId")).isEqualTo(SOURCE_ID);
+        return chainId;
+    }
+
+    private static Duration remaining(long deadline) {
+        long left = deadline - System.nanoTime();
+        assertThat(left).as("the existing connector identity phase budget remains positive").isPositive();
+        return Duration.ofNanos(left);
     }
 
     private static void seedOneRow(Map<String, Object> settings) throws Exception {

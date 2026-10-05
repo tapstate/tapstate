@@ -23,4 +23,5 @@ steps:
   - await: { doc: { tgt_mongo.orders: { where: { id: 1, sku: c }, expect: { customer: ada, items.sku: c } } } }
   - await: { doc: { tgt_mongo.orders: { where: { id: 2, sku: d }, expect: { customer: grace, items.sku: d } } } }
   # Every expected key is present; the exact count leaves no room for stale rows.
+  - await: { state: RUNNING }
   - assert: { state: RUNNING }
