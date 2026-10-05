@@ -142,12 +142,19 @@ class PurgeReleasesTheSlotIT {
     /**
      * Inserts row {@code id} into {@code table} and waits for it at the target: the pipeline reading it is
      * then carrying changes through the slot, not only holding one.
+     *
+     * <p>An empty transaction is committed just before the row, so the row never begins exactly where the
+     * position a resumed capture started from ends. A capture resuming from a position recorded after a commit
+     * skips a change that begins there (tapstate/tapstate#639). That defect is not what this test measures, and
+     * the row it would skip is the one each segment relies on to show that a pipeline still reads through the
+     * slot.
      */
     private static void carry(Map<String, Object> source, Target target, String table, int id) throws Exception {
         Await.until("a slot on " + source.get("database") + " held by a reader", BOUND,
                 () -> PostgresSlots.active(source), () -> String.valueOf(PostgresSlots.of(source)));
         try (Connection connection = SharedPostgres.connect(source);
                 Statement statement = connection.createStatement()) {
+            statement.execute("SELECT pg_current_xact_id()");
             statement.execute("INSERT INTO " + table + " (id, name) VALUES (" + (100 + id) + ", 'r" + id + "')");
         }
         Await.until("row " + (100 + id) + " of " + table + " at the target", BOUND,
