@@ -124,6 +124,40 @@ has   "Cloud checks Web files and revision"         cloud-image 'web-provenance[
 has   "Cloud retains the checked archive"           cloud-image 'name: cloud-image-sealed'
 has   "a failed Cloud image blocks approval"         gates       'needs:.*cloud-image'
 hasnt "Cloud does not rebuild Web"                   cloud-image 'pnpm build|prepare-web-assets[.]sh|mvn .*package'
+has   "Cloud runtime proof waits for the paired OP image" cloud-image 'needs:.*server-image'
+has   "Cloud runtime proof downloads the already-built OP archive" cloud-image 'name: server-image'
+has   "the OP archive is verified before the paired runtime proof" cloud-image 'onprem-web-provenance-check[.]json'
+has   "paired OP proof checks its exact Boot byte digest" cloud-image '\-\-boot-jar-sha256.*needs[.]server-image[.]outputs[.]boot_jar_sha256'
+has   "the runtime importer selects an explicit native Linux architecture" cloud-image 'skopeo .*\-\-override-os linux .*\-\-override-arch'
+has   "the runtime importer consumes the checked OCI archive" cloud-image 'oci-archive:'
+has   "the runtime importer only creates a local Docker archive" cloud-image 'docker-archive:'
+# shellcheck disable=SC2016
+has   "the immutable loaded image is exported for exact config proof" cloud-image 'docker image save .*"\$image_id"'
+# shellcheck disable=SC2016
+has   "loaded raw config bytes match the selected original OCI configs" cloud-image 'test "\$loaded_config_digest" = "\$expected_config_digest"'
+has   "loaded rootfs diff IDs are checked" cloud-image 'json [.]RootFS[.]Layers'
+has   "the original publish archives remain unchanged" cloud-image 'sha256sum \-\-check .*runtime-image-archives[.]sha256'
+# shellcheck disable=SC2016
+has   "real container smoke receives immutable image IDs" cloud-image 'cloud-image-smoke[.]sh "\$\{images\[0\]\}" "\$\{images\[1\]\}"'
+hasnt "runtime proof cannot rebuild the checked image" cloud-image '(^|[[:space:]])\-\-build([[:space:]]|$)'
+hasnt "a failed runtime proof cannot be ignored" cloud-image 'continue-on-error:|cloud-image-smoke[.]sh.*\|\|'
+
+cloud_verify_at="$(job cloud-image | grep -n 'verify-image[.]py' | head -1 | cut -d: -f1)"
+onprem_verify_at="$(job cloud-image | grep -n 'onprem-web-provenance-check[.]json' | head -1 | cut -d: -f1)"
+cloud_runtime_at="$(job cloud-image | grep -n 'cloud-image-smoke[.]sh' | head -1 | cut -d: -f1)"
+cloud_seal_at="$(job cloud-image | grep -n 'seal-cloud-artifact[.]mjs seal' | head -1 | cut -d: -f1)"
+cloud_upload_at="$(job cloud-image | grep -n 'actions/upload-artifact' | head -1 | cut -d: -f1)"
+if [ -n "$cloud_verify_at" ] && [ -n "$onprem_verify_at" ] && [ -n "$cloud_runtime_at" ] \
+    && [ -n "$cloud_seal_at" ] && [ -n "$cloud_upload_at" ] \
+    && [ "$cloud_verify_at" -lt "$onprem_verify_at" ] \
+    && [ "$onprem_verify_at" -lt "$cloud_runtime_at" ] \
+    && [ "$cloud_runtime_at" -lt "$cloud_seal_at" ] \
+    && [ "$cloud_seal_at" -lt "$cloud_upload_at" ]; then
+  ok "static validation precedes real runtime proof, sealing and upload"
+else
+  bad "static validation precedes real runtime proof, sealing and upload" \
+    "Cloud verify ${cloud_verify_at:-none}, OP verify ${onprem_verify_at:-none}, runtime ${cloud_runtime_at:-none}, seal ${cloud_seal_at:-none}, upload ${cloud_upload_at:-none}"
+fi
 
 # Cloud publishes only through release, after the same approval as OP. Intermediate artifacts
 # must remain authenticated ciphertext even though this repository's Actions runs are public.
