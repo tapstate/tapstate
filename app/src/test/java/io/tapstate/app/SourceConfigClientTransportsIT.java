@@ -20,6 +20,8 @@ import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
@@ -51,7 +53,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** Actual JVM CLI and isolated stdio MCP processes over encrypted Mongo-backed HTTP. */
+/** Actual CLI and isolated stdio MCP processes over encrypted Mongo-backed HTTP. */
 @RequiresDocker
 class SourceConfigClientTransportsIT {
 
@@ -69,23 +71,25 @@ class SourceConfigClientTransportsIT {
     @TempDir Path work;
     private int processSequence;
 
-    @Test
-    void cliSavedConnectionProbesReceiveTheWholeDecryptedConfigurationWithoutReturningIt() throws Exception {
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("cliFlavors")
+    void cliSavedConnectionProbesReceiveTheWholeDecryptedConfigurationWithoutReturningIt(CliFlavor flavor)
+            throws Exception {
         try (Fixture fixture = start(false)) {
             String token = fixture.mint("write");
             var probes = fixture.context.getBean(SharedConnectorSourceModesIT.RecordingProbes.class);
             for (String connector : List.of("mongodb", "mongodb-atlas", "mysql", "oracle", "aws-rds-mysql")) {
                 String id = "cli_probe_" + connector.replace('-', '_');
                 Map<String, Object> config = config(connector, SECRET);
-                success(cli(fixture, token, "apply", file(source(id, connector, config)).toString()));
+                success(cli(fixture, flavor, token, "apply", file(source(id, connector, config)).toString()));
                 Document before = fixture.document(id);
                 encrypted(fixture, id, config);
 
-                success(cli(fixture, token, "test", id, "-o", "json"));
+                success(cli(fixture, flavor, token, "test", id, "-o", "json"));
                 assertThat(probes.tested.id()).isEqualTo(id);
                 assertThat(probes.tested.connectorId()).isEqualTo(connector);
                 sameConfig(probes.tested.settings(), config);
-                success(cli(fixture, token, "discover-schema", id, "-o", "json"));
+                success(cli(fixture, flavor, token, "discover-schema", id, "-o", "json"));
                 assertThat(probes.discovered.id()).isEqualTo(id);
                 assertThat(probes.discovered.connectorId()).isEqualTo(connector);
                 sameConfig(probes.discovered.settings(), config);
@@ -94,43 +98,44 @@ class SourceConfigClientTransportsIT {
         }
     }
 
-    @Test
-    void cliReplayPartialEditsAndExplicitReplacementKeepCiphertextAndRealCas() throws Exception {
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("cliFlavors")
+    void cliReplayPartialEditsAndExplicitReplacementKeepCiphertextAndRealCas(CliFlavor flavor) throws Exception {
         try (Fixture fixture = start(false)) {
             String token = fixture.mint("write");
             String id = "cli_source";
             Map<String, Object> original = config("mongodb-atlas", SECRET);
-            success(cli(fixture, token, "apply", file(source(id, "mongodb-atlas", original)).toString()));
+            success(cli(fixture, flavor, token, "apply", file(source(id, "mongodb-atlas", original)).toString()));
             encrypted(fixture, id, original);
             Document before = fixture.document(id);
             StoredArtifact displayed = fixture.view(id);
-            CliReply get = cli(fixture, token, "get", id);
+            CliReply get = cli(fixture, flavor, token, "get", id);
             success(get);
             assertThat(get.out.strip()).isEqualTo(displayed.canonicalForm().strip());
             safeProjection(get.out);
-            success(cli(fixture, token, "ls", "source"));
+            success(cli(fixture, flavor, token, "ls", "source"));
 
-            CliReply replay = cli(fixture, token, "apply", file(get.out).toString(),
+            CliReply replay = cli(fixture, flavor, token, "apply", file(get.out).toString(),
                     "--if-match", displayed.contentHash());
             success(replay);
             assertThat(replay.out).contains("unchanged");
             assertThat(fixture.document(id)).isEqualTo(before);
 
             String partial = envelope(id, "mongodb-atlas") + "metadata: { description: client-edited }\n";
-            success(cli(fixture, token, "apply", file(partial).toString(), "--if-match", displayed.contentHash()));
+            success(cli(fixture, flavor, token, "apply", file(partial).toString(), "--if-match", displayed.contentHash()));
             encrypted(fixture, id, original);
             assertThat(fixture.source(id).metadata().description()).isEqualTo("client-edited");
             Document edited = fixture.document(id);
-            CliReply stale = cli(fixture, token, "apply", file(partial).toString(),
+            CliReply stale = cli(fixture, flavor, token, "apply", file(partial).toString(),
                     "--if-match", displayed.contentHash());
             refusal(stale, "artifact.version-conflict");
             assertThat(fixture.document(id)).isEqualTo(edited);
 
             Map<String, Object> replacement = Map.of("uri", uri(REPLACEMENT));
-            success(cli(fixture, token, "apply", file(source(id, "mongodb-atlas", replacement)).toString()));
+            success(cli(fixture, flavor, token, "apply", file(source(id, "mongodb-atlas", replacement)).toString()));
             encrypted(fixture, id, replacement);
             assertThat(fixture.source(id).config()).doesNotContainKey("nested");
-            success(cli(fixture, token, "apply", file(source(id, "mongodb-atlas", Map.of())).toString()));
+            success(cli(fixture, flavor, token, "apply", file(source(id, "mongodb-atlas", Map.of())).toString()));
             encrypted(fixture, id, Map.of());
         }
     }
@@ -288,10 +293,12 @@ class SourceConfigClientTransportsIT {
             List<Document> before = cloud.snapshot();
             List<Document> audit = cloud.audit();
             for (String credential : List.of(localToken, "controlled-outbound-token", cloud.credential)) {
-                refusal(cli(cloud, credential, "get", id), "control.unauthenticated");
-                refusal(cli(cloud, credential, "apply", file(source(
-                        "cloud_rejected_source", "mongodb-atlas", config("mongodb-atlas", REPLACEMENT))).toString()),
-                        "control.unauthenticated");
+                for (CliFlavor flavor : cliFlavors()) {
+                    refusal(cli(cloud, flavor, credential, "get", id), "control.unauthenticated");
+                    refusal(cli(cloud, flavor, credential, "apply", file(source(
+                            "cloud_rejected_source", "mongodb-atlas", config("mongodb-atlas", REPLACEMENT))).toString()),
+                            "control.unauthenticated");
+                }
                 try (McpSession mcp = mcp(cloud, credential, true)) {
                     mcp.refused("artifact_get", Map.of("id", id), "control.unauthenticated");
                     mcp.refused("source_list", Map.of(), "control.unauthenticated");
@@ -391,12 +398,33 @@ class SourceConfigClientTransportsIT {
     }
 
     private CliReply cli(Fixture fixture, String token, String... words) throws Exception {
+        return cli(fixture, CliFlavor.JVM, token, words);
+    }
+
+    private enum CliFlavor { JVM, NATIVE }
+
+    /** An explicit native input adds real binary cases; the ordinary reactor remains JVM-only. */
+    private static List<CliFlavor> cliFlavors() {
+        return System.getenv().containsKey("TAPSTATE_TEST_NATIVE_CLI")
+                ? List.of(CliFlavor.JVM, CliFlavor.NATIVE) : List.of(CliFlavor.JVM);
+    }
+
+    private CliReply cli(Fixture fixture, CliFlavor flavor, String token, String... words) throws Exception {
         Path home = Files.createDirectory(work.resolve("cli-" + (++processSequence)));
         Path stdout = home.resolve("stdout");
         Path stderr = home.resolve("stderr");
-        String classpath = System.getProperty("surefire.test.class.path", System.getProperty("java.class.path"));
-        List<String> command = new ArrayList<>(List.of(java(), "-Duser.home=" + home,
-                "-cp", classpath, Cli.class.getName(), "-c", fixture.baseUrl));
+        List<String> command = new ArrayList<>();
+        if (flavor == CliFlavor.NATIVE) {
+            String configured = System.getenv("TAPSTATE_TEST_NATIVE_CLI");
+            assertThat(configured).as("the native transport witness requires an explicit binary").isNotBlank();
+            Path binary = Path.of(configured);
+            assertThat(binary).isAbsolute().isRegularFile().isExecutable();
+            command.addAll(List.of(binary.toString(), "-Duser.home=" + home));
+        } else {
+            String classpath = System.getProperty("surefire.test.class.path", System.getProperty("java.class.path"));
+            command.addAll(List.of(java(), "-Duser.home=" + home, "-cp", classpath, Cli.class.getName()));
+        }
+        command.addAll(List.of("-c", fixture.baseUrl));
         command.addAll(List.of(words));
         ProcessBuilder builder = new ProcessBuilder(command).directory(home.toFile())
                 .redirectOutput(stdout.toFile()).redirectError(stderr.toFile());
@@ -405,7 +433,10 @@ class SourceConfigClientTransportsIT {
         Process process = builder.start();
         try {
             assertThat(process.waitFor(30, TimeUnit.SECONDS)).as("the owned CLI process completed").isTrue();
-            return new CliReply(process.exitValue(), Files.readString(stdout), Files.readString(stderr));
+            CliReply reply = new CliReply(process.exitValue(), Files.readString(stdout), Files.readString(stderr));
+            assertThat(reply.out + reply.err).as("CLI output must not expose the supplied credential")
+                    .doesNotContain(token);
+            return reply;
         } finally {
             stop(process);
         }
