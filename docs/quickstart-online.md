@@ -967,8 +967,12 @@ is no blanket guarantee of recovery after that history expires.
 | Read mode | Recovery of a running pipeline after a single-member restart |
 | --- | --- |
 | `snapshot_and_cdc` (default) | Skip tables whose initial load this pipeline's sinks already confirmed. Read each unconfirmed table again from the beginning, keeping its recorded snapshot generation and original pre-snapshot CDC position, then resume changes from the recorded position. There is no durable cursor within an unfinished table's snapshot. |
-| `cdc_only` | Take no initial snapshot. Reopen CDC at the saved source position; when none exists, use the configured initial `start_from`. |
+| `cdc_only` | Take no initial snapshot. Reopen CDC at a saved source checkpoint or proven start anchor. The configured initial `start_from` applies only to fresh initialization. If a previously started channel has neither anchor, restart is refused with `capture.recovery-progress-unproven` and the pipeline becomes `FAILED`. |
 | `snapshot_only` | Read the selected data again for an interrupted active load. There is no CDC recovery chain or durable snapshot row cursor. |
+
+For `capture.recovery-progress-unproven`, keep the retained state for diagnosis.
+Perform a full reload, or explicitly accept a new CDC-only baseline and the missing
+interval. The runtime does not clear retained state automatically.
 
 With shared SRS enabled, capture resumes from its persisted source checkpoint and
 each pipeline source continues from its own recorded per-table progress in the
