@@ -34,6 +34,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -923,6 +924,108 @@ class PdkCapturePortTest {
         assertThat(failure.get())
                 .as("an interruption caused by subscription close is normal teardown")
                 .isNull();
+    }
+
+    /**
+     * The interrupt a close sends wakes whatever the batch is waiting in, and that need not answer with a
+     * {@link CancellationException}: a store write breaks off with its driver's own exception, as the
+     * capture's checkpoint write does. The close is still what stopped the stream.
+     */
+    @Test
+    void closingACdcSubscriptionDoesNotReportAWriteItsInterruptBrokeOffAsAFailure(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.emittingSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.EmittingSource", null));
+        ParkedBatch parked = new ParkedBatch(
+                interrupted -> new IllegalStateException("the checkpoint write was interrupted", interrupted));
+
+        closeWhileParked(port.cdc(config("t1"), CaptureStart.present(), parked), parked);
+
+        assertThat(parked.failure.get())
+                .as("an interruption caused by subscription close is normal teardown, whatever it surfaces as")
+                .isNull();
+    }
+
+    /**
+     * A connector may wrap whatever its hand-over throws in an exception of its own on the way out, as a
+     * binlog reader does, so even the {@link CancellationException} a parked batch answers with arrives
+     * wrapped. The close is still what stopped the stream.
+     */
+    @Test
+    void closingACdcSubscriptionDoesNotReportItsInterruptedBatchThroughAConnectorThatWrapsIt(@TempDir Path dir)
+            throws Exception {
+        Path jar = Synthetic.wrappingStreamSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.WrappingStream", null));
+        ParkedBatch parked = new ParkedBatch(
+                interrupted -> new CancellationException("the cdc batch was interrupted while it waited for room"));
+
+        closeWhileParked(port.cdc(config("t1"), CaptureStart.present(), parked), parked);
+
+        assertThat(parked.failure.get())
+                .as("an interruption caused by subscription close is normal teardown, however the connector wraps it")
+                .isNull();
+    }
+
+    /**
+     * A JVM error is not how a close stops a stream. Thrown on the way down from one, it is still reported,
+     * as it would have been had nobody closed the stream.
+     */
+    @Test
+    void aJvmErrorOnTheWayDownFromACloseIsStillReported(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.emittingSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.EmittingSource", null));
+        ParkedBatch parked = new ParkedBatch(interrupted -> {
+            throw new OutOfMemoryError("simulated while the batch waited");
+        });
+
+        closeWhileParked(port.cdc(config("t1"), CaptureStart.present(), parked), parked);
+
+        assertThat(parked.failure.get())
+                .as("a JVM error on a closed stream is reported, not taken for the close")
+                .isNotNull()
+                .hasRootCauseInstanceOf(OutOfMemoryError.class);
+    }
+
+    /**
+     * Closes {@code sub} once its stream is parked in a batch, and returns once the close has reached that
+     * batch. The close joins the stream, so a failure it was going to report has been reported by then.
+     */
+    private static void closeWhileParked(Subscription sub, ParkedBatch parked) throws InterruptedException {
+        try (sub) {
+            assertThat(parked.entered.await(5, TimeUnit.SECONDS)).as("the stream reached its parked batch").isTrue();
+        }
+        assertThat(parked.interrupted.await(5, TimeUnit.SECONDS))
+                .as("the close reached the parked batch, so the stream had a failure to report")
+                .isTrue();
+    }
+
+    /** Parks the first batch until a close interrupts it, then fails the way it was told to. */
+    private static final class ParkedBatch implements CaptureListener {
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch interrupted = new CountDownLatch(1);
+        final AtomicReference<Throwable> failure = new AtomicReference<>();
+        private final CountDownLatch released = new CountDownLatch(1);
+        private final Function<InterruptedException, RuntimeException> onInterrupt;
+
+        ParkedBatch(Function<InterruptedException, RuntimeException> onInterrupt) {
+            this.onInterrupt = onInterrupt;
+        }
+
+        @Override
+        public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+            entered.countDown();
+            try {
+                released.await();
+            } catch (InterruptedException interruption) {
+                Thread.currentThread().interrupt();
+                interrupted.countDown();
+                throw onInterrupt.apply(interruption);
+            }
+        }
+
+        @Override
+        public void onError(Throwable error) {
+            failure.set(error);
+        }
     }
 
     @Test

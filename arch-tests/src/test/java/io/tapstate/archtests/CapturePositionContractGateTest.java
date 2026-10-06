@@ -8,6 +8,7 @@ import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.CaptureStartedListener;
 import io.tapstate.spi.capture.SourcePosition;
+import io.tapstate.spi.capture.Subscription;
 import java.io.IOException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
@@ -51,10 +52,14 @@ class CapturePositionContractGateTest {
      * stated for it. Dropping that parameter compiles, leaves the build green, and leaves the durable read
      * offset with nothing to advance on — a pipeline that runs, reports healthy, and resumes from the
      * beginning every time.
+     *
+     * <p>{@code Subscription} is one of them because it is how a source is told the position it may release
+     * its change log up to. The method has a default that does nothing, so removing or renaming it compiles
+     * too, and every source then keeps its whole log while every pipeline runs as before.
      */
     private static final List<Class<?>> CONTRACT = List.of(
             CapturePort.class, CaptureBatch.class, CaptureStart.class, SourcePosition.class,
-            CaptureListener.class, CaptureStartedListener.class);
+            CaptureListener.class, CaptureStartedListener.class, Subscription.class);
 
     private static final Path GOLDEN = Path.of("src", "test", "resources", "capture-position-contract.golden");
 

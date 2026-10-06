@@ -2,6 +2,7 @@ package io.tapstate.runtime.srs;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.logging.LogSink;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.core.event.ChainPosition;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
@@ -18,6 +19,7 @@ import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
+import io.tapstate.spi.capture.SharedNotes;
 import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.LogScopedCapturePort;
@@ -2152,6 +2154,12 @@ class CaptureRunUnitTest {
         CaptureStart cdcStart;
         CaptureConfig cdcConfig;
         boolean cdcClosed;
+        /** Every position the run told this source it may release up to, in order. */
+        final List<String> acknowledged = new java.util.concurrent.CopyOnWriteArrayList<>();
+        /** Every config the run asked this source to let go of what it set up through, in order. */
+        final List<CaptureConfig> released = new java.util.concurrent.CopyOnWriteArrayList<>();
+        /** What this source answers a release with. */
+        Optional<TapstateException> refusal = Optional.empty();
 
         FakeSource(List<Envelope> snapshotRows, List<Envelope> changes) {
             this(snapshotRows, changes, "seam-0");
@@ -2188,12 +2196,26 @@ class CaptureRunUnitTest {
             cdcStart = start;
             if (cdcError != null) {
                 listener.onError(cdcError);
-                return () -> cdcClosed = true;
+                return subscription();
             }
             for (Envelope e : changes) {
                 listener.onBatch(java.util.List.of(e), Optional.of(new SourcePosition("src-" + e.ts())));
             }
-            return () -> cdcClosed = true;
+            return subscription();
+        }
+
+        private Subscription subscription() {
+            return new Subscription() {
+                @Override
+                public void acknowledge(SourcePosition durable) {
+                    acknowledged.add(durable.token());
+                }
+
+                @Override
+                public void close() {
+                    cdcClosed = true;
+                }
+            };
         }
 
         @Override
@@ -2204,6 +2226,12 @@ class CaptureRunUnitTest {
         @Override
         public DiscoveredSchema discoverSchema(CaptureConfig config) {
             throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public Optional<TapstateException> release(CaptureConfig config) {
+            released.add(config);
+            return refusal;
         }
     }
 
@@ -2283,7 +2311,7 @@ class CaptureRunUnitTest {
      * clobbering its sink-ack — enough to exercise the run unit's provision, cdc-start, offset and cursor
      * wiring without a store backend.
      */
-    private static class InMemoryMeta implements SrsMetaStore {
+    static class InMemoryMeta implements SrsMetaStore {
         /** Per chain and pipeline, how far each table's ring is done with -- kept once, never raised here. */
         final Map<String, Map<String, Long>> ringDone = new LinkedHashMap<>();
         private volatile String pausedPipeline;
@@ -2332,7 +2360,7 @@ class CaptureRunUnitTest {
                     .filter(c -> !c.pipelineId().equals(pipelineId))
                     .toList();
             records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), kept,
-                    m.schemaHistory(), m.retention(), m.epoch()));
+                    m.schemaHistory(), m.retention(), m.epoch(), m.sourceReadAt(), m.sourceReadDurable()));
         }
 
         final List<String> created = new ArrayList<>();
@@ -2340,6 +2368,11 @@ class CaptureRunUnitTest {
         int wholeRecordReads;
         int cursorReads;
         private final Map<String, SrsMeta> records = new LinkedHashMap<>();
+
+        /** Puts {@code record} in place as it stands, for a case that needs a field no write here sets. */
+        synchronized void seed(SrsMeta record) {
+            records.put(record.miningChainId(), record);
+        }
 
         @Override
         public synchronized Optional<SrsMeta> read(String miningChainId) {
@@ -2389,7 +2422,7 @@ class CaptureRunUnitTest {
             next.add(offset);
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), next,
-                    m.schemaHistory(), m.retention(), m.epoch()));
+                    m.schemaHistory(), m.retention(), m.epoch(), m.sourceReadAt(), m.sourceReadDurable()));
         }
 
         @Override
@@ -2427,7 +2460,7 @@ class CaptureRunUnitTest {
                     existing == null ? 0L : existing.snapshotEpoch()));
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), next,
-                    m.schemaHistory(), m.retention(), m.epoch()));
+                    m.schemaHistory(), m.retention(), m.epoch(), m.sourceReadAt(), m.sourceReadDurable()));
         }
 
         @Override
@@ -2452,7 +2485,7 @@ class CaptureRunUnitTest {
                     existing == null ? 0L : existing.snapshotEpoch()));
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), next,
-                    m.schemaHistory(), m.retention(), m.epoch()));
+                    m.schemaHistory(), m.retention(), m.epoch(), m.sourceReadAt(), m.sourceReadDurable()));
         }
 
         @Override
@@ -2477,7 +2510,7 @@ class CaptureRunUnitTest {
                     snapshotEpoch));
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), next,
-                    m.schemaHistory(), m.retention(), m.epoch()));
+                    m.schemaHistory(), m.retention(), m.epoch(), m.sourceReadAt(), m.sourceReadDurable()));
         }
 
         @Override
@@ -2486,7 +2519,7 @@ class CaptureRunUnitTest {
             long opened = m.epoch() + 1;
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), m.consumerOffsets(),
-                    m.schemaHistory(), m.retention(), opened));
+                    m.schemaHistory(), m.retention(), opened, m.sourceReadAt(), m.sourceReadDurable()));
             return opened;
         }
 
@@ -2497,7 +2530,7 @@ class CaptureRunUnitTest {
             next.add(version);
             records.put(miningChainId, new SrsMeta(
                     m.miningChainId(), m.sourceRead(), m.consumerOffsets(),
-                    next, m.retention(), m.epoch()));
+                    next, m.retention(), m.epoch(), m.sourceReadAt(), m.sourceReadDurable()));
         }
 
         @Override
@@ -2524,7 +2557,7 @@ class CaptureRunUnitTest {
                     mine == null ? null : mine.cdcStartPosition(),
                     mine == null ? 0L : mine.snapshotEpoch()));
             records.put(miningChainId, new SrsMeta(m.miningChainId(), m.sourceRead(), consumers,
-                    m.schemaHistory(), m.retention(), m.epoch()));
+                    m.schemaHistory(), m.retention(), m.epoch(), m.sourceReadAt(), m.sourceReadDurable()));
         }
 
         private SrsMeta require(String miningChainId) {
@@ -2875,5 +2908,142 @@ class CaptureRunUnitTest {
         runUnit(port, new InMemoryMeta())
                 .start(spec(ReadMode.CDC_ONLY, false, srsKey, startFrom), e -> { });
         return port.cdcStart;
+    }
+
+    /**
+     * A capture whose rings write through tells its source the checkpoint it resumes from the moment its
+     * stream is open: the source may let go of everything before it, because each consumer replays what it has
+     * not landed from the recoverable log rather than from the source.
+     */
+    @Test
+    void aSharedCaptureTellsItsSourceTheWriteThroughCheckpointItResumesFrom() {
+        HazelcastInstance member = emptyDurableMember();
+        try {
+            InMemoryMeta meta = new InMemoryMeta();
+            CaptureRunSpec owner = new CaptureRunSpec(config(), ReadMode.CDC_ONLY, "chain-acknowledged-checkpoint",
+                    true, "root_source", "root_pipeline", StartFrom.latest(), null, 0L)
+                    .withConsumerId(SrsConsumerId.of("root_pipeline", "root_source").value());
+            String chain = owner.miningChainId().value();
+            meta.create(chain, null);
+            FakeSource first = new FakeSource(List.of(), List.of());
+            try (CaptureRun initial = new CaptureRunUnit(first, new SrsCoordinator(meta), meta, member)
+                    .start(owner, e -> { })) {
+                assertThat(first.acknowledged).as("a fresh chain has no position to release up to").isEmpty();
+            }
+            SrsMeta record = meta.read(chain).orElseThrow();
+            meta.seed(new SrsMeta(chain, new ChainPosition(new SourceOrder(record.epoch(), 3L), "checkpoint-3"),
+                    record.consumerOffsets(), record.schemaHistory(), record.retention(), record.epoch(), null,
+                    true));
+
+            FakeSource restarted = new FakeSource(List.of(), List.of());
+            try (CaptureRun resumed = new CaptureRunUnit(restarted, new SrsCoordinator(meta), meta, member)
+                    .start(owner, e -> { })) {
+                assertThat(restarted.cdcStart)
+                        .isEqualTo(CaptureStart.resume(new SourcePosition("checkpoint-3")));
+                assertThat(restarted.acknowledged).containsExactly("checkpoint-3");
+            }
+        } finally {
+            member.shutdown();
+        }
+    }
+
+    /**
+     * A direct channel tells its source the position the channel resumes from, which only ever moves once its
+     * targets have confirmed what came before it; closing the run stops that and closes the tail.
+     */
+    @Test
+    void aDirectChannelTellsItsSourceTheCheckpointItResumesFrom() {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRunSpec spec = spec(ReadMode.CDC_ONLY, false, "chain-direct-acknowledged");
+        MiningChainId chainId = spec.miningChainId();
+        meta.create(chainId.value(), null);
+        meta.advanceSourceReadOffset(chainId.value(), new ChainPosition(new SourceOrder(1L, 7L), "src-11"));
+
+        FakeSource port = new FakeSource(List.of(), List.of());
+        try (CaptureRun run = runUnit(port, meta).start(spec, e -> { })) {
+            assertThat(port.cdcStart).isEqualTo(CaptureStart.resume(new SourcePosition("src-11")));
+            assertThat(port.acknowledged).containsExactly("src-11");
+        }
+        assertThat(port.cdcClosed).as("closing the run closes the tail it followed").isTrue();
+    }
+
+    /**
+     * A capture whose rings write through reads through the physical capture's notes, so letting go of what
+     * its connector set up is asked of those -- carried over from the node of the pipeline asking, all a
+     * cleared chain has left to carry from -- and not of the node's own notes, which such a capture never
+     * wrote to.
+     */
+    @Test
+    void aSharedCaptureIsReleasedThroughThePhysicalCapturesNotes() {
+        HazelcastInstance member = emptyDurableMember();
+        try {
+            InMemoryMeta meta = new InMemoryMeta();
+            CaptureRunSpec owner = new CaptureRunSpec(config(), ReadMode.CDC_ONLY, "chain-released-shared",
+                    true, "root_source", "root_pipeline", StartFrom.latest(), null, 0L)
+                    .withConsumerId(SrsConsumerId.of("root_pipeline", "root_source").value());
+            FakeSource port = new FakeSource(List.of(), List.of());
+
+            assertThat(new CaptureRunUnit(port, new SrsCoordinator(meta), meta, member).release(owner)).isEmpty();
+
+            PipelineNode node = new PipelineNode("root_pipeline", "root_source");
+            assertThat(port.released).singleElement().satisfies(released -> {
+                assertThat(released.sharedNotes())
+                        .isEqualTo(new SharedNotes(owner.miningChainId().value(), List.of(node)));
+                assertThat(released.node()).isEqualTo(node);
+            });
+        } finally {
+            member.shutdown();
+        }
+    }
+
+    /**
+     * A direct channel -- and a chain whose rings do not write through, which only a pipeline reading as its
+     * own consumer runs -- reads through its node's own notes, and letting go is asked of those; what the
+     * source refuses comes back as it was answered.
+     */
+    @Test
+    void aTailThroughTheNodesOwnNotesIsReleasedThroughThem() {
+        FakeSource port = new FakeSource(List.of(), List.of());
+        TapstateException refused = new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "no"), null);
+        port.refusal = Optional.of(refused);
+
+        assertThat(runUnit(port, new InMemoryMeta()).release(spec(ReadMode.CDC_ONLY, false, "chain-released-direct")))
+                .containsSame(refused);
+        assertThat(runUnit(port, new InMemoryMeta()).release(spec(ReadMode.CDC_ONLY, true, "chain-released-own")))
+                .containsSame(refused);
+
+        assertThat(port.released).hasSize(2).allSatisfy(released -> {
+            assertThat(released.sharedNotes()).isNull();
+            assertThat(released.node()).isEqualTo(new PipelineNode("pipe-1", "src-1"));
+        });
+    }
+
+    /** A read with no change tail set nothing up for one, so nothing is asked of its source. */
+    @Test
+    void aReadWithNoTailReleasesNothing() {
+        FakeSource port = new FakeSource(List.of(), List.of());
+
+        assertThat(runUnit(port, new InMemoryMeta()).release(spec(ReadMode.SNAPSHOT_ONLY, true))).isEmpty();
+        assertThat(runUnit(port, new InMemoryMeta()).release(spec(ReadMode.SNAPSHOT_ONLY, false))).isEmpty();
+
+        assertThat(port.released).isEmpty();
+    }
+
+    /**
+     * Closing the unit stops telling its tails' sources how far they may release: the thread that reads for
+     * them ends with the unit, rather than outliving the server that closed it.
+     */
+    @Test
+    void closingTheUnitStopsTellingItsSources() throws InterruptedException {
+        CaptureRunUnit unit = runUnit(new FakeSource(List.of(), List.of()), new InMemoryMeta());
+        assertThat(unit.acknowledging()).isTrue();
+
+        unit.close();
+
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (unit.acknowledging() && System.nanoTime() < deadline) {
+            Thread.sleep(20);
+        }
+        assertThat(unit.acknowledging()).as("the unit's reads stopped with it").isFalse();
     }
 }

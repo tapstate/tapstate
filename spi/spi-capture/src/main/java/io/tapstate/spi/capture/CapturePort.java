@@ -1,5 +1,6 @@
 package io.tapstate.spi.capture;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import java.util.Objects;
 import java.util.Optional;
@@ -69,4 +70,20 @@ public interface CapturePort {
 
     /** Discovers the streams and fields the source exposes. */
     DiscoveredSchema discoverSchema(CaptureConfig config);
+
+    /**
+     * Lets go of what the connector set up on the source to read changes through {@code config}'s notes -- a
+     * replication slot, say. Called once nothing reads through those notes any more and the state they belong
+     * to is being cleared: a resource left behind there is one nobody confirms again, and a source keeps its
+     * whole change log for it.
+     *
+     * <p>A source that refuses, or cannot be reached, keeps what it had. That is answered rather than thrown,
+     * as a coded refusal naming what is left there for somebody to remove by hand, because it must not stop
+     * the state being cleared. The notes are left as they are: they are the only record of what was set up,
+     * so dropping them is the caller's, after this returns. A port or connector with nothing to let go of
+     * answers empty, which is the default.
+     */
+    default Optional<TapstateException> release(CaptureConfig config) {
+        return Optional.empty();
+    }
 }

@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.mongodb.ConnectionString;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
+import com.mongodb.client.model.CountOptions;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.adapters.pdk.ConnectorStateNamespace;
 import io.tapstate.adapters.mongostore.MongoStorePort;
@@ -80,6 +81,7 @@ class RealMysqlToMongoSharedPositionIT {
                                 && !safeStart.equals(control.resumePoint(first).get("token")),
                         () -> "position=" + control.resumePoint(first) + ", logs=" + control.logs(first));
                 originalReader = sharedReader(control, state, store, first, "first_source", "orders", firstDeadline);
+                assertSinglePhysicalChain(state, store, firstDeadline);
                 firstIdentity = identity(state, originalReader, firstDeadline);
                 assertPhysicalSelection(state, store, originalReader.chainId(), List.of("orders"), firstDeadline);
 
@@ -93,6 +95,7 @@ class RealMysqlToMongoSharedPositionIT {
                 SharedReader secondReader = sharedReader(control, state, store, second, "second_source", "later_orders", joinedDeadline);
                 assertThat(firstReader).as("attaching another source does not replace the original physical reader")
                         .isEqualTo(originalReader);
+                assertSinglePhysicalChain(state, store, joinedDeadline);
                 assertThat(secondReader).as("both actual scoped consumers share one physical chain and notes namespace")
                         .isEqualTo(originalReader);
                 assertPhysicalSelection(state, store, originalReader.chainId(), List.of("orders", "later_orders"), joinedDeadline);
@@ -118,6 +121,7 @@ class RealMysqlToMongoSharedPositionIT {
                 SharedReader secondReader = sharedReader(control, state, store, second, "second_source", "later_orders", restartedDeadline);
                 assertThat(firstReader).as("the first live restarted consumer keeps its original physical chain")
                         .isEqualTo(originalReader);
+                assertSinglePhysicalChain(state, store, restartedDeadline);
                 assertThat(secondReader).as("the second live restarted consumer shares that exact chain and namespace")
                         .isEqualTo(originalReader);
                 assertPhysicalSelection(state, store, originalReader.chainId(), List.of("orders", "later_orders"), restartedDeadline);
@@ -243,6 +247,17 @@ class RealMysqlToMongoSharedPositionIT {
         assertThat(epoch).isPositive();
         assertThat(((Number) root.get("captureServingEpoch")).longValue())
                 .as("the serving union belongs to the current physical capture epoch").isEqualTo(epoch);
+    }
+
+    /** The isolated tier store must contain only the capture these pipelines actually consume. */
+    private static void assertSinglePhysicalChain(MongoClient client, String store, long deadline) {
+        String database = new ConnectionString(store).getDatabase();
+        assertThat(database).isNotBlank();
+        assertThat(client.getDatabase(database).getCollection(MongoStorePort.SRS_META)
+                .countDocuments(new Document(), new CountOptions()
+                        .maxTime(remaining(deadline).toNanos(), TimeUnit.NANOSECONDS)))
+                .as("one physical chain in this tier's isolated store")
+                .isEqualTo(1L);
     }
 
     private static Duration remaining(long deadline) {

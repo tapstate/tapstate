@@ -4,14 +4,16 @@ import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.adapters.pdk.PdkCapturePort;
 import io.tapstate.adapters.pdk.PdkExternalCallStats;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.engine.StoredCountSampler;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.runtime.scheduler.RebuildAdmission;
-import io.tapstate.runtime.srs.CaptureRunUnit;
+import io.tapstate.runtime.srs.CaptureHandoff;
 import io.tapstate.runtime.srs.CaptureRun;
 import io.tapstate.runtime.srs.CaptureRunSpec;
+import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.runtime.srs.SnapshotBuffer;
 import io.tapstate.runtime.srs.SourcePlacement;
@@ -21,7 +23,6 @@ import io.tapstate.spi.store.ConnectionTester;
 import io.tapstate.spi.store.ExecutionGenerationStore;
 import io.tapstate.spi.store.ClusterIdentity;
 import io.tapstate.spi.store.ClusterIdentityStore;
-import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.OperatorStateStores;
 import io.tapstate.spi.store.SrsMetaStore;
@@ -34,6 +35,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
 import java.util.UUID;
+import java.util.Optional;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -139,7 +141,7 @@ class DataPlaneActuationConfiguration {
                 io.tapstate.runtime.srs.SnapshotWorkers.DEFAULT_QUEUE_CAPACITY);
     }
 
-    @Bean
+    @Bean(destroyMethod = "close")
     CaptureRunUnit captureRunUnit(CapturePort capturePort, SrsCoordinator srsCoordinator,
             SrsMetaStore srsMetaStore, HazelcastInstance hazelcastMember,
             SnapshotBuffer snapshotBuffer, io.tapstate.runtime.srs.SnapshotWorkers snapshotWorkers) {
@@ -266,7 +268,17 @@ class DataPlaneActuationConfiguration {
         // Begun rather than started: a run comes back as soon as its load is open, and the load is read while
         // the pipeline's job takes it. Read to the end first, it would have to fit on the heap whole.
         // The attacher's widening path invokes the handler installed on the runtime's shared reader.
-        CaptureAttacher attacher = captureRunUnit::begin;
+        CaptureAttacher attacher = new CaptureAttacher() {
+            @Override
+            public CaptureRun start(CaptureRunSpec spec, CaptureHandoff handoff, boolean startTail) {
+                return captureRunUnit.begin(spec, handoff, startTail);
+            }
+
+            @Override
+            public Optional<TapstateException> release(CaptureRunSpec spec) {
+                return captureRunUnit.release(spec);
+            }
+        };
         if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
             return new StoreBackedPipelineCaptureCoordinator(
                     storePort, attacher, srsCoordinator, snapshotBuffer, lifecycleWork);

@@ -30,6 +30,18 @@ final class UnfinishedCdcJars {
                                 context.getConnectionConfig().getString("fixtureKey"));
                     }
                     public void registerCapabilities(ConnectorFunctions functions, TapCodecsRegistry codecs) {
+                        functions.supportFlushOffsetFunction((context, offset) -> {
+                            Map<String, Object> state = state(context);
+                            ((AtomicReference<Thread>) state.get("flushThread")).set(Thread.currentThread());
+                            ((CountDownLatch) state.get("flushEntered")).countDown();
+                            CountDownLatch release = (CountDownLatch) state.get("releaseFlush");
+                            while (true) {
+                                try { release.await(); break; }
+                                catch (InterruptedException ignored) {
+                                    ((AtomicInteger) state.get("flushInterrupts")).incrementAndGet();
+                                }
+                            }
+                        });
                         functions.supportStreamRead((context, tables, offset, size, consumer) -> {
                             Map<String, Object> state = state(context);
                             ((AtomicReference<Thread>) state.get("reader")).set(Thread.currentThread());
@@ -42,8 +54,14 @@ final class UnfinishedCdcJars {
                                     catch (InterruptedException ignored) { }
                                 }
                             } else {
+                                if ("ownedAcknowledgement".equals(state.get("mode"))) {
+                                    consumer.accept(List.<TapEvent>of(), 41L);
+                                }
                                 Thread callback = new Thread(() -> {
                                     try {
+                                        if ("ownedAcknowledgement".equals(state.get("mode"))) {
+                                            ((CountDownLatch) state.get("allowFlush")).await();
+                                        }
                                         consumer.accept(List.<TapEvent>of(TapInsertRecordEvent.create().table("t1")
                                                 .referenceTime(1L).after(Map.of("id", 1))), null);
                                     } catch (Throwable failure) {

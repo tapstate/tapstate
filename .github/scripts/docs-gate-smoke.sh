@@ -37,7 +37,10 @@ cat > "$scratch/bin/gh" <<'STUB'
 case "$1" in
   pr)
     for a in "$@"; do case "$a" in [0-9]*) n="$a"; break ;; esac; done
-    [ -f "$SMOKE_SCRATCH/pr/$n" ] || exit 1
+    if [ ! -f "$SMOKE_SCRATCH/pr/$n" ]; then
+      echo "GraphQL: Could not resolve to a PullRequest with the number of $n. (repository.pullRequest)" >&2
+      exit 1
+    fi
     cat "$SMOKE_SCRATCH/pr/$n" ;;
   issue)
     for a in "$@"; do case "$a" in *"/pull/"*) u="${a##*/pull/}" ;; esac; done
@@ -209,7 +212,10 @@ cat > "$scratch/bin/gh" <<'STUB'
 case "$1" in
   pr)
     for a in "$@"; do case "$a" in [0-9]*) n="$a"; break ;; esac; done
-    [ -f "$SMOKE_SCRATCH/pr/$n" ] || exit 1
+    if [ ! -f "$SMOKE_SCRATCH/pr/$n" ]; then
+      echo "GraphQL: Could not resolve to a PullRequest with the number of $n. (repository.pullRequest)" >&2
+      exit 1
+    fi
     cat "$SMOKE_SCRATCH/pr/$n" ;;
   issue) echo "HTTP 404: Not Found" >&2; exit 1 ;;
   *) exit 1 ;;
@@ -227,7 +233,10 @@ cat > "$scratch/bin/gh" <<'STUB'
 case "$1" in
   pr)
     for a in "$@"; do case "$a" in [0-9]*) n="$a"; break ;; esac; done
-    [ -f "$SMOKE_SCRATCH/pr/$n" ] || exit 1
+    if [ ! -f "$SMOKE_SCRATCH/pr/$n" ]; then
+      echo "GraphQL: Could not resolve to a PullRequest with the number of $n. (repository.pullRequest)" >&2
+      exit 1
+    fi
     cat "$SMOKE_SCRATCH/pr/$n" ;;
   issue)
     for a in "$@"; do case "$a" in *"/pull/"*) u="${a##*/pull/}" ;; esac; done

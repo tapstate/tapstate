@@ -3,6 +3,7 @@ package io.tapstate.adapters.pdk;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureStart;
+import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import java.nio.file.Path;
 import java.util.List;
@@ -21,6 +22,44 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class PdkConfirmedCdcEndTest {
+
+    @Test
+    void anEndedReadCannotConfirmItsStillRunningConnectorOwnedAcknowledgement(@TempDir Path directory)
+            throws Exception {
+        try (Fixture fixture = new Fixture(directory, "ownedAcknowledgement")) {
+            AtomicReference<SourcePosition> delivered = new AtomicReference<>();
+            Subscription capture = fixture.port().cdc(fixture.config(), CaptureStart.present(), (rows, position) ->
+                    position.ifPresent(delivered::set));
+            try {
+                assertThat(fixture.latch("readerEntered").await(5, TimeUnit.SECONDS)).isTrue();
+                fixture.join("reader");
+                assertThat(delivered.get()).as("the acknowledgement uses the position this source actually delivered")
+                        .isNotNull();
+                capture.acknowledge(delivered.get());
+                fixture.latch("allowFlush").countDown();
+                assertThat(fixture.latch("flushEntered").await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(fixture.thread("flushThread")).isSameAs(fixture.thread("callback"))
+                        .isNotSameAs(Thread.currentThread());
+                assertThat(fixture.thread("reader").isAlive()).isFalse();
+
+                assertUnfinished(capture);
+                assertThat(fixture.thread("callback").isAlive()).isTrue();
+                assertUnfinished(capture);
+                assertThat(fixture.counter("flushInterrupts").get())
+                        .as("closing wakes the downstream handover but does not interrupt a connector-owned flush")
+                        .isZero();
+
+                fixture.latch("releaseFlush").countDown();
+                fixture.join("callback");
+                assertThatCode(capture::close).doesNotThrowAnyException();
+                assertThatCode(capture::close).doesNotThrowAnyException();
+            } finally {
+                fixture.latch("allowFlush").countDown();
+                fixture.latch("releaseFlush").countDown();
+                fixture.join("reader"); fixture.join("callback"); capture.close();
+            }
+        }
+    }
 
     @Test
     void aNormallyReturningStopCannotConfirmAStreamThatIgnoresInterrupts(@TempDir Path directory) throws Exception {
@@ -91,9 +130,12 @@ class PdkConfirmedCdcEndTest {
             reference = new ConnectorRef(List.of(UnfinishedCdcJars.source(directory)),
                     "synthetic.UnfinishedCdcSource", "2.0.8", null);
             state.put("mode", mode); state.put("stops", new AtomicInteger());
+            state.put("flushInterrupts", new AtomicInteger());
             state.put("reader", new AtomicReference<Thread>()); state.put("callback", new AtomicReference<Thread>());
+            state.put("flushThread", new AtomicReference<Thread>());
             state.put("callbackFailure", new AtomicReference<Throwable>());
-            for (String name : List.of("readerEntered", "callbackEntered", "releaseRead", "releaseCallback")) {
+            for (String name : List.of("readerEntered", "callbackEntered", "releaseRead", "releaseCallback",
+                    "allowFlush", "flushEntered", "releaseFlush")) {
                 state.put(name, new CountDownLatch(1));
             }
             assertThat(System.getProperties().put(key, state)).isNull();
@@ -112,6 +154,7 @@ class PdkConfirmedCdcEndTest {
         }
         @Override public void close() throws InterruptedException {
             latch("releaseRead").countDown(); latch("releaseCallback").countDown();
+            latch("allowFlush").countDown(); latch("releaseFlush").countDown();
             try {
                 if (thread("reader") != null) { join("reader"); }
                 if (thread("callback") != null) { join("callback"); }

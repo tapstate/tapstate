@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.mongodb.ConnectionString;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
+import com.mongodb.client.model.CountOptions;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.adapters.pdk.ConnectorStateNamespace;
 import io.tapstate.adapters.mongostore.MongoStorePort;
@@ -109,6 +110,7 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
 
                 long noteDeadline = System.nanoTime() + WAIT.toNanos();
                 originalChain = sharedChain(control, state, storeUri, pipelineId, noteDeadline);
+                assertSinglePhysicalChain(state, storeUri, noteDeadline);
                 namespace = ConnectorStateNamespace.ofShared(originalChain);
                 Await.until("the connector to have filed the identity it minted", remaining(noteDeadline),
                         () -> note(state, namespace, SERVER_NAME, noteDeadline).isPresent(),
@@ -185,6 +187,17 @@ class AConnectorKeepsItsIdentityAcrossARestartIT {
         assertThat(consumer.getString("ownerPipelineId")).isEqualTo(pipelineId);
         assertThat(consumer.getString("sourceNodeId")).isEqualTo(SOURCE_ID);
         return chainId;
+    }
+
+    /** The isolated tier store must contain only the capture these pipelines actually consume. */
+    private static void assertSinglePhysicalChain(MongoClient client, String store, long deadline) {
+        String database = new ConnectionString(store).getDatabase();
+        assertThat(database).isNotBlank();
+        assertThat(client.getDatabase(database).getCollection(MongoStorePort.SRS_META)
+                .countDocuments(new Document(), new CountOptions()
+                        .maxTime(remaining(deadline).toNanos(), TimeUnit.NANOSECONDS)))
+                .as("one physical chain in this tier's isolated store")
+                .isEqualTo(1L);
     }
 
     private static Duration remaining(long deadline) {

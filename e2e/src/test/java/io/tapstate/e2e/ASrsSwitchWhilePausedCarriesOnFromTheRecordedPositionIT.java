@@ -282,14 +282,18 @@ class ASrsSwitchWhilePausedCarriesOnFromTheRecordedPositionIT {
                 .updateOne(new Document("_id", id), new Document("$set", new Document("name", name)));
     }
 
+    /** Checked, because a delete that matched nothing would leave the target agreeing for no reason. */
     private static void delete(MongoClient client, String database, int id) {
-        client.getDatabase(database).getCollection(COLLECTION).deleteOne(new Document("_id", id));
+        assertThat(client.getDatabase(database).getCollection(COLLECTION)
+                        .deleteOne(new Document("_id", id)).getDeletedCount())
+                .as("the source to have deleted document %d", id)
+                .isEqualTo(1L);
     }
 
     private static void awaitState(ControlPlane control, String pipelineId, PipelineState expected) {
         Await.until("%s to reach %s".formatted(pipelineId, expected), TIMEOUT,
                 () -> control.state(pipelineId).filter(expected::equals).isPresent(),
-                () -> String.valueOf(control.state(pipelineId)));
+                () -> control.state(pipelineId) + ", failure " + control.failureCode(pipelineId));
     }
 
     private static void awaitCount(MongoEndpoints mongo, EndpointAddress target, String what) {
