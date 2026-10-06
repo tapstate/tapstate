@@ -16,6 +16,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -74,6 +75,10 @@ final class LifecycleWorkDispatcher implements AutoCloseable {
 
     private final ConcurrentHashMap<String, Work> workByPipeline = new ConcurrentHashMap<>();
     private final Semaphore capacity;
+    private final int cleanupLimit;
+    private final AtomicBoolean shuttingDown = new AtomicBoolean();
+    private final AtomicInteger ownedCleanupPending = new AtomicInteger();
+    private final Object shutdownWorkGate = new Object();
     private final ThreadPoolExecutor workers;
     private final Instant startedAt = Instant.now();
     private final AtomicBoolean observed = new AtomicBoolean();
@@ -89,6 +94,7 @@ final class LifecycleWorkDispatcher implements AutoCloseable {
 
     private LifecycleWorkDispatcher() {
         this.capacity = null;
+        this.cleanupLimit = 1;
         this.workers = null;
         for (Verb verb : Verb.values()) {
             workDurations.put(verb, new DurationHistogram(HistogramBounds.LIFECYCLE_WORK_DURATION));
@@ -105,7 +111,8 @@ final class LifecycleWorkDispatcher implements AutoCloseable {
             throw new TapstateException(ActuationError.LIFECYCLE_DISPATCHER_INVALID_CAPACITY,
                     Map.of("maxConcurrency", maxConcurrency, "queueCapacity", queueCapacity), null);
         }
-        this.capacity = new Semaphore(Math.addExact(maxConcurrency, queueCapacity));
+        this.cleanupLimit = Math.addExact(maxConcurrency, queueCapacity);
+        this.capacity = new Semaphore(cleanupLimit);
         for (Verb verb : Verb.values()) {
             workDurations.put(verb, new DurationHistogram(HistogramBounds.LIFECYCLE_WORK_DURATION));
         }
@@ -134,6 +141,7 @@ final class LifecycleWorkDispatcher implements AutoCloseable {
         Objects.requireNonNull(desired, "desired");
         Objects.requireNonNull(reconcile, "reconcile");
         observed.set(true);
+        if (shuttingDown.get()) { return Submission.CAPACITY; }
         Work existing = workByPipeline.get(pipelineId);
         if (existing != null) {
             if (!desired.equals(existing.desired)) {
@@ -157,6 +165,12 @@ final class LifecycleWorkDispatcher implements AutoCloseable {
             }
             coalesced.incrementAndGet();
             return Submission.COALESCED;
+        }
+        if (shuttingDown.get()) {
+            offered.outcome = Outcome.cancelled();
+            offered.finished = true;
+            if (workByPipeline.remove(pipelineId, offered) && capacity != null) { capacity.release(); }
+            return Submission.CAPACITY;
         }
         if (workers == null) {
             offered.run();
@@ -199,14 +213,14 @@ final class LifecycleWorkDispatcher implements AutoCloseable {
 
     /** Returns one completed result, releasing its global slot only after the caller has it. */
     Outcome take(String pipelineId) {
-        Work work = workByPipeline.get(pipelineId);
-        if (work == null || work.outcome == null || !workByPipeline.remove(pipelineId, work)) {
-            return null;
+        synchronized (shutdownWorkGate) {
+            Work work = workByPipeline.get(pipelineId);
+            if (work == null || work.outcome == null || (shuttingDown.get() && !work.finished)
+                    || !workByPipeline.remove(pipelineId, work)) { return null; }
+            if (capacity != null) { capacity.release(); }
+            shutdownWorkGate.notifyAll();
+            return work.outcome;
         }
-        if (capacity != null) {
-            capacity.release();
-        }
-        return work.outcome;
     }
 
     /** A worker decision belongs only to the still accepted, uncancelled full intent. */
@@ -260,21 +274,120 @@ final class LifecycleWorkDispatcher implements AutoCloseable {
         return workByPipeline.size();
     }
 
+    /** Stops reconciliation admission before local resource teardown, without inventing desired intent. */
+    void beginOwnedShutdown() {
+        shuttingDown.set(true);
+        workByPipeline.forEach((pipelineId, work) -> {
+            work.supersede();
+            take(pipelineId);
+        });
+    }
+
+    /** Shutdown cannot qualify while an older accepted worker can still return a native handle. */
+    boolean awaitOwnedReconciliation(long deadline) throws InterruptedException {
+        synchronized (shutdownWorkGate) {
+            while (workByPipeline.values().stream().anyMatch(work -> !work.finished)) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) { return false; }
+                TimeUnit.NANOSECONDS.timedWait(shutdownWorkGate, remaining);
+            }
+            return true;
+        }
+    }
+
+    boolean ownedCleanupAccepting() { return workers == null || !workers.isShutdown(); }
+    int ownedCleanupLimit() { return cleanupLimit; }
+    int ownedCleanupPending() { return ownedCleanupPending.get(); }
+
+    /** A local cleanup uses the same worker and capacity budgets as lifecycle work. */
+    Optional<CompletableFuture<Void>> offerOwnedCleanup(Runnable action, long deadline) throws InterruptedException {
+        Objects.requireNonNull(action, "action");
+        if (!shuttingDown.get()) { throw new IllegalStateException("owned cleanup requires stopped admission"); }
+        if (!ownedCleanupAccepting()) { return Optional.empty(); }
+        if (workers != null) {
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0 || !capacity.tryAcquire(remaining, TimeUnit.NANOSECONDS)) { return Optional.empty(); }
+        }
+        OwnedCleanup cleanup = new OwnedCleanup(action);
+        ownedCleanupPending.incrementAndGet();
+        observed.set(true);
+        if (workers == null) {
+            // Direct focused fixtures keep the same inline execution model as ordinary reconciliation.
+            cleanup.run();
+            return Optional.of(cleanup.completion);
+        }
+        cleanup.queued.set(true);
+        int depth = queued.incrementAndGet();
+        try {
+            workers.execute(cleanup);
+            queueHighWater.accumulateAndGet(depth, Math::max);
+            return Optional.of(cleanup.completion);
+        } catch (java.util.concurrent.RejectedExecutionException unavailable) {
+            cleanup.discard();
+            return Optional.empty();
+        }
+    }
+
+    private final class OwnedCleanup implements Runnable {
+        private final Runnable action;
+        private final CompletableFuture<Void> completion = new CompletableFuture<>();
+        private final AtomicBoolean queued = new AtomicBoolean();
+        private final AtomicBoolean ended = new AtomicBoolean();
+
+        private OwnedCleanup(Runnable action) { this.action = action; }
+        private void leaveQueue() {
+            if (queued.compareAndSet(true, false)) { LifecycleWorkDispatcher.this.queued.decrementAndGet(); }
+        }
+        private void finish() {
+            if (ended.compareAndSet(false, true)) {
+                ownedCleanupPending.decrementAndGet();
+                if (capacity != null) { capacity.release(); }
+            }
+        }
+        private void discard() {
+            leaveQueue();
+            completion.completeExceptionally(new TapstateException(ActuationError.CAPTURE_SHUTDOWN_INCOMPLETE,
+                    Map.of("resources", 1, "timeout", Duration.ZERO.toString()),
+                    new java.util.concurrent.CancellationException("owned cleanup did not enter its worker")));
+            finish();
+        }
+        @Override public void run() {
+            leaveQueue();
+            activeSlots.incrementAndGet();
+            Throwable failure = null;
+            try { action.run(); }
+            catch (Throwable refused) { failure = refused; }
+            finally { activeSlots.decrementAndGet(); finish(); }
+            if (failure == null) { completion.complete(null); }
+            else { completion.completeExceptionally(failure); }
+            if (failure instanceof Error defect) { throw defect; }
+        }
+    }
+
     @Override
     public void close() {
-        cancelAll();
+        beginOwnedShutdown();
         if (workers == null) {
             return;
         }
-        workers.shutdownNow();
+        for (Runnable dropped : workers.shutdownNow()) {
+            if (dropped instanceof OwnedCleanup cleanup) { cleanup.discard(); }
+        }
         try {
             if (!workers.awaitTermination(Duration.ofSeconds(5).toNanos(), TimeUnit.NANOSECONDS)) {
                 workers.shutdownNow();
+                if (ownedCleanupPending.get() > 0) { throw incompleteOwnedCleanup(null); }
             }
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             workers.shutdownNow();
+            if (ownedCleanupPending.get() > 0) { throw incompleteOwnedCleanup(interrupted); }
         }
+    }
+
+    private TapstateException incompleteOwnedCleanup(Throwable cause) {
+        return new TapstateException(ActuationError.CAPTURE_SHUTDOWN_INCOMPLETE,
+                Map.of("resources", ownedCleanupPending.get(), "timeout", Duration.ofSeconds(5).toString()), cause);
     }
 
     private final class Work implements Runnable {
@@ -287,6 +400,7 @@ final class LifecycleWorkDispatcher implements AutoCloseable {
         private volatile Thread runner;
         private final AtomicBoolean wasCancelled = new AtomicBoolean();
         private volatile Outcome outcome;
+        private volatile boolean finished;
 
         private Work(String pipelineId, DesiredState desired, Supplier<ConvergeResult> reconcile,
                 long capacityWaitSinceNanos) {
@@ -307,6 +421,8 @@ final class LifecycleWorkDispatcher implements AutoCloseable {
             if (workers != null && workers.remove(this)) {
                 leaveQueue();
                 outcome = Outcome.cancelled();
+                finished = true;
+                if (shuttingDown.get()) { take(pipelineId); }
                 return;
             }
             Thread running = runner;
@@ -324,7 +440,7 @@ final class LifecycleWorkDispatcher implements AutoCloseable {
             logContext.restore();
             MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, pipelineId);
             try {
-                if (wasCancelled.get()) {
+                if (shuttingDown.get() || wasCancelled.get()) {
                     outcome = Outcome.cancelled();
                     return;
                 }
@@ -340,6 +456,11 @@ final class LifecycleWorkDispatcher implements AutoCloseable {
                 previousLogContext.restore();
                 runner = null;
                 activeSlots.decrementAndGet();
+                synchronized (shutdownWorkGate) {
+                    finished = true;
+                    if (shuttingDown.get()) { take(pipelineId); }
+                    shutdownWorkGate.notifyAll();
+                }
             }
         }
 

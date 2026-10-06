@@ -338,6 +338,8 @@ final class RealProcessServer implements ServerHandle {
         return tail(output);
     }
 
+    @Override public boolean terminated() { return !process.isAlive(); }
+
     @Override
     public void close() {
         process.destroy();

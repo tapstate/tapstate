@@ -88,86 +88,88 @@ class CrossEngineIdleStreamDoesNotStallFrontierIT {
     @ParameterizedTest
     @EnumSource(Tiers.class)
     void changesOnOneEngineAloneStillMoveWhatTheRunWouldResumeFrom(Tiers tier) throws Exception {
-        String suffix = tier.name().toLowerCase(Locale.ROOT);
-        String pipelineId = "cross_engine_idle_" + suffix;
+        try (SharedPostgres.Fixture postgresFixture = SharedPostgres.fixture()) {
+            String suffix = tier.name().toLowerCase(Locale.ROOT);
+            String pipelineId = "cross_engine_idle_" + suffix;
 
-        Map<String, Object> orders = SharedMySql.settings("idle_orders_" + suffix);
-        Map<String, Object> shipments = SharedPostgres.settings("idle_shipments_" + suffix);
-        createTables(orders, shipments);
-        seedRoots(orders);
+            Map<String, Object> orders = SharedMySql.settings("idle_orders_" + suffix);
+            Map<String, Object> shipments = postgresFixture.settings("idle_shipments_" + suffix);
+            createTables(orders, shipments);
+            seedRoots(orders);
 
-        String storeUri = SharedMongo.replicaSetUrl("idlestream_store_" + suffix);
-        String targetUri = SharedMongo.replicaSetUrl("idlestream_target_" + suffix);
+            String storeUri = SharedMongo.replicaSetUrl("idlestream_store_" + suffix);
+            String targetUri = SharedMongo.replicaSetUrl("idlestream_target_" + suffix);
 
-        try (ServerHandle server = tier.launch(storeUri);
-                MongoEndpoints mongo = new MongoEndpoints()) {
-            ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            try (ServerHandle server = postgresFixture.launch(() -> tier.launch(storeUri));
+                    MongoEndpoints mongo = new MongoEndpoints()) {
+                ControlPlane control = new ControlPlane(server.baseUrl());
+                control.bootstrapAndLogin("e2e", "e2e-password");
 
-            control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
-            control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
-            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+                control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
+                control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
+                control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 
-            Map<String, String> resources = new LinkedHashMap<>();
-            resources.put("src_orders.tap.yml", mysqlSourceYaml(orders));
-            resources.put("src_shipments.tap.yml", postgresSourceYaml(shipments));
-            resources.put("tgt_mongo.tap.yml", targetYaml(targetUri));
-            resources.put("pipeline.tap.yml", pipelineYaml(pipelineId));
-            control.apply(resources);
+                Map<String, String> resources = new LinkedHashMap<>();
+                resources.put("src_orders.tap.yml", mysqlSourceYaml(orders));
+                resources.put("src_shipments.tap.yml", postgresSourceYaml(shipments));
+                resources.put("tgt_mongo.tap.yml", targetYaml(targetUri));
+                resources.put("pipeline.tap.yml", pipelineYaml(pipelineId));
+                control.apply(resources);
 
-            control.discoverSchema("src_orders", "mysql", orders);
-            control.discoverSchema("src_shipments", "postgres", postgresDiscoveryConfig(shipments));
+                control.discoverSchema("src_orders", "mysql", orders);
+                control.discoverSchema("src_shipments", "postgres", postgresDiscoveryConfig(shipments));
 
-            control.lifecycle(pipelineId, LifecycleVerb.START);
+                control.lifecycle(pipelineId, LifecycleVerb.START);
 
-            Await.until("every root to be assembled and written", BOUND,
-                    () -> mongo.documents(EndpointAddress.uri(targetUri), ROOT_TABLE).size() == ROOTS,
-                    () -> mongo.documents(EndpointAddress.uri(targetUri), ROOT_TABLE).size() + " documents");
+                Await.until("every root to be assembled and written", BOUND,
+                        () -> mongo.documents(EndpointAddress.uri(targetUri), ROOT_TABLE).size() == ROOTS,
+                        () -> mongo.documents(EndpointAddress.uri(targetUri), ROOT_TABLE).size() + " documents");
 
-            // Traffic on both streams, so both chains exist and carry an offset to compare against.
-            changeOrders(orders, 1, WARMUP_PER_STREAM);
-            insertShipments(shipments, 1, WARMUP_PER_STREAM);
+                // Traffic on both streams, so both chains exist and carry an offset to compare against.
+                changeOrders(orders, 1, WARMUP_PER_STREAM);
+                insertShipments(shipments, 1, WARMUP_PER_STREAM);
 
-            Await.until("both chains to be carrying a durable offset", BOUND,
-                    () -> offsets(mongo, storeUri).size() >= 2,
-                    () -> String.valueOf(mongo.documents(EndpointAddress.uri(storeUri), CHAIN_RECORDS)));
-            Map<String, String> before = offsets(mongo, storeUri);
-            assertThat(before)
-                    .as("both chains have to be carrying an offset before one of them is asked to go "
-                            + "quiet - a run where the second engine never produced a chain record has "
-                            + "nothing idle in it, and would satisfy the assertion below having witnessed "
-                            + "nothing.%n  chain records: %s",
-                            mongo.documents(EndpointAddress.uri(storeUri), CHAIN_RECORDS))
-                    .hasSizeGreaterThanOrEqualTo(2);
+                Await.until("both chains to be carrying a durable offset", BOUND,
+                        () -> offsets(mongo, storeUri).size() >= 2,
+                        () -> String.valueOf(mongo.documents(EndpointAddress.uri(storeUri), CHAIN_RECORDS)));
+                Map<String, String> before = offsets(mongo, storeUri);
+                assertThat(before)
+                        .as("both chains have to be carrying an offset before one of them is asked to go "
+                                + "quiet - a run where the second engine never produced a chain record has "
+                                + "nothing idle in it, and would satisfy the assertion below having witnessed "
+                                + "nothing.%n  chain records: %s",
+                                mongo.documents(EndpointAddress.uri(storeUri), CHAIN_RECORDS))
+                        .hasSizeGreaterThanOrEqualTo(2);
 
-            // The narrow traffic: orders only. The shipments database is not touched again.
-            changeOrders(orders, WARMUP_PER_STREAM + 1, NARROW_CHANGES);
+                // The narrow traffic: orders only. The shipments database is not touched again.
+                changeOrders(orders, WARMUP_PER_STREAM + 1, NARROW_CHANGES);
 
-            Await.until("a chain's durable offset to move while the other engine stays quiet", BOUND,
-                    () -> !changed(before, offsets(mongo, storeUri)).isEmpty(),
-                    () -> "before " + before + ", now " + offsets(mongo, storeUri));
-            Map<String, String> after = offsets(mongo, storeUri);
-            assertThat(changed(before, after))
-                    .as("what the run would resume from, after %d changes that all belong to one of the "
-                            + "two engines. A chain that received nothing promises nothing new, and a job "
-                            + "held to the lowest promise stops here while every other reading stays "
-                            + "healthy.%n  before: %s%n  after:  %s%n  metrics: %s",
-                            NARROW_CHANGES, before, after, control.metrics(pipelineId))
-                    .isNotEmpty();
+                Await.until("a chain's durable offset to move while the other engine stays quiet", BOUND,
+                        () -> !changed(before, offsets(mongo, storeUri)).isEmpty(),
+                        () -> "before " + before + ", now " + offsets(mongo, storeUri));
+                Map<String, String> after = offsets(mongo, storeUri);
+                assertThat(changed(before, after))
+                        .as("what the run would resume from, after %d changes that all belong to one of the "
+                                + "two engines. A chain that received nothing promises nothing new, and a job "
+                                + "held to the lowest promise stops here while every other reading stays "
+                                + "healthy.%n  before: %s%n  after:  %s%n  metrics: %s",
+                                NARROW_CHANGES, before, after, control.metrics(pipelineId))
+                        .isNotEmpty();
 
-            assertThat(after.keySet())
-                    .as("the idle chain has to still be there at the end. One that disappeared instead of "
-                            + "being outrun is a different product, and it would pass the assertion above "
-                            + "for a reason that has nothing to do with what this is for.%n  before: %s%n"
-                            + "  after:  %s", before, after)
-                    .containsAll(before.keySet());
+                assertThat(after.keySet())
+                        .as("the idle chain has to still be there at the end. One that disappeared instead of "
+                                + "being outrun is a different product, and it would pass the assertion above "
+                                + "for a reason that has nothing to do with what this is for.%n  before: %s%n"
+                                + "  after:  %s", before, after)
+                        .containsAll(before.keySet());
 
-            // Read after the offset, so a run that died on the way cannot satisfy the assertions above
-            // by having stopped for the wrong reason.
-            assertThat(control.state(pipelineId))
-                    .as("the run has to be alive for a frontier reading to mean anything")
-                    .contains(PipelineState.RUNNING);
-            assertThat(control.errorCount(pipelineId)).contains(0L);
+                // Read after the offset, so a run that died on the way cannot satisfy the assertions above
+                // by having stopped for the wrong reason.
+                assertThat(control.state(pipelineId))
+                        .as("the run has to be alive for a frontier reading to mean anything")
+                        .contains(PipelineState.RUNNING);
+                assertThat(control.errorCount(pipelineId)).contains(0L);
+            }
         }
     }
 

@@ -83,58 +83,60 @@ class ASecondRunDoesNotLeakAReplicationSlotIT {
 
     @Test
     void aPipelineStartedAgainReusesTheSlotItsFirstRunRecorded() throws Exception {
-        Map<String, Object> source = SharedPostgres.settings(DATABASE);
-        createTable(source);
-        insert(source, 1);
+        try (SharedPostgres.Fixture postgresFixture = SharedPostgres.fixture()) {
+            Map<String, Object> source = postgresFixture.settings(DATABASE);
+            createTable(source);
+            insert(source, 1);
 
-        String storeUri = SharedMongo.replicaSetUrl("slot_reuse_store");
-        String targetUri = SharedMongo.replicaSetUrl("slot_reuse_target");
+            String storeUri = SharedMongo.replicaSetUrl("slot_reuse_store");
+            String targetUri = SharedMongo.replicaSetUrl("slot_reuse_target");
 
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(storeUri);
-                MongoEndpoints mongo = new MongoEndpoints()) {
-            ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
-            control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
-            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+            try (ServerHandle server = postgresFixture.launch(() -> Tiers.IN_PROCESS.launch(storeUri));
+                    MongoEndpoints mongo = new MongoEndpoints()) {
+                ControlPlane control = new ControlPlane(server.baseUrl());
+                control.bootstrapAndLogin("e2e", "e2e-password");
+                control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
+                control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 
-            Map<String, String> resources = new LinkedHashMap<>();
-            resources.put(SOURCE_ID + ".tap.yml", sourceYaml(source));
-            resources.put(TARGET_ID + ".tap.yml", targetYaml(targetUri));
-            resources.put(PIPELINE_ID + ".tap.yml", Workspaces.pipelineYaml(
-                    PIPELINE_ID, SOURCE_ID, TARGET_ID, TABLE));
-            control.apply(resources);
-            control.discoverSchema(SOURCE_ID, "postgres", discoveryConfig(source));
+                Map<String, String> resources = new LinkedHashMap<>();
+                resources.put(SOURCE_ID + ".tap.yml", sourceYaml(source));
+                resources.put(TARGET_ID + ".tap.yml", targetYaml(targetUri));
+                resources.put(PIPELINE_ID + ".tap.yml", Workspaces.pipelineYaml(
+                        PIPELINE_ID, SOURCE_ID, TARGET_ID, TABLE));
+                control.apply(resources);
+                control.discoverSchema(SOURCE_ID, "postgres", discoveryConfig(source));
 
-            // ---- the first run -----------------------------------------------------------------
-            control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
-            awaitState(control, PipelineState.RUNNING);
-            awaitActiveSlot(source, "the first run's change stream to take a replication slot");
-            // Proven to carry, not merely to have opened a slot: a change laid down while the run is live
-            // reaching the target is what says this pipeline works at all.
-            insert(source, 2);
-            Await.until("the first run to carry a change to the target", BOUND,
-                    () -> holdsRow(mongo, targetUri, 2),
-                    () -> String.valueOf(documentsIn(mongo, targetUri)));
+                // ---- the first run -----------------------------------------------------------------
+                control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
+                awaitState(control, PipelineState.RUNNING);
+                awaitActiveSlot(source, "the first run's change stream to take a replication slot");
+                // Proven to carry, not merely to have opened a slot: a change laid down while the run is live
+                // reaching the target is what says this pipeline works at all.
+                insert(source, 2);
+                Await.until("the first run to carry a change to the target", BOUND,
+                        () -> holdsRow(mongo, targetUri, 2),
+                        () -> String.valueOf(documentsIn(mongo, targetUri)));
 
-            List<String> afterTheFirstRun = slotNamesFor(source);
-            assertThat(afterTheFirstRun)
-                    .as("the first run made exactly one slot - without it there is nothing to reuse and "
-                            + "the count below would be met by a second run that never streamed")
-                    .hasSize(1);
+                List<String> afterTheFirstRun = slotNamesFor(source);
+                assertThat(afterTheFirstRun)
+                        .as("the first run made exactly one slot - without it there is nothing to reuse and "
+                                + "the count below would be met by a second run that never streamed")
+                        .hasSize(1);
 
-            control.stop(PIPELINE_ID, false);
-            awaitState(control, PipelineState.STOPPED);
+                control.stop(PIPELINE_ID, false);
+                awaitState(control, PipelineState.STOPPED);
 
-            // ---- the second run ----------------------------------------------------------------
-            control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
-            awaitState(control, PipelineState.RUNNING);
-            // An active slot, not a row: a row can arrive from this run's snapshot, which needs no slot.
-            awaitActiveSlot(source, "the second run's change stream to take a replication slot");
+                // ---- the second run ----------------------------------------------------------------
+                control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
+                awaitState(control, PipelineState.RUNNING);
+                // An active slot, not a row: a row can arrive from this run's snapshot, which needs no slot.
+                awaitActiveSlot(source, "the second run's change stream to take a replication slot");
 
-            assertThat(slotNamesFor(source))
-                    .as("the second run finds the slot its first run recorded and reuses it, leaving the "
-                            + "source database with one slot rather than one more")
-                    .isEqualTo(afterTheFirstRun);
+                assertThat(slotNamesFor(source))
+                        .as("the second run finds the slot its first run recorded and reuses it, leaving the "
+                                + "source database with one slot rather than one more")
+                        .isEqualTo(afterTheFirstRun);
+            }
         }
     }
 

@@ -5,6 +5,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -47,6 +48,7 @@ public final class SnapshotWorkers implements AutoCloseable {
 
     public final class Reservation implements AutoCloseable {
         private final AtomicBoolean released = new AtomicBoolean();
+        private final CountDownLatch ended = new CountDownLatch(1);
         private volatile Work work;
         private volatile boolean closed;
 
@@ -86,10 +88,19 @@ public final class SnapshotWorkers implements AutoCloseable {
             }
         }
 
+        /** True only after a never-started cancellation or the actual reserved task's finally. */
+        public boolean isReleased() { return released.get(); }
+
+        /** Waits on that same real task-exit fact without extending the caller's total deadline. */
+        public boolean awaitReleased(Duration remaining) throws InterruptedException {
+            return ended.await(remaining.toNanos(), TimeUnit.NANOSECONDS);
+        }
+
         private void release() {
             if (released.compareAndSet(false, true)) {
                 reservations.remove(this);
                 capacity.release();
+                ended.countDown();
             }
         }
     }

@@ -262,19 +262,28 @@ class DataPlaneActuationConfiguration {
     PipelineCaptureCoordinator pipelineCaptureCoordinator(
             StorePort storePort, CaptureRunUnit captureRunUnit, SrsCoordinator srsCoordinator,
             SnapshotBuffer snapshotBuffer, CaptureOwnership captureOwnership,
-            ClusterProperties clusterProperties) {
+            ClusterProperties clusterProperties, LifecycleWorkDispatcher lifecycleWork) {
         // Begun rather than started: a run comes back as soon as its load is open, and the load is read while
         // the pipeline's job takes it. Read to the end first, it would have to fit on the heap whole.
         // The attacher's widening path invokes the handler installed on the runtime's shared reader.
         CaptureAttacher attacher = captureRunUnit::begin;
         if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
             return new StoreBackedPipelineCaptureCoordinator(
-                    storePort, attacher, srsCoordinator, snapshotBuffer);
+                    storePort, attacher, srsCoordinator, snapshotBuffer, lifecycleWork);
         }
         return new StoreBackedPipelineCaptureCoordinator(
                 storePort, attacher, srsCoordinator, snapshotBuffer, captureOwnership,
                 clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE
-                        ? Duration.ZERO : clusterProperties.getWorkloadClaimRenewInterval());
+                        ? Duration.ZERO : clusterProperties.getWorkloadClaimRenewInterval(), lifecycleWork);
+    }
+
+    /** A context being inactive is not proof that its asynchronous local sources finished teardown. */
+    @Bean("localCaptureShutdownComplete")
+    java.util.function.BooleanSupplier localCaptureShutdownComplete(PipelineCaptureCoordinator capture) {
+        if (!(capture instanceof StoreBackedPipelineCaptureCoordinator owned)) {
+            throw new IllegalStateException("the configured local capture shutdown receipt is missing");
+        }
+        return owned::shutdownComplete;
     }
 
     @Bean

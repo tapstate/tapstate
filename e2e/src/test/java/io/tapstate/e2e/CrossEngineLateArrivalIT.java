@@ -95,123 +95,125 @@ class CrossEngineLateArrivalIT {
     @ParameterizedTest
     @EnumSource(Tiers.class)
     void aStreamArrivingLongAfterTheOtherStillReachesTheRightObject(Tiers tier) throws Exception {
-        String suffix = tier.name().toLowerCase(Locale.ROOT);
-        String pipelineId = "cross_engine_late_" + suffix;
+        try (SharedPostgres.Fixture postgresFixture = SharedPostgres.fixture()) {
+            String suffix = tier.name().toLowerCase(Locale.ROOT);
+            String pipelineId = "cross_engine_late_" + suffix;
 
-        Map<String, Object> orders = SharedMySql.settings("late_orders_" + suffix);
-        Map<String, Object> shipments = SharedPostgres.settings("late_shipments_" + suffix);
-        createTables(orders, shipments);
-        seedRoots(orders);
-        // The children of a root that does not exist, seeded before the run so the snapshot reads them.
-        // Ordering by construction rather than by waiting: these are read while the run starts, and the
-        // root they name is not written until several assertions later. Inserting them at that later
-        // point instead would only order the two writes, which says nothing about the order the two
-        // engines' streams reach the assembly - measured: with the writes ordered and nothing else, the
-        // root wins the race and the case stops discriminating at all.
-        insertShipments(shipments, List.of(shipment(7, LATE_ROOT, "dhl"), shipment(8, LATE_ROOT, "ups")));
+            Map<String, Object> orders = SharedMySql.settings("late_orders_" + suffix);
+            Map<String, Object> shipments = postgresFixture.settings("late_shipments_" + suffix);
+            createTables(orders, shipments);
+            seedRoots(orders);
+            // The children of a root that does not exist, seeded before the run so the snapshot reads them.
+            // Ordering by construction rather than by waiting: these are read while the run starts, and the
+            // root they name is not written until several assertions later. Inserting them at that later
+            // point instead would only order the two writes, which says nothing about the order the two
+            // engines' streams reach the assembly - measured: with the writes ordered and nothing else, the
+            // root wins the race and the case stops discriminating at all.
+            insertShipments(shipments, List.of(shipment(7, LATE_ROOT, "dhl"), shipment(8, LATE_ROOT, "ups")));
 
-        String storeUri = SharedMongo.replicaSetUrl("late_store_" + suffix);
-        String targetUri = SharedMongo.replicaSetUrl("late_target_" + suffix);
+            String storeUri = SharedMongo.replicaSetUrl("late_store_" + suffix);
+            String targetUri = SharedMongo.replicaSetUrl("late_target_" + suffix);
 
-        try (ServerHandle server = tier.launch(storeUri);
-                MongoEndpoints mongo = new MongoEndpoints()) {
-            ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            try (ServerHandle server = postgresFixture.launch(() -> tier.launch(storeUri));
+                    MongoEndpoints mongo = new MongoEndpoints()) {
+                ControlPlane control = new ControlPlane(server.baseUrl());
+                control.bootstrapAndLogin("e2e", "e2e-password");
 
-            control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
-            control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
-            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+                control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
+                control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
+                control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 
-            Map<String, String> resources = new LinkedHashMap<>();
-            resources.put("src_orders.tap.yml", mysqlSourceYaml(orders));
-            resources.put("src_shipments.tap.yml", postgresSourceYaml(shipments));
-            resources.put("tgt_mongo.tap.yml", targetYaml(targetUri));
-            resources.put("pipeline.tap.yml", pipelineYaml(pipelineId));
-            control.apply(resources);
+                Map<String, String> resources = new LinkedHashMap<>();
+                resources.put("src_orders.tap.yml", mysqlSourceYaml(orders));
+                resources.put("src_shipments.tap.yml", postgresSourceYaml(shipments));
+                resources.put("tgt_mongo.tap.yml", targetYaml(targetUri));
+                resources.put("pipeline.tap.yml", pipelineYaml(pipelineId));
+                control.apply(resources);
 
-            control.discoverSchema("src_orders", "mysql", orders);
-            control.discoverSchema("src_shipments", "postgres", postgresDiscoveryConfig(shipments));
+                control.discoverSchema("src_orders", "mysql", orders);
+                control.discoverSchema("src_shipments", "postgres", postgresDiscoveryConfig(shipments));
 
-            control.lifecycle(pipelineId, LifecycleVerb.START);
+                control.lifecycle(pipelineId, LifecycleVerb.START);
 
-            // The leading stream runs to completion and its documents are written out, with the other
-            // engine's table still empty. Waiting for the scalar column - not merely for three documents
-            // - is what makes the rest of this a statement about a document that already exists.
-            // Three, not four: the children seeded for the fourth root have been read by now, and a
-            // document is not written for a key whose root row has never arrived.
-            Await.until("the three roots to be assembled and written", BOUND,
-                    () -> documentsIn(mongo, targetUri).size() == 3,
-                    () -> String.valueOf(documentsIn(mongo, targetUri)));
-            assertThat(scalarOf(mongo, targetUri, LATE_CHILDREN_ROOT, "customer"))
-                    .as("the roots have to be assembled and written before any child exists, or the lag "
-                            + "this drives is not a lag at all")
-                    .isEqualTo("alice");
-            assertThat(arrayOf(mongo, targetUri, LATE_CHILDREN_ROOT))
-                    .as("no child row has been written yet, so nothing can be hanging under a root")
-                    .isEmpty();
+                // The leading stream runs to completion and its documents are written out, with the other
+                // engine's table still empty. Waiting for the scalar column - not merely for three documents
+                // - is what makes the rest of this a statement about a document that already exists.
+                // Three, not four: the children seeded for the fourth root have been read by now, and a
+                // document is not written for a key whose root row has never arrived.
+                Await.until("the three roots to be assembled and written", BOUND,
+                        () -> documentsIn(mongo, targetUri).size() == 3,
+                        () -> String.valueOf(documentsIn(mongo, targetUri)));
+                assertThat(scalarOf(mongo, targetUri, LATE_CHILDREN_ROOT, "customer"))
+                        .as("the roots have to be assembled and written before any child exists, or the lag "
+                                + "this drives is not a lag at all")
+                        .isEqualTo("alice");
+                assertThat(arrayOf(mongo, targetUri, LATE_CHILDREN_ROOT))
+                        .as("no child row has been written yet, so nothing can be hanging under a root")
+                        .isEmpty();
 
-            // Direction one: the children of roots that were written out long ago.
-            insertShipments(shipments, List.of(
-                    shipment(1, 1, "dhl"),
-                    shipment(2, 1, "ups"),
-                    shipment(3, 2, "fedex"),
-                    shipment(4, 3, "dhl"),
-                    shipment(5, 3, "ups"),
-                    shipment(6, 3, "fedex")));
+                // Direction one: the children of roots that were written out long ago.
+                insertShipments(shipments, List.of(
+                        shipment(1, 1, "dhl"),
+                        shipment(2, 1, "ups"),
+                        shipment(3, 2, "fedex"),
+                        shipment(4, 3, "dhl"),
+                        shipment(5, 3, "ups"),
+                        shipment(6, 3, "fedex")));
 
-            Await.until("the late children to reach the documents already written", BOUND,
-                    () -> sizeOf(mongo, targetUri, 1) == 2
-                            && sizeOf(mongo, targetUri, 2) == 1
-                            && sizeOf(mongo, targetUri, 3) == 3,
-                    () -> String.valueOf(documentsIn(mongo, targetUri)));
+                Await.until("the late children to reach the documents already written", BOUND,
+                        () -> sizeOf(mongo, targetUri, 1) == 2
+                                && sizeOf(mongo, targetUri, 2) == 1
+                                && sizeOf(mongo, targetUri, 3) == 3,
+                        () -> String.valueOf(documentsIn(mongo, targetUri)));
 
-            assertThat(List.of(sizeOf(mongo, targetUri, 1), sizeOf(mongo, targetUri, 2),
-                            sizeOf(mongo, targetUri, 3)))
-                    .as("children reaching a document that was written out before they existed. The three "
-                            + "lengths differ so that a constant, and an implementation hanging every child "
-                            + "on the first root, each fail at least one of them.%n  documents: %s",
-                            documentsIn(mongo, targetUri))
-                    .containsExactly(2, 1, 3);
+                assertThat(List.of(sizeOf(mongo, targetUri, 1), sizeOf(mongo, targetUri, 2),
+                                sizeOf(mongo, targetUri, 3)))
+                        .as("children reaching a document that was written out before they existed. The three "
+                                + "lengths differ so that a constant, and an implementation hanging every child "
+                                + "on the first root, each fail at least one of them.%n  documents: %s",
+                                documentsIn(mongo, targetUri))
+                        .containsExactly(2, 1, 3);
 
-            assertThat(scalarOf(mongo, targetUri, LATE_CHILDREN_ROOT, "customer"))
-                    .as("the root's own column, read back beside the array: a document whose array is "
-                            + "right and whose scalars were dropped on the way through is unusable, and "
-                            + "no assertion about the array notices it")
-                    .isEqualTo("alice");
+                assertThat(scalarOf(mongo, targetUri, LATE_CHILDREN_ROOT, "customer"))
+                        .as("the root's own column, read back beside the array: a document whose array is "
+                                + "right and whose scalars were dropped on the way through is unusable, and "
+                                + "no assertion about the array notices it")
+                        .isEqualTo("alice");
 
-            // Direction two: the root of the children that were read at the start of the run.
-            insertRoot(orders, LATE_ROOT, "dave");
+                // Direction two: the root of the children that were read at the start of the run.
+                insertRoot(orders, LATE_ROOT, "dave");
 
-            Await.until("the children that arrived before their root to appear under it", BOUND,
-                    () -> sizeOf(mongo, targetUri, LATE_ROOT) == 2,
-                    () -> String.valueOf(documentsIn(mongo, targetUri)));
-            assertThat(sizeOf(mongo, targetUri, LATE_ROOT))
-                    .as("children that arrived before their root have to be waiting for it, not dropped. "
-                            + "An implementation attaching a child to whichever root is present has "
-                            + "nothing to attach these to at the moment they arrive.%n  documents: %s",
-                            documentsIn(mongo, targetUri))
-                    .isEqualTo(2);
-            assertThat(scalarOf(mongo, targetUri, LATE_ROOT, "customer")).isEqualTo("dave");
+                Await.until("the children that arrived before their root to appear under it", BOUND,
+                        () -> sizeOf(mongo, targetUri, LATE_ROOT) == 2,
+                        () -> String.valueOf(documentsIn(mongo, targetUri)));
+                assertThat(sizeOf(mongo, targetUri, LATE_ROOT))
+                        .as("children that arrived before their root have to be waiting for it, not dropped. "
+                                + "An implementation attaching a child to whichever root is present has "
+                                + "nothing to attach these to at the moment they arrive.%n  documents: %s",
+                                documentsIn(mongo, targetUri))
+                        .isEqualTo(2);
+                assertThat(scalarOf(mongo, targetUri, LATE_ROOT, "customer")).isEqualTo("dave");
 
-            // A value carried by the lagging stream, asserted on the field it changed.
-            updateShipmentCarrier(shipments, 1, "maersk");
+                // A value carried by the lagging stream, asserted on the field it changed.
+                updateShipmentCarrier(shipments, 1, "maersk");
 
-            Await.until("the changed carrier to reach the document", BOUND,
-                    () -> carriersOf(mongo, targetUri, LATE_CHILDREN_ROOT).contains("maersk"),
-                    () -> String.valueOf(documentsIn(mongo, targetUri)));
-            assertThat(carriersOf(mongo, targetUri, LATE_CHILDREN_ROOT))
-                    .as("the changed field itself, in the document the change had to reach. The size stays "
-                            + "two either way, so a length assertion cannot see this one; and the value it "
-                            + "replaced has to be gone, since still-there-as-well is what an append rather "
-                            + "than an update looks like.%n  documents: %s", documentsIn(mongo, targetUri))
-                    .containsExactlyInAnyOrder("maersk", "ups");
+                Await.until("the changed carrier to reach the document", BOUND,
+                        () -> carriersOf(mongo, targetUri, LATE_CHILDREN_ROOT).contains("maersk"),
+                        () -> String.valueOf(documentsIn(mongo, targetUri)));
+                assertThat(carriersOf(mongo, targetUri, LATE_CHILDREN_ROOT))
+                        .as("the changed field itself, in the document the change had to reach. The size stays "
+                                + "two either way, so a length assertion cannot see this one; and the value it "
+                                + "replaced has to be gone, since still-there-as-well is what an append rather "
+                                + "than an update looks like.%n  documents: %s", documentsIn(mongo, targetUri))
+                        .containsExactlyInAnyOrder("maersk", "ups");
 
-            // Read after the assertions, so a run that died on the way cannot satisfy them by having
-            // stopped for the wrong reason.
-            assertThat(control.state(pipelineId))
-                    .as("the run has to be alive for any of the readings above to mean anything")
-                    .contains(PipelineState.RUNNING);
-            assertThat(control.errorCount(pipelineId)).contains(0L);
+                // Read after the assertions, so a run that died on the way cannot satisfy them by having
+                // stopped for the wrong reason.
+                assertThat(control.state(pipelineId))
+                        .as("the run has to be alive for any of the readings above to mean anything")
+                        .contains(PipelineState.RUNNING);
+                assertThat(control.errorCount(pipelineId)).contains(0L);
+            }
         }
     }
 

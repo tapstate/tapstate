@@ -17,6 +17,9 @@ import java.util.Set;
  */
 enum ActuationError implements TapstateErrorCode {
 
+    /** Local resource teardown did not establish completion before its fixed shutdown deadline. */
+    CAPTURE_SHUTDOWN_INCOMPLETE("actuation.capture-shutdown-incomplete", Set.of("resources", "timeout")),
+
     /** A start named a pipeline id with no stored artifact to run: {@code pipeline} is the id given. */
     PIPELINE_NOT_FOUND("actuation.pipeline-not-found", Set.of("pipeline")),
 

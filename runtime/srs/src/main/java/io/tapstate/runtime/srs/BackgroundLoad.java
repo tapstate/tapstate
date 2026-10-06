@@ -12,6 +12,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 /**
@@ -82,6 +83,7 @@ final class BackgroundLoad {
 
     /** The tail once it has opened, until the run is closed; guarded by this. */
     private Subscription opened;
+    private final AtomicReference<Throwable> closeFailure = new AtomicReference<>();
 
     BackgroundLoad(SnapshotPhase.Load load, CaptureHandoff handoff, Supplier<Optional<Subscription>> tail,
             CaptureHealth health, String threadName) {
@@ -131,7 +133,9 @@ final class BackgroundLoad {
     }
 
     boolean awaitFinished(Duration timeout) throws InterruptedException {
-        return finished.await(timeout.toNanos(), TimeUnit.NANOSECONDS);
+        boolean done = finished.await(timeout.toNanos(), TimeUnit.NANOSECONDS);
+        throwCloseFailure();
+        return done;
     }
 
     /**
@@ -157,9 +161,11 @@ final class BackgroundLoad {
         }
         // The batch being read is closed under the reader and a wait for room is interrupted: those are the
         // two places the thread can be parked for a long time, and neither ends by itself.
+        boolean alreadyFinished = finished();
+        Throwable failure = null;
+        try { load.close(); }
+        catch (RuntimeException | Error refused) { failure = refused; closeFailure.compareAndSet(null, refused); }
         try {
-            load.close();
-        } finally {
             if (queued) {
                 // A removed queued task never enters run(), so its close completes the handle here.
                 finished.countDown();
@@ -173,14 +179,18 @@ final class BackgroundLoad {
                 }
             }
             Subscription subscription;
-            synchronized (this) {
-                subscription = opened;
-                opened = null;
-            }
-            if (subscription != null) {
-                subscription.close();
-            }
+            synchronized (this) { subscription = opened; }
+            if (subscription != null) { closeTail(subscription); }
+        } catch (RuntimeException | Error refused) {
+            if (failure == null) { failure = refused; }
+            else if (failure != refused) { failure.addSuppressed(refused); }
         }
+        if (failure instanceof RuntimeException refused) { throw refused; }
+        if (failure instanceof Error defect) { throw defect; }
+        if (alreadyFinished) {
+            synchronized (this) { if (opened == null) { closeFailure.set(null); } }
+        }
+        throwCloseFailure();
     }
 
     /**
@@ -200,6 +210,18 @@ final class BackgroundLoad {
             }
         }
         load.close();
+    }
+
+    private void closeTail(Subscription actual) {
+        try { actual.close(); }
+        catch (RuntimeException | Error refused) { closeFailure.compareAndSet(null, refused); throw refused; }
+        synchronized (this) { if (opened == actual) { opened = null; } }
+    }
+
+    private void throwCloseFailure() {
+        Throwable refused = closeFailure.get();
+        if (refused instanceof RuntimeException runtime) { throw runtime; }
+        if (refused instanceof Error defect) { throw defect; }
     }
 
     private void run() {
@@ -223,13 +245,11 @@ final class BackgroundLoad {
             boolean keep;
             synchronized (this) {
                 keep = !cancelled;
-                if (keep) {
-                    opened = subscription.orElse(null);
-                }
+                opened = subscription.orElse(null);
             }
             if (!keep) {
                 // Abandoned while the tail was opening: nobody is left to close it but this thread.
-                subscription.ifPresent(Subscription::close);
+                subscription.ifPresent(this::closeTail);
             }
         } catch (RuntimeException | Error failure) {
             // A run closed while it ran was cut short by the stop somebody asked for. Anything else that cuts it
@@ -239,9 +259,9 @@ final class BackgroundLoad {
                 health.fail(failure);
             }
         } finally {
-            try {
-                load.close();
-            } finally {
+            try { load.close(); }
+            catch (RuntimeException | Error refused) { closeFailure.compareAndSet(null, refused); throw refused; }
+            finally {
                 synchronized (this) {
                     runner = null;
                     if (cancelled || loadLetGo) {

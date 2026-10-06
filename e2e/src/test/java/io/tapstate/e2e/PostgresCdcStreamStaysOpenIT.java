@@ -35,91 +35,93 @@ class PostgresCdcStreamStaysOpenIT {
 
     @Test
     void aFreshWideSourceDoesNotReopenItsCdcConnectionEverySecond() throws Exception {
-        Map<String, Object> postgres = SharedPostgres.settings(DATABASE);
-        List<String> tables = IntStream.range(0, 27).mapToObj(index -> "source_table_" + index).toList();
-        try (Connection connection = SharedPostgres.connect(postgres);
-                Statement statement = connection.createStatement()) {
-            for (String table : tables) {
-                statement.execute("CREATE TABLE " + table + " (id INT PRIMARY KEY, value TEXT)");
-            }
-            statement.execute("INSERT INTO source_table_0 VALUES (1, 'initial')");
-        }
-
-        String targetUri = SharedMongo.replicaSetUrl("cdc_stream_stays_open_target_523");
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(
-                SharedMongo.replicaSetUrl("cdc_stream_stays_open_store_523"));
-                MongoEndpoints mongo = new MongoEndpoints()) {
-            ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
-            control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
-            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
-
-            Map<String, String> resources = new LinkedHashMap<>();
-            resources.put("source.tap.yml", """
-                    version: tapstate/v1
-                    kind: source
-                    id: src_pg
-                    connector: postgres
-                    config: { host: %s, port: %s, database: %s, schema: public, user: %s, password: %s }
-                    mode: cdc
-                    tables: [ %s ]
-                    """.formatted(postgres.get("host"), postgres.get("port"), postgres.get("database"),
-                    postgres.get("username"), postgres.get("password"), String.join(", ", tables)));
-            resources.put("target.tap.yml", """
-                    version: tapstate/v1
-                    kind: source
-                    id: tgt_mongo
-                    connector: mongodb
-                    config: { uri: "%s" }
-                    """.formatted(targetUri));
-            resources.put("pipeline.tap.yml", """
-                    version: tapstate/v1
-                    kind: pipeline
-                    id: %s
-                    source: src_pg
-                    settings: { read_mode: snapshot_and_cdc }
-                    transforms:
-                      - { id: all_rows, from: /source_table_.*/, type: filter, expr: "true" }
-                    serve:
-                      from: all_rows
-                      sync:
-                        - source: tgt_mongo
-                    """.formatted(PIPELINE));
-            control.apply(resources);
-            Map<String, Object> discovery = new LinkedHashMap<>(postgres);
-            discovery.put("user", discovery.remove("username"));
-            discovery.put("schema", "public");
-            control.discoverSchema("src_pg", "postgres", discovery);
-            AtomicInteger poolStarts = new AtomicInteger();
-            Logger hikari = (Logger) LoggerFactory.getLogger("com.zaxxer.hikari.HikariDataSource");
-            AppenderBase<ILoggingEvent> observedStarts = new AppenderBase<>() {
-                @Override
-                protected void append(ILoggingEvent event) {
-                    String message = event.getFormattedMessage();
-                    if (message.startsWith("HikariPool-") && message.endsWith(" - Starting...")) {
-                        poolStarts.incrementAndGet();
-                    }
+        try (SharedPostgres.Fixture postgresFixture = SharedPostgres.fixture()) {
+            Map<String, Object> postgres = postgresFixture.settings(DATABASE);
+            List<String> tables = IntStream.range(0, 27).mapToObj(index -> "source_table_" + index).toList();
+            try (Connection connection = SharedPostgres.connect(postgres);
+                    Statement statement = connection.createStatement()) {
+                for (String table : tables) {
+                    statement.execute("CREATE TABLE " + table + " (id INT PRIMARY KEY, value TEXT)");
                 }
-            };
-            observedStarts.start();
-            hikari.addAppender(observedStarts);
-            try {
-                control.lifecycle(PIPELINE, LifecycleVerb.START);
-                Await.until("the snapshot row to reach MongoDB", START_BOUND,
-                        () -> mongo.count(EndpointAddress.uri(targetUri), "source_table_0") == 1,
-                        () -> control.logs(PIPELINE));
-                Await.until("the fresh PostgreSQL slot to become active", START_BOUND,
-                        () -> activeReplicationPids(postgres).size() == 1,
-                        () -> "active replication PIDs: " + activeReplicationPids(postgres)
-                                + "; pipeline logs: " + control.logs(PIPELINE));
-            } finally {
-                hikari.detachAppender(observedStarts);
-                observedStarts.stop();
+                statement.execute("INSERT INTO source_table_0 VALUES (1, 'initial')");
             }
-            assertThat(poolStarts.get())
-                    .as("a single fresh 27-table source opened a new pool pair for each table before "
-                            + "CDC became active, matching the reported start/warn/shutdown churn")
-                    .isBetween(1, 4);
+
+            String targetUri = SharedMongo.replicaSetUrl("cdc_stream_stays_open_target_523");
+            try (ServerHandle server = postgresFixture.launch(() -> Tiers.IN_PROCESS.launch(
+                    SharedMongo.replicaSetUrl("cdc_stream_stays_open_store_523")));
+                    MongoEndpoints mongo = new MongoEndpoints()) {
+                ControlPlane control = new ControlPlane(server.baseUrl());
+                control.bootstrapAndLogin("e2e", "e2e-password");
+                control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
+                control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+
+                Map<String, String> resources = new LinkedHashMap<>();
+                resources.put("source.tap.yml", """
+                        version: tapstate/v1
+                        kind: source
+                        id: src_pg
+                        connector: postgres
+                        config: { host: %s, port: %s, database: %s, schema: public, user: %s, password: %s }
+                        mode: cdc
+                        tables: [ %s ]
+                        """.formatted(postgres.get("host"), postgres.get("port"), postgres.get("database"),
+                        postgres.get("username"), postgres.get("password"), String.join(", ", tables)));
+                resources.put("target.tap.yml", """
+                        version: tapstate/v1
+                        kind: source
+                        id: tgt_mongo
+                        connector: mongodb
+                        config: { uri: "%s" }
+                        """.formatted(targetUri));
+                resources.put("pipeline.tap.yml", """
+                        version: tapstate/v1
+                        kind: pipeline
+                        id: %s
+                        source: src_pg
+                        settings: { read_mode: snapshot_and_cdc }
+                        transforms:
+                          - { id: all_rows, from: /source_table_.*/, type: filter, expr: "true" }
+                        serve:
+                          from: all_rows
+                          sync:
+                            - source: tgt_mongo
+                        """.formatted(PIPELINE));
+                control.apply(resources);
+                Map<String, Object> discovery = new LinkedHashMap<>(postgres);
+                discovery.put("user", discovery.remove("username"));
+                discovery.put("schema", "public");
+                control.discoverSchema("src_pg", "postgres", discovery);
+                AtomicInteger poolStarts = new AtomicInteger();
+                Logger hikari = (Logger) LoggerFactory.getLogger("com.zaxxer.hikari.HikariDataSource");
+                AppenderBase<ILoggingEvent> observedStarts = new AppenderBase<>() {
+                    @Override
+                    protected void append(ILoggingEvent event) {
+                        String message = event.getFormattedMessage();
+                        if (message.startsWith("HikariPool-") && message.endsWith(" - Starting...")) {
+                            poolStarts.incrementAndGet();
+                        }
+                    }
+                };
+                observedStarts.start();
+                hikari.addAppender(observedStarts);
+                try {
+                    control.lifecycle(PIPELINE, LifecycleVerb.START);
+                    Await.until("the snapshot row to reach MongoDB", START_BOUND,
+                            () -> mongo.count(EndpointAddress.uri(targetUri), "source_table_0") == 1,
+                            () -> control.logs(PIPELINE));
+                    Await.until("the fresh PostgreSQL slot to become active", START_BOUND,
+                            () -> activeReplicationPids(postgres).size() == 1,
+                            () -> "active replication PIDs: " + activeReplicationPids(postgres)
+                                    + "; pipeline logs: " + control.logs(PIPELINE));
+                } finally {
+                    hikari.detachAppender(observedStarts);
+                    observedStarts.stop();
+                }
+                assertThat(poolStarts.get())
+                        .as("a single fresh 27-table source opened a new pool pair for each table before "
+                                + "CDC became active, matching the reported start/warn/shutdown churn")
+                        .isBetween(1, 4);
+            }
         }
     }
 

@@ -44,124 +44,127 @@ class RealPostgresIndependentRecoveryIT {
     @ValueSource(strings = {"snapshot_and_cdc", "cdc_only"})
     void aStoppedDirectChannelRecoversHighAndADeleteAfterItsSiblingAlreadyConfirmedThem(
             String readMode) throws Exception {
-        String databaseName = "independent_postgres_" + readMode;
-        Map<String, Object> postgres = SharedPostgres.settings(databaseName);
-        try (Connection connection = SharedPostgres.connect(postgres); Statement sql = connection.createStatement()) {
-            assertThat(connection.getAutoCommit()).as("each statement is its own source transaction").isTrue();
-            sql.execute("CREATE TABLE support_case (id INT PRIMARY KEY, priority TEXT)");
-            sql.execute("ALTER TABLE support_case REPLICA IDENTITY FULL");
-            sql.execute("INSERT INTO support_case VALUES (1, 'Seeded')");
-        }
-        EndpointAddress slowTarget = EndpointAddress.uri(SharedMongo.replicaSetUrl(databaseName + "_slow"));
-        EndpointAddress fastTarget = EndpointAddress.uri(SharedMongo.replicaSetUrl(databaseName + "_fast"));
-        String storeUri = SharedMongo.replicaSetUrl(databaseName + "_state");
-
-        try (MongoClient reader = MongoClients.create(storeUri);
-                MongoEndpoints targets = new MongoEndpoints();
-                RealProcessServer server = RealProcessServer.start(storeUri, databaseName + "_operators");
-                Connection writer = SharedPostgres.connect(postgres);
-                Statement sql = writer.createStatement()) {
-            MongoDatabase store = reader.getDatabase(new ConnectionString(storeUri).getDatabase());
-            ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
-            control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
-            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
-            control.apply(workspace(postgres, slowTarget, fastTarget, readMode));
-            Map<String, Object> discovery = new LinkedHashMap<>(postgres);
-            discovery.put("user", discovery.remove("username"));
-            discovery.put("schema", "public");
-            control.discoverSchema(SLOW_SOURCE, "postgres", discovery);
-            control.discoverSchema(FAST_SOURCE, "postgres", discovery);
-            control.lifecycle(SLOW_PIPELINE, LifecycleVerb.START);
-            control.lifecycle(FAST_PIPELINE, LifecycleVerb.START);
-            awaitState(control, SLOW_PIPELINE, PipelineState.RUNNING);
-            awaitState(control, FAST_PIPELINE, PipelineState.RUNNING);
-            Await.until("two independent native PostgreSQL slots to be streaming", TIMEOUT,
-                    () -> activeSlots(postgres) == 2,
-                    () -> "slots=" + activeSlots(postgres) + ", logs=" + control.logs(SLOW_PIPELINE));
-            if (readMode.equals("cdc_only")) {
-                assertThat(targets.documents(slowTarget, TABLE))
-                        .as("CDC-only does not snapshot rows from before its own start").isEmpty();
-                assertThat(targets.documents(fastTarget, TABLE)).isEmpty();
-                sql.execute("DELETE FROM support_case WHERE id = 1");
+        try (SharedPostgres.Fixture postgresFixture = SharedPostgres.fixture()) {
+            String databaseName = "independent_postgres_" + readMode;
+            Map<String, Object> postgres = postgresFixture.settings(databaseName);
+            try (Connection connection = SharedPostgres.connect(postgres); Statement sql = connection.createStatement()) {
+                assertThat(connection.getAutoCommit()).as("each statement is its own source transaction").isTrue();
+                sql.execute("CREATE TABLE support_case (id INT PRIMARY KEY, priority TEXT)");
+                sql.execute("ALTER TABLE support_case REPLICA IDENTITY FULL");
                 sql.execute("INSERT INTO support_case VALUES (1, 'Seeded')");
-                awaitRow(control, targets, slowTarget, "1", "Seeded");
-                awaitRow(control, targets, fastTarget, "1", "Seeded");
-            } else {
-                awaitRow(control, targets, slowTarget, "1", "Seeded");
-                awaitRow(control, targets, fastTarget, "1", "Seeded");
             }
+            EndpointAddress slowTarget = EndpointAddress.uri(SharedMongo.replicaSetUrl(databaseName + "_slow"));
+            EndpointAddress fastTarget = EndpointAddress.uri(SharedMongo.replicaSetUrl(databaseName + "_fast"));
+            String storeUri = SharedMongo.replicaSetUrl(databaseName + "_state");
 
-            sql.execute("UPDATE support_case SET priority = 'Low' WHERE id = 1");
-            sql.execute("INSERT INTO support_case VALUES (3, 'delete-while-paused')");
-            awaitRow(control, targets, slowTarget, "1", "Low");
-            awaitRow(control, targets, fastTarget, "1", "Low");
-            awaitRow(control, targets, slowTarget, "3", "delete-while-paused");
-            awaitRow(control, targets, fastTarget, "3", "delete-while-paused");
-            sql.execute("INSERT INTO support_case VALUES (4, 'baseline-barrier')");
-            awaitRow(control, targets, slowTarget, "4", "baseline-barrier");
-            awaitRow(control, targets, fastTarget, "4", "baseline-barrier");
-            Await.until("both native channels to record confirmed database positions", TIMEOUT,
-                    () -> token(consumer(store, SLOW_PIPELINE, SLOW_SOURCE)) != null
-                            && token(consumer(store, FAST_PIPELINE, FAST_SOURCE)) != null
-                            && consumer(store, SLOW_PIPELINE, SLOW_SOURCE)
-                                    .getList("directBatches", Document.class).isEmpty()
-                            && consumer(store, FAST_PIPELINE, FAST_SOURCE)
-                                    .getList("directBatches", Document.class).isEmpty(),
-                    () -> consumers(store));
-            control.lifecycle(SLOW_PIPELINE, LifecycleVerb.PAUSE);
-            awaitState(control, SLOW_PIPELINE, PipelineState.PAUSED);
-            Document paused = consumer(store, SLOW_PIPELINE, SLOW_SOURCE);
-            long confirmedSequence = paused.get("sinkAckedSeq", Number.class).longValue();
-            String fastBefore = token(consumer(store, FAST_PIPELINE, FAST_SOURCE));
-            assertThat(paused.getString("miningChainId"))
-                    .isNotEqualTo(consumer(store, FAST_PIPELINE, FAST_SOURCE).getString("miningChainId"));
+            try (MongoClient reader = MongoClients.create(storeUri);
+                    MongoEndpoints targets = new MongoEndpoints();
+                    OwnedLaunch launched = launch(postgresFixture, storeUri, databaseName + "_operators");
+                    Connection writer = SharedPostgres.connect(postgres);
+                    Statement sql = writer.createStatement()) {
+                RealProcessServer server = launched.server();
+                MongoDatabase store = reader.getDatabase(new ConnectionString(storeUri).getDatabase());
+                ControlPlane control = new ControlPlane(server.baseUrl());
+                control.bootstrapAndLogin("e2e", "e2e-password");
+                control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
+                control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+                control.apply(workspace(postgres, slowTarget, fastTarget, readMode));
+                Map<String, Object> discovery = new LinkedHashMap<>(postgres);
+                discovery.put("user", discovery.remove("username"));
+                discovery.put("schema", "public");
+                control.discoverSchema(SLOW_SOURCE, "postgres", discovery);
+                control.discoverSchema(FAST_SOURCE, "postgres", discovery);
+                control.lifecycle(SLOW_PIPELINE, LifecycleVerb.START);
+                control.lifecycle(FAST_PIPELINE, LifecycleVerb.START);
+                awaitState(control, SLOW_PIPELINE, PipelineState.RUNNING);
+                awaitState(control, FAST_PIPELINE, PipelineState.RUNNING);
+                Await.until("two independent native PostgreSQL slots to be streaming", TIMEOUT,
+                        () -> activeSlots(postgres) == 2,
+                        () -> "slots=" + activeSlots(postgres) + ", logs=" + control.logs(SLOW_PIPELINE));
+                if (readMode.equals("cdc_only")) {
+                    assertThat(targets.documents(slowTarget, TABLE))
+                            .as("CDC-only does not snapshot rows from before its own start").isEmpty();
+                    assertThat(targets.documents(fastTarget, TABLE)).isEmpty();
+                    sql.execute("DELETE FROM support_case WHERE id = 1");
+                    sql.execute("INSERT INTO support_case VALUES (1, 'Seeded')");
+                    awaitRow(control, targets, slowTarget, "1", "Seeded");
+                    awaitRow(control, targets, fastTarget, "1", "Seeded");
+                } else {
+                    awaitRow(control, targets, slowTarget, "1", "Seeded");
+                    awaitRow(control, targets, fastTarget, "1", "Seeded");
+                }
 
-            long deliveredFrom = System.nanoTime();
-            sql.execute("UPDATE support_case SET priority = 'Low' WHERE id = 1");
-            sql.execute("UPDATE support_case SET priority = 'High' WHERE id = 1");
-            sql.execute("DELETE FROM support_case WHERE id = 3");
-            awaitRow(control, targets, fastTarget, "1", "High");
-            awaitMissing(control, targets, fastTarget, "3");
-            sql.execute("INSERT INTO support_case VALUES (5, 'after-high-barrier')");
-            awaitRow(control, targets, fastTarget, "5", "after-high-barrier");
-            long deliveryMillis = Duration.ofNanos(System.nanoTime() - deliveredFrom).toMillis();
-            Await.until("the healthy channel to advance its own confirmed position", TIMEOUT,
-                    () -> !fastBefore.equals(token(consumer(store, FAST_PIPELINE, FAST_SOURCE))),
-                    () -> consumers(store));
-            Await.until("the paused channel to register pending source changes beyond its confirmed prefix", TIMEOUT,
-                    () -> consumer(store, SLOW_PIPELINE, SLOW_SOURCE).getList("directBatches", Document.class)
-                            .stream().anyMatch(batch -> batch.get("targets", Document.class)
-                                    .get(TABLE, Number.class).longValue() >= confirmedSequence + 3),
-                    () -> consumers(store));
-            Document held = consumer(store, SLOW_PIPELINE, SLOW_SOURCE);
-            long firstPending = held.getList("directBatches", Document.class).getFirst()
-                    .get("seq", Number.class).longValue();
-            assertThat(held.get("sinkAckedSeq", Number.class).longValue())
-                    .as("a confirmed recovery prefix cannot pass the first pending source batch")
-                    .isLessThan(firstPending);
-            assertThat(row(targets, slowTarget, "1")).isEqualTo("Low");
-            assertThat(row(targets, slowTarget, "3")).isEqualTo("delete-while-paused");
+                sql.execute("UPDATE support_case SET priority = 'Low' WHERE id = 1");
+                sql.execute("INSERT INTO support_case VALUES (3, 'delete-while-paused')");
+                awaitRow(control, targets, slowTarget, "1", "Low");
+                awaitRow(control, targets, fastTarget, "1", "Low");
+                awaitRow(control, targets, slowTarget, "3", "delete-while-paused");
+                awaitRow(control, targets, fastTarget, "3", "delete-while-paused");
+                sql.execute("INSERT INTO support_case VALUES (4, 'baseline-barrier')");
+                awaitRow(control, targets, slowTarget, "4", "baseline-barrier");
+                awaitRow(control, targets, fastTarget, "4", "baseline-barrier");
+                Await.until("both native channels to record confirmed database positions", TIMEOUT,
+                        () -> token(consumer(store, SLOW_PIPELINE, SLOW_SOURCE)) != null
+                                && token(consumer(store, FAST_PIPELINE, FAST_SOURCE)) != null
+                                && consumer(store, SLOW_PIPELINE, SLOW_SOURCE)
+                                        .getList("directBatches", Document.class).isEmpty()
+                                && consumer(store, FAST_PIPELINE, FAST_SOURCE)
+                                        .getList("directBatches", Document.class).isEmpty(),
+                        () -> consumers(store));
+                control.lifecycle(SLOW_PIPELINE, LifecycleVerb.PAUSE);
+                awaitState(control, SLOW_PIPELINE, PipelineState.PAUSED);
+                Document paused = consumer(store, SLOW_PIPELINE, SLOW_SOURCE);
+                long confirmedSequence = paused.get("sinkAckedSeq", Number.class).longValue();
+                String fastBefore = token(consumer(store, FAST_PIPELINE, FAST_SOURCE));
+                assertThat(paused.getString("miningChainId"))
+                        .isNotEqualTo(consumer(store, FAST_PIPELINE, FAST_SOURCE).getString("miningChainId"));
 
-            control.stop(SLOW_PIPELINE, false);
-            awaitState(control, SLOW_PIPELINE, PipelineState.STOPPED);
-            Await.until("only the healthy native channel to remain active after the keep-state stop", TIMEOUT,
-                    () -> activeSlots(postgres) == 1,
-                    () -> "active slots=" + activeSlots(postgres));
-            long resumedFrom = System.nanoTime();
-            control.lifecycle(SLOW_PIPELINE, LifecycleVerb.START);
-            awaitState(control, SLOW_PIPELINE, PipelineState.RUNNING);
-            awaitRow(control, targets, slowTarget, "1", "High");
-            awaitMissing(control, targets, slowTarget, "3");
-            awaitRow(control, targets, slowTarget, "5", "after-high-barrier");
-            long recoveryMillis = Duration.ofNanos(System.nanoTime() - resumedFrom).toMillis();
-            Await.until("the resumed independent slot and its sibling to both be active", TIMEOUT,
-                    () -> activeSlots(postgres) == 2,
-                    () -> "active slots=" + activeSlots(postgres));
-            assertThat(control.errorCount(SLOW_PIPELINE)).contains(0L);
-            assertThat(row(targets, fastTarget, "1")).isEqualTo("High");
-            System.out.println("PostgreSQL direct " + readMode + " carried Low/High and a delete in "
-                    + deliveryMillis + " ms; its stopped sibling recovered in " + recoveryMillis + " ms.");
+                long deliveredFrom = System.nanoTime();
+                sql.execute("UPDATE support_case SET priority = 'Low' WHERE id = 1");
+                sql.execute("UPDATE support_case SET priority = 'High' WHERE id = 1");
+                sql.execute("DELETE FROM support_case WHERE id = 3");
+                awaitRow(control, targets, fastTarget, "1", "High");
+                awaitMissing(control, targets, fastTarget, "3");
+                sql.execute("INSERT INTO support_case VALUES (5, 'after-high-barrier')");
+                awaitRow(control, targets, fastTarget, "5", "after-high-barrier");
+                long deliveryMillis = Duration.ofNanos(System.nanoTime() - deliveredFrom).toMillis();
+                Await.until("the healthy channel to advance its own confirmed position", TIMEOUT,
+                        () -> !fastBefore.equals(token(consumer(store, FAST_PIPELINE, FAST_SOURCE))),
+                        () -> consumers(store));
+                Await.until("the paused channel to register pending source changes beyond its confirmed prefix", TIMEOUT,
+                        () -> consumer(store, SLOW_PIPELINE, SLOW_SOURCE).getList("directBatches", Document.class)
+                                .stream().anyMatch(batch -> batch.get("targets", Document.class)
+                                        .get(TABLE, Number.class).longValue() >= confirmedSequence + 3),
+                        () -> consumers(store));
+                Document held = consumer(store, SLOW_PIPELINE, SLOW_SOURCE);
+                long firstPending = held.getList("directBatches", Document.class).getFirst()
+                        .get("seq", Number.class).longValue();
+                assertThat(held.get("sinkAckedSeq", Number.class).longValue())
+                        .as("a confirmed recovery prefix cannot pass the first pending source batch")
+                        .isLessThan(firstPending);
+                assertThat(row(targets, slowTarget, "1")).isEqualTo("Low");
+                assertThat(row(targets, slowTarget, "3")).isEqualTo("delete-while-paused");
+
+                control.stop(SLOW_PIPELINE, false);
+                awaitState(control, SLOW_PIPELINE, PipelineState.STOPPED);
+                Await.until("only the healthy native channel to remain active after the keep-state stop", TIMEOUT,
+                        () -> activeSlots(postgres) == 1,
+                        () -> "active slots=" + activeSlots(postgres));
+                long resumedFrom = System.nanoTime();
+                control.lifecycle(SLOW_PIPELINE, LifecycleVerb.START);
+                awaitState(control, SLOW_PIPELINE, PipelineState.RUNNING);
+                awaitRow(control, targets, slowTarget, "1", "High");
+                awaitMissing(control, targets, slowTarget, "3");
+                awaitRow(control, targets, slowTarget, "5", "after-high-barrier");
+                long recoveryMillis = Duration.ofNanos(System.nanoTime() - resumedFrom).toMillis();
+                Await.until("the resumed independent slot and its sibling to both be active", TIMEOUT,
+                        () -> activeSlots(postgres) == 2,
+                        () -> "active slots=" + activeSlots(postgres));
+                assertThat(control.errorCount(SLOW_PIPELINE)).contains(0L);
+                assertThat(row(targets, fastTarget, "1")).isEqualTo("High");
+                System.out.println("PostgreSQL direct " + readMode + " carried Low/High and a delete in "
+                        + deliveryMillis + " ms; its stopped sibling recovered in " + recoveryMillis + " ms.");
+            }
         }
     }
 
@@ -169,104 +172,119 @@ class RealPostgresIndependentRecoveryIT {
     @ValueSource(strings = {"snapshot_and_cdc", "cdc_only"})
     void aSharedNativeCaptureKeepsItsSlotWhenAnotherSourceOwnsItAfterAProcessRestart(
             String readMode) throws Exception {
-        String databaseName = "shared_owner_postgres_" + readMode;
-        Map<String, Object> postgres = SharedPostgres.settings(databaseName);
-        try (Connection connection = SharedPostgres.connect(postgres); Statement sql = connection.createStatement()) {
-            assertThat(connection.getAutoCommit()).isTrue();
-            sql.execute("CREATE TABLE support_case (id INT PRIMARY KEY, priority TEXT)");
-            sql.execute("ALTER TABLE support_case REPLICA IDENTITY FULL");
-            sql.execute("INSERT INTO support_case VALUES (1, 'Seeded')");
-        }
-        EndpointAddress slowTarget = EndpointAddress.uri(SharedMongo.replicaSetUrl(databaseName + "_slow"));
-        EndpointAddress fastTarget = EndpointAddress.uri(SharedMongo.replicaSetUrl(databaseName + "_fast"));
-        String storeUri = SharedMongo.replicaSetUrl(databaseName + "_state");
-        String operatorDatabase = databaseName + "_operators";
-        try (MongoClient reader = MongoClients.create(storeUri);
-                MongoEndpoints targets = new MongoEndpoints();
-                Connection writer = SharedPostgres.connect(postgres);
-                Statement sql = writer.createStatement()) {
-            MongoDatabase store = reader.getDatabase(new ConnectionString(storeUri).getDatabase());
-            List<String> originalSlots;
-            String stoppedConfirmation;
-            try (RealProcessServer first = RealProcessServer.start(storeUri, operatorDatabase)) {
-                ControlPlane control = new ControlPlane(first.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
-                control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
-                control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
-                control.apply(workspace(postgres, slowTarget, fastTarget, readMode, true));
-                Map<String, Object> discovery = new LinkedHashMap<>(postgres);
-                discovery.put("user", discovery.remove("username"));
-                discovery.put("schema", "public");
-                control.discoverSchema(SLOW_SOURCE, "postgres", discovery);
-                control.discoverSchema(FAST_SOURCE, "postgres", discovery);
-                control.lifecycle(SLOW_PIPELINE, LifecycleVerb.START);
-                awaitState(control, SLOW_PIPELINE, PipelineState.RUNNING);
-                control.lifecycle(FAST_PIPELINE, LifecycleVerb.START);
-                awaitState(control, FAST_PIPELINE, PipelineState.RUNNING);
-                Await.until("one native slot to serve both shared sources", TIMEOUT,
-                        () -> activeSlots(postgres) == 1,
-                        () -> "slots=" + slotNames(postgres) + ", logs=" + control.logs(SLOW_PIPELINE));
-                if (readMode.equals("cdc_only")) {
-                    assertThat(targets.documents(slowTarget, TABLE)).isEmpty();
-                    assertThat(targets.documents(fastTarget, TABLE)).isEmpty();
-                    sql.execute("DELETE FROM support_case WHERE id = 1");
-                    sql.execute("INSERT INTO support_case VALUES (1, 'Low')");
-                } else {
-                    awaitRow(control, targets, slowTarget, "1", "Seeded");
-                    awaitRow(control, targets, fastTarget, "1", "Seeded");
-                    sql.execute("UPDATE support_case SET priority = 'Low' WHERE id = 1");
+        try (SharedPostgres.Fixture postgresFixture = SharedPostgres.fixture()) {
+            String databaseName = "shared_owner_postgres_" + readMode;
+            Map<String, Object> postgres = postgresFixture.settings(databaseName);
+            try (Connection connection = SharedPostgres.connect(postgres); Statement sql = connection.createStatement()) {
+                assertThat(connection.getAutoCommit()).isTrue();
+                sql.execute("CREATE TABLE support_case (id INT PRIMARY KEY, priority TEXT)");
+                sql.execute("ALTER TABLE support_case REPLICA IDENTITY FULL");
+                sql.execute("INSERT INTO support_case VALUES (1, 'Seeded')");
+            }
+            EndpointAddress slowTarget = EndpointAddress.uri(SharedMongo.replicaSetUrl(databaseName + "_slow"));
+            EndpointAddress fastTarget = EndpointAddress.uri(SharedMongo.replicaSetUrl(databaseName + "_fast"));
+            String storeUri = SharedMongo.replicaSetUrl(databaseName + "_state");
+            String operatorDatabase = databaseName + "_operators";
+            try (MongoClient reader = MongoClients.create(storeUri);
+                    MongoEndpoints targets = new MongoEndpoints();
+                    Connection writer = SharedPostgres.connect(postgres);
+                    Statement sql = writer.createStatement()) {
+                MongoDatabase store = reader.getDatabase(new ConnectionString(storeUri).getDatabase());
+                List<String> originalSlots;
+                String stoppedConfirmation;
+                try (OwnedLaunch launched = launch(postgresFixture, storeUri, operatorDatabase)) {
+                    RealProcessServer first = launched.server();
+                    ControlPlane control = new ControlPlane(first.baseUrl());
+                    control.bootstrapAndLogin("e2e", "e2e-password");
+                    control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
+                    control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+                    control.apply(workspace(postgres, slowTarget, fastTarget, readMode, true));
+                    Map<String, Object> discovery = new LinkedHashMap<>(postgres);
+                    discovery.put("user", discovery.remove("username"));
+                    discovery.put("schema", "public");
+                    control.discoverSchema(SLOW_SOURCE, "postgres", discovery);
+                    control.discoverSchema(FAST_SOURCE, "postgres", discovery);
+                    control.lifecycle(SLOW_PIPELINE, LifecycleVerb.START);
+                    awaitState(control, SLOW_PIPELINE, PipelineState.RUNNING);
+                    control.lifecycle(FAST_PIPELINE, LifecycleVerb.START);
+                    awaitState(control, FAST_PIPELINE, PipelineState.RUNNING);
+                    Await.until("one native slot to serve both shared sources", TIMEOUT,
+                            () -> activeSlots(postgres) == 1,
+                            () -> "slots=" + slotNames(postgres) + ", logs=" + control.logs(SLOW_PIPELINE));
+                    if (readMode.equals("cdc_only")) {
+                        assertThat(targets.documents(slowTarget, TABLE)).isEmpty();
+                        assertThat(targets.documents(fastTarget, TABLE)).isEmpty();
+                        sql.execute("DELETE FROM support_case WHERE id = 1");
+                        sql.execute("INSERT INTO support_case VALUES (1, 'Low')");
+                    } else {
+                        awaitRow(control, targets, slowTarget, "1", "Seeded");
+                        awaitRow(control, targets, fastTarget, "1", "Seeded");
+                        sql.execute("UPDATE support_case SET priority = 'Low' WHERE id = 1");
+                    }
+                    sql.execute("INSERT INTO support_case VALUES (3, 'delete-during-restart')");
+                    awaitRow(control, targets, slowTarget, "1", "Low");
+                    awaitRow(control, targets, fastTarget, "1", "Low");
+                    awaitRow(control, targets, slowTarget, "3", "delete-during-restart");
+                    awaitRow(control, targets, fastTarget, "3", "delete-during-restart");
+                    sql.execute("INSERT INTO support_case VALUES (4, 'owner-barrier')");
+                    awaitRow(control, targets, slowTarget, "4", "owner-barrier");
+                    awaitRow(control, targets, fastTarget, "4", "owner-barrier");
+                    Await.until("both sources to confirm the shared baseline", TIMEOUT,
+                            () -> token(consumer(store, SLOW_PIPELINE, SLOW_SOURCE)) != null
+                                    && token(consumer(store, FAST_PIPELINE, FAST_SOURCE)) != null,
+                            () -> consumers(store));
+                    String chain = consumer(store, SLOW_PIPELINE, SLOW_SOURCE).getString("miningChainId");
+                    assertThat(consumer(store, FAST_PIPELINE, FAST_SOURCE).getString("miningChainId"))
+                            .isEqualTo(chain);
+                    assertThat(store.getCollection(MongoStorePort.SRS_META).find(new Document("_id", chain)).first())
+                            .containsEntry("sourceReadDurable", true);
+                    originalSlots = slotNames(postgres);
+                    assertThat(originalSlots).hasSize(1);
+                    control.stop(SLOW_PIPELINE, false);
+                    awaitState(control, SLOW_PIPELINE, PipelineState.STOPPED);
+                    stoppedConfirmation = token(consumer(store, SLOW_PIPELINE, SLOW_SOURCE));
+                    first.kill();
                 }
-                sql.execute("INSERT INTO support_case VALUES (3, 'delete-during-restart')");
-                awaitRow(control, targets, slowTarget, "1", "Low");
-                awaitRow(control, targets, fastTarget, "1", "Low");
-                awaitRow(control, targets, slowTarget, "3", "delete-during-restart");
-                awaitRow(control, targets, fastTarget, "3", "delete-during-restart");
-                sql.execute("INSERT INTO support_case VALUES (4, 'owner-barrier')");
-                awaitRow(control, targets, slowTarget, "4", "owner-barrier");
-                awaitRow(control, targets, fastTarget, "4", "owner-barrier");
-                Await.until("both sources to confirm the shared baseline", TIMEOUT,
-                        () -> token(consumer(store, SLOW_PIPELINE, SLOW_SOURCE)) != null
-                                && token(consumer(store, FAST_PIPELINE, FAST_SOURCE)) != null,
-                        () -> consumers(store));
-                String chain = consumer(store, SLOW_PIPELINE, SLOW_SOURCE).getString("miningChainId");
-                assertThat(consumer(store, FAST_PIPELINE, FAST_SOURCE).getString("miningChainId"))
-                        .isEqualTo(chain);
-                assertThat(store.getCollection(MongoStorePort.SRS_META).find(new Document("_id", chain)).first())
-                        .containsEntry("sourceReadDurable", true);
-                originalSlots = slotNames(postgres);
-                assertThat(originalSlots).hasSize(1);
-                control.stop(SLOW_PIPELINE, false);
-                awaitState(control, SLOW_PIPELINE, PipelineState.STOPPED);
-                stoppedConfirmation = token(consumer(store, SLOW_PIPELINE, SLOW_SOURCE));
-                first.kill();
-            }
-            Await.until("the crashed capture to release its connection while retaining its slot", TIMEOUT,
-                    () -> activeSlots(postgres) == 0, () -> "slots=" + slotNames(postgres));
-            sql.execute("UPDATE support_case SET priority = 'Low' WHERE id = 1");
-            sql.execute("UPDATE support_case SET priority = 'High' WHERE id = 1");
-            sql.execute("DELETE FROM support_case WHERE id = 3");
-            sql.execute("INSERT INTO support_case VALUES (5, 'written-with-server-down')");
-            long recoveredFrom = System.nanoTime();
-            try (RealProcessServer second = RealProcessServer.start(storeUri, operatorDatabase)) {
-                ControlPlane control = new ControlPlane(second.baseUrl());
-                control.login("e2e", "e2e-password");
-                awaitState(control, SLOW_PIPELINE, PipelineState.STOPPED);
-                awaitState(control, FAST_PIPELINE, PipelineState.RUNNING);
-                awaitRow(control, targets, fastTarget, "1", "High");
-                awaitMissing(control, targets, fastTarget, "3");
-                awaitRow(control, targets, fastTarget, "5", "written-with-server-down");
-                assertThat(slotNames(postgres)).as("a different owner reuses the original physical capture slot")
-                        .isEqualTo(originalSlots);
-                assertThat(activeSlots(postgres)).isEqualTo(1);
-                assertThat(token(consumer(store, SLOW_PIPELINE, SLOW_SOURCE))).isEqualTo(stoppedConfirmation);
-                assertThat(row(targets, slowTarget, "1")).isEqualTo("Low");
-                assertThat(row(targets, slowTarget, "3")).isEqualTo("delete-during-restart");
-                assertThat(control.errorCount(FAST_PIPELINE)).contains(0L);
-                System.out.println("Shared PostgreSQL " + readMode + " recovered changes written with the server down"
-                        + " under another source owner in "
-                        + Duration.ofNanos(System.nanoTime() - recoveredFrom).toMillis() + " ms with the same slot.");
+                Await.until("the crashed capture to release its connection while retaining its slot", TIMEOUT,
+                        () -> activeSlots(postgres) == 0, () -> "slots=" + slotNames(postgres));
+                sql.execute("UPDATE support_case SET priority = 'Low' WHERE id = 1");
+                sql.execute("UPDATE support_case SET priority = 'High' WHERE id = 1");
+                sql.execute("DELETE FROM support_case WHERE id = 3");
+                sql.execute("INSERT INTO support_case VALUES (5, 'written-with-server-down')");
+                long recoveredFrom = System.nanoTime();
+                try (OwnedLaunch launched = launch(postgresFixture, storeUri, operatorDatabase)) {
+                    RealProcessServer second = launched.server();
+                    ControlPlane control = new ControlPlane(second.baseUrl());
+                    control.login("e2e", "e2e-password");
+                    awaitState(control, SLOW_PIPELINE, PipelineState.STOPPED);
+                    awaitState(control, FAST_PIPELINE, PipelineState.RUNNING);
+                    awaitRow(control, targets, fastTarget, "1", "High");
+                    awaitMissing(control, targets, fastTarget, "3");
+                    awaitRow(control, targets, fastTarget, "5", "written-with-server-down");
+                    assertThat(slotNames(postgres)).as("a different owner reuses the original physical capture slot")
+                            .isEqualTo(originalSlots);
+                    assertThat(activeSlots(postgres)).isEqualTo(1);
+                    assertThat(token(consumer(store, SLOW_PIPELINE, SLOW_SOURCE))).isEqualTo(stoppedConfirmation);
+                    assertThat(row(targets, slowTarget, "1")).isEqualTo("Low");
+                    assertThat(row(targets, slowTarget, "3")).isEqualTo("delete-during-restart");
+                    assertThat(control.errorCount(FAST_PIPELINE)).contains(0L);
+                    System.out.println("Shared PostgreSQL " + readMode + " recovered changes written with the server down"
+                            + " under another source owner in "
+                            + Duration.ofNanos(System.nanoTime() - recoveredFrom).toMillis() + " ms with the same slot.");
+                }
             }
         }
+    }
+
+    private record OwnedLaunch(RealProcessServer server, SharedPostgres.Closing closing) implements AutoCloseable {
+        @Override public void close() throws Exception { closing.close(); }
+    }
+
+    private static OwnedLaunch launch(SharedPostgres.Fixture fixture, String store, String operatorDatabase) {
+        SharedPostgres.Closing closing = fixture.pending("owned PostgreSQL recovery server");
+        RealProcessServer server = RealProcessServer.start(store, operatorDatabase);
+        fixture.bind(closing, server, server::terminated);
+        return new OwnedLaunch(server, closing);
     }
 
     private static Map<String, String> workspace(Map<String, Object> postgres, EndpointAddress slowTarget,

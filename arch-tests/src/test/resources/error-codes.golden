@@ -3,6 +3,7 @@
 # Sorted, one <domain>.<symbol> per line. The ErrorCodeGatesTest diffs the scanned codes
 # against this file. Adding a code = append it here in the same change set; renaming or
 # removing one = a breaking change to an external contract (review + major version).
+actuation.capture-shutdown-incomplete
 actuation.execution-generation-unavailable
 actuation.from-regex-empty
 actuation.from-regex-invalid

@@ -61,6 +61,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
         Optional<BenchmarkJdiTelemetrySession.Evidence> finish() throws Exception {
             return telemetry == null ? Optional.empty() : Optional.of(telemetry.shutdownAndFinish());
         }
+        boolean terminated() { return server.terminated(); }
         @Override public void close() throws Exception {
             if (admission != null) { admission.close(); }
             else if (telemetry != null) { telemetry.close(); }
@@ -149,6 +150,8 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
     private final ControlPlane control;
     private final Connection source;
     private final MongoClient mongo;
+    private final SharedPostgres.Fixture postgresFixture;
+    private final SharedPostgres.Closing bootClosing;
 
     private int nextPhase;
     private BenchmarkWorkloadDefinitions.Phase pendingPhase;
@@ -157,7 +160,8 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
     private BenchmarkForkEnvironment(BenchmarkWorkloadDefinitions.Workload workload, String forkId,
             Map<String, Object> sourceSettings, String storeUri, String externalTargetUri,
             String managedViewsUri, String operatorStateUri, OwnedBoot boot,
-            ControlPlane control, Connection source, MongoClient mongo) {
+            ControlPlane control, Connection source, MongoClient mongo,
+            SharedPostgres.Fixture postgresFixture, SharedPostgres.Closing bootClosing) {
         this.workload = workload;
         this.forkId = forkId;
         this.sourceSettings = Map.copyOf(sourceSettings);
@@ -168,7 +172,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
         this.boot = Objects.requireNonNull(boot); this.server = boot.server();
         this.control = control;
         this.source = source;
-        this.mongo = mongo;
+        this.mongo = mongo; this.postgresFixture = postgresFixture; this.bootClosing = bootClosing;
     }
 
     /** Opens and starts one fork, with all source rows present before the first pipeline starts. */
@@ -192,20 +196,23 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
         }
         String namespace = "bench_" + workload.id() + "_"
                 + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
-        Map<String, Object> sourceSettings = workload.database() == BenchmarkWorkloadDefinitions.Database.MYSQL
-                ? SharedMySql.settings(namespace + "_src")
-                : SharedPostgres.settings(namespace + "_src");
-        String storeUri = SharedMongo.replicaSetUrl(namespace + "_control");
-        String externalTargetUri = SharedMongo.replicaSetUrl(namespace + "_target");
-        String managedViewsUri = SharedMongo.replicaSetUrl("views");
-        String operatorDatabase = namespace + "_operator";
-        String operatorStateUri = SharedMongo.replicaSetUrl(operatorDatabase);
-
-        Connection source = workload.database() == BenchmarkWorkloadDefinitions.Database.MYSQL
-                ? SharedMySql.connect(sourceSettings) : SharedPostgres.connect(sourceSettings);
+        SharedPostgres.Fixture postgresFixture = SharedPostgres.fixture();
+        SharedPostgres.Closing bootClosing = postgresFixture.pending("owned benchmark boot");
+        Connection source = null;
         OwnedBoot boot = null;
         MongoClient mongo = null;
         try {
+            Map<String, Object> sourceSettings = workload.database() == BenchmarkWorkloadDefinitions.Database.MYSQL
+                    ? SharedMySql.settings(namespace + "_src")
+                    : postgresFixture.settings(namespace + "_src");
+            String storeUri = SharedMongo.replicaSetUrl(namespace + "_control");
+            String externalTargetUri = SharedMongo.replicaSetUrl(namespace + "_target");
+            String managedViewsUri = SharedMongo.replicaSetUrl("views");
+            String operatorDatabase = namespace + "_operator";
+            String operatorStateUri = SharedMongo.replicaSetUrl(operatorDatabase);
+
+            source = workload.database() == BenchmarkWorkloadDefinitions.Database.MYSQL
+                    ? SharedMySql.connect(sourceSettings) : SharedPostgres.connect(sourceSettings);
             execute(source, workload.setupSql());
             // The view database is product-wide on this replica set. Forks run serially, and the
             // preceding application process is closed before these shared collections are dropped.
@@ -213,6 +220,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
             boot = Objects.requireNonNull(launcher.launch(storeUri, operatorDatabase, applicationJar));
             RealProcessServer server = boot.server();
             OwnedBoot ownedBoot = boot;
+            postgresFixture.bind(bootClosing, ownedBoot, ownedBoot::terminated);
             ControlPlane readiness = new ControlPlane(server.baseUrl());
             Await.until("benchmark owned boot readiness", () -> { ownedBoot.check(); return readiness.healthy(); },
                     () -> "owned process alive=" + server.isAlive());
@@ -249,11 +257,12 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
             }
             mongo = MongoClients.create(storeUri);
             return new BenchmarkForkEnvironment(workload, forkId, sourceSettings, storeUri,
-                    externalTargetUri, managedViewsUri, operatorStateUri, boot, control, source, mongo);
+                    externalTargetUri, managedViewsUri, operatorStateUri, boot, control, source, mongo, postgresFixture, bootClosing);
         } catch (Exception | Error failure) {
-            closeAfterFailure(boot, failure);
+            closeAfterFailure(bootClosing, failure);
             closeAfterFailure(mongo, failure);
             closeAfterFailure(source, failure);
+            closeAfterFailure(postgresFixture, failure);
             throw failure;
         }
     }
@@ -283,6 +292,13 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
 
     String forkId() {
         return forkId;
+    }
+
+    /** A real external reader without a terminal receipt keeps the same PostgreSQL database owned. */
+    void registerUnconfirmedExternalPostgresBorrower(String label) {
+        if (workload.database() != BenchmarkWorkloadDefinitions.Database.MYSQL) {
+            postgresFixture.pending("external PostgreSQL borrower: " + Objects.requireNonNull(label));
+        }
     }
 
     Map<String, Object> sourceSettings() {
@@ -558,14 +574,14 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
             return;
         }
         closed = true;
-        try {
-            boot.close();
-        } finally {
-            try {
-                source.close();
-            } finally {
-                mongo.close();
+        Throwable primary = null;
+        for (AutoCloseable resource : List.of(bootClosing, source, mongo, postgresFixture)) {
+            try { resource.close(); }
+            catch (Exception | Error failure) {
+                if (primary == null) { primary = failure; } else if (primary != failure) { primary.addSuppressed(failure); }
             }
         }
+        if (primary instanceof Exception failure) { throw failure; }
+        if (primary instanceof Error failure) { throw failure; }
     }
 }

@@ -75,6 +75,89 @@ import static org.assertj.core.api.Assertions.catchThrowableOfType;
 class CaptureRunUnitTest {
 
     @Test
+    void configuredCloseCannotClaimLoadedWhileTheRealReservedWorkerIsStillOpeningItsTable() throws Exception {
+        CountDownLatch reading = new CountDownLatch(1), release = new CountDownLatch(1);
+        class Source implements CapturePort, SnapshotSession.Provider {
+            @Override public SnapshotSession snapshotSession(CaptureConfig config) {
+                return table -> {
+                    reading.countDown(); awaitHeldShutdownRead(release);
+                    return new FakeBatch(List.of(), "controlled-close-seam");
+                };
+            }
+            @Override public CaptureBatch snapshot(CaptureConfig config) { throw new AssertionError("expected the real session seam"); }
+            @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) { return () -> { }; }
+            @Override public ConnectionReport testConnection(CaptureConfig config) { throw new UnsupportedOperationException(); }
+            @Override public DiscoveredSchema discoverSchema(CaptureConfig config) { throw new UnsupportedOperationException(); }
+        }
+        InMemoryMeta meta = new InMemoryMeta();
+        try (SnapshotWorkers workers = new SnapshotWorkers(1, 1)) {
+            CaptureRunUnit unit = new CaptureRunUnit(new Source(), new SrsCoordinator(meta), meta, hz,
+                    new SnapshotBuffer(2, 1, 1_024, 512), workers);
+            CaptureRun run = unit.begin(spec(ReadMode.SNAPSHOT_AND_CDC, false, "stubborn-close-read"), CaptureHandoff.of(row -> { }));
+            try {
+                run.activateSnapshot();
+                assertThat(reading.await(5, TimeUnit.SECONDS)).isTrue();
+                run.close();
+                assertThat(run.awaitLoaded(Duration.ZERO))
+                        .as("a returned close cannot forge completion of the actual reservation worker").isFalse();
+                assertThat(run.loading()).isTrue();
+            } finally {
+                release.countDown();
+                run.awaitLoaded(Duration.ofSeconds(5));
+                run.close();
+            }
+        }
+    }
+
+    @Test
+    void aLateNativeCloseFailureSurvivesTheCancelledReservedWorkersExit() throws Exception {
+        CountDownLatch opening = new CountDownLatch(1), release = new CountDownLatch(1), closeAttempted = new CountDownLatch(1);
+        AtomicInteger closes = new AtomicInteger();
+        IllegalStateException original = new IllegalStateException("controlled late native close refusal");
+        class Source implements CapturePort, SnapshotSession.Provider {
+            @Override public SnapshotSession snapshotSession(CaptureConfig config) {
+                return table -> new FakeBatch(List.of(), "late-close-seam");
+            }
+            @Override public CaptureBatch snapshot(CaptureConfig config) { throw new AssertionError("expected the real session seam"); }
+            @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+                opening.countDown(); awaitHeldShutdownRead(release);
+                return () -> { closes.incrementAndGet(); closeAttempted.countDown(); throw original; };
+            }
+            @Override public ConnectionReport testConnection(CaptureConfig config) { throw new UnsupportedOperationException(); }
+            @Override public DiscoveredSchema discoverSchema(CaptureConfig config) { throw new UnsupportedOperationException(); }
+        }
+        InMemoryMeta meta = new InMemoryMeta();
+        try (SnapshotWorkers workers = new SnapshotWorkers(1, 1)) {
+            CaptureRunUnit unit = new CaptureRunUnit(new Source(), new SrsCoordinator(meta), meta, hz,
+                    new SnapshotBuffer(2, 1, 1_024, 512), workers);
+            CaptureRun run = unit.begin(spec(ReadMode.SNAPSHOT_AND_CDC, false, "late-native-close"), CaptureHandoff.of(row -> { }));
+            try {
+                run.activateSnapshot();
+                assertThat(opening.await(5, TimeUnit.SECONDS)).isTrue();
+                run.close();
+                release.countDown();
+                assertThat(closeAttempted.await(5, TimeUnit.SECONDS)).isTrue();
+                workers.close();
+                assertThat(closes).hasValue(1);
+                assertThatThrownBy(() -> run.awaitLoaded(Duration.ZERO)).isSameAs(original);
+                assertThatThrownBy(run::close).isSameAs(original);
+                assertThat(run.failure()).as("requested cancellation is not a new business failure").isEmpty();
+            } finally { release.countDown(); }
+        }
+    }
+
+    private static void awaitHeldShutdownRead(CountDownLatch release) {
+        boolean interrupted = false;
+        try {
+            while (release.getCount() != 0) {
+                try {
+                    if (!release.await(5, TimeUnit.SECONDS)) { throw new AssertionError("the controlled native open was not released"); }
+                } catch (InterruptedException ignored) { interrupted = true; }
+            }
+        } finally { if (interrupted) { Thread.currentThread().interrupt(); } }
+    }
+
+    @Test
     void anActivatedReaderFreezesOneExplicitOwnerForItsSnapshotAndInitialTail() throws Exception {
         CaptureRunSpec request = spec(ReadMode.SNAPSHOT_AND_CDC, false, "explicit-log-owner")
                 .withSnapshotWriterToken("explicit-owner-run");

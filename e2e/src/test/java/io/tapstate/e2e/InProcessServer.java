@@ -28,7 +28,7 @@ final class InProcessServer implements ServerHandle {
     private final ConfigurableApplicationContext context;
     private final URI baseUrl;
 
-    private InProcessServer(ConfigurableApplicationContext context, URI baseUrl) {
+    InProcessServer(ConfigurableApplicationContext context, URI baseUrl) {
         this.context = context;
         this.baseUrl = baseUrl;
     }
@@ -114,8 +114,27 @@ final class InProcessServer implements ServerHandle {
         return cancelled;
     }
 
+    private volatile boolean sourcesEnded;
+
+    @Override public boolean terminated() { return !context.isActive() && sourcesEnded; }
+
     @Override
     public void close() {
-        context.close();
+        if (!context.isActive()) { return; }
+        java.util.function.BooleanSupplier captured = () -> false;
+        Throwable failure = null;
+        try {
+            if (context.containsBean("localCaptureShutdownComplete")) {
+                captured = context.getBean("localCaptureShutdownComplete", java.util.function.BooleanSupplier.class);
+            }
+        } catch (RuntimeException | Error unavailable) { failure = unavailable; }
+        try { context.close(); }
+        catch (RuntimeException | Error refused) {
+            if (failure == null) { failure = refused; }
+            else if (failure != refused) { failure.addSuppressed(refused); }
+        }
+        if (failure instanceof RuntimeException refused) { throw refused; }
+        if (failure instanceof Error defect) { throw defect; }
+        sourcesEnded = captured.getAsBoolean();
     }
 }

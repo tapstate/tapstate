@@ -149,9 +149,11 @@ public final class SnapshotPhase {
             return new Load(session, miningChainId, tables, owed, order, tailSeam, first, false);
         } catch (RuntimeException | Error failure) {
             if (first != null) {
-                first.close();
+                try { first.close(); }
+                catch (RuntimeException | Error cleanup) { if (cleanup != failure) { failure.addSuppressed(cleanup); } }
             }
-            session.close();
+            try { session.close(); }
+            catch (RuntimeException | Error cleanup) { if (cleanup != failure) { failure.addSuppressed(cleanup); } }
             throw failure;
         }
     }

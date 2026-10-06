@@ -574,6 +574,152 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         assertThat(liveTails.get())
                 .as("15 pipelines over one source must not decode the same WAL backlog 15 times at once")
                 .isEqualTo(1);
+        var retained = store.meta().read(chainId).orElseThrow();
+        coordinator.close();
+        assertThat(liveTails.get()).as("all local attachments end the single actual shared reader").isZero();
+        assertThat(store.meta().read(chainId)).contains(retained);
+        coordinator.close();
+        assertThat(liveTails.get()).as("shared-reader shutdown is idempotent").isZero();
+    }
+
+    @Test
+    void aFailedOrdinaryCloseRetriesTheSameActualHandleAndKeepsTheSourceState() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipeline("p", "orders_src"));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        SrsCoordinator chains = new SrsCoordinator(store.meta());
+        AtomicInteger closes = new AtomicInteger();
+        AtomicBoolean actuallyEnded = new AtomicBoolean();
+        AtomicReference<CaptureRunSpec> captured = new AtomicReference<>();
+        TapstateException original = new TapstateException(io.tapstate.adapters.pdk.ConnectorError.CAPTURE_FAILED,
+                Map.of("connector", "mysql", "detail", "controlled first close refusal"), null);
+        CaptureStarter starter = (spec, handoff) -> {
+            captured.set(spec);
+            chains.provisionSource(spec.sourceId(), spec.miningChainId(), spec.config().streams(), spec.retention());
+            chains.attachConsumer(spec.miningChainId(), spec.consumerId());
+            Subscription sameHandle = () -> {
+                if (closes.incrementAndGet() == 1) { throw original; }
+                actuallyEnded.set(true);
+            };
+            return new CaptureRun(Optional.of(spec.miningChainId()), false, 0L, Optional.empty(),
+                    Optional.of(sameHandle), new CaptureHealth());
+        };
+        var coordinator = new StoreBackedPipelineCaptureCoordinator(store, starter, chains, new SnapshotBuffer());
+        coordinator.startCapture("p");
+        String chain = captured.get().miningChainId().value();
+        store.meta().upsertConsumerOffset(chain, new ConsumerOffset(captured.get().consumerId(), Map.of(), null));
+        var retained = store.meta().read(chain).orElseThrow();
+
+        assertThatThrownBy(() -> coordinator.stopCapture("p", false)).isSameAs(original);
+        assertThat(actuallyEnded).isFalse();
+        coordinator.stopCapture("p", false);
+
+        assertThat(closes).as("the retry must reach the same actual retained subscription").hasValue(2);
+        assertThat(actuallyEnded).isTrue();
+        assertThat(coordinator.isActive("p")).isFalse();
+        assertThat(store.meta().read(chain)).contains(retained);
+    }
+
+    @Test
+    void coordinatorShutdownClosesItsOwnedSubscriptionAndKeepsDurableState() {
+        CursorFixture fixture = new CursorFixture();
+        fixture.coordinator.startCapture("p");
+        fixture.leaveACursorFor("p");
+        var desired = new io.tapstate.core.lifecycle.DesiredState("p",
+                io.tapstate.core.lifecycle.PipelineState.RUNNING, "controlled-revision");
+        fixture.store.desired().save(desired);
+        var retained = fixture.store.meta().read(fixture.chainId()).orElseThrow();
+        assertThat(fixture.coordinator.isActive("p")).isTrue();
+        assertThat(fixture.subscriptionsClosed).hasValue(0);
+
+        fixture.coordinator.close();
+
+        assertThat(fixture.subscriptionsClosed).as("shutdown closes the actual retained CaptureRun subscription").hasValue(1);
+        assertThat(fixture.coordinator.isActive("p")).isFalse();
+        assertThat(fixture.coordinator.snapshotProgress("p").byTable()).isEmpty();
+        assertThat(fixture.store.meta().read(fixture.chainId())).contains(retained);
+        assertThat(fixture.store.desired().read("p")).contains(desired);
+        fixture.coordinator.close();
+        assertThat(fixture.subscriptionsClosed).as("the same captured handle is closed once").hasValue(1);
+    }
+
+    @Test
+    void coordinatorShutdownRefusesANewStartWithoutOpeningAnotherSubscription() {
+        CursorFixture fixture = new CursorFixture();
+        fixture.coordinator.startCapture("p");
+        fixture.coordinator.close();
+        assertThatThrownBy(() -> fixture.coordinator.startCapture("p"))
+                .isInstanceOf(CancellationException.class);
+        assertThat(fixture.subscriptionsClosed).hasValue(1);
+        assertThat(fixture.coordinator.isActive("p")).isFalse();
+    }
+
+    @Test
+    void coordinatorShutdownCancelsAPendingStartAndClosesTheHandleItReturnsLate() throws Exception {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipelineWithReadMode("p", "orders_src", ReadMode.SNAPSHOT_AND_CDC));
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicBoolean interrupted = new AtomicBoolean();
+        AtomicInteger closed = new AtomicInteger();
+        CaptureStarter starter = (spec, passthrough) -> {
+            entered.countDown();
+            try {
+                if (!release.await(5, TimeUnit.SECONDS)) { throw new AssertionError("the controlled source open was not released"); }
+            } catch (InterruptedException cancelled) { interrupted.set(true); Thread.currentThread().interrupt(); }
+            return new CaptureRun(Optional.empty(), false, 1L, Optional.empty(),
+                    Optional.of(closed::incrementAndGet), new CaptureHealth());
+        };
+        var coordinator = new StoreBackedPipelineCaptureCoordinator(artifactsOnly(artifacts), starter,
+                new SrsCoordinator(new InMemorySrsMetaStore()), new SnapshotBuffer());
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> start = workers.submit(() -> coordinator.startCapture("p"));
+            assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+            Future<?> close = workers.submit(coordinator::close);
+            close.get(5, TimeUnit.SECONDS);
+            assertThat(interrupted).as("shutdown cancels the already-entered source open").isTrue();
+            assertThatThrownBy(() -> start.get(5, TimeUnit.SECONDS))
+                    .isInstanceOf(ExecutionException.class).hasCauseInstanceOf(CancellationException.class);
+            assertThat(closed).as("a late returned handle cannot be published live").hasValue(1);
+            assertThat(coordinator.isActive("p")).isFalse();
+        } finally {
+            release.countDown(); workers.shutdownNow();
+            assertThat(workers.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+        }
+    }
+
+    @Test
+    void coordinatorShutdownRetainsTheOriginalFailureAndStillClosesAnotherLocalCapture() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("failed_src", "orders", "failed-chain"));
+        artifacts.save(cdcSource("healthy_src", "customers", "healthy-chain"));
+        artifacts.save(pipeline("a_failed", "failed_src"));
+        artifacts.save(pipeline("b_healthy", "healthy_src"));
+        SrsCoordinator chains = new SrsCoordinator(new InMemorySrsMetaStore());
+        AtomicInteger failedCloses = new AtomicInteger(), healthyCloses = new AtomicInteger();
+        TapstateException original = new TapstateException(io.tapstate.adapters.pdk.ConnectorError.CAPTURE_FAILED,
+                Map.of("connector", "mysql", "detail", "controlled subscription shutdown refusal"), null);
+        CaptureStarter starter = (spec, passthrough) -> {
+            chains.provisionSource(spec.sourceId(), spec.miningChainId(), spec.config().streams(), spec.retention());
+            chains.attachConsumer(spec.miningChainId(), spec.consumerId());
+            Subscription subscription = () -> {
+                if (spec.pipelineId().equals("a_failed")) { failedCloses.incrementAndGet(); throw original; }
+                healthyCloses.incrementAndGet();
+            };
+            return new CaptureRun(Optional.of(spec.miningChainId()), false, 0L, Optional.empty(),
+                    Optional.of(subscription), new CaptureHealth());
+        };
+        var coordinator = new StoreBackedPipelineCaptureCoordinator(artifactsOnly(artifacts), starter, chains, new SnapshotBuffer());
+        coordinator.startCapture("a_failed"); coordinator.startCapture("b_healthy");
+
+        assertThatThrownBy(coordinator::close).isSameAs(original);
+
+        assertThat(failedCloses).hasValue(1);
+        assertThat(healthyCloses).as("one refusal cannot strand another owned local handle").hasValue(1);
+        assertThat(coordinator.isActive("b_healthy")).isFalse();
     }
 
     @Test
@@ -633,6 +779,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         private final InMemoryStorePort store;
         private final SrsCoordinator srsCoordinator;
         private final StoreBackedPipelineCaptureCoordinator coordinator;
+        private final AtomicInteger subscriptionsClosed = new AtomicInteger();
         private final SourceResource source = cdcSource("orders_src", "orders", null);
 
         CursorFixture() {
@@ -649,8 +796,8 @@ class StoreBackedPipelineCaptureCoordinatorTest {
             MiningChainId chainId = spec.miningChainId();
             srsCoordinator.provisionSource(spec.sourceId(), chainId, spec.config().streams(), spec.retention());
             srsCoordinator.attachConsumer(chainId, spec.consumerId());
-            return new CaptureRun(Optional.of(chainId), false, 0L, Optional.empty(), Optional.of(() -> {
-            }), new CaptureHealth());
+            return new CaptureRun(Optional.of(chainId), false, 0L, Optional.empty(),
+                    Optional.of(subscriptionsClosed::incrementAndGet), new CaptureHealth());
         }
 
         /** Writes the durable cursor a run leaves behind, which is what a purge has to take away. */
@@ -1974,6 +2121,120 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                         .isEqualTo("actuation.source-schema-not-discovered"));
         assertThat(opened).isEmpty();
         assertThat(coordinator.isActive("p")).isFalse();
+    }
+
+    @Test
+    void aFailedStartupKeepsItsUnclosedExactHandleForContextCleanupWithoutPublishingIt() {
+        AbortedStartFixture fixture = new AbortedStartFixture();
+        assertThatThrownBy(() -> fixture.coordinator.startCapture("p")).isSameAs(fixture.startFailure)
+                .satisfies(failure -> assertThat(failure.getSuppressed()).contains(fixture.closeFailure));
+        assertThat(fixture.coordinator.isActive("p")).as("a half-open failed assembly is never an active reader").isFalse();
+        var retained = fixture.store.meta().read(fixture.chain.get()).orElseThrow();
+        fixture.allowClose.set(true);
+
+        fixture.coordinator.close();
+
+        assertThat(fixture.closeAttempts).as("context teardown must reach the original unclosed subscription").hasValue(2);
+        assertThat(fixture.ended).isTrue();
+        assertThat(fixture.store.meta().read(fixture.chain.get())).contains(retained);
+    }
+
+    @Test
+    void anotherStartCannotReuseTheFailedHalfAssemblyOrOpenSourcesBeforeItsHandleEnds() {
+        AbortedStartFixture fixture = new AbortedStartFixture();
+        assertThatThrownBy(() -> fixture.coordinator.startCapture("p")).isSameAs(fixture.startFailure);
+        assertThat(fixture.sourceOpens).hasValue(2);
+
+        assertThatThrownBy(() -> fixture.coordinator.startCapture("p")).isSameAs(fixture.closeFailure);
+
+        assertThat(fixture.sourceOpens).as("a fresh assembly cannot begin over an unclosed aborted source").hasValue(2);
+        assertThat(fixture.coordinator.isActive("p")).isFalse();
+        fixture.allowClose.set(true);
+        fixture.coordinator.close();
+        assertThat(fixture.closeAttempts).hasValue(3);
+        assertThat(fixture.ended).isTrue();
+    }
+
+    private static final class AbortedStartFixture {
+        private final AtomicBoolean allowClose = new AtomicBoolean(), ended = new AtomicBoolean();
+        private final AtomicInteger sourceOpens = new AtomicInteger(), closeAttempts = new AtomicInteger();
+        private final AtomicReference<String> chain = new AtomicReference<>();
+        private final TapstateException startFailure = new TapstateException(io.tapstate.adapters.pdk.ConnectorError.CAPTURE_FAILED,
+                Map.of("connector", "mysql", "detail", "controlled second source admission refusal"), null);
+        private final TapstateException closeFailure = new TapstateException(io.tapstate.adapters.pdk.ConnectorError.CAPTURE_FAILED,
+                Map.of("connector", "mysql", "detail", "controlled first source close refusal"), null);
+        private final InMemoryStorePort store;
+        private final StoreBackedPipelineCaptureCoordinator coordinator;
+        private AbortedStartFixture() {
+            InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+            artifacts.save(cdcSource("src_a", "orders", "abort-a"));
+            artifacts.save(cdcSource("src_b", "customers", "abort-b"));
+            artifacts.save(twoSourcePipeline("p", "src_a", "src_b"));
+            store = new InMemoryStorePort(artifacts);
+            SrsCoordinator chains = new SrsCoordinator(store.meta());
+            CaptureStarter starter = (spec, handoff) -> {
+                sourceOpens.incrementAndGet();
+                if (spec.sourceId().equals("src_b")) { throw startFailure; }
+                chain.set(spec.miningChainId().value());
+                chains.provisionSource(spec.sourceId(), spec.miningChainId(), spec.config().streams(), spec.retention());
+                chains.attachConsumer(spec.miningChainId(), spec.consumerId());
+                Subscription exact = () -> {
+                    closeAttempts.incrementAndGet();
+                    if (!allowClose.get()) { throw closeFailure; }
+                    ended.set(true);
+                };
+                return new CaptureRun(Optional.of(spec.miningChainId()), false, 0L, Optional.empty(), Optional.of(exact), new CaptureHealth());
+            };
+            coordinator = new StoreBackedPipelineCaptureCoordinator(store, starter, chains, new SnapshotBuffer());
+        }
+    }
+
+    @Test
+    void aManagedHandleRejectedAfterOpeningIsRetainedWhenItsImmediateCloseFails() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("managed_src", "orders", "managed-late-refusal"));
+        artifacts.save(pipeline("p", "managed_src"));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        SrsCoordinator chains = new SrsCoordinator(store.meta());
+        AtomicInteger closes = new AtomicInteger();
+        AtomicBoolean allowClose = new AtomicBoolean(), ended = new AtomicBoolean();
+        AtomicReference<CaptureRunSpec> admitted = new AtomicReference<>();
+        TapstateException closeFailure = new TapstateException(io.tapstate.adapters.pdk.ConnectorError.CAPTURE_FAILED,
+                Map.of("connector", "mysql", "detail", "controlled just-opened managed handle close refusal"), null);
+        CaptureAttacher attacher = (spec, handoff, startsTail) -> {
+            admitted.set(spec);
+            chains.provisionSource(spec.sourceId(), spec.miningChainId(), spec.config().streams(), spec.retention());
+            chains.attachConsumer(spec.miningChainId(), spec.consumerId());
+            CaptureRun actual = new CaptureRun(Optional.of(spec.miningChainId()), false, 0L, Optional.empty(),
+                    Optional.of(() -> {
+                        closes.incrementAndGet();
+                        if (!allowClose.get()) { throw closeFailure; }
+                        ended.set(true);
+                    }), new CaptureHealth());
+            // The actual source callback cancels its caller after returning a real handle. The
+            // managed opening check must refuse it before publication under the original permit.
+            Thread.currentThread().interrupt();
+            return actual;
+        };
+        var coordinator = new StoreBackedPipelineCaptureCoordinator(store, attacher, chains, new SnapshotBuffer());
+        try {
+            assertThatThrownBy(() -> coordinator.startCapture("p"))
+                    .isInstanceOf(CancellationException.class)
+                    .satisfies(refused -> assertThat(refused.getSuppressed()).containsExactly(closeFailure));
+            assertThat(Thread.currentThread().isInterrupted()).isTrue();
+        } finally { Thread.interrupted(); }
+        assertThat(admitted.get()).isNotNull();
+        assertThat(coordinator.isActive("p")).isFalse();
+        assertThat(closes).hasValue(1);
+        var retained = store.meta().read(admitted.get().miningChainId().value()).orElseThrow();
+        allowClose.set(true);
+
+        coordinator.close();
+
+        assertThat(closes).as("context cleanup must return to the actual pre-publication handle").hasValue(2);
+        assertThat(ended).isTrue();
+        assertThat(coordinator.hasActiveCapture("p")).isFalse();
+        assertThat(store.meta().read(admitted.get().miningChainId().value())).contains(retained);
     }
 
     @Test

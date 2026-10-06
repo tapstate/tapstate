@@ -71,50 +71,64 @@ class AnInitialLoadLargerThanTheHeapReachesTheTargetIT {
 
     @Test
     void everyRowOfALoadTheHeapCannotHoldWholeReachesTheTarget() throws Exception {
-        Map<String, Object> source = SharedPostgres.settings(DATABASE);
-        seed(source);
+        try (SharedPostgres.Fixture postgresFixture = SharedPostgres.fixture()) {
+            Map<String, Object> source = postgresFixture.settings(DATABASE);
+            seed(source);
 
-        String storeUri = SharedMongo.replicaSetUrl("large_load_store");
-        String targetUri = SharedMongo.replicaSetUrl("large_load_target");
-        EndpointAddress target = EndpointAddress.uri(targetUri);
+            String storeUri = SharedMongo.replicaSetUrl("large_load_store");
+            String targetUri = SharedMongo.replicaSetUrl("large_load_target");
+            EndpointAddress target = EndpointAddress.uri(targetUri);
 
-        // Everything but the load is done by a server with the ordinary heap, and kept in the store for the
-        // one under test. Uploading a connector holds its jar several times over on the way in, which a heap
-        // this small cannot afford either: a limit of its own, found in the first run of this case, and not
-        // the one this case is about.
-        try (ServerHandle preparing = RealProcessServer.start(storeUri)) {
-            ControlPlane control = new ControlPlane(preparing.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
-            control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
-            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+            // Everything but the load is done by a server with the ordinary heap, and kept in the store for the
+            // one under test. Uploading a connector holds its jar several times over on the way in, which a heap
+            // this small cannot afford either: a limit of its own, found in the first run of this case, and not
+            // the one this case is about.
+            try (ServerHandle preparing = postgresFixture.launch(() -> RealProcessServer.start(storeUri))) {
+                ControlPlane control = new ControlPlane(preparing.baseUrl());
+                control.bootstrapAndLogin("e2e", "e2e-password");
+                control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
+                control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 
-            Map<String, String> resources = new LinkedHashMap<>();
-            resources.put(SOURCE_ID + ".tap.yml", sourceYaml(source));
-            resources.put(TARGET_ID + ".tap.yml", targetYaml(targetUri));
-            resources.put(PIPELINE_ID + ".tap.yml", Workspaces.pipelineYaml(
-                    PIPELINE_ID, SOURCE_ID, TARGET_ID, TABLE));
-            control.apply(resources);
-            control.discoverSchema(SOURCE_ID, "postgres", discoveryConfig(source));
+                Map<String, String> resources = new LinkedHashMap<>();
+                resources.put(SOURCE_ID + ".tap.yml", sourceYaml(source));
+                resources.put(TARGET_ID + ".tap.yml", targetYaml(targetUri));
+                resources.put(PIPELINE_ID + ".tap.yml", Workspaces.pipelineYaml(
+                        PIPELINE_ID, SOURCE_ID, TARGET_ID, TABLE));
+                control.apply(resources);
+                control.discoverSchema(SOURCE_ID, "postgres", discoveryConfig(source));
+            }
+
+            try (OwnedLoad launched = launchSmallHeap(postgresFixture, storeUri);
+                    MongoEndpoints mongo = new MongoEndpoints()) {
+                RealProcessServer server = launched.server();
+                ControlPlane control = new ControlPlane(server.baseUrl());
+                control.login("e2e", "e2e-password");
+                control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
+
+                long[] reading = {0};
+                Await.until("all " + ROWS + " rows of the load to reach the target", BOUND,
+                        () -> {
+                            if (!server.isAlive()) {
+                                throw new AssertionError("the server exited part way through the load, with "
+                                        + mongo.count(target, TABLE) + " of " + ROWS + " rows at the target; "
+                                        + "its output ended:\n" + server.tail());
+                            }
+                            return (reading[0] = mongo.count(target, TABLE)) == ROWS;
+                        },
+                        () -> reading[0] + " rows");
+            }
         }
+    }
 
-        try (RealProcessServer server = RealProcessServer.startInJvm(storeUri, SMALL_HEAP);
-                MongoEndpoints mongo = new MongoEndpoints()) {
-            ControlPlane control = new ControlPlane(server.baseUrl());
-            control.login("e2e", "e2e-password");
-            control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
+    private record OwnedLoad(RealProcessServer server, SharedPostgres.Closing closing) implements AutoCloseable {
+        @Override public void close() throws Exception { closing.close(); }
+    }
 
-            long[] reading = {0};
-            Await.until("all " + ROWS + " rows of the load to reach the target", BOUND,
-                    () -> {
-                        if (!server.isAlive()) {
-                            throw new AssertionError("the server exited part way through the load, with "
-                                    + mongo.count(target, TABLE) + " of " + ROWS + " rows at the target; "
-                                    + "its output ended:\n" + server.tail());
-                        }
-                        return (reading[0] = mongo.count(target, TABLE)) == ROWS;
-                    },
-                    () -> reading[0] + " rows");
-        }
+    private static OwnedLoad launchSmallHeap(SharedPostgres.Fixture fixture, String store) {
+        SharedPostgres.Closing closing = fixture.pending("owned small-heap PostgreSQL load server");
+        RealProcessServer server = RealProcessServer.startInJvm(store, SMALL_HEAP);
+        fixture.bind(closing, server, server::terminated);
+        return new OwnedLoad(server, closing);
     }
 
     /**

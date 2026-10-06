@@ -38,6 +38,7 @@ final class ProvisionedStores implements AutoCloseable {
     private final Map<String, Endpoints> driversByConnector = new LinkedHashMap<>();
     private final Map<String, Store> storesByName = new LinkedHashMap<>();
     private final List<StreamGate> gates = new ArrayList<>();
+    private final SharedPostgres.Fixture postgres = SharedPostgres.fixture();
 
     /**
      * One store as this run brought it up: the database that is its identity, a handle of our own, and
@@ -119,6 +120,12 @@ final class ProvisionedStores implements AutoCloseable {
         gates.forEach(StreamGate::close);
         gates.clear();
         environment.clear();
+        postgres.close();
+    }
+
+    /** A launch failure or an unconfirmed close keeps this run's PostgreSQL slots reserved. */
+    ServerHandle launch(java.util.function.Supplier<ServerHandle> launcher) {
+        return postgres.launch(launcher);
     }
 
     private void bring(String name, DatabaseRequest request, String runId) {
@@ -133,7 +140,7 @@ final class ProvisionedStores implements AutoCloseable {
             // Same five settings as MySQL and published the same way: both are JDBC stores a resource
             // addresses by host, port, database and credentials, so a specification that swaps one engine
             // for the other changes the kind and nothing else.
-            case POSTGRES -> gated(name, prefix, database, driver, SharedPostgres.settings(database));
+            case POSTGRES -> gated(name, prefix, database, driver, postgres.settings(database));
             case ORACLE -> {
                 Map<String, Object> settings = SharedOracle.settings(database);
                 gated(name, prefix, String.valueOf(settings.get("schema")), driver, settings);

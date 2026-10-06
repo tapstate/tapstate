@@ -11,6 +11,9 @@
 cluster.membership-unreadable:
   message: "This member cannot read who is in the cluster right now."
   solution: "Its engine cannot answer for the cluster yet, which is what a member looks like while it is starting, while it is stopping, while the cluster is putting itself back together after a partition healed, and while it settles after another member has left. Ask another member, or read again in a moment."
+actuation.capture-shutdown-incomplete:
+  message: "Local capture shutdown still has {resources} unconfirmed resources after {timeout}."
+  solution: "Keep their source state and replication slots. Inspect the original cleanup cause and confirm the owned readers have ended before reclaiming anything."
 actuation.pipeline-not-found:
   message: "No pipeline artifact `{pipeline}` is stored to run."
   solution: "Apply the pipeline before starting it, and check the id for typos."

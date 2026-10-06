@@ -539,6 +539,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     new LinkedHashMap<>();
             try {
                 for (BenchmarkWorkloadDefinitions.SourceChain chain : workload.sourceChains()) {
+                    fork.registerUnconfirmedExternalPostgresBorrower(chain.id());
                     captures.put(chain, BenchmarkTerminalCapture.open(connectorId, connectorJar,
                             connectorConfig, chain.table(), BenchmarkPreflightWrites.warmupRowId(workload, chain),
                             chain.terminalRowId(), BenchmarkBoundaryWrites.forChain(workload, chain),

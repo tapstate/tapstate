@@ -35,6 +35,9 @@ interface ServerHandle extends AutoCloseable {
     @Override
     void close();
 
+    /** True only when this owned launch has actually stopped; unknown handles do not prove it. */
+    default boolean terminated() { return false; }
+
     /**
      * A directory of this launch's own for the server to stage resolved connectors into.
      *

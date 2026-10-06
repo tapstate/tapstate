@@ -504,7 +504,7 @@ public final class CaptureRunUnit {
                 }
             } finally {
                 if (load != null) {
-                    try { load.close(); }
+                    try { deferred.closeLoad(load); }
                     catch (RuntimeException | Error cleanup) {
                         if (readFailure != null) { readFailure.addSuppressed(cleanup); }
                         else { throw cleanup; }
@@ -546,14 +546,35 @@ public final class CaptureRunUnit {
             this.ringNames = List.copyOf(ringNames); this.token = token; this.health = health;
             this.port = port; this.node = node;
         }
+        private final AtomicReference<Throwable> closeFailure = new AtomicReference<>();
+
+        private void noteCloseFailure(Throwable refused) {
+            Throwable original = closeFailure.get();
+            if (original == null && closeFailure.compareAndSet(null, refused)) { return; }
+            original = closeFailure.get();
+            if (original != refused) { synchronized (original) { original.addSuppressed(refused); } }
+        }
+        private void throwCloseFailure() {
+            Throwable refused = closeFailure.get();
+            if (refused instanceof RuntimeException runtime) { throw runtime; }
+            if (refused instanceof Error defect) { throw defect; }
+        }
+        private void closeTail(Subscription actual) {
+            try { actual.close(); }
+            catch (RuntimeException | Error refused) { noteCloseFailure(refused); throw refused; }
+        }
+        private void closeLoad(SnapshotPhase.Load actual) {
+            try { actual.close(); }
+            catch (RuntimeException | Error refused) { noteCloseFailure(refused); throw refused; }
+        }
         private void prepare(Consumer<CapturePort> read) { this.read = Objects.requireNonNull(read, "read"); }
         private boolean attachLoad(SnapshotPhase.Load opened) {
             if (!load.compareAndSet(null, opened)) {
-                opened.close();
+                closeLoad(opened);
                 throw new IllegalStateException("a reserved snapshot opened more than one load");
             }
             if (closed.get() || loadAbandoned.get()) {
-                if (load.compareAndSet(opened, null)) { opened.close(); }
+                if (load.get() == opened) { closeLoad(opened); load.compareAndSet(opened, null); }
                 return false;
             }
             return true;
@@ -561,9 +582,12 @@ public final class CaptureRunUnit {
         private void received(Envelope event) { rows.incrementAndGet(); byTable.merge(event.src(), 1L, Long::sum); }
         @Override public long snapshotRows() { return rows.get(); }
         @Override public Map<String, Long> snapshotRowsByTable() { return Map.copyOf(byTable); }
-        @Override public boolean loading() { return finished.getCount() != 0; }
+        @Override public boolean loading() { return closed.get() ? !reservation.isReleased() : finished.getCount() != 0; }
         @Override public boolean awaitLoaded(java.time.Duration timeout) throws InterruptedException {
-            return finished.await(timeout.toNanos(), java.util.concurrent.TimeUnit.NANOSECONDS);
+            boolean ready = closed.get() ? reservation.awaitReleased(timeout)
+                    : finished.await(timeout.toNanos(), java.util.concurrent.TimeUnit.NANOSECONDS);
+            throwCloseFailure();
+            return ready;
         }
         @Override public void activateSnapshot() { activate(null); }
         @Override public void activateSnapshot(LogSink.Scope scope) {
@@ -597,35 +621,54 @@ public final class CaptureRunUnit {
             });
         }
         private void attach(Subscription started) {
-            if (closed.get()) { started.close(); return; }
-            if (!tail.compareAndSet(null, started)) {
-                started.close(); throw new IllegalStateException("a snapshot run opened more than one CDC tail");
+            if (closed.get()) {
+                try { closeTail(started); }
+                catch (RuntimeException | Error refused) { tail.compareAndSet(null, started); throw refused; }
+                return;
             }
-            if (closed.get()) { Subscription late = tail.getAndSet(null); if (late != null) { late.close(); } }
+            if (!tail.compareAndSet(null, started)) {
+                closeTail(started); throw new IllegalStateException("a snapshot run opened more than one CDC tail");
+            }
+            if (closed.get()) {
+                Subscription late = tail.get();
+                if (late != null) { closeTail(late); tail.compareAndSet(late, null); }
+            }
         }
         @Override public void abandonLoad() {
             if (!loading() || !loadAbandoned.compareAndSet(false, true)) { return; }
             SnapshotPhase.Load opened = load.getAndSet(null);
-            if (opened != null) { opened.close(); }
+            if (opened != null) { closeLoad(opened); }
             if (buffer != null) {
                 for (String ringName : ringNames) { buffer.releaseSnapshot(pipelineId, ringName, token); }
             }
             if (!activated.get()) { activateSnapshot(); }
         }
         @Override public void close() {
-            if (!closed.compareAndSet(false, true)) { return; }
-            SnapshotPhase.Load opened = load.getAndSet(null);
-            RuntimeException failure = opened == null ? null : runCleanup(opened::close, null);
+            boolean first = closed.compareAndSet(false, true);
+            if (!first && closeFailure.get() == null) { return; }
+            SnapshotPhase.Load opened = load.get();
+            boolean retriedActual = !first && (opened != null || tail.get() != null);
+            RuntimeException failure = opened == null ? null : runCleanup(() -> closeLoad(opened), null);
+            if (opened != null && failure == null) { load.compareAndSet(opened, null); }
             if (buffer != null) {
                 for (String ringName : ringNames) {
                     failure = runCleanup(() -> buffer.releaseSnapshot(pipelineId, ringName, token), failure);
                 }
             }
             failure = runCleanup(reservation::close, failure);
-            Subscription started = tail.getAndSet(null);
-            if (started != null) { failure = runCleanup(started::close, failure); }
-            finished.countDown();
-            if (failure != null) { throw failure; }
+            Subscription started = tail.get();
+            if (started != null) {
+                try {
+                    closeTail(started);
+                    tail.compareAndSet(started, null);
+                } catch (RuntimeException refused) {
+                    if (failure == null) { failure = refused; }
+                    else if (failure != refused) { failure.addSuppressed(refused); }
+                }
+            }
+            if (failure != null) { noteCloseFailure(failure); throw failure; }
+            if (retriedActual && reservation.isReleased() && load.get() == null && tail.get() == null) { closeFailure.set(null); }
+            throwCloseFailure();
         }
     }
 

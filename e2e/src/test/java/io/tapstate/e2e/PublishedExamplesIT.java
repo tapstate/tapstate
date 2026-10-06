@@ -152,7 +152,7 @@ class PublishedExamplesIT {
         // The stores the example asked for come up before anything else: a resource cannot be applied
         // before the endpoint whose address it interpolates exists.
         try (ProvisionedStores stores = ProvisionedStores.provision(envelope.setup().databases(), run);
-                ServerHandle server = tier.launch(SharedMongo.replicaSetUrl(run));
+                ServerHandle server = stores.launch(() -> tier.launch(SharedMongo.replicaSetUrl(run)));
                 Endpoints files = new FileEndpoints()) {
             ControlPlane control = new ControlPlane(server.baseUrl());
             control.bootstrapAndLogin("e2e", "e2e-password");

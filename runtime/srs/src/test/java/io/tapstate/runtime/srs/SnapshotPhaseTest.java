@@ -40,6 +40,31 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class SnapshotPhaseTest {
 
     @Test
+    void aSnapshotOpenReadFailureRemainsPrimaryWhenItsActualSessionCloseAlsoFails() {
+        IllegalStateException readFailure = new IllegalStateException("controlled first-table read refusal");
+        IllegalStateException cleanupFailure = new IllegalStateException("controlled session close refusal");
+        java.util.concurrent.atomic.AtomicInteger sessionCloses = new java.util.concurrent.atomic.AtomicInteger();
+        class Source implements CapturePort, io.tapstate.spi.capture.SnapshotSession.Provider {
+            @Override public io.tapstate.spi.capture.SnapshotSession snapshotSession(CaptureConfig config) {
+                return new io.tapstate.spi.capture.SnapshotSession() {
+                    @Override public CaptureBatch read(String table) { throw readFailure; }
+                    @Override public void close() { sessionCloses.incrementAndGet(); throw cleanupFailure; }
+                };
+            }
+            @Override public CaptureBatch snapshot(CaptureConfig config) { throw new AssertionError("the real session read is required"); }
+            @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) { throw new UnsupportedOperationException(); }
+            @Override public ConnectionReport testConnection(CaptureConfig config) { throw new UnsupportedOperationException(); }
+            @Override public DiscoveredSchema discoverSchema(CaptureConfig config) { throw new UnsupportedOperationException(); }
+        }
+
+        assertThatThrownBy(() -> SnapshotPhase.open(new Source(), config(), "primary-cause-chain", PIPE,
+                List.of("orders"), 1L, new RecordingMeta(new ArrayList<>())))
+                .isSameAs(readFailure)
+                .satisfies(failure -> assertThat(failure.getSuppressed()).containsExactly(cleanupFailure));
+        assertThat(sessionCloses).hasValue(1);
+    }
+
+    @Test
     void chainlessSnapshotUsesTheStreamingPortWithoutMaterializingABatch() {
         CapturePort streamed = new CapturePort() {
             @Override public CaptureBatch snapshot(CaptureConfig config) {
