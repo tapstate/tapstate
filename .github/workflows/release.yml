@@ -468,6 +468,7 @@ jobs:
           echo "Dispatched the real-connector lane on ${GITHUB_REF_NAME} (${tip})."
 
   join-perf:
+    name: dispatch-join-perf
     # The join operator's performance lane, started here for the same reason as the connector one
     # above: the ordinary build runs three of its scenarios on one tier, so a release could otherwise
     # go out having never had the other eight measured, or the resident and cold tiers looked at at
