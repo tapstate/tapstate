@@ -97,13 +97,14 @@ schema configuration before starting.
 ## Existing rows in the target
 
 A target collection is created from the source model when it is absent. Existing
-target rows are governed by `on_full_load` on each `serve.sync` element:
+target rows are governed by `on_full_load` on each `serve.sync` element and on each
+view:
 
 | Policy | Before a new full load |
 |---|---|
 | `append` (default) | Keep existing rows and use the configured `write_mode`. |
 | `clear` | Clear existing rows before writing the new full load. |
-| `fail` | Refuse to start writing if the target collection is not empty. |
+| `fail` | Refuse the start if the target already holds rows. |
 
 For example, a sync to the `warehouse` connection can request a clean full load:
 
@@ -115,11 +116,64 @@ serve:
       on_full_load: clear
 ```
 
+A view takes the same two settings as a sync element, with the same values, meanings
+and defaults: `write_mode` (`upsert`, or `append`) and `on_full_load`. Both may be
+written on an inline view or on a `kind: view` definition; a `use:` reference takes
+neither. With `write_mode: append` a delete at the source removes nothing. On MongoDB,
+the target keeps its key index, so an update still replaces the document under its
+key: each key ends up holding one document, its latest, and a deleted row's last one
+stays.
+
+```yaml
+view:
+  id: order_state
+  from: orders
+  primary_key: id
+  on_full_load: clear
+```
+
 An empty or newly created collection is allowed with `fail`. Resume, failure recovery,
-and `cdc_only` runs never clear the target, even when `clear` is declared.
-`restart --rerun` resets the pipeline's progress and starts a new full load; it
-still follows `on_full_load`, so use `clear` explicitly when existing target rows
-should be removed. A failed clear stops the pipeline before it writes rows.
+`cdc_only` runs, and a pipeline a restarted server carries on never clear the target,
+even when `clear` is declared. A failed clear stops the pipeline before it writes rows.
+
+### A start checks the targets first
+
+Before a start writes anything, it looks at every target its new full load would
+write into. A new full load copies what the source holds now, so a row deleted at the
+source while the pipeline was stopped with its state cleared is in neither the source
+nor the load: kept in a target that is not cleared, it stays there, and nothing else
+would say so. So when a target already holds rows and its policy is `append`, the start
+stops and asks, naming the target and how many rows it holds:
+
+- **`clear`** clears the target before the full load, and records `on_full_load: clear`
+  on the element that writes it. That changes the pipeline's definition on the server;
+  your workspace file still says `append`, so applying it again sets it back, and the
+  next new full load asks again.
+- **`keep`** keeps the rows and starts anyway.
+
+A target set to `fail` refuses the start outright, before anything is written. A target
+set to `clear`, or an empty one, is not asked about. A target whose rows the server
+cannot read gets a warning and does not stop the start. An element that comes from a
+shared `kind: serve` or `kind: view` definition is only offered `keep`; change the
+shared definition to clear it.
+
+At a terminal, `tapstate start` shows the question and waits for an answer; Enter
+cancels and leaves the pipeline as it is. Where nobody can answer, the start is
+refused with the commands that answer it. In a script:
+
+```sh
+tapstate start orders_sync --checks-only               # what a start would ask; exits 0 when nothing
+tapstate start orders_sync --decide target-not-empty=keep
+tapstate start orders_sync -y                          # answer every question by going ahead as configured
+```
+
+`--decide <check>=<answer>` answers every question one check asks;
+`--decide <check>/<subject>=<answer>` answers one, by the key the start checks print.
+`-o json` prints the report the start was stopped with and never asks.
+`restart --rerun` asks everything, the clearing included, before it stops anything,
+so cancelling leaves the pipeline running untouched. `up --yes` answers every question
+by going ahead as configured. What the checks are and how a new one is added is in
+[Start checks](start-checks/).
 
 ## The one-command demo
 
@@ -944,6 +998,12 @@ This runtime is a preview. Known constraints in this slice:
 - **Preview builds.** Until the first release, the server image is assembled locally
   and the CLI is built from source; a published image and a CLI installer remove
   those steps.
+- **A new full load cannot see what the source deleted meanwhile.** After a stop that
+  clears the pipeline's state, the next run copies what the source holds then, and a
+  row deleted at the source in between is not in the copy: a target that is not
+  cleared keeps it. The start asks before that happens (see
+  [A start checks the targets first](#a-start-checks-the-targets-first)), but only for
+  targets whose rows the server can read; for any other target it warns and goes ahead.
 - **`logs` is thin.** The per-pipeline `logs` face is a node-local operational tail
   and is often sparse; full runtime detail is in the server process log.
 - **No CLI bootstrap verb.** The compose stack creates the first admin for you; on

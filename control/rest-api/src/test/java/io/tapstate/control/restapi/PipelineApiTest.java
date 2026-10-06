@@ -1,5 +1,7 @@
 package io.tapstate.control.restapi;
 
+import io.tapstate.control.core.TargetProbe;
+
 import io.tapstate.control.core.ApplyService;
 import io.tapstate.control.core.AccessTokenService;
 import io.tapstate.control.core.ArtifactMutationService;
@@ -161,6 +163,7 @@ class PipelineApiTest {
         context.getBean(FakePipelineLayoutStore.class).clear();
         context.getBean(FakePipelineDraftStore.class).clear();
         context.getBean(RecordingAuditStore.class).clear();
+        context.getBean(StartChecksTestConfiguration.StartCheckTargets.class).clear();
         FakeArtifactStore artifacts = context.getBean(FakeArtifactStore.class);
         artifacts.clear();
         // Every test starts from one applied, never-run pipeline (state NEW) and its complete reference closure.
@@ -978,7 +981,8 @@ class PipelineApiTest {
                 .containsExactlyInAnyOrder(
                         "pipeline.list", "pipeline.catalog", "pipeline.get", "pipeline.layout.get", "pipeline.layout.update", "pipeline.create",
                         "pipeline.update",
-                        "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
+                        "pipeline.start", "pipeline.start-checks", "pipeline.stop", "pipeline.pause",
+                        "pipeline.resume",
                         "pipeline.status", "pipeline.metrics", "pipeline.snapshot", "pipeline.logs",
                         "pipeline.metrics.history", "pipeline.explain",
                         "pipeline.position", "pipeline.set-position",
@@ -1087,7 +1091,8 @@ class PipelineApiTest {
     @EnableAutoConfiguration
     @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceProjectionServiceTestConfiguration.class,
             PipelinePositionTestConfiguration.class, ClusterTopologyTestConfiguration.class,
-            DerivedSchemaTestConfiguration.class, ObservabilityTestConfiguration.class})
+            DerivedSchemaTestConfiguration.class, ObservabilityTestConfiguration.class,
+            StartChecksTestConfiguration.class})
     static class TestApp {
 
         @Bean
@@ -1460,6 +1465,233 @@ class PipelineApiTest {
             return new PipelineLogQueryService(sink);
         }
 
+    }
+
+    // ---- start checks: a start asks before a new full load goes into a target that already holds rows ----
+
+    private static final String TARGET_KEY = "target-not-empty/tgt_x/orders";
+
+    private StartChecksTestConfiguration.StartCheckTargets targetHolds(long rows) {
+        StartChecksTestConfiguration.StartCheckTargets targets =
+                context.getBean(StartChecksTestConfiguration.StartCheckTargets.class);
+        targets.tables.put("sink1", "orders");
+        targets.rows.put("tgt_x/orders", new TargetProbe.TargetRows(false, rows, false));
+        return targets;
+    }
+
+    private RestClient.RequestBodySpec start(String pipelineId, Scope scope) {
+        return client().post().uri("/api/pipelines/" + pipelineId + ":start")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(scope));
+    }
+
+    private static Map<String, Object> answer(String action) {
+        return Map.of("decisions", List.of(Map.of("finding", TARGET_KEY, "action", action)));
+    }
+
+    @Test
+    void aStartThatNeedsAnAnswerIsRefusedInTheShapeEveryClientAlreadyReads() {
+        targetHolds(5);
+
+        ApiError plain = start("pl1", Scope.WRITE).exchange((request, response) -> {
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+            return response.bodyTo(ApiError.class);
+        });
+
+        assertThat(plain.code()).isEqualTo("lifecycle.start-needs-confirmation");
+        assertThat(plain.params()).containsEntry("pipeline", "pl1").containsEntry("count", 1)
+                .containsEntry("check", "target-not-empty").containsEntry("subject", "tgt_x/orders");
+        assertThat(plain.message()).as("the message alone says how to answer")
+                .contains("tapstate start pl1 --decide").contains("-y");
+        assertThat(context.getBean(FakeDesiredStore.class).read("pl1")).isEmpty();
+        assertThat(context.getBean(RecordingAuditStore.class).records).isEmpty();
+    }
+
+    @Test
+    void aRefusedStartCarriesTheWholeReportBesideTheCodedError() {
+        targetHolds(5);
+
+        Map<?, ?> body = start("pl1", Scope.WRITE).exchange((request, response) -> response.bodyTo(Map.class));
+
+        Map<?, ?> report = (Map<?, ?>) body.get("startChecks");
+        assertThat(report.get("outcome")).isEqualTo("NEEDS_CONFIRMATION");
+        assertThat(report.get("contentHash")).isEqualTo(revisionOf(PIPELINE_V1));
+        Map<?, ?> finding = (Map<?, ?>) ((List<?>) report.get("findings")).getFirst();
+        assertThat(finding.get("key")).isEqualTo(TARGET_KEY);
+        assertThat(finding.get("behavior")).isEqualTo("CONFIRM");
+        assertThat((String) finding.get("message")).contains("orders").contains("5 rows");
+        assertThat(((List<?>) finding.get("actions")).stream().map(action -> String.valueOf(((Map<?, ?>) action).get("id"))).toList())
+                .containsExactly("clear", "keep");
+    }
+
+    @Test
+    void keepingTheRowsStartsAndAnswersWithTheIntentAndTheReport() {
+        targetHolds(5);
+
+        Map<?, ?> body = start("pl1", Scope.WRITE)
+                .header(HttpHeaders.IF_MATCH, "\"" + revisionOf(PIPELINE_V1) + "\"")
+                .contentType(MediaType.APPLICATION_JSON).body(answer("keep"))
+                .retrieve().toEntity(Map.class).getBody();
+
+        assertThat(body.get("pipelineId")).isEqualTo("pl1");
+        assertThat(body.get("targetState")).isEqualTo("RUNNING");
+        assertThat(body.get("revision")).isEqualTo(revisionOf(PIPELINE_V1));
+        assertThat(((Map<?, ?>) body.get("startChecks")).get("outcome")).isEqualTo("READY");
+        assertThat(((Map<?, ?>) ((List<?>) body.get("decisionsApplied")).getFirst()).get("action")).isEqualTo("keep");
+        assertThat(context.getBean(FakeDesiredStore.class).read("pl1")).isPresent();
+    }
+
+    @Test
+    void clearingFirstRewritesTheDefinitionAndStartsTheRewrittenOne() {
+        targetHolds(5);
+
+        Map<?, ?> body = start("pl1", Scope.WRITE)
+                .header(HttpHeaders.IF_MATCH, "\"" + revisionOf(PIPELINE_V1) + "\"")
+                .contentType(MediaType.APPLICATION_JSON).body(answer("clear"))
+                .retrieve().toEntity(Map.class).getBody();
+
+        Resource rewritten = context.getBean(FakeArtifactStore.class).get("pl1").orElseThrow();
+        String rewrittenHash = CanonicalHash.of(rewritten);
+        assertThat(new io.tapstate.core.model.canonical.CanonicalWriter().write(rewritten)).contains("on_full_load: clear");
+        assertThat(body.get("revision")).isEqualTo(rewrittenHash);
+        assertThat(((Map<?, ?>) ((List<?>) body.get("decisionsApplied")).getFirst()).get("contentHash"))
+                .isEqualTo(rewrittenHash);
+        assertThat(context.getBean(RecordingAuditStore.class).records)
+                .extracting(AuditRecord::operationId).containsExactly("pipeline.update", "pipeline.start");
+    }
+
+    @Test
+    void anAnswerSentWithoutTheDefinitionItAnswersIsRefusedAndWritesNothing() {
+        targetHolds(5);
+
+        ApiError body = start("pl1", Scope.WRITE).contentType(MediaType.APPLICATION_JSON).body(answer("keep"))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.PRECONDITION_REQUIRED);
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(body.code()).isEqualTo("pipeline.precondition-required");
+        assertThat(context.getBean(FakeDesiredStore.class).read("pl1")).isEmpty();
+    }
+
+    @Test
+    void anAnswerGivenAgainstAnOlderDefinitionIsRefusedAndWritesNothing() {
+        targetHolds(5);
+
+        ApiError body = start("pl1", Scope.WRITE)
+                .header(HttpHeaders.IF_MATCH, "\"" + revisionOf(PIPELINE_V2) + "\"")
+                .contentType(MediaType.APPLICATION_JSON).body(answer("clear"))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.PRECONDITION_FAILED);
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(body.code()).isEqualTo("pipeline.version-conflict");
+        assertThat(CanonicalHash.of(context.getBean(FakeArtifactStore.class).get("pl1").orElseThrow()))
+                .isEqualTo(revisionOf(PIPELINE_V1));
+        assertThat(context.getBean(FakeDesiredStore.class).read("pl1")).isEmpty();
+    }
+
+    @Test
+    void aRefusalStandsWhateverIsAnswered() {
+        context.getBean(FakeArtifactStore.class).seed(PIPELINE_V1.replace("ddl: apply", "ddl: apply\n      on_full_load: fail"));
+        targetHolds(5);
+
+        ApiError body = start("pl1", Scope.WRITE)
+                .header(HttpHeaders.IF_MATCH, "\"" + CanonicalHash.of(
+                        context.getBean(FakeArtifactStore.class).get("pl1").orElseThrow()) + "\"")
+                .contentType(MediaType.APPLICATION_JSON).body(answer("keep"))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(body.code()).isEqualTo("lifecycle.start-blocked");
+        assertThat(context.getBean(FakeDesiredStore.class).read("pl1")).isEmpty();
+    }
+
+    @Test
+    void anAnswerTheQuestionDoesNotOfferIsTheCallersToFix() {
+        targetHolds(5);
+
+        ApiError body = start("pl1", Scope.WRITE)
+                .header(HttpHeaders.IF_MATCH, "\"" + revisionOf(PIPELINE_V1) + "\"")
+                .contentType(MediaType.APPLICATION_JSON).body(answer("truncate"))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(body.code()).isEqualTo("lifecycle.invalid-start-decision");
+        assertThat(body.params()).containsEntry("finding", TARGET_KEY).containsEntry("action", "truncate");
+    }
+
+    @Test
+    void anAnswerToAQuestionNoLongerAskedIsReportedStale() {
+        targetHolds(0).rows.put("tgt_x/orders", TargetProbe.TargetRows.EMPTY);
+
+        Map<?, ?> body = start("pl1", Scope.WRITE)
+                .header(HttpHeaders.IF_MATCH, "\"" + revisionOf(PIPELINE_V1) + "\"")
+                .contentType(MediaType.APPLICATION_JSON).body(answer("clear"))
+                .retrieve().toEntity(Map.class).getBody();
+
+        assertThat(body.get("targetState")).isEqualTo("RUNNING");
+        assertThat(body.get("staleDecisions")).isEqualTo(List.of(Map.of("finding", TARGET_KEY, "action", "clear")));
+        assertThat(new io.tapstate.core.model.canonical.CanonicalWriter().write(
+                context.getBean(FakeArtifactStore.class).get("pl1").orElseThrow())).doesNotContain("on_full_load");
+    }
+
+    @Test
+    void theStartChecksCanBeReadWithoutStartingAnything() {
+        targetHolds(5);
+
+        Map<?, ?> report = client().get().uri("/api/pipelines/pl1/start-checks")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(Map.class).getBody();
+
+        assertThat(report.get("intent")).isEqualTo("START");
+        assertThat(report.get("outcome")).isEqualTo("NEEDS_CONFIRMATION");
+        assertThat(context.getBean(FakeDesiredStore.class).read("pl1")).isEmpty();
+        assertThat(context.getBean(RecordingAuditStore.class).records).isEmpty();
+    }
+
+    @Test
+    void theStartChecksOfAPipelineNeverAppliedAreNotFound() {
+        ApiError body = client().get().uri("/api/pipelines/ghost/start-checks?intent=rerun")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(body.code()).isEqualTo("lifecycle.unknown-pipeline");
+    }
+
+    @Test
+    void anIntentTheServerDoesNotKnowIsRefusedRatherThanReadAsAPlainStart() {
+        ApiError body = client().get().uri("/api/pipelines/pl1/start-checks?intent=restart")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(body.code()).isEqualTo("control.malformed-request");
+    }
+
+    @Test
+    void startingADraftThatCannotRunYetIsAConflictNotAServerFailure() {
+        client().post().uri("/api/pipelines")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.WRITE))
+                .contentType(MediaType.APPLICATION_JSON)
+                .body("""
+                        {"id":"blank_draft","metadata":{"labels":{},"description":"draft"},
+                         "sources":[],"transforms":[],"view":null,"serve":null,"settings":null,"experimental":null}
+                        """)
+                .retrieve().toBodilessEntity();
+
+        ApiError body = start("blank_draft", Scope.WRITE).exchange((request, response) -> {
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+            return response.bodyTo(ApiError.class);
+        });
+        assertThat(body.code()).isEqualTo("lifecycle.pipeline-not-runnable");
     }
 
     // ---- fakes ----

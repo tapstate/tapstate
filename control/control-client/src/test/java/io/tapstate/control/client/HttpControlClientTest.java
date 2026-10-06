@@ -10,6 +10,9 @@ import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -118,6 +121,41 @@ class HttpControlClientTest {
 
             assertThat(response).isEqualTo(new ControlResponse.Rejected(
                     403, "control.forbidden", "Forbidden.", Map.of("required", "admin")));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void aRefusalKeepsWhatItCarriedBesidesItsCodeMessageAndParams() throws Exception {
+        HttpServer server = server(exchange -> answer(exchange, 409,
+                "{\"code\":\"lifecycle.start-needs-confirmation\",\"message\":\"Answer first.\","
+                        + "\"params\":{\"pipeline\":\"orders\"},\"startChecks\":{\"outcome\":\"NEEDS_CONFIRMATION\"}}"));
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            ControlResponse response = client.post(baseOf(server), "token", "/api/pipelines/orders:start", null,
+                    RequestBudget.HEAVY);
+
+            assertThat(response).isEqualTo(new ControlResponse.Rejected(409, "lifecycle.start-needs-confirmation",
+                    "Answer first.", Map.of("pipeline", "orders"),
+                    Map.of("startChecks", Map.of("outcome", "NEEDS_CONFIRMATION"))));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void aPostCarriesThePreconditionAsAnEntityTagAndNoneWhenThereIsNone() throws Exception {
+        List<String> preconditions = Collections.synchronizedList(new ArrayList<>());
+        HttpServer server = server(exchange -> {
+            preconditions.add(String.valueOf(exchange.getRequestHeaders().getFirst("If-Match")));
+            answer(exchange, 200, "{}");
+        });
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            client.post(baseOf(server), "token", "/api/pipelines/orders:start", Map.of("decisions", List.of()),
+                    RequestBudget.HEAVY, "c".repeat(64));
+            client.post(baseOf(server), "token", "/api/pipelines/orders:start", null, RequestBudget.HEAVY);
+
+            assertThat(preconditions).containsExactly("\"" + "c".repeat(64) + "\"", "null");
         } finally {
             server.stop(0);
         }

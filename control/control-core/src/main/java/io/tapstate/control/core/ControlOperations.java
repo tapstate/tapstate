@@ -227,9 +227,25 @@ public final class ControlOperations {
             "pipeline-draft.rebase", Scope.WRITE, true, null,
             "Explicitly rebase one Pipeline draft onto the artifact hash the caller has just read, preserving its content.",
             CLI_AND_REST);
+    // The start runs its start checks first. The answer convention is in the description because the
+    // caller on that face is a model: it relays the questions and carries back a person's answers, and the
+    // precondition proves that somebody answered the report as it stood, never that a person did.
     public static final Operation PIPELINE_START = mcp(
             "pipeline.start", Scope.WRITE, true,
-            "Set a Pipeline's desired state to running after its workspace has been applied.");
+            "Set a Pipeline's desired state to running after its workspace has been applied. Its start "
+                    + "checks run first: a start they stop is refused with their report under startChecks, "
+                    + "each question listing the answers it offers. Relay the findings to the person starting "
+                    + "the Pipeline and send back the answers they choose as decisions, with the report's "
+                    + "contentHash as expectedContentHash. Never choose an answer that changes the Pipeline "
+                    + "or clears data unless the person said to.");
+    // The start checks a start would be asked, read without starting anything: what a client shows
+    // before it starts, and what a rerun asks about while the pipeline still runs untouched. Read-scoped,
+    // so a caller with no write capability can still see why a start would stop.
+    public static final Operation PIPELINE_START_CHECKS = mcp(
+            "pipeline.start-checks", Scope.READ, false,
+            "Read the start checks a Pipeline start would be asked, without starting it: each finding, "
+                    + "whether it lets the start go ahead, asks a question first, or refuses it, and the "
+                    + "answers a question offers. Relay the findings to the person starting the Pipeline.");
     // The description is rendered from the same declarations a stop works through, both outcomes of
             // them. Written out by hand it would describe whatever was true when somebody last edited it,
             // and a description that has fallen behind reads exactly like one that is complete.
@@ -355,6 +371,7 @@ public final class ControlOperations {
             PIPELINE_DRAFT_PUBLISH,
             PIPELINE_DRAFT_REBASE,
             PIPELINE_START,
+            PIPELINE_START_CHECKS,
             PIPELINE_STOP,
             PIPELINE_PAUSE,
             PIPELINE_RESUME,

@@ -1069,6 +1069,112 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         }
     }
 
+    @Override
+    public StartAttempt start(URI baseUrl, String credential, String pipelineId, List<StartDecision> decisions,
+            String ifMatch) {
+        try {
+            HttpRequest.Builder builder = authed(baseUrl, "/api/pipelines/" + pipelineId + ":start", credential,
+                    heavyTimeout);
+            if (decisions != null && !decisions.isEmpty()) {
+                List<Map<String, Object>> answers = new ArrayList<>();
+                for (StartDecision decision : decisions) {
+                    Map<String, Object> answer = new LinkedHashMap<>();
+                    answer.put("finding", decision.finding());
+                    answer.put("action", decision.action());
+                    answers.add(answer);
+                }
+                builder = builder.header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers
+                        .ofString(JsonOut.compact(Map.of("decisions", answers)), StandardCharsets.UTF_8));
+            } else {
+                builder = builder.POST(HttpRequest.BodyPublishers.noBody());
+            }
+            if (ifMatch != null) {
+                builder = builder.header("If-Match", "\"" + ifMatch + "\"");
+            }
+            HttpResponse<String> response =
+                    send(builder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            Object json = parseOrNull(response.body());
+            if (response.statusCode() == 200) {
+                LifecycleOutcome.Accepted accepted = desiredState(response.body());
+                if (accepted == null || !(json instanceof Map<?, ?> body)) {
+                    return new StartAttempt.Unreachable(true);
+                }
+                return new StartAttempt.Started(accepted.pipelineId(), accepted.targetState(), accepted.revision(),
+                        StartChecks.parse(body.get("startChecks")), maps(body.get("decisionsApplied")),
+                        maps(body.get("staleDecisions")), stringKeyed(body));
+            }
+            Rejection r = rejection(response.body(), "The server refused the start.");
+            if (json instanceof Map<?, ?> body) {
+                StartChecks checks = StartChecks.parse(body.get("startChecks"));
+                if (checks != null) {
+                    return new StartAttempt.Stopped(r.code(), r.params(), r.message(), checks);
+                }
+                return new StartAttempt.Rejected(r.code(), r.params(), r.message(), maps(body.get("decisionsApplied")));
+            }
+            return new StartAttempt.Rejected(r.code(), r.params(), r.message(), List.of());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new StartAttempt.Unreachable(true);
+        } catch (java.net.ConnectException | HttpConnectTimeoutException notConnected) {
+            // No connection was made, so nothing was sent: another member may be asked instead.
+            return new StartAttempt.Unreachable(false);
+        } catch (IOException | RuntimeException e) {
+            return new StartAttempt.Unreachable(true);
+        }
+    }
+
+    @Override
+    public StartChecksOutcome startChecks(URI baseUrl, String credential, String pipelineId, String intent) {
+        try {
+            HttpRequest request = authed(baseUrl, "/api/pipelines/" + pipelineId + "/start-checks?intent="
+                    + URLEncoder.encode(intent, StandardCharsets.UTF_8), credential, heavyTimeout).GET().build();
+            HttpResponse<String> response =
+                    send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200) {
+                StartChecks checks = StartChecks.parse(parseOrNull(response.body()));
+                return checks == null ? new StartChecksOutcome.Unreachable() : new StartChecksOutcome.Found(checks);
+            }
+            Rejection r = rejection(response.body(), "The server refused to read the start checks.");
+            // A server released before start checks has no such resource at all: its 404 carries no code of
+            // ours, which is what tells it apart from a pipeline this server does not have.
+            if (response.statusCode() == 404 && !r.code().startsWith("lifecycle.")) {
+                return new StartChecksOutcome.NotSupported();
+            }
+            return new StartChecksOutcome.Rejected(r.code(), r.params(), r.message());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new StartChecksOutcome.Unreachable();
+        } catch (IOException | RuntimeException e) {
+            return new StartChecksOutcome.Unreachable();
+        }
+    }
+
+    private static Object parseOrNull(String body) {
+        try {
+            return body == null || body.isBlank() ? null : JsonReader.parse(body);
+        } catch (RuntimeException malformed) {
+            return null;
+        }
+    }
+
+    private static List<Map<String, Object>> maps(Object value) {
+        List<Map<String, Object>> maps = new ArrayList<>();
+        if (value instanceof List<?> list) {
+            for (Object item : list) {
+                if (item instanceof Map<?, ?> map) {
+                    maps.add(stringKeyed(map));
+                }
+            }
+        }
+        return maps;
+    }
+
+    private static Map<String, Object> stringKeyed(Map<?, ?> map) {
+        Map<String, Object> keyed = new LinkedHashMap<>();
+        map.forEach((key, value) -> keyed.put(String.valueOf(key), value));
+        return keyed;
+    }
+
     /** The new desired state decoded from a 200 body, or {@code null} unless it carries all three string fields. */
     private static LifecycleOutcome.Accepted desiredState(String body) {
         if (JsonReader.parse(body) instanceof Map<?, ?> m

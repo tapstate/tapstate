@@ -246,6 +246,25 @@ cli.mcp-unavailable:
 cli.confirmation-needs-a-terminal:
   message: "`{verb}` clears what the pipeline accumulated, and there is no terminal here to confirm at."
   solution: "Add `-y` to go ahead without being asked, or run `stop <pipeline-id> --keep-state` to stop it and keep everything it has."
+cli.start-needs-an-answer:
+  message: "{pipeline} was left as it is: {count} start check question(s) need an answer, and there is no terminal here to ask at."
+  solution: "Answer them on the command line: {commands}"
+cli.start-checks-unsupported:
+  message: "This server does not run start checks, so {option} cannot take effect; nothing was started."
+  solution: "Upgrade the server, or start without {option}."
+cli.start-checks-not-run:
+  message: "The server started {pipeline} without running start checks; it is likely older than this client."
+cli.decide-malformed:
+  message: "--decide {decide} is not an answer: write <check>=<action>, or <check>/<subject>=<action> for one question."
+cli.decide-not-offered:
+  message: "--decide {decide} cannot be taken: {findings} do(es) not offer that answer."
+  solution: "Answer each of them on its own with --decide <check>/<subject>=<action>, using an answer it offers."
+cli.decide-on-a-refusal:
+  message: "--decide {decide} answers a start check that refuses the start, and no answer changes a refusal."
+  solution: "Read the start checks for what the refusal needs changed, change it, then start again."
+cli.start-may-have-gone-ahead:
+  message: "The start of {pipeline} was sent to {server}, and no answer came back in time; it may have gone ahead there."
+  solution: "Check with 'tapstate status {pipeline}' before starting it again."
 cli.watch-needs-a-terminal:
   message: "`watch` redraws one row in place, which needs a terminal; here its output is a pipe or a file."
   solution: "Use `tail <source>.<collection>` for a stream you can pipe, or `<source>.<collection>.find(...)` for a one-shot look."
@@ -420,6 +439,15 @@ lifecycle.pipeline-not-runnable:
 lifecycle.unknown-pipeline:
   message: "No pipeline named {pipeline} is applied."
   solution: "Apply the pipeline before acting on it or reading its status, and check the id for typos."
+lifecycle.start-needs-confirmation:
+  message: "Pipeline {pipeline} was not started: {count} start check question(s) need an answer first. Answer them with a client that shows start checks, or run tapstate start {pipeline} --decide <check>=<action>, or -y to go ahead as configured. First: {check} on {subject}."
+  solution: "Read the start checks, answer each question, and start again with the answers."
+lifecycle.start-blocked:
+  message: "Pipeline {pipeline} was not started: {count} start check(s) refuse this start whatever is answered. First: {check} on {subject}."
+  solution: "Read the start checks for what each refusal needs changed, change it, then start again."
+lifecycle.invalid-start-decision:
+  message: "Pipeline {pipeline} was not started: the answer {action} to start check {finding} cannot be taken, because that question does not offer it or was answered more than once."
+  solution: "Answer each question once, with one of the actions its start check lists."
 role.unsupported:
   message: "Unsupported --role value '{role}'."
   solution: "L1 runs the whole platform in one process; use --role=all (the default)."
@@ -952,3 +980,22 @@ cli.auth-issuer-mismatch:
 actuation.unwind-parent-key-unresolved:
   message: "Cannot bind the parent key for step `{step}` and stream `{stream}`: {reason}."
   solution: "Discover a source primary key and keep its column names consistent across merged branches feeding unwind."
+start-check.target-empty:
+  message: "{target} on {connection} is empty, so the full load starts from nothing."
+start-check.target-set-to-clear:
+  message: "{target} on {connection} already holds {holding}; this pipeline is set to clear it before a new full load (on_full_load: clear)."
+start-check.target-not-empty:
+  message: "{target} on {connection} already holds {holding}. This start runs a new full load without clearing it, so rows whose source rows were deleted will stay."
+start-check.target-not-empty-shared:
+  message: "{target} on {connection} already holds {holding}. This start runs a new full load without clearing it, so rows whose source rows were deleted will stay. Its write settings come from the shared definition {definition}, so clearing first is set there, not here."
+start-check.target-not-empty-refused:
+  message: "{target} on {connection} already holds {holding}, and on_full_load is fail, so this start's new full load is refused."
+  solution: "Empty {target}, or set on_full_load to clear or append, then start again."
+start-check.target-rows-unknown:
+  message: "Could not tell whether {target} on {connection} holds rows: {reason}. The start goes ahead without asking."
+start-check.unavailable:
+  message: "The {check} start check could not be evaluated: {reason}."
+start-check.clear-before-full-load:
+  message: "Clear {target} before the full load, and set on_full_load: clear on {element}"
+start-check.keep-existing-rows:
+  message: "Keep the rows already in {target} and start anyway"

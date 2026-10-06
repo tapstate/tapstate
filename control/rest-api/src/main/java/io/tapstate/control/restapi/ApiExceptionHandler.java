@@ -1,6 +1,7 @@
 package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.ControlError;
+import io.tapstate.control.core.StartRefusal;
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.messages.MessageCatalog;
@@ -45,6 +46,18 @@ class ApiExceptionHandler {
         MessageCatalog.Rendered rendered = catalog.render(e.code(), e.args());
         // Sorted so the params render identically regardless of throw-site order (a stable machine contract).
         ApiError body = new ApiError(e.code().code(), new TreeMap<>(e.args()), rendered.message());
+        return ResponseEntity.status(statusFor(e.code())).cacheControl(CacheControl.noStore()).body(body);
+    }
+
+    /**
+     * A start that did not go ahead answers with the coded error a client already knows how to read, and
+     * beside it what the start checks said and what the start had already changed in the definition.
+     */
+    @ExceptionHandler(StartRefusal.class)
+    ResponseEntity<StartRefusalError> handle(StartRefusal e) {
+        MessageCatalog.Rendered rendered = catalog.render(e.code(), e.args());
+        StartRefusalError body = new StartRefusalError(e.code().code(), new TreeMap<>(e.args()),
+                rendered.message(), e.report(), e.decisionsApplied().isEmpty() ? null : e.decisionsApplied());
         return ResponseEntity.status(statusFor(e.code())).cacheControl(CacheControl.noStore()).body(body);
     }
 
@@ -122,6 +135,14 @@ class ApiExceptionHandler {
             // from the current state, or a start/resume at a stale revision, is a 409 state conflict.
             case "lifecycle.unknown-pipeline" -> HttpStatus.NOT_FOUND;
             case "lifecycle.illegal-transition", "lifecycle.incompatible-revision" -> HttpStatus.CONFLICT;
+            // A start its start checks stopped -- to ask, or to refuse -- conflicts with the state its
+            // target is in, which an answer or a change resolves; the request itself was well formed.
+            case "lifecycle.start-needs-confirmation", "lifecycle.start-blocked" -> HttpStatus.CONFLICT;
+            // An answer that names something the start checks do not offer is the caller's to fix.
+            case "lifecycle.invalid-start-decision" -> HttpStatus.BAD_REQUEST;
+            // An editor draft saved before it has a source and an output is in a state that cannot run
+            // yet, like a forbidden transition: completing the draft resolves it, retrying does not.
+            case "lifecycle.pipeline-not-runnable" -> HttpStatus.CONFLICT;
             // The request did not say something it has to say, which is the caller's to fix by sending
             // it -- not a conflict with the pipeline's state, which is what the two above are.
             case "lifecycle.purge-state-not-stated" -> HttpStatus.BAD_REQUEST;

@@ -4,12 +4,15 @@ import com.mongodb.ConnectionString;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
+import io.tapstate.adapters.mongostore.MongoAuthStores;
 import io.tapstate.adapters.mongostore.MongoRateHistoryStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.spi.store.WorkloadClaimType;
 import org.bson.Document;
 
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
@@ -64,6 +67,18 @@ final class StoreDocuments implements AutoCloseable {
     long rateSamplesOf(String pipelineId) {
         return database.getCollection(MongoStorePort.PIPELINE_RATE_HISTORY)
                 .countDocuments(new Document(MongoRateHistoryStore.PIPELINE_ID, pipelineId));
+    }
+
+    /**
+     * The audit records of {@code operationId} on {@code resourceId}, oldest first. The audit has no read face
+     * either, and what a start recorded about its checks and the answers it was given is read where it was
+     * written.
+     */
+    List<Document> auditOf(String operationId, String resourceId) {
+        return database.getCollection(MongoAuthStores.AUDIT)
+                .find(new Document("operationId", operationId).append("resourceId", resourceId))
+                .sort(new Document("ts", 1))
+                .into(new ArrayList<>());
     }
 
     /** Every {@code _id} in {@code collection} - the reconciliation set a converger would work from. */

@@ -191,6 +191,7 @@ public final class CanonicalWriter {
         B b = new B();
         header(b, v);
         b.scalar("primary_key", v.primaryKey());
+        viewWriteSettings(b, v.writeMode(), v.onFullLoad());
         if (v.storage() != null) {
             b.put("storage", storage(v.storage()));
         }
@@ -425,6 +426,7 @@ public final class CanonicalWriter {
                 b.scalar("id", v.id());
                 b.scalar("from", fromRef(v.from()));
                 b.scalar("primary_key", v.primaryKey());
+                viewWriteSettings(b, v.writeMode(), v.onFullLoad());
                 if (v.storage() != null) {
                     b.put("storage", storage(v.storage()));
                 }
@@ -492,6 +494,19 @@ public final class CanonicalWriter {
                 items.add(pushElement(e));
             }
             b.put("push", new Node.SeqN(items));
+        }
+    }
+
+    /**
+     * A view's write settings, each left out at its documented default exactly as a sync element's are, so
+     * a view that declares neither -- every view written before views could -- hashes as it always did.
+     */
+    private static void viewWriteSettings(B b, WriteMode writeMode, OnFullLoad onFullLoad) {
+        if (writeMode != null && writeMode != WriteMode.UPSERT) {
+            b.scalar("write_mode", writeMode.yaml());
+        }
+        if (onFullLoad != null && onFullLoad != OnFullLoad.APPEND) {
+            b.scalar("on_full_load", onFullLoad.yaml());
         }
     }
 
