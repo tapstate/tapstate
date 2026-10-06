@@ -53,7 +53,7 @@ import java.util.concurrent.TimeUnit;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.data.Offset.offset;
 
-/** A real controller crash before replacement admission preserves a qualified floor on its survivor. */
+/** A real controller crash before replacement submission preserves a qualified floor on its survivor. */
 @RequiresDocker
 @EnabledIfSystemProperty(named = "tapstate.e2e.claimed-rebuild-crash.jar", matches = ".+")
 class RealClaimedRebuildHandoffCrashIT {
@@ -110,10 +110,24 @@ class RealClaimedRebuildHandoffCrashIT {
     @Test
     @Timeout(value = 20, unit = TimeUnit.MINUTES)
     void aClaimedPreAdmissionCrashKeepsItsKnownFloorThroughSurvivorTakeover() throws Exception {
+        verifyClaimedCrash(RebuildHandoffJdiSession.Cut.PRE_ADMISSION);
+    }
+
+    @Test
+    @Timeout(value = 20, unit = TimeUnit.MINUTES)
+    void aClaimedPostAdmissionCrashKeepsItsKnownFloorThroughSurvivorTakeover() throws Exception {
+        verifyClaimedCrash(RebuildHandoffJdiSession.Cut.POST_ADMISSION_PRE_SUBMIT);
+    }
+
+    private void verifyClaimedCrash(RebuildHandoffJdiSession.Cut cut) throws Exception {
+        assertThat(cut).isIn(RebuildHandoffJdiSession.Cut.PRE_ADMISSION,
+                RebuildHandoffJdiSession.Cut.POST_ADMISSION_PRE_SUBMIT);
         Path jar = Path.of(required("jar")).toRealPath();
         String expectedSha = required("sha256");
         assertThat(PipelineBenchmarkLiveRunIT.sha256(jar)).isEqualTo(expectedSha);
-        Path output = Path.of(required("output")).toAbsolutePath().normalize();
+        Path requested = Path.of(required("output")).toAbsolutePath().normalize();
+        Path output = cut == RebuildHandoffJdiSession.Cut.PRE_ADMISSION ? requested
+                : requested.resolveSibling(requested.getFileName() + "." + cut.name().toLowerCase(Locale.ROOT) + ".json");
         Path harnessRoot = PipelineBenchmarkLiveRunIT.harnessRoot();
         PipelineBenchmarkLiveRunIT.requireSafeOutput(output, harnessRoot);
         Path logDirectory = output.resolveSibling(output.getFileName() + ".server-logs");
@@ -122,9 +136,11 @@ class RealClaimedRebuildHandoffCrashIT {
         Map<String, Object> connectors = Map.of("mysql", PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor("mysql")),
                 "mongodb", PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor("mongodb")));
         BenchmarkLiveReport report = new BenchmarkLiveReport(output);
-        report.begin(Map.of("purpose", "REAL_CLAIMED_PRE_ADMISSION_CRASH", "application", application,
+        report.begin(Map.of("purpose", cut == RebuildHandoffJdiSession.Cut.PRE_ADMISSION
+                        ? "REAL_CLAIMED_PRE_ADMISSION_CRASH" : "REAL_CLAIMED_POST_ADMISSION_PRE_SUBMIT_CRASH",
+                        "application", application,
                         "expectedJarSha256", expectedSha, "connectors", connectors, "harness", inputs,
-                        "rows", ROWS, "cut", "PRE_ADMISSION", "serverLogDirectory", logDirectory.toString()),
+                        "rows", ROWS, "cut", cut.name(), "serverLogDirectory", logDirectory.toString()),
                 Map.of("kind", "correctness-only", "clusterProfile", "process-failure-only", "clusterMembers", 2), List.of());
         Map<String, RebuildHandoffJdiSession> observers = new LinkedHashMap<>();
         TwoMemberCluster cluster = null;
@@ -162,7 +178,7 @@ class RealClaimedRebuildHandoffCrashIT {
                 cluster = TwoMemberCluster.start(storeUri, operatorDatabase, jar, clusterId, USER, PASSWORD,
                         List.of(), List.of(), (node, address, arguments, jvm) -> {
                             try {
-                                var observer = RebuildHandoffJdiSession.startClaimed(jar, PIPELINE, TABLE,
+                                var observer = RebuildHandoffJdiSession.startClaimed(jar, PIPELINE, TABLE, cut,
                                         logDirectory, node.equals(TwoMemberCluster.NODE_A) ? "membera" : "memberb",
                                         (artifact, debug) -> {
                                             List<String> options = new ArrayList<>(jvm); options.addAll(debug);
@@ -220,33 +236,87 @@ class RealClaimedRebuildHandoffCrashIT {
                         .isEqualTo(WorkloadClaimFence.from(oldClaim));
                 first.arm(oldScope);
                 owned.first().lifecycle(PIPELINE, LifecycleVerb.RESUME);
+                long heldDeadline = System.nanoTime() + SETUP_WAIT.toNanos();
                 var held = first.awaitHeld(SETUP_WAIT);
                 StopReservation marker = actual.readStopReservation(PIPELINE).orElseThrow();
                 assertThat(marker.legacy()).isFalse();
                 assertThat(marker.counterPolicy()).isEqualTo(StopReservation.CounterPolicy.CONTINUE);
-                assertThat(marker.phase()).isEqualTo(StopReservation.Phase.REPLACEMENT_PENDING);
-                assertThat(marker.successor()).isNull();
                 assertThat(marker.source().scope()).isEqualTo(oldScope);
                 assertThat(marker.source().clusterId()).isEqualTo(clusterId);
                 assertThat(marker.writerAuthority().standalone()).isFalse();
-                assertThat(marker.writerAuthority().claim()).isEqualTo(WorkloadClaimFence.from(oldClaim));
-                assertThat(marker.writerAuthority().executionGeneration()).isEqualTo(oldScope.executionGeneration());
+                WorkloadClaim heldClaim;
+                long heldGeneration;
+                if (cut == RebuildHandoffJdiSession.Cut.PRE_ADMISSION) {
+                    assertThat(marker.phase()).isEqualTo(StopReservation.Phase.REPLACEMENT_PENDING);
+                    assertThat(marker.successor()).isNull();
+                    assertThat(marker.writerAuthority().claim()).isEqualTo(WorkloadClaimFence.from(oldClaim));
+                    assertThat(marker.writerAuthority().executionGeneration()).isEqualTo(oldScope.executionGeneration());
+                    heldClaim = oldClaim;
+                    heldGeneration = oldScope.executionGeneration();
+                } else {
+                    assertThat(marker.phase()).isEqualTo(StopReservation.Phase.SUCCESSOR_ADMITTED);
+                    heldGeneration = Math.incrementExact(oldScope.executionGeneration());
+                    heldClaim = claims.read(key).filter(reading -> reading.leased()).orElseThrow().claim();
+                    assertThat(heldClaim.key()).isEqualTo(oldClaim.key());
+                    assertThat(heldClaim.owner()).isEqualTo(oldClaim.owner());
+                    assertThat(heldClaim.claimGeneration()).isEqualTo(oldClaim.claimGeneration());
+                    assertThat(heldClaim.topologyRevision()).isEqualTo(oldClaim.topologyRevision());
+                    assertThat(heldClaim.executionGeneration()).isEqualTo(heldGeneration);
+                    assertThat(heldClaim.contextExecutionGeneration()).isEqualTo(heldGeneration);
+                    assertThat(heldClaim.executionClaimGeneration()).isEqualTo(heldClaim.claimGeneration());
+                    assertThat(heldClaim.executionNodeIds()).containsExactlyInAnyOrder(TwoMemberCluster.NODE_A, TwoMemberCluster.NODE_B);
+                    assertThat(heldClaim.failureClaimGeneration()).isZero();
+                    assertThat(heldClaim.failureAfterMemberLoss()).isFalse();
+                    assertNodeSession(claims, clusterId, heldClaim);
+                    assertThat(marker.writerAuthority().claim()).isEqualTo(WorkloadClaimFence.from(heldClaim));
+                    assertThat(marker.writerAuthority().executionGeneration()).isEqualTo(heldGeneration);
+                    assertThat(marker.successor()).isNotNull();
+                    assertThat(marker.successor().scope()).isEqualTo(held.scope());
+                    assertThat(marker.successor().scope().pipelineIncarnationId()).isEqualTo(oldScope.pipelineIncarnationId());
+                    assertThat(marker.successor().scope().executionGeneration()).isEqualTo(heldGeneration);
+                    assertThat(marker.successor().job()).isNull();
+                    assertThat(held.submittedJob()).isNull();
+                    assertThat(marker.successor().submissionBootId()).isEqualTo(held.submissionBootId());
+                    assertThat(marker.successor().submissionBootId()).isNotBlank();
+                }
                 assertThat(marker.originalDesired().targetState()).isEqualTo(PipelineState.RUNNING);
                 assertThat(marker.originalDesired().rebuiltAtStateEpoch()).isNull();
                 assertThat(marker.originalDesired().purgeState()).isFalse();
-                assertThat(held.cut()).isEqualTo(RebuildHandoffJdiSession.Cut.PRE_ADMISSION);
+                assertThat(held.cut()).isEqualTo(cut);
                 assertThat(held.pipelineId()).isEqualTo(PIPELINE);
-                assertThat(held.token()).isEqualTo(marker.token());
-                assertThat(held.scope()).isEqualTo(oldScope);
-                assertThat(held.binding().signature()).contains("Ljava/util/Set;");
+                if (cut == RebuildHandoffJdiSession.Cut.PRE_ADMISSION) {
+                    assertThat(held.token()).isEqualTo(marker.token());
+                    assertThat(held.scope()).isEqualTo(oldScope);
+                    assertThat(held.binding().signature()).contains("Ljava/util/Set;");
+                } else {
+                    assertThat(held.token()).as("Engine submission has no reservation-token argument").isNull();
+                    assertThat(held.binding().type()).isEqualTo("io.tapstate.runtime.engine.Engine");
+                    assertThat(held.binding().name()).isEqualTo("submit");
+                    String peer = ownerNode.equals(TwoMemberCluster.NODE_A) ? TwoMemberCluster.NODE_B : TwoMemberCluster.NODE_A;
+                    Map<String, Object> negative = new LinkedHashMap<>();
+                    negative.put("held", held.evidence());
+                    negative.put("marker", markerEvidence(marker));
+                    negative.put("advancedClaim", claimEvidence(heldClaim));
+                    try {
+                        assertHeldOldCurrent(database, latest, claims, key, heldClaim, oldScope,
+                                marker.successor().scope(), owned.memberOtherThan(ownerNode),
+                                observers.get(peer).server().baseUrl(), heldDeadline, negative);
+                    } finally {
+                        negative.put("action", "held-gen2-old-current-observation-refused");
+                        report.addFork(Map.copyOf(negative));
+                    }
+                }
                 assertThat(actual.read(PIPELINE).map(value -> StateJson.parse(value.stateJson())))
-                        .as("the old native job and capture completed before admission is held").contains(PipelineState.STOPPED);
+                        .as(cut == RebuildHandoffJdiSession.Cut.PRE_ADMISSION
+                                ? "the old native job and capture completed before admission is held"
+                                : "the admitted successor has not reached native submission or binding")
+                        .contains(PipelineState.STOPPED);
                 var oldJobProof = first.observedJob(oldScope).orElseThrow();
                 assertThat(oldJobProof.job()).isEqualTo(marker.source().oldJob());
                 assertThat(oldJobProof.scope()).isEqualTo(marker.source().scope());
                 assertThat(oldJobProof.returnedAtNanos()).isLessThanOrEqualTo(held.atNanos());
                 assertThat(desired.read(PIPELINE)).contains(marker.originalDesired());
-                assertThat(generation(database)).isEqualTo(oldScope.executionGeneration());
+                assertThat(generation(database)).isEqualTo(heldGeneration);
                 Document owed = requireOwedConsumer(database, owned.first());
                 var carrier = Await.answered("a qualified known floor remains readable before the real controller crash", SETUP_WAIT,
                         () -> latest.readContinuation(PIPELINE).filter(saved -> saved.continuation().token().equals(marker.token())
@@ -261,12 +331,24 @@ class RealClaimedRebuildHandoffCrashIT {
                 assertThat(targetHoldReceipt(target)).as("the terminal old job cannot consume these held-window changes")
                         .isEqualTo(heldTarget);
                 assertThat(actual.readStopReservation(PIPELINE)).contains(marker);
-                assertThat(generation(database)).isEqualTo(oldScope.executionGeneration());
-                report.addFork(Map.of("action", "qualified-claimed-pre-admission-boundary", "held", held.evidence(),
-                        "oldClaim", claimEvidence(oldClaim), "artifact", Map.of("id", resource.getString("_id"),
+                assertThat(generation(database)).isEqualTo(heldGeneration);
+                report.addFork(Map.of("action", cut == RebuildHandoffJdiSession.Cut.PRE_ADMISSION
+                                ? "qualified-claimed-pre-admission-boundary" : "qualified-claimed-post-admission-boundary",
+                        "held", held.evidence(), "oldClaim", claimEvidence(oldClaim), "artifact", Map.of("id", resource.getString("_id"),
                                 "incarnation", resource.getString("pipelineIncarnationId")), "marker", markerEvidence(marker),
                         "oldJobProof", oldJobProof.evidence(), "owedConsumer", owed.toJson(),
                         "carrier", continuationEvidence(carrier), "heldTarget", heldTarget));
+                if (cut == RebuildHandoffJdiSession.Cut.POST_ADMISSION_PRE_SUBMIT) {
+                    assertThat(WorkloadClaimFence.from(claims.read(key).filter(reading -> reading.leased()).orElseThrow().claim()))
+                            .isEqualTo(WorkloadClaimFence.from(heldClaim));
+                    report.addFork(Map.of("action", "actual-held-advanced-claim", "claim", claimEvidence(heldClaim),
+                            "contextExecutionGeneration", heldClaim.contextExecutionGeneration(),
+                            "executionClaimGeneration", heldClaim.executionClaimGeneration(),
+                            "failureClaimGeneration", heldClaim.failureClaimGeneration(),
+                            "failureAfterMemberLoss", heldClaim.failureAfterMemberLoss(),
+                            "successorScope", RebuildHandoffJdiSession.scopeEvidence(marker.successor().scope()),
+                            "submissionBootId", held.submissionBootId(), "nativeJob", "NOT_SUBMITTED_AT_HELD_ENTRY"));
+                }
                 report.addFork(Map.of("action", "actual-source-changes-before-controller-kill", "source", changedSource,
                         "targetUnchanged", targetHoldReceipt(target), "timing", "OLD_JOB_TERMINAL_OWNER_HELD_BEFORE_OS_KILL"));
                 long killedPid = first.server().pid();
@@ -277,7 +359,7 @@ class RealClaimedRebuildHandoffCrashIT {
                 String survivorNode = ownerNode.equals(TwoMemberCluster.NODE_A) ? TwoMemberCluster.NODE_B : TwoMemberCluster.NODE_A;
                 var restarted = observers.get(survivorNode);
                 ControlPlane survivor = owned.memberOtherThan(ownerNode);
-                long expectedGeneration = Math.incrementExact(oldScope.executionGeneration());
+                long expectedGeneration = Math.incrementExact(heldGeneration);
                 ObservationStore.Scope expected = new ObservationStore.Scope(oldScope.pipelineIncarnationId(), expectedGeneration);
                 MatchTrace recoveryTrace = new MatchTrace();
                 long recoveryDeadline = System.nanoTime() + SETUP_WAIT.toNanos();
@@ -310,6 +392,9 @@ class RealClaimedRebuildHandoffCrashIT {
                 assertThat(actualNewJob.job()).isEqualTo(firstKnown.raw().job());
                 assertThat(firstKnown.raw().job().clusterId()).isEqualTo(clusterId);
                 assertThat(firstKnown.raw().job().bootId()).isNotEqualTo(marker.source().oldJob().bootId());
+                if (marker.successor() != null) {
+                    assertThat(firstKnown.raw().job().bootId()).isNotEqualTo(marker.successor().submissionBootId());
+                }
                 assertThat(firstKnown.raw().scope()).isEqualTo(expected);
                 assertThat(requireArtifact(database, expected).getString("pipelineIncarnationId"))
                         .isEqualTo(resource.getString("pipelineIncarnationId"));
@@ -390,10 +475,14 @@ class RealClaimedRebuildHandoffCrashIT {
             for (String connector : List.of("mysql", "mongodb")) {
                 assertThat(PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor(connector))).isEqualTo(connectors.get(connector));
             }
-            List<String> unverified = new ArrayList<>(List.of("POST_ADMISSION_AND_SUBMIT_PRE_BIND_CLAIMED_CRASH",
+            List<String> unverified = new ArrayList<>(List.of(cut == RebuildHandoffJdiSession.Cut.PRE_ADMISSION
+                            ? "POST_ADMISSION_AND_SUBMIT_PRE_BIND_CLAIMED_CRASH"
+                            : "PRE_ADMISSION_AND_SUBMIT_PRE_BIND_CLAIMED_CRASH_IN_THIS_RUN",
                     "OLD_CALLBACK_WINDOWS", "NEGATIVE_UNKNOWN_BASELINE_MATRIX", "ALL_TELEMETRY_SURFACE_IDENTITIES", "FORMAL_PERFORMANCE_ACCEPTANCE"));
             if (!pending.qualified) { unverified.add("NEW_GENERATION_BEFORE_FIRST_CURRENT_PUBLICATION_WINDOW"); }
-            report.completeDiagnostic(Map.of("correctness", "CLAIMED_PRE_ADMISSION_CRASH_SURVIVOR_KNOWN_FLOOR",
+            report.completeDiagnostic(Map.of("correctness", cut == RebuildHandoffJdiSession.Cut.PRE_ADMISSION
+                            ? "CLAIMED_PRE_ADMISSION_CRASH_SURVIVOR_KNOWN_FLOOR"
+                            : "CLAIMED_POST_ADMISSION_PRE_SUBMIT_CRASH_SURVIVOR_KNOWN_FLOOR",
                     "performanceAcceptanceEligible", false, "newCurrentWindow", pending.evidence(), "unverified", List.copyOf(unverified)));
         } catch (Exception | Error failure) {
             primary = failure;
@@ -409,6 +498,53 @@ class RealClaimedRebuildHandoffCrashIT {
                 if (cleanup != primary) { primary.addSuppressed(cleanup); }
             }
         }
+    }
+
+    private static void assertHeldOldCurrent(MongoDatabase database, MongoObservationStore latest,
+            MongoWorkloadClaimStore claims, WorkloadClaimKey key, WorkloadClaim heldClaim,
+            ObservationStore.Scope old, ObservationStore.Scope expected, ControlPlane control, URI base,
+            long deadline, Map<String, Object> evidence) throws Exception {
+        evidence.put("status", "UNQUALIFIED");
+        evidence.put("authority", RebuildHandoffJdiSession.scopeEvidence(expected));
+        evidence.put("reader", base.toString());
+        var before = latest.readStored(PIPELINE);
+        evidence.put("retainedBefore", before.map(value -> Map.of("scope", value.scope()
+                        .map(RebuildHandoffJdiSession::scopeEvidence).orElseGet(Map::of),
+                "state", value.observation().state().name(), "observedAt", value.observation().observedAt().toString()))
+                .orElseGet(Map::of));
+        var beforeGeneration = claims.currentGeneration(key.clusterId(), PIPELINE);
+        evidence.put("durableGenerationBefore", beforeGeneration.isPresent() ? beforeGeneration.getAsLong() : "ABSENT");
+        assertThat(beforeGeneration).hasValue(expected.executionGeneration());
+        assertThat(WorkloadClaimFence.from(claims.read(key).filter(reading -> reading.leased()).orElseThrow().claim()))
+                .isEqualTo(WorkloadClaimFence.from(heldClaim));
+        requireArtifact(database, expected);
+        assertThat(before).as("the actual held GEN2 boundary must still retain its old GEN1 latest").isPresent();
+        assertThat(before.orElseThrow().scope()).contains(old);
+        long left = deadline - System.nanoTime();
+        assertThat(left).as("the mandatory held-boundary read shares the original cut wait deadline").isPositive();
+        HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(20)).build();
+        HttpRequest request = HttpRequest.newBuilder(base.resolve("/api/pipelines/" + PIPELINE + "/status"))
+                .timeout(Duration.ofNanos(Math.min(left, Duration.ofSeconds(20).toNanos())))
+                .header("Authorization", "Bearer " + control.credential()).GET().build();
+        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+        evidence.put("httpStatus", response.statusCode());
+        evidence.put("reply", response.body());
+        var afterGeneration = claims.currentGeneration(key.clusterId(), PIPELINE);
+        evidence.put("durableGenerationAfter", afterGeneration.isPresent() ? afterGeneration.getAsLong() : "ABSENT");
+        var after = latest.readStored(PIPELINE);
+        evidence.put("retainedAfter", after.map(value -> Map.of("scope", value.scope()
+                        .map(RebuildHandoffJdiSession::scopeEvidence).orElseGet(Map::of),
+                "state", value.observation().state().name(), "observedAt", value.observation().observedAt().toString()))
+                .orElseGet(Map::of));
+        var decoded = ControlPlane.interpretState(response.statusCode(), response.body(), PIPELINE);
+        assertThat(response.statusCode()).isEqualTo(404);
+        assertThat(decoded).as("only monitor.no-observation is decoded as an absent state").isEmpty();
+        assertThat(afterGeneration).hasValue(expected.executionGeneration());
+        assertThat(WorkloadClaimFence.from(claims.read(key).filter(reading -> reading.leased()).orElseThrow().claim()))
+                .isEqualTo(WorkloadClaimFence.from(heldClaim));
+        requireArtifact(database, expected);
+        assertThat(after).as("the same old latest remains physical evidence across this negative read").contains(before.orElseThrow());
+        evidence.put("status", "QUALIFIED_HELD_GEN2_AUTHORITY_OLD_GEN1_LATEST_404");
     }
 
     private static void closeOwned(Collection<RebuildHandoffJdiSession> observers, TwoMemberCluster cluster) throws Exception {

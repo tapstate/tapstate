@@ -45,7 +45,7 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
         }
     }
     record Held(Cut cut, String pipelineId, String token, ObservationStore.Scope scope,
-            StopReservation.JobIdentity submittedJob, long threadIdentity, long atNanos,
+            String submissionBootId, StopReservation.JobIdentity submittedJob, long threadIdentity, long atNanos,
             Binding binding, List<String> callers) {
         Held { callers = List.copyOf(callers); }
         Map<String, Object> evidence() {
@@ -54,6 +54,7 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
             if (token != null) { value.put("token", token); }
             else { value.put("tokenArgumentAvailability", "ABSENT"); }
             value.put("scope", scopeEvidence(scope));
+            if (submissionBootId != null) { value.put("submissionBootId", submissionBootId); }
             if (submittedJob != null) { value.put("submittedJob", jobEvidence(submittedJob)); }
             value.put("threadIdentity", threadIdentity); value.put("atNanos", atNanos);
             value.put("binding", binding.evidence()); value.put("callers", callers);
@@ -155,7 +156,12 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
     /** A claimed crash uses the same bounded event pump for its cut, genuine Job lookup and raw frame. */
     static RebuildHandoffJdiSession startClaimed(Path selectedJar, String pipelineId, String table,
             Path logDirectory, String processLabel, OwnedLauncher launcher) throws Exception {
-        return startObserved(selectedJar, pipelineId, table, Cut.PRE_ADMISSION, logDirectory,
+        return startClaimed(selectedJar, pipelineId, table, Cut.PRE_ADMISSION, logDirectory, processLabel, launcher);
+    }
+
+    static RebuildHandoffJdiSession startClaimed(Path selectedJar, String pipelineId, String table, Cut cut,
+            Path logDirectory, String processLabel, OwnedLauncher launcher) throws Exception {
+        return startObserved(selectedJar, pipelineId, table, Objects.requireNonNull(cut, "cut"), logDirectory,
                 processLabel, true, Objects.requireNonNull(launcher, "launcher"));
     }
 
@@ -171,7 +177,8 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
         Path jar = selectedJar.toRealPath();
         if (!Files.isRegularFile(jar) || Files.size(jar) > 512L * 1024 * 1024) { throw invalid("artifact unavailable or unbounded"); }
         String sha = PipelineBenchmarkLiveRunIT.sha256(jar);
-        Set<Site> selected = cut == null ? Set.of(RAW) : Set.of(CUTS.get(cut), JOB_LOOKUP);
+        Set<Site> selected = cut == null ? Set.of(RAW) : rawAlongsideCut
+                ? Set.of(CUTS.get(cut), JOB_LOOKUP, RAW) : Set.of(CUTS.get(cut), JOB_LOOKUP);
         Site selectedCut = cut == null ? null : CUTS.get(cut);
         Map<Site, Image> images;
         if (cut == Cut.PRE_ADMISSION) {
@@ -444,11 +451,19 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
         List<StackFrame> frames = event.thread().frames();
         if (frames.isEmpty() || frames.size() > MAX_FRAMES) { throw invalid("held stack unavailable or unbounded"); }
         List<Value> arguments = frames.getFirst().getArgumentValues();
-        String id; String token = null; ObservationStore.Scope scope; StopReservation.JobIdentity job = null;
+        String id; String token = null, submissionBootId = null;
+        ObservationStore.Scope scope; StopReservation.JobIdentity job = null;
         if (cut == Cut.POST_ADMISSION_PRE_SUBMIT) {
             if (arguments.size() != 6) { throw invalid("scope-bearing submission arguments changed"); }
             id = text(arguments.getFirst()); if (!pipelineId.equals(id)) { return false; }
             scope = scope(object(arguments.get(5), SCOPE));
+            ObjectReference engine = object(frames.getFirst().thisObject(), "io.tapstate.runtime.engine.Engine");
+            if (engine.referenceType().classLoader() == null
+                    || engine.referenceType().classLoader().uniqueID() != bindings.get(cutSite).loaderIdentity()) {
+                throw invalid("submission receiver does not belong to the pinned application loader");
+            }
+            submissionBootId = text(value(engine, "bootId", "Ljava/lang/String;"));
+            if (submissionBootId.isBlank()) { throw invalid("submission receiver has no factual boot identity"); }
             if (!scope.pipelineIncarnationId().equals(armedSource.pipelineIncarnationId())
                     || scope.executionGeneration() != Math.incrementExact(armedSource.executionGeneration())) { return false; }
         } else {
@@ -474,7 +489,7 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
             throw invalid("held method is not this real replacement's lifecycle call");
         }
         event.request().disable(); heldSet = set;
-        held.complete(new Held(cut, id, token, scope, job, event.thread().uniqueID(), System.nanoTime(),
+        held.complete(new Held(cut, id, token, scope, submissionBootId, job, event.thread().uniqueID(), System.nanoTime(),
                 bindings.get(cutSite), frames.stream().limit(16).map(frame -> frame.location().declaringType().name()
                         + "#" + frame.location().method().name()).toList()));
         return true;
