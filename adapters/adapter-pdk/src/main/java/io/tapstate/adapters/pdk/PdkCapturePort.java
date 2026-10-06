@@ -548,7 +548,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
         // Position discovery may inspect the selected tables too. Populate their context first, while
         // still sampling before any snapshot row is read so the snapshot-to-stream transition has no gap.
         return new PreparedSnapshot(discovered, declaredTypes(discovered),
-                position(connector, startOffset(connector, null)));
+                position(connector, startOffset(connector, config, null)));
     }
 
     private void readTable(PdkConnector connector, PreparedSnapshot snapshot, String stream,
@@ -701,7 +701,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
                 // name one, which also keeps a null offset out of the connector -- that drives a
                 // schema-only recovery with no stored offset to recover from. Which position it names is
                 // the instant it is handed: none for the present, the caller's for an instant start.
-                Object startOffset = resumeAt != null ? resumeAt : startOffset(connector, startAt);
+                Object startOffset = resumeAt != null ? resumeAt : startOffset(connector, config, startAt);
                 if (listener instanceof CaptureStartedListener started) {
                     position(connector, startOffset).ifPresent(started::onStart);
                 }
@@ -820,9 +820,10 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
      * recovery that has no stored offset. Null when the connector declares no offset function, which only
      * a present start reaches: an instant start is refused before this, where the caller can still hear it.
      */
-    private static Object startOffset(PdkConnector connector, Long atEpochMilli) throws Throwable {
+    private static Object startOffset(PdkConnector connector, CaptureConfig config, Long atEpochMilli) throws Throwable {
         TimestampToStreamOffsetFunction offset = connector.functions().getTimestampToStreamOffsetFunction();
-        return offset == null ? null : offset.timestampToStreamOffset(connector.context(), atEpochMilli);
+        return offset == null ? null : PostgresPublicationStartGate.LOCAL.sample(config,
+                () -> offset.timestampToStreamOffset(connector.context(), atEpochMilli));
     }
 
     /**
