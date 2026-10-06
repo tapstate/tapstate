@@ -120,28 +120,51 @@ class RealClaimedRebuildHandoffCrashIT {
     }
 
     private void verifyClaimedCrash(RebuildHandoffJdiSession.Cut cut) throws Exception {
+        verifyClaimedCrash(cut, Path.of(required("jar")), required("sha256"), Path.of(required("output")), false);
+    }
+
+    static void diagnoseSubmittedFirstBranch(Path jar, String sha256, Path output) throws Exception {
+        new RealClaimedRebuildHandoffCrashIT().verifyClaimedCrash(RebuildHandoffJdiSession.Cut.SUBMIT_PRE_BIND,
+                jar, sha256, output, true);
+    }
+
+    private void verifyClaimedCrash(RebuildHandoffJdiSession.Cut cut, Path selected, String expectedSha,
+            Path selectedOutput, boolean firstBranchDiagnostic) throws Exception {
         assertThat(cut).isIn(RebuildHandoffJdiSession.Cut.PRE_ADMISSION,
-                RebuildHandoffJdiSession.Cut.POST_ADMISSION_PRE_SUBMIT);
-        Path jar = Path.of(required("jar")).toRealPath();
-        String expectedSha = required("sha256");
+                RebuildHandoffJdiSession.Cut.POST_ADMISSION_PRE_SUBMIT, RebuildHandoffJdiSession.Cut.SUBMIT_PRE_BIND);
+        assertThat(firstBranchDiagnostic).isEqualTo(cut == RebuildHandoffJdiSession.Cut.SUBMIT_PRE_BIND);
+        Path jar = selected.toRealPath();
         assertThat(PipelineBenchmarkLiveRunIT.sha256(jar)).isEqualTo(expectedSha);
-        Path requested = Path.of(required("output")).toAbsolutePath().normalize();
+        Path requested = selectedOutput.toAbsolutePath().normalize();
         Path output = cut == RebuildHandoffJdiSession.Cut.PRE_ADMISSION ? requested
                 : requested.resolveSibling(requested.getFileName() + "." + cut.name().toLowerCase(Locale.ROOT) + ".json");
         Path harnessRoot = PipelineBenchmarkLiveRunIT.harnessRoot();
         PipelineBenchmarkLiveRunIT.requireSafeOutput(output, harnessRoot);
         Path logDirectory = output.resolveSibling(output.getFileName() + ".server-logs");
         Map<String, Object> inputs = inputHashes(harnessRoot);
+        if (firstBranchDiagnostic) {
+            Map<String, Object> pinned = new LinkedHashMap<>(inputs);
+            String name = "RealClaimedSubmittedHandoffBranchDiagnosticIT";
+            pinned.put(name + ".source", PipelineBenchmarkLiveRunIT.sha256(harnessRoot.resolve(
+                    "e2e/src/test/java/io/tapstate/e2e/" + name + ".java")));
+            try (var bytes = RealClaimedRebuildHandoffCrashIT.class.getResourceAsStream("/io/tapstate/e2e/" + name + ".class")) {
+                if (bytes == null) { throw new AssertionError("the executing diagnostic class is absent"); }
+                pinned.put(name + ".class", HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes.readAllBytes())));
+            }
+            inputs = Map.copyOf(pinned);
+        }
         Map<String, Object> application = PipelineBenchmarkLiveRunIT.artifact(jar);
         Map<String, Object> connectors = Map.of("mysql", PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor("mysql")),
                 "mongodb", PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor("mongodb")));
         BenchmarkLiveReport report = new BenchmarkLiveReport(output);
-        report.begin(Map.of("purpose", cut == RebuildHandoffJdiSession.Cut.PRE_ADMISSION
+        report.begin(Map.of("purpose", firstBranchDiagnostic ? "CLAIMED_SUBMIT_PRE_BIND_FIRST_BRANCH_DIAGNOSTIC"
+                        : cut == RebuildHandoffJdiSession.Cut.PRE_ADMISSION
                         ? "REAL_CLAIMED_PRE_ADMISSION_CRASH" : "REAL_CLAIMED_POST_ADMISSION_PRE_SUBMIT_CRASH",
                         "application", application,
                         "expectedJarSha256", expectedSha, "connectors", connectors, "harness", inputs,
                         "rows", ROWS, "cut", cut.name(), "serverLogDirectory", logDirectory.toString()),
-                Map.of("kind", "correctness-only", "clusterProfile", "process-failure-only", "clusterMembers", 2), List.of());
+                Map.of("kind", firstBranchDiagnostic ? "first-branch-diagnostic-only" : "correctness-only",
+                        "clusterProfile", "process-failure-only", "clusterMembers", 2), List.of());
         Map<String, RebuildHandoffJdiSession> observers = new LinkedHashMap<>();
         TwoMemberCluster cluster = null;
         Throwable primary = null;
@@ -178,17 +201,20 @@ class RealClaimedRebuildHandoffCrashIT {
                 cluster = TwoMemberCluster.start(storeUri, operatorDatabase, jar, clusterId, USER, PASSWORD,
                         List.of(), List.of(), (node, address, arguments, jvm) -> {
                             try {
-                                var observer = RebuildHandoffJdiSession.startClaimed(jar, PIPELINE, TABLE, cut,
-                                        logDirectory, node.equals(TwoMemberCluster.NODE_A) ? "membera" : "memberb",
-                                        (artifact, debug) -> {
-                                            List<String> options = new ArrayList<>(jvm); options.addAll(debug);
-                                            return RealProcessServer.launchingWithJvmArguments(storeUri, operatorDatabase,
-                                                    artifact, address, httpPort -> {
-                                                        List<String> applicationArgs = new ArrayList<>(arguments.apply(httpPort));
-                                                        applicationArgs.add("--tapstate.metrics.history.sample-interval=PT2S");
-                                                        return List.copyOf(applicationArgs);
-                                                    }, List.copyOf(options));
-                                        });
+                                RebuildHandoffJdiSession.OwnedLauncher launch = (artifact, debug) -> {
+                                    List<String> options = new ArrayList<>(jvm); options.addAll(debug);
+                                    return RealProcessServer.launchingWithJvmArguments(storeUri, operatorDatabase,
+                                            artifact, address, httpPort -> {
+                                                List<String> applicationArgs = new ArrayList<>(arguments.apply(httpPort));
+                                                applicationArgs.add("--tapstate.metrics.history.sample-interval=PT2S");
+                                                return List.copyOf(applicationArgs);
+                                            }, List.copyOf(options));
+                                };
+                                var observer = firstBranchDiagnostic
+                                        ? RebuildHandoffJdiSession.startClaimedBranchDiagnostic(jar, PIPELINE, TABLE,
+                                                logDirectory, node.equals(TwoMemberCluster.NODE_A) ? "membera" : "memberb", launch)
+                                        : RebuildHandoffJdiSession.startClaimed(jar, PIPELINE, TABLE, cut,
+                                                logDirectory, node.equals(TwoMemberCluster.NODE_A) ? "membera" : "memberb", launch);
                                 observers.put(node, observer);
                                 return observer.server();
                             } catch (RuntimeException | Error failure) { throw failure; }
@@ -275,8 +301,20 @@ class RealClaimedRebuildHandoffCrashIT {
                     assertThat(marker.successor().scope().pipelineIncarnationId()).isEqualTo(oldScope.pipelineIncarnationId());
                     assertThat(marker.successor().scope().executionGeneration()).isEqualTo(heldGeneration);
                     assertThat(marker.successor().job()).isNull();
-                    assertThat(held.submittedJob()).isNull();
-                    assertThat(marker.successor().submissionBootId()).isEqualTo(held.submissionBootId());
+                    if (firstBranchDiagnostic) {
+                        assertThat(held.submittedJob()).isNotNull();
+                        assertThat(marker.successor().submissionBootId()).isEqualTo(held.submittedJob().bootId());
+                        assertThat(held.submittedJob().clusterId()).isEqualTo(clusterId);
+                        var submitted = first.observedJob(held.scope()).orElseThrow(
+                                () -> new AssertionError("the held submitted Job lacks its genuine native lookup return"));
+                        assertThat(submitted.scope()).isEqualTo(marker.successor().scope());
+                        assertThat(submitted.job()).isEqualTo(held.submittedJob());
+                        assertThat(submitted.returnedAtNanos()).isLessThanOrEqualTo(held.atNanos());
+                        report.addFork(Map.of("action", "actual-submitted-unbound-native-job", "proof", submitted.evidence()));
+                    } else {
+                        assertThat(held.submittedJob()).isNull();
+                        assertThat(marker.successor().submissionBootId()).isEqualTo(held.submissionBootId());
+                    }
                     assertThat(marker.successor().submissionBootId()).isNotBlank();
                 }
                 assertThat(marker.originalDesired().targetState()).isEqualTo(PipelineState.RUNNING);
@@ -288,6 +326,10 @@ class RealClaimedRebuildHandoffCrashIT {
                     assertThat(held.token()).isEqualTo(marker.token());
                     assertThat(held.scope()).isEqualTo(oldScope);
                     assertThat(held.binding().signature()).contains("Ljava/util/Set;");
+                } else if (firstBranchDiagnostic) {
+                    assertThat(held.token()).isEqualTo(marker.token());
+                    assertThat(held.binding().type()).isEqualTo("io.tapstate.adapters.mongostore.MongoStateStore");
+                    assertThat(held.binding().name()).isEqualTo("bindSuccessor");
                 } else {
                     assertThat(held.token()).as("Engine submission has no reservation-token argument").isNull();
                     assertThat(held.binding().type()).isEqualTo("io.tapstate.runtime.engine.Engine");
@@ -317,40 +359,57 @@ class RealClaimedRebuildHandoffCrashIT {
                 assertThat(oldJobProof.returnedAtNanos()).isLessThanOrEqualTo(held.atNanos());
                 assertThat(desired.read(PIPELINE)).contains(marker.originalDesired());
                 assertThat(generation(database)).isEqualTo(heldGeneration);
-                Document owed = requireOwedConsumer(database, owned.first());
-                var carrier = Await.answered("a qualified known floor remains readable before the real controller crash", SETUP_WAIT,
-                        () -> latest.readContinuation(PIPELINE).filter(saved -> saved.continuation().token().equals(marker.token())
-                                && oldScope.equals(saved.continuation().sourceScope()) && saved.receipt().knownBaseline()
-                                && hasKnownDelivery(saved.continuation().baselineFacts())));
-                ObservationContinuation savedFloor = carrier.continuation();
-                assertFloorAtLeast(delivery(paused.observation().facts()), delivery(savedFloor.baselineFacts()));
+                Document owed = firstBranchDiagnostic ? requireConsumer(database, owned.first())
+                        : requireOwedConsumer(database, owned.first());
+                var carrier = firstBranchDiagnostic ? latest.readContinuation(PIPELINE).orElse(null)
+                        : Await.answered("a qualified known floor remains readable before the real controller crash", SETUP_WAIT,
+                                () -> latest.readContinuation(PIPELINE).filter(saved -> saved.continuation().token().equals(marker.token())
+                                        && oldScope.equals(saved.continuation().sourceScope()) && saved.receipt().knownBaseline()
+                                        && hasKnownDelivery(saved.continuation().baselineFacts())));
+                ObservationContinuation savedFloor = carrier == null ? null : carrier.continuation();
+                if (!firstBranchDiagnostic) {
+                    assertFloorAtLeast(delivery(paused.observation().facts()), delivery(savedFloor.baselineFacts()));
+                }
                 Map<String, Object> heldTarget = targetHoldReceipt(target);
-                mutateDuringCrash(source);
-                Map<String, Object> changedSource = sourceChangeReceipt(source);
-                assertThat(requireOwedConsumer(database, owned.first())).isEqualTo(owed);
-                assertThat(targetHoldReceipt(target)).as("the terminal old job cannot consume these held-window changes")
-                        .isEqualTo(heldTarget);
-                assertThat(actual.readStopReservation(PIPELINE)).contains(marker);
-                assertThat(generation(database)).isEqualTo(heldGeneration);
-                report.addFork(Map.of("action", cut == RebuildHandoffJdiSession.Cut.PRE_ADMISSION
-                                ? "qualified-claimed-pre-admission-boundary" : "qualified-claimed-post-admission-boundary",
-                        "held", held.evidence(), "oldClaim", claimEvidence(oldClaim), "artifact", Map.of("id", resource.getString("_id"),
-                                "incarnation", resource.getString("pipelineIncarnationId")), "marker", markerEvidence(marker),
-                        "oldJobProof", oldJobProof.evidence(), "owedConsumer", owed.toJson(),
-                        "carrier", continuationEvidence(carrier), "heldTarget", heldTarget));
-                if (cut == RebuildHandoffJdiSession.Cut.POST_ADMISSION_PRE_SUBMIT) {
-                    assertThat(WorkloadClaimFence.from(claims.read(key).filter(reading -> reading.leased()).orElseThrow().claim()))
-                            .isEqualTo(WorkloadClaimFence.from(heldClaim));
-                    report.addFork(Map.of("action", "actual-held-advanced-claim", "claim", claimEvidence(heldClaim),
+                if (firstBranchDiagnostic) {
+                    report.addFork(Map.of("action", "actual-submitted-unbound-boundary", "held", held.evidence(),
+                            "marker", markerEvidence(marker), "claim", claimEvidence(heldClaim),
                             "contextExecutionGeneration", heldClaim.contextExecutionGeneration(),
                             "executionClaimGeneration", heldClaim.executionClaimGeneration(),
                             "failureClaimGeneration", heldClaim.failureClaimGeneration(),
                             "failureAfterMemberLoss", heldClaim.failureAfterMemberLoss(),
-                            "successorScope", RebuildHandoffJdiSession.scopeEvidence(marker.successor().scope()),
-                            "submissionBootId", held.submissionBootId(), "nativeJob", "NOT_SUBMITTED_AT_HELD_ENTRY"));
+                            "carrier", carrier == null ? Map.of("availability", "ABSENT") : continuationEvidence(carrier),
+                            "targetBeforeKill", heldTarget));
+                    String peer = ownerNode.equals(TwoMemberCluster.NODE_A) ? TwoMemberCluster.NODE_B : TwoMemberCluster.NODE_A;
+                    observers.get(peer).observeFirstBranch(marker, held.submittedJob());
+                } else {
+                    mutateDuringCrash(source);
+                    Map<String, Object> changedSource = sourceChangeReceipt(source);
+                    assertThat(requireOwedConsumer(database, owned.first())).isEqualTo(owed);
+                    assertThat(targetHoldReceipt(target)).as("the terminal old job cannot consume these held-window changes")
+                            .isEqualTo(heldTarget);
+                    assertThat(actual.readStopReservation(PIPELINE)).contains(marker);
+                    assertThat(generation(database)).isEqualTo(heldGeneration);
+                    report.addFork(Map.of("action", cut == RebuildHandoffJdiSession.Cut.PRE_ADMISSION
+                                    ? "qualified-claimed-pre-admission-boundary" : "qualified-claimed-post-admission-boundary",
+                            "held", held.evidence(), "oldClaim", claimEvidence(oldClaim), "artifact", Map.of("id", resource.getString("_id"),
+                                    "incarnation", resource.getString("pipelineIncarnationId")), "marker", markerEvidence(marker),
+                            "oldJobProof", oldJobProof.evidence(), "owedConsumer", owed.toJson(),
+                            "carrier", continuationEvidence(carrier), "heldTarget", heldTarget));
+                    if (cut == RebuildHandoffJdiSession.Cut.POST_ADMISSION_PRE_SUBMIT) {
+                        assertThat(WorkloadClaimFence.from(claims.read(key).filter(reading -> reading.leased()).orElseThrow().claim()))
+                                .isEqualTo(WorkloadClaimFence.from(heldClaim));
+                        report.addFork(Map.of("action", "actual-held-advanced-claim", "claim", claimEvidence(heldClaim),
+                                "contextExecutionGeneration", heldClaim.contextExecutionGeneration(),
+                                "executionClaimGeneration", heldClaim.executionClaimGeneration(),
+                                "failureClaimGeneration", heldClaim.failureClaimGeneration(),
+                                "failureAfterMemberLoss", heldClaim.failureAfterMemberLoss(),
+                                "successorScope", RebuildHandoffJdiSession.scopeEvidence(marker.successor().scope()),
+                                "submissionBootId", held.submissionBootId(), "nativeJob", "NOT_SUBMITTED_AT_HELD_ENTRY"));
+                    }
+                    report.addFork(Map.of("action", "actual-source-changes-before-controller-kill", "source", changedSource,
+                            "targetUnchanged", targetHoldReceipt(target), "timing", "OLD_JOB_TERMINAL_OWNER_HELD_BEFORE_OS_KILL"));
                 }
-                report.addFork(Map.of("action", "actual-source-changes-before-controller-kill", "source", changedSource,
-                        "targetUnchanged", targetHoldReceipt(target), "timing", "OLD_JOB_TERMINAL_OWNER_HELD_BEFORE_OS_KILL"));
                 long killedPid = first.server().pid();
                 first.killHeldProcess();
                 assertThat(first.server().isAlive()).isFalse();
@@ -359,122 +418,147 @@ class RealClaimedRebuildHandoffCrashIT {
                 String survivorNode = ownerNode.equals(TwoMemberCluster.NODE_A) ? TwoMemberCluster.NODE_B : TwoMemberCluster.NODE_A;
                 var restarted = observers.get(survivorNode);
                 ControlPlane survivor = owned.memberOtherThan(ownerNode);
-                long expectedGeneration = Math.incrementExact(heldGeneration);
-                ObservationStore.Scope expected = new ObservationStore.Scope(oldScope.pipelineIncarnationId(), expectedGeneration);
-                MatchTrace recoveryTrace = new MatchTrace();
-                long recoveryDeadline = System.nanoTime() + SETUP_WAIT.toNanos();
-                Matched firstKnown;
-                try {
-                    firstKnown = Await.answered("the actual survivor publishes the same floor plus its own raw native facts", SETUP_WAIT,
+                if (firstBranchDiagnostic) {
+                    observeActualFirstBranch(report, restarted, actual, latest, claims, key,
+                            marker, held, heldClaim, survivorNode);
+                } else {
+                    long expectedGeneration = Math.incrementExact(heldGeneration);
+                    ObservationStore.Scope expected = new ObservationStore.Scope(oldScope.pipelineIncarnationId(), expectedGeneration);
+                    MatchTrace recoveryTrace = new MatchTrace();
+                    long recoveryDeadline = System.nanoTime() + SETUP_WAIT.toNanos();
+                    Matched firstKnown;
+                    try {
+                        firstKnown = Await.answered("the actual survivor publishes the same floor plus its own raw native facts", SETUP_WAIT,
+                                () -> {
+                                    pending.observe(database, latest, survivor, restarted.server().baseUrl(), expected, oldScope, recoveryDeadline);
+                                    return matched(latest, restarted, expected, savedFloor, null, recoveryTrace);
+                                });
+                    } finally {
+                        report.addFork(Map.of("action", "claimed-recovery-diagnostic", "sampling", recoveryTrace.evidence(),
+                                "newCurrentWindow", pending.evidence(), "durableGeneration", generation(database)));
+                    }
+                    assertCumulativeExactly(firstKnown, savedFloor);
+                    WorkloadClaim successor = Await.answered("the survivor really owns the restored execution", SETUP_WAIT,
+                            () -> claims.read(key).filter(reading -> reading.leased()
+                                    && reading.claim().executionGeneration() == expectedGeneration
+                                    && reading.claim().owner().nodeId().equals(survivorNode)).map(reading -> reading.claim()));
+                    assertThat(successor.claimGeneration()).isGreaterThan(oldClaim.claimGeneration());
+                    assertThat(successor.executionNodeIds()).containsExactly(survivorNode);
+                    assertNodeSession(claims, clusterId, successor);
+                    assertThat(survivor.pipelineControllerOf(PIPELINE)).contains(survivorNode);
+                    assertThat(survivor.executionGenerationOf(PIPELINE)).contains(expectedGeneration);
+                    assertThat(successor.contextExecutionGeneration()).isEqualTo(expectedGeneration);
+                    assertThat(successor.executionClaimGeneration()).isEqualTo(successor.claimGeneration());
+                    var actualNewJob = restarted.observedJob(expected).orElseThrow(
+                            () -> new AssertionError("the survivor has no genuine native Job lookup for the restored scope"));
+                    assertThat(actualNewJob.scope()).isEqualTo(expected);
+                    assertThat(actualNewJob.job()).isEqualTo(firstKnown.raw().job());
+                    assertThat(firstKnown.raw().job().clusterId()).isEqualTo(clusterId);
+                    assertThat(firstKnown.raw().job().bootId()).isNotEqualTo(marker.source().oldJob().bootId());
+                    if (marker.successor() != null) {
+                        assertThat(firstKnown.raw().job().bootId()).isNotEqualTo(marker.successor().submissionBootId());
+                    }
+                    assertThat(firstKnown.raw().scope()).isEqualTo(expected);
+                    assertThat(requireArtifact(database, expected).getString("pipelineIncarnationId"))
+                            .isEqualTo(resource.getString("pipelineIncarnationId"));
+                    assertThat(claims.advanceUnderClaim(oldClaim, oldClaim.topologyRevision()))
+                            .as("the killed controller's exact old claim cannot allocate a later execution").isEmpty();
+                    assertThat(generation(database)).isEqualTo(expectedGeneration);
+                    report.addFork(Map.of("action", "actual-survivor-claim-and-native-floor", "claim", claimEvidence(successor),
+                            "job", RebuildHandoffJdiSession.jobEvidence(firstKnown.raw().job()),
+                            "scope", RebuildHandoffJdiSession.scopeEvidence(expected), "rawBinding", restarted.rawBinding().evidence(),
+                            "rawNative", factsEvidence(firstKnown.raw().facts()),
+                            "cumulative", factsEvidence(firstKnown.publicValue().observation().facts())));
+                    Await.until("the actual matching handoff receipt retires its reservation", SETUP_WAIT,
+                            () -> actual.readStopReservation(PIPELINE).isEmpty()
+                                    && actual.read(PIPELINE).map(value -> StateJson.parse(value.stateJson()))
+                                            .filter(PipelineState.RUNNING::equals).isPresent(),
+                            () -> "marker=" + actual.readStopReservation(PIPELINE));
+                    Await.until("the complete snapshot and held-window CDC reach the physical target", DELIVERY_WAIT,
                             () -> {
-                                pending.observe(database, latest, survivor, restarted.server().baseUrl(), expected, oldScope, recoveryDeadline);
-                                return matched(latest, restarted, expected, savedFloor, null, recoveryTrace);
-                            });
-                } finally {
-                    report.addFork(Map.of("action", "claimed-recovery-diagnostic", "sampling", recoveryTrace.evidence(),
-                            "newCurrentWindow", pending.evidence(), "durableGeneration", generation(database)));
+                                if (actual.read(PIPELINE).map(value -> StateJson.parse(value.stateJson()))
+                                        .filter(PipelineState.FAILED::equals).isPresent()) {
+                                    throw new AssertionError("the recovered claimed pipeline failed before physical delivery: " + survivor.metrics(PIPELINE));
+                                }
+                                return target.getCollection(TABLE).countDocuments() == ROWS
+                                        && row(target, INSERTED, "inserted-during-crash") && row(target, UPDATED, "updated-during-crash")
+                                        && target.getCollection(TABLE).find(new Document("id", (long) DELETED)).first() == null
+                                        && snapshotConfirmed(database, survivor);
+                            }, () -> "targetRows=" + target.getCollection(TABLE).countDocuments() + ", actual=" + actual.read(PIPELINE));
+                    String coverageSha = assertFullTargetContent(target);
+                    Instant targetConfirmedAt = Instant.now();
+                    MatchTrace anchorTrace = new MatchTrace();
+                    Matched quiet;
+                    try {
+                        quiet = Await.answered("the actual complete native workload after physical target delivery", SETUP_WAIT,
+                                () -> matched(latest, restarted, expected, savedFloor, targetConfirmedAt, anchorTrace)
+                                        .filter(value -> {
+                                            assertCumulativeExactly(value, savedFloor);
+                                            boolean complete = hasCompletedRecoveryWorkload(value.raw());
+                                            anchorTrace.stage(complete ? "NATIVE_WORKLOAD_COMPLETE" : "NATIVE_WORKLOAD_INCOMPLETE");
+                                            return complete;
+                                        }));
+                    } finally { report.addFork(Map.of("action", "claimed-complete-native-anchor-diagnostic", "sampling", anchorTrace.evidence())); }
+                    assertCumulativeExactly(quiet, savedFloor);
+                    report.addFork(Map.of("action", "post-delivery-complete-native-anchor", "targetConfirmedAt", targetConfirmedAt.toString(),
+                            "anchor", matchedEvidence(quiet)));
+                    MatchTrace repeatedTrace = new MatchTrace();
+                    Matched repeated;
+                    try {
+                        repeated = Await.answered("a later unchanged native frame keeps this claimed floor added once", SETUP_WAIT,
+                                () -> matched(latest, restarted, expected, savedFloor, quiet.publicValue().observation().observedAt(), repeatedTrace)
+                                        .filter(value -> {
+                                            assertCumulativeExactly(value, savedFloor);
+                                            boolean unchanged = sameNativeTotals(quiet.raw(), value.raw());
+                                            repeatedTrace.stage(unchanged ? "UNCHANGED" : "NATIVE_TOTALS_CHANGED");
+                                            return unchanged;
+                                        }));
+                    } finally { report.addFork(repeatedTrace.evidence()); }
+                    assertCumulativeExactly(repeated, savedFloor);
+                    assertSameTotals(delivery(quiet.publicValue().observation().facts()), delivery(repeated.publicValue().observation().facts()));
+                    assertThat(desired.read(PIPELINE)).contains(marker.originalDesired());
+                    assertThat(generation(database)).isEqualTo(expectedGeneration);
+                    assertThat(survivor.errorCount(PIPELINE)).contains(0L);
+                    assertThat(WorkloadClaimFence.from(claims.read(key).filter(reading -> reading.leased()).orElseThrow().claim()))
+                            .isEqualTo(WorkloadClaimFence.from(successor));
+                    report.addFork(Map.of("action", "claimed-crash-recovered-with-fixed-native-pair", "scope", RebuildHandoffJdiSession.scopeEvidence(expected),
+                            "job", RebuildHandoffJdiSession.jobEvidence(repeated.raw().job()), "claim", claimEvidence(successor),
+                            "rawNative", factsEvidence(repeated.raw().facts()), "cumulative", factsEvidence(repeated.publicValue().observation().facts()),
+                            "targetIdCoverageSha256", coverageSha, "sourceCheckpoint", sourceCheckpoint(database)));
+                    survivor.stop(PIPELINE, false);
+                    Await.until("the recovered claimed execution really finishes its stop", SETUP_WAIT,
+                            () -> actual.read(PIPELINE).map(value -> StateJson.parse(value.stateJson()))
+                                    .filter(PipelineState.STOPPED::equals).isPresent(), () -> "actual=" + actual.read(PIPELINE));
                 }
-                assertCumulativeExactly(firstKnown, savedFloor);
-                WorkloadClaim successor = Await.answered("the survivor really owns the restored execution", SETUP_WAIT,
-                        () -> claims.read(key).filter(reading -> reading.leased()
-                                && reading.claim().executionGeneration() == expectedGeneration
-                                && reading.claim().owner().nodeId().equals(survivorNode)).map(reading -> reading.claim()));
-                assertThat(successor.claimGeneration()).isGreaterThan(oldClaim.claimGeneration());
-                assertThat(successor.executionNodeIds()).containsExactly(survivorNode);
-                assertNodeSession(claims, clusterId, successor);
-                assertThat(survivor.pipelineControllerOf(PIPELINE)).contains(survivorNode);
-                assertThat(survivor.executionGenerationOf(PIPELINE)).contains(expectedGeneration);
-                assertThat(successor.contextExecutionGeneration()).isEqualTo(expectedGeneration);
-                assertThat(successor.executionClaimGeneration()).isEqualTo(successor.claimGeneration());
-                var actualNewJob = restarted.observedJob(expected).orElseThrow(
-                        () -> new AssertionError("the survivor has no genuine native Job lookup for the restored scope"));
-                assertThat(actualNewJob.scope()).isEqualTo(expected);
-                assertThat(actualNewJob.job()).isEqualTo(firstKnown.raw().job());
-                assertThat(firstKnown.raw().job().clusterId()).isEqualTo(clusterId);
-                assertThat(firstKnown.raw().job().bootId()).isNotEqualTo(marker.source().oldJob().bootId());
-                if (marker.successor() != null) {
-                    assertThat(firstKnown.raw().job().bootId()).isNotEqualTo(marker.successor().submissionBootId());
-                }
-                assertThat(firstKnown.raw().scope()).isEqualTo(expected);
-                assertThat(requireArtifact(database, expected).getString("pipelineIncarnationId"))
-                        .isEqualTo(resource.getString("pipelineIncarnationId"));
-                assertThat(claims.advanceUnderClaim(oldClaim, oldClaim.topologyRevision()))
-                        .as("the killed controller's exact old claim cannot allocate a later execution").isEmpty();
-                assertThat(generation(database)).isEqualTo(expectedGeneration);
-                report.addFork(Map.of("action", "actual-survivor-claim-and-native-floor", "claim", claimEvidence(successor),
-                        "job", RebuildHandoffJdiSession.jobEvidence(firstKnown.raw().job()),
-                        "scope", RebuildHandoffJdiSession.scopeEvidence(expected), "rawBinding", restarted.rawBinding().evidence(),
-                        "rawNative", factsEvidence(firstKnown.raw().facts()),
-                        "cumulative", factsEvidence(firstKnown.publicValue().observation().facts())));
-                Await.until("the actual matching handoff receipt retires its reservation", SETUP_WAIT,
-                        () -> actual.readStopReservation(PIPELINE).isEmpty()
-                                && actual.read(PIPELINE).map(value -> StateJson.parse(value.stateJson()))
-                                        .filter(PipelineState.RUNNING::equals).isPresent(),
-                        () -> "marker=" + actual.readStopReservation(PIPELINE));
-                Await.until("the complete snapshot and held-window CDC reach the physical target", DELIVERY_WAIT,
-                        () -> {
-                            if (actual.read(PIPELINE).map(value -> StateJson.parse(value.stateJson()))
-                                    .filter(PipelineState.FAILED::equals).isPresent()) {
-                                throw new AssertionError("the recovered claimed pipeline failed before physical delivery: " + survivor.metrics(PIPELINE));
-                            }
-                            return target.getCollection(TABLE).countDocuments() == ROWS
-                                    && row(target, INSERTED, "inserted-during-crash") && row(target, UPDATED, "updated-during-crash")
-                                    && target.getCollection(TABLE).find(new Document("id", (long) DELETED)).first() == null
-                                    && snapshotConfirmed(database, survivor);
-                        }, () -> "targetRows=" + target.getCollection(TABLE).countDocuments() + ", actual=" + actual.read(PIPELINE));
-                String coverageSha = assertFullTargetContent(target);
-                Instant targetConfirmedAt = Instant.now();
-                MatchTrace anchorTrace = new MatchTrace();
-                Matched quiet;
-                try {
-                    quiet = Await.answered("the actual complete native workload after physical target delivery", SETUP_WAIT,
-                            () -> matched(latest, restarted, expected, savedFloor, targetConfirmedAt, anchorTrace)
-                                    .filter(value -> {
-                                        assertCumulativeExactly(value, savedFloor);
-                                        boolean complete = hasCompletedRecoveryWorkload(value.raw());
-                                        anchorTrace.stage(complete ? "NATIVE_WORKLOAD_COMPLETE" : "NATIVE_WORKLOAD_INCOMPLETE");
-                                        return complete;
-                                    }));
-                } finally { report.addFork(Map.of("action", "claimed-complete-native-anchor-diagnostic", "sampling", anchorTrace.evidence())); }
-                assertCumulativeExactly(quiet, savedFloor);
-                report.addFork(Map.of("action", "post-delivery-complete-native-anchor", "targetConfirmedAt", targetConfirmedAt.toString(),
-                        "anchor", matchedEvidence(quiet)));
-                MatchTrace repeatedTrace = new MatchTrace();
-                Matched repeated;
-                try {
-                    repeated = Await.answered("a later unchanged native frame keeps this claimed floor added once", SETUP_WAIT,
-                            () -> matched(latest, restarted, expected, savedFloor, quiet.publicValue().observation().observedAt(), repeatedTrace)
-                                    .filter(value -> {
-                                        assertCumulativeExactly(value, savedFloor);
-                                        boolean unchanged = sameNativeTotals(quiet.raw(), value.raw());
-                                        repeatedTrace.stage(unchanged ? "UNCHANGED" : "NATIVE_TOTALS_CHANGED");
-                                        return unchanged;
-                                    }));
-                } finally { report.addFork(repeatedTrace.evidence()); }
-                assertCumulativeExactly(repeated, savedFloor);
-                assertSameTotals(delivery(quiet.publicValue().observation().facts()), delivery(repeated.publicValue().observation().facts()));
-                assertThat(desired.read(PIPELINE)).contains(marker.originalDesired());
-                assertThat(generation(database)).isEqualTo(expectedGeneration);
-                assertThat(survivor.errorCount(PIPELINE)).contains(0L);
-                assertThat(WorkloadClaimFence.from(claims.read(key).filter(reading -> reading.leased()).orElseThrow().claim()))
-                        .isEqualTo(WorkloadClaimFence.from(successor));
-                report.addFork(Map.of("action", "claimed-crash-recovered-with-fixed-native-pair", "scope", RebuildHandoffJdiSession.scopeEvidence(expected),
-                        "job", RebuildHandoffJdiSession.jobEvidence(repeated.raw().job()), "claim", claimEvidence(successor),
-                        "rawNative", factsEvidence(repeated.raw().facts()), "cumulative", factsEvidence(repeated.publicValue().observation().facts()),
-                        "targetIdCoverageSha256", coverageSha, "sourceCheckpoint", sourceCheckpoint(database)));
-                survivor.stop(PIPELINE, false);
-                Await.until("the recovered claimed execution really finishes its stop", SETUP_WAIT,
-                        () -> actual.read(PIPELINE).map(value -> StateJson.parse(value.stateJson()))
-                                .filter(PipelineState.STOPPED::equals).isPresent(), () -> "actual=" + actual.read(PIPELINE));
             }
             try { closeOwned(observers.values(), cluster); }
             finally { observers.clear(); cluster = null; }
             assertThat(PipelineBenchmarkLiveRunIT.artifact(jar)).isEqualTo(application);
             assertThat(PipelineBenchmarkLiveRunIT.sha256(jar)).isEqualTo(expectedSha);
-            assertThat(inputHashes(harnessRoot)).isEqualTo(inputs);
+            Map<String, Object> finalInputs = inputHashes(harnessRoot);
+            if (firstBranchDiagnostic) {
+                Map<String, Object> pinned = new LinkedHashMap<>(finalInputs);
+                String name = "RealClaimedSubmittedHandoffBranchDiagnosticIT";
+                pinned.put(name + ".source", PipelineBenchmarkLiveRunIT.sha256(harnessRoot.resolve(
+                        "e2e/src/test/java/io/tapstate/e2e/" + name + ".java")));
+                try (var bytes = RealClaimedRebuildHandoffCrashIT.class.getResourceAsStream("/io/tapstate/e2e/" + name + ".class")) {
+                    if (bytes == null) { throw new AssertionError("the executing diagnostic class is absent"); }
+                    pinned.put(name + ".class", HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes.readAllBytes())));
+                }
+                finalInputs = Map.copyOf(pinned);
+            }
+            assertThat(finalInputs).isEqualTo(inputs);
             for (String connector : List.of("mysql", "mongodb")) {
                 assertThat(PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor(connector))).isEqualTo(connectors.get(connector));
             }
+            if (firstBranchDiagnostic) {
+                report.completeDiagnostic(Map.of("purpose", "FIRST_SUBMIT_PRE_BIND_SURVIVOR_BRANCH_ONLY",
+                        "acceptanceEvaluated", false, "taskAcceptanceEligible", false,
+                        "performanceAcceptanceEligible", false,
+                        "unverified", List.of("TARGET2_EXACT_NATIVE_FLOOR", "TERMINAL_STATE_AND_HANDOFF_RECEIPT",
+                                "SUBSEQUENT_MEMBER_LOSS_ADMISSION_OR_GEN3", "PHYSICAL_FULL_CONTENT_AND_CHECKSUM",
+                                "UNKNOWN_BASELINE_OLD_CALLBACK_MATRIX", "ALL_TELEMETRY_SURFACE_IDENTITIES", "FORMAL_PERFORMANCE_ACCEPTANCE")));
+            } else {
             List<String> unverified = new ArrayList<>(List.of(cut == RebuildHandoffJdiSession.Cut.PRE_ADMISSION
                             ? "POST_ADMISSION_AND_SUBMIT_PRE_BIND_CLAIMED_CRASH"
                             : "PRE_ADMISSION_AND_SUBMIT_PRE_BIND_CLAIMED_CRASH_IN_THIS_RUN",
@@ -484,6 +568,7 @@ class RealClaimedRebuildHandoffCrashIT {
                             ? "CLAIMED_PRE_ADMISSION_CRASH_SURVIVOR_KNOWN_FLOOR"
                             : "CLAIMED_POST_ADMISSION_PRE_SUBMIT_CRASH_SURVIVOR_KNOWN_FLOOR",
                     "performanceAcceptanceEligible", false, "newCurrentWindow", pending.evidence(), "unverified", List.copyOf(unverified)));
+            }
         } catch (Exception | Error failure) {
             primary = failure;
             try { report.fail(failure); } catch (RuntimeException reporting) { if (reporting != failure) { failure.addSuppressed(reporting); } }
@@ -498,6 +583,67 @@ class RealClaimedRebuildHandoffCrashIT {
                 if (cleanup != primary) { primary.addSuppressed(cleanup); }
             }
         }
+    }
+
+    private static void observeActualFirstBranch(BenchmarkLiveReport report, RebuildHandoffJdiSession observer,
+            MongoStateStore states, MongoObservationStore latest, MongoWorkloadClaimStore claims, WorkloadClaimKey key,
+            StopReservation original, RebuildHandoffJdiSession.Held held, WorkloadClaim heldClaim,
+            String survivorNode) throws Exception {
+        long deadline = System.nanoTime() + SETUP_WAIT.toNanos();
+        var inspected = observer.awaitFirstInspection(SETUP_WAIT);
+        assertThat(inspected.input().phase()).isEqualTo(StopReservation.Phase.SUCCESSOR_ADMITTED);
+        assertThat(inspected.input().token()).isEqualTo(original.token());
+        assertThat(inspected.input().source()).isEqualTo(original.source());
+        assertThat(inspected.input().originalDesired()).isEqualTo(original.originalDesired());
+        assertThat(inspected.input().successor()).isEqualTo(original.successor());
+        var writer = inspected.input().writerAuthority().claim();
+        assertThat(writer.key()).isEqualTo(heldClaim.key());
+        assertThat(writer.owner().nodeId()).isEqualTo(survivorNode);
+        assertThat(writer.claimGeneration()).isGreaterThan(heldClaim.claimGeneration());
+        assertThat(writer.executionGeneration()).isEqualTo(held.scope().executionGeneration());
+        String branch = inspected.job().isEmpty() ? "QUALIFIED_PRODUCTION_ABSENCE"
+                : inspected.terminalState().map(end -> "MATCHING_TERMINAL_" + end.name()).orElse("MATCHING_NOT_YET_TERMINAL");
+        Map<String, Object> diagnostic = new LinkedHashMap<>();
+        diagnostic.put("action", "first-qualified-survivor-return"); diagnostic.put("selectedBranch", branch);
+        diagnostic.put("inspection", inspected.evidence()); diagnostic.put("acceptanceEvaluated", false);
+        try {
+            if (inspected.job().isPresent()) {
+                assertThat(inspected.job()).contains(held.submittedJob());
+                long remaining = deadline - System.nanoTime();
+                assertThat(remaining).as("the bind return shares the original inspection deadline").isPositive();
+                var bound = observer.awaitFirstBinding(Duration.ofNanos(remaining));
+                assertThat(bound.input()).isEqualTo(inspected.input());
+                assertThat(bound.bound().phase()).isEqualTo(StopReservation.Phase.SUCCESSOR_BOUND);
+                assertThat(bound.bound().successor().job()).isEqualTo(held.submittedJob());
+                diagnostic.put("boundReturn", bound.evidence());
+            } else {
+                diagnostic.put("boundReturn", "NOT_APPLICABLE_FOR_ACTUAL_ABSENCE");
+            }
+            var currentClaim = claims.read(key).orElseThrow();
+            diagnostic.put("currentClaim", claimEvidence(currentClaim.claim()));
+            diagnostic.put("currentClaimMatchesObservedWriter", WorkloadClaimFence.from(currentClaim.claim()).equals(writer));
+            diagnostic.put("leaseStillLive", currentClaim.leased());
+            diagnostic.put("contextExecutionGeneration", currentClaim.claim().contextExecutionGeneration());
+            diagnostic.put("executionClaimGeneration", currentClaim.claim().executionClaimGeneration());
+            diagnostic.put("failureClaimGeneration", currentClaim.claim().failureClaimGeneration());
+            diagnostic.put("failureAfterMemberLoss", currentClaim.claim().failureAfterMemberLoss());
+            var stored = states.readStopReservation(PIPELINE);
+            diagnostic.put("storedMarker", stored.map(RealClaimedRebuildHandoffCrashIT::markerEvidence).orElseGet(Map::of));
+            states.read(PIPELINE).ifPresent(checkpoint -> diagnostic.put("checkpoint", Map.of("epoch", checkpoint.epoch(),
+                    "state", StateJson.parse(checkpoint.stateJson()).name(), "touchTime", checkpoint.touchTime().toString())));
+            latest.readContinuation(PIPELINE).ifPresent(carrier -> diagnostic.put("carrier", continuationEvidence(carrier)));
+            if (inspected.job().isPresent()) {
+                boolean retainedBound = stored.filter(value -> value.phase() == StopReservation.Phase.SUCCESSOR_BOUND
+                        && value.token().equals(original.token()) && value.successor().scope().equals(held.scope())
+                        && value.successor().job().equals(held.submittedJob())).isPresent();
+                diagnostic.put("boundPhaseStillRetainedAtRead", retainedBound);
+                diagnostic.put("laterDurablePhaseQualification", "UNVERIFIED_SNAPSHOT_ONLY");
+            } else {
+                // Absence is the returned production conclusion, not a missing observer record.
+                assertThat(inspected.terminalState()).isEmpty();
+                diagnostic.put("slotRetirementAndNextAdmission", "UNVERIFIED_NOT_OBSERVED_BY_THIS_SLICE");
+            }
+        } finally { report.addFork(Map.copyOf(diagnostic)); }
     }
 
     private static void assertHeldOldCurrent(MongoDatabase database, MongoObservationStore latest,
@@ -1001,7 +1147,7 @@ class RealClaimedRebuildHandoffCrashIT {
                 "RebuildHandoffJdiSession$OwnedLauncher", "RebuildHandoffJdiSession$Cut", "RebuildHandoffJdiSession$Site",
                 "RebuildHandoffJdiSession$Image", "RebuildHandoffJdiSession$Binding", "RebuildHandoffJdiSession$Held",
                 "RebuildHandoffJdiSession$Raw", "RebuildHandoffJdiSession$RawKey", "RebuildHandoffJdiSession$JobProof",
-                "RebuildHandoffJdiSession$JobCall")) {
+                "RebuildHandoffJdiSession$JobCall", "RebuildHandoffJdiSession$BranchProof", "RebuildHandoffJdiSession$BranchCall")) {
             try (var bytes = RealClaimedRebuildHandoffCrashIT.class.getResourceAsStream("/io/tapstate/e2e/" + name + ".class")) {
                 if (bytes == null) { throw new AssertionError("the executing nested harness class is absent: " + name); }
                 result.put(name + ".class", HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes.readAllBytes())));

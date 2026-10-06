@@ -11,6 +11,13 @@ import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.lifecycle.MetricAttributes;
 import io.tapstate.core.lifecycle.MetricType;
+import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.StopAuthority;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
+import io.tapstate.spi.store.WorkloadOwner;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.StopReservation;
 
@@ -79,6 +86,28 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
         JobCall { callers = List.copyOf(callers); }
     }
 
+    record BranchProof(String site, StopReservation input, StopReservation bound,
+            Optional<StopReservation.JobIdentity> job, Optional<PipelineState> terminalState,
+            long threadIdentity, long entryAtNanos, long returnedAtNanos, long returnCodeIndex, Binding binding) {
+        Map<String, Object> evidence() {
+            Map<String, Object> value = new LinkedHashMap<>();
+            value.put("site", site); value.put("inputToken", input.token());
+            value.put("inputPhase", input.phase().name()); value.put("inputEpoch", input.reservedEpoch());
+            value.put("scope", scopeEvidence(input.successor().scope()));
+            value.put("submissionBootId", input.successor().submissionBootId());
+            value.put("jobAvailability", job.isPresent() ? "PRESENT" : "QUALIFIED_ABSENT");
+            job.ifPresent(actual -> value.put("job", jobEvidence(actual)));
+            value.put("terminalState", terminalState.map(Enum::name).orElse("NOT_TERMINAL"));
+            if (bound != null) { value.put("boundEpoch", bound.reservedEpoch()); value.put("boundPhase", bound.phase().name()); }
+            value.put("writer", fenceEvidence(input.writerAuthority().claim()));
+            value.put("threadIdentity", threadIdentity); value.put("entryAtNanos", entryAtNanos);
+            value.put("returnedAtNanos", returnedAtNanos); value.put("returnCodeIndex", returnCodeIndex);
+            value.put("binding", binding.evidence()); value.put("source", "GENUINE_METHOD_RETURN");
+            return Map.copyOf(value);
+        }
+    }
+    private record BranchCall(Site site, JobCall call, StopReservation input, StopReservation.JobIdentity job) { }
+
     private static final String LOADER = "org.springframework.boot.loader.launch.LaunchedClassLoader";
     private static final String SCOPE = "io.tapstate.spi.store.ObservationStore$Scope";
     private static final String JOB = "io.tapstate.spi.store.StopReservation$JobIdentity";
@@ -98,6 +127,9 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
             Cut.SUBMIT_PRE_BIND, new Site("io.tapstate.adapters.mongostore.MongoStateStore", "bindSuccessor",
                     "(Lio/tapstate/spi/store/StopReservation;Lio/tapstate/spi/store/ObservationStore$Scope;"
                             + "Lio/tapstate/spi/store/StopReservation$JobIdentity;Ljava/time/Instant;)Ljava/util/Optional;"));
+    private static final Site INSPECT = new Site("io.tapstate.app.EngineLifecycleActuator", "inspectSuccessor",
+            "(Lio/tapstate/spi/store/StopReservation;Ljava/util/function/BooleanSupplier;)Ljava/util/Optional;");
+    private static final Site BIND = CUTS.get(Cut.SUBMIT_PRE_BIND);
     private static final Site MEMBER_ADMISSION = new Site("io.tapstate.adapters.mongostore.MongoStateStore", "admitSuccessor",
             "(Lio/tapstate/spi/store/StopReservation;Ljava/lang/String;Ljava/lang/String;Ljava/util/Set;"
                     + "Ljava/time/Instant;)Ljava/util/Optional;");
@@ -118,6 +150,12 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
     private final List<EventRequest> requests = new ArrayList<>();
     private final LinkedHashMap<RawKey, Raw> raw = new LinkedHashMap<>();
     private final Map<Long, JobCall> jobCalls = new HashMap<>();
+    private final Map<Long, BranchCall> branchCalls = new HashMap<>();
+    private final boolean branchDiagnostic;
+    private StopReservation branchExpected;
+    private StopReservation.JobIdentity branchJob;
+    private final CompletableFuture<BranchProof> firstInspection = new CompletableFuture<>();
+    private final CompletableFuture<BranchProof> firstBinding = new CompletableFuture<>();
     private final LinkedHashMap<ObservationStore.Scope, JobProof> jobProofs = new LinkedHashMap<>();
     private final Path retainedOutput;
     private final RealProcessServer server;
@@ -133,10 +171,12 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
     private long events;
 
     private RebuildHandoffJdiSession(Path jar, String artifactSha, String pipelineId, String table,
-            Cut cut, Site selectedCut, Map<Site, Image> images, RealProcessServer server, VirtualMachine vm, Path retainedOutput) {
+            Cut cut, Site selectedCut, Map<Site, Image> images, RealProcessServer server, VirtualMachine vm,
+            Path retainedOutput, boolean branchDiagnostic) {
         this.jar = jar; this.artifactSha = artifactSha; this.pipelineId = pipelineId; this.table = table;
         this.cut = cut; this.cutSite = selectedCut;
         this.images = images; this.server = server; this.vm = vm;
+        this.branchDiagnostic = branchDiagnostic;
         this.retainedOutput = retainedOutput;
         pump = new Thread(this::loop, "rebuild-handoff-jdi-events"); pump.setDaemon(true);
     }
@@ -165,8 +205,20 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
                 processLabel, true, Objects.requireNonNull(launcher, "launcher"));
     }
 
+    static RebuildHandoffJdiSession startClaimedBranchDiagnostic(Path selectedJar, String pipelineId, String table,
+            Path logDirectory, String processLabel, OwnedLauncher launcher) throws Exception {
+        return startObserved(selectedJar, pipelineId, table, Cut.SUBMIT_PRE_BIND, logDirectory,
+                processLabel, true, true, Objects.requireNonNull(launcher, "launcher"));
+    }
+
     private static RebuildHandoffJdiSession startObserved(Path selectedJar, String pipelineId, String table,
             Cut cut, Path logDirectory, String processLabel, boolean rawAlongsideCut,
+            OwnedLauncher launcher) throws Exception {
+        return startObserved(selectedJar, pipelineId, table, cut, logDirectory, processLabel, rawAlongsideCut, false, launcher);
+    }
+
+    private static RebuildHandoffJdiSession startObserved(Path selectedJar, String pipelineId, String table,
+            Cut cut, Path logDirectory, String processLabel, boolean rawAlongsideCut, boolean branchDiagnostic,
             OwnedLauncher launcher) throws Exception {
         Objects.requireNonNull(pipelineId); Objects.requireNonNull(table);
         Objects.requireNonNull(logDirectory); Objects.requireNonNull(processLabel);
@@ -179,6 +231,10 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
         String sha = PipelineBenchmarkLiveRunIT.sha256(jar);
         Set<Site> selected = cut == null ? Set.of(RAW) : rawAlongsideCut
                 ? Set.of(CUTS.get(cut), JOB_LOOKUP, RAW) : Set.of(CUTS.get(cut), JOB_LOOKUP);
+        if (branchDiagnostic) {
+            Set<Site> extended = new HashSet<>(selected); extended.add(INSPECT); extended.add(BIND);
+            selected = Set.copyOf(extended);
+        }
         Site selectedCut = cut == null ? null : CUTS.get(cut);
         Map<Site, Image> images;
         if (cut == Cut.PRE_ADMISSION) {
@@ -219,7 +275,8 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
             if (cut != null && !vm.canGetMethodReturnValues()) { throw invalid("genuine native Job return values unavailable"); }
             connector.stopListening(arguments); listening = false;
             Path retained = logDirectory.resolve(processLabel + "-" + server.pid() + "-server.out");
-            session = new RebuildHandoffJdiSession(jar, sha, pipelineId, table, cut, selectedCut, images, server, vm, retained);
+            session = new RebuildHandoffJdiSession(jar, sha, pipelineId, table, cut, selectedCut, images,
+                    server, vm, retained, branchDiagnostic);
             session.install(); session.pump.start(); server.awaitHealthy(); session.awaitReady(MAX_WAIT);
             session.retainOutput();
             return session;
@@ -256,6 +313,22 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
     Optional<JobProof> observedJob(ObservationStore.Scope scope) {
         synchronized (lock) { check(); return Optional.ofNullable(jobProofs.get(scope)); }
     }
+    void observeFirstBranch(StopReservation actualAdmission, StopReservation.JobIdentity actualSubmittedJob) {
+        synchronized (lock) {
+            check();
+            if (!branchDiagnostic || branchExpected != null || actualAdmission.phase() != StopReservation.Phase.SUCCESSOR_ADMITTED
+                    || actualAdmission.successor() == null || actualAdmission.successor().job() != null
+                    || actualAdmission.writerAuthority().standalone()
+                    || !actualAdmission.successor().submissionBootId().equals(actualSubmittedJob.bootId())
+                    || !actualAdmission.source().clusterId().equals(actualSubmittedJob.clusterId())) {
+                throw invalid("branch observation lacks its actual submitted admission");
+            }
+            branchExpected = actualAdmission; branchJob = actualSubmittedJob;
+        }
+    }
+    BranchProof awaitFirstInspection(Duration timeout) throws Exception { return await(firstInspection, timeout); }
+    BranchProof awaitFirstBinding(Duration timeout) throws Exception { return await(firstBinding, timeout); }
+
     private void awaitReady(Duration timeout) throws Exception { await(ready, timeout); }
     Held awaitHeld(Duration timeout) throws Exception { return await(held, timeout); }
 
@@ -334,9 +407,14 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
                         verify(site);
                         if (site.equals(RAW)) { captureRaw(breakpoint); }
                         else if (site.equals(JOB_LOOKUP)) { captureJobEntry(breakpoint); }
-                        else if (captureCut(breakpoint, set)) { retained = true; }
+                        else {
+                            if (branchDiagnostic && (site.equals(INSPECT) || site.equals(BIND))) { captureBranchEntry(site, breakpoint); }
+                            if (site.equals(cutSite) && captureCut(breakpoint, set)) { retained = true; }
+                        }
                     } else if (event instanceof MethodExitEvent returned) {
                         if (returned.method().equals(methods.get(JOB_LOOKUP))) { captureJobReturn(returned); }
+                        else if (branchDiagnostic && (returned.method().equals(methods.get(INSPECT))
+                                || returned.method().equals(methods.get(BIND)))) { captureBranchReturn(returned); }
                     } else if (event instanceof VMDeathEvent || event instanceof VMDisconnectEvent) {
                         if (!crashing && !closing) { throw invalid("owned Boot exited before the witness finished"); }
                         running = false;
@@ -396,7 +474,8 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
         if (arguments.size() != 1) { throw invalid("Job lookup arguments changed"); }
         if (!pipelineId.equals(text(arguments.getFirst()))) { return; }
         ObjectReference receiver = frame.thisObject();
-        if (receiver == null || jobCalls.containsKey(event.thread().uniqueID()) || jobCalls.size() >= MAX_JOB_CALLS) {
+        if (receiver == null || jobCalls.containsKey(event.thread().uniqueID())
+                || jobCalls.size() + branchCalls.size() >= MAX_JOB_CALLS) {
             throw invalid("Job lookup receiver absent or call overlap exceeds its bound");
         }
         MethodExitRequest exit = vm.eventRequestManager().createMethodExitRequest();
@@ -410,25 +489,7 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
         if (!event.method().equals(methods.get(JOB_LOOKUP))) { return; }
         JobCall call = jobCalls.get(event.thread().uniqueID());
         if (call == null || !event.request().equals(call.exit())) { throw invalid("Job return lost its exact entry correlation"); }
-        verify(JOB_LOOKUP);
-        List<StackFrame> frames = event.thread().frames();
-        int firstCaller = frames.size() - call.callers().size();
-        if (frames.isEmpty() || frames.size() > MAX_FRAMES || firstCaller < 0 || firstCaller > 1
-                || firstCaller == 1 && (frames.size() != call.depth()
-                        || !frames.getFirst().location().method().equals(methods.get(JOB_LOOKUP))
-                        || frames.getFirst().thisObject() == null
-                        || frames.getFirst().thisObject().uniqueID() != call.receiver())) {
-            throw invalid("Job return changed its stack depth or receiver");
-        }
-        for (int i = 0; i < call.callers().size(); i++) {
-            if (!frames.get(firstCaller + i).location().method().equals(call.callers().get(i))) {
-                throw invalid("Job return changed its observed caller chain");
-            }
-        }
-        long codeIndex = event.location().codeIndex();
-        if (codeIndex < 0 || !BenchmarkJdiCostObserver.returnOffsets(images.get(JOB_LOOKUP).code()).contains(Math.toIntExact(codeIndex))) {
-            throw invalid("Job return is outside its pinned normal return instructions");
-        }
+        long codeIndex = verifyNormalReturn(event, JOB_LOOKUP, call);
         ObjectReference optional = object(event.returnValue(), "java.util.Optional");
         Value found = value(optional, "value", "Ljava/lang/Object;");
         call.exit().disable(); vm.eventRequestManager().deleteEventRequest(call.exit()); requests.remove(call.exit());
@@ -443,7 +504,173 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
         StopReservation.JobIdentity job = job(object(value(execution, "job", "Lio/tapstate/spi/store/StopReservation$JobIdentity;"), JOB));
         jobProofs.put(scope, new JobProof(scope, job, event.thread().uniqueID(), call.entryAtNanos(), System.nanoTime(),
                 codeIndex, bindings.get(JOB_LOOKUP)));
-        while (jobProofs.size() > MAX_JOB_PROOFS) { jobProofs.remove(jobProofs.keySet().iterator().next()); }
+        // The diagnostic reserves two of the same proof slots for its first inspection and binding.
+        while (jobProofs.size() > MAX_JOB_PROOFS - (branchDiagnostic ? 2 : 0)) {
+            jobProofs.remove(jobProofs.keySet().iterator().next());
+        }
+    }
+
+    private long verifyNormalReturn(MethodExitEvent event, Site site, JobCall call) throws Exception {
+        verify(site);
+        List<StackFrame> frames = event.thread().frames();
+        int firstCaller = frames.size() - call.callers().size();
+        if (frames.isEmpty() || frames.size() > MAX_FRAMES || firstCaller < 0 || firstCaller > 1
+                || firstCaller == 1 && (frames.size() != call.depth()
+                        || !frames.getFirst().location().method().equals(methods.get(site))
+                        || frames.getFirst().thisObject() == null
+                        || frames.getFirst().thisObject().uniqueID() != call.receiver())) {
+            throw invalid("Job return changed its stack depth or receiver");
+        }
+        for (int i = 0; i < call.callers().size(); i++) {
+            if (!frames.get(firstCaller + i).location().method().equals(call.callers().get(i))) {
+                throw invalid("Job return changed its observed caller chain");
+            }
+        }
+        long codeIndex = event.location().codeIndex();
+        if (codeIndex < 0 || !BenchmarkJdiCostObserver.returnOffsets(images.get(site).code()).contains(Math.toIntExact(codeIndex))) {
+            throw invalid("Job return is outside its pinned normal return instructions");
+        }
+        return codeIndex;
+    }
+
+    private boolean sameSubmittedLineage(StopReservation observed) {
+        return branchExpected != null && observed.pipelineId().equals(branchExpected.pipelineId())
+                && observed.token().equals(branchExpected.token()) && observed.source().equals(branchExpected.source())
+                && observed.sourceEpoch() == branchExpected.sourceEpoch()
+                && observed.originalDesired().equals(branchExpected.originalDesired())
+                && observed.counterPolicy() == branchExpected.counterPolicy() && !observed.legacy()
+                && observed.successor() != null
+                && observed.successor().scope().equals(branchExpected.successor().scope())
+                && observed.successor().submissionBootId().equals(branchExpected.successor().submissionBootId())
+                && observed.writerAuthority() != null && !observed.writerAuthority().standalone();
+    }
+
+    private void captureBranchEntry(Site site, BreakpointEvent event) throws Exception {
+        if (branchExpected == null || site.equals(INSPECT) && firstInspection.isDone()
+                || site.equals(BIND) && firstBinding.isDone()) { return; }
+        List<StackFrame> frames = event.thread().frames();
+        if (frames.isEmpty() || frames.size() > MAX_FRAMES) { throw invalid("branch stack unavailable or unbounded"); }
+        StackFrame frame = frames.getFirst();
+        List<Value> arguments = frame.getArgumentValues();
+        if (arguments.size() != (site.equals(INSPECT) ? 2 : 4)) { throw invalid("branch arguments changed"); }
+        ObjectReference supplied = branchObject(arguments.getFirst(), MARKER);
+        if (!pipelineId.equals(text(value(supplied, "pipelineId", "Ljava/lang/String;")))
+                || value(supplied, "successor", "Lio/tapstate/spi/store/StopReservation$Successor;") == null) { return; }
+        StopReservation input = marker(supplied);
+        if (!sameSubmittedLineage(input)) { return; }
+        StopReservation.JobIdentity actualJob = null;
+        if (site.equals(BIND)) {
+            if (!scope(branchObject(arguments.get(1), SCOPE)).equals(input.successor().scope())) { throw invalid("bound scope changed"); }
+            actualJob = job(branchObject(arguments.get(2), JOB));
+            if (!actualJob.equals(branchJob)) { throw invalid("bind argument is not the actual held native Job"); }
+        }
+        ObjectReference receiver = frame.thisObject();
+        if (receiver == null || branchCalls.containsKey(event.thread().uniqueID())
+                || branchCalls.size() + jobCalls.size() >= MAX_JOB_CALLS) { throw invalid("branch call overlap or budget"); }
+        MethodExitRequest exit = vm.eventRequestManager().createMethodExitRequest();
+        exit.addClassFilter(methods.get(site).declaringType()); exit.addThreadFilter(event.thread());
+        exit.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD); exit.enable(); requests.add(exit);
+        JobCall call = new JobCall(receiver.uniqueID(), System.nanoTime(), frames.size(),
+                frames.subList(1, frames.size()).stream().map(caller -> caller.location().method()).toList(), exit);
+        branchCalls.put(event.thread().uniqueID(), new BranchCall(site, call, input, actualJob));
+    }
+
+    private void captureBranchReturn(MethodExitEvent event) throws Exception {
+        BranchCall branch = branchCalls.get(event.thread().uniqueID());
+        if (branch == null) { return; }
+        if (!event.method().equals(methods.get(branch.site()))) { return; }
+        if (!event.request().equals(branch.call().exit())) { throw invalid("branch return lost its entry correlation"); }
+        long codeIndex = verifyNormalReturn(event, branch.site(), branch.call());
+        Value found = value(object(event.returnValue(), "java.util.Optional"), "value", "Ljava/lang/Object;");
+        branch.call().exit().disable(); vm.eventRequestManager().deleteEventRequest(branch.call().exit());
+        requests.remove(branch.call().exit()); branchCalls.remove(event.thread().uniqueID());
+        // Empty outer Optional means unavailable/fenced, never factual Job absence.
+        if (found == null) { return; }
+        StopReservation bound = null;
+        Optional<StopReservation.JobIdentity> actualJob;
+        Optional<PipelineState> terminal = Optional.empty();
+        if (branch.site().equals(INSPECT)) {
+            ObjectReference inspection = branchObject(found, "io.tapstate.runtime.scheduler.LifecycleActuator$SuccessorInspection");
+            Value jobValue = value(object(value(inspection, "job", "Ljava/util/Optional;"), "java.util.Optional"), "value", "Ljava/lang/Object;");
+            actualJob = jobValue == null ? Optional.empty() : Optional.of(job(branchObject(jobValue, JOB)));
+            if (actualJob.isPresent() && !actualJob.orElseThrow().equals(branchJob)) { throw invalid("inspection named another native Job"); }
+            Value end = value(object(value(inspection, "terminalState", "Ljava/util/Optional;"), "java.util.Optional"), "value", "Ljava/lang/Object;");
+            if (end != null) {
+                PipelineState state = PipelineState.valueOf(enumName(branchObject(end, "io.tapstate.core.lifecycle.PipelineState")));
+                if (state != PipelineState.FAILED && state != PipelineState.COMPLETED || actualJob.isEmpty()) {
+                    throw invalid("inspection terminal state has no matching real Job");
+                }
+                terminal = Optional.of(state);
+            }
+        } else {
+            bound = marker(branchObject(found, MARKER));
+            if (!sameSubmittedLineage(bound) || bound.phase() != StopReservation.Phase.SUCCESSOR_BOUND
+                    || !bound.writerAuthority().equals(branch.input().writerAuthority())
+                    || bound.reservedEpoch() != Math.incrementExact(branch.input().reservedEpoch())
+                    || !bound.successor().job().equals(branchJob)) { throw invalid("normal bind did not return the exact bound successor"); }
+            actualJob = Optional.of(branch.job());
+        }
+        BranchProof proof = new BranchProof(branch.site().equals(INSPECT) ? "INSPECT" : "BIND", branch.input(), bound,
+                actualJob, terminal, event.thread().uniqueID(), branch.call().entryAtNanos(), System.nanoTime(),
+                codeIndex, bindings.get(branch.site()));
+        if (branch.site().equals(INSPECT)) { firstInspection.complete(proof); }
+        else { firstBinding.complete(proof); }
+    }
+
+    private StopReservation marker(ObjectReference input) {
+        ObjectReference intent = branchObject(value(input, "originalDesired", "Lio/tapstate/core/lifecycle/DesiredState;"), "io.tapstate.core.lifecycle.DesiredState");
+        Value assembly = value(intent, "assemblyRevision", "Ljava/lang/String;");
+        Value stamp = value(intent, "rebuiltAtStateEpoch", "Ljava/lang/Long;");
+        DesiredState desired = new DesiredState(text(value(intent, "pipelineId", "Ljava/lang/String;")),
+                PipelineState.valueOf(enumName(branchObject(value(intent, "targetState", "Lio/tapstate/core/lifecycle/PipelineState;"), "io.tapstate.core.lifecycle.PipelineState"))),
+                text(value(intent, "revision", "Ljava/lang/String;")), bool(value(intent, "purgeState", "Z")),
+                assembly == null ? null : text(assembly), bool(value(intent, "reassemble", "Z")), stamp == null ? null : boxedLong(stamp));
+        ObjectReference source = branchObject(value(input, "source", "Lio/tapstate/spi/store/StopReservation$Source;"), MARKER + "$Source");
+        Value sourceScope = value(source, "scope", "Lio/tapstate/spi/store/ObservationStore$Scope;");
+        Value sourceJob = value(source, "oldJob", "Lio/tapstate/spi/store/StopReservation$JobIdentity;");
+        StopReservation.Source origin = new StopReservation.Source(text(value(source, "clusterId", "Ljava/lang/String;")),
+                sourceScope == null ? null : scope(branchObject(sourceScope, SCOPE)), sourceJob == null ? null : job(branchObject(sourceJob, JOB)));
+        ObjectReference writer = branchObject(value(input, "writerAuthority", "Lio/tapstate/spi/store/StopAuthority;"), "io.tapstate.spi.store.StopAuthority");
+        ObjectReference fence = branchObject(value(writer, "claim", "Lio/tapstate/spi/store/WorkloadClaimFence;"), "io.tapstate.spi.store.WorkloadClaimFence");
+        ObjectReference key = branchObject(value(fence, "key", "Lio/tapstate/spi/store/WorkloadClaimKey;"), "io.tapstate.spi.store.WorkloadClaimKey");
+        ObjectReference owner = branchObject(value(fence, "owner", "Lio/tapstate/spi/store/WorkloadOwner;"), "io.tapstate.spi.store.WorkloadOwner");
+        WorkloadClaimFence claim = new WorkloadClaimFence(new WorkloadClaimKey(text(value(key, "clusterId", "Ljava/lang/String;")),
+                WorkloadClaimType.valueOf(enumName(branchObject(value(key, "type", "Lio/tapstate/spi/store/WorkloadClaimType;"), "io.tapstate.spi.store.WorkloadClaimType"))),
+                text(value(key, "resourceId", "Ljava/lang/String;"))),
+                new WorkloadOwner(text(value(owner, "nodeId", "Ljava/lang/String;")), text(value(owner, "bootId", "Ljava/lang/String;"))),
+                longValue(value(fence, "claimGeneration", "J")), longValue(value(fence, "executionGeneration", "J")),
+                longValue(value(fence, "topologyRevision", "J")));
+        StopAuthority authority = new StopAuthority(text(value(writer, "clusterId", "Ljava/lang/String;")),
+                longValue(value(writer, "executionGeneration", "J")), claim);
+        ObjectReference slot = branchObject(value(input, "successor", "Lio/tapstate/spi/store/StopReservation$Successor;"), MARKER + "$Successor");
+        Value actualJob = value(slot, "job", "Lio/tapstate/spi/store/StopReservation$JobIdentity;");
+        return new StopReservation(text(value(input, "pipelineId", "Ljava/lang/String;")), text(value(input, "token", "Ljava/lang/String;")),
+                longValue(value(input, "sourceEpoch", "J")), longValue(value(input, "reservedEpoch", "J")), desired, origin,
+                StopReservation.Phase.valueOf(enumName(branchObject(value(input, "phase", "Lio/tapstate/spi/store/StopReservation$Phase;"), MARKER + "$Phase"))),
+                StopReservation.CounterPolicy.valueOf(enumName(branchObject(value(input, "counterPolicy", "Lio/tapstate/spi/store/StopReservation$CounterPolicy;"), MARKER + "$CounterPolicy"))),
+                authority, new StopReservation.Successor(scope(branchObject(value(slot, "scope", "Lio/tapstate/spi/store/ObservationStore$Scope;"), SCOPE)),
+                        text(value(slot, "submissionBootId", "Ljava/lang/String;")), actualJob == null ? null : job(branchObject(actualJob, JOB))),
+                intValue(value(input, "formatVersion", "I")));
+    }
+    /** Observation decode only: this native tuple is never supplied back to a production authority call. */
+    private ObjectReference branchObject(Value input, String expected) {
+        ObjectReference actual = object(input, expected);
+        if (actual.referenceType().classLoader() == null
+                || actual.referenceType().classLoader().uniqueID() != bindings.get(INSPECT).loaderIdentity()) {
+            throw invalid("branch model is not from the pinned application loader");
+        }
+        return actual;
+    }
+
+    private static boolean bool(Value value) {
+        if (!(value instanceof BooleanValue typed)) { throw invalid("boolean field unavailable"); }
+        return typed.value();
+    }
+    private static Map<String, Object> fenceEvidence(WorkloadClaimFence fence) {
+        return Map.of("clusterId", fence.key().clusterId(), "resourceId", fence.key().resourceId(),
+                "ownerNodeId", fence.owner().nodeId(), "ownerBootId", fence.owner().bootId(),
+                "claimGeneration", fence.claimGeneration(), "executionGeneration", fence.executionGeneration(),
+                "topologyRevision", fence.topologyRevision());
     }
 
     private boolean captureCut(BreakpointEvent event, EventSet set) throws Exception {
@@ -655,6 +882,7 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
                 : invalid("observer failed with " + problem.getClass().getName());
         if (safe != problem) { safe.initCause(problem); }
         failure.compareAndSet(null, safe); running = false; ready.completeExceptionally(safe); held.completeExceptionally(safe);
+        if (branchDiagnostic) { firstInspection.completeExceptionally(safe); firstBinding.completeExceptionally(safe); }
     }
 
     @Override public void close() throws Exception {
