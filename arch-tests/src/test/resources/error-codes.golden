@@ -115,6 +115,7 @@ cli.workspace-has-no-pipeline
 cli.workspace-not-writable
 cli.workspace-unreadable
 cluster.membership-unreadable
+connector.acknowledge-failed
 connector.ambiguous-connector-class
 connector.ambiguous-registration
 connector.api-level-incompatible
@@ -140,6 +141,7 @@ connector.read-abandoned
 connector.read-failed
 connector.read-timeout
 connector.registration-conflict
+connector.release-failed
 connector.spec-invalid
 connector.spec-not-found
 connector.state-unreadable

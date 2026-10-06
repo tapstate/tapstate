@@ -3,6 +3,7 @@ package io.tapstate.adapters.mongostore;
 import com.mongodb.ErrorCategory;
 import com.mongodb.MongoException;
 import com.mongodb.MongoWriteException;
+import com.mongodb.ReadConcern;
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
@@ -17,6 +18,7 @@ import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.ConsumerProgressKind;
+import io.tapstate.spi.store.DurableSourceRead;
 import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SchemaVersion;
@@ -184,6 +186,22 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         Objects.requireNonNull(collection, "collection");
         return SystemCollections.WORKLOAD_CLAIMS.on(
                 client.getDatabase(collection.getNamespace().getDatabaseName()));
+    }
+
+    @Override
+    public Optional<DurableSourceRead> durableSourceRead(String miningChainId) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Document root = StoreIo.call(() -> collection.withReadConcern(ReadConcern.MAJORITY)
+                .find(new Document("_id", miningChainId))
+                .projection(Projections.include(
+                        "sourceReadOffset", "sourceReadEpoch", "sourceReadSeq", "sourceReadDurable"))
+                .first());
+        if (root == null) {
+            return Optional.empty();
+        }
+        ChainPosition position = sourceReadFrom(root);
+        return position == null ? Optional.empty()
+                : Optional.of(new DurableSourceRead(position, sourceReadDurableFrom(root, miningChainId)));
     }
 
     @Override

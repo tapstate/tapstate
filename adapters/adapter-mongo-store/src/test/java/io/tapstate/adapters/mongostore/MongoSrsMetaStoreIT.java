@@ -13,11 +13,13 @@ import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.ConsumerProgressKind;
+import io.tapstate.spi.store.DurableSourceRead;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.testsupport.RequiresDocker;
+import org.bson.BsonDocument;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.MongoDBContainer;
@@ -31,6 +33,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -1990,6 +1993,53 @@ class MongoSrsMetaStoreIT {
 
     private interface CollectionTest {
         void run(MongoSrsMetaStore store, MongoCollection<Document> collection) throws Exception;
+    }
+
+    /**
+     * The position a source may be told to release up to is read with a majority read concern, and nothing but
+     * that position: a write only the old primary had, rolled back in a failover, must never reach a source
+     * that would then have let go of what the rolled-back record asks for again. Whether it is a write-through
+     * checkpoint is read with it.
+     */
+    @Test
+    void theDurablePositionIsReadWithAMajorityReadConcernAndSaysWhetherItWasWrittenThrough() {
+        List<BsonDocument> finds = new CopyOnWriteArrayList<>();
+        CommandListener recordFinds = new CommandListener() {
+            @Override
+            public void commandStarted(CommandStartedEvent event) {
+                if ("find".equals(event.getCommandName())) {
+                    finds.add(event.getCommand().clone());
+                }
+            }
+        };
+        MongoClientSettings settings = MongoClientSettings.builder()
+                .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl()))
+                .addCommandListener(recordFinds)
+                .build();
+        try (MongoClient client = MongoClients.create(settings)) {
+            MongoCollection<Document> collection = client.getDatabase("tapstate").getCollection("srs_meta");
+            collection.drop();
+            MongoSrsMetaStore store = new MongoSrsMetaStore(client, collection, Clock.systemUTC());
+            store.create(CHAIN, null);
+            long epoch = store.openEpoch(CHAIN);
+            assertThat(store.durableSourceRead(CHAIN)).as("no offset yet").isEmpty();
+
+            ChainPosition bounded = new ChainPosition(new SourceOrder(epoch, 3), "t3");
+            store.advanceSourceReadOffset(CHAIN, bounded);
+            finds.clear();
+            assertThat(store.durableSourceRead(CHAIN)).contains(new DurableSourceRead(bounded, false));
+            assertThat(finds).hasSize(1);
+            BsonDocument find = finds.getFirst();
+            assertThat(find.getDocument("readConcern").getString("level").getValue()).isEqualTo("majority");
+            assertThat(find.getDocument("projection").keySet()).containsExactlyInAnyOrder(
+                    "sourceReadOffset", "sourceReadEpoch", "sourceReadSeq", "sourceReadDurable");
+
+            store.requestCaptureTables(CHAIN, List.of("orders"));
+            assertThat(store.publishCaptureTables(CHAIN, epoch, List.of("orders"))).isTrue();
+            ChainPosition checkpoint = new ChainPosition(new SourceOrder(epoch, 4), "t4");
+            store.advanceCaptureCheckpoint(CHAIN, checkpoint, List.of("orders"));
+            assertThat(store.durableSourceRead(CHAIN)).contains(new DurableSourceRead(checkpoint, true));
+        }
     }
 
     /** Runs a test body against a fresh meta store over a clean srs_meta collection on the replica-set. */
