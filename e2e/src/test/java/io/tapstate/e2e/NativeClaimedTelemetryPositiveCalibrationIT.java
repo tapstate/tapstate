@@ -84,6 +84,11 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
     }
 
     @Test
+    void aRealIndependentClaimedSubmissionExposesItsActualSourceLogAndProducedTelemetry() throws Exception {
+        runClaimedPositive(false, false, true);
+    }
+
+    @Test
     void aRealClaimedResetReplacementKeepsItsActualAdmissionAndSubmittedJobBridge() throws Exception {
         runClaimedPositive(true);
     }
@@ -99,6 +104,11 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
     }
 
     private static void runClaimedPositive(boolean replacement, boolean continuing) throws Exception {
+        runClaimedPositive(replacement, continuing, false);
+    }
+
+    private static void runClaimedPositive(boolean replacement, boolean continuing, boolean independent) throws Exception {
+        assertThat(independent && replacement).as("the independent calibration is a warm submission").isFalse();
         Assumptions.assumeTrue(List.of("jar", "sha256", "output").stream()
                 .anyMatch(name -> System.getProperty(PREFIX + name) != null),
                 "the claimed positive calibration needs named immutable inputs");
@@ -109,7 +119,8 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
         BenchmarkCaptureCalibrationLiveRunIT.requireConnectors();
         Path harness = PipelineBenchmarkLiveRunIT.harnessRoot();
         Path requestedOutput = Path.of(required("output")).toAbsolutePath().normalize();
-        Path output = continuing ? requestedOutput.resolveSibling(requestedOutput.getFileName() + ".continue.json")
+        Path output = independent ? requestedOutput.resolveSibling(requestedOutput.getFileName() + ".independent.json")
+                : continuing ? requestedOutput.resolveSibling(requestedOutput.getFileName() + ".continue.json")
                 : replacement ? requestedOutput.resolveSibling(requestedOutput.getFileName() + ".replacement.json") : requestedOutput;
         PipelineBenchmarkLiveRunIT.requireSafeOutput(output, harness);
         BenchmarkLiveReport report = new BenchmarkLiveReport(output);
@@ -143,13 +154,15 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                 }
             }
             MongoDatabase database = mongo.getDatabase(new ConnectionString(storeUri).getDatabase());
-            Map<String, String> resources = resources(settings, targetUri);
-            report.begin(Map.of("purpose", continuing ? "NATIVE_CLAIMED_PARTIAL_SNAPSHOT_CONTINUE_POSITIVE"
+            Map<String, String> resources = resources(settings, targetUri, independent);
+            report.begin(Map.of("purpose", independent ? "NATIVE_INDEPENDENT_CLAIMED_POSITIVE_TELEMETRY"
+                            : continuing ? "NATIVE_CLAIMED_PARTIAL_SNAPSHOT_CONTINUE_POSITIVE"
                             : replacement ? "NATIVE_CLAIMED_RESET_REPLACEMENT_POSITIVE" : "NATIVE_WARM_CLAIMED_POSITIVE_TELEMETRY",
                     "application", PipelineBenchmarkLiveRunIT.artifact(jar), "expectedJarSha256", sha,
                     "harness", inputs, "connectors", connectors, "clusterMembers", 2,
                     "fixtureResourceSha256", digest(JsonWriter.write(resources).getBytes(StandardCharsets.UTF_8)),
-                    "performanceAcceptanceEligible", false, "warmOnly", !replacement),
+                    "performanceAcceptanceEligible", false, "warmOnly", !replacement,
+                    "captureProfile", independent ? "INDEPENDENT_SNAPSHOT_AND_CDC" : "SHARED_SNAPSHOT_AND_CDC"),
                     PipelineBenchmarkLiveRunIT.environment(), List.of());
             String clusterId;
             try (var setup = RealProcessServer.start(storeUri, operatorDatabase, jar)) {
@@ -643,7 +656,9 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                 assertThat(PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor(connector.getKey())))
                         .isEqualTo(connector.getValue());
             }
-            report.completeDiagnostic(Map.of("correctness", continuing
+            report.completeDiagnostic(Map.of("correctness", independent
+                            ? "ACTUAL_INDEPENDENT_CLAIMED_ADMISSION_SOURCE_LOG_AND_EMITTER_TELEMETRY"
+                            : continuing
                             ? "ACTUAL_CLAIMED_PARTIAL_SNAPSHOT_CONTINUE_EXACT_FLOOR_AND_RAW"
                             : replacement ? "ACTUAL_CLAIMED_RESET_REPLACEMENT_ADMISSION_AND_EMITTER_TELEMETRY"
                             : "ACTUAL_WARM_CLAIMED_ADMISSION_AND_EMITTER_TELEMETRY",
@@ -1148,7 +1163,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
         }
     }
 
-    private static Map<String, String> resources(Map<String, Object> settings, String targetUri) {
+    private static Map<String, String> resources(Map<String, Object> settings, String targetUri, boolean independent) {
         return Map.of(SOURCE + ".tap.yml", """
                 version: tapstate/v1
                 kind: source
@@ -1169,12 +1184,13 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                 version: tapstate/v1
                 kind: pipeline
                 id: native_claimed_copy
-                source: native_claimed_source
+                %s
                 settings: { read_mode: snapshot_and_cdc }
                 serve:
                   from: native_claimed_orders
                   sync: [ { source: native_claimed_target } ]
-                """);
+                """.formatted(independent ? "source:\n  - { id: native_claimed_source, srs: false }"
+                        : "source: native_claimed_source"));
     }
 
     private static Map<String, Object> inputHashes(Path root, boolean continuing) throws Exception {
