@@ -12,6 +12,9 @@ import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.lifecycle.MetricAttributes;
 import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.CheckpointDoc;
+import io.tapstate.core.lifecycle.StateJson;
+import io.tapstate.spi.store.HandoffIdentity;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.spi.store.StopAuthority;
 import io.tapstate.spi.store.WorkloadClaimFence;
@@ -106,7 +109,38 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
             return Map.copyOf(value);
         }
     }
-    private record BranchCall(Site site, JobCall call, StopReservation input, StopReservation.JobIdentity job) { }
+    private record BranchCall(Site site, JobCall call, StopReservation input, StopReservation.JobIdentity job,
+            HandoffIdentity ready, long inputObjectIdentity, long readyObjectIdentity) {
+        BranchCall(Site site, JobCall call, StopReservation input, StopReservation.JobIdentity job) {
+            this(site, call, input, job, null, 0, 0);
+        }
+    }
+    record PhaseProof(String site, StopReservation input, StopReservation recorded, CheckpointDoc checkpoint,
+            HandoffIdentity ready, long inputObjectIdentity, long readyObjectIdentity, long returnedObjectIdentity,
+            long threadIdentity, long entryAtNanos, long returnedAtNanos, long returnCodeIndex, Binding binding) {
+        Map<String, Object> evidence() {
+            Map<String, Object> value = new LinkedHashMap<>();
+            value.put("site", site); value.put("token", input.token());
+            value.put("inputPhase", input.phase().name()); value.put("inputEpoch", input.reservedEpoch());
+            value.put("sourceScope", scopeEvidence(input.source().scope()));
+            value.put("scope", scopeEvidence(input.successor().scope()));
+            value.put("job", jobEvidence(input.successor().job()));
+            value.put("writer", fenceEvidence(input.writerAuthority().claim()));
+            value.put("inputObjectIdentity", inputObjectIdentity);
+            value.put("returnedObjectIdentity", returnedObjectIdentity);
+            if (ready != null) { value.put("readyObjectIdentity", readyObjectIdentity); }
+            if (recorded != null) { value.put("recordedEpoch", recorded.reservedEpoch()); }
+            if (checkpoint != null) {
+                value.put("checkpoint", Map.of("pipelineId", checkpoint.pipelineId(), "state", StateJson.parse(checkpoint.stateJson()).name(),
+                        "epoch", checkpoint.epoch(), "touchTime", checkpoint.touchTime().toString()));
+                value.put("holdSuspendPolicy", "EVENT_THREAD");
+            }
+            value.put("threadIdentity", threadIdentity); value.put("entryAtNanos", entryAtNanos);
+            value.put("returnedAtNanos", returnedAtNanos); value.put("returnCodeIndex", returnCodeIndex);
+            value.put("binding", binding.evidence()); value.put("source", "GENUINE_METHOD_RETURN");
+            return Map.copyOf(value);
+        }
+    }
 
     private static final String LOADER = "org.springframework.boot.loader.launch.LaunchedClassLoader";
     private static final String SCOPE = "io.tapstate.spi.store.ObservationStore$Scope";
@@ -130,6 +164,12 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
     private static final Site INSPECT = new Site("io.tapstate.app.EngineLifecycleActuator", "inspectSuccessor",
             "(Lio/tapstate/spi/store/StopReservation;Ljava/util/function/BooleanSupplier;)Ljava/util/Optional;");
     private static final Site BIND = CUTS.get(Cut.SUBMIT_PRE_BIND);
+    private static final Site TERMINAL = new Site("io.tapstate.adapters.mongostore.MongoStateStore", "recordSuccessorTerminal",
+            "(Lio/tapstate/spi/store/StopReservation;Lio/tapstate/spi/store/SuccessorEnd$Terminal;"
+                    + "Lio/tapstate/core/lifecycle/PipelineState;Ljava/time/Instant;)Ljava/util/Optional;");
+    private static final Site COMPLETE = new Site("io.tapstate.adapters.mongostore.MongoStateStore", "completeHandoff",
+            "(Lio/tapstate/spi/store/StopReservation;Lio/tapstate/spi/store/HandoffIdentity;"
+                    + "Ljava/time/Instant;)Ljava/util/Optional;");
     private static final Site MEMBER_ADMISSION = new Site("io.tapstate.adapters.mongostore.MongoStateStore", "admitSuccessor",
             "(Lio/tapstate/spi/store/StopReservation;Ljava/lang/String;Ljava/lang/String;Ljava/util/Set;"
                     + "Ljava/time/Instant;)Ljava/util/Optional;");
@@ -151,11 +191,15 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
     private final LinkedHashMap<RawKey, Raw> raw = new LinkedHashMap<>();
     private final Map<Long, JobCall> jobCalls = new HashMap<>();
     private final Map<Long, BranchCall> branchCalls = new HashMap<>();
-    private final boolean branchDiagnostic;
+    private final boolean branchDiagnostic, fixedFailedQualification;
     private StopReservation branchExpected;
     private StopReservation.JobIdentity branchJob;
     private final CompletableFuture<BranchProof> firstInspection = new CompletableFuture<>();
     private final CompletableFuture<BranchProof> firstBinding = new CompletableFuture<>();
+    private final CompletableFuture<PhaseProof> firstTerminal = new CompletableFuture<>();
+    private final CompletableFuture<PhaseProof> firstCompletion = new CompletableFuture<>();
+    private EventSet completionSet;
+    private long completionDeadline;
     private final LinkedHashMap<ObservationStore.Scope, JobProof> jobProofs = new LinkedHashMap<>();
     private final Path retainedOutput;
     private final RealProcessServer server;
@@ -172,11 +216,11 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
 
     private RebuildHandoffJdiSession(Path jar, String artifactSha, String pipelineId, String table,
             Cut cut, Site selectedCut, Map<Site, Image> images, RealProcessServer server, VirtualMachine vm,
-            Path retainedOutput, boolean branchDiagnostic) {
+            Path retainedOutput, boolean branchDiagnostic, boolean fixedFailedQualification) {
         this.jar = jar; this.artifactSha = artifactSha; this.pipelineId = pipelineId; this.table = table;
         this.cut = cut; this.cutSite = selectedCut;
         this.images = images; this.server = server; this.vm = vm;
-        this.branchDiagnostic = branchDiagnostic;
+        this.branchDiagnostic = branchDiagnostic; this.fixedFailedQualification = fixedFailedQualification;
         this.retainedOutput = retainedOutput;
         pump = new Thread(this::loop, "rebuild-handoff-jdi-events"); pump.setDaemon(true);
     }
@@ -211,6 +255,12 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
                 processLabel, true, true, Objects.requireNonNull(launcher, "launcher"));
     }
 
+    static RebuildHandoffJdiSession startClaimedFailedQualification(Path selectedJar, String pipelineId, String table,
+            Path logDirectory, String processLabel, OwnedLauncher launcher) throws Exception {
+        return startObserved(selectedJar, pipelineId, table, Cut.SUBMIT_PRE_BIND, logDirectory,
+                processLabel, true, false, true, Objects.requireNonNull(launcher, "launcher"));
+    }
+
     private static RebuildHandoffJdiSession startObserved(Path selectedJar, String pipelineId, String table,
             Cut cut, Path logDirectory, String processLabel, boolean rawAlongsideCut,
             OwnedLauncher launcher) throws Exception {
@@ -220,6 +270,16 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
     private static RebuildHandoffJdiSession startObserved(Path selectedJar, String pipelineId, String table,
             Cut cut, Path logDirectory, String processLabel, boolean rawAlongsideCut, boolean branchDiagnostic,
             OwnedLauncher launcher) throws Exception {
+        return startObserved(selectedJar, pipelineId, table, cut, logDirectory, processLabel, rawAlongsideCut,
+                branchDiagnostic, false, launcher);
+    }
+
+    private static RebuildHandoffJdiSession startObserved(Path selectedJar, String pipelineId, String table,
+            Cut cut, Path logDirectory, String processLabel, boolean rawAlongsideCut, boolean branchDiagnostic,
+            boolean fixedFailedQualification, OwnedLauncher launcher) throws Exception {
+        if (branchDiagnostic && fixedFailedQualification || fixedFailedQualification && cut != Cut.SUBMIT_PRE_BIND) {
+            throw invalid("the fixed terminal qualification is a separate submitted crash mode");
+        }
         Objects.requireNonNull(pipelineId); Objects.requireNonNull(table);
         Objects.requireNonNull(logDirectory); Objects.requireNonNull(processLabel);
         if (!logDirectory.isAbsolute() || !processLabel.matches("[a-z]{1,16}")) { throw invalid("owned log destination unavailable"); }
@@ -233,6 +293,10 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
                 ? Set.of(CUTS.get(cut), JOB_LOOKUP, RAW) : Set.of(CUTS.get(cut), JOB_LOOKUP);
         if (branchDiagnostic) {
             Set<Site> extended = new HashSet<>(selected); extended.add(INSPECT); extended.add(BIND);
+            selected = Set.copyOf(extended);
+        }
+        if (fixedFailedQualification) {
+            Set<Site> extended = new HashSet<>(selected); extended.add(TERMINAL); extended.add(COMPLETE);
             selected = Set.copyOf(extended);
         }
         Site selectedCut = cut == null ? null : CUTS.get(cut);
@@ -276,7 +340,7 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
             connector.stopListening(arguments); listening = false;
             Path retained = logDirectory.resolve(processLabel + "-" + server.pid() + "-server.out");
             session = new RebuildHandoffJdiSession(jar, sha, pipelineId, table, cut, selectedCut, images,
-                    server, vm, retained, branchDiagnostic);
+                    server, vm, retained, branchDiagnostic, fixedFailedQualification);
             session.install(); session.pump.start(); server.awaitHealthy(); session.awaitReady(MAX_WAIT);
             session.retainOutput();
             return session;
@@ -328,6 +392,41 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
     }
     BranchProof awaitFirstInspection(Duration timeout) throws Exception { return await(firstInspection, timeout); }
     BranchProof awaitFirstBinding(Duration timeout) throws Exception { return await(firstBinding, timeout); }
+
+    void observeFailedHandoff(StopReservation actualAdmission, StopReservation.JobIdentity actualSubmittedJob,
+            long absoluteDeadline) {
+        synchronized (lock) {
+            check();
+            long left = absoluteDeadline - System.nanoTime();
+            if (!fixedFailedQualification || branchExpected != null || left <= 0 || left > MAX_WAIT.toNanos()
+                    || actualAdmission.phase() != StopReservation.Phase.SUCCESSOR_ADMITTED
+                    || actualAdmission.counterPolicy() != StopReservation.CounterPolicy.CONTINUE
+                    || actualAdmission.successor() == null || actualAdmission.successor().job() != null
+                    || actualAdmission.writerAuthority().standalone()
+                    || !actualAdmission.successor().submissionBootId().equals(actualSubmittedJob.bootId())
+                    || !actualAdmission.source().clusterId().equals(actualSubmittedJob.clusterId())) {
+                throw invalid("fixed failure observation lacks its actual submitted admission or deadline");
+            }
+            branchExpected = actualAdmission; branchJob = actualSubmittedJob; completionDeadline = absoluteDeadline;
+        }
+    }
+    PhaseProof awaitTerminal(Duration timeout) throws Exception { return await(firstTerminal, timeout); }
+    PhaseProof awaitCompletion(Duration timeout) throws Exception { return await(firstCompletion, timeout); }
+    boolean completionHeld() { synchronized (lock) { check(); return completionSet != null; } }
+    void releaseCompletion() {
+        synchronized (lock) {
+            EventSet retained = completionSet;
+            if (retained != null) { retained.resume(); completionSet = null; }
+        }
+    }
+    private void expireCompletionHold() {
+        synchronized (lock) {
+            if (completionSet != null && System.nanoTime() - completionDeadline >= 0) {
+                releaseCompletion();
+                throw invalid("the completion hold exceeded its original absolute recovery deadline");
+            }
+        }
+    }
 
     private void awaitReady(Duration timeout) throws Exception { await(ready, timeout); }
     Held awaitHeld(Duration timeout) throws Exception { return await(held, timeout); }
@@ -387,6 +486,7 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
             while (running) {
                 EventSet set = vm.eventQueue().remove(50);
                 if (set != null) { handle(set); }
+                expireCompletionHold();
             }
         } catch (VMDisconnectedException gone) { if (!crashing && !closing) { fail(gone); } }
         catch (InterruptedException interrupted) { if (!closing) { fail(interrupted); } }
@@ -409,12 +509,17 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
                         else if (site.equals(JOB_LOOKUP)) { captureJobEntry(breakpoint); }
                         else {
                             if (branchDiagnostic && (site.equals(INSPECT) || site.equals(BIND))) { captureBranchEntry(site, breakpoint); }
+                            if (fixedFailedQualification && (site.equals(TERMINAL) || site.equals(COMPLETE))) { capturePhaseEntry(site, breakpoint); }
                             if (site.equals(cutSite) && captureCut(breakpoint, set)) { retained = true; }
                         }
                     } else if (event instanceof MethodExitEvent returned) {
                         if (returned.method().equals(methods.get(JOB_LOOKUP))) { captureJobReturn(returned); }
                         else if (branchDiagnostic && (returned.method().equals(methods.get(INSPECT))
                                 || returned.method().equals(methods.get(BIND)))) { captureBranchReturn(returned); }
+                        else if (fixedFailedQualification && (returned.method().equals(methods.get(TERMINAL))
+                                || returned.method().equals(methods.get(COMPLETE)))) {
+                            if (capturePhaseReturn(returned, set)) { retained = true; }
+                        }
                     } else if (event instanceof VMDeathEvent || event instanceof VMDisconnectEvent) {
                         if (!crashing && !closing) { throw invalid("owned Boot exited before the witness finished"); }
                         running = false;
@@ -504,8 +609,8 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
         StopReservation.JobIdentity job = job(object(value(execution, "job", "Lio/tapstate/spi/store/StopReservation$JobIdentity;"), JOB));
         jobProofs.put(scope, new JobProof(scope, job, event.thread().uniqueID(), call.entryAtNanos(), System.nanoTime(),
                 codeIndex, bindings.get(JOB_LOOKUP)));
-        // The diagnostic reserves two of the same proof slots for its first inspection and binding.
-        while (jobProofs.size() > MAX_JOB_PROOFS - (branchDiagnostic ? 2 : 0)) {
+        // Each submitted mode reserves the same two proof slots for its selected phase returns.
+        while (jobProofs.size() > MAX_JOB_PROOFS - (branchDiagnostic || fixedFailedQualification ? 2 : 0)) {
             jobProofs.remove(jobProofs.keySet().iterator().next());
         }
     }
@@ -617,6 +722,101 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
         else { firstBinding.complete(proof); }
     }
 
+    private void capturePhaseEntry(Site site, BreakpointEvent event) throws Exception {
+        if (branchExpected == null || site.equals(TERMINAL) && firstTerminal.isDone()
+                || site.equals(COMPLETE) && firstCompletion.isDone()) { return; }
+        List<StackFrame> frames = event.thread().frames();
+        if (frames.isEmpty() || frames.size() > MAX_FRAMES) { throw invalid("terminal phase stack unavailable or unbounded"); }
+        StackFrame frame = frames.getFirst(); List<Value> arguments = frame.getArgumentValues();
+        if (arguments.size() != (site.equals(TERMINAL) ? 4 : 3)) { throw invalid("terminal phase arguments changed"); }
+        ObjectReference supplied = branchObject(arguments.getFirst(), MARKER);
+        if (!pipelineId.equals(text(value(supplied, "pipelineId", "Ljava/lang/String;")))
+                || value(supplied, "successor", "Lio/tapstate/spi/store/StopReservation$Successor;") == null) { return; }
+        StopReservation input = marker(supplied);
+        if (!sameSubmittedLineage(input)) { return; }
+        if (input.phase() != StopReservation.Phase.SUCCESSOR_BOUND || !branchJob.equals(input.successor().job())) {
+            throw invalid("the fixed terminal phase is not the exact bound native Job");
+        }
+        HandoffIdentity ready = null; long readyIdentity = 0;
+        if (site.equals(TERMINAL)) {
+            ObjectReference end = branchObject(arguments.get(1), "io.tapstate.spi.store.SuccessorEnd$Terminal");
+            if (!scope(branchObject(value(end, "scope", "Lio/tapstate/spi/store/ObservationStore$Scope;"), SCOPE))
+                    .equals(input.successor().scope())
+                    || !job(branchObject(value(end, "job", "Lio/tapstate/spi/store/StopReservation$JobIdentity;"), JOB)).equals(branchJob)
+                    || PipelineState.valueOf(enumName(branchObject(arguments.get(2), "io.tapstate.core.lifecycle.PipelineState")))
+                            != PipelineState.FAILED) {
+                throw invalid("the fixed branch did not record FAILED for its exact native Job");
+            }
+        } else {
+            PhaseProof terminal = firstTerminal.getNow(null);
+            if (terminal == null || !terminal.recorded().equals(input)) {
+                throw invalid("completion did not follow the recorded exact failed marker");
+            }
+            ObjectReference nativeReady = branchObject(arguments.get(1), "io.tapstate.spi.store.HandoffIdentity");
+            ready = handoff(nativeReady); readyIdentity = nativeReady.uniqueID();
+            if (!input.handoffIdentity().equals(ready)) { throw invalid("completion argument is another handoff identity"); }
+        }
+        ObjectReference receiver = frame.thisObject();
+        if (receiver == null || branchCalls.containsKey(event.thread().uniqueID())
+                || branchCalls.size() + jobCalls.size() >= MAX_JOB_CALLS) { throw invalid("terminal phase call overlap or budget"); }
+        MethodExitRequest exit = vm.eventRequestManager().createMethodExitRequest();
+        exit.addClassFilter(methods.get(site).declaringType()); exit.addThreadFilter(event.thread());
+        exit.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD); exit.enable(); requests.add(exit);
+        JobCall call = new JobCall(receiver.uniqueID(), System.nanoTime(), frames.size(),
+                frames.subList(1, frames.size()).stream().map(caller -> caller.location().method()).toList(), exit);
+        branchCalls.put(event.thread().uniqueID(), new BranchCall(site, call, input, branchJob,
+                ready, supplied.uniqueID(), readyIdentity));
+    }
+
+    private boolean capturePhaseReturn(MethodExitEvent event, EventSet set) throws Exception {
+        BranchCall phase = branchCalls.get(event.thread().uniqueID());
+        if (phase == null || !event.method().equals(methods.get(phase.site()))) { return false; }
+        if (!event.request().equals(phase.call().exit())) { throw invalid("terminal phase lost its exact entry correlation"); }
+        long codeIndex = verifyNormalReturn(event, phase.site(), phase.call());
+        Value found = value(object(event.returnValue(), "java.util.Optional"), "value", "Ljava/lang/Object;");
+        phase.call().exit().disable(); vm.eventRequestManager().deleteEventRequest(phase.call().exit());
+        requests.remove(phase.call().exit()); branchCalls.remove(event.thread().uniqueID());
+        if (found == null) { return false; }
+        StopReservation recorded = null; CheckpointDoc checkpoint = null;
+        ObjectReference returned = branchObject(found, phase.site().equals(TERMINAL) ? MARKER : "io.tapstate.core.lifecycle.CheckpointDoc");
+        if (phase.site().equals(TERMINAL)) {
+            recorded = marker(returned);
+            if (!sameSubmittedLineage(recorded) || recorded.phase() != StopReservation.Phase.SUCCESSOR_BOUND
+                    || !recorded.writerAuthority().equals(phase.input().writerAuthority())
+                    || !recorded.successor().equals(phase.input().successor())
+                    || recorded.reservedEpoch() != Math.incrementExact(phase.input().reservedEpoch())) {
+                throw invalid("terminal return changed the bound lineage or did not advance its epoch once");
+            }
+        } else {
+            checkpoint = new CheckpointDoc(text(value(returned, "pipelineId", "Ljava/lang/String;")),
+                    text(value(returned, "stateJson", "Ljava/lang/String;")), longValue(value(returned, "epoch", "J")),
+                    instant(value(returned, "touchTime", "Ljava/time/Instant;")));
+            if (!checkpoint.pipelineId().equals(pipelineId) || StateJson.parse(checkpoint.stateJson()) != PipelineState.FAILED
+                    || checkpoint.epoch() != Math.incrementExact(phase.input().reservedEpoch())) {
+                throw invalid("handoff completion did not preserve the exact failed checkpoint");
+            }
+            if (set.suspendPolicy() != EventRequest.SUSPEND_EVENT_THREAD || heldSet != null || completionSet != null
+                    || System.nanoTime() - completionDeadline >= 0) {
+                throw invalid("completion cannot hold outside its original deadline or exact event thread");
+            }
+        }
+        PhaseProof proof = new PhaseProof(phase.site().equals(TERMINAL) ? "TERMINAL" : "COMPLETE", phase.input(),
+                recorded, checkpoint, phase.ready(), phase.inputObjectIdentity(), phase.readyObjectIdentity(), returned.uniqueID(),
+                event.thread().uniqueID(), phase.call().entryAtNanos(), System.nanoTime(), codeIndex, bindings.get(phase.site()));
+        if (phase.site().equals(TERMINAL)) { firstTerminal.complete(proof); return false; }
+        completionSet = set; firstCompletion.complete(proof); return true;
+    }
+
+    private HandoffIdentity handoff(ObjectReference input) {
+        Value source = value(input, "sourceScope", "Lio/tapstate/spi/store/ObservationStore$Scope;");
+        return new HandoffIdentity(text(value(input, "pipelineId", "Ljava/lang/String;")), text(value(input, "token", "Ljava/lang/String;")),
+                StopReservation.CounterPolicy.valueOf(enumName(branchObject(value(input, "counterPolicy",
+                        "Lio/tapstate/spi/store/StopReservation$CounterPolicy;"), MARKER + "$CounterPolicy"))),
+                source == null ? null : scope(branchObject(source, SCOPE)),
+                scope(branchObject(value(input, "targetScope", "Lio/tapstate/spi/store/ObservationStore$Scope;"), SCOPE)),
+                job(branchObject(value(input, "targetJob", "Lio/tapstate/spi/store/StopReservation$JobIdentity;"), JOB)));
+    }
+
     private StopReservation marker(ObjectReference input) {
         ObjectReference intent = branchObject(value(input, "originalDesired", "Lio/tapstate/core/lifecycle/DesiredState;"), "io.tapstate.core.lifecycle.DesiredState");
         Value assembly = value(intent, "assemblyRevision", "Ljava/lang/String;");
@@ -656,7 +856,7 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
     private ObjectReference branchObject(Value input, String expected) {
         ObjectReference actual = object(input, expected);
         if (actual.referenceType().classLoader() == null
-                || actual.referenceType().classLoader().uniqueID() != bindings.get(INSPECT).loaderIdentity()) {
+                || actual.referenceType().classLoader().uniqueID() != bindings.get(cutSite).loaderIdentity()) {
             throw invalid("branch model is not from the pinned application loader");
         }
         return actual;
@@ -883,14 +1083,25 @@ final class RebuildHandoffJdiSession implements AutoCloseable {
         if (safe != problem) { safe.initCause(problem); }
         failure.compareAndSet(null, safe); running = false; ready.completeExceptionally(safe); held.completeExceptionally(safe);
         if (branchDiagnostic) { firstInspection.completeExceptionally(safe); firstBinding.completeExceptionally(safe); }
+        if (fixedFailedQualification) { firstTerminal.completeExceptionally(safe); firstCompletion.completeExceptionally(safe); }
     }
 
     @Override public void close() throws Exception {
         closing = true; running = false;
         // A failed witness with a held instruction is also killed, never allowed to execute on cleanup.
         try {
-            if (heldSet != null && server.isAlive()) { server.kill(); }
-            try { vm.dispose(); } catch (VMDisconnectedException ignored) { }
+            Throwable releaseFailure = null;
+            try { releaseCompletion(); }
+            catch (RuntimeException | Error problem) { releaseFailure = problem; throw problem; }
+            finally {
+                try {
+                    if (heldSet != null && server.isAlive()) { server.kill(); }
+                    try { vm.dispose(); } catch (VMDisconnectedException ignored) { }
+                } catch (RuntimeException | Error cleanup) {
+                    if (releaseFailure == null) { throw cleanup; }
+                    if (cleanup != releaseFailure) { releaseFailure.addSuppressed(cleanup); }
+                }
+            }
         } finally {
             pump.interrupt();
             try { pump.join(2_000); } finally { server.close(); retainOutput(); }
