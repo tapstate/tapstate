@@ -562,7 +562,8 @@ final class Synthetic {
      * {@code channel}: the connector runs in a loader of its own, and those are one thing both sides of that
      * boundary reach. An order of {@code rows} delivers one change closed by a fresh offset of the connector's
      * own class; any other order delivers a heartbeat alone, naming no offset. It reports each offset it names
-     * under {@code named}, the thread of each delivery under {@code deliveredOn}, and, for every flush call,
+     * under {@code named}, the thread of each delivery under {@code deliveredOn} as it begins and again under
+     * {@code handedOver} once its hand-over returns, and, for every flush call,
      * the object it was handed, that object's loader, the connector's own loader and the calling thread under
      * {@code flushes}.
      *
@@ -678,6 +679,8 @@ final class Synthetic {
                 + "  @SuppressWarnings(\"unchecked\") List<Object> named = (List<Object>) channel().get(\"named\");"
                 + "  @SuppressWarnings(\"unchecked\") List<Object> deliveredOn ="
                 + "      (List<Object>) channel().get(\"deliveredOn\");"
+                + "  @SuppressWarnings(\"unchecked\") List<Object> handedOver ="
+                + "      (List<Object>) channel().get(\"handedOver\");"
                 + "  consumer.streamReadStarted();"
                 + "  Thread poll = new Thread(() -> {"
                 + "    int rows = 0;"
@@ -702,6 +705,7 @@ final class Synthetic {
                 + "      }"
                 + "      deliveredOn.add(Thread.currentThread());"
                 + "      consumer.accept(batch, at);"
+                + "      handedOver.add(Thread.currentThread());"
                 + "    }"
                 + "    List<TapEvent> last = new ArrayList<>();"
                 + "    last.add(new io.tapdata.entity.event.control.HeartbeatEvent().init());"
