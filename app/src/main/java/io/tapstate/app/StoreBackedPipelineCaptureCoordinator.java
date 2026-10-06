@@ -463,7 +463,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 CaptureRunSpec openedSpec = spec;
                 if (!managedOwnership) {
                     run = captureStarter.start(spec, handoff);
-                    runs.add(PipelineRun.unmanaged(run, spec));
+                    runs.add(PipelineRun.unmanaged(run, spec, handoff));
                 } else {
                     OwnedCapture existing = ownedCaptures.get(captureId);
                     if (existing != null) {
@@ -498,7 +498,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                                     if (started != null) {
                                         PipelineRun rejected = PipelineRun.managed(captureId, started,
                                                 openedSpec.srsEnabled() && openedSpec.readMode() != ReadMode.SNAPSHOT_ONLY,
-                                                openedSpec);
+                                                openedSpec, handoff);
                                         runs.add(rejected);
                                         try { closeRun(rejected, pipelineId); }
                                         catch (RuntimeException | Error unclosed) {
@@ -522,14 +522,14 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                             // that: its own load where its record says one is owed, then the changes the
                             // other member's tail writes into the shared ring.
                             run = captureAttacher.start(spec, handoff, false);
-                            joinedCaptures.computeIfAbsent(captureId, ignored -> new JoinedCapture(spec, handoff))
+                            joinedCaptures.computeIfAbsent(captureId, ignored -> new JoinedCapture(spec))
                                     .pipelines.add(pipelineId);
                             lookForCapturesNobodyTails();
                         }
                     }
                     runs.add(PipelineRun.managed(
                             captureId, run, openedSpec.srsEnabled() && openedSpec.readMode() != ReadMode.SNAPSHOT_ONLY,
-                            openedSpec));
+                            openedSpec, handoff));
                 }
                 pending.check();
                 if (run.loadOverWhenHandedBack()) {
@@ -796,19 +796,57 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      * source connector set up on the source through that spec's notes, as the run itself opened them.
      */
     private record PipelineRun(
-            CaptureId captureId, CaptureRun run, boolean managed, boolean sharedTail, CaptureRunSpec spec, CloseState closeState) {
+            CaptureId captureId, CaptureRun run, boolean managed, boolean sharedTail, CaptureRunSpec spec,
+            CaptureHandoff handoff, CloseState closeState, LogOwnerState logOwner) {
 
-        static PipelineRun unmanaged(CaptureRun run, CaptureRunSpec spec) {
-            return new PipelineRun(null, run, false, false, spec, new CloseState());
+        static PipelineRun unmanaged(CaptureRun run, CaptureRunSpec spec, CaptureHandoff handoff) {
+            return new PipelineRun(null, run, false, false, spec, handoff, new CloseState(), new LogOwnerState());
         }
 
-        static PipelineRun managed(CaptureId captureId, CaptureRun run, boolean sharedTail, CaptureRunSpec spec) {
-            return new PipelineRun(captureId, run, true, sharedTail, spec, new CloseState());
+        static PipelineRun managed(CaptureId captureId, CaptureRun run, boolean sharedTail, CaptureRunSpec spec,
+                CaptureHandoff handoff) {
+            return new PipelineRun(captureId, run, true, sharedTail, spec, handoff, new CloseState(), new LogOwnerState());
         }
 
         String consumerId() {
             return spec.consumerId();
         }
+    }
+
+    /** An explicit diagnostic admission belongs to one exact logical run and its prepared writer. */
+    private record AdmittedLogOwner(CaptureRun run, CaptureRunSpec spec, String writerToken,
+            io.tapstate.core.logging.LogSink.Scope scope) { }
+
+    private static final class LogOwnerState {
+        private AdmittedLogOwner admitted;
+        private boolean retired;
+
+        private synchronized boolean eligible(PipelineRun current) {
+            return !retired && !current.closeState.completed && current.run.failure().isEmpty();
+        }
+
+        private synchronized void bind(PipelineRun current, io.tapstate.core.logging.LogSink.Scope scope) {
+            if (retired || scope == null) { return; }
+            if (admitted != null) {
+                if (!scope.equals(scopeFor(current))) {
+                    throw new IllegalStateException("an active source run cannot change its admitted log owner");
+                }
+                return;
+            }
+            admitted = new AdmittedLogOwner(current.run, current.spec,
+                    Objects.requireNonNull(current.spec.snapshotWriterToken(), "snapshotWriterToken"), scope);
+        }
+
+        private synchronized io.tapstate.core.logging.LogSink.Scope scopeFor(PipelineRun current) {
+            if (admitted == null || retired) { return null; }
+            if (admitted.run != current.run || admitted.spec != current.spec
+                    || !admitted.writerToken.equals(current.spec.snapshotWriterToken())) {
+                throw new IllegalStateException("a diagnostic admission no longer belongs to its source run");
+            }
+            return admitted.scope;
+        }
+
+        private synchronized void retire() { retired = true; admitted = null; }
     }
 
     /** Holds a newly acquired claim from permit settlement through a possibly blocking source start. */
@@ -906,20 +944,42 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      */
     private static final class JoinedCapture {
         private final boolean tails;
-        private final CaptureRunSpec tailSpec;
-        private final CaptureHandoff tailPassthrough;
         private final Set<String> pipelines = new LinkedHashSet<>();
 
-        private JoinedCapture(CaptureRunSpec joinedWith, CaptureHandoff passthrough) {
+        private JoinedCapture(CaptureRunSpec joinedWith) {
             // A snapshot-only read has no tail for anybody to take over.
             this.tails = joinedWith.readMode() != ReadMode.SNAPSHOT_ONLY;
-            this.tailSpec = new CaptureRunSpec(
-                    joinedWith.config(), ReadMode.CDC_ONLY, joinedWith.srsKey(), joinedWith.srsEnabled(),
-                    joinedWith.sourceId(), joinedWith.pipelineId(), joinedWith.startFrom(),
-                    joinedWith.retention(), joinedWith.schemaVer(), joinedWith.snapshotEpoch())
-                    .withConsumerId(joinedWith.consumerId());
-            this.tailPassthrough = passthrough;
         }
+    }
+
+    private record JoinedReader(PipelineRun logical, io.tapstate.core.logging.LogSink.Scope scope) {
+        CaptureRunSpec tailSpec() {
+            CaptureRunSpec source = logical.spec;
+            return new CaptureRunSpec(source.config(), ReadMode.CDC_ONLY, source.srsKey(), source.srsEnabled(),
+                    source.sourceId(), source.pipelineId(), source.startFrom(), source.retention(),
+                    source.schemaVer(), source.snapshotEpoch()).withConsumerId(source.consumerId())
+                    .withSnapshotWriterToken(Objects.requireNonNull(source.snapshotWriterToken(), "snapshotWriterToken"));
+        }
+    }
+
+    /** Reads an admitted owner only from a still-live exact attachment of this physical capture. */
+    private JoinedReader joinedReader(CaptureId captureId, JoinedCapture capture) {
+        JoinedReader unscoped = null;
+        for (String pipeline : List.copyOf(capture.pipelines)) {
+            for (PipelineRun run : Objects.requireNonNullElse(runsByPipeline.get(pipeline), List.<PipelineRun>of())) {
+                if (!run.managed || !captureId.equals(run.captureId) || !run.logOwner.eligible(run)) { continue; }
+                if (!pipeline.equals(run.spec.pipelineId())
+                        || !new io.tapstate.core.model.PipelineNode(pipeline, run.spec.sourceId()).equals(run.spec.config().node())
+                        || !captureId.equals(CaptureId.of(run.spec))) {
+                    throw new IllegalStateException("a joined source run does not match its physical capture");
+                }
+                JoinedReader reader = new JoinedReader(run, run.logOwner.scopeFor(run));
+                if (reader.scope != null) { return reader; }
+                if (unscoped == null) { unscoped = reader; }
+            }
+        }
+        // Capture-only operation has no pipeline observation owner to invent. Its source remains readable.
+        return unscoped;
     }
 
 
@@ -950,6 +1010,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                     continue;
                 }
                 if (stillLoading(capture.pipelines)) { continue; }
+                JoinedReader reader = joinedReader(captureId, capture);
+                if (reader == null) { continue; }
                 CaptureOwnership.Permit permit = ownership.acquire(captureId);
                 if (!permit.acquired()) {
                     continue;
@@ -964,12 +1026,20 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 CaptureRun tail = null;
                 try {
                     opening.check();
-                    tail = captureAttacher.start(
-                            capture.tailSpec.withCaptureFence(permit.fence()), capture.tailPassthrough, true);
+                    CaptureRunSpec tailSpec = reader.tailSpec().withCaptureFence(permit.fence());
+                    tail = captureAttacher.start(tailSpec, reader.logical.handoff, true);
+                    opening.check();
+                    List<PipelineRun> current = runsByPipeline.get(reader.logical.spec.pipelineId());
+                    if (current == null || current.stream().noneMatch(run -> run == reader.logical)
+                            || !reader.logical.logOwner.eligible(reader.logical)
+                            || !Objects.equals(reader.scope, reader.logical.logOwner.scopeFor(reader.logical))) {
+                        throw new CancellationException("the joined source run ended before takeover activation");
+                    }
+                    if (reader.scope == null) { tail.activateSnapshot(); }
+                    else { tail.activateSnapshot(reader.scope); }
                     opening.check();
                     joinedCaptures.remove(captureId, capture);
-                    opening.publish(tail, capture.pipelines,
-                            capture.tailSpec.withCaptureFence(permit.fence()), capture.tailPassthrough);
+                    opening.publish(tail, capture.pipelines, tailSpec, reader.logical.handoff);
                     if (opening.lost) {
                         captureClaimLost(captureId, opening.published);
                         throw new CancellationException("capture claim was lost during takeover");
@@ -1321,7 +1391,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             runsByPipeline.values().stream()
                     .flatMap(List::stream)
                     .filter(run -> run.managed && captureId.equals(run.captureId))
-                    .forEach(run -> run.run.health().fail(fenced));
+                    .forEach(run -> { run.logOwner.retire(); run.run.health().fail(fenced); });
             // Readers no longer take the coordinator's global monitor. Publish failure to every local
             // attachment before removing the shared owner, so a read during a slow tail close cannot
             // mistake a lost claim for a healthy joined capture.
@@ -1913,6 +1983,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     private void closeRun(PipelineRun pipelineRun, String pipelineId) {
+        // Retire logical eligibility before cleanup; a native handle keeps its own frozen identity until it ends.
+        pipelineRun.logOwner.retire();
         closeOnce(pipelineRun.closeState, () -> closeRunNow(pipelineRun, pipelineId));
     }
 
@@ -2251,19 +2323,29 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     }
 
     @Override
-    public void activateSnapshot(String pipelineId) {
-        List<PipelineRun> runs = runsByPipeline.get(pipelineId);
-        if (runs != null) {
-            runs.forEach(pipelineRun -> pipelineRun.run.activateSnapshot());
-        }
-    }
+    public void activateSnapshot(String pipelineId) { activateReaders(pipelineId, null); }
 
     @Override
     public void activateSnapshot(String pipelineId, io.tapstate.core.logging.LogSink.Scope scope) {
-        Objects.requireNonNull(scope, "scope");
-        List<PipelineRun> runs = runsByPipeline.get(pipelineId);
-        if (runs != null) {
-            runs.forEach(pipelineRun -> pipelineRun.run.activateSnapshot(scope));
+        activateReaders(pipelineId, Objects.requireNonNull(scope, "scope"));
+    }
+
+    private void activateReaders(String pipelineId, io.tapstate.core.logging.LogSink.Scope scope) {
+        try (KeyedLocks.Hold<String> ignored = pipelineLocks.acquireInterruptibly(pipelineId)) {
+            checkOpen();
+            List<PipelineRun> runs = runsByPipeline.get(pipelineId);
+            if (runs == null) { return; }
+            List<KeyedLocks.Hold<CaptureId>> holds = lockCaptures(runs.stream().filter(PipelineRun::managed)
+                    .map(PipelineRun::captureId).toList(), true);
+            try {
+                if (runsByPipeline.get(pipelineId) != runs) { return; }
+                for (PipelineRun run : runs) {
+                    if (!run.logOwner.eligible(run)) { continue; }
+                    run.logOwner.bind(run, scope);
+                    if (scope == null) { run.run.activateSnapshot(); }
+                    else { run.run.activateSnapshot(scope); }
+                }
+            } finally { releaseCaptures(holds); }
         }
     }
 

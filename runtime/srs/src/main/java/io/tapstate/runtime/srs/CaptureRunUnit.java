@@ -204,8 +204,10 @@ public final class CaptureRunUnit implements AutoCloseable {
      * <p>With configured buffer sessions, opening the first table is deferred as well, until the submitted
      * job activates the reserved snapshot worker.
      *
-     * <p>A run that owes no load has nothing to read, and is started as {@link #start} starts it, tail
-     * included. A failure of what is left is reported through the run's {@link CaptureRun#failure()}.
+     * <p>A configured run with only a change tail reserves the same bounded worker capacity and opens
+     * that tail only after activation with its admitted execution owner. It creates no snapshot session.
+     * A direct caller without configured workers opens that tail before this returns. A deferred failure
+     * is reported through the run's {@link CaptureRun#failure()}.
      */
     public CaptureRun begin(CaptureRunSpec spec, CaptureHandoff handoff, boolean startTail) {
         return open(spec, handoff, startTail, true);
@@ -244,7 +246,8 @@ public final class CaptureRunUnit implements AutoCloseable {
             throw new IllegalArgumentException("capture config must select at least one stream");
         }
         OpenState state = new OpenState();
-        SnapshotWorkers.Reservation reservation = plan.snapshot() && snapshotWorkers != null
+        boolean deferTail = !plan.snapshot() && plan.tail() && startTail && snapshotWorkers != null;
+        SnapshotWorkers.Reservation reservation = (plan.snapshot() || deferTail) && snapshotWorkers != null
                 ? snapshotWorkers.reserve().orElseThrow(SnapshotCapacityUnavailable::new) : null;
         try {
             provisionChain(spec, plan, startTail, state);
@@ -256,8 +259,10 @@ public final class CaptureRunUnit implements AutoCloseable {
             Optional<StreamSource<SrsItem>> ringSource = ringSource(spec, plan, tables, state.chainId);
             state.load = reservation == null ? openLoad(spec, plan, tables, state.chainId, state.epoch) : null;
             if (reservation != null) {
-                CaptureRun deferred = startDeferredSnapshot(spec, handoff, startTail, plan, tables,
-                        health, reservation, state, ringSource);
+                CaptureRun deferred = plan.snapshot()
+                        ? startDeferredSnapshot(spec, handoff, startTail, plan, tables,
+                                health, reservation, state, ringSource)
+                        : startDeferredTail(spec, handoff, plan, health, reservation, state, ringSource);
                 return withWidening(deferred, state);
             }
             // The seam this run's own load began at, for the tail that follows it -- null when no load ran
@@ -470,6 +475,24 @@ public final class CaptureRunUnit implements AutoCloseable {
         private final AtomicReference<SharedTail> sharedTail = new AtomicReference<>();
     }
 
+    private CaptureRun startDeferredTail(CaptureRunSpec spec, CaptureHandoff handoff, ConsumptionPlan plan,
+            CaptureHealth health, SnapshotWorkers.Reservation reservation, OpenState state,
+            Optional<StreamSource<SrsItem>> ringSource) {
+        // No snapshot is owed: only the native tail opening uses the reserved worker and activation.
+        DeferredCapture deferred = new DeferredCapture(reservation, null, spec.pipelineId(), List.of(), null,
+                health, port, spec.config().node(), false);
+        state.subscription = Optional.of(deferred);
+        deferred.prepare(reader -> {
+            if (deferred.closed.get()) { return; }
+            Optional<Subscription> opened = openTail(reader, spec, plan, state.chainId, state.epoch,
+                    null, true, health, handoff);
+            state.sharedTail.set(state.chainId == null ? null : sharedTails.get(state.chainId.value()));
+            opened.ifPresent(deferred::attach);
+        });
+        return new CaptureRun(Optional.ofNullable(state.chainId), state.merged, 0L, Map.of(), ringSource,
+                Optional.of(deferred), health);
+    }
+
     private CaptureRun startDeferredSnapshot(CaptureRunSpec spec, CaptureHandoff handoff, boolean startTail,
             ConsumptionPlan plan, List<String> tables, CaptureHealth health,
             SnapshotWorkers.Reservation reservation, OpenState state, Optional<StreamSource<SrsItem>> ringSource) {
@@ -493,7 +516,7 @@ public final class CaptureRunUnit implements AutoCloseable {
             throw failure;
         }
         DeferredCapture deferred = new DeferredCapture(reservation, snapshotBuffer, spec.pipelineId(),
-                ringByTable.values(), token, health, port, spec.config().node());
+                ringByTable.values(), token, health, port, spec.config().node(), true);
         state.subscription = Optional.of(deferred);
         deferred.prepare(reader -> {
             Consumer<Envelope> receive = event -> {
@@ -565,6 +588,7 @@ public final class CaptureRunUnit implements AutoCloseable {
     private static final class DeferredCapture implements SnapshotActivation {
         private final SnapshotWorkers.Reservation reservation;
         private final SnapshotBuffer buffer;
+        private final boolean readsSnapshot;
         private final String pipelineId;
         private final List<String> ringNames;
         private final String token;
@@ -581,10 +605,11 @@ public final class CaptureRunUnit implements AutoCloseable {
         private Consumer<CapturePort> read;
 
         private DeferredCapture(SnapshotWorkers.Reservation reservation, SnapshotBuffer buffer, String pipelineId,
-                Collection<String> ringNames, String token, CaptureHealth health, CapturePort port, PipelineNode node) {
+                Collection<String> ringNames, String token, CaptureHealth health, CapturePort port,
+                PipelineNode node, boolean readsSnapshot) {
             this.reservation = reservation; this.buffer = buffer; this.pipelineId = pipelineId;
             this.ringNames = List.copyOf(ringNames); this.token = token; this.health = health;
-            this.port = port; this.node = node;
+            this.port = port; this.node = node; this.readsSnapshot = readsSnapshot;
         }
         private final AtomicReference<Throwable> closeFailure = new AtomicReference<>();
 
@@ -675,7 +700,7 @@ public final class CaptureRunUnit implements AutoCloseable {
             }
         }
         @Override public void abandonLoad() {
-            if (!loading() || !loadAbandoned.compareAndSet(false, true)) { return; }
+            if (!readsSnapshot || !loading() || !loadAbandoned.compareAndSet(false, true)) { return; }
             SnapshotPhase.Load opened = load.getAndSet(null);
             if (opened != null) { closeLoad(opened); }
             if (buffer != null) {

@@ -2414,6 +2414,195 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         assertThat(coordinator.loadDelivered("p")).isTrue();
     }
 
+    @Test
+    void aJoinedDirectConsumerCarriesItsExplicitOwnerIntoTheReaderThatTakesOver() {
+        try (JoinedOwnerFixture fixture = new JoinedOwnerFixture(false, false)) {
+            fixture.coordinator.startCapture("p", fixture.store.artifacts(), "writer-p");
+            io.tapstate.core.logging.LogSink.Scope scope = new io.tapstate.core.logging.LogSink.Scope("resource-p", 7);
+            fixture.coordinator.activateSnapshot("p", scope);
+            assertThat(fixture.logicalOwners).containsExactly(scope);
+            assertThat(fixture.port.opened).isEmpty();
+
+            fixture.allowCapture.set(true);
+            fixture.coordinator.tailWhatNobodyTails();
+
+            assertThat(fixture.port.opened).singleElement().satisfies(opened -> {
+                assertThat(opened.config().node()).isEqualTo(new PipelineNode("p", "src_p"));
+                assertThat(opened.scope()).isEqualTo(scope);
+            });
+            assertThat(fixture.tailSpecs).singleElement().satisfies(spec -> {
+                assertThat(spec.pipelineId()).isEqualTo("p");
+                assertThat(spec.sourceId()).isEqualTo("src_p");
+                assertThat(spec.snapshotWriterToken()).isEqualTo("writer-p");
+                assertThat(spec.readMode()).isEqualTo(ReadMode.CDC_ONLY);
+            });
+        }
+    }
+
+    @Test
+    void aJoinedSharedReaderUsesTheSurvivingConsumersNodeAndOwnerWhenTheFirstLeaves() {
+        try (JoinedOwnerFixture fixture = new JoinedOwnerFixture(true, false)) {
+            fixture.coordinator.startCapture("p", fixture.store.artifacts(), "writer-p");
+            fixture.coordinator.startCapture("q", fixture.store.artifacts(), "writer-q");
+            io.tapstate.core.logging.LogSink.Scope first = new io.tapstate.core.logging.LogSink.Scope("resource-p", 7);
+            io.tapstate.core.logging.LogSink.Scope survivor = new io.tapstate.core.logging.LogSink.Scope("resource-q", 19);
+            fixture.coordinator.activateSnapshot("p", first);
+            fixture.coordinator.activateSnapshot("q", survivor);
+            fixture.coordinator.stopCapture("p", false);
+            assertThat(fixture.port.opened).isEmpty();
+
+            fixture.allowCapture.set(true);
+            fixture.coordinator.tailWhatNobodyTails();
+
+            assertThat(fixture.tailSpecs).singleElement().satisfies(spec -> {
+                assertThat(spec.config().node()).isEqualTo(new PipelineNode("q", "src_q"));
+                assertThat(spec.consumerId()).isEqualTo(SrsConsumerId.of("q", "src_q").value());
+                assertThat(spec.snapshotWriterToken()).isEqualTo("writer-q");
+            });
+            assertThat(fixture.port.opened).singleElement().satisfies(opened -> {
+                assertThat(opened.config().node()).isEqualTo(new PipelineNode("q", "src_q"));
+                assertThat(opened.scope()).isEqualTo(survivor).isNotEqualTo(first);
+            });
+        }
+    }
+
+    @Test
+    void aSixArgumentCaptureOnlyTakeoverResumesWithoutInventingAnObservationOwner() throws InterruptedException {
+        try (JoinedOwnerFixture fixture = new JoinedOwnerFixture(false, true)) {
+            fixture.coordinator.startCapture("p", fixture.store.artifacts(), "writer-p");
+            fixture.coordinator.activateSnapshot("p");
+            assertThat(fixture.port.opened).isEmpty();
+
+            fixture.allowCapture.set(true);
+            fixture.coordinator.tailWhatNobodyTails();
+
+            long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+            while (fixture.port.opened.isEmpty() && System.nanoTime() - deadline < 0) { Thread.sleep(10); }
+            assertThat(fixture.port.opened).singleElement().satisfies(opened -> {
+                assertThat(opened.config().node()).isEqualTo(new PipelineNode("p", "src_p"));
+                assertThat(opened.scope()).isNull();
+                assertThat(opened.start()).isEqualTo(CaptureStart.resume(new SourcePosition("processed-source-token")));
+            });
+        }
+    }
+
+    /** Controlled scope/permit inputs isolate the coordinator; they are not native claim or Job receipts. */
+    private static final class JoinedOwnerFixture implements AutoCloseable {
+        private final InMemoryStorePort store;
+        private final SrsCoordinator chains;
+        private final AtomicBoolean allowCapture = new AtomicBoolean();
+        private final List<io.tapstate.core.logging.LogSink.Scope> logicalOwners = new java.util.concurrent.CopyOnWriteArrayList<>();
+        private final List<CaptureRunSpec> tailSpecs = new java.util.concurrent.CopyOnWriteArrayList<>();
+        private final OwnerPort port = new OwnerPort(null);
+        private final io.tapstate.runtime.srs.SnapshotWorkers workers;
+        private final CaptureRunUnit unit;
+        private final StoreBackedPipelineCaptureCoordinator coordinator;
+
+        private JoinedOwnerFixture(boolean shared, boolean actualUnit) {
+            InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+            for (String pipeline : shared ? List.of("p", "q") : List.of("p")) {
+                String source = "src_" + pipeline;
+                artifacts.save(cdcSource(source, "orders", null));
+                artifacts.save(new PipelineResource(pipeline, null, List.of(SourceRef.spec(source, shared)), null, null,
+                        new ServeBlock.Inline(null, FromRef.literal(source),
+                                List.of(new SyncElement("sync_1", source, null, null, null)), null, null),
+                        new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null));
+            }
+            store = new InMemoryStorePort(artifacts);
+            chains = new SrsCoordinator(store.meta());
+            for (String pipeline : shared ? List.of("p", "q") : List.of("p")) {
+                String source = "src_" + pipeline;
+                store.schemas().save(new DiscoveredSourceModel(source, "mysql", 1L, new SourceModel(List.of(
+                        new SourceTable("orders", List.of(new io.tapstate.spi.store.SourceField(
+                                "id", "bigint", io.tapstate.core.common.TapstateType.INT64)), List.of("id"), List.of())))));
+                CaptureRunSpec spec = StoreBackedPipelineCaptureCoordinator.deriveSpec(pipeline,
+                        ((PipelineResource) artifacts.get(pipeline).orElseThrow()).settings(),
+                        (SourceResource) artifacts.get(source).orElseThrow(),
+                        SourceCaptureResolution.of((SourceResource) artifacts.get(source).orElseThrow()), shared);
+                String chain = spec.miningChainId().value();
+                if (store.meta().read(chain).isEmpty()) {
+                    store.meta().create(chain, null);
+                    long epoch = store.meta().openEpoch(chain);
+                    if (shared) {
+                        store.meta().requestCaptureTables(chain, List.of("orders"));
+                        assertThat(store.meta().publishCaptureTables(chain, epoch, List.of("orders"))).isTrue();
+                    } else {
+                        store.meta().beginDirectCapture(chain, spec.consumerId(), epoch, "processed-source-token");
+                    }
+                }
+            }
+            CaptureOwnership ownership = mock(CaptureOwnership.class);
+            when(ownership.acquire(any())).thenAnswer(ignored -> allowCapture.get()
+                    ? CaptureOwnership.Permit.unfenced() : CaptureOwnership.Permit.denied());
+            when(ownership.ttl()).thenReturn(Duration.ofSeconds(30));
+            SnapshotBuffer buffer = new SnapshotBuffer(2, 1, 1_024, 512);
+            if (actualUnit) {
+                HazelcastInstance member = mock(HazelcastInstance.class);
+                when(member.getUserContext()).thenReturn(new java.util.concurrent.ConcurrentHashMap<>());
+                workers = new io.tapstate.runtime.srs.SnapshotWorkers(1, 1);
+                unit = new CaptureRunUnit(port, chains, store.meta(), member, buffer, workers);
+            } else { workers = null; unit = null; }
+            CaptureAttacher attacher = (spec, handoff, startTail) -> {
+                if (startTail) { tailSpecs.add(spec); }
+                if (unit != null) { return unit.begin(spec, handoff, startTail); }
+                CaptureHealth health = new CaptureHealth();
+                io.tapstate.runtime.srs.SnapshotActivation deferred = new io.tapstate.runtime.srs.SnapshotActivation() {
+                    private Subscription reader;
+                    private boolean activated;
+                    @Override public void activateSnapshot() { activate(null); }
+                    @Override public void activateSnapshot(io.tapstate.core.logging.LogSink.Scope scope) { activate(scope); }
+                    private void activate(io.tapstate.core.logging.LogSink.Scope scope) {
+                        if (activated) { return; }
+                        activated = true;
+                        if (!startTail) { logicalOwners.add(scope); return; }
+                        CapturePort view = scope == null ? port : port.forLogOwner(spec.config().node(), scope);
+                        reader = view.cdc(spec.config(), CaptureStart.resume(new SourcePosition("processed-source-token")),
+                                new CaptureListener() {
+                                    @Override public void onBatch(List<Envelope> events, Optional<SourcePosition> position) { }
+                                    @Override public void onError(Throwable failure) { health.fail(failure); }
+                                });
+                    }
+                    @Override public void close() { if (reader != null) { reader.close(); } }
+                };
+                return new CaptureRun(Optional.empty(), false, 0L, Optional.empty(), Optional.of(deferred), health);
+            };
+            coordinator = new StoreBackedPipelineCaptureCoordinator(store, attacher, chains, buffer, ownership,
+                    Duration.ofHours(1));
+        }
+
+        @Override public void close() {
+            try { coordinator.close(); }
+            finally {
+                try { if (unit != null) { unit.close(); } }
+                finally { if (workers != null) { workers.close(); } }
+            }
+        }
+    }
+
+    private static final class OwnerPort implements CapturePort, io.tapstate.spi.capture.LogScopedCapturePort {
+        private record Opening(CaptureConfig config, CaptureStart start, io.tapstate.core.logging.LogSink.Scope scope) { }
+        private final io.tapstate.core.logging.LogSink.Scope scope;
+        private final PipelineNode node;
+        private final List<Opening> opened;
+        private OwnerPort(io.tapstate.core.logging.LogSink.Scope scope) {
+            this(scope, null, new java.util.concurrent.CopyOnWriteArrayList<>());
+        }
+        private OwnerPort(io.tapstate.core.logging.LogSink.Scope scope, PipelineNode node, List<Opening> opened) {
+            this.scope = scope; this.node = node; this.opened = opened;
+        }
+        @Override public CapturePort forLogOwner(PipelineNode node, io.tapstate.core.logging.LogSink.Scope owner) {
+            return new OwnerPort(owner, node, opened);
+        }
+        @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+            if (node != null) { assertThat(config.node()).as("the immutable view opens its own admitted node").isEqualTo(node); }
+            opened.add(new Opening(config, start, scope));
+            return () -> { };
+        }
+        @Override public CaptureBatch snapshot(CaptureConfig config) { throw new AssertionError("no snapshot is owed"); }
+        @Override public ConnectionReport testConnection(CaptureConfig config) { throw new UnsupportedOperationException(); }
+        @Override public DiscoveredSchema discoverSchema(CaptureConfig config) { throw new UnsupportedOperationException(); }
+    }
+
     // ---- fixtures --------------------------------------------------------------------------------
 
     private static SourceResource cdcSource(String id, String table, String srsKey) {

@@ -277,6 +277,286 @@ class CaptureRunUnitTest {
     }
 
     @Test
+    void aConfiguredDirectCdcOnlyReaderWaitsForItsExplicitAdmittedOwner() throws Exception {
+        requireConfiguredCdcOnlyOwner(false);
+    }
+
+    @Test
+    void aConfiguredDurableSharedCdcOnlyReaderWaitsForItsExplicitAdmittedOwner() throws Exception {
+        requireConfiguredCdcOnlyOwner(true);
+    }
+
+    private void requireConfiguredCdcOnlyOwner(boolean shared) throws Exception {
+        CaptureRunSpec request = spec(ReadMode.CDC_ONLY, shared,
+                shared ? "admitted-shared-cdc-only" : "admitted-direct-cdc-only", StartFrom.latest());
+        // Typed activation scopes isolate the runtime phase boundary; they do not assert native admission.
+        LogSink.Scope admitted = new LogSink.Scope("cdc-only-resource", 7);
+        record Opening(CapturePort reader, CaptureConfig config, PipelineNode node, LogSink.Scope owner,
+                       AtomicInteger closeCalls) { }
+        List<LogSink.Scope> views = new CopyOnWriteArrayList<>();
+        List<Opening> opened = new CopyOnWriteArrayList<>();
+        CountDownLatch tailOpened = new CountDownLatch(1);
+        class Source implements CapturePort, LogScopedCapturePort {
+            private final PipelineNode node;
+            private final LogSink.Scope owner;
+            Source(PipelineNode node, LogSink.Scope owner) { this.node = node; this.owner = owner; }
+            @Override public CapturePort forLogOwner(PipelineNode actualNode, LogSink.Scope scope) {
+                if (owner != null) { throw new AssertionError("a frozen source view cannot be rebound"); }
+                assertThat(actualNode).isEqualTo(request.config().node());
+                views.add(scope);
+                return new Source(actualNode, scope);
+            }
+            @Override public CaptureBatch snapshot(CaptureConfig config) {
+                throw new AssertionError("a CDC-only reader must not open a snapshot");
+            }
+            @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+                AtomicInteger closes = new AtomicInteger();
+                opened.add(new Opening(this, config, node, owner, closes));
+                tailOpened.countDown();
+                AtomicBoolean closed = new AtomicBoolean();
+                return () -> { if (closed.compareAndSet(false, true)) { closes.incrementAndGet(); } };
+            }
+            @Override public ConnectionReport testConnection(CaptureConfig config) {
+                throw new UnsupportedOperationException();
+            }
+            @Override public DiscoveredSchema discoverSchema(CaptureConfig config) {
+                throw new UnsupportedOperationException();
+            }
+        }
+        InMemoryMeta meta = new InMemoryMeta();
+        SnapshotBuffer buffer = new SnapshotBuffer(2, 1, 1_024, 512);
+        HazelcastInstance member = emptyDurableMember();
+        try (SnapshotWorkers workers = new SnapshotWorkers(1, 1);
+             CaptureRunUnit unit = new CaptureRunUnit(new Source(null, null), new SrsCoordinator(meta), meta,
+                     member, buffer, workers)) {
+            try (CaptureRun run = unit.begin(request, CaptureHandoff.of(row -> { }))) {
+                assertThat(views).as("preparation has no explicit admitted log owner").isEmpty();
+                assertThat(opened).as("the source must not open before the consuming execution activates it").isEmpty();
+
+                run.activateSnapshot(admitted);
+                assertThat(tailOpened.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(run.failure()).isEmpty();
+                assertThat(views).containsExactly(admitted);
+                assertThat(opened).hasSize(1);
+                Opening actual = opened.getFirst();
+                assertThat(actual.node()).isEqualTo(request.config().node());
+                assertThat(actual.config().node()).isEqualTo(request.config().node());
+                assertThat(actual.owner()).isEqualTo(admitted);
+                assertThat(actual.reader()).isNotNull();
+                assertThat(actual.config().streams()).containsExactlyElementsOf(request.config().streams());
+                assertThat(actual.config().sharedNotes() != null).isEqualTo(shared);
+                assertThat(actual.closeCalls()).hasValue(0);
+
+                run.activateSnapshot(admitted);
+                assertThatThrownBy(() -> run.activateSnapshot(new LogSink.Scope("cdc-only-resource", 8)))
+                        .isInstanceOf(IllegalStateException.class);
+                assertThatThrownBy(() -> run.activateSnapshot(new LogSink.Scope("other-resource", 7)))
+                        .isInstanceOf(IllegalStateException.class);
+                assertThat(views).containsExactly(admitted);
+                assertThat(opened).containsExactly(actual);
+                run.close();
+                run.close();
+                assertThat(actual.closeCalls()).hasValue(1);
+            }
+        } finally { member.shutdown(); }
+    }
+
+    @Test
+    void aConfiguredCdcOnlyCloseBeforeActivationReleasesCapacityWithoutOpeningANativeReader() throws Exception {
+        AtomicInteger opens = new AtomicInteger();
+        CapturePort source = deferredCdcOnlyPort(() -> { opens.incrementAndGet(); return () -> { }; });
+        InMemoryMeta meta = new InMemoryMeta();
+        SnapshotBuffer buffer = new SnapshotBuffer(2, 1, 1_024, 512);
+        try (SnapshotWorkers workers = new SnapshotWorkers(1, 1);
+             CaptureRunUnit unit = new CaptureRunUnit(source, new SrsCoordinator(meta), meta, hz, buffer, workers);
+             CaptureRun run = unit.begin(spec(ReadMode.CDC_ONLY, false, "closed-cdc-only"), CaptureHandoff.of(row -> { }))) {
+            assertThat(opens).hasValue(0);
+            run.abandonLoad();
+            assertThat(opens).as("abandoning a nonexistent snapshot cannot bypass execution activation").hasValue(0);
+            run.close();
+            run.close();
+            run.activateSnapshot(new LogSink.Scope("closed-cdc-resource", 7));
+            assertThat(run.awaitLoaded(Duration.ZERO)).isTrue();
+            assertThat(run.loading()).isFalse();
+            assertThat(run.snapshotCount()).isZero();
+            assertThat(run.snapshotCounts()).isEmpty();
+            assertThat(run.failure()).isEmpty();
+            assertThat(opens).hasValue(0);
+            try (SnapshotWorkers.Reservation first = workers.reserve().orElseThrow();
+                 SnapshotWorkers.Reservation second = workers.reserve().orElseThrow()) {
+                assertThat(workers.reserve()).as("both original capacity permits are available, with no extra one").isEmpty();
+            }
+        }
+    }
+
+    @Test
+    void anExplicitUnscopedCdcOnlyActivationOpensTheOriginalReaderWithoutInventingALogOwner() throws Exception {
+        CaptureRunSpec request = spec(ReadMode.CDC_ONLY, false, "explicit-unscoped-cdc-only");
+        AtomicInteger opens = new AtomicInteger(), closes = new AtomicInteger(), scopedViews = new AtomicInteger();
+        AtomicReference<CapturePort> actualReader = new AtomicReference<>();
+        CountDownLatch opened = new CountDownLatch(1);
+        class Source implements CapturePort, LogScopedCapturePort {
+            @Override public CapturePort forLogOwner(PipelineNode node, LogSink.Scope scope) {
+                scopedViews.incrementAndGet();
+                throw new AssertionError("an unscoped activation cannot invent an admitted log owner");
+            }
+            @Override public CaptureBatch snapshot(CaptureConfig config) {
+                throw new AssertionError("a CDC-only activation cannot open a snapshot");
+            }
+            @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+                assertThat(config.node()).isEqualTo(request.config().node());
+                opens.incrementAndGet();
+                actualReader.set(this);
+                opened.countDown();
+                AtomicBoolean ended = new AtomicBoolean();
+                return () -> { if (ended.compareAndSet(false, true)) { closes.incrementAndGet(); } };
+            }
+            @Override public ConnectionReport testConnection(CaptureConfig config) { throw new UnsupportedOperationException(); }
+            @Override public DiscoveredSchema discoverSchema(CaptureConfig config) { throw new UnsupportedOperationException(); }
+        }
+        Source original = new Source();
+        InMemoryMeta meta = new InMemoryMeta();
+        SnapshotBuffer buffer = new SnapshotBuffer(2, 1, 1_024, 512);
+        try (SnapshotWorkers workers = new SnapshotWorkers(1, 1);
+             CaptureRunUnit unit = new CaptureRunUnit(original, new SrsCoordinator(meta), meta, hz, buffer, workers);
+             CaptureRun run = unit.begin(request, CaptureHandoff.of(row -> { }))) {
+            assertThat(opens).as("begin has not activated the native reader").hasValue(0);
+            assertThat(scopedViews).hasValue(0);
+            run.activateSnapshot();
+            assertThat(opened.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(run.awaitLoaded(Duration.ofSeconds(5))).isTrue();
+            assertThat(actualReader).hasValue(original);
+            assertThat(opens).hasValue(1);
+            assertThat(scopedViews).hasValue(0);
+            assertThat(run.failure()).isEmpty();
+            assertThat(run.snapshotCount()).isZero();
+            assertThat(run.snapshotCounts()).isEmpty();
+            run.activateSnapshot();
+            // This typed fixture scope checks immutability; it is not an actual native admission receipt.
+            assertThatThrownBy(() -> run.activateSnapshot(new LogSink.Scope("no-retroactive-log-owner", 7)))
+                    .isInstanceOf(IllegalStateException.class);
+            assertThat(opens).hasValue(1);
+            assertThat(scopedViews).hasValue(0);
+            run.close();
+            run.close();
+            assertThat(closes).hasValue(1);
+        }
+    }
+
+    @Test
+    void configuredCdcOnlyPreparationsUseTheExistingFiniteWorkerReservationBudget() {
+        AtomicInteger opens = new AtomicInteger();
+        CapturePort source = deferredCdcOnlyPort(() -> { opens.incrementAndGet(); return () -> { }; });
+        InMemoryMeta meta = new InMemoryMeta();
+        SnapshotBuffer buffer = new SnapshotBuffer(2, 1, 1_024, 512);
+        CaptureRunSpec third = spec(ReadMode.CDC_ONLY, false, "capacity-cdc-three");
+        try (SnapshotWorkers workers = new SnapshotWorkers(1, 1);
+             CaptureRunUnit unit = new CaptureRunUnit(source, new SrsCoordinator(meta), meta, hz, buffer, workers);
+             CaptureRun first = unit.begin(spec(ReadMode.CDC_ONLY, false, "capacity-cdc-one"), CaptureHandoff.of(row -> { }));
+             CaptureRun second = unit.begin(spec(ReadMode.CDC_ONLY, false, "capacity-cdc-two"), CaptureHandoff.of(row -> { }))) {
+            assertThatThrownBy(() -> unit.begin(third, CaptureHandoff.of(row -> { })))
+                    .isInstanceOf(SnapshotCapacityUnavailable.class);
+            assertThat(meta.read(third.miningChainId().value())).isEmpty();
+            assertThat(opens).hasValue(0);
+            first.close();
+            try (CaptureRun admittedLater = unit.begin(third, CaptureHandoff.of(row -> { }))) {
+                assertThat(admittedLater.snapshotCount()).isZero();
+                assertThat(opens).hasValue(0);
+            }
+        }
+    }
+
+    @Test
+    void aClosedConfiguredCdcOnlyRunKeepsItsLateExactNativeCloseFailureUntilRetry() throws Exception {
+        CountDownLatch opening = new CountDownLatch(1), release = new CountDownLatch(1);
+        AtomicInteger opens = new AtomicInteger(), closes = new AtomicInteger();
+        AtomicBoolean mayEnd = new AtomicBoolean(), ended = new AtomicBoolean();
+        CaptureRunSpec request = spec(ReadMode.CDC_ONLY, false, "late-cdc-only-native-close");
+        TapstateException original = new TapstateException(CaptureError.SRS_NOT_RECOVERABLE,
+                Map.of("chain", request.miningChainId().value()), null);
+        Subscription exact = () -> {
+            if (ended.get()) { return; }
+            closes.incrementAndGet();
+            if (!mayEnd.get()) { throw original; }
+            ended.set(true);
+        };
+        CapturePort source = deferredCdcOnlyPort(() -> {
+            opens.incrementAndGet();
+            opening.countDown();
+            awaitHeldShutdownRead(release);
+            return exact;
+        });
+        InMemoryMeta meta = new InMemoryMeta();
+        SnapshotBuffer buffer = new SnapshotBuffer(2, 1, 1_024, 512);
+        try (SnapshotWorkers workers = new SnapshotWorkers(1, 1);
+             CaptureRunUnit unit = new CaptureRunUnit(source, new SrsCoordinator(meta), meta, hz, buffer, workers);
+             CaptureRun run = unit.begin(request, CaptureHandoff.of(row -> { }))) {
+            try {
+                // A typed fixture scope isolates activation and teardown, not a claim or native admission.
+                run.activateSnapshot(new LogSink.Scope("late-cdc-resource", 7));
+                assertThat(opening.await(5, TimeUnit.SECONDS)).isTrue();
+                run.close();
+                assertThat(run.loading()).as("a cancelled reservation is not an ended native opening").isTrue();
+                assertThat(run.awaitLoaded(Duration.ZERO)).isFalse();
+                release.countDown();
+                assertThatThrownBy(() -> run.awaitLoaded(Duration.ofSeconds(5))).isSameAs(original);
+                assertThat(opens).hasValue(1);
+                assertThat(closes).hasValue(1);
+                assertThat(ended).isFalse();
+                assertThat(run.failure()).as("requested cancellation does not create a business failure").isEmpty();
+                mayEnd.set(true);
+                run.close();
+                assertThat(run.awaitLoaded(Duration.ZERO)).isTrue();
+                assertThat(ended).isTrue();
+                assertThat(closes).hasValue(2);
+                run.close();
+                assertThat(closes).hasValue(2);
+            } finally { mayEnd.set(true); release.countDown(); }
+        }
+    }
+
+    @Test
+    void aConfiguredRemoteCdcOnlyAttachmentCannotOpenItsPhysicalTail() {
+        HazelcastInstance member = emptyDurableMember();
+        String key = "remote-deferred-cdc-only";
+        AtomicInteger remoteOpens = new AtomicInteger();
+        InMemoryMeta meta = new InMemoryMeta();
+        FakeSource actualOwner = new FakeSource(List.of(), List.of());
+        CapturePort remote = deferredCdcOnlyPort(() -> { remoteOpens.incrementAndGet(); return () -> { }; });
+        SnapshotBuffer buffer = new SnapshotBuffer(2, 1, 1_024, 512);
+        try (SnapshotWorkers workers = new SnapshotWorkers(1, 1);
+             CaptureRunUnit owner = new CaptureRunUnit(actualOwner, new SrsCoordinator(meta), meta, member);
+             CaptureRun first = owner.start(specFor("owner-cdc-only", ReadMode.CDC_ONLY, key), row -> { });
+             CaptureRunUnit joining = new CaptureRunUnit(remote, new SrsCoordinator(meta), meta, member, buffer, workers);
+             CaptureRun attached = joining.begin(specFor("remote-cdc-only", ReadMode.CDC_ONLY, key),
+                     CaptureHandoff.of(row -> { }), false)) {
+            attached.activateSnapshot(new LogSink.Scope("remote-cdc-resource", 7));
+            assertThat(attached.chainId()).isEqualTo(first.chainId());
+            assertThat(attached.cdcSubscription()).isEmpty();
+            assertThat(remoteOpens).hasValue(0);
+            assertThat(actualOwner.cdcStarts).isOne();
+            assertThat(attached.snapshotCount()).isZero();
+            try (SnapshotWorkers.Reservation one = workers.reserve().orElseThrow();
+                 SnapshotWorkers.Reservation two = workers.reserve().orElseThrow()) {
+                assertThat(workers.reserve()).isEmpty();
+            }
+        } finally { member.shutdown(); }
+    }
+
+    private static CapturePort deferredCdcOnlyPort(Supplier<Subscription> tail) {
+        return new CapturePort() {
+            @Override public CaptureBatch snapshot(CaptureConfig config) {
+                throw new AssertionError("a CDC-only activation cannot open a snapshot");
+            }
+            @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+                return tail.get();
+            }
+            @Override public ConnectionReport testConnection(CaptureConfig config) { throw new UnsupportedOperationException(); }
+            @Override public DiscoveredSchema discoverSchema(CaptureConfig config) { throw new UnsupportedOperationException(); }
+        };
+    }
+
+    @Test
     void anActivatedReaderFreezesOneExplicitOwnerForItsSnapshotAndInitialTail() throws Exception {
         CaptureRunSpec request = spec(ReadMode.SNAPSHOT_AND_CDC, false, "explicit-log-owner")
                 .withSnapshotWriterToken("explicit-owner-run");
