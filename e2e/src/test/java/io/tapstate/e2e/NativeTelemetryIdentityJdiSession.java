@@ -26,7 +26,7 @@ import java.util.zip.ZipInputStream;
 final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     interface OwnedLauncher { RealProcessServer launch(Path jar, List<String> jvmArguments) throws Exception; }
     enum Target { JOB, ADMISSION, REPLACEMENT_ADMISSION, RAW_CONTINUATION, SUBMIT, LOG, OFFER, VISIBLE, PRODUCE, PREPARE, FOLDER_FORGET, EXPORT_FORGET, EXPORT_INCARNATION,
-        PUBLISHER_SWEEP, EXPORT_SWEEP, FOLDER_SWEEP }
+        PUBLISHER_SWEEP, EXPORT_SWEEP, FOLDER_SWEEP, JOINED_TAKEOVER }
     record Binding(String type, String method, String descriptor, String origin,
             String codeSha256, long loaderId, List<Integer> returns) { }
     record Counts(long entries, long normalReturns, long exceptionalExits, long inFlight) { }
@@ -55,13 +55,15 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     record Boundary(String phase, long sequence, String jarSha256, String pipelineId,
             Map<Target, Binding> bindings, Map<Target, Counts> counts, List<Map<String, Object>> records,
             List<AuthorityReceipt> authorityReceipts, Set<String> unverified, Set<String> decodedLayouts,
+            Map<String, Object> logFamilyCalibration,
             String vmVersion, long events, long handlingNanos, int openCalls, boolean queueDrained,
             boolean ownedVmDeath, boolean ownedVmDisconnected, boolean replacementObservationEnabled,
-            boolean rawContinuationObservationEnabled) {
+            boolean rawContinuationObservationEnabled, boolean joinedTakeoverObservationEnabled) {
         Boundary {
             bindings = Map.copyOf(bindings); counts = Map.copyOf(counts); records = List.copyOf(records);
             authorityReceipts = List.copyOf(authorityReceipts); unverified = Set.copyOf(unverified);
             decodedLayouts = Set.copyOf(decodedLayouts);
+            logFamilyCalibration = Map.copyOf(logFamilyCalibration);
         }
         boolean invocationDrainComplete() {
             return queueDrained && openCalls == 0 && counts.values().stream().allMatch(count ->
@@ -69,7 +71,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         }
         boolean decodedAndAuthorityBound() {
             return unverified.isEmpty() && bindings.size() == Target.values().length - (replacementObservationEnabled ? 0 : 1)
-                    - (rawContinuationObservationEnabled ? 0 : 1)
+                    - (rawContinuationObservationEnabled ? 0 : 1) - (joinedTakeoverObservationEnabled ? 0 : 1)
                     && invocationDrainComplete() && !authorityReceipts.isEmpty();
         }
         Map<String, Object> evidence() {
@@ -91,6 +93,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                     "coordinationId", receipt.coordinationId(), "capturedAt", receipt.capturedAt())).toList());
             out.put("unverified", unverified.stream().sorted().toList());
             out.put("decodedLayouts", decodedLayouts.stream().sorted().toList());
+            out.put("logFamilyCalibration", logFamilyCalibration);
             out.put("vmVersion", vmVersion); out.put("events", events); out.put("handlingNanos", handlingNanos);
             out.put("openCalls", openCalls); out.put("queueDrained", queueDrained);
             out.put("ownedVmDeath", ownedVmDeath); out.put("ownedVmDisconnected", ownedVmDisconnected);
@@ -98,6 +101,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                     ? "ORDINARY_AND_REPLACEMENT_ADMISSION" : "ORDINARY_ADMISSION_ONLY");
             out.put("replacementObservationEnabled", replacementObservationEnabled);
             out.put("rawContinuationObservationEnabled", rawContinuationObservationEnabled);
+            out.put("joinedTakeoverObservationEnabled", joinedTakeoverObservationEnabled);
             out.put("passiveObserver", true); out.put("performanceAcceptanceEligible", false);
             return Map.copyOf(out);
         }
@@ -118,6 +122,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         final List<Value> arguments;
         final Map<String, Object> entry;
         final boolean qualified;
+        boolean logCalibration;
         final List<Map<String, Object>> included = new ArrayList<>();
         boolean escaping;
         MethodExitRequest exit;
@@ -184,11 +189,14 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             new Spec(Target.EXPORT_SWEEP, OTEL + "FactsMetricProducer", "forgetPipelinesOutside",
                     "(Ljava/util/Collection;)V", 1, -1),
             new Spec(Target.FOLDER_SWEEP, "io.tapstate.core.lifecycle.CardinalityBudget$Folder", "forgetPipelinesOutside",
-                    "(Ljava/util/Collection;)V", 1, -1));
+                    "(Ljava/util/Collection;)V", 1, -1),
+            new Spec(Target.JOINED_TAKEOVER, "io.tapstate.runtime.srs.CaptureRunUnit", "begin",
+                    "(Lio/tapstate/runtime/srs/CaptureRunSpec;Lio/tapstate/runtime/srs/CaptureHandoff;Z)"
+                            + "Lio/tapstate/runtime/srs/CaptureRun;", 3, -1));
 
     private final Path jar;
     private final String sha, pipeline;
-    private final boolean replacementObservationEnabled, rawContinuationObservationEnabled;
+    private final boolean replacementObservationEnabled, rawContinuationObservationEnabled, joinedTakeoverObservationEnabled;
     private final RealProcessServer server;
     private final VirtualMachine vm;
     private final String vmVersion;
@@ -220,17 +228,21 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     private long phaseBytes;
     private Boundary terminal;
     private UnqualifiedEntry lastUnqualifiedEntry;
+    private boolean logFamilyCalibrationStarted;
+    private Map<String, Object> logFamilyCalibration = Map.of();
 
     private NativeTelemetryIdentityJdiSession(Path jar, String sha, String pipeline,
             Map<String, Image> images, RealProcessServer server, VirtualMachine vm, boolean replacementObservationEnabled,
-            boolean rawContinuationObservationEnabled) throws Exception {
+            boolean rawContinuationObservationEnabled, boolean joinedTakeoverObservationEnabled) throws Exception {
         this.jar = jar; this.sha = sha; this.pipeline = pipeline; this.images = images;
         this.server = server; this.vm = vm; this.vmVersion = vm.version();
         this.replacementObservationEnabled = replacementObservationEnabled;
         this.rawContinuationObservationEnabled = rawContinuationObservationEnabled;
+        this.joinedTakeoverObservationEnabled = joinedTakeoverObservationEnabled;
         for (Spec spec : SPECS) {
             if (spec.target() == Target.REPLACEMENT_ADMISSION && !replacementObservationEnabled
-                    || spec.target() == Target.RAW_CONTINUATION && !rawContinuationObservationEnabled) { continue; }
+                    || spec.target() == Target.RAW_CONTINUATION && !rawContinuationObservationEnabled
+                    || spec.target() == Target.JOINED_TAKEOVER && !joinedTakeoverObservationEnabled) { continue; }
             totals.put(spec.target(), new Totals());
             Image image = images.get(spec.type());
             if (image == null || !image.methods().containsKey(spec.method() + spec.descriptor())) {
@@ -271,8 +283,21 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         return start(input, expectedSha256, pipelineId, launcher, true, true);
     }
 
+    /** Adds only the cold, caller-qualified joined takeover receipt to the same bounded debugger. */
+    static NativeTelemetryIdentityJdiSession startWithJoinedTakeoverObservation(Path input, String expectedSha256,
+            String pipelineId, OwnedLauncher launcher) throws Exception {
+        return start(input, expectedSha256, pipelineId, launcher, false, false, true);
+    }
+
     private static NativeTelemetryIdentityJdiSession start(Path input, String expectedSha256, String pipelineId,
             OwnedLauncher launcher, boolean replacementObservationEnabled, boolean rawContinuationObservationEnabled) throws Exception {
+        return start(input, expectedSha256, pipelineId, launcher, replacementObservationEnabled,
+                rawContinuationObservationEnabled, false);
+    }
+
+    private static NativeTelemetryIdentityJdiSession start(Path input, String expectedSha256, String pipelineId,
+            OwnedLauncher launcher, boolean replacementObservationEnabled, boolean rawContinuationObservationEnabled,
+            boolean joinedTakeoverObservationEnabled) throws Exception {
         Objects.requireNonNull(expectedSha256); Objects.requireNonNull(pipelineId);
         Objects.requireNonNull(launcher);
         if (!expectedSha256.matches("[0-9a-f]{64}") || pipelineId.isBlank() || pipelineId.length() > 256) {
@@ -281,7 +306,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         Path jar = input.toRealPath();
         if (!Files.isRegularFile(jar) || Files.size(jar) > 512L * 1024 * 1024
                 || !expectedSha256.equals(hash(jar))) { throw invalid("immutable input hash mismatch"); }
-        Map<String, Image> images = images(jar);
+        Map<String, Image> images = images(jar, joinedTakeoverObservationEnabled);
         if (!expectedSha256.equals(hash(jar))) { throw invalid("artifact changed during metadata read"); }
         ListeningConnector connector = Bootstrap.virtualMachineManager().listeningConnectors().stream()
                 .filter(value -> value.name().equals("com.sun.jdi.SocketListen")).findFirst()
@@ -304,7 +329,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             if (!vm.canGetBytecodes() || !vm.canGetMethodReturnValues()) { throw invalid("required mirror capability missing"); }
             connector.stopListening(options); listening = false;
             session = new NativeTelemetryIdentityJdiSession(jar, expectedSha256, pipelineId, images, server, vm,
-                    replacementObservationEnabled, rawContinuationObservationEnabled);
+                    replacementObservationEnabled, rawContinuationObservationEnabled, joinedTakeoverObservationEnabled);
             server.awaitHealthy(); session.check();
             return session;
         } catch (Throwable problem) {
@@ -331,6 +356,194 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                 }
             }
         }
+    }
+
+    /** One existing sweep ENTRY can hold its event thread while another member normally acquires Q. */
+    final class PublisherSweepPark implements AutoCloseable {
+        private final String keptPipeline, node, boot;
+        private final long deadline;
+        private final boolean holding;
+        private final CompletableFuture<Map<String, Object>> entered = new CompletableFuture<>();
+        private EventSet held;
+        private Map<String, Object> receipt;
+        private String releaseReason;
+        private long parkedAtNanos, releasedAtNanos;
+        private boolean done, releasing;
+
+        private PublisherSweepPark(String keptPipeline, String node, String boot, long deadline, boolean holding) {
+            this.keptPipeline = keptPipeline; this.node = node; this.boot = boot; this.deadline = deadline;
+            this.holding = holding;
+        }
+
+        Map<String, Object> awaitEntry() throws Exception {
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) { throw afterWaitFailure("UNSELECTED: sweep park deadline expired before ENTRY", null); }
+            try { return entered.get(remaining, TimeUnit.NANOSECONDS); }
+            catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw afterWaitFailure("UNSELECTED: sweep ENTRY wait interrupted", interrupted);
+            } catch (Exception failed) {
+                throw afterWaitFailure("UNSELECTED: sweep ENTRY was not observed within the original bound", failed);
+            }
+        }
+
+        private AssertionError afterWaitFailure(String message, Throwable cause) {
+            AssertionError primary = new AssertionError(message, cause);
+            try { close(); }
+            catch (Throwable cleanup) { append(primary, cleanup); }
+            return primary;
+        }
+
+        boolean held() {
+            synchronized (lock) { return held != null && !done && !releasing && System.nanoTime() - deadline < 0; }
+        }
+
+        Map<String, Object> evidence() {
+            synchronized (lock) {
+                Map<String, Object> out = new LinkedHashMap<>();
+                if (receipt != null) { out.putAll(receipt); }
+                out.put("releaseReason", releaseReason == null ? "NOT_RELEASED" : releaseReason);
+                out.put("done", done); out.put("parkedAtNanos", parkedAtNanos); out.put("releasedAtNanos", releasedAtNanos);
+                out.put("deadlineNanos", deadline); return Map.copyOf(out);
+            }
+        }
+
+        @Override public void close() { releasePublisherSweepPark(this, "CALLER_RELEASE"); }
+    }
+
+    private volatile PublisherSweepPark sweepPark;
+    private boolean sweepParkUsed;
+
+    PublisherSweepPark armPublisherSweepPark(String keptPipeline, String node, String boot, long deadline) {
+        return armPublisherSweep(keptPipeline, node, boot, deadline, true);
+    }
+
+    /** A readiness receipt uses the same existing ENTRY and resumes before its future is answered. */
+    PublisherSweepPark observePublisherSweep(String keptPipeline, String node, String boot, long deadline) {
+        return armPublisherSweep(keptPipeline, node, boot, deadline, false);
+    }
+
+    private PublisherSweepPark armPublisherSweep(String keptPipeline, String node, String boot,
+            long deadline, boolean holding) {
+        synchronized (lock) {
+            check();
+            if (!joinedTakeoverObservationEnabled || sweepParkUsed || closing
+                    || keptPipeline == null || keptPipeline.isBlank() || node == null || node.isBlank()
+                    || boot == null || boot.isBlank() || deadline - System.nanoTime() <= 0) {
+                throw invalid("UNSELECTED: invalid one-shot sweep parking request");
+            }
+            sweepParkUsed = true; sweepPark = new PublisherSweepPark(keptPipeline, node, boot, deadline, holding);
+            return sweepPark;
+        }
+    }
+
+    private void releasePublisherSweepPark(PublisherSweepPark expected, String reason) {
+        EventSet eventSet;
+        synchronized (lock) {
+            if (expected == null || expected != sweepPark || expected.done || expected.releasing) { return; }
+            expected.releasing = true; eventSet = expected.held;
+        }
+        boolean resumed = false;
+        try {
+            if (eventSet != null) {
+                try { eventSet.resume(); } catch (VMDisconnectedException gone) { }
+            }
+            resumed = true;
+        } finally {
+            synchronized (lock) {
+                expected.releasing = false;
+                if (resumed) {
+                    expected.done = true; expected.releaseReason = reason; expected.releasedAtNanos = System.nanoTime();
+                    expected.held = null;
+                    if (!expected.entered.isDone()) {
+                        expected.entered.completeExceptionally(invalid("UNSELECTED: sweep was not observed: " + reason));
+                    }
+                }
+            }
+        }
+    }
+
+    private long publisherSweepPollMillis() {
+        synchronized (lock) {
+            if (sweepPark == null || sweepPark.done) { return 25; }
+            long remaining = sweepPark.deadline - System.nanoTime();
+            if (remaining <= 0) { return 1; }
+            return Math.min(25, Math.max(1, TimeUnit.NANOSECONDS.toMillis(remaining)));
+        }
+    }
+
+    private void releaseExpiredPublisherSweepPark() {
+        PublisherSweepPark current;
+        synchronized (lock) {
+            current = sweepPark;
+            if (current == null || current.done || System.nanoTime() - current.deadline < 0) { return; }
+        }
+        releasePublisherSweepPark(current, "DEADLINE_RELEASE");
+    }
+
+    private void completeObservedPublisherSweep(PublisherSweepPark expected) {
+        synchronized (lock) {
+            if (expected != sweepPark || expected.holding || expected.done || expected.releasing) { return; }
+            expected.done = true; expected.releaseReason = "OBSERVATION_RELEASE";
+            expected.releasedAtNanos = System.nanoTime();
+            if (expected.releasedAtNanos - expected.deadline <= 0) { expected.entered.complete(expected.receipt); }
+            else { expected.entered.completeExceptionally(invalid("UNSELECTED: sweep observation exceeded its original deadline")); }
+        }
+    }
+
+    /** The matcher is independent from Q's account/receiver qualification and cannot count as Q evidence. */
+    private PublisherSweepPark parkPublisherSweepEntry(BreakpointEvent event, EventSet eventSet) throws Exception {
+        PublisherSweepPark current = sweepPark;
+        if (current == null || current.done || current.releasing || current.held != null || System.nanoTime() - current.deadline >= 0
+                || !(event.request().getProperty("native-identity-site") instanceof Site site)
+                || site.target() != Target.PUBLISHER_SWEEP || !site.entry()) { return null; }
+        if (eventSet.suspendPolicy() != EventRequest.SUSPEND_EVENT_THREAD) {
+            throw invalid("UNSELECTED: sweep parking requires only its event thread");
+        }
+        List<StackFrame> frames = frames(event.thread());
+        StackFrame top = frames.getFirst(), caller = null;
+        for (StackFrame frame : frames) {
+            Method method = frame.location().method();
+            if (method.declaringType().name().equals("io.tapstate.app.ConvergenceDriver")
+                    && method.name().equals("reconcile") && method.signature().equals("()V")) {
+                if (caller != null) { throw invalid("UNSELECTED: ambiguous convergence sweep caller"); }
+                caller = frame;
+            }
+        }
+        if (caller == null) { return null; }
+        NativeTelemetryMirror mirror = mirror();
+        List<Object> kept = mirror.scalars(top.getArgumentValues().getFirst());
+        if (!kept.equals(List.of(current.keptPipeline))) { return null; }
+        Method method = caller.location().method(); validate(method.declaringType());
+        byte[] expected = images.get("io.tapstate.app.ConvergenceDriver").methods().get("reconcile()V");
+        if (expected == null || method.isObsolete() || !Arrays.equals(expected, method.bytecodes())) {
+            throw invalid("UNSELECTED: sweep caller code differs from selected artifact");
+        }
+        ObjectReference driver = caller.thisObject(), publisher = top.thisObject();
+        if (driver == null || publisher == null || mirror.object(mirror.field(driver, "publisher",
+                "Lio/tapstate/runtime/scheduler/ObservationPublisher;")).uniqueID() != publisher.uniqueID()) {
+            throw invalid("UNSELECTED: sweep receiver is not this convergence publisher");
+        }
+        ObjectReference ownership = requiredObject(mirror.field(driver, "actuation", "Lio/tapstate/app/PipelineActuationOwnership;"),
+                "io.tapstate.app.PipelineActuationOwnership", mirror);
+        Map<String, Object> owner = workloadOwner(mirror.field(ownership, "owner", "Lio/tapstate/spi/store/WorkloadOwner;"), mirror);
+        if (!current.node.equals(owner.get("nodeId")) || !current.boot.equals(owner.get("bootId"))) {
+            throw invalid("UNSELECTED: parked VM has a different actual member owner");
+        }
+        if (!vm.canGetOwnedMonitorInfo() || !event.thread().ownedMonitors().isEmpty()) {
+            throw invalid("UNSELECTED: sweep ENTRY has unavailable or held monitor evidence");
+        }
+        Map<String, Object> receipt = new LinkedHashMap<>();
+        receipt.put("target", current.holding ? "P_ONLY_PUBLISHER_SWEEP_PARK" : "P_ONLY_PUBLISHER_SWEEP_OBSERVED");
+        receipt.put("keptIds", kept);
+        receipt.put("owner", owner); receipt.put("publisherReceiver", publisher.uniqueID());
+        receipt.put("driverReceiver", driver.uniqueID()); receipt.put("threadId", event.thread().uniqueID());
+        receipt.put("threadName", event.thread().name()); receipt.put("entryOrder", events);
+        receipt.put("callerCodeSha256", hash(expected)); receipt.put("callerLoaderId", loaderId);
+        receipt.put("ownedMonitors", List.of()); receipt.put("suspendPolicy", "EVENT_THREAD");
+        current.receipt = Map.copyOf(receipt); current.parkedAtNanos = System.nanoTime();
+        if (current.holding) { current.held = eventSet; current.entered.complete(current.receipt); }
+        return current;
     }
 
     RealProcessServer server() { return server; }
@@ -419,13 +632,15 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     private void loop() {
         try {
             while (running) {
-                EventSet set = vm.eventQueue().remove(25);
+                releaseExpiredPublisherSweepPark();
+                EventSet set = vm.eventQueue().remove(publisherSweepPollMillis());
                 if (set != null) { handle(set); }
                 CompletableFuture<Boundary> request = command;
                 if (request != null) {
                     int drain = 0;
                     EventSet next;
                     while ((next = vm.eventQueue().remove(1)) != null) {
+                        releaseExpiredPublisherSweepPark();
                         if (++drain > 2048) { throw invalid("phase event-drain budget exceeded"); }
                         handle(next);
                     }
@@ -436,16 +651,31 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                 }
             }
         } catch (Throwable problem) { fail(problem); }
+        finally {
+            try { releasePublisherSweepPark(sweepPark, "PUMP_EXIT"); }
+            catch (Throwable cleanup) { fail(cleanup); }
+        }
     }
 
     private void handle(EventSet set) throws Exception {
         long started = System.nanoTime();
+        boolean parked = false, processed = false;
+        PublisherSweepPark observedSweep = null;
         try {
             synchronized (lock) {
                 for (Event event : set) {
                     if (++events > MAX_EVENTS) { throw invalid("event budget exceeded"); }
                     if (event instanceof ClassPrepareEvent prepare) { bind(prepare.referenceType()); }
-                    else if (event instanceof BreakpointEvent breakpoint) { breakpoint(breakpoint); }
+                    else if (event instanceof BreakpointEvent breakpoint) {
+                        try {
+                            PublisherSweepPark selected = parkPublisherSweepEntry(breakpoint, set);
+                            if (selected != null) { observedSweep = selected; parked = selected.holding; }
+                        }
+                        catch (NativeTelemetryMirror.Unavailable unavailable) {
+                            throw new AssertionError("UNSELECTED: sweep parking layout is unavailable: " + unavailable.getMessage(), unavailable);
+                        }
+                        breakpoint(breakpoint);
+                    }
                     else if (event instanceof MethodExitEvent exit) { normalExit(exit); }
                     else if (event instanceof ExceptionEvent exception) { exception(exception); }
                     else if (event instanceof ThreadDeathEvent death) { threadDeath(death); }
@@ -458,10 +688,16 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                     } else if (!(event instanceof VMStartEvent)) { throw invalid("unmapped capture event"); }
                 }
             }
+            processed = true;
         } finally {
             handlingNanos += System.nanoTime() - started;
-            try { set.resume(); }
-            catch (VMDisconnectedException gone) { if (!closing || !vmDeath) { throw gone; } }
+            if (!parked) {
+                try {
+                    set.resume();
+                    if (observedSweep != null && processed) { completeObservedPublisherSweep(observedSweep); }
+                }
+                catch (VMDisconnectedException gone) { if (!closing || !vmDeath) { throw gone; } }
+            }
         }
     }
 
@@ -525,7 +761,11 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         ObjectReference receiver = frame.thisObject();
         if (receiver == null) { throw invalid("receiver unavailable"); }
         NativeTelemetryMirror mirror = mirror();
-        boolean qualified = site.target() == Target.SUBMIT
+        boolean qualified = site.target() == Target.JOINED_TAKEOVER
+                ? joinedCaller(frames) != null && pipeline.equals(mirror.text(mirror.field(
+                        requiredObject(arguments.getFirst(), "io.tapstate.runtime.srs.CaptureRunSpec", mirror),
+                        "pipelineId", "Ljava/lang/String;")))
+                : site.target() == Target.SUBMIT
                 ? pipeline.equals(mirror.text(mirror.field(receiver, "val$pipelineId", "Ljava/lang/String;")))
                         && (replacementObservationEnabled
                                 || mirror.field(receiver, "val$accepted", "Lio/tapstate/spi/store/SuccessorAdmission;") == null)
@@ -548,9 +788,12 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                 throw invalid("observed entry overlapped an unreturned call or exceeded its bound");
             }
             Map<String, Object> entry = new LinkedHashMap<>();
+            boolean logCalibration = false;
             if (qualified) {
                 try {
-                    entry(spec, receiver, arguments, mirror, entry);
+                    if (spec.target() == Target.JOINED_TAKEOVER) {
+                        entry.putAll(joinedTakeover(frames, arguments, mirror));
+                    } else { entry(spec, receiver, arguments, mirror, entry); }
                     if (spec.target() == Target.LOG) { entry.put("callers", logCallers(frames)); }
                     if (evidenceBytes(entry, 0) > MAX_RECORD_BYTES) {
                         entry.clear();
@@ -563,11 +806,33 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             } else {
                 lastUnqualifiedEntry = new UnqualifiedEntry(site.target(), event.thread().uniqueID(),
                         receiver.uniqueID(), frames.size(), events);
+                if (joinedTakeoverObservationEnabled && site.target() == Target.LOG
+                        && !logFamilyCalibrationStarted && arguments.get(1) != null) {
+                    logFamilyCalibrationStarted = true; logCalibration = true;
+                    try {
+                        entry(spec, receiver, arguments, mirror, entry);
+                        entry.put("calibrationScope", entry.remove("scope"));
+                        entry.put("foreignPipelineId", mirror.text(arguments.getFirst()));
+                        entry.put("queryPipelineId", pipeline);
+                        Binding binding = bindings.get(Target.LOG);
+                        entry.put("bindingCodeSha256", binding.codeSha256());
+                        entry.put("bindingLoaderId", binding.loaderId());
+                        entry.put("ownedPid", server.pid());
+                        entry.put("interpretation", "COMMON_LOG_DECODER_AND_BINDING_ONLY");
+                        if (evidenceBytes(entry, 0) > MAX_RECORD_BYTES) {
+                            entry.clear(); throw new NativeTelemetryMirror.Unavailable("CALIBRATION_RECORD_BYTE_BUDGET");
+                        }
+                    } catch (NativeTelemetryMirror.Unavailable missing) {
+                        entry.remove("scope");
+                        decoderUnavailable(entry, Target.LOG, "FAMILY_CALIBRATION", missing.getMessage());
+                    }
+                }
             }
             entry.put("entryOrder", events);
             Call call = new Call(++calls, spec, frames.size(), receiver,
                     Collections.unmodifiableList(new ArrayList<>(arguments)),
                     Collections.unmodifiableMap(new LinkedHashMap<>(entry)), qualified);
+            call.logCalibration = logCalibration;
             state.calls.push(call);
             if (qualified) { totals.get(site.target()).entries++; }
         } else {
@@ -577,7 +842,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                 throw returnCorrelationFailure(event, site, receiver, frames.size(), qualified, call);
             }
             // Registration can change during this call. Its entry decision still owns its return.
-            if (!call.qualified) {
+            if (!call.qualified && !call.logCalibration) {
                 state.calls.pop(); removeEmpty(state);
                 return;
             }
@@ -653,6 +918,134 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         exceptions.enable(); death.enable();
         ThreadState state = new ThreadState(thread, exceptions, death);
         threads.put(thread.uniqueID(), state); return state;
+    }
+
+    private static StackFrame joinedCaller(List<StackFrame> frames) {
+        StackFrame found = null;
+        for (StackFrame frame : frames) {
+            Method method = frame.location().method();
+            if (method.declaringType().name().equals("io.tapstate.app.StoreBackedPipelineCaptureCoordinator")
+                    && method.name().equals("tailWhatNobodyTails") && method.signature().equals("()V")) {
+                if (found != null) { throw invalid("ambiguous joined takeover caller"); }
+                found = frame;
+            }
+        }
+        return found;
+    }
+
+    private static Value callerLocal(StackFrame frame, String name, String signature) throws Exception {
+        try {
+            LocalVariable variable = frame.visibleVariableByName(name);
+            if (variable == null || !signature.equals(variable.signature())) {
+                throw new NativeTelemetryMirror.Unavailable("JOINED_LOCAL_UNAVAILABLE:" + name);
+            }
+            return frame.getValue(variable);
+        } catch (AbsentInformationException missing) {
+            throw new NativeTelemetryMirror.Unavailable("JOINED_LVT_UNAVAILABLE:" + name);
+        }
+    }
+
+    private Map<String, Object> joinedTakeover(List<StackFrame> frames, List<Value> arguments,
+            NativeTelemetryMirror mirror) throws Exception {
+        StackFrame caller = joinedCaller(frames);
+        if (caller == null) { throw new NativeTelemetryMirror.Unavailable("JOINED_CALLER_UNAVAILABLE"); }
+        Method method = caller.location().method();
+        validate(method.declaringType());
+        byte[] expected = images.get(method.declaringType().name()).methods().get("tailWhatNobodyTails()V");
+        if (expected == null || method.isObsolete() || !Arrays.equals(expected, method.bytecodes())) {
+            throw new NativeTelemetryMirror.Unavailable("JOINED_CALLER_CODE_MISMATCH");
+        }
+        String prefix = "io.tapstate.app.StoreBackedPipelineCaptureCoordinator$";
+        ObjectReference reader = requiredObject(callerLocal(caller, "reader", "L" + prefix.replace('.', '/')
+                + "JoinedReader;"), prefix + "JoinedReader", mirror);
+        ObjectReference logical = requiredObject(mirror.field(reader, "logical", "L" + prefix.replace('.', '/')
+                + "PipelineRun;"), prefix + "PipelineRun", mirror);
+        ObjectReference opening = requiredObject(callerLocal(caller, "opening", "L" + prefix.replace('.', '/')
+                + "OpeningClaim;"), prefix + "OpeningClaim", mirror);
+        ObjectReference capture = requiredObject(callerLocal(caller, "captureId", "Lio/tapstate/runtime/srs/CaptureId;"),
+                "io.tapstate.runtime.srs.CaptureId", mirror);
+        ObjectReference supplied = requiredObject(arguments.getFirst(), "io.tapstate.runtime.srs.CaptureRunSpec", mirror);
+        if (supplied.uniqueID() != mirror.object(callerLocal(caller, "tailSpec",
+                "Lio/tapstate/runtime/srs/CaptureRunSpec;")).uniqueID()
+                || !Boolean.TRUE.equals(mirror.scalar(arguments.get(2)))) {
+            throw new NativeTelemetryMirror.Unavailable("JOINED_TAIL_ARGUMENT_MISMATCH");
+        }
+        ObjectReference original = requiredObject(mirror.field(logical, "spec", "Lio/tapstate/runtime/srs/CaptureRunSpec;"),
+                "io.tapstate.runtime.srs.CaptureRunSpec", mirror);
+        ObjectReference originalRun = requiredObject(mirror.field(logical, "run", "Lio/tapstate/runtime/srs/CaptureRun;"),
+                "io.tapstate.runtime.srs.CaptureRun", mirror);
+        ObjectReference logOwner = requiredObject(mirror.field(logical, "logOwner", "L" + prefix.replace('.', '/')
+                + "LogOwnerState;"), prefix + "LogOwnerState", mirror);
+        ObjectReference admitted = requiredObject(mirror.field(logOwner, "admitted", "L" + prefix.replace('.', '/')
+                + "AdmittedLogOwner;"), prefix + "AdmittedLogOwner", mirror);
+        ObjectReference close = requiredObject(mirror.field(logical, "closeState", "L" + prefix.replace('.', '/')
+                + "CloseState;"), prefix + "CloseState", mirror);
+        Map<String, Object> scope = mirror.scope(mirror.field(reader, "scope", "Lio/tapstate/core/logging/LogSink$Scope;"));
+        String source = mirror.text(mirror.field(original, "sourceId", "Ljava/lang/String;"));
+        String consumer = mirror.text(mirror.field(original, "consumerId", "Ljava/lang/String;"));
+        String writer = mirror.text(mirror.field(original, "snapshotWriterToken", "Ljava/lang/String;"));
+        if (!pipeline.equals(mirror.text(mirror.field(original, "pipelineId", "Ljava/lang/String;")))
+                || !Boolean.TRUE.equals(mirror.scalar(mirror.field(logical, "managed", "Z")))
+                || !Boolean.TRUE.equals(mirror.scalar(mirror.field(logical, "sharedTail", "Z")))
+                || Boolean.TRUE.equals(mirror.scalar(mirror.field(close, "completed", "Z")))
+                || Boolean.TRUE.equals(mirror.scalar(mirror.field(logOwner, "retired", "Z")))
+                || mirror.object(mirror.field(admitted, "run", "Lio/tapstate/runtime/srs/CaptureRun;")).uniqueID() != originalRun.uniqueID()
+                || mirror.object(mirror.field(admitted, "spec", "Lio/tapstate/runtime/srs/CaptureRunSpec;")).uniqueID() != original.uniqueID()
+                || !writer.equals(mirror.text(mirror.field(admitted, "writerToken", "Ljava/lang/String;")))
+                || !scope.equals(mirror.scope(mirror.field(admitted, "scope", "Lio/tapstate/core/logging/LogSink$Scope;")))) {
+            throw new NativeTelemetryMirror.Unavailable("JOINED_LOGICAL_ADMISSION_MISMATCH");
+        }
+        for (String field : List.of("pipelineId", "sourceId", "consumerId", "snapshotWriterToken")) {
+            if (!mirror.text(mirror.field(original, field, "Ljava/lang/String;"))
+                    .equals(mirror.text(mirror.field(supplied, field, "Ljava/lang/String;")))) {
+                throw new NativeTelemetryMirror.Unavailable("JOINED_SPEC_IDENTITY_MISMATCH:" + field);
+            }
+        }
+        if (!"CDC_ONLY".equals(mirror.enumName(mirror.field(supplied, "readMode", "Lio/tapstate/core/model/ReadMode;")))
+                || !Boolean.TRUE.equals(mirror.scalar(mirror.field(supplied, "srsEnabled", "Z")))
+                || Boolean.TRUE.equals(mirror.scalar(mirror.field(opening, "lost", "Z")))
+                || mirror.field(opening, "published", "L" + prefix.replace('.', '/') + "OwnedCapture;") != null) {
+            throw new NativeTelemetryMirror.Unavailable("JOINED_OPENING_STATE_MISMATCH");
+        }
+        String captureId = mirror.text(mirror.field(capture, "value", "Ljava/lang/String;"));
+        for (ObjectReference holder : List.of(logical, opening)) {
+            ObjectReference held = requiredObject(mirror.field(holder, "captureId", "Lio/tapstate/runtime/srs/CaptureId;"),
+                    "io.tapstate.runtime.srs.CaptureId", mirror);
+            if (!captureId.equals(mirror.text(mirror.field(held, "value", "Ljava/lang/String;")))) {
+                throw new NativeTelemetryMirror.Unavailable("JOINED_HELD_CAPTURE_ID_MISMATCH");
+            }
+        }
+        if (mirror.object(mirror.field(opening, "this$0", "Lio/tapstate/app/StoreBackedPipelineCaptureCoordinator;"))
+                .uniqueID() != caller.thisObject().uniqueID()) {
+            throw new NativeTelemetryMirror.Unavailable("JOINED_OPENING_RECEIVER_MISMATCH");
+        }
+        ObjectReference permit = requiredObject(mirror.field(opening, "permit", "Lio/tapstate/app/CaptureOwnership$Permit;"),
+                "io.tapstate.app.CaptureOwnership$Permit", mirror);
+        if (!Boolean.TRUE.equals(mirror.scalar(mirror.field(permit, "acquired", "Z")))) {
+            throw new NativeTelemetryMirror.Unavailable("JOINED_CAPTURE_PERMIT_REFUSED");
+        }
+        Map<String, Object> claim = workloadClaim(mirror.field(permit, "claim", "Lio/tapstate/spi/store/WorkloadClaim;"), mirror);
+        Map<?, ?> key = (Map<?, ?>) claim.get("key");
+        if (!"CAPTURE".equals(key.get("type")) || !captureId.equals(key.get("resourceId"))) {
+            throw new NativeTelemetryMirror.Unavailable("JOINED_CAPTURE_CLAIM_MISMATCH");
+        }
+        ObjectReference config = requiredObject(mirror.field(supplied, "config", "Lio/tapstate/spi/capture/CaptureConfig;"),
+                "io.tapstate.spi.capture.CaptureConfig", mirror);
+        ObjectReference node = requiredObject(mirror.field(config, "node", "Lio/tapstate/core/model/PipelineNode;"),
+                "io.tapstate.core.model.PipelineNode", mirror);
+        if (!pipeline.equals(mirror.text(mirror.field(node, "pipelineId", "Ljava/lang/String;")))
+                || !source.equals(mirror.text(mirror.field(node, "nodeId", "Ljava/lang/String;")))) {
+            throw new NativeTelemetryMirror.Unavailable("JOINED_CONFIG_NODE_MISMATCH");
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("scope", scope); out.put("pipelineId", pipeline); out.put("sourceId", source); out.put("consumerId", consumer);
+        out.put("captureId", captureId); out.put("captureClaim", claim); out.put("writerToken", writer);
+        out.put("coordinatorReceiver", caller.thisObject().uniqueID()); out.put("readerObject", reader.uniqueID());
+        out.put("logicalRunObject", originalRun.uniqueID()); out.put("logicalSpecObject", original.uniqueID());
+        out.put("logOwnerObject", logOwner.uniqueID()); out.put("admittedObject", admitted.uniqueID());
+        out.put("openingObject", opening.uniqueID()); out.put("tailSpecObject", supplied.uniqueID());
+        out.put("callerCodeSha256", hash(expected)); out.put("callerLoaderId", loaderId);
+        return Map.copyOf(out);
     }
 
     private void entry(Spec spec, ObjectReference receiver, List<Value> arguments,
@@ -778,28 +1171,55 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     private void normalExit(MethodExitEvent event) throws Exception {
         ThreadState state = threads.get(event.thread().uniqueID());
         Call call = state == null ? null : state.calls.peek();
-        if (call == null || !call.qualified || call.exit != event.request()
+        if (call == null || (!call.qualified && !call.logCalibration) || call.exit != event.request()
                 || !Objects.equals(event.request().getProperty("native-identity-call"), call.id)
                 || !event.method().equals(methods.get(call.spec.target())) || call.escaping) {
             throw invalid("method exit lost its exact return-site correlation");
         }
         vm.eventRequestManager().deleteEventRequest(call.exit); call.exit = null;
         Map<String, Object> out = new LinkedHashMap<>(call.entry);
-        try { returned(call, event.returnValue(), state, out, mirror()); }
-        catch (NativeTelemetryMirror.Unavailable missing) {
-            decoderUnavailable(out, call.spec.target(), "RETURN", missing.getMessage());
+        if (!call.logCalibration) {
+            try { returned(call, event.returnValue(), state, out, mirror()); }
+            catch (NativeTelemetryMirror.Unavailable missing) {
+                decoderUnavailable(out, call.spec.target(), "RETURN", missing.getMessage());
+            }
         }
-        out.put("target", call.spec.target().name()); out.put("invocation", call.id);
+        out.put("target", call.logCalibration ? "LOG_FAMILY_CALIBRATION" : call.spec.target().name());
+        out.put("invocation", call.id);
         out.put("returnOrder", events);
         out.put("receiver", call.receiver.uniqueID()); out.put("normalReturn", true);
+        if (call.logCalibration) { out.put("calibrationComplete", !out.containsKey("decoderStatus")); }
         addRecord(out);
-        totals.get(call.spec.target()).normal++;
+        if (call.logCalibration) {
+            logFamilyCalibration = Collections.unmodifiableMap(new LinkedHashMap<>(out));
+        } else { totals.get(call.spec.target()).normal++; }
         state.calls.pop(); removeEmpty(state);
     }
 
     private void returned(Call call, Value returned, ThreadState state, Map<String, Object> out,
             NativeTelemetryMirror mirror) throws Exception {
         switch (call.spec.target()) {
+            case JOINED_TAKEOVER -> {
+                if (call.entry.containsKey("decoderStatus")) {
+                    throw new NativeTelemetryMirror.Unavailable("JOINED_ENTRY_UNVERIFIED");
+                }
+                Map<String, Object> after = joinedTakeover(frames(state.thread), call.arguments, mirror);
+                if (!after.equals(call.entry.entrySet().stream().filter(entry -> !entry.getKey().equals("entryOrder"))
+                        .collect(java.util.stream.Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue)))) {
+                    throw new NativeTelemetryMirror.Unavailable("JOINED_CALLER_CHANGED_DURING_BEGIN");
+                }
+                ObjectReference actual = requiredObject(returned, "io.tapstate.runtime.srs.CaptureRun", mirror);
+                ObjectReference optional = requiredObject(mirror.field(actual, "chainId", "Ljava/util/Optional;"),
+                        "java.util.Optional", mirror);
+                ObjectReference chain = requiredObject(mirror.field(optional, "value", "Ljava/lang/Object;"),
+                        "io.tapstate.runtime.srs.MiningChainId", mirror);
+                if (Long.valueOf(actual.uniqueID()).equals(call.entry.get("logicalRunObject"))) {
+                    throw new NativeTelemetryMirror.Unavailable("JOINED_RETURN_REUSED_LOGICAL_HANDLE");
+                }
+                out.put("returnedRunObject", actual.uniqueID());
+                out.put("returnedChainId", mirror.text(mirror.field(chain, "value", "Ljava/lang/String;")));
+                out.put("callerStable", true);
+            }
             case ADMISSION -> {
                 if (call.entry.containsKey("decoderStatus")) {
                     throw new NativeTelemetryMirror.Unavailable("ADMISSION_ENTRY_UNVERIFIED");
@@ -1539,6 +1959,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     private void exceptional(Call call) {
         if (call.exit != null) { vm.eventRequestManager().deleteEventRequest(call.exit); call.exit = null; }
         if (call.qualified) { totals.get(call.spec.target()).exceptional++; }
+        if (call.logCalibration) { unknown("FAMILY_CALIBRATION:LOG:EXCEPTIONAL_EXIT"); }
     }
     private void threadDeath(ThreadDeathEvent event) {
         ThreadState state = threads.get(event.thread().uniqueID());
@@ -1605,7 +2026,8 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         Set<String> missing = new LinkedHashSet<>(unverified);
         for (Target target : Target.values()) {
             if (target == Target.REPLACEMENT_ADMISSION && !replacementObservationEnabled
-                    || target == Target.RAW_CONTINUATION && !rawContinuationObservationEnabled) { continue; }
+                    || target == Target.RAW_CONTINUATION && !rawContinuationObservationEnabled
+                    || target == Target.JOINED_TAKEOVER && !joinedTakeoverObservationEnabled) { continue; }
             if (!bindings.containsKey(target)) { missing.add("LIVE_BINDING_UNAVAILABLE:" + target); }
             else if (!disconnected) {
                 Method method = methods.get(target);
@@ -1623,10 +2045,14 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         }
         if (authorities.isEmpty()) { missing.add("AUTHORITY_RECEIPTS_UNVERIFIED"); }
         for (Map<String, Object> record : records) { qualifyScopes(record, missing, 0); }
+        if (!logFamilyCalibration.isEmpty()
+                && evidenceBytes(Map.of("records", records, "logFamilyCalibration", logFamilyCalibration), 0) > MAX_PHASE_BYTES) {
+            throw invalid("log calibration and retained records exceed the existing phase budget");
+        }
         return new Boundary(phase, ++sequence, sha, pipeline, bindings, counts, records, authorities,
-                missing, layouts, vmVersion, events, handlingNanos,
+                missing, layouts, logFamilyCalibration, vmVersion, events, handlingNanos,
                 threads.values().stream().mapToInt(state -> state.calls.size()).sum(), drained, vmDeath, disconnected,
-                replacementObservationEnabled, rawContinuationObservationEnabled);
+                replacementObservationEnabled, rawContinuationObservationEnabled, joinedTakeoverObservationEnabled);
     }
     private void qualifyScopes(Object value, Set<String> missing, int depth) {
         if (depth > 16) { throw invalid("scope qualification depth exceeded"); }
@@ -1669,15 +2095,31 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     private void fail(Throwable problem) {
         AssertionError error = problem instanceof AssertionError assertion ? assertion
                 : invalid("capture failed: " + problem.getClass().getName());
+        if (error != problem) { error.initCause(problem); }
         failure.compareAndSet(null, error); running = false;
+        error = failure.get();
+        if (error != problem && error.getCause() != problem) { append(error, problem); }
         CompletableFuture<Boundary> waiting = command;
         if (waiting != null) { waiting.completeExceptionally(error); }
-        detach();
+        detach(error);
     }
-    private void detach() {
+    private Throwable detach(Throwable primary) {
+        try { releasePublisherSweepPark(sweepPark, "DETACH"); }
+        catch (Throwable problem) { primary = append(primary, problem); }
         try { vm.dispose(); }
         catch (VMDisconnectedException gone) { }
-        catch (Throwable problem) { server.kill(); }
+        catch (Throwable problem) {
+            primary = append(primary, problem);
+            try { server.kill(); }
+            catch (Throwable cleanup) { primary = append(primary, cleanup); }
+        }
+        return primary;
+    }
+
+    private static Throwable append(Throwable primary, Throwable next) {
+        if (primary == null) { return next; }
+        if (primary != next) { primary.addSuppressed(next); }
+        return primary;
     }
 
     Boundary shutdownAndFinish() throws Exception {
@@ -1685,6 +2127,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             if (closed) { check(); if (terminal == null) { throw invalid("no qualified terminal boundary"); } return terminal; }
             Throwable primary = null;
             try {
+                releasePublisherSweepPark(sweepPark, "OWNED_CLOSE");
                 check();
                 synchronized (lock) { closing = true; }
                 server.close(); pump.join(5000); check();
@@ -1699,21 +2142,45 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                 }
             } catch (Exception | Error problem) { primary = problem; fail(problem); throw problem; }
             finally {
-                running = false; detach(); server.close(); pump.interrupt();
+                running = false;
+                Throwable cleanup = detach(null);
+                try { server.close(); }
+                catch (Throwable problem) { cleanup = append(cleanup, problem); }
+                pump.interrupt();
                 try { pump.join(2000); }
                 catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
-                    if (primary != null) { primary.addSuppressed(interrupted); } else { throw interrupted; }
+                    cleanup = append(cleanup, interrupted);
                 } finally { closed = true; }
-                if (pump.isAlive()) { throw invalid("owned event pump did not stop"); }
+                if (pump.isAlive()) { cleanup = append(cleanup, invalid("owned event pump did not stop")); }
+                if (cleanup != null) {
+                    if (primary != null) { append(primary, cleanup); }
+                    else if (cleanup instanceof Exception exception) { throw exception; }
+                    else { throw (Error) cleanup; }
+                }
             }
         }
     }
     @Override public void close() throws Exception { if (!closed) { shutdownAndFinish(); } }
 
-    private static Map<String, Image> images(Path jar) throws Exception {
+    private static Map<String, Image> images(Path jar, boolean joinedTakeoverObservationEnabled) throws Exception {
         Map<String, Image> images = new LinkedHashMap<>();
-        Set<String> wanted = new HashSet<>(SPECS.stream().map(Spec::type).toList());
+        Set<String> wanted = new HashSet<>(SPECS.stream()
+                .filter(spec -> spec.target() != Target.JOINED_TAKEOVER || joinedTakeoverObservationEnabled)
+                .map(Spec::type).toList());
+        if (joinedTakeoverObservationEnabled) {
+            wanted.addAll(List.of("io.tapstate.app.StoreBackedPipelineCaptureCoordinator",
+                    "io.tapstate.app.StoreBackedPipelineCaptureCoordinator$JoinedReader",
+                    "io.tapstate.app.StoreBackedPipelineCaptureCoordinator$PipelineRun",
+                    "io.tapstate.app.StoreBackedPipelineCaptureCoordinator$LogOwnerState",
+                    "io.tapstate.app.StoreBackedPipelineCaptureCoordinator$AdmittedLogOwner",
+                    "io.tapstate.app.StoreBackedPipelineCaptureCoordinator$OpeningClaim",
+                    "io.tapstate.app.StoreBackedPipelineCaptureCoordinator$CloseState",
+                    "io.tapstate.app.CaptureOwnership$Permit", "io.tapstate.runtime.srs.CaptureRunSpec",
+                    "io.tapstate.runtime.srs.CaptureRun", "io.tapstate.runtime.srs.CaptureId",
+                    "io.tapstate.runtime.srs.MiningChainId", "io.tapstate.spi.capture.CaptureConfig",
+                    "io.tapstate.core.model.PipelineNode", "io.tapstate.core.model.ReadMode"));
+        }
         wanted.addAll(List.of(OTEL + "FactsMetricProducer$Offered", OTEL + "FactMetricData",
                 "io.tapstate.app.EngineLifecycleActuator", "io.tapstate.app.PipelineActuationOwnership$Execution",
                 "io.tapstate.app.ExecutionFence", "io.tapstate.spi.store.WorkloadClaim",
