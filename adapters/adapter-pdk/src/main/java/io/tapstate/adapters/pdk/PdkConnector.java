@@ -424,6 +424,34 @@ final class PdkConnector implements AutoCloseable {
         }
     }
 
+    /** Stops normally without allowing a native refusal to masquerade as successful cleanup. */
+    void stopStrict() {
+        stopped = true;
+        try {
+            underLoader(() -> {
+                try {
+                    connector.stop(context);
+                } catch (TapstateException coded) {
+                    throw coded;
+                } catch (Error defect) {
+                    throw defect;
+                } catch (Throwable refusal) {
+                    if (refusal instanceof InterruptedException) { Thread.currentThread().interrupt(); }
+                    throw new TapstateException(ConnectorError.CAPTURE_FAILED, Map.of(
+                            "connector", connectorId,
+                            "detail", refusal.getMessage() != null ? refusal.getMessage() : refusal.getClass().getSimpleName()),
+                            refusal);
+                }
+                return null;
+            });
+        } catch (RuntimeException | Error failure) {
+            // Host attribution and loader invariants are outside the native failure boundary.
+            throw failure;
+        } catch (Throwable unexpected) {
+            throw new IllegalStateException("connector stop left an unexpected host throwable", unexpected);
+        }
+    }
+
     /** Stops the connector, swallowing failures — used on the cleanup path where the real error already won. */
     void stopQuietly() {
         stopped = true;

@@ -1,5 +1,6 @@
 package io.tapstate.adapters.pdk;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.SourcePosition;
@@ -7,6 +8,7 @@ import io.tapstate.spi.capture.SourcePosition;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Optional;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -51,7 +53,7 @@ final class PdkCaptureBatch implements CaptureBatch {
     /** How long a taker waits between checks that the batch is still open. */
     private static final long POLL_MILLIS = 100;
 
-    private static final long JOIN_MILLIS = 2000;
+    static final long JOIN_MILLIS = 2000;
 
     /** What the reading thread puts behind the last batch of an ordinary end. */
     private static final Object END = new Object();
@@ -74,8 +76,9 @@ final class PdkCaptureBatch implements CaptureBatch {
     private Iterator<Envelope> current = Collections.emptyIterator();
     private boolean over;
     private final AtomicBoolean closed = new AtomicBoolean();
+    private boolean ended;
 
-    private PdkCaptureBatch(PdkConnector connector, Read read, String threadName, boolean ownsConnector) {
+    PdkCaptureBatch(PdkConnector connector, Read read, String threadName, boolean ownsConnector) {
         this.connector = connector;
         this.ownsConnector = ownsConnector;
         this.reader = new Thread(() -> readAll(read), threadName);
@@ -94,22 +97,37 @@ final class PdkCaptureBatch implements CaptureBatch {
     static PdkCaptureBatch start(
             PdkConnector connector, Read read, String threadName, boolean ownsConnector) {
         PdkCaptureBatch batch = new PdkCaptureBatch(connector, read, threadName, ownsConnector);
-        batch.reader.start();
+        batch.startRead();
+        return batch.awaitSeam();
+    }
+
+    /** A session registers its handle and starts this worker under the same ownership lock. */
+    void startRead() { reader.start(); }
+
+    PdkCaptureBatch awaitSeam() {
         try {
-            batch.seam.get();
+            seam.get();
         } catch (InterruptedException interrupted) {
-            batch.close();
-            Thread.currentThread().interrupt();
-            throw new CancellationException("the snapshot read was interrupted before its seam was taken");
+            CancellationException primary = new CancellationException("the snapshot read was interrupted before its seam was taken");
+            primary.initCause(interrupted);
+            try { closeAfterFailedOpen(primary); }
+            finally { Thread.currentThread().interrupt(); }
+            throw primary;
         } catch (ExecutionException failed) {
-            batch.close();
-            throw unchecked(failed.getCause());
+            Throwable primary = failed.getCause();
+            closeAfterFailedOpen(primary);
+            throw unchecked(primary);
         } catch (CancellationException abandoned) {
             // A read abandoned before its seam ends the wait with that as itself, not wrapped as a failure is.
-            batch.close();
+            closeAfterFailedOpen(abandoned);
             throw abandoned;
         }
-        return batch;
+        return this;
+    }
+
+    private void closeAfterFailedOpen(Throwable primary) {
+        try { close(); }
+        catch (TapstateException unfinished) { primary.addSuppressed(unfinished); }
     }
 
     /** The connector this batch was read from, and the state scope it was opened under. */
@@ -181,22 +199,38 @@ final class PdkCaptureBatch implements CaptureBatch {
 
     @Override
     public void close() {
-        boolean first = requestClose();
-        // A session-owned batch releases only its worker. The session stops and closes the connector
-        // after the table read, or on abandonment before this worker is joined.
-        if (first && ownsConnector) {
-            connector.stopQuietly();
-        }
+        closeBy(System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(JOIN_MILLIS));
+    }
+
+    /** Confirms the worker within the caller's original wait budget; native stop is not forcibly timed. */
+    synchronized void closeBy(long deadline) {
+        if (ended) { return; }
+        requestClose();
+        // A session-owned batch releases only its worker. The session owns strict native stop and
+        // loader release; standalone batches cannot declare either complete after a native refusal.
+        if (ownsConnector) { connector.stopStrict(); }
         try {
-            reader.join(JOIN_MILLIS);
+            while (reader.isAlive()) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) {
+                    throw new TapstateException(ConnectorError.CAPTURE_FAILED, Map.of(
+                            "connector", connector.connectorId(),
+                            "detail", "snapshot read remained active after its shutdown wait budget"), null);
+                }
+                TimeUnit.NANOSECONDS.timedJoin(reader, remaining);
+            }
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
+            throw new TapstateException(ConnectorError.CAPTURE_FAILED, Map.of(
+                    "connector", connector.connectorId(),
+                    "detail", "snapshot shutdown was interrupted before its read ended"), interrupted);
         }
         ahead.clear();
-        if (first && ownsConnector) {
-            connector.close();
-        }
+        if (ownsConnector) { connector.close(); }
+        ended = true;
     }
+
+    synchronized boolean ended() { return ended; }
 
     private void readAll(Read read) {
         try {
