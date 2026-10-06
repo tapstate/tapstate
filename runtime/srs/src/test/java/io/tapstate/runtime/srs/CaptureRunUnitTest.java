@@ -75,6 +75,123 @@ import static org.assertj.core.api.Assertions.catchThrowableOfType;
 class CaptureRunUnitTest {
 
     @Test
+    void theLastSharedSubscriberRetriesItsExactStreamUntilNativeCloseSucceeds() {
+        HazelcastInstance member = emptyDurableMember();
+        String key = "shared-strict-close-retry";
+        ControlledSharedClosePort port = new ControlledSharedClosePort(key);
+        CaptureRun first = null, last = null;
+        try {
+            InMemoryMeta meta = new InMemoryMeta();
+            CaptureRunUnit unit = new CaptureRunUnit(port, new SrsCoordinator(meta), meta, member);
+            first = unit.start(specFor("close-first", ReadMode.CDC_ONLY, key), row -> { });
+            last = unit.start(specFor("close-last", ReadMode.CDC_ONLY, key), row -> { });
+            assertThat(first.chainId()).isEqualTo(last.chainId());
+            assertThat(port.opened).as("both actual runs retain one shared physical subscription").hasSize(1);
+            Subscription physical = port.opened.getFirst();
+
+            first.close();
+            assertThat(port.attempted).as("the other subscriber still owns the shared tail").isEmpty();
+            CaptureRun exactLast = last;
+            assertThatThrownBy(exactLast::close).isSameAs(port.refused);
+            assertThat(port.attempted).containsExactly(physical);
+            assertThat(port.ended).as("a refused close is not a successful end").isFalse();
+
+            assertThatThrownBy(exactLast::close).isSameAs(port.refused);
+            assertThat(port.attempted).as("retry must reach that same still-unended stream, not return normally")
+                    .containsExactly(physical, physical);
+            assertThat(port.opened).hasSize(1);
+            assertThat(port.ended).isFalse();
+
+            port.mayEnd.set(true);
+            exactLast.close();
+            assertThat(port.attempted).containsExactly(physical, physical, physical);
+            assertThat(port.ended).isTrue();
+            exactLast.close();
+            first.close();
+            assertThat(port.attempted).as("successful logical releases are idempotent")
+                    .containsExactly(physical, physical, physical);
+        } finally {
+            port.mayEnd.set(true);
+            try { if (last != null) { last.close(); } }
+            finally {
+                try { if (first != null) { first.close(); } }
+                finally { member.shutdown(); }
+            }
+        }
+    }
+
+    @Test
+    void closingOneSharedSubscriberTwiceCannotStopItsOtherSubscriber() {
+        HazelcastInstance member = emptyDurableMember();
+        String key = "shared-subscriber-release-once";
+        ControlledSharedClosePort port = new ControlledSharedClosePort(key);
+        port.mayEnd.set(true);
+        CaptureRun first = null, last = null;
+        try {
+            InMemoryMeta meta = new InMemoryMeta();
+            CaptureRunUnit unit = new CaptureRunUnit(port, new SrsCoordinator(meta), meta, member);
+            first = unit.start(specFor("release-first", ReadMode.CDC_ONLY, key), row -> { });
+            last = unit.start(specFor("release-last", ReadMode.CDC_ONLY, key), row -> { });
+            assertThat(first.chainId()).isEqualTo(last.chainId());
+            assertThat(port.opened).hasSize(1);
+            Subscription physical = port.opened.getFirst();
+
+            first.close();
+            first.close();
+            assertThat(port.attempted).as("one subscriber cannot release the other subscriber's reference")
+                    .isEmpty();
+            assertThat(port.ended).isFalse();
+            last.close();
+            assertThat(port.attempted).containsExactly(physical);
+            assertThat(port.ended).isTrue();
+            first.close();
+            last.close();
+            assertThat(port.attempted).containsExactly(physical);
+        } finally {
+            port.mayEnd.set(true);
+            try { if (last != null) { last.close(); } }
+            finally {
+                try { if (first != null) { first.close(); } }
+                finally { member.shutdown(); }
+            }
+        }
+    }
+
+    /** Controlled native close; only the actual shared reference and retry protocol are under test. */
+    private static final class ControlledSharedClosePort implements CapturePort {
+        private final TapstateException refused;
+        private final AtomicBoolean mayEnd = new AtomicBoolean();
+        private final AtomicBoolean ended = new AtomicBoolean();
+        private final List<Subscription> opened = new CopyOnWriteArrayList<>();
+        private final List<Subscription> attempted = new CopyOnWriteArrayList<>();
+
+        private ControlledSharedClosePort(String chain) {
+            refused = new TapstateException(CaptureError.SRS_NOT_RECOVERABLE, Map.of("chain", chain), null);
+        }
+
+        @Override public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+            Subscription actual = new Subscription() {
+                private boolean completed;
+                @Override public synchronized void close() {
+                    if (completed) { return; }
+                    attempted.add(this);
+                    if (!mayEnd.get()) { throw refused; }
+                    completed = true;
+                    ended.set(true);
+                }
+            };
+            opened.add(actual);
+            return actual;
+        }
+        @Override public CaptureBatch snapshot(CaptureConfig config) {
+            throw new AssertionError("a CDC-only shared-close control must not open a snapshot");
+        }
+        @Override public ConnectionReport testConnection(CaptureConfig config) { throw new UnsupportedOperationException(); }
+        @Override public DiscoveredSchema discoverSchema(CaptureConfig config) { throw new UnsupportedOperationException(); }
+    }
+
+
+    @Test
     void configuredCloseCannotClaimLoadedWhileTheRealReservedWorkerIsStillOpeningItsTable() throws Exception {
         CountDownLatch reading = new CountDownLatch(1), release = new CountDownLatch(1);
         class Source implements CapturePort, SnapshotSession.Provider {

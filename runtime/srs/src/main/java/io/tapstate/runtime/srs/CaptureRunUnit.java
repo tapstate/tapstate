@@ -753,6 +753,9 @@ public final class CaptureRunUnit {
         private final AtomicInteger references = new AtomicInteger(1);
         private final AtomicLong batchOrder;
         private volatile boolean closed;
+        private boolean closing;
+        private AtomicBoolean lastRelease;
+        private Throwable closeFailure;
         private List<String> serving = List.of();
         private Subscription subscription;
         private final String firstSeam;
@@ -831,8 +834,21 @@ public final class CaptureRunUnit {
             }
         }
 
+        private synchronized boolean retain() {
+            if (closed) { return false; }
+            if (closing) {
+                if (closeFailure instanceof RuntimeException refused) { throw refused; }
+                if (closeFailure instanceof Error defect) { throw defect; }
+                throw new IllegalStateException("a shared tail remained closing without its close failure");
+            }
+            // A rejected widening must not create a subscriber with no returned release handle.
+            widen();
+            references.incrementAndGet();
+            return true;
+        }
+
         private synchronized void widen() {
-            if (closed) {
+            if (closed || closing) {
                 return;
             }
             if (serving.containsAll(meta.captureTables(chain))) {
@@ -862,15 +878,28 @@ public final class CaptureRunUnit {
             }
         }
 
-        private synchronized void release() {
-            if (references.decrementAndGet() != 0 || closed) {
-                return;
+        private void release(AtomicBoolean released) {
+            synchronized (this) {
+                if (released.compareAndSet(false, true)) {
+                    int remaining = references.decrementAndGet();
+                    if (remaining < 0) { throw new IllegalStateException("shared tail references went below zero"); }
+                    if (remaining != 0) { return; }
+                    closing = true;
+                    lastRelease = released;
+                }
+                if (closed || lastRelease != released) { return; }
+                try {
+                    if (subscription != null) { subscription.close(); }
+                    closeFailure = null;
+                    closed = true;
+                } catch (RuntimeException | Error refused) {
+                    closeFailure = refused;
+                    throw refused;
+                }
             }
-            closed = true;
+            // Never wait for a map mutation while holding the tail monitor: compute can retain
+            // and widen under that monitor. Conditional removal also preserves a newer tail.
             sharedTails.remove(chain, this);
-            if (subscription != null) {
-                subscription.close();
-            }
         }
     }
 
@@ -922,14 +951,11 @@ public final class CaptureRunUnit {
             SrsLogStore durable = durableLog();
             if (durable != null) {
                 SharedTail shared = sharedTails.compute(cid, (key, running) -> {
-                    if (running != null && !running.closed) {
-                        running.references.incrementAndGet();
-                        running.widen();
-                        return running;
-                    }
+                    if (running != null && running.retain()) { return running; }
                     return new SharedTail(reader, spec, cid, epoch, ownSeam, health, durable);
                 });
-                return Optional.of(() -> shared.release());
+                AtomicBoolean released = new AtomicBoolean();
+                return Optional.of(() -> shared.release(released));
             }
             if (!spec.consumerId().equals(spec.pipelineId()) || spec.captureFence() != null) {
                 throw new TapstateException(CaptureError.SRS_NOT_RECOVERABLE, Map.of("chain", cid), null);
