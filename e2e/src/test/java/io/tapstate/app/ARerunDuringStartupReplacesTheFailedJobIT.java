@@ -22,6 +22,7 @@ import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.PipelineStateHolding;
+import io.tapstate.e2e.Await;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.engine.JobFailureRegistry;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
@@ -188,11 +189,9 @@ class ARerunDuringStartupReplacesTheFailedJobIT {
         return Hazelcast.newHazelcastInstance(config);
     }
 
-    private static void awaitRunning(Job job) throws InterruptedException {
-        long deadline = System.nanoTime() + BUDGET.toNanos();
-        while (job.getStatus() != JobStatus.RUNNING && System.nanoTime() < deadline) {
-            Thread.sleep(25);
-        }
+    private static void awaitRunning(Job job) {
+        Await.until("the fresh job becomes running", BUDGET,
+                () -> job.getStatus() == JobStatus.RUNNING, () -> job.getStatus().name());
         assertThat(job.getStatus()).as("the fresh job becomes running").isEqualTo(JobStatus.RUNNING);
     }
 
@@ -241,18 +240,8 @@ class ARerunDuringStartupReplacesTheFailedJobIT {
 
     private static final class Running extends AbstractProcessor {
         @Override
-        public boolean isCooperative() {
-            return false;
-        }
-
-        @Override
         public boolean complete() {
-            try {
-                Thread.sleep(20);
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-                return true;
-            }
+            // Jet backs off a cooperative processor that reports no progress.
             return false;
         }
     }

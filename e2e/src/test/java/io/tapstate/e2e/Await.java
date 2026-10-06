@@ -14,7 +14,7 @@ import java.util.function.Supplier;
  * run and is not quite reliable anyway. An expired bound reports what was last read, because "timed out"
  * on its own sends an author looking at the wait instead of at the product.
  */
-final class Await {
+public final class Await {
 
     private static final Duration BOUND = Duration.ofSeconds(60);
     private static final Duration POLL = Duration.ofMillis(250);
@@ -36,7 +36,7 @@ final class Await {
      * pass. Widening the shared default would have slowed every other case's failure instead, which is
      * why this is a parameter rather than a larger constant.
      */
-    static void until(String what, Duration bound, BooleanSupplier condition, Supplier<String> lastReading) {
+    public static void until(String what, Duration bound, BooleanSupplier condition, Supplier<String> lastReading) {
         long start = System.nanoTime();
         long deadline = start + bound.toNanos();
         while (true) {
