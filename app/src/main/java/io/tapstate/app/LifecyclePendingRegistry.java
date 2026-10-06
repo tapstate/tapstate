@@ -19,12 +19,16 @@ final class LifecyclePendingRegistry {
     record Context(ObservationScopeRegistry.BindingIdentity binding, ObservationScopeRecovery.Owner owner) { }
 
     /** Historical decision evidence classifies a queue label; it never skips actual reconciliation. */
-    private record TerminalNoop(DesiredState intent, CheckpointDoc checkpoint, Context context) {
+    record TerminalNoop(DesiredState intent, CheckpointDoc checkpoint, Context context) {
+        boolean sameRequest(DesiredState requested, Context current) {
+            return intent.equals(requested) && context.equals(current);
+        }
+
         boolean matches(DesiredState requested, Context current) {
             // A remote incarnation may change before this member sees a local invalidation. Leave
             // claimed and unknown-scope paths provisional until their actual worker decides again.
             return current.owner() == null && (current.binding() == null || current.binding().known())
-                    && intent.equals(requested) && context.equals(current);
+                    && sameRequest(requested, current);
         }
     }
 
@@ -36,6 +40,9 @@ final class LifecyclePendingRegistry {
 
     private record Entry(Pending pending, PipelineState capacityTarget, long capacitySinceNanos,
             TerminalNoop terminalNoop, ActiveDecision activeDecision) { }
+
+    /** A read token for the same bounded entry; qualification never changes its raw pending facts. */
+    record Projection(Pending pending, TerminalNoop terminalNoop, Object identity) { }
 
 
     private final ConcurrentHashMap<String, Entry> byPipeline = new ConcurrentHashMap<>();
@@ -64,7 +71,9 @@ final class LifecyclePendingRegistry {
             PipelineState target = capacityTarget(reason);
             long since = target != null && previous != null && previous.capacityTarget() == target
                     ? previous.capacitySinceNanos() : target != null ? System.nanoTime() : 0L;
-            return new Entry(new Pending(reason), target, since, null, null);
+            TerminalNoop candidate = previous != null && previous.terminalNoop() != null
+                    && previous.terminalNoop().sameRequest(intent, context) ? previous.terminalNoop() : null;
+            return new Entry(new Pending(reason), target, since, candidate, null);
         });
     }
 
@@ -108,6 +117,20 @@ final class LifecyclePendingRegistry {
 
     Optional<Pending> pending(String pipelineId) {
         return Optional.ofNullable(byPipeline.get(pipelineId)).map(Entry::pending);
+    }
+
+    Projection projection(String pipelineId) {
+        Entry entry = byPipeline.get(pipelineId);
+        return entry == null ? new Projection(null, null, null)
+                : new Projection(entry.pending(), entry.terminalNoop(), entry);
+    }
+
+    /** Applies only a memory read projection while its original entry is still current. */
+    void withProjection(String pipelineId, Projection expected, Runnable projection) {
+        byPipeline.computeIfPresent(pipelineId, (ignored, entry) -> {
+            if (expected != null && entry == expected.identity()) { projection.run(); }
+            return entry;
+        });
     }
 
     /** A refused local pause has no public pending reason but still waits for the same bounded worker. */
