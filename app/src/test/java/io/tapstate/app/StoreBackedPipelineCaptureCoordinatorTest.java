@@ -2486,6 +2486,279 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         }
     }
 
+    @Test
+    void anUnpublishedTakeoverRetriesItsExactTailCloseBeforeOpeningAnotherTail() {
+        AtomicInteger logicalCloses = new AtomicInteger(), tailOpens = new AtomicInteger();
+        AtomicInteger firstCloses = new AtomicInteger(), replacementCloses = new AtomicInteger(), widened = new AtomicInteger();
+        AtomicBoolean firstEnded = new AtomicBoolean(), replacementEnded = new AtomicBoolean();
+        List<String> order = new java.util.concurrent.CopyOnWriteArrayList<>();
+        List<CaptureRun> returnedTails = new java.util.concurrent.CopyOnWriteArrayList<>();
+        AtomicReference<MiningChainId> logicalChain = new AtomicReference<>();
+        AtomicReference<String> logicalConsumer = new AtomicReference<>();
+        AtomicReference<SrsCoordinator> joinedChains = new AtomicReference<>();
+        AtomicBoolean stillAttachedWhenCloseRetried = new AtomicBoolean();
+        TapstateException activationFailure = new TapstateException(io.tapstate.adapters.pdk.ConnectorError.CAPTURE_FAILED,
+                Map.of("connector", "mysql", "detail", "controlled takeover activation refusal"), null);
+        TapstateException closeFailure = new TapstateException(io.tapstate.adapters.pdk.ConnectorError.CAPTURE_FAILED,
+                Map.of("connector", "mysql", "detail", "controlled first takeover tail close refusal"), null);
+        CaptureAttacher actualAttachments = (spec, handoff, startTail) -> {
+            if (!startTail) {
+                logicalChain.set(spec.miningChainId());
+                logicalConsumer.set(spec.consumerId());
+                joinedChains.get().joinSource(spec.sourceId(), spec.miningChainId(), spec.config().streams());
+                joinedChains.get().attachConsumer(spec.miningChainId(), spec.consumerId());
+                io.tapstate.runtime.srs.SnapshotActivation logical = new io.tapstate.runtime.srs.SnapshotActivation() {
+                    private boolean closed;
+                    @Override public void activateSnapshot() { order.add("logical-activated"); }
+                    @Override public void close() {
+                        if (closed) { return; }
+                        closed = true;
+                        logicalCloses.incrementAndGet();
+                        order.add("logical-closed");
+                    }
+                };
+                return new CaptureRun(Optional.of(spec.miningChainId()), false, 0L, Optional.empty(),
+                        Optional.of(logical), new CaptureHealth());
+            }
+            int opened = tailOpens.incrementAndGet();
+            order.add("tail-open-" + opened);
+            io.tapstate.runtime.srs.SnapshotActivation tail = new io.tapstate.runtime.srs.SnapshotActivation() {
+                private boolean closed;
+                @Override public void activateSnapshot() {
+                    order.add("tail-activate-" + opened);
+                    if (opened == 1) { throw activationFailure; }
+                }
+                @Override public void close() {
+                    if (closed) { return; }
+                    if (opened == 1) {
+                        int attempt = firstCloses.incrementAndGet();
+                        order.add("first-close-" + attempt);
+                        if (attempt == 1) { throw closeFailure; }
+                        stillAttachedWhenCloseRetried.set(joinedChains.get().isProvisioned(logicalChain.get())
+                                && joinedChains.get().affectedConsumers(logicalChain.get()).contains(logicalConsumer.get())
+                                && logicalCloses.get() == 0 && tailOpens.get() == 1);
+                        firstEnded.set(true);
+                        order.add("first-ended");
+                    } else {
+                        replacementCloses.incrementAndGet();
+                        replacementEnded.set(true);
+                        order.add("replacement-ended");
+                    }
+                    closed = true;
+                }
+            };
+            CaptureRun actual = new CaptureRun(Optional.of(spec.miningChainId()), false, 0L, Optional.empty(),
+                    Optional.of(tail), new CaptureHealth()).withWidening(widened::incrementAndGet);
+            returnedTails.add(actual);
+            return actual;
+        };
+        try (JoinedOwnerFixture fixture = new JoinedOwnerFixture(false, false, actualAttachments)) {
+            joinedChains.set(fixture.chains);
+            fixture.coordinator.startCapture("p", fixture.store.artifacts(), "writer-p");
+            fixture.coordinator.activateSnapshot("p");
+            var logicalMetadata = fixture.store.meta().read(logicalChain.get().value()).orElseThrow();
+            assertThat(fixture.coordinator.isActive("p")).isTrue();
+            assertThat(tailOpens).hasValue(0);
+            fixture.allowCapture.set(true);
+
+            fixture.coordinator.tailWhatNobodyTails();
+
+            assertThat(returnedTails).hasSize(1);
+            assertThat(activationFailure.getSuppressed()).containsExactly(closeFailure);
+            assertThat(firstCloses).hasValue(1);
+            assertThat(firstEnded).isFalse();
+            assertThat(logicalCloses).hasValue(0);
+            assertThat(fixture.store.meta().read(logicalChain.get().value())).contains(logicalMetadata);
+            fixture.coordinator.widenTheReadersHere();
+            assertThat(widened).as("an unpublished refused tail is not a serving owner").hasValue(0);
+
+            fixture.coordinator.tailWhatNobodyTails();
+
+            assertThat(firstCloses).as("the next maintenance must reach the same returned tail handle").hasValue(2);
+            assertThat(firstEnded).isTrue();
+            assertThat(logicalCloses).as("the joined consumer outlives cleanup of the refused tail").hasValue(0);
+            assertThat(stillAttachedWhenCloseRetried).as("close confirmation precedes reopen or logical release").isTrue();
+            assertThat(fixture.store.meta().read(logicalChain.get().value())).contains(logicalMetadata);
+            if (tailOpens.get() == 1) { fixture.coordinator.tailWhatNobodyTails(); }
+            assertThat(tailOpens).hasValue(2);
+            assertThat(returnedTails).hasSize(2);
+            assertThat(order.indexOf("first-ended")).isLessThan(order.indexOf("tail-open-2"));
+            assertThat(replacementEnded).isFalse();
+            assertThat(fixture.coordinator.isActive("p")).isTrue();
+
+            fixture.coordinator.stopCapture("p", false);
+
+            assertThat(logicalCloses).hasValue(1);
+            assertThat(replacementCloses).hasValue(1);
+            assertThat(replacementEnded).isTrue();
+            assertThat(firstCloses).hasValue(2);
+            assertThat(fixture.coordinator.hasActiveCapture("p")).isFalse();
+            fixture.coordinator.tailWhatNobodyTails();
+            assertThat(tailOpens).hasValue(2);
+        } finally {
+            // Fixture-owned fallback cleanup cannot turn a failed maintenance assertion into evidence.
+            returnedTails.forEach(CaptureRun::close);
+        }
+    }
+
+    @Test
+    void aNormalStopRetriesAnUnpublishedTailAndRetainsItsConsumerUntilCloseSucceeds() {
+        try (UnpublishedTailCloseFixture fixture = new UnpublishedTailCloseFixture(2)) {
+            fixture.openAndRejectTakeover();
+
+            assertThatThrownBy(() -> fixture.joined.coordinator.stopCapture("p", false))
+                    .isSameAs(fixture.closeFailure);
+
+            fixture.assertUnconfirmed(2);
+            fixture.joined.coordinator.stopCapture("p", false);
+
+            fixture.assertClosed(3);
+            fixture.joined.coordinator.tailWhatNobodyTails();
+            assertThat(fixture.tailOpens).hasValue(1);
+        }
+    }
+
+    @Test
+    void contextShutdownRetriesAnUnpublishedTailBeforeReleasingItsLogicalConsumer() {
+        try (UnpublishedTailCloseFixture fixture = new UnpublishedTailCloseFixture(1)) {
+            fixture.openAndRejectTakeover();
+
+            fixture.joined.coordinator.close();
+
+            fixture.assertClosed(2);
+            assertThat(fixture.joined.coordinator.shutdownComplete()).isTrue();
+            fixture.joined.coordinator.tailWhatNobodyTails();
+            assertThat(fixture.tailOpens).hasValue(1);
+        }
+    }
+
+    private static final class UnpublishedTailCloseFixture implements AutoCloseable {
+        private record CloseEvidence(int logicalCloses, int tailOpens, boolean consumerAttached,
+                Optional<io.tapstate.spi.store.SrsMeta> metadata) { }
+
+        private final AtomicInteger refusals;
+        private final AtomicInteger tailOpens = new AtomicInteger(), tailCloses = new AtomicInteger();
+        private final AtomicInteger logicalCloses = new AtomicInteger();
+        private final AtomicBoolean tailEnded = new AtomicBoolean();
+        private final List<CaptureRun> returnedTails = new java.util.concurrent.CopyOnWriteArrayList<>();
+        private final List<CloseEvidence> closeEvidence = new java.util.concurrent.CopyOnWriteArrayList<>();
+        private final List<String> order = new java.util.concurrent.CopyOnWriteArrayList<>();
+        private final TapstateException activationFailure = new TapstateException(
+                io.tapstate.adapters.pdk.ConnectorError.CAPTURE_FAILED,
+                Map.of("connector", "mysql", "detail", "controlled unpublished takeover activation refusal"), null);
+        private final TapstateException closeFailure = new TapstateException(
+                io.tapstate.adapters.pdk.ConnectorError.CAPTURE_FAILED,
+                Map.of("connector", "mysql", "detail", "controlled unpublished takeover close refusal"), null);
+        private final JoinedOwnerFixture joined;
+        private MiningChainId chain;
+        private String consumer;
+        private io.tapstate.spi.store.SrsMeta retainedMetadata;
+
+        private UnpublishedTailCloseFixture(int refusedCloses) {
+            refusals = new AtomicInteger(refusedCloses);
+            joined = new JoinedOwnerFixture(false, false, this::attach);
+        }
+
+        private CaptureRun attach(CaptureRunSpec spec, io.tapstate.runtime.srs.CaptureHandoff handoff,
+                boolean startTail) {
+            if (!startTail) {
+                chain = spec.miningChainId();
+                consumer = spec.consumerId();
+                joined.chains.joinSource(spec.sourceId(), chain, spec.config().streams());
+                joined.chains.attachConsumer(chain, consumer);
+                io.tapstate.runtime.srs.SnapshotActivation logical = new io.tapstate.runtime.srs.SnapshotActivation() {
+                    private boolean closed;
+                    @Override public void activateSnapshot() { }
+                    @Override public void close() {
+                        if (closed) { return; }
+                        closed = true;
+                        logicalCloses.incrementAndGet();
+                        order.add("logical-ended");
+                    }
+                };
+                return new CaptureRun(Optional.of(chain), false, 0L, Optional.empty(), Optional.of(logical),
+                        new CaptureHealth());
+            }
+            tailOpens.incrementAndGet();
+            io.tapstate.runtime.srs.SnapshotActivation exact = new io.tapstate.runtime.srs.SnapshotActivation() {
+                private boolean closed;
+                @Override public void activateSnapshot() { throw activationFailure; }
+                @Override public void close() {
+                    if (closed) { return; }
+                    tailCloses.incrementAndGet();
+                    closeEvidence.add(new CloseEvidence(logicalCloses.get(), tailOpens.get(),
+                            joined.chains.isProvisioned(chain) && joined.chains.affectedConsumers(chain).contains(consumer),
+                            joined.store.meta().read(chain.value())));
+                    if (refusals.getAndUpdate(remaining -> Math.max(0, remaining - 1)) > 0) { throw closeFailure; }
+                    closed = true;
+                    tailEnded.set(true);
+                    order.add("tail-ended");
+                }
+            };
+            CaptureRun actual = new CaptureRun(Optional.of(spec.miningChainId()), false, 0L, Optional.empty(),
+                    Optional.of(exact), new CaptureHealth());
+            returnedTails.add(actual);
+            return actual;
+        }
+
+        private void openAndRejectTakeover() {
+            joined.coordinator.startCapture("p", joined.store.artifacts(), "writer-p");
+            joined.coordinator.activateSnapshot("p");
+            retainedMetadata = joined.store.meta().read(chain.value()).orElseThrow();
+            assertThat(joined.chains.affectedConsumers(chain)).containsExactly(consumer);
+            joined.allowCapture.set(true);
+
+            joined.coordinator.tailWhatNobodyTails();
+
+            assertThat(activationFailure.getSuppressed()).containsExactly(closeFailure);
+            assertThat(returnedTails).hasSize(1);
+            assertUnconfirmed(1);
+        }
+
+        private void assertUnconfirmed(int attempts) {
+            assertThat(tailCloses).hasValue(attempts);
+            assertThat(tailEnded).isFalse();
+            assertThat(logicalCloses).hasValue(0);
+            assertThat(tailOpens).hasValue(1);
+            assertThat(joined.coordinator.isActive("p")).isTrue();
+            assertThat(joined.coordinator.hasActiveCapture("p")).isTrue();
+            assertThat(joined.chains.affectedConsumers(chain)).containsExactly(consumer);
+            assertThat(joined.store.meta().read(chain.value())).contains(retainedMetadata);
+            assertBeforeConsumerRelease(attempts);
+        }
+
+        private void assertClosed(int attempts) {
+            assertThat(tailCloses).as("cleanup reaches only the original returned tail").hasValue(attempts);
+            assertThat(tailEnded).isTrue();
+            assertThat(logicalCloses).hasValue(1);
+            assertThat(tailOpens).hasValue(1);
+            assertThat(returnedTails).hasSize(1);
+            assertBeforeConsumerRelease(attempts);
+            assertThat(order).containsExactly("tail-ended", "logical-ended");
+            assertThat(joined.coordinator.hasActiveCapture("p")).isFalse();
+            assertThat(joined.chains.isProvisioned(chain)).isFalse();
+            assertThat(joined.store.meta().read(chain.value())).isPresent();
+        }
+
+        private void assertBeforeConsumerRelease(int attempts) {
+            assertThat(closeEvidence).hasSize(attempts).allSatisfy(evidence -> {
+                assertThat(evidence.logicalCloses()).isZero();
+                assertThat(evidence.tailOpens()).isEqualTo(1);
+                assertThat(evidence.consumerAttached()).isTrue();
+                assertThat(evidence.metadata()).contains(retainedMetadata);
+            });
+        }
+
+        @Override public void close() {
+            refusals.set(0);
+            try { joined.close(); }
+            finally {
+                // Only fixture-owned fallback cleanup runs after the evidence assertions.
+                returnedTails.forEach(CaptureRun::close);
+            }
+        }
+    }
+
     /** Controlled scope/permit inputs isolate the coordinator; they are not native claim or Job receipts. */
     private static final class JoinedOwnerFixture implements AutoCloseable {
         private final InMemoryStorePort store;
@@ -2499,6 +2772,10 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         private final StoreBackedPipelineCaptureCoordinator coordinator;
 
         private JoinedOwnerFixture(boolean shared, boolean actualUnit) {
+            this(shared, actualUnit, null);
+        }
+
+        private JoinedOwnerFixture(boolean shared, boolean actualUnit, CaptureAttacher attachmentOverride) {
             InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
             for (String pipeline : shared ? List.of("p", "q") : List.of("p")) {
                 String source = "src_" + pipeline;
@@ -2544,6 +2821,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
             } else { workers = null; unit = null; }
             CaptureAttacher attacher = (spec, handoff, startTail) -> {
                 if (startTail) { tailSpecs.add(spec); }
+                if (attachmentOverride != null) { return attachmentOverride.start(spec, handoff, startTail); }
                 if (unit != null) { return unit.begin(spec, handoff, startTail); }
                 CaptureHealth health = new CaptureHealth();
                 io.tapstate.runtime.srs.SnapshotActivation deferred = new io.tapstate.runtime.srs.SnapshotActivation() {

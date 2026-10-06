@@ -99,6 +99,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     private final SnapshotBuffer snapshotBuffer;
     private final Map<String, List<PipelineRun>> runsByPipeline = new ConcurrentHashMap<>();
     private final Map<CaptureId, OwnedCapture> ownedCaptures = new ConcurrentHashMap<>();
+    /** One refused unpublished tail per capture, retained until its exact native handle closes. */
+    private final Map<CaptureId, UnpublishedCapture> unpublishedCaptures = new ConcurrentHashMap<>();
     private final KeyedLocks<String> pipelineLocks = new KeyedLocks<>();
     private final KeyedLocks<CaptureId> captureLocks = new KeyedLocks<>();
     private final Map<String, PendingStart> pendingStarts = new ConcurrentHashMap<>();
@@ -670,6 +672,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         for (SourcePlan plan : plans) {
             pending.check();
             CaptureId captureId = plan.captureId();
+            if (managedOwnership) { closeUnpublishedCapture(captureId); }
             if (managedOwnership && !ownedCaptures.containsKey(captureId) && !permits.containsKey(captureId)) {
                 CaptureOwnership.Permit permit = permitOrNotYet(pipelineId, captureId, plan.spec());
                 try {
@@ -936,6 +939,24 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         }
     }
 
+    /** Cleanup evidence only: an unpublished tail never serves, reports or purges as a normal owner. */
+    private final class UnpublishedCapture {
+        private final CaptureRun run;
+        private final OpeningClaim opening;
+        private final CaptureRunSpec spec;
+        private final Set<String> pipelines;
+        private final CloseState nativeClose = new CloseState();
+        private final CloseState leaseClose = new CloseState();
+
+        private UnpublishedCapture(CaptureRun run, OpeningClaim opening, CaptureRunSpec spec,
+                Collection<String> pipelines) {
+            this.run = Objects.requireNonNull(run, "run");
+            this.opening = Objects.requireNonNull(opening, "opening");
+            this.spec = Objects.requireNonNull(spec, "spec");
+            this.pipelines = Set.copyOf(pipelines);
+        }
+    }
+
     /**
      * A capture pipelines here read while another member tails it: those pipelines, and what this member
      * would open the tail with should nobody else be tailing it. That tail reads no load -- each of the
@@ -998,13 +1019,21 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      */
     void tailWhatNobodyTails() {
         if (closing) { return; }
-        for (CaptureId captureId : List.copyOf(joinedCaptures.keySet())) {
+        Set<CaptureId> captures = new LinkedHashSet<>(joinedCaptures.keySet());
+        captures.addAll(unpublishedCaptures.keySet());
+        for (CaptureId captureId : captures) {
             // A slow start on one capture cannot hold the takeover pass or another capture behind it.
             KeyedLocks.Hold<CaptureId> hold = captureLocks.tryAcquire(captureId);
             if (hold == null) {
                 continue;
             }
             try (hold) {
+                try {
+                    closeUnpublishedCapture(captureId);
+                } catch (RuntimeException unclosed) {
+                    LOG.warn("Could not confirm close of capture {}; asking again later", captureId.value(), unclosed);
+                    continue;
+                }
                 JoinedCapture capture = joinedCaptures.get(captureId);
                 if (capture == null || !capture.tails) {
                     continue;
@@ -1024,9 +1053,10 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                     throw failure;
                 }
                 CaptureRun tail = null;
+                CaptureRunSpec tailSpec = null;
                 try {
                     opening.check();
-                    CaptureRunSpec tailSpec = reader.tailSpec().withCaptureFence(permit.fence());
+                    tailSpec = reader.tailSpec().withCaptureFence(permit.fence());
                     tail = captureAttacher.start(tailSpec, reader.logical.handoff, true);
                     opening.check();
                     List<PipelineRun> current = runsByPipeline.get(reader.logical.spec.pipelineId());
@@ -1047,16 +1077,19 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 } catch (RuntimeException | Error failure) {
                     boolean interrupted = Thread.interrupted();
                     if (tail != null && opening.published == null) {
+                        UnpublishedCapture rejected = rememberUnpublishedCapture(
+                                captureId, tail, opening, tailSpec, capture.pipelines);
                         try {
-                            tail.close();
+                            closeUnpublishedCapture(captureId, rejected);
                         } catch (RuntimeException unclosed) {
-                            failure.addSuppressed(unclosed);
+                            if (unclosed != failure) { failure.addSuppressed(unclosed); }
                         }
-                    }
-                    try {
-                        opening.close();
-                    } catch (RuntimeException unreleased) {
-                        failure.addSuppressed(unreleased);
+                    } else {
+                        try {
+                            opening.close();
+                        } catch (RuntimeException unreleased) {
+                            if (unreleased != failure) { failure.addSuppressed(unreleased); }
+                        }
                     }
                     LOG.warn("Could not open the tail of capture {} for pipelines {} here; asking again later",
                             captureId.value(), capture.pipelines, failure);
@@ -1161,6 +1194,13 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                     PendingStart pending = pendingStarts.get(pipeline);
                     work.add(new ShutdownWork(pipeline, () -> closeExpectedPipeline(pipeline, expected, pending)));
                 }
+                for (var entry : unpublishedCaptures.entrySet()) {
+                    CaptureId capture = entry.getKey(); UnpublishedCapture expected = entry.getValue();
+                    boolean covered = java.util.stream.Stream.concat(runsByPipeline.values().stream(), abortedRunsByPipeline.values().stream())
+                            .flatMap(List::stream)
+                            .anyMatch(run -> run.managed && capture.equals(run.captureId));
+                    if (!covered) { work.add(new ShutdownWork(capture.value(), () -> closeExpectedUnpublished(capture, expected))); }
+                }
                 for (var entry : ownedCaptures.entrySet()) {
                     CaptureId capture = entry.getKey(); OwnedCapture expected = entry.getValue();
                     boolean covered = java.util.stream.Stream.concat(runsByPipeline.values().stream(), abortedRunsByPipeline.values().stream())
@@ -1191,6 +1231,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
 
     private void closeExpectedPipeline(String pipeline, List<PipelineRun> expected, PendingStart pending) {
         try (KeyedLocks.Hold<String> ignored = pipelineLocks.acquireInterruptibly(pipeline)) {
+            if (expected == null || expected.isEmpty()) { closeUnpublishedForPipeline(pipeline); }
             if (expected != null && runsByPipeline.get(pipeline) == expected) {
                 List<KeyedLocks.Hold<CaptureId>> held = lockCaptures(expected.stream().filter(PipelineRun::managed)
                         .map(PipelineRun::captureId).toList(), true);
@@ -1233,6 +1274,12 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             snapshotBuffer.release(pipeline);
             abortedRunsByPipeline.remove(pipeline, expected);
         } finally { releaseCaptures(held); }
+    }
+
+    private void closeExpectedUnpublished(CaptureId capture, UnpublishedCapture expected) {
+        try (KeyedLocks.Hold<CaptureId> ignored = captureLocks.acquireInterruptibly(capture)) {
+            closeUnpublishedCapture(capture, expected);
+        }
     }
 
     private void closeExpectedOrphan(CaptureId capture, OwnedCapture expected) {
@@ -1304,6 +1351,9 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         }
         if (completed < work.size()) {
             failure = combineShutdownFailure(failure, incompleteShutdown(work.size() - completed, null));
+        }
+        if (!unpublishedCaptures.isEmpty()) {
+            failure = combineShutdownFailure(failure, incompleteShutdown(unpublishedCaptures.size(), null));
         }
         if (failure != null) { throwShutdownFailure(failure); }
     }
@@ -1793,6 +1843,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         // absent handle is what made the verb report success and take nothing, in the one state a caller
         // reaches for it most: after a run has died.
         List<PipelineRun> runs = Objects.requireNonNullElse(runsByPipeline.get(pipelineId), List.of());
+        if (runs.isEmpty()) { closeUnpublishedForPipeline(pipelineId); }
         List<KeyedLocks.Hold<CaptureId>> captureHolds = lockCaptures(runs.stream()
                 .filter(PipelineRun::managed).map(PipelineRun::captureId).toList(), false);
         try {
@@ -2003,6 +2054,50 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         actual.close();
     }
 
+    private UnpublishedCapture rememberUnpublishedCapture(CaptureId captureId, CaptureRun run,
+            OpeningClaim opening, CaptureRunSpec spec, Collection<String> pipelines) {
+        UnpublishedCapture rejected = new UnpublishedCapture(run, opening, spec, pipelines);
+        synchronized (startGate) {
+            if (unpublishedCaptures.putIfAbsent(captureId, rejected) != null) {
+                throw new IllegalStateException("a capture already holds an unpublished native tail");
+            }
+        }
+        return rejected;
+    }
+
+    /** Called with the capture lock held; failed close keeps this same reference for the next caller. */
+    private void closeUnpublishedCapture(CaptureId captureId) {
+        UnpublishedCapture expected = unpublishedCaptures.get(captureId);
+        if (expected != null) { closeUnpublishedCapture(captureId, expected); }
+    }
+
+    private void closeUnpublishedCapture(CaptureId captureId, UnpublishedCapture expected) {
+        if (unpublishedCaptures.get(captureId) != expected) { return; }
+        Throwable failure = null;
+        try { closeOnce(expected.nativeClose, () -> closeCaptureRun(expected.run)); }
+        catch (RuntimeException | Error refused) { failure = refused; }
+        // Release the original lease even when native end is unconfirmed, so old writes remain fenced.
+        try { closeOnce(expected.leaseClose, expected.opening::close); }
+        catch (RuntimeException | Error refused) { failure = combineShutdownFailure(failure, refused); }
+        if (failure != null) { throwShutdownFailure(failure); }
+        unpublishedCaptures.remove(captureId, expected);
+    }
+
+    private void closeUnpublishedForPipeline(String pipelineId) {
+        List<Map.Entry<CaptureId, UnpublishedCapture>> captured = unpublishedCaptures.entrySet().stream()
+                .filter(entry -> entry.getValue().pipelines.contains(pipelineId))
+                .sorted(Map.Entry.comparingByKey(Comparator.comparing(CaptureId::value))).toList();
+        Throwable failure = null;
+        for (var entry : captured) {
+            try (KeyedLocks.Hold<CaptureId> ignored = captureLocks.acquireInterruptibly(entry.getKey())) {
+                closeUnpublishedCapture(entry.getKey(), entry.getValue());
+            } catch (RuntimeException | Error refused) {
+                failure = combineShutdownFailure(failure, refused);
+            }
+        }
+        if (failure != null) { throwShutdownFailure(failure); }
+    }
+
     private void closeOwnedCapture(OwnedCapture expected) {
         Throwable failure = null;
         try { closeOnce(expected.nativeClose, () -> closeCaptureRun(expected.run)); }
@@ -2017,6 +2112,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             closeCaptureRun(pipelineRun.run);
             return;
         }
+        closeUnpublishedCapture(pipelineRun.captureId);
         OwnedCapture owned = ownedCaptures.get(pipelineRun.captureId);
         if (owned == null) {
             forgetJoined(pipelineRun.captureId, pipelineId);
