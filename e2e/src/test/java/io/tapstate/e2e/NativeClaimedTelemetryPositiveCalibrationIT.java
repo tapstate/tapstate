@@ -4,6 +4,7 @@ import com.mongodb.ConnectionString;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.MongoAuthStores;
+import io.tapstate.adapters.mongostore.MongoArtifactStore;
 import io.tapstate.adapters.mongostore.MongoClusterIdentityStore;
 import io.tapstate.adapters.mongostore.MongoObservationStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
@@ -19,6 +20,16 @@ import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.PipelineEvent;
+import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.model.SourceRef;
+import io.tapstate.core.model.TableRef;
+import io.tapstate.core.model.ReadMode;
+import io.tapstate.runtime.srs.CaptureId;
+import io.tapstate.runtime.srs.CaptureRunSpec;
+import io.tapstate.runtime.srs.MiningChainId;
+import io.tapstate.runtime.srs.StartFrom;
+import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.ObservationContinuation;
 import io.tapstate.spi.store.ObservationStore;
@@ -77,6 +88,10 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
     private static final String SOURCE = "native_claimed_source";
     private static final String TABLE = "native_claimed_orders";
     private record Positive(NativeTelemetryIdentityJdiSession.Boundary boundary, String body, String logNode) { }
+    private record DirectFixture(SourceResource source, PipelineResource pipeline, CaptureConfig config,
+            String srsKey, String chainId, String consumerId, Document sourceDocument, Document pipelineDocument) { }
+    private record DirectReady(DirectFixture fixture, WorkloadClaim pipeline, WorkloadClaim capture,
+            NativeTelemetryIdentityJdiSession.AuthorityReceipt receipt, long epoch, String anchor) { }
 
     @Test
     void aRealWarmClaimedSubmissionOffersProducesAndScrapesUnderItsActualOwner() throws Exception {
@@ -86,6 +101,11 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
     @Test
     void aRealIndependentClaimedSubmissionExposesItsActualSourceLogAndProducedTelemetry() throws Exception {
         runClaimedPositive(false, false, true);
+    }
+
+    @Test
+    void aRealIndependentCdcOnlySubmissionReadsAfterItsActualDurableStartAndExposesSourceTelemetry() throws Exception {
+        runClaimedPositive(false, false, true, true);
     }
 
     @Test
@@ -108,7 +128,12 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
     }
 
     private static void runClaimedPositive(boolean replacement, boolean continuing, boolean independent) throws Exception {
+        runClaimedPositive(replacement, continuing, independent, false);
+    }
+
+    private static void runClaimedPositive(boolean replacement, boolean continuing, boolean independent, boolean cdcOnly) throws Exception {
         assertThat(independent && replacement).as("the independent calibration is a warm submission").isFalse();
+        assertThat(cdcOnly && (!independent || continuing || replacement)).isFalse();
         Assumptions.assumeTrue(List.of("jar", "sha256", "output").stream()
                 .anyMatch(name -> System.getProperty(PREFIX + name) != null),
                 "the claimed positive calibration needs named immutable inputs");
@@ -119,7 +144,8 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
         BenchmarkCaptureCalibrationLiveRunIT.requireConnectors();
         Path harness = PipelineBenchmarkLiveRunIT.harnessRoot();
         Path requestedOutput = Path.of(required("output")).toAbsolutePath().normalize();
-        Path output = independent ? requestedOutput.resolveSibling(requestedOutput.getFileName() + ".independent.json")
+        Path output = cdcOnly ? requestedOutput.resolveSibling(requestedOutput.getFileName() + ".independent-cdc-only.json")
+                : independent ? requestedOutput.resolveSibling(requestedOutput.getFileName() + ".independent.json")
                 : continuing ? requestedOutput.resolveSibling(requestedOutput.getFileName() + ".continue.json")
                 : replacement ? requestedOutput.resolveSibling(requestedOutput.getFileName() + ".replacement.json") : requestedOutput;
         PipelineBenchmarkLiveRunIT.requireSafeOutput(output, harness);
@@ -154,15 +180,17 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                 }
             }
             MongoDatabase database = mongo.getDatabase(new ConnectionString(storeUri).getDatabase());
-            Map<String, String> resources = resources(settings, targetUri, independent);
-            report.begin(Map.of("purpose", independent ? "NATIVE_INDEPENDENT_CLAIMED_POSITIVE_TELEMETRY"
+            Map<String, String> resources = resources(settings, targetUri, independent, cdcOnly);
+            report.begin(Map.of("purpose", cdcOnly ? "NATIVE_INDEPENDENT_CDC_ONLY_CLAIMED_POSITIVE_TELEMETRY"
+                            : independent ? "NATIVE_INDEPENDENT_CLAIMED_POSITIVE_TELEMETRY"
                             : continuing ? "NATIVE_CLAIMED_PARTIAL_SNAPSHOT_CONTINUE_POSITIVE"
                             : replacement ? "NATIVE_CLAIMED_RESET_REPLACEMENT_POSITIVE" : "NATIVE_WARM_CLAIMED_POSITIVE_TELEMETRY",
                     "application", PipelineBenchmarkLiveRunIT.artifact(jar), "expectedJarSha256", sha,
                     "harness", inputs, "connectors", connectors, "clusterMembers", 2,
                     "fixtureResourceSha256", digest(JsonWriter.write(resources).getBytes(StandardCharsets.UTF_8)),
                     "performanceAcceptanceEligible", false, "warmOnly", !replacement,
-                    "captureProfile", independent ? "INDEPENDENT_SNAPSHOT_AND_CDC" : "SHARED_SNAPSHOT_AND_CDC"),
+                    "captureProfile", cdcOnly ? "INDEPENDENT_CDC_ONLY"
+                            : independent ? "INDEPENDENT_SNAPSHOT_AND_CDC" : "SHARED_SNAPSHOT_AND_CDC"),
                     PipelineBenchmarkLiveRunIT.environment(), List.of());
             String clusterId;
             try (var setup = RealProcessServer.start(storeUri, operatorDatabase, jar)) {
@@ -235,10 +263,35 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
             long nativeDeadline = setupDeadline;
             var historyEvents = continuing ? new TelemetryMongoIdentityWitness(database, latest, report, PIPELINE,
                     Instant.now().minusSeconds(1), WAIT) : null;
+            DirectFixture directFixture = cdcOnly ? freshDirectFixture(mongo, database) : null;
             cluster.first().lifecycle(PIPELINE, LifecycleVerb.START);
+            DirectReady directReady = cdcOnly ? awaitDirectReady(database, claims, key, memberBoots, directFixture,
+                    sessions, records, report, setupDeadline) : null;
             try (var target = MongoClients.create(targetUri)) {
                 MongoDatabase targetDatabase = target.getDatabase(new ConnectionString(targetUri).getDatabase());
-                if (continuing) {
+                if (cdcOnly) {
+                    assertThat(targetDatabase.getCollection(TABLE).countDocuments()).isZero();
+                    requireDirectReadyStable(database, claims, key, memberBoots, directReady);
+                    assertThat(source.getAutoCommit()).isTrue();
+                    try (var sql = source.createStatement()) {
+                        sql.execute("INSERT INTO " + TABLE + " (id,amount,payload) VALUES (4,400,'native-4')");
+                    }
+                    report.addFork(Map.of("action", "actual-cdc-only-insert-after-durable-start", "id", 4,
+                            "chainId", directReady.fixture().chainId(), "directEpoch", directReady.epoch(),
+                            "anchorSha256", digest(directReady.anchor().getBytes(StandardCharsets.UTF_8))));
+                    Await.until("only the actual post-anchor CDC row reaches Mongo", remaining(setupDeadline),
+                            () -> {
+                                requireDirectReadyStable(database, claims, key, memberBoots, directReady);
+                                captureContinueBoundaries(sessions, records, report, "claimed-independent-cdc-only-delivery");
+                                return targetDatabase.getCollection(TABLE).countDocuments() == 1;
+                            }, () -> "target rows=" + targetDatabase.getCollection(TABLE).countDocuments());
+                    List<Document> rows = targetDatabase.getCollection(TABLE).find().limit(2).into(new ArrayList<>());
+                    assertThat(rows).hasSize(1);
+                    assertThat(((Number) rows.getFirst().get("id")).longValue()).isEqualTo(4L);
+                    assertThat(((Number) rows.getFirst().get("amount")).longValue()).isEqualTo(400L);
+                    assertThat(rows.getFirst().getString("payload")).isEqualTo("native-4");
+                    requireDirectReadyStable(database, claims, key, memberBoots, directReady);
+                } else if (continuing) {
                     Await.until("real claimed partial snapshot has known counters and histogram", remaining(setupDeadline),
                             () -> {
                                 captureContinueBoundaries(sessions, records, report, "claimed-partial-snapshot");
@@ -359,9 +412,12 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                     new Document("clusterId", clusterId).append("resourceType", "PIPELINE_ACTUATION")
                             .append("resourceId", PIPELINE)).first();
             assertThat(claimDocument).isNotNull();
-            var receipt = new NativeTelemetryIdentityJdiSession.AuthorityReceipt(PIPELINE, clusterId,
+            var receipt = directReady != null ? directReady.receipt() : new NativeTelemetryIdentityJdiSession.AuthorityReceipt(PIPELINE, clusterId,
                     scope.pipelineIncarnationId(), scope.executionGeneration(), JsonWriter.write(claimDocument.get("_id")),
                     Instant.now().toString());
+            assertThat(receipt.scope()).isEqualTo(Map.of("incarnation", scope.pipelineIncarnationId(),
+                    "generation", scope.executionGeneration()));
+            String requiredSourceNode = directReady == null ? null : directReady.capture().owner().nodeId();
             for (var observer : sessions.values()) { observer.recordAuthority(receipt); }
             String emittingNode = claim.owner().nodeId();
             var owner = sessions.get(emittingNode);
@@ -489,7 +545,8 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                             predicates.put("job", has(observed, "JOB", receipt));
                             predicates.put("scopedLogOnAdmittedMember", logNode.isPresent());
                             if (!replacement) {
-                                predicates.put("nativeSourceStreamCaller", submission.members().stream()
+                                predicates.put("nativeSourceStreamCaller", (requiredSourceNode == null ? submission.members().stream()
+                                        : java.util.stream.Stream.of(requiredSourceNode))
                                         .anyMatch(node -> records.get(node).stream()
                                                 .anyMatch(record -> isSourceStreamLog(record, receipt))));
                             }
@@ -603,7 +660,8 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
             logEvidence.put("nodeSessionOwner", memberEvidence(afterBoots).get(logNode));
             report.addFork(logEvidence);
             if (!replacement) {
-                String sourceNode = submission.members().stream()
+                String sourceNode = (requiredSourceNode == null ? submission.members().stream()
+                        : java.util.stream.Stream.of(requiredSourceNode))
                         .filter(node -> records.get(node).stream().anyMatch(record -> isSourceStreamLog(record, receipt)))
                         .findFirst().orElseThrow(() -> new AssertionError("the admitted source log member is absent"));
                 List<Map<String, Object>> sourceLogs = records.get(sourceNode).stream()
@@ -616,6 +674,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                 sourceRead.put("sourceCallerVerified", true);
                 report.addFork(sourceRead);
             }
+            if (directReady != null) { requireDirectReadyStable(database, claims, key, memberBoots, directReady); }
             Map<String, Object> ownerEvidence = new LinkedHashMap<>(Map.of(
                     "action", "actual-claimed-admission-and-current-owner", "nodeId", emittingNode,
                     "claim", submission.claim(), "admissionObject", submission.admissionObjectId(),
@@ -656,7 +715,9 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                 assertThat(PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor(connector.getKey())))
                         .isEqualTo(connector.getValue());
             }
-            report.completeDiagnostic(Map.of("correctness", independent
+            report.completeDiagnostic(Map.of("correctness", cdcOnly
+                            ? "ACTUAL_INDEPENDENT_CDC_ONLY_DURABLE_START_ROW_SOURCE_LOG_AND_EMITTER_TELEMETRY"
+                            : independent
                             ? "ACTUAL_INDEPENDENT_CLAIMED_ADMISSION_SOURCE_LOG_AND_EMITTER_TELEMETRY"
                             : continuing
                             ? "ACTUAL_CLAIMED_PARTIAL_SNAPSHOT_CONTINUE_EXACT_FLOOR_AND_RAW"
@@ -1163,7 +1224,141 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
         }
     }
 
-    private static Map<String, String> resources(Map<String, Object> settings, String targetUri, boolean independent) {
+    private static DirectFixture freshDirectFixture(com.mongodb.client.MongoClient client, MongoDatabase database) {
+        var artifacts = new MongoArtifactStore(client, database.getCollection(MongoStorePort.ARTIFACTS));
+        var storedSource = artifacts.get(SOURCE).orElseThrow();
+        var storedPipeline = artifacts.get(PIPELINE).orElseThrow();
+        assertThat(storedSource).isInstanceOf(SourceResource.class);
+        assertThat(storedPipeline).isInstanceOf(PipelineResource.class);
+        SourceResource source = (SourceResource) storedSource;
+        PipelineResource pipeline = (PipelineResource) storedPipeline;
+        assertThat(source.connector()).isEqualTo("mysql");
+        assertThat(source.tables()).containsExactly(TableRef.literal(TABLE));
+        assertThat(pipeline.sources()).hasSize(1);
+        assertThat(pipeline.sources().getFirst()).isInstanceOf(SourceRef.Spec.class);
+        SourceRef.Spec selected = (SourceRef.Spec) pipeline.sources().getFirst();
+        assertThat(selected.id()).isEqualTo(SOURCE);
+        assertThat(selected.srs()).isFalse();
+        assertThat(pipeline.transforms()).isNullOrEmpty();
+        assertThat(pipeline.settings().readMode()).isEqualTo(ReadMode.CDC_ONLY);
+        CaptureConfig config = new CaptureConfig(source.connector(), source.config(), List.of(TABLE));
+        String srsKey = source.srs() == null ? null : source.srs().key();
+        String chainId = MiningChainId.forChannel(config, srsKey, PIPELINE, SOURCE).value();
+        String consumerId = SrsConsumerId.of(PIPELINE, SOURCE).value();
+        assertThat(database.getCollection(MongoStorePort.SRS_META).find(new Document("_id", chainId)).first())
+                .as("the fresh direct fixture has no prior source checkpoint").isNull();
+        assertThat(database.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS)
+                .find(directConsumerKey(chainId, consumerId)).first()).isNull();
+        return new DirectFixture(source, pipeline, config, srsKey, chainId, consumerId,
+                database.getCollection(MongoStorePort.ARTIFACTS).find(new Document("_id", SOURCE)).first(),
+                database.getCollection(MongoStorePort.ARTIFACTS).find(new Document("_id", PIPELINE)).first());
+    }
+
+    private static DirectReady awaitDirectReady(MongoDatabase database, MongoWorkloadClaimStore claims,
+            WorkloadClaimKey key, Map<String, WorkloadClaim> memberBoots, DirectFixture fixture,
+            Map<String, NativeTelemetryIdentityJdiSession> sessions, Map<String, List<Map<String, Object>>> records,
+            BenchmarkLiveReport report, long deadline) throws Exception {
+        WorkloadClaim pipeline = Await.answered("the actual positive leased CDC-only pipeline admission", remaining(deadline),
+                () -> claims.read(key).filter(reading -> reading.leased() && reading.claim().executionGeneration() > 0)
+                        .map(reading -> reading.claim()));
+        assertThat(pipeline.executionNodeIds()).containsExactlyInAnyOrder(TwoMemberCluster.NODE_A, TwoMemberCluster.NODE_B);
+        assertThat(memberBoots.get(pipeline.owner().nodeId()).owner()).isEqualTo(pipeline.owner());
+        Document claimDocument = database.getCollection(MongoStorePort.WORKLOAD_CLAIMS)
+                .find(new Document("clusterId", key.clusterId()).append("resourceType", key.type().name())
+                        .append("resourceId", key.resourceId())).first();
+        assertThat(claimDocument).isNotNull();
+        String incarnation = fixture.pipelineDocument().getString("pipelineIncarnationId");
+        assertThat(incarnation).isNotBlank();
+        var receipt = new NativeTelemetryIdentityJdiSession.AuthorityReceipt(PIPELINE, key.clusterId(), incarnation,
+                pipeline.executionGeneration(), JsonWriter.write(claimDocument.get("_id")), Instant.now().toString());
+        for (var session : sessions.values()) { session.recordAuthority(receipt); }
+        var submitted = Await.answered("the genuine CDC-only admission and native Job before input", remaining(deadline),
+                () -> {
+                    captureContinueBoundaries(sessions, records, report, "claimed-independent-cdc-only-job");
+                    return sessions.get(pipeline.owner().nodeId()).claimedSubmission(receipt);
+                });
+        assertThat(withoutLease(submitted.claim())).isEqualTo(claimTuple(pipeline));
+        assertThat(submitted.job().scope()).isEqualTo(receipt.scope());
+        assertThat(submitted.members()).containsExactlyInAnyOrder(TwoMemberCluster.NODE_A, TwoMemberCluster.NODE_B);
+        String start = fixture.pipeline().settings().startFrom();
+        String retention = fixture.source().srs() == null ? null : fixture.source().srs().retention();
+        // This model selects an exact lookup key; no reconstructed spec is installed in the product.
+        var specification = new CaptureRunSpec(fixture.config(), ReadMode.CDC_ONLY, fixture.srsKey(), false,
+                SOURCE, PIPELINE, StartFrom.parse(start == null ? "latest" : start), retention, 0L,
+                pipeline.executionGeneration()).withConsumerId(fixture.consumerId());
+        WorkloadClaimKey captureKey = new WorkloadClaimKey(key.clusterId(), WorkloadClaimType.CAPTURE,
+                CaptureId.of(specification).value());
+        WorkloadClaim capture = Await.answered("the actual managed direct CAPTURE lease", remaining(deadline),
+                () -> claims.read(captureKey).filter(reading -> reading.leased()).map(reading -> reading.claim()));
+        assertThat(submitted.members()).contains(capture.owner().nodeId());
+        assertThat(memberBoots.get(capture.owner().nodeId()).owner()).isEqualTo(capture.owner());
+        DirectReady ready = Await.answered("the fresh actual onStart anchor is durable in its direct epoch", remaining(deadline),
+                () -> {
+                    captureContinueBoundaries(sessions, records, report, "claimed-independent-cdc-only-anchor");
+                    Document cursor = database.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS)
+                            .find(directConsumerKey(fixture.chainId(), fixture.consumerId())).first();
+                    Document root = database.getCollection(MongoStorePort.SRS_META)
+                            .find(new Document("_id", fixture.chainId())).first();
+                    if (cursor == null || root == null || !(cursor.get("directAnchor") instanceof String anchor)
+                            || anchor.isBlank()) { return Optional.empty(); }
+                    assertThat(cursor.getString("progressKind")).isEqualTo("DIRECT_SOURCE");
+                    assertThat(cursor.get("directEpoch")).isInstanceOf(Long.class);
+                    assertThat(root.get("epoch")).isInstanceOf(Long.class);
+                    long epoch = cursor.getLong("directEpoch");
+                    assertThat(epoch).isPositive().isEqualTo(root.getLong("epoch"));
+                    DirectReady observed = new DirectReady(fixture, pipeline, capture, receipt, epoch, anchor);
+                    requireDirectReadyStable(database, claims, key, memberBoots, observed);
+                    return Optional.of(observed);
+                });
+        report.addFork(Map.of("action", "actual-cdc-only-durable-start-before-input", "scope", receipt.scope(),
+                "job", submitted.job().job(), "pipelineClaim", claimTuple(pipeline), "captureClaim", claimTuple(capture),
+                "chainId", fixture.chainId(), "consumerId", fixture.consumerId(), "directEpoch", ready.epoch(),
+                "anchorSha256", digest(ready.anchor().getBytes(StandardCharsets.UTF_8)),
+                "artifactHashes", Map.of("source", fixture.sourceDocument().getString("contentHash"),
+                        "pipeline", fixture.pipelineDocument().getString("contentHash"))));
+        return ready;
+    }
+
+    private static void requireDirectReadyStable(MongoDatabase database, MongoWorkloadClaimStore claims,
+            WorkloadClaimKey key, Map<String, WorkloadClaim> memberBoots, DirectReady ready) {
+        DirectFixture fixture = ready.fixture();
+        assertThat(database.getCollection(MongoStorePort.ARTIFACTS).find(new Document("_id", SOURCE)).first())
+                .isEqualTo(fixture.sourceDocument());
+        assertThat(database.getCollection(MongoStorePort.ARTIFACTS).find(new Document("_id", PIPELINE)).first())
+                .isEqualTo(fixture.pipelineDocument());
+        assertThat(claims.currentGeneration(key.clusterId(), PIPELINE)).hasValue(ready.pipeline().executionGeneration());
+        for (WorkloadClaim expected : List.of(ready.pipeline(), ready.capture())) {
+            WorkloadClaim actual = claims.read(expected.key()).filter(reading -> reading.leased()).orElseThrow().claim();
+            assertThat(claimTuple(actual)).isEqualTo(claimTuple(expected));
+            WorkloadClaim boot = claims.read(new WorkloadClaimKey(key.clusterId(), WorkloadClaimType.NODE_SESSION,
+                    actual.owner().nodeId())).filter(reading -> reading.leased()).orElseThrow().claim();
+            assertThat(boot.owner()).isEqualTo(actual.owner());
+            assertThat(claimTuple(boot)).isEqualTo(claimTuple(memberBoots.get(actual.owner().nodeId())));
+        }
+        Document root = database.getCollection(MongoStorePort.SRS_META)
+                .find(new Document("_id", fixture.chainId())).first();
+        Document cursor = database.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS)
+                .find(directConsumerKey(fixture.chainId(), fixture.consumerId())).first();
+        assertThat(root).isNotNull(); assertThat(cursor).isNotNull();
+        assertThat(root.get("epoch")).isEqualTo(ready.epoch());
+        assertThat(cursor.getString("miningChainId")).isEqualTo(fixture.chainId());
+        assertThat(cursor.getString("pipelineId")).isEqualTo(fixture.consumerId());
+        assertThat(cursor.getString("ownerPipelineId")).isEqualTo(PIPELINE);
+        assertThat(cursor.getString("sourceNodeId")).isEqualTo(SOURCE);
+        assertThat(cursor.getString("progressKind")).isEqualTo("DIRECT_SOURCE");
+        assertThat(cursor.get("directEpoch")).isEqualTo(ready.epoch());
+        assertThat(cursor.getString("directAnchor")).isEqualTo(ready.anchor());
+        for (WorkloadClaim expected : List.of(ready.pipeline(), ready.capture())) {
+            assertThat(claimTuple(claims.read(expected.key()).filter(reading -> reading.leased()).orElseThrow().claim()))
+                    .isEqualTo(claimTuple(expected));
+        }
+    }
+
+    private static Document directConsumerKey(String chainId, String consumerId) {
+        return new Document("_id", new Document("chain", chainId).append("pipeline", consumerId));
+    }
+
+    private static Map<String, String> resources(Map<String, Object> settings, String targetUri, boolean independent, boolean cdcOnly) {
         return Map.of(SOURCE + ".tap.yml", """
                 version: tapstate/v1
                 kind: source
@@ -1185,12 +1380,12 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                 kind: pipeline
                 id: native_claimed_copy
                 %s
-                settings: { read_mode: snapshot_and_cdc }
+                settings: { read_mode: %s }
                 serve:
                   from: native_claimed_orders
                   sync: [ { source: native_claimed_target } ]
                 """.formatted(independent ? "source:\n  - { id: native_claimed_source, srs: false }"
-                        : "source: native_claimed_source"));
+                        : "source: native_claimed_source", cdcOnly ? "cdc_only" : "snapshot_and_cdc"));
     }
 
     private static Map<String, Object> inputHashes(Path root, boolean continuing) throws Exception {
@@ -1207,6 +1402,15 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                 byte[] bytes = stream.readNBytes(MAX_BYTES + 1);
                 assertThat(bytes.length).isLessThanOrEqualTo(MAX_BYTES);
                 result.put(type.getSimpleName() + "ExecutingClassSha256", digest(bytes));
+            }
+        }
+        for (String name : List.of("DirectFixture", "DirectReady")) {
+            String nested = NativeClaimedTelemetryPositiveCalibrationIT.class.getSimpleName() + "$" + name;
+            try (InputStream stream = NativeClaimedTelemetryPositiveCalibrationIT.class.getResourceAsStream(nested + ".class")) {
+                assertThat(stream).isNotNull();
+                byte[] bytes = stream.readNBytes(MAX_BYTES + 1);
+                assertThat(bytes.length).isLessThanOrEqualTo(MAX_BYTES);
+                result.put(nested + "ExecutingClassSha256", digest(bytes));
             }
         }
         return Map.copyOf(result);
