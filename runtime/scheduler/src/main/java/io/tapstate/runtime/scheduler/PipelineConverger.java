@@ -75,7 +75,10 @@ public final class PipelineConverger {
                 && actualDoc.map(CheckpointDoc::epoch).orElse(-1L).equals(stampedAt);
         boolean rebuild = reassemble && (stampedAt == null || rebuildOwed);
 
-        if (target == PipelineState.RUNNING && actual == PipelineState.RUNNING) {
+        // An owed restart must reach the fenced stop/start below before checking the old run.
+        // Recording that run's failure would advance the epoch without carrying out the restart,
+        // consuming its accepted start and any clearing the user requested.
+        if (target == PipelineState.RUNNING && actual == PipelineState.RUNNING && !rebuildOwed) {
             // A pipeline believed running whose job has died converges to the observable FAILED state,
             // rather than reporting RUNNING over a dead job. The failure cause rides out on the result so
             // the driver can surface it. A converge-side transition, never a user verb.
