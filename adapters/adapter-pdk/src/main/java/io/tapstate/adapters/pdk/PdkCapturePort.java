@@ -909,8 +909,12 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
                 return null;
             });
         } catch (Throwable t) {
-            if (t instanceof CancellationException && delivery.closed) {
-                // Consumer cancellation is the requested stop, not a connector failure to publish.
+            if (delivery.closed && !(t instanceof VirtualMachineError)) {
+                // A closed stream stopped because it was asked to, whatever it throws on the way down. The
+                // interrupt the close sends breaks off whatever the batch is waiting in, and that answers in
+                // its own words: a store write with its driver's exception, a source with one it wraps the
+                // hand-over's failure in. Nothing reads a closed stream's failures, and publishing one fails
+                // every pipeline on the capture -- a widening closes the stream it is replacing.
                 return;
             }
             // The cdc stream runs on this daemon thread; its failure cannot be returned to the caller, so it
