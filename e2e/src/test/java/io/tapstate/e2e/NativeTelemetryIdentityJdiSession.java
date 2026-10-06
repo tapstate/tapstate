@@ -551,6 +551,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             if (qualified) {
                 try {
                     entry(spec, receiver, arguments, mirror, entry);
+                    if (spec.target() == Target.LOG) { entry.put("callers", logCallers(frames)); }
                     if (evidenceBytes(entry, 0) > MAX_RECORD_BYTES) {
                         entry.clear();
                         throw new NativeTelemetryMirror.Unavailable("ENTRY_RECORD_BYTE_BUDGET");
@@ -585,6 +586,44 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             exit.putProperty("native-identity-call", call.id);
             exit.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD); call.exit = exit; exit.enable();
         }
+    }
+
+    /**
+     * Complete caller rows: type, method, descriptor, code index, loader id, loader type, origin,
+     * provenance and code SHA. String positions index a record-local table; -1 preserves absence.
+     * The second array retains every frame in consecutive groups of nine columns.
+     */
+    private List<Object> logCallers(List<StackFrame> frames) throws Exception {
+        Map<String, Integer> strings = new LinkedHashMap<>();
+        List<Object> callers = new ArrayList<>();
+        for (StackFrame frame : frames) {
+            Method method = frame.location().method();
+            ReferenceType type = method.declaringType();
+            String name = type.name();
+            ClassLoaderReference loader = type.classLoader();
+            Image image = images.get(name);
+            String origin = image == null ? null : image.origin();
+            String provenance = "UNVERIFIED_CALLER_METHOD";
+            String codeSha256 = null;
+            byte[] expected = image == null ? null : image.methods().get(method.name() + method.signature());
+            if (loader != null && loader.uniqueID() == loaderId && LOADER.equals(loader.referenceType().name())
+                    && !method.isNative() && !method.isAbstract() && !method.isObsolete() && expected != null) {
+                validate(type);
+                byte[] actual = method.bytecodes();
+                if (!Arrays.equals(expected, actual)) { throw invalid("log caller differs from selected input artifact"); }
+                provenance = "EXACT_ARTIFACT_METHOD"; codeSha256 = hash(actual);
+            }
+            callers.addAll(List.of(callerString(strings, name), callerString(strings, method.name()),
+                    callerString(strings, method.signature()),
+                    frame.location().codeIndex(), loader == null ? -1L : loader.uniqueID(),
+                    callerString(strings, loader == null ? "BOOTSTRAP" : loader.referenceType().name()),
+                    callerString(strings, origin), callerString(strings, provenance), callerString(strings, codeSha256)));
+        }
+        return List.of(List.copyOf(strings.keySet()), List.copyOf(callers));
+    }
+
+    private static int callerString(Map<String, Integer> strings, String value) {
+        return value == null ? -1 : strings.computeIfAbsent(value, ignored -> strings.size());
     }
 
     private AssertionError returnCorrelationFailure(BreakpointEvent event, Site site,
@@ -1554,7 +1593,9 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             throw invalid("phase or record byte budget exceeded: target=" + record.get("target")
                     + ", recordBytes=" + bytes + ", maxRecordBytes=" + recordLimit
                     + ", phaseBytes=" + phaseBytes + ", maxPhaseBytes=" + MAX_PHASE_BYTES
-                    + ", retainedRecords=" + records.size());
+                    + ", retainedRecords=" + records.size()
+                    + ", callerBytes=" + evidenceBytes(record.get("callers"), 0)
+                    + ", messageBytes=" + evidenceBytes(record.get("message"), 0));
         }
         phaseBytes += bytes;
         records.add(Collections.unmodifiableMap(new LinkedHashMap<>(record)));
@@ -1689,6 +1730,9 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                 "io.tapstate.runtime.engine.Engine$ExecutionJob", "io.tapstate.spi.store.StopReservation$JobIdentity",
                 "io.tapstate.spi.store.ObservationStore$Scope", "io.tapstate.core.logging.LogSink$Scope",
                 "io.tapstate.core.logging.LogLine", "io.tapstate.spi.metrics.MetricsExport$ScopeToken",
+                "io.tapstate.adapters.pdk.PdkCapturePort", "io.tapstate.adapters.pdk.PdkConnector",
+                "io.tapstate.adapters.pdk.ConnectorLog", "io.tapstate.adapters.pdk.PdkSinkWriter",
+                "io.tapstate.app.PipelineLogAppender", "io.tapstate.app.ConvergenceDriver",
                 "io.tapstate.core.lifecycle.MetricFact", "io.tapstate.core.lifecycle.MetricPoint",
                 "io.tapstate.core.lifecycle.MetricType", "io.tapstate.core.lifecycle.PipelineState",
                 "io.tapstate.core.lifecycle.HistogramValue", "io.tapstate.core.lifecycle.ObservationFailure",

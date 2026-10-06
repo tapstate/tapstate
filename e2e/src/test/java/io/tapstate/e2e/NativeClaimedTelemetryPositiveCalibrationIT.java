@@ -475,6 +475,11 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                             Map<String, Object> predicates = new LinkedHashMap<>();
                             predicates.put("job", has(observed, "JOB", receipt));
                             predicates.put("scopedLogOnAdmittedMember", logNode.isPresent());
+                            if (!replacement) {
+                                predicates.put("nativeSourceStreamCaller", submission.members().stream()
+                                        .anyMatch(node -> records.get(node).stream()
+                                                .anyMatch(record -> isSourceStreamLog(record, receipt))));
+                            }
                             predicates.put("acceptedOffer", flag(observed, "OFFER", "accepted", receipt));
                             predicates.put("visible", flag(observed, "VISIBLE", "included", receipt));
                             predicates.put("matchingProduced", matchingProduced(observed, fresh, receipt));
@@ -522,6 +527,15 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
             assertThat(submission.members()).contains(logNode);
             assertThat(has(records.get(logNode), "LOG", receipt))
                     .as("a genuine scoped log on an actual admitted member is required; quiet is unverified").isTrue();
+            if (!replacement) {
+                boolean sourceDrive = records.values().stream().flatMap(List::stream)
+                        .anyMatch(record -> isSourceStreamLog(record, receipt));
+                report.addFork(Map.of("action", "actual-warm-source-log-caller-qualification",
+                        "scope", receipt.scope(), "sourceStreamCallerVerified", sourceDrive));
+                assertThat(sourceDrive)
+                        .as("UNVERIFIED: a generic scoped line cannot stand in for an actual native source stream caller")
+                        .isTrue();
+            }
             assertThat(flag(observed, "OFFER", "accepted", receipt)).isTrue();
             assertThat(flag(observed, "VISIBLE", "included", receipt)).isTrue();
             assertThat(observed.stream().anyMatch(record -> "PRODUCE".equals(record.get("target")) && positiveProduced(record))).isTrue();
@@ -575,6 +589,20 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
             logEvidence.put("observedNodeId", logNode);
             logEvidence.put("nodeSessionOwner", memberEvidence(afterBoots).get(logNode));
             report.addFork(logEvidence);
+            if (!replacement) {
+                String sourceNode = submission.members().stream()
+                        .filter(node -> records.get(node).stream().anyMatch(record -> isSourceStreamLog(record, receipt)))
+                        .findFirst().orElseThrow(() -> new AssertionError("the admitted source log member is absent"));
+                List<Map<String, Object>> sourceLogs = records.get(sourceNode).stream()
+                        .filter(record -> isSourceStreamLog(record, receipt)).toList();
+                ControlPlane sourceControl = sourceNode.equals(TwoMemberCluster.NODE_A) ? cluster.first() : cluster.second();
+                Map<String, Object> sourceRead = new LinkedHashMap<>(NativeTelemetryPositiveCalibrationIT.assertScopedLogRead(
+                        sourceLogs, http, sourceControl, sessions.get(sourceNode).server().baseUrl(), receipt));
+                sourceRead.put("action", "actual-current-native-source-log-response");
+                sourceRead.put("observedNodeId", sourceNode);
+                sourceRead.put("sourceCallerVerified", true);
+                report.addFork(sourceRead);
+            }
             Map<String, Object> ownerEvidence = new LinkedHashMap<>(Map.of(
                     "action", "actual-claimed-admission-and-current-owner", "nodeId", emittingNode,
                     "claim", submission.claim(), "admissionObject", submission.admissionObjectId(),
@@ -652,6 +680,28 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
     private record Series(String name, Map<String, String> attributes) { }
     private record ContinuedReading(ObservationStore.Stored publicValue, ObservationStore.StoredContinuation privateValue,
             Map<String, Object> raw, List<MetricFact> rawFacts) { }
+
+    private static boolean isSourceStreamLog(Map<String, Object> record,
+            NativeTelemetryIdentityJdiSession.AuthorityReceipt receipt) {
+        if (!"LOG".equals(record.get("target")) || !receipt.scope().equals(record.get("scope"))
+                || !Boolean.TRUE.equals(record.get("normalReturn")) || record.containsKey("decoderStatus")
+                || !(record.get("callers") instanceof List<?> encoded) || encoded.size() != 2
+                || !(encoded.get(0) instanceof List<?> strings)
+                || !(encoded.get(1) instanceof List<?> callers) || callers.size() % 9 != 0) { return false; }
+        for (int offset = 0; offset < callers.size(); offset += 9) {
+            if ("io.tapstate.adapters.pdk.PdkCapturePort".equals(callerString(strings, callers.get(offset)))
+                    && "streamLoop".equals(callerString(strings, callers.get(offset + 1)))
+                    && "EXACT_ARTIFACT_METHOD".equals(callerString(strings, callers.get(offset + 7)))
+                    && callerString(strings, callers.get(offset + 8)) instanceof String hash
+                    && hash.matches("[0-9a-f]{64}")) { return true; }
+        }
+        return false;
+    }
+
+    private static String callerString(List<?> strings, Object encoded) {
+        if (!(encoded instanceof Integer index) || index < 0 || index >= strings.size()) { return null; }
+        return strings.get(index) instanceof String value ? value : null;
+    }
 
     private static void captureContinueBoundaries(Map<String, NativeTelemetryIdentityJdiSession> sessions,
             Map<String, List<Map<String, Object>>> records, BenchmarkLiveReport report, String phase) {
