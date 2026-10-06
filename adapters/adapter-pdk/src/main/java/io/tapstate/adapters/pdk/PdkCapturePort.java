@@ -880,28 +880,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
                     // and outside the delivery a close cancels, so a close wakes the hand-over and never the
                     // source's own call.
                     acknowledgements.applyIfDue();
-                    delivery.accept(() -> {
-                        // A change stream also carries control events (heartbeats and the like) that signal
-                        // the tail is alive but carry no row; they are not decodable changes, so skip them.
-                        List<TapEvent> changes = new ArrayList<>(events.size());
-                        for (TapEvent event : events) {
-                            if (!(event instanceof ControlEvent)) {
-                                changes.add(event);
-                            }
-                        }
-                        // The batch goes over whole, with the one offset the source named for it. The offset
-                        // means the source had read to here once this entire batch was handed over, so it
-                        // belongs to the batch and not to any change inside it; and the batch itself is worth
-                        // keeping, because everything downstream that costs per act rather than per change --
-                        // writing the changes down above all -- costs one act per batch only while the batch
-                        // still exists.
-                        List<Envelope> decoded = new ArrayList<>(changes.size());
-                        for (TapEvent change : changes) {
-                            decoded.add(TapEventCodec.decodeChange(
-                                    change, connector.codecs(), declaredTypes(declared, change)));
-                        }
-                        listener.onBatch(decoded, position(connector, offset));
-                    });
+                    delivery.accept(() -> handOver(connector, declared, listener, events, offset));
                 });
                 Object readerOffset = MysqlResumeOffset.forReader(connector.connectorId(), startOffset,
                         connector.context().getStateMap(), () -> InstanceFactory.instance(JsonParser.class));
@@ -909,8 +888,12 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
                 return null;
             });
         } catch (Throwable t) {
-            if (t instanceof CancellationException && delivery.closed) {
-                // Consumer cancellation is the requested stop, not a connector failure to publish.
+            if (delivery.closed && !(t instanceof VirtualMachineError)) {
+                // A closed stream stopped because it was asked to, whatever it throws on the way down. The
+                // interrupt the close sends breaks off whatever the batch is waiting in, and that answers in
+                // its own words: a store write with its driver's exception, a source with one it wraps the
+                // hand-over's failure in. Nothing reads a closed stream's failures, and publishing one fails
+                // every pipeline on the capture -- a widening closes the stream it is replacing.
                 return;
             }
             // The cdc stream runs on this daemon thread; its failure cannot be returned to the caller, so it
@@ -933,6 +916,31 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
             LOG.warn("cdc stream for connector {} stopped on a failure", connector.connectorId(), t);
             listener.onError(reported);
         }
+    }
+
+    /**
+     * Hands one delivery to {@code listener}: its changes, decoded, with the offset the source named for it.
+     *
+     * <p>A change stream also carries control events (heartbeats and the like) that signal the tail is alive but
+     * carry no row; they are not decodable changes, so they are skipped. The batch goes over whole, with the one
+     * offset the source named for it. The offset means the source had read to here once this entire batch was
+     * handed over, so it belongs to the batch and not to any change inside it; and the batch itself is worth
+     * keeping, because everything downstream that costs per act rather than per change -- writing the changes
+     * down above all -- costs one act per batch only while the batch still exists.
+     */
+    private static void handOver(PdkConnector connector, Map<String, Map<String, String>> declared,
+            CaptureListener listener, List<TapEvent> events, Object offset) {
+        List<TapEvent> changes = new ArrayList<>(events.size());
+        for (TapEvent event : events) {
+            if (!(event instanceof ControlEvent)) {
+                changes.add(event);
+            }
+        }
+        List<Envelope> decoded = new ArrayList<>(changes.size());
+        for (TapEvent change : changes) {
+            decoded.add(TapEventCodec.decodeChange(change, connector.codecs(), declaredTypes(declared, change)));
+        }
+        listener.onBatch(decoded, position(connector, offset));
     }
 
     /**

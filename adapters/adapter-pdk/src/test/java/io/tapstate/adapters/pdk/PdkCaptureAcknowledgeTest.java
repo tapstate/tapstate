@@ -286,6 +286,9 @@ class PdkCaptureAcknowledgeTest {
         try {
             durable = deliver(recorder, "rows").position().orElseThrow();
             sub.acknowledge(durable);
+            // The close has to find the source between deliveries. One still inside its hand-over is cut off by
+            // the close, the way any delivery in flight is, and then makes no last delivery for this case to count.
+            awaitTheSourceBetweenDeliveries();
             deliveredBeforeClose = channel.deliveredOn.size();
         } finally {
             sub.close();
@@ -304,6 +307,22 @@ class PdkCaptureAcknowledgeTest {
     }
 
     // ---- harness -----------------------------------------------------------------------------------------
+
+    /**
+     * Waits until the source has come back from every hand-over it began, so that it is between deliveries. A
+     * delivery reaches the listener before its hand-over returns, so a case that has seen the batch has not yet
+     * seen that.
+     */
+    private void awaitTheSourceBetweenDeliveries() {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(AWAIT_SECONDS);
+        while (channel.handedOver.size() < channel.deliveredOn.size()) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("the source never came back from its hand-over: it began "
+                        + channel.deliveredOn.size() + " and returned from " + channel.handedOver.size());
+            }
+            Thread.onSpinWait();
+        }
+    }
 
     /** Starts a stream at the present over the synthetic {@code simpleName}, on the case's clock. */
     private Subscription open(Path jar, String simpleName, CaptureListener listener) {
@@ -331,12 +350,15 @@ class PdkCaptureAcknowledgeTest {
         private final List<Object> named = new CopyOnWriteArrayList<>();
         /** The thread each delivery was made on, in order. */
         private final List<Thread> deliveredOn = new CopyOnWriteArrayList<>();
+        /** The same, once each delivery's hand-over returned: the source is between deliveries when it catches up. */
+        private final List<Thread> handedOver = new CopyOnWriteArrayList<>();
         /** One entry per flush call, as the source recorded it. */
         private final List<Map<String, Object>> flushes = new CopyOnWriteArrayList<>();
 
         private Channel() {
             System.getProperties().put(key, Map.of(
-                    "orders", orders, "named", named, "deliveredOn", deliveredOn, "flushes", flushes));
+                    "orders", orders, "named", named, "deliveredOn", deliveredOn, "handedOver", handedOver,
+                    "flushes", flushes));
         }
 
         @Override
