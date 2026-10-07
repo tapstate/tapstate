@@ -106,6 +106,34 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             return Map.copyOf(out);
         }
     }
+    /** Crash receipts retain observed data without claiming drained calls or a decoded old heap. */
+    record OwnedCrash(long ownedPid, long markedAtEvent, boolean processDeadBeforeCleanup,
+            boolean processDeadAfterCleanup, boolean disconnectBeforeDispose, String disconnectReceipt,
+            boolean cleanupForcedKill, boolean artifactUnchanged, boolean pumpStopped,
+            Boundary observed, List<Map<String, Object>> unpairedCalls, String evidenceFailure,
+            String observerFailure, String cleanupFailure) {
+        OwnedCrash { if (unpairedCalls != null) { unpairedCalls = List.copyOf(unpairedCalls); } }
+        boolean ownedFaultObserved() {
+            return processDeadBeforeCleanup && disconnectBeforeDispose && !cleanupForcedKill;
+        }
+        Map<String, Object> evidence() {
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("status", "INCOMPLETE"); out.put("ownedPid", ownedPid); out.put("markedAtEvent", markedAtEvent);
+            out.put("ownedFaultObserved", ownedFaultObserved());
+            out.put("processDeadBeforeCleanup", processDeadBeforeCleanup);
+            out.put("processDeadAfterCleanup", processDeadAfterCleanup);
+            out.put("disconnectBeforeDispose", disconnectBeforeDispose); out.put("disconnectReceipt", disconnectReceipt);
+            out.put("cleanupForcedKill", cleanupForcedKill); out.put("artifactUnchanged", artifactUnchanged);
+            out.put("pumpStopped", pumpStopped); out.put("normalDrain", false); out.put("decodedComplete", false);
+            out.put("oldHeapCleanup", "UNKNOWN");
+            out.put("observed", observed == null ? null : observed.evidence()); out.put("unpairedCalls", unpairedCalls);
+            out.put("evidenceStatus", evidenceFailure == null && observed != null ? "RETAINED_INCOMPLETE" : "UNKNOWN");
+            out.put("evidenceFailure", evidenceFailure); out.put("observerFailure", observerFailure);
+            out.put("cleanupFailure", cleanupFailure); out.put("passiveObserver", true);
+            out.put("performanceAcceptanceEligible", false);
+            return Collections.unmodifiableMap(out);
+        }
+    }
     private record Spec(Target target, String type, String method, String descriptor, int arguments, int pipeline) { }
     private record Image(String origin, Map<String, byte[]> methods, Map<String, String> fields) { }
     private record Site(Target target, boolean entry) { }
@@ -230,6 +258,10 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     private UnqualifiedEntry lastUnqualifiedEntry;
     private boolean logFamilyCalibrationStarted;
     private Map<String, Object> logFamilyCalibration = Map.of();
+    private boolean ownedCrashRequested, localDisposeStarted, crashDisconnectBeforeDispose, crashCleanupForcedKill;
+    private long crashOwnedPid, crashMarkedAtEvent;
+    private String crashDisconnectReceipt, crashReadInterruption, activeObservation = "EVENT_QUEUE";
+    private OwnedCrash crashTerminal;
 
     private NativeTelemetryIdentityJdiSession(Path jar, String sha, String pipeline,
             Map<String, Image> images, RealProcessServer server, VirtualMachine vm, boolean replacementObservationEnabled,
@@ -619,7 +651,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             if (phase == null || phase.isBlank() || phase.length() > 128) { throw invalid("invalid phase"); }
             if (!sha.equals(hash(jar))) { throw invalid("immutable artifact changed"); }
             synchronized (lock) {
-                if (closing || closed || disconnected) { throw invalid("boundary requested after close"); }
+                if (closing || closed || disconnected || ownedCrashRequested) { throw invalid("boundary requested after close"); }
                 requestedPhase = phase; command = new CompletableFuture<>();
             }
             CompletableFuture<Boundary> waiting = command;
@@ -633,6 +665,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         try {
             while (running) {
                 releaseExpiredPublisherSweepPark();
+                activeObservation = "EVENT_QUEUE";
                 EventSet set = vm.eventQueue().remove(publisherSweepPollMillis());
                 if (set != null) { handle(set); }
                 CompletableFuture<Boundary> request = command;
@@ -650,6 +683,8 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                     }
                 }
             }
+        } catch (VMDisconnectedException gone) {
+            if (!observeOwnedCrashDisconnect("JDI_EXCEPTION:" + activeObservation)) { fail(gone); }
         } catch (Throwable problem) { fail(problem); }
         finally {
             try { releasePublisherSweepPark(sweepPark, "PUMP_EXIT"); }
@@ -665,6 +700,12 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             synchronized (lock) {
                 for (Event event : set) {
                     if (++events > MAX_EVENTS) { throw invalid("event budget exceeded"); }
+                    activeObservation = event instanceof BreakpointEvent breakpoint
+                            && breakpoint.request().getProperty("native-identity-site") instanceof Site site
+                            ? (site.entry() ? "ENTRY:" : "RETURN_SITE:") + site.target()
+                            : event instanceof MethodExitEvent exit
+                            ? "NORMAL_EXIT:call=" + exit.request().getProperty("native-identity-call")
+                            : event.getClass().getSimpleName();
                     if (event instanceof ClassPrepareEvent prepare) { bind(prepare.referenceType()); }
                     else if (event instanceof BreakpointEvent breakpoint) {
                         try {
@@ -680,11 +721,15 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                     else if (event instanceof ExceptionEvent exception) { exception(exception); }
                     else if (event instanceof ThreadDeathEvent death) { threadDeath(death); }
                     else if (event instanceof VMDeathEvent) {
-                        if (!closing || !threads.isEmpty()) { throw invalid("VM death lost open calls or owned close"); }
+                        if (!ownedCrashRequested && (!closing || !threads.isEmpty())) {
+                            throw invalid("VM death lost open calls or owned close");
+                        }
                         vmDeath = true;
                     } else if (event instanceof VMDisconnectEvent) {
-                        if (!closing || !vmDeath) { throw invalid("disconnect lacked owned VM death"); }
-                        disconnected = true; running = false;
+                        if (!observeOwnedCrashDisconnect("VMDisconnectEvent")) {
+                            if (!closing || !vmDeath) { throw invalid("disconnect lacked owned VM death"); }
+                            disconnected = true; running = false;
+                        }
                     } else if (!(event instanceof VMStartEvent)) { throw invalid("unmapped capture event"); }
                 }
             }
@@ -696,8 +741,27 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                     set.resume();
                     if (observedSweep != null && processed) { completeObservedPublisherSweep(observedSweep); }
                 }
-                catch (VMDisconnectedException gone) { if (!closing || !vmDeath) { throw gone; } }
+                catch (VMDisconnectedException gone) {
+                    if (!observeOwnedCrashDisconnect("EVENT_SET_RESUME:" + activeObservation)
+                            && (!closing || !vmDeath)) { throw gone; }
+                }
             }
+        }
+    }
+
+    private boolean observeOwnedCrashDisconnect(String receipt) {
+        synchronized (lock) {
+            if (!ownedCrashRequested) { return false; }
+            if (!localDisposeStarted && !crashDisconnectBeforeDispose) {
+                crashDisconnectBeforeDispose = true; crashDisconnectReceipt = receipt;
+            }
+            if (receipt.startsWith("JDI_EXCEPTION:") && !receipt.equals("JDI_EXCEPTION:EVENT_QUEUE")) {
+                crashReadInterruption = receipt;
+            }
+            disconnected = true; running = false;
+            CompletableFuture<Boundary> waiting = command;
+            if (waiting != null) { waiting.completeExceptionally(invalid("owned crash interrupted boundary")); }
+            return true;
         }
     }
 
@@ -1947,7 +2011,8 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             Call call = state.calls.peek();
             boolean present = present(call, frames);
             if (present && !(newEntry == call.spec.target() && frames.size() == call.depth)) { break; }
-            state.calls.pop(); exceptional(call);
+            if (ownedCrashRequested) { exceptional(call); state.calls.pop(); }
+            else { state.calls.pop(); exceptional(call); }
         }
         for (Call call : state.calls) { if (!present(call, frames)) { throw invalid("call vanished without observed unwind"); } }
         if (newEntry == null) { removeEmpty(state); }
@@ -1964,6 +2029,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     private void threadDeath(ThreadDeathEvent event) {
         ThreadState state = threads.get(event.thread().uniqueID());
         if (state == null) { return; }
+        if (ownedCrashRequested) { return; }
         while (!state.calls.isEmpty()) {
             Call call = state.calls.pop();
             if (!call.escaping) { throw invalid("thread death lost an unaccounted call"); }
@@ -2106,10 +2172,12 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     private Throwable detach(Throwable primary) {
         try { releasePublisherSweepPark(sweepPark, "DETACH"); }
         catch (Throwable problem) { primary = append(primary, problem); }
+        synchronized (lock) { localDisposeStarted = true; }
         try { vm.dispose(); }
         catch (VMDisconnectedException gone) { }
         catch (Throwable problem) {
             primary = append(primary, problem);
+            synchronized (lock) { if (ownedCrashRequested && server.isAlive()) { crashCleanupForcedKill = true; } }
             try { server.kill(); }
             catch (Throwable cleanup) { primary = append(primary, cleanup); }
         }
@@ -2122,8 +2190,120 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         return primary;
     }
 
+    /** The caller marks its actual owned process immediately before calling server().kill(). */
+    Map<String, Object> markOwnedCrash() {
+        synchronized (commands) {
+            synchronized (lock) {
+                check();
+                if (ownedCrashRequested || closing || closed || disconnected || command != null || !server.isAlive()
+                        || sweepPark != null && !sweepPark.done) { throw invalid("owned crash cannot be marked now"); }
+                crashOwnedPid = server.pid(); crashMarkedAtEvent = events; ownedCrashRequested = true;
+                return Map.of("ownedPid", crashOwnedPid, "markedAtEvent", crashMarkedAtEvent,
+                        "callerMustKillOwnedProcess", true);
+            }
+        }
+    }
+
+    /** No live target reads: preserve actual counters and entries even when SIGKILL interrupts decoding. */
+    private Boundary crashSnapshot() {
+        Map<Target, Counts> counts = new EnumMap<>(Target.class);
+        Set<String> missing = new LinkedHashSet<>(unverified);
+        missing.add("OWNED_CRASH_INCOMPLETE"); missing.add("LIVE_PROVENANCE_AT_CRASH_UNKNOWN");
+        if (crashReadInterruption != null) { missing.add("DISCONNECT_INTERRUPTED_OBSERVATION:" + crashReadInterruption); }
+        for (var target : totals.entrySet()) {
+            if (!bindings.containsKey(target.getKey())) { missing.add("LIVE_BINDING_UNAVAILABLE:" + target.getKey()); }
+            long open = threads.values().stream().flatMap(state -> state.calls.stream())
+                    .filter(call -> call.qualified && call.spec.target() == target.getKey()).count();
+            Totals total = target.getValue();
+            if (total.entries != total.normal + total.exceptional + open) {
+                missing.add("CRASH_CALL_ACCOUNTING_INCOMPLETE:" + target.getKey());
+            }
+            counts.put(target.getKey(), new Counts(total.entries, total.normal, total.exceptional, open));
+        }
+        if (authorities.isEmpty()) { missing.add("AUTHORITY_RECEIPTS_UNVERIFIED"); }
+        for (Map<String, Object> record : records) { qualifyScopes(record, missing, 0); }
+        return new Boundary("owned-crash", ++sequence, sha, pipeline, bindings, counts, records, authorities,
+                missing, layouts, logFamilyCalibration, vmVersion, events, handlingNanos,
+                threads.values().stream().mapToInt(state -> state.calls.size()).sum(), false, vmDeath, disconnected,
+                replacementObservationEnabled, rawContinuationObservationEnabled, joinedTakeoverObservationEnabled);
+    }
+
+    private List<Map<String, Object>> crashOpenCalls() {
+        List<Map<String, Object>> open = new ArrayList<>();
+        for (var thread : threads.entrySet()) {
+            for (Call call : thread.getValue().calls) {
+                open.add(Map.of("thread", thread.getKey(), "invocation", call.id, "target", call.spec.target().name(),
+                        "depth", call.depth, "qualifiedAtEntry", call.qualified, "escapingObserved", call.escaping,
+                        "returnRequestCreated", call.exit != null, "entry", call.entry, "logCalibration", call.logCalibration));
+            }
+        }
+        if (open.size() > MAX_OPEN_CALLS) { throw invalid("crash open-call budget exceeded"); }
+        if (evidenceBytes(Map.of("records", records, "unpairedCalls", open, "logFamilyCalibration", logFamilyCalibration), 0) > MAX_PHASE_BYTES) {
+            throw invalid("crash retained evidence exceeds the existing phase byte budget");
+        }
+        return List.copyOf(open);
+    }
+
+    private static String problemText(Throwable problem) {
+        return problem == null ? null : problem.getClass().getName() + ":" + problem.getMessage();
+    }
+
+    /** Fault substrate only; missing drain, interrupted decoding and prior observer errors remain explicit. */
+    OwnedCrash finishOwnedCrash() throws Exception {
+        synchronized (commands) {
+            synchronized (lock) {
+                if (!ownedCrashRequested) { throw invalid("owned crash was not marked before the caller kill"); }
+                if (closed) {
+                    if (crashTerminal == null) { throw invalid("owned crash evidence was not saved"); }
+                    return crashTerminal;
+                }
+            }
+            boolean deadBeforeCleanup = false, artifactUnchanged = false;
+            Throwable cleanup = null, evidenceProblem = null;
+            Boundary observed = null;
+            List<Map<String, Object>> open = null;
+            try {
+                pump.join(5000);
+                artifactUnchanged = sha.equals(hash(jar));
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt(); evidenceProblem = interrupted;
+            } catch (Exception | Error problem) { evidenceProblem = problem; }
+            finally {
+                deadBeforeCleanup = !server.isAlive();
+                running = false;
+                cleanup = detach(null);
+                if (server.isAlive()) {
+                    synchronized (lock) { crashCleanupForcedKill = true; }
+                    try { server.kill(); } catch (Throwable problem) { cleanup = append(cleanup, problem); }
+                }
+                try { server.close(); } catch (Throwable problem) { cleanup = append(cleanup, problem); }
+                pump.interrupt();
+                try { pump.join(2000); }
+                catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt(); cleanup = append(cleanup, interrupted);
+                }
+                synchronized (lock) {
+                    closed = true;
+                    if (pump.isAlive()) {
+                        cleanup = append(cleanup, invalid("owned event pump did not stop"));
+                        evidenceProblem = append(evidenceProblem, invalid("crash evidence is not stable while the pump is alive"));
+                    } else {
+                        try { observed = crashSnapshot(); open = crashOpenCalls(); }
+                        catch (Exception | Error problem) { evidenceProblem = append(evidenceProblem, problem); }
+                    }
+                    crashTerminal = new OwnedCrash(crashOwnedPid, crashMarkedAtEvent, deadBeforeCleanup,
+                            !server.isAlive(), crashDisconnectBeforeDispose, crashDisconnectReceipt,
+                            crashCleanupForcedKill, artifactUnchanged, !pump.isAlive(), observed, open,
+                            problemText(evidenceProblem), problemText(failure.get()), problemText(cleanup));
+                }
+            }
+            return crashTerminal;
+        }
+    }
+
     Boundary shutdownAndFinish() throws Exception {
         synchronized (commands) {
+            if (ownedCrashRequested) { throw invalid("owned crash requires finishOwnedCrash"); }
             if (closed) { check(); if (terminal == null) { throw invalid("no qualified terminal boundary"); } return terminal; }
             Throwable primary = null;
             try {
@@ -2161,7 +2341,18 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             }
         }
     }
-    @Override public void close() throws Exception { if (!closed) { shutdownAndFinish(); } }
+    @Override public void close() throws Exception {
+        if (!closed) {
+            if (ownedCrashRequested) {
+                OwnedCrash crash = finishOwnedCrash();
+                check();
+                if (!crash.ownedFaultObserved() || !crash.pumpStopped() || !crash.artifactUnchanged()
+                        || crash.evidenceFailure() != null || crash.cleanupFailure() != null) {
+                    throw invalid("owned crash remains unqualified; retained crash evidence is available");
+                }
+            } else { shutdownAndFinish(); }
+        }
+    }
 
     private static Map<String, Image> images(Path jar, boolean joinedTakeoverObservationEnabled) throws Exception {
         Map<String, Image> images = new LinkedHashMap<>();
