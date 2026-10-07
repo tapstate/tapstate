@@ -12,6 +12,9 @@ import io.tapstate.adapters.mongostore.MongoClusterIdentityStore;
 import io.tapstate.adapters.mongostore.MongoAuthStores;
 import io.tapstate.adapters.mongostore.MongoWorkloadClaimStore;
 import io.tapstate.spi.store.SrsConsumerId;
+import io.tapstate.spi.store.IoError;
+import java.nio.file.Files;
+import java.util.regex.Pattern;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimFence;
@@ -147,8 +150,26 @@ class RealClaimedRebuildHandoffCrashIT {
         verifyClaimedCrash(cut, selected, expectedSha, selectedOutput, firstBranchDiagnostic, false);
     }
 
+    static void qualifyContinueReadOutage(Path jar, String sha256, Path output,
+            java.util.function.Function<String, String> ownedStoreUri) throws Exception {
+        new RealClaimedRebuildHandoffCrashIT().verifyClaimedCrash(RebuildHandoffJdiSession.Cut.PRE_ADMISSION,
+                jar, sha256, output, false, false, true, Objects.requireNonNull(ownedStoreUri, "owned fault store URI"));
+    }
+
     private void verifyClaimedCrash(RebuildHandoffJdiSession.Cut cut, Path selected, String expectedSha,
             Path selectedOutput, boolean firstBranchDiagnostic, boolean fixedFailedQualification) throws Exception {
+        verifyClaimedCrash(cut, selected, expectedSha, selectedOutput, firstBranchDiagnostic, fixedFailedQualification, false);
+    }
+
+    private void verifyClaimedCrash(RebuildHandoffJdiSession.Cut cut, Path selected, String expectedSha,
+            Path selectedOutput, boolean firstBranchDiagnostic, boolean fixedFailedQualification, boolean readUnavailable) throws Exception {
+        verifyClaimedCrash(cut, selected, expectedSha, selectedOutput, firstBranchDiagnostic, fixedFailedQualification, readUnavailable, null);
+    }
+
+    private void verifyClaimedCrash(RebuildHandoffJdiSession.Cut cut, Path selected, String expectedSha,
+            Path selectedOutput, boolean firstBranchDiagnostic, boolean fixedFailedQualification, boolean readUnavailable,
+            java.util.function.Function<String, String> ownedStoreUri) throws Exception {
+        if (readUnavailable) { assertThat(cut).isEqualTo(RebuildHandoffJdiSession.Cut.PRE_ADMISSION); }
         boolean submittedObservation = firstBranchDiagnostic || fixedFailedQualification;
         assertThat(firstBranchDiagnostic && fixedFailedQualification).isFalse();
         assertThat(cut).isIn(RebuildHandoffJdiSession.Cut.PRE_ADMISSION,
@@ -163,9 +184,9 @@ class RealClaimedRebuildHandoffCrashIT {
         PipelineBenchmarkLiveRunIT.requireSafeOutput(output, harnessRoot);
         Path logDirectory = output.resolveSibling(output.getFileName() + ".server-logs");
         Map<String, Object> inputs = inputHashes(harnessRoot);
-        if (submittedObservation) {
+        if (submittedObservation || readUnavailable) {
             Map<String, Object> pinned = new LinkedHashMap<>(inputs);
-            String name = fixedFailedQualification ? "RealClaimedFailedHandoffQualificationIT"
+            String name = readUnavailable ? "RealClaimedContinueObservationReadOutageIT" : fixedFailedQualification ? "RealClaimedFailedHandoffQualificationIT"
                     : "RealClaimedSubmittedHandoffBranchDiagnosticIT";
             pinned.put(name + ".source", PipelineBenchmarkLiveRunIT.sha256(harnessRoot.resolve(
                     "e2e/src/test/java/io/tapstate/e2e/" + name + ".java")));
@@ -179,7 +200,7 @@ class RealClaimedRebuildHandoffCrashIT {
         Map<String, Object> connectors = Map.of("mysql", PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor("mysql")),
                 "mongodb", PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor("mongodb")));
         BenchmarkLiveReport report = new BenchmarkLiveReport(output);
-        report.begin(Map.of("purpose", fixedFailedQualification ? "CLAIMED_SUBMIT_PRE_BIND_MATCHING_FAILED_UNKNOWN_NATIVE_KNOWN_SOURCE_FLOOR"
+        report.begin(Map.of("purpose", readUnavailable ? "CLAIMED_CONTINUE_NATIVE_LATEST_READ_UNAVAILABLE" : fixedFailedQualification ? "CLAIMED_SUBMIT_PRE_BIND_MATCHING_FAILED_UNKNOWN_NATIVE_KNOWN_SOURCE_FLOOR"
                         : firstBranchDiagnostic ? "CLAIMED_SUBMIT_PRE_BIND_FIRST_BRANCH_DIAGNOSTIC"
                         : cut == RebuildHandoffJdiSession.Cut.PRE_ADMISSION
                         ? "REAL_CLAIMED_PRE_ADMISSION_CRASH" : "REAL_CLAIMED_POST_ADMISSION_PRE_SUBMIT_CRASH",
@@ -197,10 +218,16 @@ class RealClaimedRebuildHandoffCrashIT {
             String suffix = UUID.randomUUID().toString().replace("-", "").substring(0, 12);
             Map<String, Object> source = SharedMySql.settings("claimed_crash_" + suffix);
             seed(source);
-            String storeUri = SharedMongo.replicaSetUrl("claimed_crash_" + suffix + "_store");
+            String storeDatabase = "claimed_crash_" + suffix + "_store";
+            String storeUri = readUnavailable ? Objects.requireNonNull(ownedStoreUri, "owned fault store URI").apply(storeDatabase)
+                    : SharedMongo.replicaSetUrl(storeDatabase);
+            String nativeAppName = "claimed-continue-read-" + suffix;
+            String nativeStoreUri = readUnavailable ? storeUri + (storeUri.contains("?") ? "&" : "?")
+                    + "appName=" + nativeAppName : storeUri;
             String targetUri = SharedMongo.replicaSetUrl("claimed_crash_" + suffix + "_target");
             String operatorDatabase = "claimed_crash_" + suffix + "_operator";
-            try (MongoClient storeClient = MongoClients.create(storeUri); MongoClient targetClient = MongoClients.create(targetUri)) {
+            try (MongoClient storeClient = MongoClients.create(storeUri); MongoClient targetClient = MongoClients.create(targetUri);
+                    ReadFault readFault = readUnavailable ? new ReadFault(storeUri, new ConnectionString(storeUri).getDatabase(), nativeAppName) : null) {
                 MongoDatabase database = storeClient.getDatabase(new ConnectionString(storeUri).getDatabase());
                 MongoDatabase target = targetClient.getDatabase(new ConnectionString(targetUri).getDatabase());
                 var actual = new MongoStateStore(database.getCollection(MongoStorePort.PIPELINE_STATE));
@@ -227,7 +254,7 @@ class RealClaimedRebuildHandoffCrashIT {
                             try {
                                 RebuildHandoffJdiSession.OwnedLauncher launch = (artifact, debug) -> {
                                     List<String> options = new ArrayList<>(jvm); options.addAll(debug);
-                                    return RealProcessServer.launchingWithJvmArguments(storeUri, operatorDatabase,
+                                    return RealProcessServer.launchingWithJvmArguments(nativeStoreUri, operatorDatabase,
                                             artifact, address, httpPort -> {
                                                 List<String> applicationArgs = new ArrayList<>(arguments.apply(httpPort));
                                                 applicationArgs.add("--tapstate.metrics.history.sample-interval=PT2S");
@@ -441,6 +468,10 @@ class RealClaimedRebuildHandoffCrashIT {
                     report.addFork(Map.of("action", "actual-source-changes-before-controller-kill", "source", changedSource,
                             "targetUnchanged", targetHoldReceipt(target), "timing", "OLD_JOB_TERMINAL_OWNER_HELD_BEFORE_OS_KILL"));
                 }
+                if (readUnavailable) {
+                    report.addFork(Map.of("action", "native-latest-find-fault-enabled", "failpoint", readFault.enable(),
+                            "appName", nativeAppName, "namespace", database.getName() + "." + MongoStorePort.PIPELINE_OBSERVATION));
+                }
                 long killedPid = first.server().pid();
                 first.killHeldProcess();
                 assertThat(first.server().isAlive()).isFalse();
@@ -460,9 +491,14 @@ class RealClaimedRebuildHandoffCrashIT {
                     ObservationStore.Scope expected = new ObservationStore.Scope(oldScope.pipelineIncarnationId(), expectedGeneration);
                     MatchTrace recoveryTrace = new MatchTrace();
                     long recoveryDeadline = System.nanoTime() + SETUP_WAIT.toNanos();
+                    if (readUnavailable) {
+                        qualifySurvivorColdReadFailure(report, readFault, restarted, actual, desired, latest,
+                                marker, savedFloor, recoveryDeadline);
+                    }
                     Matched firstKnown;
                     try {
-                        firstKnown = Await.answered("the actual survivor publishes the same floor plus its own raw native facts", SETUP_WAIT,
+                        firstKnown = Await.answered("the actual survivor publishes the same floor plus its own raw native facts",
+                                readUnavailable ? remainingRecovery(recoveryDeadline) : SETUP_WAIT,
                                 () -> {
                                     pending.observe(database, latest, survivor, restarted.server().baseUrl(), expected, oldScope, recoveryDeadline);
                                     return matched(latest, restarted, expected, savedFloor, null, recoveryTrace);
@@ -570,9 +606,9 @@ class RealClaimedRebuildHandoffCrashIT {
             assertThat(PipelineBenchmarkLiveRunIT.artifact(jar)).isEqualTo(application);
             assertThat(PipelineBenchmarkLiveRunIT.sha256(jar)).isEqualTo(expectedSha);
             Map<String, Object> finalInputs = inputHashes(harnessRoot);
-            if (submittedObservation) {
+            if (submittedObservation || readUnavailable) {
                 Map<String, Object> pinned = new LinkedHashMap<>(finalInputs);
-                String name = fixedFailedQualification ? "RealClaimedFailedHandoffQualificationIT"
+                String name = readUnavailable ? "RealClaimedContinueObservationReadOutageIT" : fixedFailedQualification ? "RealClaimedFailedHandoffQualificationIT"
                         : "RealClaimedSubmittedHandoffBranchDiagnosticIT";
                 pinned.put(name + ".source", PipelineBenchmarkLiveRunIT.sha256(harnessRoot.resolve(
                         "e2e/src/test/java/io/tapstate/e2e/" + name + ".java")));
@@ -607,7 +643,8 @@ class RealClaimedRebuildHandoffCrashIT {
                             : "PRE_ADMISSION_AND_SUBMIT_PRE_BIND_CLAIMED_CRASH_IN_THIS_RUN",
                     "OLD_CALLBACK_WINDOWS", "NEGATIVE_UNKNOWN_BASELINE_MATRIX", "ALL_TELEMETRY_SURFACE_IDENTITIES", "FORMAL_PERFORMANCE_ACCEPTANCE"));
             if (!pending.qualified) { unverified.add("NEW_GENERATION_BEFORE_FIRST_CURRENT_PUBLICATION_WINDOW"); }
-            report.completeDiagnostic(Map.of("correctness", cut == RebuildHandoffJdiSession.Cut.PRE_ADMISSION
+            report.completeDiagnostic(Map.of("correctness", readUnavailable ? "CLAIMED_CONTINUE_READ_UNAVAILABLE_THEN_EXACT_KNOWN_RECOVERY"
+                            : cut == RebuildHandoffJdiSession.Cut.PRE_ADMISSION
                             ? "CLAIMED_PRE_ADMISSION_CRASH_SURVIVOR_KNOWN_FLOOR"
                             : "CLAIMED_POST_ADMISSION_PRE_SUBMIT_CRASH_SURVIVOR_KNOWN_FLOOR",
                     "performanceAcceptanceEligible", false, "newCurrentWindow", pending.evidence(), "unverified", List.copyOf(unverified)));
@@ -626,6 +663,101 @@ class RealClaimedRebuildHandoffCrashIT {
                 if (cleanup != primary) { primary.addSuppressed(cleanup); }
             }
         }
+    }
+
+    private static final class ReadFault implements AutoCloseable {
+        private final MongoClient admin;
+        private final String namespace, appName;
+        private boolean enabled;
+        private long countBefore;
+        ReadFault(String uri, String database, String appName) {
+            this.admin = MongoClients.create(uri); this.namespace = database + "." + MongoStorePort.PIPELINE_OBSERVATION;
+            this.appName = appName;
+        }
+        Map<String, Object> enable() {
+            enabled = true;
+            Document reply = admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand")
+                    .append("mode", "alwaysOn").append("data", new Document("failCommands", List.of("find"))
+                            .append("appName", appName).append("namespace", namespace).append("errorCode", 2)));
+            assertThat(reply.get("count")).as("actual failpoint count before native attempts").isInstanceOf(Number.class);
+            countBefore = ((Number) reply.get("count")).longValue();
+            return Map.of("reply", reply.toJson(), "countBefore", countBefore);
+        }
+        Map<String, Object> disable() {
+            if (!enabled) { return Map.of("disabled", true); }
+            Document reply = admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+            enabled = false;
+            assertThat(reply.get("count")).as("actual native attempts before any matching client probe").isInstanceOf(Number.class);
+            long count = ((Number) reply.get("count")).longValue();
+            assertThat(count).isGreaterThan(countBefore);
+            return Map.of("reply", reply.toJson(), "countBefore", countBefore, "countAfter", count,
+                    "matchingAppNameProbeIssued", false);
+        }
+        @Override public void close() {
+            try {
+                if (enabled) {
+                    admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+                    enabled = false;
+                }
+            } finally { admin.close(); }
+        }
+    }
+
+    private static void qualifySurvivorColdReadFailure(BenchmarkLiveReport report, ReadFault fault,
+            RebuildHandoffJdiSession survivor, MongoStateStore states, MongoDesiredStore desired,
+            MongoObservationStore latest, StopReservation original, ObservationContinuation floor, long deadline) throws Exception {
+        Path nativeOutput = survivor.server().output();
+        long postKillOffset = Files.size(nativeOutput);
+        Map<String, Object> evidence = new LinkedHashMap<>();
+        evidence.put("action", "survivor-native-continuation-cold-read-unavailable"); evidence.put("status", "UNVERIFIED");
+        evidence.put("survivorPid", survivor.server().pid()); evidence.put("outputPath", nativeOutput.toString());
+        evidence.put("postKillOutputOffset", postKillOffset); evidence.put("matchingAppNameProbeIssued", false);
+        try {
+            String block = Await.answered("survivor post-kill prepareHandoff real coded Mongo read failure", remainingRecovery(deadline),
+                    () -> nativeColdReadFailure(nativeOutput, postKillOffset));
+            evidence.put("nativeThrowableBlock", block);
+            var coded = Pattern.compile(Pattern.quote(IoError.STORE_UNAVAILABLE.code()) + " \\{detail=[^\\r\\n]*\\}").matcher(block);
+            assertThat(coded.find()).as("the actual canonical developer string carries the named detail argument").isTrue();
+            evidence.put("canonicalCodedFailure", coded.group());
+            var marker = states.readStopReservation(PIPELINE).orElseThrow(
+                    () -> new AssertionError("an unavailable cold read cannot qualify completed CONTINUE handoff"));
+            assertThat(marker.token()).isEqualTo(original.token()); assertThat(marker.source()).isEqualTo(original.source());
+            assertThat(marker.counterPolicy()).isEqualTo(StopReservation.CounterPolicy.CONTINUE);
+            assertThat(marker.originalDesired()).isEqualTo(original.originalDesired());
+            assertThat(desired.read(PIPELINE)).contains(original.originalDesired());
+            var preserved = latest.readContinuation(PIPELINE).orElseThrow(
+                    () -> new AssertionError("the original-URI admin read must still find the known source carrier"));
+            assertThat(preserved.continuation().token()).isEqualTo(floor.token());
+            assertThat(preserved.continuation().sourceScope()).isEqualTo(floor.sourceScope());
+            assertThat(preserved.receipt().knownBaseline()).as("IO unavailable is never proven UNKNOWN").isTrue();
+            assertSameTotals(delivery(floor.baselineFacts()), delivery(preserved.continuation().baselineFacts()));
+            evidence.put("preservedAdminCarrier", continuationEvidence(preserved)); evidence.put("liveMarker", markerEvidence(marker));
+            evidence.put("faultDisabled", fault.disable());
+            remainingRecovery(deadline);
+            evidence.put("status", "QUALIFIED_NATIVE_COLD_READ_IO_UNAVAILABLE_KNOWN_F1_RETAINED");
+        } finally { report.addFork(Map.copyOf(evidence)); }
+    }
+
+    private static Optional<String> nativeColdReadFailure(Path output, long offset) {
+        try (var input = Files.newInputStream(output)) {
+            input.skipNBytes(offset); byte[] bytes = input.readNBytes(2 * 1024 * 1024 + 1);
+            assertThat(bytes.length).as("all post-kill native failure evidence stays bounded").isLessThanOrEqualTo(2 * 1024 * 1024);
+            String appended = new String(bytes, StandardCharsets.UTF_8);
+            String warning = "Could not write latest observation for pipeline " + PIPELINE;
+            int from = appended.indexOf(warning);
+            while (from >= 0) {
+                String tail = appended.substring(from);
+                var next = Pattern.compile("\\R(?=\\d{4}-\\d{2}-\\d{2}[T ])").matcher(tail);
+                String block = next.find() ? tail.substring(0, next.start()) : tail;
+                if (block.contains("io.tapstate.app.ObservationContinuationRecovery.prepareHandoff")
+                        && (block.contains("io.tapstate.adapters.mongostore.MongoObservationStore.readContinuation")
+                                || block.contains("io.tapstate.adapters.mongostore.MongoObservationStore.readStored"))
+                        && block.contains("io.tapstate.app.TelemetryDispatcher")
+                        && block.contains(IoError.STORE_UNAVAILABLE.code() + " {detail=")) { return Optional.of(block); }
+                from = appended.indexOf(warning, from + warning.length());
+            }
+            return Optional.empty();
+        } catch (java.io.IOException unavailable) { throw new AssertionError("owned survivor log read failed", unavailable); }
     }
 
     private static void qualifyActualFailedHandoff(BenchmarkLiveReport report, RebuildHandoffJdiSession observer,
@@ -1381,7 +1513,7 @@ class RealClaimedRebuildHandoffCrashIT {
                 "RebuildHandoffJdiSession$Image", "RebuildHandoffJdiSession$Binding", "RebuildHandoffJdiSession$Held",
                 "RebuildHandoffJdiSession$Raw", "RebuildHandoffJdiSession$RawKey", "RebuildHandoffJdiSession$JobProof",
                 "RebuildHandoffJdiSession$JobCall", "RebuildHandoffJdiSession$BranchProof", "RebuildHandoffJdiSession$BranchCall",
-                "RebuildHandoffJdiSession$PhaseProof")) {
+                "RebuildHandoffJdiSession$PhaseProof", "RealClaimedRebuildHandoffCrashIT$ReadFault")) {
             try (var bytes = RealClaimedRebuildHandoffCrashIT.class.getResourceAsStream("/io/tapstate/e2e/" + name + ".class")) {
                 if (bytes == null) { throw new AssertionError("the executing nested harness class is absent: " + name); }
                 result.put(name + ".class", HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes.readAllBytes())));
