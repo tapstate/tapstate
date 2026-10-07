@@ -1,5 +1,7 @@
 package io.tapstate.e2e;
 
+import io.tapstate.core.common.JsonWriter;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
@@ -603,18 +605,40 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             if (pending.isEmpty()) {
                 throw new AssertionError("measured phase has no final source marker: " + phase.id());
             }
+            Map<BenchmarkWorkloadDefinitions.SourceChain, String> lastAcks = new LinkedHashMap<>();
             long deadline = System.nanoTime() + ACK_WAIT.toNanos();
             while (true) {
-                pending.entrySet().removeIf(entry -> fork.control()
-                        .targetAckForIfPresent(entry.getKey())
-                        .filter(ack -> positionCoverage.covers(ack, entry.getValue()))
-                        .isPresent());
+                pending.entrySet().removeIf(entry -> {
+                    Optional<String> ack = fork.control().targetAckForIfPresent(entry.getKey());
+                    lastAcks.put(entry.getKey(), ack.orElse(null));
+                    return ack.filter(value -> positionCoverage.covers(value, entry.getValue())).isPresent();
+                });
                 if (pending.isEmpty()) {
                     return System.nanoTime();
                 }
                 if (System.nanoTime() >= deadline) {
-                    throw new AssertionError("target ACK did not cover measured source markers: "
-                            + pending.keySet());
+                    AssertionError incomplete = new AssertionError("target ACK did not cover measured source markers: "
+                            + pending.entrySet().stream().map(entry -> entry.getKey().id()
+                                    + " [source=" + positionCoverage.describe(entry.getValue())
+                                    + "; lastAck=" + positionCoverage.describe(lastAcks.get(entry.getKey()))
+                                    + "]").toList());
+                    // Read only after this window has failed; successful measurement IO stays unchanged.
+                    try (StoreDocuments documents = StoreDocuments.at(fork.storeUri())) {
+                        List<Map<String, Object>> receipts = new ArrayList<>();
+                        for (BenchmarkWorkloadDefinitions.SourceChain chain : pending.keySet()) {
+                            receipts.add(BenchmarkTerminalMetaReceipt.readPending(documents,
+                                    fork.control().positionRead(chain.pipelineId()), chain, positionCoverage::describe));
+                        }
+                        String captured = JsonWriter.write(Map.of("phase", phase.id(), "windowFailed", true,
+                                "receipts", receipts));
+                        if (captured.getBytes(StandardCharsets.UTF_8).length > 65_536) {
+                            throw new AssertionError("pending ACK evidence exceeded its diagnostic byte budget");
+                        }
+                        System.out.println("benchmark-pending-ack-receipt=" + captured);
+                    } catch (RuntimeException | AssertionError diagnosticFailure) {
+                        incomplete.addSuppressed(diagnosticFailure);
+                    }
+                    throw incomplete;
                 }
                 TimeUnit.NANOSECONDS.sleep(COUNTER_POLL.toNanos());
             }

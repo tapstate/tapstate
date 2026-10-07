@@ -9,10 +9,79 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.Function;
 
 /** Reads terminal proof after the measured windows, without changing the application's store. */
 final class BenchmarkTerminalMetaReceipt {
     private BenchmarkTerminalMetaReceipt() { }
+
+    /** A failed window's exact source consumer, with opaque tokens replaced by numeric diagnostics. */
+    static Map<String, Object> readPending(StoreDocuments documents, ControlPlane.PositionRead read,
+            BenchmarkWorkloadDefinitions.SourceChain chain, Function<String, String> describe) {
+        ControlPlane.PositionChain physical = physical(read, chain);
+        Document root = documents.chain(physical.chainId());
+        String scopedKey = SrsConsumerId.of(chain.pipelineId(), chain.sourceId()).value();
+        Document split = documents.consumerOffset(physical.chainId(), scopedKey);
+        StoredConsumer consumer = candidate(root == null ? null : nested(root, "consumerOffsets"),
+                physical.chainId(), scopedKey, split);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("logicalChainId", chain.id());
+        result.put("physicalChainId", physical.chainId());
+        result.put("positionTargetAck", describe.apply(physical.targetAckedToken()));
+        if (consumer == null) {
+            result.put("state", "SCOPED_CONSUMER_ABSENT");
+            return Map.copyOf(result);
+        }
+        Document cursor = consumer.document();
+        checkIdentityField(cursor, "ownerPipelineId", chain.pipelineId());
+        checkIdentityField(cursor, "sourceNodeId", chain.sourceId());
+        result.put("actualConsumerId", consumer.id());
+        result.put("consumerDocument", consumer.origin());
+        result.put("scalarAck", pendingPoint(cursor, describe));
+        Document tableAcks = nested(cursor, "sinkAckedByTable");
+        result.put("tableAck", pendingPoint(tableAcks == null ? null : nested(tableAcks, chain.table()), describe));
+        Document plan = nested(cursor, "expectedSinkWriters");
+        if (plan != null) {
+            if (plan.size() > 64) { throw new AssertionError("pending writer plan exceeded diagnostic bounds"); }
+            result.put("writerPlanTables", List.copyOf(plan.keySet()));
+            Object selected = plan.get(chain.table());
+            if (!(selected instanceof List<?> writers) || writers.size() > 64) {
+                throw new AssertionError("pending table has no bounded actual writer plan");
+            }
+            Document progress = nested(cursor, "sinkWriterProgress");
+            Map<String, Object> recorded = new LinkedHashMap<>();
+            for (Object raw : writers) {
+                if (!(raw instanceof String writer) || writer.isBlank() || writer.length() > 256) {
+                    throw new AssertionError("pending writer identity exceeded diagnostic bounds");
+                }
+                Document tables = progress == null ? null : nested(progress, writer);
+                Document point = tables == null ? null : nested(tables, chain.table());
+                Map<String, Object> value = new LinkedHashMap<>(pendingPoint(point, describe));
+                if (point != null) {
+                    copyOptional(value, "ringDone", point, "ringDone", Number.class);
+                    copyOptional(value, "snapshotComplete", point, "snapshotComplete", Boolean.class);
+                }
+                recorded.put(writer, Map.copyOf(value));
+            }
+            result.put("expectedWriters", Map.copyOf(recorded));
+        }
+        copyTableNumber(result, "consumerReadSeq", cursor, "perTableSeq", chain.table());
+        copyTableNumber(result, "consumerRingDoneSeq", cursor, "perTableRingDone", chain.table());
+        result.put("readConsistency", "SEQUENTIAL_POINT_READS");
+        return Map.copyOf(result);
+    }
+
+    private static Map<String, Object> pendingPoint(Document point, Function<String, String> describe) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        Object token = point == null ? null : point.get("sinkAckedSrcpos");
+        if (token != null && !(token instanceof String)) { throw new AssertionError("invalid pending ACK token"); }
+        result.put("position", describe.apply((String) token));
+        if (point != null) {
+            copyOptional(result, "epoch", point, "sinkAckedEpoch", Number.class);
+            copyOptional(result, "seq", point, "sinkAckedSeq", Number.class);
+        }
+        return Map.copyOf(result);
+    }
 
     static Map<String, Object> read(StoreDocuments documents, ControlPlane.PositionRead read,
             BenchmarkWorkloadDefinitions.SourceChain chain, String terminal,
