@@ -19,10 +19,172 @@ import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Qualifies complete append evidence after trim and distinguishes an incomplete replacement delta. */
 @RequiresDocker
 class BenchmarkTableLogAppendWitnessIT {
+    @Test
+    void aFloatingCaptureEpochIsRejectedRatherThanTruncated() {
+        String database = "benchmark_table_terminal_fractional_epoch_witness";
+        String ring = "srs.fractional-observer-chain.orders";
+        String uri = SharedMongo.replicaSetUrl(database);
+        try (var client = MongoClients.create(uri)) {
+            var collection = client.getDatabase(database).getCollection(MongoStorePort.SRS_LOG);
+            collection.drop(); collection.insertOne(new Document("_id", "setup"));
+            var marker = new BenchmarkTableTerminalObserver.Marker("orders/cdc-end", ring, "u", 12_000L, "qty", 2L);
+            var observer = BenchmarkTableTerminalObserver.open(uri, database, List.of(marker));
+            try {
+                collection.insertOne(new Document("_id", new Document("ring", ring).append("seq", 41L))
+                        .append("epoch", 7.5d).append("op", "u")
+                        .append("after", new Document("id", 12_000L).append("qty", 2L)));
+                assertThatThrownBy(() -> observer.await(marker.id(), Duration.ofSeconds(10)))
+                        .isInstanceOf(AssertionError.class).hasStackTraceContaining("no proven original capture order");
+            } finally {
+                assertThatThrownBy(observer::close).isInstanceOf(AssertionError.class)
+                        .hasStackTraceContaining("no proven original capture order");
+            }
+        }
+    }
+
+    @Test
+    void droppingTheObservedLogCannotLeaveACapturedMarkerQualified() throws Exception {
+        String database = "benchmark_table_terminal_invalidation_witness";
+        String ring = "srs.invalidated-observer-chain.orders";
+        String uri = SharedMongo.replicaSetUrl(database);
+        try (var client = MongoClients.create(uri)) {
+            var collection = client.getDatabase(database).getCollection(MongoStorePort.SRS_LOG);
+            collection.drop(); collection.insertOne(new Document("_id", "setup"));
+            var marker = new BenchmarkTableTerminalObserver.Marker("orders/cdc-end", ring, "u", 12_000L, "qty", 2L);
+            var observer = BenchmarkTableTerminalObserver.open(uri, database, List.of(marker));
+            try {
+                new MongoSrsLogStore(collection).store(ring, 41L, new SrsLogRecord(null, Op.UPDATE, 123L,
+                        Map.of("id", 12_000L, "qty", 1L), Map.of("id", 12_000L, "qty", 2L), 0L, 7L));
+                observer.await(marker.id(), Duration.ofSeconds(10));
+                collection.drop();
+                Await.until("table log invalidation rejected", Duration.ofSeconds(10), () -> {
+                    try { observer.check(); return false; }
+                    catch (AssertionError expected) { return true; }
+                }, () -> "the captured marker's collection was dropped");
+                assertThatThrownBy(observer::check).isInstanceOf(AssertionError.class)
+                        .hasStackTraceContaining("stream was invalidated");
+            } finally {
+                assertThatThrownBy(observer::close).isInstanceOf(AssertionError.class)
+                        .hasStackTraceContaining("stream was invalidated");
+                assertThatThrownBy(observer::close).isInstanceOf(AssertionError.class)
+                        .hasStackTraceContaining("stream was invalidated");
+            }
+        }
+    }
+
+    @Test
+    void replacingARetainedMarkerKeyWithAnotherRowCannotHideTheRewrite() throws Exception {
+        String database = "benchmark_table_terminal_replacement_witness";
+        String ring = "srs.replacement-observer-chain.orders";
+        String uri = SharedMongo.replicaSetUrl(database);
+        try (var client = MongoClients.create(uri)) {
+            var collection = client.getDatabase(database).getCollection(MongoStorePort.SRS_LOG);
+            collection.drop(); collection.insertOne(new Document("_id", "setup"));
+            var marker = new BenchmarkTableTerminalObserver.Marker("orders/cdc-end", ring, "u", 12_000L, "qty", 2L);
+            var observer = BenchmarkTableTerminalObserver.open(uri, database, List.of(marker));
+            try {
+                new MongoSrsLogStore(collection).store(ring, 41L, new SrsLogRecord(null, Op.UPDATE, 123L,
+                        Map.of("id", 12_000L, "qty", 1L), Map.of("id", 12_000L, "qty", 2L), 0L, 7L));
+                observer.await(marker.id(), Duration.ofSeconds(10));
+                Document key = new Document("ring", ring).append("seq", 41L);
+                collection.replaceOne(Filters.eq("_id", key), new Document("_id", key)
+                        .append("op", "u").append("epoch", 7L)
+                        .append("after", new Document("id", 99L).append("qty", 3L)));
+                Await.until("retained marker rewrite rejected", Duration.ofSeconds(2), () -> {
+                    try { observer.check(); return false; }
+                    catch (AssertionError expected) { return true; }
+                }, () -> "a replacement changed the retained marker's row identity");
+                assertThatThrownBy(observer::check).isInstanceOf(AssertionError.class)
+                        .hasStackTraceContaining("retained marker log key was rewritten");
+            } finally {
+                try { observer.close(); }
+                catch (AssertionError expectedObserverFailure) {
+                    assertThat(expectedObserverFailure).hasStackTraceContaining("retained marker log key was rewritten");
+                }
+            }
+        }
+    }
+
+    @Test
+    void aSecondExactMarkerIsRejectedEvenWhenItUsesAnotherLogSequence() throws Exception {
+        String database = "benchmark_table_terminal_duplicate_witness";
+        String ring = "srs.duplicate-observer-chain.orders";
+        String uri = SharedMongo.replicaSetUrl(database);
+        try (var client = MongoClients.create(uri)) {
+            var collection = client.getDatabase(database).getCollection(MongoStorePort.SRS_LOG);
+            collection.drop(); collection.insertOne(new Document("_id", "setup"));
+            var marker = new BenchmarkTableTerminalObserver.Marker("orders/cdc-end", ring, "u", 12_000L, "qty", 2L);
+            var observer = BenchmarkTableTerminalObserver.open(uri, database, List.of(marker));
+            var store = new MongoSrsLogStore(collection);
+            try {
+                var row = new SrsLogRecord(null, Op.UPDATE, 123L,
+                        Map.of("id", 12_000L, "qty", 1L), Map.of("id", 12_000L, "qty", 2L), 0L, 7L);
+                store.store(ring, 41L, row);
+                observer.await(marker.id(), Duration.ofSeconds(10));
+                store.store(ring, 42L, row);
+                Await.until("duplicate exact log marker rejected", Duration.ofSeconds(10), () -> {
+                    try { observer.check(); return false; }
+                    catch (AssertionError expected) { return true; }
+                }, () -> "the duplicate append has not reached the observer");
+                assertThatThrownBy(observer::check).isInstanceOf(AssertionError.class)
+                        .hasStackTraceContaining("duplicate table marker");
+            } finally {
+                assertThatThrownBy(observer::close).isInstanceOf(AssertionError.class)
+                        .hasStackTraceContaining("duplicate table marker");
+            }
+        }
+    }
+
+    @Test
+    void aMarkerWithoutAnOriginalCaptureEpochCannotBeQualified() {
+        String database = "benchmark_table_terminal_unknown_epoch_witness";
+        String ring = "srs.unknown-observer-chain.orders";
+        String uri = SharedMongo.replicaSetUrl(database);
+        try (var client = MongoClients.create(uri)) {
+            var collection = client.getDatabase(database).getCollection(MongoStorePort.SRS_LOG);
+            collection.drop(); collection.insertOne(new Document("_id", "setup"));
+            var marker = new BenchmarkTableTerminalObserver.Marker("orders/cdc-end", ring, "u", 12_000L, "qty", 2L);
+            var observer = BenchmarkTableTerminalObserver.open(uri, database, List.of(marker));
+            try {
+                new MongoSrsLogStore(collection).store(ring, 41L, new SrsLogRecord(null, Op.UPDATE, 123L,
+                        Map.of("id", 12_000L, "qty", 1L), Map.of("id", 12_000L, "qty", 2L), 0L));
+                assertThatThrownBy(() -> observer.await(marker.id(), Duration.ofSeconds(10)))
+                        .isInstanceOf(AssertionError.class).hasStackTraceContaining("no proven original capture order");
+            } finally {
+                assertThatThrownBy(observer::close).isInstanceOf(AssertionError.class)
+                        .hasStackTraceContaining("no proven original capture order");
+            }
+        }
+    }
+
+    @Test
+    void aBoundedObserverRetainsAnExactTokenlessMarkerAcrossImmediateTrim() throws Exception {
+        String database = "benchmark_table_terminal_observer_witness";
+        String ring = "srs.exact-observer-chain.orders";
+        String uri = SharedMongo.replicaSetUrl(database);
+        try (var client = MongoClients.create(uri)) {
+            var collection = client.getDatabase(database).getCollection(MongoStorePort.SRS_LOG);
+            collection.drop();
+            collection.insertOne(new Document("_id", "setup"));
+            var marker = new BenchmarkTableTerminalObserver.Marker("orders/cdc-end", ring,
+                    "u", 12_000L, "qty", 2L);
+            try (var observer = BenchmarkTableTerminalObserver.open(uri, database, List.of(marker))) {
+                var store = new MongoSrsLogStore(collection);
+                store.store(ring, 41L, new SrsLogRecord(null, Op.UPDATE, 123L,
+                        Map.of("id", 12_000L, "qty", 1L), Map.of("id", 12_000L, "qty", 2L), 0L, 7L));
+                store.trim(ring, 41L);
+                assertThat(observer.await(marker.id(), Duration.ofSeconds(10)))
+                        .isEqualTo(new BenchmarkTableTerminalObserver.Point(marker.id(), ring, 7L, 41L, null));
+                assertThat(store.load(ring, 41L)).isEmpty();
+            }
+        }
+    }
+
     @Test
     void aTokenlessAppendSurvivesTrimWhileAReplacementCannotSupplyACompleteRecord() {
         String databaseName = "benchmark_table_log_append_witness";
