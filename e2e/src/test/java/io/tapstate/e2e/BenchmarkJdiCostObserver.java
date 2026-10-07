@@ -193,6 +193,7 @@ final class BenchmarkJdiCostObserver {
 
     private static final String TARGET = "io.tapstate.adapters.mongostore.BenchmarkJdiEncoderTarget";
     private static final String LATEST_TARGET = "io.tapstate.adapters.mongostore.BenchmarkJdiLatestEncoderTarget";
+    private static final String LATEST_PUBLICATION_TARGET = "io.tapstate.adapters.mongostore.BenchmarkJdiLatestPublicationTarget";
     private static final String OBSERVATION = "io.tapstate.adapters.mongostore.MongoObservationStore";
     private static final String RATE = "io.tapstate.adapters.mongostore.MongoRateHistoryStore";
     private static final String LATEST = "io.tapstate.adapters.mongostore.LatestObservationPayloadCodec";
@@ -227,7 +228,8 @@ final class BenchmarkJdiCostObserver {
             "bson-record-codec-5.8.0.jar", "mongodb-driver-core-5.8.0.jar",
             "mongodb-driver-sync-5.8.0.jar", "slf4j-api-2.0.18.jar");
     private static final List<String> TARGET_CLASSES = List.of(TARGET, LATEST_TARGET,
-            LATEST_TARGET + "$Chunks", LATEST_TARGET + "$ChunkFixture");
+            LATEST_TARGET + "$Chunks", LATEST_TARGET + "$ChunkFixture",
+            LATEST_PUBLICATION_TARGET, LATEST_PUBLICATION_TARGET + "$InlineChunks");
     private static final Duration TIMEOUT = Duration.ofSeconds(30);
 
     private BenchmarkJdiCostObserver() {
@@ -425,12 +427,14 @@ final class BenchmarkJdiCostObserver {
     static Summary run(Artifact artifact, String mode, Options options, String mongoUri) throws Exception {
         boolean latest = mode.equals("latest") || mode.equals("latest-chunk");
         boolean wire = mode.startsWith("wire");
-        boolean store = mode.startsWith("store-raw");
+        boolean store = mode.startsWith("store-");
+        boolean storeLatest = mode.startsWith("store-latest");
         if (latest && !artifact.latestAvailable()) {
             throw invalid("latest binary encoder is unavailable in the selected arm");
         }
         List<Signature> signatures = latest ? List.of(LATEST_ENCODER)
                 : wire ? List.of(SYNC_SEND, ASYNC_SEND)
+                : storeLatest ? List.of(LATEST_ENCODER)
                 : store ? List.of(ENCODERS.get(1), ENCODERS.get(2)) : ENCODERS;
         ListeningConnector connector = Bootstrap.virtualMachineManager().listeningConnectors().stream()
                 .filter(item -> item.name().equals("com.sun.jdi.SocketListen"))
@@ -456,7 +460,7 @@ final class BenchmarkJdiCostObserver {
             Path java = Path.of(System.getProperty("java.home"), "bin", "java");
             ProcessBuilder builder = new ProcessBuilder(java.toString(),
                     "-agentlib:jdwp=transport=dt_socket,server=n,suspend=y,address=" + address,
-                    "-cp", artifact.classpath(), latest ? LATEST_TARGET : TARGET, mode);
+                    "-cp", artifact.classpath(), latest ? LATEST_TARGET : storeLatest ? LATEST_PUBLICATION_TARGET : TARGET, mode);
             for (String variable : List.of("CLASSPATH", "JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS")) {
                 builder.environment().remove(variable);
             }
@@ -473,10 +477,10 @@ final class BenchmarkJdiCostObserver {
             }
             pump = new Pump(vm, artifact, signatures, options, store);
             pump.start();
-            protocol.await("READY", pump, artifact, latest, wire);
+            protocol.await("READY", pump, artifact, latest, wire, storeLatest);
             pump.begin();
             protocol.send("START");
-            protocol.await("DONE", pump, artifact, latest, wire);
+            protocol.await("DONE", pump, artifact, latest, wire, storeLatest);
             Summary summary = pump.finish();
             protocol.send("STOP");
             if (!child.waitFor(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS) || child.exitValue() != 0) {
@@ -1162,7 +1166,7 @@ final class BenchmarkJdiCostObserver {
             }
         }
 
-        void await(String expected, Pump pump, Artifact artifact, boolean latest, boolean wire) throws Exception {
+        void await(String expected, Pump pump, Artifact artifact, boolean latest, boolean wire, boolean storeLatest) throws Exception {
             long deadline = System.nanoTime() + TIMEOUT.toNanos();
             while (System.nanoTime() < deadline) {
                 check();
@@ -1188,6 +1192,7 @@ final class BenchmarkJdiCostObserver {
                             ? Set.of(LATEST, "io.tapstate.core.lifecycle.Observation")
                             : wire ? Set.of(OBSERVATION, RATE, BSON, CONNECTION,
                                     "io.tapstate.core.lifecycle.Observation")
+                            : storeLatest ? Set.of(OBSERVATION, RATE, BSON, LATEST, "io.tapstate.core.lifecycle.Observation")
                             : Set.of(OBSERVATION, RATE, BSON, "io.tapstate.core.lifecycle.Observation");
                     if (!origins.equals(required)) {
                         throw invalid("the complete pinned code-source roster was not reported");
