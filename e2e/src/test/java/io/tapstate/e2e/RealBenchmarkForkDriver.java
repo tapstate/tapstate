@@ -134,6 +134,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                         new LinkedHashMap<>(snapshot.expectedLogicalCoverage());
                 BenchmarkForkEnvironment.PhaseResult terminal = null;
                 List<BenchmarkAckOracle.SourceChain> chains = null;
+                List<Map<String, Object>> tableReceipts = List.of();
                 Map<String, Long> observedTargetCoverage;
                 BenchmarkWorkloadDefinitions.Phase previousPhase = snapshot;
                 int phaseIndex = 1;
@@ -154,13 +155,14 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 awaitFreshObservationAfterBoundary(workload, fork.control());
                 awaitQuiescentRecordsOut(workload, fork.control());
                 try (TargetWatchSet targets = TargetWatchSet.open(
-                        workload, workload.phases().get(phaseIndex), fork)) {
+                        workload, workload.phases().get(phaseIndex), fork);
+                     BenchmarkTableCaptureSet tables = BenchmarkTableCaptureSet.open(workload, fork)) {
                     fork.beginTelemetryCapture();
                     for (BenchmarkWorkloadDefinitions.Phase phase : workload.phases().subList(phaseIndex,
                             workload.phases().size())) {
                         if (phase.measured()) {
                             PhaseWindow window = runMeasuredPhase(workload, fork, phase,
-                                    captures, positionCoverage, targets);
+                                    captures, positionCoverage, targets, tables);
                             measured.add(window.measurement());
                             allDurations.addAll(window.deliveryDurations());
                             resourceWindows.add(window.resources());
@@ -172,7 +174,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                             fork.cutoffTelemetryCapture();
                             targets.expectTerminal(workload, phase);
                             terminal = fork.runPhase(phase, true);
-                            chains = captures.awaitTerminalAcks(workload, fork, positionCoverage);
+                            chains = captures.awaitTerminalAcks(workload, fork, positionCoverage, tables);
                             targets.checkpoint(phase);
                         } else {
                             throw new AssertionError("unmeasured setup followed measured SQL: " + phase.id());
@@ -180,6 +182,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                         mergeCoverage(declaredSourceCoverage, phase.expectedLogicalCoverage());
                     }
                     observedTargetCoverage = targets.observedCoverage();
+                    tableReceipts = tables.receipts();
                 }
                 if (terminal == null || chains == null
                         || resourceWindows.isEmpty() || commandWindows.isEmpty()) {
@@ -214,6 +217,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 PipelineBenchmarkComparison.Fork performance = new PipelineBenchmarkComparison.Fork(
                         arm, throughput, latencies, resources.peakHeapBytes(), resources.peakRssBytes());
                 List<Map<String, Object>> receipts = new ArrayList<>();
+                receipts.addAll(tableReceipts);
                 // All measured ACK, resource and command windows have already closed.
                 try (StoreDocuments documents = StoreDocuments.at(fork.storeUri())) {
                     Map<String, ControlPlane.PositionRead> positions = new LinkedHashMap<>();
@@ -222,8 +226,12 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                                 chain.pipelineId(), fork.control()::positionRead);
                         BenchmarkAckOracle.SourceChain proof = chains.stream()
                                 .filter(candidate -> candidate.id().equals(chain.id())).findFirst().orElseThrow();
-                        receipts.add(BenchmarkTerminalMetaReceipt.read(documents, position, chain,
-                                proof.sourceTerminals().getFirst().sourcePosition(), positionCoverage));
+                        if (proof.tableConfirmation() != null) {
+                            receipts.add(PipelineBenchmarkLiveRunIT.tableConfirmation(proof.tableConfirmation()));
+                        } else {
+                            receipts.add(BenchmarkTerminalMetaReceipt.read(documents, position, chain,
+                                    proof.sourceTerminals().getFirst().sourcePosition(), positionCoverage));
+                        }
                     }
                 }
                 Evidence run = new Evidence(forkId, workload, arm, applicationJar,
@@ -239,7 +247,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
     private static PhaseWindow runMeasuredPhase(BenchmarkWorkloadDefinitions.Workload workload,
             BenchmarkForkEnvironment fork, BenchmarkWorkloadDefinitions.Phase phase,
             CaptureSet captures, BenchmarkConnectorPositionCoverage positionCoverage,
-            TargetWatchSet targets) throws Exception {
+            TargetWatchSet targets, BenchmarkTableCaptureSet tables) throws Exception {
         List<BenchmarkExpectedChanges.TargetPlan> plans = BenchmarkExpectedChanges.forPhase(workload, phase);
         long initialAcknowledged = recordsOut(workload, fork.control());
         BenchmarkForkEnvironment.PhaseIssue issued;
@@ -262,7 +270,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             if (issued.batches().isEmpty()) {
                 throw new AssertionError("measured phase has no source batches: " + phase.id());
             }
-            completedAckAt = captures.awaitMeasuredAcks(workload, phase, fork, positionCoverage);
+            captures.awaitMeasuredSourceMarkers(workload, phase);
+            completedAckAt = tables.awaitMeasured(workload, phase.id());
             resources = resourceSampler.finish();
             commands = commandSampler.finish();
         } catch (BenchmarkResourceSampler.SamplingFailure failure) {
@@ -644,8 +653,21 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             }
         }
 
+        void awaitMeasuredSourceMarkers(BenchmarkWorkloadDefinitions.Workload workload,
+                BenchmarkWorkloadDefinitions.Phase phase) throws InterruptedException {
+            boolean observed = false;
+            for (var entry : captures.entrySet()) {
+                if (BenchmarkMeasuredEndMarkers.forChain(workload, entry.getKey()).containsKey(phase.id())) {
+                    entry.getValue().awaitMeasuredEnd(phase.id(), SIDE_CAR_WAIT);
+                    observed = true;
+                }
+            }
+            if (!observed) { throw new AssertionError("measured phase has no own source marker"); }
+        }
+
         List<BenchmarkAckOracle.SourceChain> awaitTerminalAcks(BenchmarkWorkloadDefinitions.Workload workload,
-                BenchmarkForkEnvironment fork, BenchmarkConnectorPositionCoverage positionCoverage)
+                BenchmarkForkEnvironment fork, BenchmarkConnectorPositionCoverage positionCoverage,
+                BenchmarkTableCaptureSet tables)
                 throws InterruptedException {
             List<BenchmarkAckOracle.SourceChain> result = new ArrayList<>();
             for (Map.Entry<BenchmarkWorkloadDefinitions.SourceChain, BenchmarkTerminalCapture> entry
@@ -653,7 +675,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 BenchmarkWorkloadDefinitions.SourceChain chain = entry.getKey();
                 BenchmarkTerminalCapture capture = entry.getValue();
                 String terminal = capture.awaitTerminal(SIDE_CAR_WAIT);
-                String ack = awaitAck(fork.control(), chain, terminal, positionCoverage);
+                var tableProof = tables.awaitTerminal(chain, terminal);
+                String ack = fork.control().targetAckForIfPresent(chain).orElse(null);
                 String closedTerminal = capture.closeAndTerminal();
                 if (!terminal.equals(closedTerminal)) {
                     throw new AssertionError("sidecar terminal position changed for " + chain.id());
@@ -662,8 +685,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 String verifiedTerminal = terminal;
                 result.add(new BenchmarkAckOracle.SourceChain(chain.id(),
                         List.of(new BenchmarkAckOracle.TerminalEvent(chain.terminalLogicalId(), terminal)),
-                        ack, (candidateAck, candidateTerminal) -> verifiedAck.equals(candidateAck)
-                                && verifiedTerminal.equals(candidateTerminal)));
+                        ack, (candidateAck, candidateTerminal) -> Objects.equals(verifiedAck, candidateAck)
+                                && verifiedTerminal.equals(candidateTerminal), tableProof));
             }
             return List.copyOf(result);
         }

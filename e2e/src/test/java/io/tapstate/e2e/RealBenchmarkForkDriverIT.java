@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -103,6 +104,9 @@ class RealBenchmarkForkDriverIT {
                         .isEqualTo(mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN);
                 System.out.println("benchmark-real-telemetry mode=" + mode + " evidence="
                         + JsonWriter.write(PipelineBenchmarkLiveRunIT.telemetryEvidence(evidence.telemetry())));
+                System.out.println("benchmark-real-table-confirmations=" + JsonWriter.write(Map.of(
+                        "receipts", evidence.terminalMetaReceipts(), "sourceProofs", result.correctness().chains().stream()
+                                .map(chain -> PipelineBenchmarkLiveRunIT.tableConfirmation(chain.tableConfirmation())).toList())));
                 evidence.phases().forEach(phase -> {
                     BenchmarkForkEnvironment.ClockAnchor anchor = phase.clockAnchor();
                     BenchmarkResourceSampler.SamplingDiagnostics sampling = phase.resources().sampling()

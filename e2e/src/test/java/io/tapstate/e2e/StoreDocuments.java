@@ -157,6 +157,20 @@ final class StoreDocuments implements AutoCloseable {
                 .first();
     }
 
+    /** Frozen artifact and submitted-generation identity; older reference builds keep absent fields absent. */
+    Document benchmarkRunIdentity(String pipelineId) {
+        Document artifact = database.getCollection(MongoStorePort.ARTIFACTS)
+                .find(new Document("_id", pipelineId))
+                .projection(new Document("_id", 1).append("contentHash", 1).append("pipelineIncarnationId", 1)).first();
+        if (artifact == null) { throw new AssertionError("benchmark pipeline artifact is absent"); }
+        List<Document> executions = database.getCollection(MongoStorePort.WORKLOAD_CLAIMS)
+                .find(new Document("resourceType", "PIPELINE_ACTUATION").append("resourceId", pipelineId))
+                .projection(new Document("_id", 1).append("clusterId", 1).append("executionGeneration", 1))
+                .limit(2).into(new java.util.ArrayList<>());
+        if (executions.size() > 1) { throw new AssertionError("benchmark execution authority is ambiguous"); }
+        return new Document("artifact", artifact).append("executionAuthority", executions);
+    }
+
     /**
      * The chain's durable read offset - how far the capture may forget, held back to the slowest consumer.
      *

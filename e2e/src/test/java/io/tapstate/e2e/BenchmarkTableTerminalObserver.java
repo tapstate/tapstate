@@ -25,7 +25,7 @@ final class BenchmarkTableTerminalObserver implements AutoCloseable {
     record Marker(String id, String ring, String op, long rowId, String field, Object value) {
         Marker {
             if (id == null || id.isBlank() || id.length() > 256 || ring == null || ring.isBlank()
-                    || ring.length() > 512 || !List.of("c", "u").contains(op) || rowId < 0
+                    || ring.length() > 512 || !List.of("i", "u").contains(op) || rowId < 0
                     || field == null || !field.matches("[A-Za-z_][A-Za-z0-9_]{0,127}")
                     || !(value instanceof Number || value instanceof String text && text.length() <= 256)) {
                 throw new IllegalArgumentException("a bounded exact table marker is required");
@@ -46,6 +46,10 @@ final class BenchmarkTableTerminalObserver implements AutoCloseable {
     private boolean closed;
     private boolean terminated;
     private long events;
+    private long eventBytes;
+    private long pollCalls;
+    private long pollNanos;
+    private final Map<String, Map<String, Object>> provenance = new LinkedHashMap<>();
 
     static BenchmarkTableTerminalObserver open(String uri, String database, List<Marker> markers) {
         return new BenchmarkTableTerminalObserver(uri, database, markers);
@@ -89,7 +93,9 @@ final class BenchmarkTableTerminalObserver implements AutoCloseable {
         try {
             while (true) {
                 synchronized (this) { if (closed || failure != null) { return; } }
+                long started = System.nanoTime();
                 ChangeStreamDocument<Document> event = cursor.tryNext();
+                synchronized (this) { pollCalls++; pollNanos += System.nanoTime() - started; }
                 if (event != null) { accept(event); }
             }
         } catch (RuntimeException | AssertionError observerFailure) {
@@ -126,6 +132,11 @@ final class BenchmarkTableTerminalObserver implements AutoCloseable {
         if (record == null || !(record.get("after") instanceof Document after)) {
             throw new AssertionError("table marker has no operation-time row image");
         }
+        int bytes = record.toJson().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        if (bytes > 65_536 || eventBytes + bytes > 2 * 1024 * 1024) {
+            throw new AssertionError("table marker evidence exceeded its retained byte budget");
+        }
+        eventBytes += bytes;
         if (!(record.get("_id") instanceof Document storedKey)
                 || !key.ring().equals(storedKey.get("ring"))
                 || !(storedKey.get("seq") instanceof Integer || storedKey.get("seq") instanceof Long)
@@ -150,6 +161,15 @@ final class BenchmarkTableTerminalObserver implements AutoCloseable {
                 throw new AssertionError("duplicate table marker or reused log key");
             }
             captured.put(marker.id(), new Point(marker.id(), key.ring(), epoch.longValue(), key.seq(), (String) token));
+            if (event.getResumeToken() == null || event.getClusterTime() == null) {
+                throw new AssertionError("table marker event has no stream provenance");
+            }
+            String resume = event.getResumeToken().toJson();
+            if (resume.length() > 4096) { throw new AssertionError("table marker resume token exceeded its bound"); }
+            provenance.put(marker.id(), Map.of("resumeToken", resume, "clusterTime", event.getClusterTime().toString(),
+                    "operation", event.getOperationTypeString(), "operationTimeRecordBytes", bytes,
+                    "recordSha256", sha256(record.toJson(org.bson.json.JsonWriterSettings.builder()
+                            .outputMode(org.bson.json.JsonMode.EXTENDED).build()))));
             notifyAll();
         }
     }
@@ -173,6 +193,20 @@ final class BenchmarkTableTerminalObserver implements AutoCloseable {
     synchronized void check() {
         if (failure != null) { throw failure; }
         if (closed) { throw new AssertionError("table marker observer is already closed"); }
+    }
+
+    synchronized Map<String, Object> evidence() {
+        check();
+        return Map.of("registeredMarkers", markers.size(), "retainedMarkers", captured.size(),
+                "events", events, "recordBytes", eventBytes, "pollCalls", pollCalls, "pollNanos", pollNanos,
+                "costScope", "EXTERNAL_CHANGE_STREAM_OBSERVER", "markers", Map.copyOf(provenance));
+    }
+
+    private static String sha256(String value) {
+        try {
+            return java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(value.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        } catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
     }
 
     private static Object portable(Object value) {

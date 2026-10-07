@@ -346,12 +346,24 @@ class PipelineBenchmarkLiveRunIT {
                 "terminalMetaReceipts", evidence.terminalMetaReceipts(),
                 "sourceChains", correctness.chains().stream().map(chain -> object(
                         "id", chain.id(), "authoritativeTargetAck", chain.authoritativeTargetAck(),
+                        "ackProofKind", chain.tableConfirmation() == null ? "SOURCE_TOKEN" : "TABLE_ORDER",
+                        "tableConfirmation", tableConfirmation(chain.tableConfirmation()),
                         "sourceTerminals", chain.sourceTerminals().stream().map(event -> object(
                                 "logicalId", event.logicalId(),
                                 "sourcePosition", event.sourcePosition())).toList())).toList(),
                 "checksum", evidence.checksum(),
                 "correctnessChecksum", correctness.checksum(),
                 "errorTotal", evidence.errorTotal());
+    }
+
+    static Map<String, Object> tableConfirmation(BenchmarkAckOracle.TableConfirmationProof proof) {
+        if (proof == null) { return object("state", "NOT_RECORDED"); }
+        return object("terminalLogicalId", proof.terminalLogicalId(), "sourceTerminalToken", proof.sourceTerminalToken(),
+                "ring", proof.marker().ring(), "epoch", proof.marker().epoch(), "seq", proof.marker().seq(),
+                "actualMarkerSourceToken", proof.marker().sourceToken(),
+                "physicalChainId", proof.binding().physicalChain(), "actualConsumerId", proof.binding().consumer(),
+                "table", proof.binding().table(), "expectedWriters", proof.binding().writers(),
+                "confirmedConsumer", io.tapstate.core.common.JsonReader.parse(proof.confirmedConsumerCanonicalJson()));
     }
 
     static Map<String, Object> telemetryEvidence(Optional<BenchmarkJdiTelemetrySession.Evidence> recorded) {

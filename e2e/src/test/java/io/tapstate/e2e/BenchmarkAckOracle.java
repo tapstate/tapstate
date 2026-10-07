@@ -5,6 +5,9 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import org.bson.Document;
+import org.bson.json.JsonMode;
+import org.bson.json.JsonWriterSettings;
 
 /** Checks delivery evidence without assuming that positions from separate source runs are comparable. */
 final class BenchmarkAckOracle {
@@ -20,10 +23,50 @@ final class BenchmarkAckOracle {
 
     record TerminalEvent(String logicalId, String sourcePosition) {}
 
+    /** A separate table-order proof; it never fabricates a connector token for a tokenless log row. */
+    record TableConfirmationProof(String terminalLogicalId, String sourceTerminalToken,
+            BenchmarkTableTerminalObserver.Point marker, BenchmarkTableAckGate.Binding binding,
+            String confirmedConsumerCanonicalJson) {
+        TableConfirmationProof {
+            if (terminalLogicalId == null || terminalLogicalId.isBlank() || terminalLogicalId.length() > 512
+                    || sourceTerminalToken == null || sourceTerminalToken.isBlank() || sourceTerminalToken.length() > 65_536
+                    || marker == null || binding == null || !terminalLogicalId.equals(marker.markerId())
+                    || confirmedConsumerCanonicalJson == null
+                    || confirmedConsumerCanonicalJson.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 65_536) {
+                throw new AssertionError("table-order confirmation proof is incomplete or exceeds its byte budget");
+            }
+        }
+        static TableConfirmationProof from(String logicalId, String sourceToken,
+                BenchmarkTableTerminalObserver.Point marker, BenchmarkTableAckGate.Binding binding, Document cursor) {
+            if (!logicalId.equals(marker.markerId()) || sourceToken == null || sourceToken.isBlank()) {
+                throw new AssertionError("table-order proof names a different source terminal event");
+            }
+            if (!BenchmarkTableAckGate.covers(binding, marker, cursor)) {
+                throw new AssertionError("table-order terminal has not been confirmed by every target writer");
+            }
+            String json = cursor.toJson(JsonWriterSettings.builder().outputMode(JsonMode.EXTENDED).build());
+            if (json.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 65_536) {
+                throw new AssertionError("table-order confirmation proof exceeded its byte budget");
+            }
+            return new TableConfirmationProof(logicalId, sourceToken, marker, binding, json);
+        }
+
+        boolean covers(TerminalEvent terminal) {
+            return terminal != null && terminal.logicalId().equals(terminalLogicalId)
+                    && marker.markerId().equals(terminalLogicalId)
+                    && terminal.sourcePosition().equals(sourceTerminalToken)
+                    && BenchmarkTableAckGate.covers(binding, marker, Document.parse(confirmedConsumerCanonicalJson));
+        }
+    }
+
     record SourceChain(String id, List<TerminalEvent> sourceTerminals, String authoritativeTargetAck,
-                       PositionCoverage positionCoverage) {
+                       PositionCoverage positionCoverage, TableConfirmationProof tableConfirmation) {
         SourceChain {
             sourceTerminals = List.copyOf(sourceTerminals);
+        }
+        SourceChain(String id, List<TerminalEvent> sourceTerminals, String authoritativeTargetAck,
+                PositionCoverage positionCoverage) {
+            this(id, sourceTerminals, authoritativeTargetAck, positionCoverage, null);
         }
     }
 
@@ -112,9 +155,17 @@ final class BenchmarkAckOracle {
                 throw new AssertionError("fork " + fork.id() + " has a duplicate source terminal event");
             }
             terminalsByChain.put(chain.id(), terminal.logicalId());
-            if (chain.authoritativeTargetAck() == null || chain.authoritativeTargetAck().isBlank()
+            boolean coveredByTable = chain.tableConfirmation() != null && chain.tableConfirmation().covers(terminal);
+            if (chain.tableConfirmation() != null && !coveredByTable) {
+                throw new AssertionError("table-order confirmation does not cover its own source terminal event");
+            }
+            if (chain.tableConfirmation() != null && !chain.id().equals(
+                    chain.tableConfirmation().binding().pipeline() + "/" + chain.tableConfirmation().binding().source())) {
+                throw new AssertionError("table-order confirmation belongs to a different source chain");
+            }
+            if (!coveredByTable && (chain.authoritativeTargetAck() == null || chain.authoritativeTargetAck().isBlank()
                     || chain.positionCoverage() == null
-                    || !chain.positionCoverage().covers(chain.authoritativeTargetAck(), terminal.sourcePosition())) {
+                    || !chain.positionCoverage().covers(chain.authoritativeTargetAck(), terminal.sourcePosition()))) {
                 throw new AssertionError("fork " + fork.id() + " chain " + chain.id()
                         + " has no authoritative target ACK covering its source terminal event");
             }
