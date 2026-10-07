@@ -42,8 +42,7 @@ class AStageReportsWorkWhileItIsBlockedTest {
         released = new CountDownLatch(1);
         String cluster = "stage-work-" + System.nanoTime();
         Config config = configuration(cluster);
-        config.getNetworkConfig().getJoin().getTcpIpConfig().setEnabled(true)
-                .addMember("127.0.0.1:" + config.getNetworkConfig().getPort());
+        config.getNetworkConfig().getJoin().getTcpIpConfig().setEnabled(true);
         HazelcastInstance member = Hazelcast.newHazelcastInstance(config);
         HazelcastInstance second = null;
         try {
@@ -190,7 +189,7 @@ class AStageReportsWorkWhileItIsBlockedTest {
     private static Config configuration(String cluster) {
         Config config = new Config();
         config.setClusterName(cluster);
-        config.getNetworkConfig().setPort(freePort()).setPortAutoIncrement(false).setReuseAddress(false);
+        config.getNetworkConfig().setPort(0).setPortAutoIncrement(false).setReuseAddress(false);
         config.getJetConfig().setEnabled(true).setCooperativeThreadCount(2);
         config.getMetricsConfig().setCollectionFrequencySeconds(1);
         config.setProperty("hazelcast.phone.home.enabled", "false");
@@ -201,14 +200,6 @@ class AStageReportsWorkWhileItIsBlockedTest {
         join.getAutoDetectionConfig().setEnabled(false);
         config.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");
         return config;
-    }
-
-    private static int freePort() {
-        try (java.net.ServerSocket socket = new java.net.ServerSocket(0)) {
-            return socket.getLocalPort();
-        } catch (java.io.IOException failure) {
-            throw new AssertionError("could not reserve a local test port", failure);
-        }
     }
 
     private static final class IdleWork extends AbstractProcessor implements DynamicMetricsProvider {
