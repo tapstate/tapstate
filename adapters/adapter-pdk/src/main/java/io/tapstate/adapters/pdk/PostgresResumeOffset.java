@@ -18,6 +18,11 @@ final class PostgresResumeOffset {
         if (offset == null || !TYPE.equals(offset.getClass().getName())) {
             return offset;
         }
+        return prepareReaderCopy(connectorId, offset, parser);
+    }
+
+    /** Adjusts the JSON coordinates independently of the connector class that carries them. */
+    static Object prepareReaderCopy(String connectorId, Object offset, Supplier<JsonParser> parser) {
         try {
             JsonParser json = parser.get();
             Map<String, Object> document = json.fromJsonObject(json.toJson(offset));
@@ -36,10 +41,8 @@ final class PostgresResumeOffset {
             if (lsn == 0 || lsn != ((Number) committed).longValue()) {
                 return offset;
             }
-            // A heartbeat names the end of the previous commit. The next BEGIN and INSERT may start
-            // exactly there, and Debezium filters that INSERT if it is named as the last processed change.
-            // No WAL record starts one byte earlier. Keep the commit boundary and all stored coordinates;
-            // only the reader's copy uses this discriminator, so the committed transaction is not replayed.
+            // The previous byte cannot begin a WAL record or filter the next transaction's first INSERT.
+            // Change only the reader's copy, preserving the commit boundary and the recorded token.
             Map<String, Object> readerCoordinates = new LinkedHashMap<>(coordinates);
             readerCoordinates.put("lsn_proc", lsn - 1);
             Map<String, Object> reader = new LinkedHashMap<>(document);
@@ -50,7 +53,7 @@ final class PostgresResumeOffset {
         } catch (RuntimeException failure) {
             throw new TapstateException(ConnectorError.POSITION_UNREADABLE,
                     Map.of("connector", connectorId, "detail", "cannot prepare PostgreSQL resume offset: "
-                            + String.valueOf(failure.getMessage())), failure);
+                            + failure.getMessage()), failure);
         }
     }
 }

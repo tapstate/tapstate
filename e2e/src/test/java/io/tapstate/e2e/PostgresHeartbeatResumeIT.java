@@ -91,9 +91,9 @@ class PostgresHeartbeatResumeIT {
                     () -> !PostgresSlots.active(source), () -> String.valueOf(PostgresSlots.of(source)));
             String slot = PostgresSlots.only(source).name();
             SourcePosition recorded = delivered.position.get();
-            Map<?, ?> heartbeat = sourceOffset(recorded, offsets);
+            Map<String, Object> heartbeat = sourceOffset(recorded, offsets);
             assertThat(heartbeat.get("txId")).isNull();
-            assertThat(heartbeat.get("lsn_proc")).isEqualTo(heartbeat.get("lsn_commit"));
+            assertThat(heartbeat).containsEntry("lsn_proc", heartbeat.get("lsn_commit"));
             long resumeLsn = ((Number) heartbeat.get("lsn_proc")).longValue();
 
             // Closing keeps the connector's notes and the exact opaque position; resume uses both.
@@ -141,7 +141,8 @@ class PostgresHeartbeatResumeIT {
         }
     }
 
-    private static Map<?, ?> sourceOffset(SourcePosition position, ConnectorClassLoader loader) {
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> sourceOffset(SourcePosition position, ConnectorClassLoader loader) {
         if (position == null) {
             return Map.of();
         }
@@ -153,7 +154,7 @@ class PostgresHeartbeatResumeIT {
         }) {
             Object offset = input.readObject();
             String source = (String) offset.getClass().getMethod("getSourceOffset").invoke(offset);
-            return source == null ? Map.of() : (Map<?, ?>) JsonReader.parse(source);
+            return source == null ? Map.of() : (Map<String, Object>) JsonReader.parse(source);
         } catch (Exception failure) {
             throw new AssertionError("the real connector's recorded offset must be readable", failure);
         }
