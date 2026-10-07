@@ -36,11 +36,49 @@ final class SharedSqlServer {
             }
             statement.execute("CREATE DATABASE " + EnterpriseJdbcEndpoints.quoted(database));
             statement.execute("USE " + EnterpriseJdbcEndpoints.quoted(database));
-            statement.execute("EXEC sys.sp_cdc_enable_db");
+            enableCdc(statement, Duration.ofSeconds(60));
         } catch (SQLException error) {
             throw new EnvelopeException("cannot provision the SQL Server database " + database, error);
         }
         return settings;
+    }
+
+    static void enableCdc(Statement statement, Duration bound) throws SQLException {
+        long deadline = System.nanoTime() + bound.toNanos();
+        while (true) {
+            long remaining = deadline - System.nanoTime();
+            statement.setQueryTimeout((int) Math.max(1, (remaining + 999_999_999L) / 1_000_000_000L));
+            try {
+                statement.execute("EXEC sys.sp_cdc_enable_db");
+                return;
+            } catch (SQLException error) {
+                if (!deadlock(error) || System.nanoTime() - deadline >= 0) {
+                    throw error;
+                }
+                try {
+                    Thread.sleep(Math.min(100, Math.max(1,
+                            Duration.ofNanos(deadline - System.nanoTime()).toMillis())));
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new EnvelopeException("interrupted enabling SQL Server database CDC", interrupted);
+                }
+                if (System.nanoTime() - deadline >= 0) {
+                    throw error;
+                }
+            }
+        }
+    }
+
+    private static boolean deadlock(SQLException error) {
+        for (SQLException current = error; current != null; current = current.getNextException()) {
+            // Database CDC setup can wrap the original deadlock in a metadata error.
+            if (current.getErrorCode() == 1205
+                    || (current.getErrorCode() == 22830 && current.getMessage() != null
+                    && current.getMessage().contains("The error returned was 1205:"))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static MSSQLServerContainer<?> server() {
