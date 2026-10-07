@@ -54,7 +54,7 @@ class RealBenchmarkForkDriverIT {
         BenchmarkJdiCostObserver.Artifact artifact = mode == BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN
                 ? null : BenchmarkJdiCostObserver.Artifact.open(
                 applicationJar, arm == PipelineBenchmarkComparison.Arm.A ? BenchmarkJdiCostObserver.Arm.REFERENCE
-                        : BenchmarkJdiCostObserver.Arm.OBSERVABILITY);
+                        : BenchmarkJdiCostObserver.Arm.OBSERVABILITY, BenchmarkJdiCostObserver.selectedArtifactSet());
         try (artifact) {
             RealBenchmarkForkDriver driver = mode.driver(applicationJar, artifact);
             int forkNumber = Integer.parseInt(System.getProperty(FORK_PROPERTY, "1"));

@@ -37,9 +37,11 @@ class BenchmarkJdiEncoderWitnessIT {
         assertThat(reference).as("the reference artifact input").isNotBlank();
         assertThat(observability).as("the observability artifact input").isNotBlank();
         ARTIFACTS.put(Arm.REFERENCE,
-                BenchmarkJdiCostObserver.Artifact.open(Path.of(reference), Arm.REFERENCE));
+                BenchmarkJdiCostObserver.Artifact.open(Path.of(reference), Arm.REFERENCE,
+                        BenchmarkJdiCostObserver.selectedArtifactSet()));
         ARTIFACTS.put(Arm.OBSERVABILITY,
-                BenchmarkJdiCostObserver.Artifact.open(Path.of(observability), Arm.OBSERVABILITY));
+                BenchmarkJdiCostObserver.Artifact.open(Path.of(observability), Arm.OBSERVABILITY,
+                        BenchmarkJdiCostObserver.selectedArtifactSet()));
     }
 
     @AfterAll
@@ -79,7 +81,7 @@ class BenchmarkJdiEncoderWitnessIT {
                 .isInstanceOf(AssertionError.class).hasMessageContaining("required numeric loopback bind");
         for (Arm arm : Arm.values()) {
             var summary = BenchmarkJdiCostObserver.run(ARTIFACTS.get(arm), "normal", Options.NORMAL, null);
-            assertThat(summary.artifactSha256()).isEqualTo(arm.sha256);
+            assertThat(summary.artifactSha256()).isEqualTo(ARTIFACTS.get(arm).artifactSha256);
             assertThat(summary.require(Unit.OBSERVATION_DOCUMENT_BUILD)).isEqualTo(new Count(3, 3));
             assertThat(summary.require(Unit.RATE_DOCUMENT_BUILD)).isEqualTo(new Count(2, 2));
             assertThat(summary.require(Unit.BSON_BINARY_ENCODER_INVOCATION)).isEqualTo(new Count(5, 5));

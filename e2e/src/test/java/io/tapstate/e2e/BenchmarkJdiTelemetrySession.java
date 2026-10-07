@@ -232,7 +232,7 @@ final class BenchmarkJdiTelemetrySession implements AutoCloseable {
                     BenchmarkJdiCostObserver.Unavailable.WIRE_DOCUMENT_COUNT,
                     BenchmarkJdiCostObserver.Unavailable.WIRE_BYTE_COUNT);
             if (mode == Mode.PASSIVE_JDWP) { unavailable.add(BenchmarkJdiCostObserver.Unavailable.SCOPED_COST_CAPTURE); }
-            return new Evidence(artifact.arm, artifact.arm.sha256, mode, available, costs.counts(), commands.counts(),
+            return new Evidence(artifact.arm, artifact.artifactSha256, mode, available, costs.counts(), commands.counts(),
                     callbacks.counts(), begin, cutoff, shutdown, deltas, eventCount, handlingNanos,
                     windowBreakpointEvents, drainBreakpointEvents, drainHandlingNanos, excludedLoaders,
                     mode == Mode.ACTIVE_CAPTURE, unavailable);
@@ -285,6 +285,8 @@ final class BenchmarkJdiTelemetrySession implements AutoCloseable {
         add(new Spec(DISPATCHER, "<init>", "(Lio/tapstate/runtime/scheduler/ObservationPublisher;"
                 + "Lio/tapstate/runtime/scheduler/RateSampler;Lio/tapstate/spi/metrics/MetricsExport;"
                 + "Lio/tapstate/app/ObservationScopeRegistry;Lio/tapstate/spi/store/PipelineEventStore;"
+                + (artifact.artifactSet == BenchmarkJdiCostObserver.ArtifactSet.COMMON_SOURCE
+                        ? "Lio/tapstate/app/ObservationScopeRecovery;Lio/tapstate/app/ObservationContinuationRecovery;" : "")
                 + "IILjava/time/Duration;)V", Kind.CONSTRUCTOR, null, null, null));
         add(new Spec(DISPATCHER, "close", "()V", Kind.CLOSE, null, null, null));
         feature(Feature.LATEST_PAYLOAD, MONGO + "LatestObservationPayloadCodec");

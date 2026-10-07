@@ -70,7 +70,7 @@ class BenchmarkCaptureCalibrationLiveRunIT {
                             .filter(workload -> "copy".equals(workload.get("id"))).toList());
             List<BenchmarkAckOracle.Fork> correctness = new ArrayList<>();
             try (var artifact = BenchmarkJdiCostObserver.Artifact.open(jar,
-                    BenchmarkJdiCostObserver.Arm.OBSERVABILITY)) {
+                    BenchmarkJdiCostObserver.Arm.OBSERVABILITY, BenchmarkJdiCostObserver.selectedArtifactSet())) {
                 for (int group = 0; group < GROUPS.size(); group++) {
                     int forkNumber = group + 1;
                     for (Mode mode : GROUPS.get(group)) {

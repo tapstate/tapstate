@@ -38,6 +38,10 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /** Proves supported cost units and health boundaries against actual immutable boot processes. */
 class BenchmarkJdiTelemetryWitnessIT {
+    private static BenchmarkJdiCostObserver.Artifact openArtifact(Path path, Arm arm) throws Exception {
+        return BenchmarkJdiCostObserver.Artifact.open(path, arm, BenchmarkJdiCostObserver.selectedArtifactSet());
+    }
+
     @BeforeAll
     static void immutableInputsAndDocker() {
         String reference = System.getProperty("tapstate.e2e.jdi-cost.reference-jar");
@@ -53,7 +57,7 @@ class BenchmarkJdiTelemetryWitnessIT {
         String database = "jdi_telemetry_failed_launch";
         String uri = SharedMongo.replicaSetUrl(database);
         AtomicReference<RealProcessServer> launched = new AtomicReference<>();
-        try (var artifact = BenchmarkJdiCostObserver.Artifact.open(Path.of(System.getProperty(
+        try (var artifact = openArtifact(Path.of(System.getProperty(
                 "tapstate.e2e.jdi-cost.observability-jar")), Arm.OBSERVABILITY)) {
             try {
                 assertThatThrownBy(() -> BenchmarkJdiTelemetrySession.launch(artifact, uri, database,
@@ -72,7 +76,7 @@ class BenchmarkJdiTelemetryWitnessIT {
     void aFailedDebugDetachStopsTheActualOwnedBootProcess() throws Exception {
         String database = "jdi_telemetry_failed_detach";
         String uri = SharedMongo.replicaSetUrl(database);
-        try (var artifact = BenchmarkJdiCostObserver.Artifact.open(Path.of(System.getProperty(
+        try (var artifact = openArtifact(Path.of(System.getProperty(
                     "tapstate.e2e.jdi-cost.observability-jar")), Arm.OBSERVABILITY);
                 var session = BenchmarkJdiTelemetrySession.launch(artifact, uri, database)) {
             ControlPlane readiness = new ControlPlane(session.server().baseUrl());
@@ -102,7 +106,7 @@ class BenchmarkJdiTelemetryWitnessIT {
                 : "tapstate.e2e.jdi-cost.observability-jar";
         String database = "jdi_passive_" + arm.name().toLowerCase(Locale.ROOT);
         String uri = SharedMongo.replicaSetUrl(database);
-        try (var artifact = BenchmarkJdiCostObserver.Artifact.open(Path.of(System.getProperty(property)), arm);
+        try (var artifact = openArtifact(Path.of(System.getProperty(property)), arm);
                 var session = BenchmarkJdiTelemetrySession.launch(artifact, uri, database, database + "_operator",
                         BenchmarkJdiTelemetrySession.Mode.PASSIVE_JDWP)) {
             ControlPlane readiness = new ControlPlane(session.server().baseUrl());
@@ -146,7 +150,7 @@ class BenchmarkJdiTelemetryWitnessIT {
                 : "tapstate.e2e.jdi-cost.observability-jar";
         String database = "jdi_telemetry_" + arm.name().toLowerCase(Locale.ROOT);
         String uri = SharedMongo.replicaSetUrl(database);
-        try (var artifact = BenchmarkJdiCostObserver.Artifact.open(Path.of(System.getProperty(property)), arm);
+        try (var artifact = openArtifact(Path.of(System.getProperty(property)), arm);
                 var session = BenchmarkJdiTelemetrySession.launch(artifact, uri, database);
                 StoreDocuments documents = StoreDocuments.at(uri)) {
             ControlPlane readiness = new ControlPlane(session.server().baseUrl());
@@ -169,7 +173,7 @@ class BenchmarkJdiTelemetryWitnessIT {
             pipeline.stopAndSettle();
             session.cutoff();
             var evidence = session.shutdownAndFinish();
-            assertThat(evidence.artifactSha256()).isEqualTo(arm.sha256);
+            assertThat(evidence.artifactSha256()).isEqualTo(artifact.artifactSha256);
             assertThat(evidence.fullyDrained()).isTrue();
             assertThat(evidence.entries(Unit.RATE_DOCUMENT_BUILD)).isPositive();
             assertThat(evidence.entries(Unit.WIRE_COMMAND_BINARY_ENCODER_INVOCATION)).isPositive();
@@ -214,7 +218,7 @@ class BenchmarkJdiTelemetryWitnessIT {
     void aRealClosedRollupCapturesNestedEncodersBesideItsCommandCount(@TempDir Path directory) throws Exception {
         String database = "jdi_nonempty_closed_rollup";
         String uri = SharedMongo.replicaSetUrl(database);
-        try (var artifact = BenchmarkJdiCostObserver.Artifact.open(Path.of(System.getProperty(
+        try (var artifact = openArtifact(Path.of(System.getProperty(
                     "tapstate.e2e.jdi-cost.observability-jar")), Arm.OBSERVABILITY);
                 var session = BenchmarkJdiTelemetrySession.launch(artifact, uri, database);
                 var client = MongoClients.create(uri)) {
@@ -270,7 +274,7 @@ class BenchmarkJdiTelemetryWitnessIT {
             assertThat(recordsOutDelta(bucket)).isEqualByComparingTo("20");
             pipeline.stopAndSettle(); session.cutoff();
             var evidence = session.shutdownAndFinish();
-            assertThat(evidence.artifactSha256()).isEqualTo(Arm.OBSERVABILITY.sha256);
+            assertThat(evidence.artifactSha256()).isEqualTo(artifact.artifactSha256);
             assertThat(evidence.fullyDrained()).isTrue();
             for (Unit unit : new Unit[]{Unit.ROLLUP_DOCUMENT_BUILD, Unit.BSON_BINARY_ENCODER_INVOCATION,
                     Unit.BSON_DOCUMENT_BINARY_ENCODER_INVOCATION, Unit.WIRE_COMMAND_BINARY_ENCODER_INVOCATION,

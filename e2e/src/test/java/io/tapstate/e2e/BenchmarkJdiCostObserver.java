@@ -74,6 +74,24 @@ final class BenchmarkJdiCostObserver {
         }
     }
 
+    enum ArtifactSet {
+        LEGACY("0.5.0", Arm.REFERENCE.sha256, Arm.OBSERVABILITY.sha256),
+        COMMON_SOURCE("0.6.0", "f7b371f38fd6af3dfdf3ba2aca00612ff313de617cff53b251deb6ae77714635",
+                "023f2cbf0b4ef3e72b4f992312f2d1761c270037babc63dd67e2ec76f197e9d3");
+
+        final String moduleVersion;
+        final String referenceSha;
+        final String observabilitySha;
+        ArtifactSet(String moduleVersion, String referenceSha, String observabilitySha) {
+            this.moduleVersion = moduleVersion; this.referenceSha = referenceSha; this.observabilitySha = observabilitySha;
+        }
+        String sha256(Arm arm) { return arm == Arm.REFERENCE ? referenceSha : observabilitySha; }
+    }
+
+    static ArtifactSet selectedArtifactSet() {
+        return ArtifactSet.valueOf(System.getProperty("tapstate.e2e.jdi-cost.artifact-set", "LEGACY"));
+    }
+
     enum Unit {
         OBSERVATION_DOCUMENT_BUILD,
         RATE_DOCUMENT_BUILD,
@@ -216,14 +234,18 @@ final class BenchmarkJdiCostObserver {
 
     static final class Artifact implements AutoCloseable {
         final Arm arm;
+        final ArtifactSet artifactSet;
+        final String artifactSha256;
         final Path bootJar;
         final Path directory;
         final List<Path> libraries;
         final Path targets;
         final Map<String, ClassImage> images = new ConcurrentHashMap<>();
 
-        private Artifact(Arm arm, Path bootJar, Path directory, List<Path> libraries, Path targets) {
+        private Artifact(Arm arm, ArtifactSet artifactSet, Path bootJar, Path directory, List<Path> libraries, Path targets) {
             this.arm = arm;
+            this.artifactSet = artifactSet;
+            this.artifactSha256 = artifactSet.sha256(arm);
             this.bootJar = bootJar;
             this.directory = directory;
             this.libraries = List.copyOf(libraries);
@@ -231,11 +253,16 @@ final class BenchmarkJdiCostObserver {
         }
 
         static Artifact open(Path input, Arm arm) throws Exception {
-            if (!Files.isRegularFile(input) || !sha256(Files.newInputStream(input)).equals(arm.sha256)) {
+            return open(input, arm, ArtifactSet.LEGACY);
+        }
+
+        static Artifact open(Path input, Arm arm, ArtifactSet set) throws Exception {
+            if (!Files.isRegularFile(input) || !sha256(Files.newInputStream(input)).equals(set.sha256(arm))) {
                 throw invalid("immutable artifact hash did not match its selected arm");
             }
             Path directory = Files.createTempDirectory("benchmark-jdi-cost-");
-            Artifact result = new Artifact(arm, input.toRealPath(), directory, LIBRARIES.stream()
+            Artifact result = new Artifact(arm, set, input.toRealPath(), directory, LIBRARIES.stream()
+                    .map(name -> name.replace("-0.5.0.jar", "-" + set.moduleVersion + ".jar"))
                     .map(directory::resolve).toList(), directory.resolve("targets"));
             try {
                 try (ZipFile boot = new ZipFile(input.toFile())) {
@@ -249,7 +276,7 @@ final class BenchmarkJdiCostObserver {
                         }
                     }
                 }
-                if (!sha256(Files.newInputStream(input)).equals(arm.sha256)) {
+                if (!sha256(Files.newInputStream(input)).equals(set.sha256(arm))) {
                     throw invalid("immutable artifact changed during extraction");
                 }
                 for (String target : TARGET_CLASSES) {
@@ -947,7 +974,7 @@ final class BenchmarkJdiCostObserver {
             if (artifact.arm == Arm.REFERENCE) {
                 unavailable.add(Unavailable.LATEST_OBSERVATION_BINARY_ENCODER);
             }
-            return new Summary(artifact.arm, artifact.arm.sha256, snapshot, wires, unavailable,
+            return new Summary(artifact.arm, artifact.artifactSha256, snapshot, wires, unavailable,
                     events, handlingNanos, breakpointRequests,
                     vm.eventRequestManager().methodEntryRequests().size(), closed);
         }
