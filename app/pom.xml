@@ -315,6 +315,8 @@
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-failsafe-plugin</artifactId>
         <configuration>
+          <!-- Match the server's cglib module opening while retaining integration coverage. -->
+          <argLine>@{argLine} --add-opens java.base/java.lang=ALL-UNNAMED</argLine>
           <!-- The packaged boot jar, handed to the boot-jar guard IT so it can assert the PDK runtime is
                bundled into the shipped artifact (repackage runs in package, before integration-test). -->
           <systemPropertyVariables>
