@@ -79,9 +79,14 @@ public final class Await {
         }
     }
 
+    /** Spaces consecutive observations in a caller's bounded condition loop. */
+    static void pauseBeforeNextPoll(Duration interval) throws InterruptedException {
+        Thread.sleep(interval.toMillis());
+    }
+
     private static void sleep() {
         try {
-            Thread.sleep(POLL.toMillis());
+            pauseBeforeNextPoll(POLL);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new AssertionError("interrupted while waiting for a condition", e);

@@ -56,8 +56,8 @@ final class SharedSqlServer {
                     throw error;
                 }
                 try {
-                    Thread.sleep(Math.min(100, Math.max(1,
-                            Duration.ofNanos(deadline - System.nanoTime()).toMillis())));
+                    Await.pauseBeforeNextPoll(Duration.ofMillis(Math.min(100, Math.max(1,
+                            Duration.ofNanos(deadline - System.nanoTime()).toMillis()))));
                 } catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
                     throw new EnvelopeException("interrupted enabling SQL Server database CDC", interrupted);
