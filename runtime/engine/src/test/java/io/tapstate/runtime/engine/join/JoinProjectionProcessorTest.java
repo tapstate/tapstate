@@ -4,7 +4,10 @@ import com.hazelcast.jet.core.test.TestInbox;
 import com.hazelcast.jet.core.test.TestOutbox;
 import com.hazelcast.jet.core.test.TestProcessorContext;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.sql.JoinKey;
+import io.tapstate.runtime.engine.SettledPositions;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -14,6 +17,35 @@ import java.util.Map;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class JoinProjectionProcessorTest {
+
+    @Test
+    void projectionKeepsTheCausingPositionAndPassesAZeroOutputSettlementWord() throws Exception {
+        CountingJoinStores stores = new CountingJoinStores(4);
+        String key = JoinKey.of(List.of(10L)).name();
+        stores.putFact(key, Map.of("id", 10L, "customer_id", 1L));
+        stores.putDimensionRow("c", JoinKey.of(List.of(1L)).name(),
+                Map.of("id", 1L, "name", "Ada"));
+        ChainPosition fact = new ChainPosition(new SourceOrder(1, 7), "order-7");
+        ChainPosition dimension = new ChainPosition(new SourceOrder(1, 9), "customer-9");
+        JoinProjectionProcessor processor = new JoinProjectionProcessor(
+                new JoinProjection(JoinProjectionTest.plan(), List.of("id"), "joined", stores));
+        TestOutbox outbox = new TestOutbox(new int[] {4}, 4);
+        processor.init(outbox, new TestProcessorContext());
+
+        TestInbox inbox = new TestInbox(List.of(
+                new JoinUpdate(key, Envelope.insert(1, "joined", Map.of("order_id", 10L), null)
+                        .withPositions(Map.of("orders", fact))),
+                new SettledPositions(Map.of("customers", dimension))));
+        processor.process(0, inbox);
+        List<Object> emitted = new ArrayList<>();
+        outbox.drainQueueAndReset(0, emitted, false);
+
+        assertThat(inbox.isEmpty()).isTrue();
+        assertThat(emitted).hasSize(2);
+        assertThat(((Envelope) emitted.getFirst()).positions()).containsEntry("orders", fact);
+        assertThat(emitted.getLast()).isEqualTo(new SettledPositions(Map.of("customers", dimension)));
+    }
+
     @Test
     void backpressureDoesNotRepeatOrLoseABatchedProjection() throws Exception {
         CountingJoinStores stores = new CountingJoinStores(4);

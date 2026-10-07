@@ -14,6 +14,8 @@ import io.tapstate.core.sql.JoinKey;
 import io.tapstate.core.sql.JoinPlan;
 import io.tapstate.core.sql.JoinTree;
 import io.tapstate.runtime.engine.PassthroughProcessor;
+import io.tapstate.runtime.engine.SettledPositions;
+import io.tapstate.runtime.engine.ChainAxes;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -41,6 +43,8 @@ import java.util.function.ToIntFunction;
  */
 public final class JoinDag {
 
+    private static final String SETTLEMENT_PARTITION = "join-settlement";
+
     private JoinDag() {
     }
 
@@ -58,6 +62,16 @@ public final class JoinDag {
             Function<String, List<Vertex>> sourceUpstream,
             ToIntFunction<Vertex> nextOutbound, JoinStoresBinding stores,
             DimensionRowDisplacedAlert displaced) {
+        return attach(dag, plan, pipelineId, nodeId, factKeyColumns, dimensionRowKeyColumns,
+                sourceUpstream, nextOutbound, stores, displaced, null);
+    }
+
+    /** The same Join with per-source chain bounds that reach its projection and sink. */
+    public static Vertex attach(DAG dag, JoinPlan plan, String pipelineId, String nodeId,
+            List<String> factKeyColumns, Map<String, List<String>> dimensionRowKeyColumns,
+            Function<String, List<Vertex>> sourceUpstream,
+            ToIntFunction<Vertex> nextOutbound, JoinStoresBinding stores,
+            DimensionRowDisplacedAlert displaced, JoinFrontier frontier) {
         Map<Integer, String> sourceByOrdinal = new LinkedHashMap<>();
         Map<String, List<String>> keyColumns = new LinkedHashMap<>();
         String factSource = plan.factSource().name();
@@ -72,24 +86,35 @@ public final class JoinDag {
             keyColumns.put(source.name(), dimensionKeyColumns(plan.from(), source.name()));
         }
 
+        Map<Integer, List<String>> chainsByOrdinal = new LinkedHashMap<>();
+        sourceByOrdinal.forEach((edge, source) -> {
+            if (frontier != null) {
+                chainsByOrdinal.put(edge, frontier.chainsOfAlias(source));
+            }
+        });
+        List<String> allChains = chainsByOrdinal.values().stream().flatMap(List::stream).distinct().toList();
+        ChainAxes axes = frontier == null ? null : frontier.axes();
         Vertex vertex = dag.newVertex(nodeId, ProcessorMetaSupplier.of(new JoinVertexSupplier(
                 plan, pipelineId, nodeId, factKeyColumns, dimensionRowKeyColumns,
-                Map.copyOf(sourceByOrdinal), stores, displaced, false)));
+                Map.copyOf(sourceByOrdinal), axes, Map.copyOf(chainsByOrdinal), allChains,
+                stores, displaced, false)));
         sourceByOrdinal.forEach((edge, source) -> {
             List<Vertex> producers = sourceUpstream.apply(source);
             if (producers == null || producers.isEmpty()) {
                 throw new IllegalStateException("join source '" + source + "' resolved to no vertex");
             }
             Vertex producer = producers.size() == 1 ? producers.get(0)
-                    : merged(dag, vertex, source, producers, nextOutbound);
+                    : merged(dag, vertex, source, producers, nextOutbound, frontier);
             dag.edge(Edge.from(producer, nextOutbound.applyAsInt(producer)).to(vertex, edge)
                     .partitioned(keyOf(keyColumns.get(source))).distributed());
         });
         Vertex projection = dag.newVertex(nodeId + ":project", ProcessorMetaSupplier.of(new JoinVertexSupplier(
-                plan, pipelineId, nodeId, factKeyColumns, Map.of(), Map.of(), stores,
+                plan, pipelineId, nodeId, factKeyColumns, Map.of(), Map.of(), axes,
+                Map.of(), allChains, stores,
                 displaced, true)));
         dag.edge(Edge.from(vertex, nextOutbound.applyAsInt(vertex)).to(projection)
-                .partitioned(item -> ((JoinUpdate) item).factKey()).distributed());
+                .partitioned(item -> item instanceof JoinUpdate update
+                        ? update.factKey() : SETTLEMENT_PARTITION).distributed());
         return projection;
     }
 
@@ -104,9 +129,21 @@ public final class JoinDag {
      * member the two are indistinguishable, which is why this is spelled out rather than left to a test.
      */
     private static Vertex merged(DAG dag, Vertex destination, String source, List<Vertex> producers,
-            ToIntFunction<Vertex> nextOutbound) {
+            ToIntFunction<Vertex> nextOutbound, JoinFrontier frontier) {
         String name = destination.getName() + ":" + source;
-        Vertex merge = dag.newVertex(name, PassthroughProcessor.metaSupplier(name));
+        Map<Integer, List<String>> chainsByOrdinal = new LinkedHashMap<>();
+        if (frontier != null) {
+            List<List<String>> perProducer = frontier.chainsOfAliasByProducer().apply(source);
+            if (perProducer.size() != producers.size()) {
+                throw new IllegalStateException("join source producer count changed while wiring " + source);
+            }
+            for (int i = 0; i < perProducer.size(); i++) {
+                chainsByOrdinal.put(i, perProducer.get(i));
+            }
+        }
+        Vertex merge = dag.newVertex(name, frontier == null
+                ? PassthroughProcessor.metaSupplier(name)
+                : PassthroughProcessor.metaSupplier(name, frontier.axes(), chainsByOrdinal));
         int ordinal = 0;
         for (Vertex producer : producers) {
             dag.edge(Edge.from(producer, nextOutbound.applyAsInt(producer)).to(merge, ordinal++)
@@ -147,6 +184,9 @@ public final class JoinDag {
      */
     private static FunctionEx<Object, Object> keyOf(List<String> columns) {
         return item -> {
+            if (item instanceof SettledPositions) {
+                return SETTLEMENT_PARTITION;
+            }
             Envelope event = (Envelope) item;
             Map<String, Object> row = event.after() != null ? event.after() : event.before();
             if (row == null) {
@@ -176,6 +216,9 @@ public final class JoinDag {
         private final List<String> factKeyColumns;
         private final Map<String, List<String>> dimensionRowKeyColumns;
         private final Map<Integer, String> sourceByOrdinal;
+        private final ChainAxes axes;
+        private final Map<Integer, List<String>> chainsByOrdinal;
+        private final List<String> allChains;
         private final JoinStoresBinding binding;
         private final DimensionRowDisplacedAlert displaced;
         private final boolean projection;
@@ -186,6 +229,7 @@ public final class JoinDag {
         private JoinVertexSupplier(JoinPlan plan, String pipelineId, String stepId,
                 List<String> factKeyColumns, Map<String, List<String>> dimensionRowKeyColumns,
                 Map<Integer, String> sourceByOrdinal,
+                ChainAxes axes, Map<Integer, List<String>> chainsByOrdinal, List<String> allChains,
                 JoinStoresBinding binding, DimensionRowDisplacedAlert displaced, boolean projection) {
             this.plan = plan;
             this.pipelineId = pipelineId;
@@ -193,6 +237,9 @@ public final class JoinDag {
             this.factKeyColumns = factKeyColumns;
             this.dimensionRowKeyColumns = dimensionRowKeyColumns;
             this.sourceByOrdinal = sourceByOrdinal;
+            this.axes = axes;
+            this.chainsByOrdinal = chainsByOrdinal;
+            this.allChains = allChains;
             this.binding = binding;
             this.displaced = displaced;
             this.projection = projection;
@@ -257,10 +304,11 @@ public final class JoinDag {
             List<Processor> processors = new ArrayList<>(count);
             for (int i = 0; i < count; i++) {
                 processors.add(projection
-                        ? new JoinProjectionProcessor(new JoinProjection(plan, factKeyColumns, stepId, stores))
+                        ? new JoinProjectionProcessor(
+                                new JoinProjection(plan, factKeyColumns, stepId, stores), axes, allChains)
                         : new JoinProcessor(new JoinDriver(plan, factKeyColumns, stepId, stores,
                                 JoinDriver.DEFAULT_KEYS_PER_READ, gauge, dimensionRowKeyColumns,
-                                boundDisplaced), sourceByOrdinal));
+                                boundDisplaced), sourceByOrdinal, axes, chainsByOrdinal));
             }
             return processors;
         }
