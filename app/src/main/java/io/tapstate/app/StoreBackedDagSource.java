@@ -2300,18 +2300,30 @@ final class StoreBackedDagSource implements DagSource {
         String table = literal.ref();
         String sourceId = sourceIdByTable.get(table);
         if (sourceId == null) {
+            int separator = table.indexOf('.');
+            if (separator > 0 && separator + 1 < table.length()) {
+                String candidate = table.substring(separator + 1);
+                String owner = sourceIdByTable.get(candidate);
+                if (table.substring(0, separator).equals(owner)) {
+                    table = candidate;
+                    sourceId = owner;
+                }
+            }
+        }
+        if (sourceId == null) {
             // A step id: the stream is another step's output, which has no table key to fall back on.
             return new NestTable(table, List.of());
         }
+        String resolvedTable = table;
         return storePort.schemas().get(sourceId)
                 .map(DiscoveredSourceModel::model)
-                .flatMap(model -> model.tables().stream().filter(t -> t.name().equals(table)).findFirst())
+                .flatMap(model -> model.tables().stream().filter(t -> t.name().equals(resolvedTable)).findFirst())
                 .map(discovered -> new NestTable(
-                        table,
+                        resolvedTable,
                         discovered.primaryKey(),
                         uniqueIndexesOf(discovered),
                         discovered.fields().stream().map(field -> field.name()).toList()))
-                .orElseGet(() -> new NestTable(table, List.of()));
+                .orElseGet(() -> new NestTable(resolvedTable, List.of()));
     }
 
     /**

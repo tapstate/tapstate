@@ -68,15 +68,20 @@ public final class ViewCatalogService {
             if (view != null) {
                 String collection = view.storage() != null && view.storage().warm() != null
                         ? view.storage().warm().collection() : view.id();
-                result.add(item("view", pipeline.id(), view.id(), storeId, collection,
+                result.add(item("view", pipeline.id(), pipeline.id() + ":" + view.id(), storeId, collection,
                         status, metrics, snapshot, resources));
             }
             List<SyncElement> sync = syncElements(pipeline.serve(), resources);
             for (SyncElement element : sync) {
-                for (String table : sourceTables(pipeline, resources)) {
+                Map<String, String> explicitNames = element.rename() == null ? null : element.rename().map();
+                List<String> outputTables = explicitNames != null && !explicitNames.isEmpty()
+                        ? List.copyOf(explicitNames.keySet()) : sourceTables(pipeline, resources);
+                String kind = pipeline.transforms() != null && !pipeline.transforms().isEmpty()
+                        ? "view" : "replica";
+                for (String table : outputTables) {
                     String collection = element.rename() != null && element.rename().map() != null
                             ? element.rename().map().getOrDefault(table, table) : table;
-                    result.add(item("replica", pipeline.id(), element.id() + ":" + table,
+                    result.add(item(kind, pipeline.id(), pipeline.id() + ":" + element.id() + ":" + table,
                             element.source(), collection, status, metrics, snapshot, resources));
                 }
             }
