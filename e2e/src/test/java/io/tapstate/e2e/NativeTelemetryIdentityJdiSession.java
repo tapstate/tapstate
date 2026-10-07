@@ -27,6 +27,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     interface OwnedLauncher { RealProcessServer launch(Path jar, List<String> jvmArguments) throws Exception; }
     enum Target { JOB, ADMISSION, REPLACEMENT_ADMISSION, RAW_CONTINUATION, SUBMIT, LOG, OFFER, VISIBLE, PRODUCE, PREPARE, FOLDER_FORGET, EXPORT_FORGET, EXPORT_INCARNATION,
         PUBLISHER_SWEEP, EXPORT_SWEEP, FOLDER_SWEEP, JOINED_TAKEOVER }
+    enum BindingProfile { FULL, RESTORED_BEFORE_FIRST_START }
     record Binding(String type, String method, String descriptor, String origin,
             String codeSha256, long loaderId, List<Integer> returns) { }
     record Counts(long entries, long normalReturns, long exceptionalExits, long inFlight) { }
@@ -57,13 +58,16 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             List<AuthorityReceipt> authorityReceipts, Set<String> unverified, Set<String> decodedLayouts,
             Map<String, Object> logFamilyCalibration,
             String vmVersion, long events, long handlingNanos, int openCalls, boolean queueDrained,
-            boolean ownedVmDeath, boolean ownedVmDisconnected, boolean replacementObservationEnabled,
+            boolean ownedVmDeath, boolean ownedVmDisconnected, BindingProfile bindingProfile,
+            Set<Target> deferredUnpreparedBindings, boolean replacementObservationEnabled,
             boolean rawContinuationObservationEnabled, boolean joinedTakeoverObservationEnabled) {
         Boundary {
             bindings = Map.copyOf(bindings); counts = Map.copyOf(counts); records = List.copyOf(records);
             authorityReceipts = List.copyOf(authorityReceipts); unverified = Set.copyOf(unverified);
             decodedLayouts = Set.copyOf(decodedLayouts);
             logFamilyCalibration = Map.copyOf(logFamilyCalibration);
+            Objects.requireNonNull(bindingProfile);
+            deferredUnpreparedBindings = Set.copyOf(deferredUnpreparedBindings);
         }
         boolean invocationDrainComplete() {
             return queueDrained && openCalls == 0 && counts.values().stream().allMatch(count ->
@@ -72,6 +76,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         boolean decodedAndAuthorityBound() {
             return unverified.isEmpty() && bindings.size() == Target.values().length - (replacementObservationEnabled ? 0 : 1)
                     - (rawContinuationObservationEnabled ? 0 : 1) - (joinedTakeoverObservationEnabled ? 0 : 1)
+                    - deferredUnpreparedBindings.size()
                     && invocationDrainComplete() && !authorityReceipts.isEmpty();
         }
         Map<String, Object> evidence() {
@@ -92,6 +97,8 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                     "incarnation", receipt.incarnation(), "generation", receipt.generation(),
                     "coordinationId", receipt.coordinationId(), "capturedAt", receipt.capturedAt())).toList());
             out.put("unverified", unverified.stream().sorted().toList());
+            out.put("requiredBindingProfile", bindingProfile.name());
+            out.put("deferredUnpreparedBindings", deferredUnpreparedBindings.stream().map(Enum::name).sorted().toList());
             out.put("decodedLayouts", decodedLayouts.stream().sorted().toList());
             out.put("logFamilyCalibration", logFamilyCalibration);
             out.put("vmVersion", vmVersion); out.put("events", events); out.put("handlingNanos", handlingNanos);
@@ -250,6 +257,8 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     private final AtomicReference<AssertionError> failure = new AtomicReference<>();
     private volatile CompletableFuture<Boundary> command;
     private volatile String requestedPhase;
+    private volatile BindingProfile requestedBindingProfile = BindingProfile.FULL;
+    private boolean restoredBeforeStartFinished;
     private volatile boolean running = true;
     private boolean closing, closed, vmDeath, disconnected;
     private long loaderId = -1, events, sequence, calls, handlingNanos;
@@ -646,18 +655,38 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
 
     /** An event-pump barrier, never a VM-wide suspension; open calls are explicit carry-in/carry-out. */
     Boundary boundary(String phase) throws Exception {
+        return boundary(phase, BindingProfile.FULL);
+    }
+
+    /** This profile cannot certify submission; every other enabled target remains required. */
+    Boundary boundary(String phase, BindingProfile profile) throws Exception {
+        Objects.requireNonNull(profile);
         synchronized (commands) {
             check();
             if (phase == null || phase.isBlank() || phase.length() > 128) { throw invalid("invalid phase"); }
             if (!sha.equals(hash(jar))) { throw invalid("immutable artifact changed"); }
             synchronized (lock) {
                 if (closing || closed || disconnected || ownedCrashRequested) { throw invalid("boundary requested after close"); }
-                requestedPhase = phase; command = new CompletableFuture<>();
+                if (profile == BindingProfile.RESTORED_BEFORE_FIRST_START && restoredBeforeStartFinished) {
+                    throw invalid("restored binding profile requested after the first START boundary closed");
+                }
+                requestedPhase = phase; requestedBindingProfile = profile; command = new CompletableFuture<>();
             }
             CompletableFuture<Boundary> waiting = command;
             try { return waiting.get(30, TimeUnit.SECONDS); }
             catch (Exception | Error problem) { fail(problem); throw problem; }
             finally { command = null; }
+        }
+    }
+
+    /** Arm the full requirement before the caller issues its first real START; this performs no target work. */
+    void requireFullBindingsBeforeStart() {
+        synchronized (commands) {
+            synchronized (lock) {
+                check();
+                if (closing || closed || disconnected || ownedCrashRequested) { throw invalid("binding requirement changed after close"); }
+                restoredBeforeStartFinished = true;
+            }
         }
     }
 
@@ -678,7 +707,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                         handle(next);
                     }
                     synchronized (lock) {
-                        check(); request.complete(snapshot(requestedPhase, true));
+                        check(); request.complete(snapshot(requestedPhase, true, requestedBindingProfile));
                         records.clear(); phaseBytes = 0; command = null;
                     }
                 }
@@ -2088,14 +2117,35 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         records.add(Collections.unmodifiableMap(new LinkedHashMap<>(record)));
     }
     private Boundary snapshot(String phase, boolean drained) throws Exception {
+        return snapshot(phase, drained, BindingProfile.FULL);
+    }
+
+    private Boundary snapshot(String phase, boolean drained, BindingProfile profile) throws Exception {
+        boolean deferSubmit = false;
+        if (profile == BindingProfile.RESTORED_BEFORE_FIRST_START) {
+            if (restoredBeforeStartFinished) { throw invalid("restored binding profile cannot follow the first START"); }
+            for (Target target : List.of(Target.ADMISSION, Target.SUBMIT)) {
+                Totals total = totals.get(target);
+                if (total.entries != 0 || total.normal != 0 || total.exceptional != 0
+                        || threads.values().stream().flatMap(state -> state.calls.stream())
+                                .anyMatch(call -> call.spec.target() == target)) {
+                    throw invalid("restored binding profile cannot follow real admission or submission activity");
+                }
+            }
+            Spec submit = specs.get(Target.SUBMIT);
+            // ClassPrepare remains armed. A prepared but unbound class is still an unverified gap.
+            deferSubmit = submit != null && !bindings.containsKey(Target.SUBMIT)
+                    && vm.classesByName(submit.type()).stream().noneMatch(ReferenceType::isPrepared);
+        }
         Map<Target, Counts> counts = new EnumMap<>(Target.class);
         Set<String> missing = new LinkedHashSet<>(unverified);
         for (Target target : Target.values()) {
             if (target == Target.REPLACEMENT_ADMISSION && !replacementObservationEnabled
                     || target == Target.RAW_CONTINUATION && !rawContinuationObservationEnabled
                     || target == Target.JOINED_TAKEOVER && !joinedTakeoverObservationEnabled) { continue; }
-            if (!bindings.containsKey(target)) { missing.add("LIVE_BINDING_UNAVAILABLE:" + target); }
-            else if (!disconnected) {
+            if (!bindings.containsKey(target)) {
+                if (target != Target.SUBMIT || !deferSubmit) { missing.add("LIVE_BINDING_UNAVAILABLE:" + target); }
+            } else if (!disconnected) {
                 Method method = methods.get(target);
                 Spec spec = specs.get(target);
                 if (method.isObsolete() || !Arrays.equals(method.bytecodes(),
@@ -2117,7 +2167,8 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         }
         return new Boundary(phase, ++sequence, sha, pipeline, bindings, counts, records, authorities,
                 missing, layouts, logFamilyCalibration, vmVersion, events, handlingNanos,
-                threads.values().stream().mapToInt(state -> state.calls.size()).sum(), drained, vmDeath, disconnected,
+                threads.values().stream().mapToInt(state -> state.calls.size()).sum(), drained, vmDeath, disconnected, profile,
+                deferSubmit ? Set.of(Target.SUBMIT) : Set.of(),
                 replacementObservationEnabled, rawContinuationObservationEnabled, joinedTakeoverObservationEnabled);
     }
     private void qualifyScopes(Object value, Set<String> missing, int depth) {
@@ -2224,8 +2275,8 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         for (Map<String, Object> record : records) { qualifyScopes(record, missing, 0); }
         return new Boundary("owned-crash", ++sequence, sha, pipeline, bindings, counts, records, authorities,
                 missing, layouts, logFamilyCalibration, vmVersion, events, handlingNanos,
-                threads.values().stream().mapToInt(state -> state.calls.size()).sum(), false, vmDeath, disconnected,
-                replacementObservationEnabled, rawContinuationObservationEnabled, joinedTakeoverObservationEnabled);
+                threads.values().stream().mapToInt(state -> state.calls.size()).sum(), false, vmDeath, disconnected, BindingProfile.FULL,
+                Set.of(), replacementObservationEnabled, rawContinuationObservationEnabled, joinedTakeoverObservationEnabled);
     }
 
     private List<Map<String, Object>> crashOpenCalls() {

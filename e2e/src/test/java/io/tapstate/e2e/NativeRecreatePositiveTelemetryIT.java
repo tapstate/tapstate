@@ -154,7 +154,8 @@ class NativeRecreatePositiveTelemetryIT {
                             .containsEntry("params", Map.of("pipeline", pipeline));
                     report.addFork(Map.of("action", "actual-paused-loss-status", "response", status,
                             "desired", desired.read(pipeline).orElseThrow().targetState().name()));
-                    var positive = collect(observer, report, http, scrape, "positive-restored-failure", stage ->
+                    var positive = collect(observer, report, http, scrape, "positive-restored-failure",
+                            NativeTelemetryIdentityJdiSession.BindingProfile.RESTORED_BEFORE_FIRST_START, stage ->
                             positiveAccount(stage.records(), old).isPresent()
                                     && scopedLog(stage.records(), old).isPresent()
                                     && matchingPoint(stage.records(), stage.body(), old, ERRORS, true,
@@ -182,14 +183,16 @@ class NativeRecreatePositiveTelemetryIT {
                             () -> "latest=" + latest.readStored(pipeline));
                     assertThat(authority(database, pipeline, latest.readStored(pipeline).orElseThrow()).scope())
                             .as("STOP retains the actual coordination generation").isEqualTo(old.scope());
-                    var stopBoundary = observer.boundary("stop-completed");
+                    var stopBoundary = observer.boundary("stop-completed",
+                            NativeTelemetryIdentityJdiSession.BindingProfile.RESTORED_BEFORE_FIRST_START);
                     report.addFork(stopBoundary.evidence());
                     assertThat(stopBoundary.unverified()).isEmpty();
                     assertThat(stopBoundary.decodedAndAuthorityBound()).isTrue();
                     assertThat(folderCleared(stopBoundary.records(), oldAccountRecord)
                             || exporterCleared(stopBoundary.records(), oldProduced))
                             .as("STOP does not evict a positive predecessor before START").isFalse();
-                    var stopped = collect(observer, report, http, scrape, "same-jvm-stop-retained", stage -> {
+                    var stopped = collect(observer, report, http, scrape, "same-jvm-stop-retained",
+                            NativeTelemetryIdentityJdiSession.BindingProfile.RESTORED_BEFORE_FIRST_START, stage -> {
                         assertThat(folderCleared(stage.records(), oldAccountRecord) || exporterCleared(stage.records(), oldProduced))
                                 .as("the STOP retention window cannot contain a positive predecessor eviction").isFalse();
                         return retainedAccount(stage.records(), old, oldAccountRecord).isPresent()
@@ -215,7 +218,8 @@ class NativeRecreatePositiveTelemetryIT {
                             .isEqualTo(old.scope());
                     var originalArtifact = control.artifact(pipeline).orElseThrow();
                     // Close the positive STOP window before the resource is deleted.
-                    var retainedBoundary = observer.boundary("stop-retained-before-delete");
+                    var retainedBoundary = observer.boundary("stop-retained-before-delete",
+                            NativeTelemetryIdentityJdiSession.BindingProfile.RESTORED_BEFORE_FIRST_START);
                     report.addFork(retainedBoundary.evidence());
                     assertThat(retainedBoundary.unverified()).isEmpty();
                     assertThat(retainedBoundary.decodedAndAuthorityBound()).isTrue();
@@ -242,6 +246,7 @@ class NativeRecreatePositiveTelemetryIT {
                             "canonicalForm", recreatedArtifact.canonicalForm(),
                             "contentHash", recreatedArtifact.contentHash(), "currentLogResponse", beforeStartLogs,
                             "startRequested", false, "ownedPid", observer.server().pid()));
+                    observer.requireFullBindingsBeforeStart();
                     control.lifecycle(pipeline, LifecycleVerb.START);
                     var reset = Await.answered("a real new RUNNING execution after same-ID recreation", WAIT, () ->
                             latest.readStored(pipeline).filter(value -> value.scope().isPresent()
@@ -341,6 +346,12 @@ class NativeRecreatePositiveTelemetryIT {
 
     private static Stage collect(NativeTelemetryIdentityJdiSession observer, BenchmarkLiveReport report,
             HttpClient http, URI scrape, String phase, Predicate<Stage> ready) throws Exception {
+        return collect(observer, report, http, scrape, phase, NativeTelemetryIdentityJdiSession.BindingProfile.FULL, ready);
+    }
+
+    private static Stage collect(NativeTelemetryIdentityJdiSession observer, BenchmarkLiveReport report,
+            HttpClient http, URI scrape, String phase, NativeTelemetryIdentityJdiSession.BindingProfile profile,
+            Predicate<Stage> ready) throws Exception {
         List<Map<String, Object>> records = new ArrayList<>();
         long deadline = System.nanoTime() + WAIT.toNanos();
         try {
@@ -353,7 +364,7 @@ class NativeRecreatePositiveTelemetryIT {
                             Math.min(left, Duration.ofSeconds(20).toNanos()))).GET().build());
                     assertThat(body).doesNotContain("pipelineIncarnationId", "executionGeneration",
                             "pipeline_incarnation_id", "pipeline_execution_generation");
-                    var boundary = observer.boundary(phase);
+                    var boundary = observer.boundary(phase, profile);
                     report.addFork(boundary.evidence());
                     assertThat(boundary.unverified()).as("decoder gaps cannot qualify a zero or empty account").isEmpty();
                     records.addAll(boundary.records());
