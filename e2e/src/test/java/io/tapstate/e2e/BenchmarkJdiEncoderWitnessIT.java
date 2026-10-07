@@ -224,6 +224,18 @@ class BenchmarkJdiEncoderWitnessIT {
                 .isInstanceOf(AssertionError.class).hasMessageContaining("unmapped namespace");
     }
 
+    @Test
+    void lifecycleCheckpointIoKeepsItsOwnExactNamespaceOnBothArtifacts() throws Exception {
+        String uri = wireUri();
+        for (Arm arm : Arm.values()) {
+            var summary = BenchmarkJdiCostObserver.run(ARTIFACTS.get(arm), "wire-pipeline-state", Options.NORMAL, uri);
+            assertThat(summary.wireCommands().get(new WireKey(Namespace.PIPELINE_STATE, Operation.INSERT)))
+                    .isEqualTo(new Count(1, 1));
+            assertThat(summary.wireCommands()).doesNotContainKey(new WireKey(Namespace.OBSERVATION, Operation.INSERT));
+            assertThat(summary.closedAndDrained()).isTrue();
+        }
+    }
+
     private static String wireUri() {
         assumeTrue(Boolean.getBoolean("tapstate.e2e.jdi-cost.wire"),
                 "Mongo-backed wire witnesses require an explicit opt-in.");

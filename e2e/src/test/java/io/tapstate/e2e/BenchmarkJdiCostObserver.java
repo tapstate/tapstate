@@ -117,7 +117,7 @@ final class BenchmarkJdiCostObserver {
 
     enum Namespace {
         OBSERVATION, OBSERVATION_CHUNKS, RAW_HISTORY, HISTORY_ROLLUPS, EVENTS, CONTROL,
-        ARTIFACTS, DESIRED, WORKLOAD_CLAIMS
+        ARTIFACTS, DESIRED, PIPELINE_STATE, WORKLOAD_CLAIMS
     }
 
     enum Operation {
@@ -950,7 +950,8 @@ final class BenchmarkJdiCostObserver {
             if (!collection.referenceType().name().equals("org.bson.BsonString")) {
                 throw invalid("a wire collection field lacked its exact string type");
             }
-            Namespace namespace = switch (string(field(collection, "value"))) {
+            String collectionName = string(field(collection, "value"));
+            Namespace namespace = switch (collectionName) {
                 case "pipeline_observation" -> Namespace.OBSERVATION;
                 case "pipeline_observation_chunks" -> Namespace.OBSERVATION_CHUNKS;
                 case "pipeline_rate_history" -> Namespace.RAW_HISTORY;
@@ -958,8 +959,11 @@ final class BenchmarkJdiCostObserver {
                 case "pipeline_events" -> Namespace.EVENTS;
                 case "artifacts" -> Namespace.ARTIFACTS;
                 case "pipeline_desired" -> Namespace.DESIRED;
+                case "pipeline_state" -> Namespace.PIPELINE_STATE;
                 case "workload_claims" -> Namespace.WORKLOAD_CLAIMS;
-                default -> throw invalid("a wire command used an unmapped namespace");
+                default -> throw invalid("a wire command used an unmapped namespace [collection="
+                        + (collectionName.length() <= 128 && collectionName.matches("[A-Za-z_][A-Za-z0-9_.-]*")
+                                ? collectionName : "UNAVAILABLE") + ", operation=" + operation + "]");
             };
             return new WireKey(namespace, operation);
         }

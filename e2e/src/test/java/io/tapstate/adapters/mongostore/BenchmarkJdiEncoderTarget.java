@@ -126,7 +126,8 @@ public final class BenchmarkJdiEncoderTarget {
         }
         try (MongoClient client = MongoClients.create(uri)) {
             var database = client.getDatabase(WIRE_DATABASE);
-            String collectionName = mode.equals("wire-unmapped") ? "unmapped_rows" : "pipeline_observation";
+            String collectionName = mode.equals("wire-unmapped") ? "unmapped_rows"
+                    : mode.equals("wire-pipeline-state") ? "pipeline_state" : "pipeline_observation";
             var collection = database.getCollection(collectionName);
             database.runCommand(new Document("ping", 1));
             collection.drop();
