@@ -171,6 +171,84 @@ class TelemetryDispatcherTest {
         }
     }
 
+    @Test
+    void queuedOldHistoryAndExportFramesAreSkippedAfterSameGenerationResourceReplacement() throws Exception {
+        ObservationScopeRegistry scopes = new ObservationScopeRegistry();
+        var blocker = scopes.begin("blocker", "inc-blocker", 1);
+        var old = scopes.begin("orders", "inc-old", 41);
+        CountDownLatch historyEntered = new CountDownLatch(1), exportEntered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        List<Map<String, Object>> appended = new java.util.concurrent.CopyOnWriteArrayList<>();
+        List<Map<String, Object>> exported = new java.util.concurrent.CopyOnWriteArrayList<>();
+        RateHistoryStore history = new RateHistoryStore() {
+            @Override public void append(RateSample sample) { throw new AssertionError("unscoped history"); }
+            @Override public void appendScoped(RateSample sample, ObservationStore.Scope scope, Instant gapFrom) {
+                if (sample.pipelineId().equals("blocker")) {
+                    historyEntered.countDown(); awaitProjectionRelease(release);
+                }
+                appended.add(Map.of("pipeline", sample.pipelineId(), "scope", scope,
+                        "out", sample.counters().get("records.out")));
+            }
+            @Override public Page readPage(String id, Instant from, Instant to, Key after, int limit) { return new Page(List.of(), false); }
+            @Override public Optional<Entry> read(String id, Key key) { return Optional.empty(); }
+            @Override public Optional<Entry> predecessor(String id, Instant time) { return Optional.empty(); }
+            @Override public Optional<Entry> successor(String id, Instant time) { return Optional.empty(); }
+            @Override public void deleteAll(String id) { }
+            @Override public Duration retention() { return Duration.ofDays(15); }
+        };
+        MetricsExport export = new MetricsExport() {
+            @Override public void offer(String id, PipelineState state, Instant at, List<MetricFact> facts) { throw new AssertionError("unscoped export"); }
+            @Override public void offerFoldedScoped(String id, ScopeToken scope, PipelineState state, Instant at, List<MetricFact> facts) {
+                if (id.equals("blocker")) { exportEntered.countDown(); awaitProjectionRelease(release); }
+                exported.add(Map.of("pipeline", id, "scope", scope, "at", at));
+            }
+            @Override public void forgetPipelinesOutside(java.util.Collection<String> ids) { }
+        };
+        ObservationStore latest = new ObservationStore() {
+            @Override public void save(Observation observation) { throw new AssertionError("unscoped latest"); }
+            @Override public boolean saveScoped(Observation observation, Scope scope) { return true; }
+            @Override public Optional<Observation> read(String id) { return Optional.empty(); }
+            @Override public void delete(String id) { }
+        };
+        try (TelemetryDispatcher dispatcher = new TelemetryDispatcher(new ObservationPublisher(new InMemoryStateStore(), latest),
+                new RateSampler(history, Duration.ofMillis(1)), export, scopes, 1, 4, Duration.ofSeconds(5))) {
+            dispatcher.offer(projectionFrame("blocker", 1), blocker);
+            assertThat(historyEntered.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(exportEntered.await(5, TimeUnit.SECONDS)).isTrue();
+            dispatcher.offer(projectionFrame("orders", 2), old);
+            await(() -> dispatcher.health().get(TelemetryDispatcher.Sink.HISTORY).queueDepth() == 1
+                    && dispatcher.health().get(TelemetryDispatcher.Sink.EXPORT).queueDepth() == 1);
+            var current = scopes.begin("orders", "inc-new", 41);
+            dispatcher.offer(projectionFrame("orders", 3), new ObservationStore.Scope("inc-foreign", 41));
+            dispatcher.offer(projectionFrame("orders", 4), null);
+            dispatcher.offer(projectionFrame("orders", 5), current);
+            release.countDown();
+            await(() -> appended.size() == 2 && exported.size() == 2
+                    && dispatcher.health().get(TelemetryDispatcher.Sink.HISTORY).inFlight() == 0
+                    && dispatcher.health().get(TelemetryDispatcher.Sink.EXPORT).inFlight() == 0);
+            assertThat(appended).containsExactly(Map.of("pipeline", "blocker", "scope", blocker, "out", 1L),
+                    Map.of("pipeline", "orders", "scope", current, "out", 5L));
+            assertThat(exported).containsExactly(
+                    Map.of("pipeline", "blocker", "scope", new MetricsExport.ScopeToken("inc-blocker", 1),
+                            "at", projectionFrame("blocker", 1).observation().observedAt()),
+                    Map.of("pipeline", "orders", "scope", new MetricsExport.ScopeToken("inc-new", 41),
+                            "at", projectionFrame("orders", 5).observation().observedAt()));
+        } finally { release.countDown(); }
+    }
+
+    private static void awaitProjectionRelease(CountDownLatch release) {
+        try { assertThat(release.await(5, TimeUnit.SECONDS)).as("the owned projection blocker is released").isTrue(); }
+        catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt(); throw new AssertionError("projection blocker interrupted", interrupted);
+        }
+    }
+
+    private static ObservationPublisher.Prepared projectionFrame(String pipeline, long count) {
+        Instant at = Instant.parse("2026-09-26T10:00:00Z").plusMillis(count);
+        return new ObservationPublisher.Prepared(new Observation(pipeline, PipelineState.RUNNING,
+                Map.of("records.out", count), Map.of(), Map.of(), null, at), false, Map.of(), Map.of(), Map.of());
+    }
+
     private static void assertHistoryGapFacts(TelemetryDispatcher dispatcher, RateSampler sampler,
             long open, long opened, long closed) {
         Instant sampledAt = Instant.now();
