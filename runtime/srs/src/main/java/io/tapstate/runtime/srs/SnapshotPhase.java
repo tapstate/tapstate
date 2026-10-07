@@ -284,8 +284,10 @@ public final class SnapshotPhase {
                     "a chainless snapshot generation must be positive, got " + snapshotEpoch);
         }
         SourceOrder order = SourceOrder.snapshotRow(snapshotEpoch);
-        CaptureBatch batch = SnapshotOnlyCapture.open(port, config);
-        return new Load(null, null, config.streams(), config.streams(), order, null, batch, true);
+        // Construct the owner before opening a source read that it must release.
+        Load load = new Load(null, null, config.streams(), config.streams(), order, null, null, true);
+        load.open = SnapshotOnlyCapture.open(port, config);
+        return load;
     }
 
     /**
