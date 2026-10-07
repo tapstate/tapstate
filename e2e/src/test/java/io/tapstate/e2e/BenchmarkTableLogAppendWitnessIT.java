@@ -5,8 +5,13 @@ import com.mongodb.client.model.Filters;
 import com.mongodb.client.model.Aggregates;
 import com.mongodb.client.model.changestream.OperationType;
 import io.tapstate.adapters.mongostore.MongoSrsLogStore;
+import io.tapstate.adapters.mongostore.MongoSrsMetaStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.event.Op;
+import io.tapstate.spi.store.ConsumerProgressKind;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.SrsLogRecord;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
@@ -24,6 +29,33 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /** Qualifies complete append evidence after trim and distinguishes an incomplete replacement delta. */
 @RequiresDocker
 class BenchmarkTableLogAppendWitnessIT {
+    @Test
+    void theRealStoreRequiresEveryWriterEvenAfterItsReadCursorPassesTheMarker() {
+        String database = "benchmark_table_ack_actual_store_witness";
+        String chain = "exact-ack-chain";
+        String consumer = SrsConsumerId.of("pipeline", "source").value();
+        String uri = SharedMongo.replicaSetUrl(database);
+        try (var client = MongoClients.create(uri)) {
+            var db = client.getDatabase(database); db.drop();
+            var roots = db.getCollection(MongoStorePort.SRS_META);
+            var cursors = db.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS);
+            var meta = new MongoSrsMetaStore(client, roots, cursors);
+            meta.create(chain, null);
+            meta.configureSinkWriters(chain, consumer, Map.of("orders", List.of("first", "second")),
+                    ConsumerProgressKind.SRS);
+            Document lookup = new Document("miningChainId", chain).append("pipelineId", consumer);
+            var binding = BenchmarkTableAckGate.bind(chain, "pipeline", "source", "orders", cursors.find(lookup).first());
+            var marker = new BenchmarkTableTerminalObserver.Point("marker", "srs." + chain + ".orders", 7L, 41L, null);
+            meta.advanceConsumerReadSeq(chain, consumer, "orders", 999L);
+            meta.advanceSinkWriterAcked(chain, consumer, "first", "orders", new ChainPosition(new SourceOrder(7L, 41L), null));
+            assertThat(BenchmarkTableAckGate.covers(binding, marker, cursors.find(lookup).first())).isFalse();
+            meta.advanceSinkWriterAcked(chain, consumer, "second", "orders", new ChainPosition(new SourceOrder(7L, 40L), null));
+            assertThat(BenchmarkTableAckGate.covers(binding, marker, cursors.find(lookup).first())).isFalse();
+            meta.advanceSinkWriterAcked(chain, consumer, "second", "orders", new ChainPosition(new SourceOrder(7L, 41L), null));
+            assertThat(BenchmarkTableAckGate.covers(binding, marker, cursors.find(lookup).first())).isTrue();
+        }
+    }
+
     @Test
     void aFloatingCaptureEpochIsRejectedRatherThanTruncated() {
         String database = "benchmark_table_terminal_fractional_epoch_witness";
