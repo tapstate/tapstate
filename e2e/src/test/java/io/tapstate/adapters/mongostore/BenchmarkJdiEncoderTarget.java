@@ -45,6 +45,10 @@ public final class BenchmarkJdiEncoderTarget {
         origin(MongoRateHistoryStore.class);
         origin(DocumentCodec.class);
         origin(Observation.class);
+        if (mode.startsWith("store-raw")) {
+            runRawStore(mode);
+            return;
+        }
         if (mode.startsWith("wire")) {
             runWire(mode);
             return;
@@ -142,6 +146,33 @@ public final class BenchmarkJdiEncoderTarget {
             }
         }
         done();
+    }
+
+    private static void runRawStore(String mode) throws Exception {
+        phase("WIRE_SETUP");
+        String uri = System.getenv("TAPSTATE_JDI_WITNESS_MONGO_URI");
+        if (uri == null || uri.isBlank()) { throw new AssertionError("raw store witness has no private connection input"); }
+        try (MongoClient client = MongoClients.create(uri)) {
+            var database = client.getDatabase(WIRE_DATABASE);
+            var collection = database.getCollection("pipeline_rate_history");
+            collection.drop();
+            var store = new MongoRateHistoryStore(database, collection, java.time.Duration.ofDays(15));
+            client.getDatabase("admin").runCommand(new Document("ping", 1));
+            RateSample sample = new RateSample("proof", Instant.now(), Map.of("records.out", 7L),
+                    Map.of("orders", 3L), Instant.now().minusSeconds(60));
+            ready();
+            phase("RATE_BUILD");
+            store.append(sample);
+            if (mode.equals("store-raw-extra")) {
+                Document document = new Document("redundant", 1L);
+                try (BasicOutputBuffer output = new BasicOutputBuffer(); BsonBinaryWriter writer = new BsonBinaryWriter(output)) {
+                    new DocumentCodec().encode(writer, document, EncoderContext.builder().build());
+                    if (output.getSize() <= 0) { throw new AssertionError("redundant encoding produced no bytes"); }
+                }
+            }
+            done();
+            if (collection.countDocuments() != 1) { throw new AssertionError("raw publication did not persist exactly one sample"); }
+        }
     }
 
     static Observation observation() {

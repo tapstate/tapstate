@@ -1,6 +1,7 @@
 package io.tapstate.e2e;
 
 import com.sun.jdi.Bootstrap;
+import com.sun.jdi.ClassType;
 import com.sun.jdi.Field;
 import com.sun.jdi.IntegerValue;
 import com.sun.jdi.Method;
@@ -236,16 +237,18 @@ final class BenchmarkJdiCostObserver {
         final Arm arm;
         final ArtifactSet artifactSet;
         final String artifactSha256;
+        boolean reactorBuild;
         final Path bootJar;
         final Path directory;
         final List<Path> libraries;
         final Path targets;
         final Map<String, ClassImage> images = new ConcurrentHashMap<>();
 
-        private Artifact(Arm arm, ArtifactSet artifactSet, Path bootJar, Path directory, List<Path> libraries, Path targets) {
+        private Artifact(Arm arm, ArtifactSet artifactSet, String artifactSha256,
+                Path bootJar, Path directory, List<Path> libraries, Path targets) {
             this.arm = arm;
             this.artifactSet = artifactSet;
-            this.artifactSha256 = artifactSet.sha256(arm);
+            this.artifactSha256 = artifactSha256;
             this.bootJar = bootJar;
             this.directory = directory;
             this.libraries = List.copyOf(libraries);
@@ -260,8 +263,39 @@ final class BenchmarkJdiCostObserver {
             if (!Files.isRegularFile(input) || !sha256(Files.newInputStream(input)).equals(set.sha256(arm))) {
                 throw invalid("immutable artifact hash did not match its selected arm");
             }
+            return extract(input, arm, set, set.sha256(arm));
+        }
+
+        /** A separate build-local gate: selected module bytes must be exactly this reactor's outputs. */
+        static Artifact openReactor(Path input, Path root) throws Exception {
+            Path actual = input.toRealPath();
+            if (!actual.getParent().equals(root.resolve("app/target").toRealPath())
+                    || !actual.getFileName().toString().equals("app-0.6.0-boot.jar")) {
+                throw invalid("reactor encoder gate requires the current app target artifact");
+            }
+            String hash = sha256(Files.newInputStream(actual));
+            Artifact artifact = extract(actual, Arm.OBSERVABILITY, ArtifactSet.COMMON_SOURCE, hash);
+            try {
+                for (Path library : artifact.libraries) {
+                    String name = library.getFileName().toString();
+                    if (!name.endsWith("-0.6.0.jar")) { continue; }
+                    String module = name.substring(0, name.length() - "-0.6.0.jar".length());
+                    String directory = module.startsWith("adapter-") ? "adapters/" + module
+                            : module.startsWith("spi-") ? "spi/" + module : "core/" + module;
+                    Path built = root.resolve(directory).resolve("target").resolve(name);
+                    if (!Files.isRegularFile(built) || !sha256(Files.newInputStream(built))
+                            .equals(sha256(Files.newInputStream(library)))) {
+                        throw invalid("reactor boot library differs from its current module output");
+                    }
+                }
+                artifact.reactorBuild = true;
+                return artifact;
+            } catch (Throwable failure) { artifact.close(); throw failure; }
+        }
+
+        private static Artifact extract(Path input, Arm arm, ArtifactSet set, String expectedHash) throws Exception {
             Path directory = Files.createTempDirectory("benchmark-jdi-cost-");
-            Artifact result = new Artifact(arm, set, input.toRealPath(), directory, LIBRARIES.stream()
+            Artifact result = new Artifact(arm, set, expectedHash, input.toRealPath(), directory, LIBRARIES.stream()
                     .map(name -> name.replace("-0.5.0.jar", "-" + set.moduleVersion + ".jar"))
                     .map(directory::resolve).toList(), directory.resolve("targets"));
             try {
@@ -276,7 +310,7 @@ final class BenchmarkJdiCostObserver {
                         }
                     }
                 }
-                if (!sha256(Files.newInputStream(input)).equals(set.sha256(arm))) {
+                if (!sha256(Files.newInputStream(input)).equals(expectedHash)) {
                     throw invalid("immutable artifact changed during extraction");
                 }
                 for (String target : TARGET_CLASSES) {
@@ -391,11 +425,13 @@ final class BenchmarkJdiCostObserver {
     static Summary run(Artifact artifact, String mode, Options options, String mongoUri) throws Exception {
         boolean latest = mode.equals("latest") || mode.equals("latest-chunk");
         boolean wire = mode.startsWith("wire");
+        boolean store = mode.startsWith("store-raw");
         if (latest && !artifact.latestAvailable()) {
             throw invalid("latest binary encoder is unavailable in the selected arm");
         }
         List<Signature> signatures = latest ? List.of(LATEST_ENCODER)
-                : wire ? List.of(SYNC_SEND, ASYNC_SEND) : ENCODERS;
+                : wire ? List.of(SYNC_SEND, ASYNC_SEND)
+                : store ? List.of(ENCODERS.get(1), ENCODERS.get(2)) : ENCODERS;
         ListeningConnector connector = Bootstrap.virtualMachineManager().listeningConnectors().stream()
                 .filter(item -> item.name().equals("com.sun.jdi.SocketListen"))
                 .findFirst().orElseThrow(() -> invalid("the loopback JDI listening connector is unavailable"));
@@ -425,7 +461,7 @@ final class BenchmarkJdiCostObserver {
                 builder.environment().remove(variable);
             }
             builder.environment().remove("TAPSTATE_JDI_WITNESS_MONGO_URI");
-            if (wire && mongoUri != null) {
+            if ((wire || store) && mongoUri != null) {
                 builder.environment().put("TAPSTATE_JDI_WITNESS_MONGO_URI", mongoUri);
             }
             child = builder.start();
@@ -435,7 +471,7 @@ final class BenchmarkJdiCostObserver {
             if (!vm.canGetBytecodes()) {
                 throw invalid("the target VM cannot expose exact method bytecodes");
             }
-            pump = new Pump(vm, artifact, signatures, options);
+            pump = new Pump(vm, artifact, signatures, options, store);
             pump.start();
             protocol.await("READY", pump, artifact, latest, wire);
             pump.begin();
@@ -568,6 +604,8 @@ final class BenchmarkJdiCostObserver {
         private final VirtualMachine vm;
         private final Artifact artifact;
         private final List<Signature> signatures;
+        private final boolean productionStore;
+        private final Set<String> verifiedWriterTypes = new HashSet<>();
         private final Options options;
         private final Object state = new Object();
         private final EnumMap<Unit, MutableCount> counts = new EnumMap<>(Unit.class);
@@ -588,10 +626,11 @@ final class BenchmarkJdiCostObserver {
         private long handlingNanos;
         private int breakpointRequests;
 
-        Pump(VirtualMachine vm, Artifact artifact, List<Signature> signatures, Options options) {
+        Pump(VirtualMachine vm, Artifact artifact, List<Signature> signatures, Options options, boolean productionStore) {
             this.vm = vm;
             this.artifact = artifact;
             this.signatures = signatures;
+            this.productionStore = productionStore;
             this.options = options;
             signatures.stream().filter(item -> item.unit() != null)
                     .forEach(item -> counts.put(item.unit(), new MutableCount()));
@@ -853,19 +892,65 @@ final class BenchmarkJdiCostObserver {
             }
         }
 
-        private static void encoderArguments(Unit unit, List<Value> arguments) {
+        private void encoderArguments(Unit unit, List<Value> arguments) throws Exception {
             String expected = unit == Unit.RATE_DOCUMENT_BUILD ? "io.tapstate.core.lifecycle.RateSample"
                     : unit == Unit.BSON_BINARY_ENCODER_INVOCATION ? "org.bson.BsonBinaryWriter"
                     : "io.tapstate.core.lifecycle.Observation";
             int size = unit == Unit.BSON_BINARY_ENCODER_INVOCATION ? 3
                     : unit == Unit.LATEST_OBSERVATION_BINARY_ENCODER_INVOCATION ? 2 : 1;
             // A null writer is allowed through the entry so the missing normal return is observable.
+            if (productionStore && unit == Unit.BSON_BINARY_ENCODER_INVOCATION && arguments.size() == 3
+                    && arguments.getFirst() instanceof ObjectReference writer) {
+                requireBinaryWriter(writer);
+                return;
+            }
             if (arguments.size() != size || (arguments.getFirst() == null
                     && unit != Unit.BSON_BINARY_ENCODER_INVOCATION)
                     || (arguments.getFirst() != null && (!(arguments.getFirst() instanceof ObjectReference object)
                     || !object.referenceType().name().equals(expected)))) {
                 throw invalid("the typed encoder arguments did not match the closed cost unit");
             }
+        }
+
+        private void requireBinaryWriter(ObjectReference writer) throws Exception {
+            String appending = "com.mongodb.internal.connection.BsonWriterHelper$AppendingBsonWriter";
+            Set<String> wrappers = Set.of(appending, "com.mongodb.internal.connection.FieldTrackingBsonWriter",
+                    "com.mongodb.internal.connection.IdHoldingBsonWriter", "com.mongodb.internal.connection.SplittablePayloadBsonWriter");
+            for (int depth = 0; depth < 8; depth++) {
+                ReferenceType type = writer.referenceType();
+                verifyWriter(type);
+                if (type.name().equals("org.bson.BsonBinaryWriter")) { return; }
+                if (type.name().equals(appending + "$InternalAppendingBsonBinaryWriter")
+                        && type instanceof ClassType concrete && concrete.superclass().name().equals("org.bson.BsonBinaryWriter")) {
+                    verifyWriter(concrete.superclass()); return;
+                }
+                if (!wrappers.contains(type.name())) { throw invalid("raw publication used an unmapped binary writer"); }
+                Field delegate = type.fieldByName("bsonWriter");
+                if (delegate == null || delegate.isStatic() || !delegate.isFinal()
+                        || !delegate.signature().equals("Lorg/bson/BsonWriter;")
+                        || !delegate.declaringType().name().equals("com.mongodb.internal.connection.BsonWriterDecorator")) {
+                    throw invalid("raw publication writer delegate differs from the pinned driver");
+                }
+                verifyWriter(delegate.declaringType()); writer = object(writer.getValue(delegate));
+            }
+            throw invalid("raw publication binary writer exceeded its bounded decorator depth");
+        }
+
+        private void verifyWriter(ReferenceType type) throws Exception {
+            if (type.classLoader() == null || type.classLoader().uniqueID() != loaderId) {
+                throw invalid("raw publication writer escaped its pinned application loader");
+            }
+            if (verifiedWriterTypes.contains(type.name())) { return; }
+            ClassImage image = artifact.image(type.name());
+            if (image == null) { throw invalid("raw publication writer is absent from the selected artifact"); }
+            for (var entry : image.methods().entrySet()) {
+                int split = entry.getKey().indexOf('(');
+                List<Method> methods = type.methodsByName(entry.getKey().substring(0, split), entry.getKey().substring(split));
+                if (methods.size() != 1 || !Arrays.equals(entry.getValue(), methods.getFirst().bytecodes())) {
+                    throw invalid("raw publication writer bytecodes differ from the selected artifact");
+                }
+            }
+            verifiedWriterTypes.add(type.name());
         }
 
         private static WireKey wireKey(BreakpointEvent event, int requestId, long connectionId,
