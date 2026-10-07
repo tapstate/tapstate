@@ -462,6 +462,8 @@ jobs:
         run: bash .github/scripts/ci-timing-smoke.sh
       - name: refresh driver cases
         run: bash scripts/refresh-catalog-smoke.sh
+      - name: catalog refresh publication credential case
+        run: python3 .github/scripts/catalog-refresh-push-auth-test.py
       - name: connector build cases
         run: bash scripts/build-real-connectors-smoke.sh
       - name: catalog age cases
