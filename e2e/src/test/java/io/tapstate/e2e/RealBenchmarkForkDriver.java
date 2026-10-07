@@ -39,13 +39,86 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         }
     }
 
+    record DeliveryTimeline(long firstFullObservedAtNanos, long lastFullObservedAtNanos,
+                            long cohortFirstObservedAtNanos, long cohortLastObservedAtNanos,
+                            long fullDeliveryCount, long cohortDeliveryCount,
+                            List<Long> cohortObservedAtNanos, List<Long> fullObservedAtNanos,
+                            List<Long> cohortServerOperationWallMillis) {
+        DeliveryTimeline(long firstFullObservedAtNanos, long lastFullObservedAtNanos,
+                         long cohortFirstObservedAtNanos, long cohortLastObservedAtNanos,
+                         long fullDeliveryCount, long cohortDeliveryCount, List<Long> cohortObservedAtNanos) {
+            this(firstFullObservedAtNanos, lastFullObservedAtNanos, cohortFirstObservedAtNanos,
+                    cohortLastObservedAtNanos, fullDeliveryCount, cohortDeliveryCount, cohortObservedAtNanos, List.of());
+        }
+        DeliveryTimeline(long firstFullObservedAtNanos, long lastFullObservedAtNanos,
+                         long cohortFirstObservedAtNanos, long cohortLastObservedAtNanos,
+                         long fullDeliveryCount, long cohortDeliveryCount, List<Long> cohortObservedAtNanos,
+                         List<Long> fullObservedAtNanos) {
+            this(firstFullObservedAtNanos, lastFullObservedAtNanos, cohortFirstObservedAtNanos, cohortLastObservedAtNanos,
+                    fullDeliveryCount, cohortDeliveryCount, cohortObservedAtNanos, fullObservedAtNanos, List.of());
+        }
+        DeliveryTimeline {
+            cohortObservedAtNanos = List.copyOf(cohortObservedAtNanos);
+            fullObservedAtNanos = List.copyOf(fullObservedAtNanos);
+            cohortServerOperationWallMillis = java.util.Collections.unmodifiableList(new ArrayList<>(cohortServerOperationWallMillis));
+            if (fullDeliveryCount <= 0 || fullDeliveryCount > 192_000 || cohortDeliveryCount <= 0
+                    || cohortDeliveryCount > fullDeliveryCount || cohortObservedAtNanos.size() != cohortDeliveryCount
+                    || firstFullObservedAtNanos > cohortFirstObservedAtNanos
+                    || lastFullObservedAtNanos < cohortLastObservedAtNanos
+                    || cohortFirstObservedAtNanos > cohortLastObservedAtNanos
+                    || cohortObservedAtNanos.getFirst() != cohortFirstObservedAtNanos
+                    || cohortObservedAtNanos.getLast() != cohortLastObservedAtNanos) {
+                throw new IllegalArgumentException("delivery timeline is incomplete, unordered, or outside its fixed profile bound");
+            }
+            for (int i = 1; i < cohortObservedAtNanos.size(); i++) {
+                if (cohortObservedAtNanos.get(i) < cohortObservedAtNanos.get(i - 1)) {
+                    throw new IllegalArgumentException("delivery timeline moved backward");
+                }
+            }
+            if (!fullObservedAtNanos.isEmpty()) {
+                if (fullObservedAtNanos.size() != fullDeliveryCount
+                        || fullObservedAtNanos.getFirst() != firstFullObservedAtNanos
+                        || fullObservedAtNanos.getLast() != lastFullObservedAtNanos) {
+                    throw new IllegalArgumentException("full delivery timeline does not match its bounded count");
+                }
+                for (int i = 1; i < fullObservedAtNanos.size(); i++) {
+                    if (fullObservedAtNanos.get(i) < fullObservedAtNanos.get(i - 1)) {
+                        throw new IllegalArgumentException("full delivery timeline moved backward");
+                    }
+                }
+            }
+        }
+    }
+
     record MeasuredPhase(String id, long acknowledgedOutputs, long firstIssuedAtNanos,
                          long sourceCompletedAtNanos, long completedAckAtNanos,
                          long expectedSourceChanges, int observedDeliveries, long reportedRecordsOut,
                          BenchmarkForkEnvironment.ClockAnchor clockAnchor,
                          List<BenchmarkForkEnvironment.BatchResult> sourceBatches,
                          BenchmarkResourceSampler.Summary resources,
-                         Optional<ConfirmationTiming> confirmationTiming) {
+                         Optional<ConfirmationTiming> confirmationTiming,
+                         Optional<DeliveryTimeline> deliveryTimeline,
+                         boolean steadyOutputProfile,
+                         Optional<BenchmarkTargetClock.LocalWindow> operationResourceWindow) {
+        MeasuredPhase(String id, long acknowledgedOutputs, long firstIssuedAtNanos, long sourceCompletedAtNanos,
+                      long completedAckAtNanos, long expectedSourceChanges, int observedDeliveries, long reportedRecordsOut,
+                      BenchmarkForkEnvironment.ClockAnchor clockAnchor, List<BenchmarkForkEnvironment.BatchResult> sourceBatches,
+                      BenchmarkResourceSampler.Summary resources, Optional<ConfirmationTiming> confirmationTiming,
+                      Optional<DeliveryTimeline> deliveryTimeline, boolean steadyOutputProfile) {
+            this(id, acknowledgedOutputs, firstIssuedAtNanos, sourceCompletedAtNanos, completedAckAtNanos,
+                    expectedSourceChanges, observedDeliveries, reportedRecordsOut, clockAnchor, sourceBatches,
+                    resources, confirmationTiming, deliveryTimeline, steadyOutputProfile, Optional.empty());
+        }
+        MeasuredPhase(String id, long acknowledgedOutputs, long firstIssuedAtNanos,
+                      long sourceCompletedAtNanos, long completedAckAtNanos,
+                      long expectedSourceChanges, int observedDeliveries, long reportedRecordsOut,
+                      BenchmarkForkEnvironment.ClockAnchor clockAnchor,
+                      List<BenchmarkForkEnvironment.BatchResult> sourceBatches,
+                      BenchmarkResourceSampler.Summary resources, Optional<ConfirmationTiming> confirmationTiming) {
+            this(id, acknowledgedOutputs, firstIssuedAtNanos, sourceCompletedAtNanos, completedAckAtNanos,
+                    expectedSourceChanges, observedDeliveries, reportedRecordsOut, clockAnchor, sourceBatches,
+                    resources, confirmationTiming, Optional.empty(), false, Optional.empty());
+        }
         MeasuredPhase(String id, long acknowledgedOutputs, long firstIssuedAtNanos,
                       long sourceCompletedAtNanos, long completedAckAtNanos,
                       long expectedSourceChanges, int observedDeliveries, long reportedRecordsOut,
@@ -54,21 +127,52 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                       BenchmarkResourceSampler.Summary resources) {
             this(id, acknowledgedOutputs, firstIssuedAtNanos, sourceCompletedAtNanos, completedAckAtNanos,
                     expectedSourceChanges, observedDeliveries, reportedRecordsOut, clockAnchor, sourceBatches,
-                    resources, Optional.empty());
+                    resources, Optional.empty(), Optional.empty(), false, Optional.empty());
         }
         MeasuredPhase {
             Objects.requireNonNull(clockAnchor, "measured clock anchor");
             sourceBatches = List.copyOf(sourceBatches);
             Objects.requireNonNull(resources, "phase resource measurements");
             Objects.requireNonNull(confirmationTiming, "confirmation timing availability");
+            Objects.requireNonNull(deliveryTimeline, "delivery timeline availability");
+            Objects.requireNonNull(operationResourceWindow, "operation resource window availability");
         }
 
         double recordsOutPerSecond() {
-            long duration = completedAckAtNanos - firstIssuedAtNanos;
+            if (steadyOutputProfile) {
+                var timeline = deliveryTimeline.orElseThrow();
+                return BenchmarkSteadyOutputWindow.readOperationCohort(timeline.cohortServerOperationWallMillis(),
+                        timeline.cohortObservedAtNanos()).recordsPerSecond();
+            }
+            long duration = deliveryWindowNanos();
             if (duration <= 0 || acknowledgedOutputs <= 0) {
-                throw new AssertionError("measured phase has no target-ACK window: " + id);
+                throw new AssertionError("measured phase has no observed target delivery window: " + id);
             }
             return acknowledgedOutputs * 1_000_000_000.0 / duration;
+        }
+
+        long deliveryWindowNanos() {
+            if (steadyOutputProfile) {
+                var timeline = deliveryTimeline.orElseThrow();
+                var window = BenchmarkSteadyOutputWindow.readOperationCohort(timeline.cohortServerOperationWallMillis(),
+                        timeline.cohortObservedAtNanos());
+                return window.endedAtNanos() - window.startedAtNanos();
+            }
+            return confirmationTiming.orElseThrow(() -> new AssertionError(
+                    "observed target delivery timing is unavailable: " + id)).lastTargetObservedAtNanos() - firstIssuedAtNanos;
+        }
+
+        double confirmationRecordsPerSecond() {
+            long duration = completedAckAtNanos - firstIssuedAtNanos;
+            if (duration <= 0 || acknowledgedOutputs <= 0) { throw new AssertionError("invalid confirmation window: " + id); }
+            return acknowledgedOutputs * 1_000_000_000.0 / duration;
+        }
+
+        boolean steadyOutputEstablished() {
+            if (!steadyOutputProfile || deliveryTimeline.isEmpty() || confirmationTiming.isEmpty()) { return false; }
+            var timeline = deliveryTimeline.orElseThrow();
+            BenchmarkSteadyOutputWindow.readOperationCohort(timeline.cohortServerOperationWallMillis(), timeline.cohortObservedAtNanos());
+            return true;
         }
     }
 
@@ -98,6 +202,14 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             observedTargetCoverage = Map.copyOf(observedTargetCoverage);
             terminalMetaReceipts = List.copyOf(terminalMetaReceipts);
             Objects.requireNonNull(telemetry, "telemetry availability");
+        }
+
+        void requireSteadyStateWindow() {
+            if (!workload.pilotProfile()) { throw new AssertionError("steady output requires the predeclared load profile"); }
+            for (var phase : phases) {
+                var timeline = phase.deliveryTimeline().orElseThrow(() -> new AssertionError("steady output has no complete timeline"));
+                BenchmarkSteadyOutputWindow.readOperationCohort(timeline.cohortServerOperationWallMillis(), timeline.cohortObservedAtNanos());
+            }
         }
     }
 
@@ -213,7 +325,11 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                         || resourceWindows.isEmpty() || commandWindows.isEmpty()) {
                     throw new AssertionError("benchmark fork ended without terminal or resource evidence");
                 }
-                BenchmarkResourceSampler.Summary resources = summarizeResources(resourceWindows);
+                BenchmarkResourceSampler.Summary resources = workload.pilotProfile()
+                        ? summarizeResources(measured.stream().map(phase -> {
+                            var window = phase.operationResourceWindow().orElseThrow(() -> new AssertionError("target operation resource window is uncalibrated"));
+                            return BenchmarkResourceSampler.slice(phase.resources(), window.latestStartNanos(), window.earliestEndNanos());
+                        }).toList()) : summarizeResources(resourceWindows);
                 BenchmarkMongoCommandSampler.Summary mongoCommands = summarizeCommands(commandWindows);
                 BenchmarkSourceLineage.verifyAfterTerminalAck(lineage, fork.sourceSettings());
                 String checksum = checksum(terminal.targets());
@@ -232,12 +348,19 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                         forkId, chains, logicalCoverage, checksum, errorTotal);
                 BenchmarkAckOracle.verify(List.of(correctness));
                 long completed = measured.stream().mapToLong(MeasuredPhase::acknowledgedOutputs).sum();
-                long duration = measured.stream().mapToLong(phase ->
-                        phase.completedAckAtNanos() - phase.firstIssuedAtNanos()).sum();
+                long duration = measured.stream().mapToLong(MeasuredPhase::deliveryWindowNanos).sum();
                 if (completed != allDurations.size() || duration <= 0) {
                     throw new AssertionError("target-ACK and observed delivery counts disagree in " + forkId);
                 }
-                double throughput = completed * 1_000_000_000.0 / duration;
+                double throughput;
+                if (workload.pilotProfile()) {
+                    long windowEvents = measured.stream().mapToLong(phase -> {
+                        var timeline = phase.deliveryTimeline().orElseThrow();
+                        return BenchmarkSteadyOutputWindow.readOperationCohort(timeline.cohortServerOperationWallMillis(),
+                                timeline.cohortObservedAtNanos()).completedDeliveries();
+                    }).sum();
+                    throughput = windowEvents * 1_000_000_000.0 / duration;
+                } else { throughput = completed * 1_000_000_000.0 / duration; }
                 long[] latencies = allDurations.stream().mapToLong(Long::longValue).toArray();
                 PipelineBenchmarkComparison.Fork performance = new PipelineBenchmarkComparison.Fork(
                         arm, throughput, latencies, resources.peakHeapBytes(), resources.peakRssBytes());
@@ -281,8 +404,35 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         long sourceMarkerWaitCompletedAt;
         BenchmarkResourceSampler.Summary resources;
         BenchmarkMongoCommandSampler.Summary commands;
-        try (BenchmarkResourceSampler resourceSampler = BenchmarkResourceSampler.open(
-                fork.server().pid(), RESOURCE_INTERVAL);
+        List<String> targetClockUris = phase.targets().stream().map(target ->
+                target.location() == BenchmarkWorkloadDefinitions.TargetLocation.MANAGED_VIEW
+                        ? fork.managedViewsUri() : fork.externalTargetUri()).distinct().toList();
+        List<BenchmarkTargetClock.Reading> targetClocksBefore = workload.pilotProfile()
+                ? targetClockUris.stream().map(BenchmarkTargetClock::read).toList() : List.of();
+        if (!targetClocksBefore.isEmpty()) { BenchmarkTargetClock.requireSharedClock(targetClocksBefore); }
+        BenchmarkTargetClock.Reading targetClockBefore = targetClocksBefore.isEmpty() ? null : targetClocksBefore.getFirst();
+        BenchmarkNativeQueueProbe nativeProbe = workload.pilotProfile()
+                ? new BenchmarkNativeQueueProbe(fork.control(), fork.server().baseUrl().toString(), "tapstate",
+                        new com.hazelcast.config.MetricsConfig().getCollectionFrequencySeconds()) : null;
+        BenchmarkUnreadSampler nativeQueues = null;
+        BenchmarkUnreadSampler unread = null;
+        try {
+            nativeQueues = nativeProbe == null ? null : new BenchmarkUnreadSampler(() ->
+                    workload.pipelineIds().stream().map(nativeProbe::read).toList());
+            unread = workload.pilotProfile() ? new BenchmarkUnreadSampler(tables) : null;
+        } catch (RuntimeException | Error failure) {
+            if (nativeQueues != null) {
+                try { nativeQueues.close(); } catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+            }
+            if (nativeProbe != null) {
+                try { nativeProbe.close(); } catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+            }
+            throw failure;
+        }
+        Throwable phaseFailure = null;
+        try (BenchmarkResourceSampler resourceSampler = workload.pilotProfile()
+                ? BenchmarkResourceSampler.openForPhaseBudget(fork.server().pid(), RESOURCE_INTERVAL, ACK_WAIT)
+                : BenchmarkResourceSampler.open(fork.server().pid(), RESOURCE_INTERVAL);
              BenchmarkMongoCommandSampler commandSampler = BenchmarkMongoCommandSampler.open(fork.storeUri())) {
             resourceSampler.start();
             commandSampler.start();
@@ -304,9 +454,68 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             resources = resourceSampler.finish();
             commands = commandSampler.finish();
         } catch (BenchmarkResourceSampler.SamplingFailure failure) {
-            throw failure.inPhase(phase.id());
+            phaseFailure = failure.inPhase(phase.id());
+            throw (BenchmarkResourceSampler.SamplingFailure) phaseFailure;
+        } catch (Exception | Error failure) {
+            phaseFailure = failure;
+            throw failure;
+        } finally {
+            boolean primaryFailed = phaseFailure != null;
+            if (nativeQueues != null) {
+                try { nativeQueues.close(); }
+                catch (RuntimeException | Error cleanup) {
+                    if (phaseFailure != null) { phaseFailure.addSuppressed(cleanup); }
+                    else { phaseFailure = cleanup; }
+                }
+            }
+            if (nativeProbe != null) {
+                try { nativeProbe.close(); }
+                catch (RuntimeException | Error cleanup) {
+                    if (phaseFailure != null) { phaseFailure.addSuppressed(cleanup); }
+                    else { phaseFailure = cleanup; }
+                }
+            }
+            if (unread != null) {
+                try { unread.close(); }
+                catch (RuntimeException | Error cleanup) {
+                    if (phaseFailure != null) { phaseFailure.addSuppressed(cleanup); }
+                    else { throw cleanup; }
+                }
+            }
+            if (!primaryFailed && phaseFailure != null) {
+                if (phaseFailure instanceof RuntimeException failure) { throw failure; }
+                if (phaseFailure instanceof Error failure) { throw failure; }
+                throw new AssertionError("measurement cleanup failed", phaseFailure);
+            }
         }
-        List<BenchmarkMongoDeliveryObserver.Delivery> deliveries = targets.checkpoint(phase);
+        if (unread != null) {
+            System.out.println("benchmark-unread-timeline=" + JsonWriter.write(Map.of("phase", phase.id(),
+                    "intervalMillis", 200, "samples", unread.samples(), "performanceAcceptanceEligible", false,
+                    "samplingScope", "EXTERNAL_SEQUENTIAL_POINT_READS_WITH_RECORDED_READ_BRACKETS")));
+        }
+        if (nativeQueues != null) {
+            System.out.println("benchmark-native-queue-timeline=" + JsonWriter.write(Map.of("phase", phase.id(),
+                    "queryIntervalMillis", 200, "samples", nativeQueues.samples(), "performanceAcceptanceEligible", false,
+                    "samplingScope", "READ_ONLY_NATIVE_JOB_METRICS_WITH_DECLARED_COLLECTION_CADENCE")));
+        }
+        List<BenchmarkTargetClock.Reading> targetClocksAfter = targetClockBefore == null ? List.of()
+                : targetClockUris.stream().map(BenchmarkTargetClock::read).toList();
+        if (!targetClocksAfter.isEmpty()) {
+            BenchmarkTargetClock.requireSharedClock(targetClocksAfter);
+            for (int i=0;i<targetClocksBefore.size();i++) { BenchmarkTargetClock.validate(targetClocksBefore.get(i), targetClocksAfter.get(i)); }
+        }
+        BenchmarkTargetClock.Reading targetClockAfter = targetClocksAfter.isEmpty() ? null : targetClocksAfter.getFirst();
+        Map<String, Object> targetClockEvidence = targetClockBefore == null
+                ? Map.of("state", "UNQUALIFIED", "reason", "MULTI_TARGET_CLOCKS_NOT_YET_CALIBRATED")
+                : BenchmarkTargetClock.validate(targetClockBefore, targetClockAfter);
+        if (workload.pilotProfile()) {
+            System.out.println("benchmark-target-clock=" + JsonWriter.write(Map.of("workload", workload.id(),
+                    "phase", phase.id(), "calibration", targetClockEvidence,
+                    "targetClockUriCount", targetClockUris.size(), "allBefore", targetClocksBefore.stream().map(BenchmarkTargetClock.Reading::evidence).toList(),
+                    "allAfter", targetClocksAfter.stream().map(BenchmarkTargetClock.Reading::evidence).toList())));
+        }
+        var targetStreams = targets.checkpointStreams(phase);
+        List<BenchmarkMongoDeliveryObserver.Delivery> deliveries = targetStreams.values().stream().flatMap(List::stream).toList();
         if (deliveries.size() != phase.expectedLogicalOutputChanges()) {
             throw new AssertionError("observed " + deliveries.size() + " deliveries for " + phase.id()
                     + ", expected " + phase.expectedLogicalOutputChanges());
@@ -317,15 +526,64 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         long firstIssued = issued.batches().getFirst().issuedAtNanos();
         long expectedSourceChanges = phase.expectedLogicalCoverage().values().stream()
                 .mapToLong(Long::longValue).sum();
+        List<BenchmarkMongoDeliveryObserver.Delivery> cohort = deliveries.stream()
+                .filter(delivery -> workload.inFixedCohort(delivery.key())).toList();
+        long measuredCount = cohort.size();
+        if (workload.pilotProfile()) {
+            long expected = phase.expectedLogicalOutputChanges() / 2;
+            if (measuredCount != expected || measuredCount < 10_000) {
+                throw new AssertionError("the fixed middle cohort lacks its complete expected deliveries");
+            }
+            firstIssued = cohort.stream().mapToLong(BenchmarkMongoDeliveryObserver.Delivery::issuedAtNanos)
+                    .min().orElseThrow();
+        }
         ConfirmationTiming timing = new ConfirmationTiming(sourceMarkerWaitStartedAt, sourceMarkerWaitCompletedAt,
-                completedAckAt, deliveries.stream().mapToLong(BenchmarkMongoDeliveryObserver.Delivery::observedAtNanos)
+                completedAckAt, cohort.stream().mapToLong(BenchmarkMongoDeliveryObserver.Delivery::observedAtNanos)
                         .min().orElseThrow(),
-                deliveries.stream().mapToLong(BenchmarkMongoDeliveryObserver.Delivery::observedAtNanos)
+                cohort.stream().mapToLong(BenchmarkMongoDeliveryObserver.Delivery::observedAtNanos)
                         .max().orElseThrow());
-        return new PhaseWindow(new MeasuredPhase(phase.id(), phase.expectedLogicalOutputChanges(),
+        var timeline = new DeliveryTimeline(
+                deliveries.stream().mapToLong(BenchmarkMongoDeliveryObserver.Delivery::observedAtNanos).min().orElseThrow(),
+                deliveries.stream().mapToLong(BenchmarkMongoDeliveryObserver.Delivery::observedAtNanos).max().orElseThrow(),
+                timing.firstTargetObservedAtNanos(), timing.lastTargetObservedAtNanos(), deliveries.size(), cohort.size(),
+                cohort.stream().map(BenchmarkMongoDeliveryObserver.Delivery::observedAtNanos).sorted().toList(),
+                deliveries.stream().map(BenchmarkMongoDeliveryObserver.Delivery::observedAtNanos).sorted().toList(),
+                BenchmarkSteadyOutputWindow.mergeValidatedOperationStreams(targetStreams.values().stream()
+                        .map(stream -> stream.stream().filter(delivery -> workload.inFixedCohort(delivery.key()))
+                                .map(BenchmarkMongoDeliveryObserver.Delivery::serverOperationWallMillis).toList())
+                        .filter(stream -> !stream.isEmpty()).toList()));
+        Optional<BenchmarkTargetClock.LocalWindow> resourceWindow = targetClockBefore == null ? Optional.empty()
+                : Optional.of(BenchmarkTargetClock.mapWindow(targetClockBefore, targetClockAfter,
+                        timeline.cohortServerOperationWallMillis().getFirst(), timeline.cohortServerOperationWallMillis().getLast()));
+        if (targetClocksBefore.size() > 1) {
+            List<BenchmarkTargetClock.LocalWindow> windows = new ArrayList<>();
+            for (int i=0;i<targetClocksBefore.size();i++) {
+                windows.add(BenchmarkTargetClock.mapWindow(targetClocksBefore.get(i), targetClocksAfter.get(i),
+                        timeline.cohortServerOperationWallMillis().getFirst(), timeline.cohortServerOperationWallMillis().getLast()));
+            }
+            resourceWindow = Optional.of(new BenchmarkTargetClock.LocalWindow(
+                    windows.stream().mapToLong(BenchmarkTargetClock.LocalWindow::earliestStartNanos).min().orElseThrow(),
+                    windows.stream().mapToLong(BenchmarkTargetClock.LocalWindow::latestStartNanos).max().orElseThrow(),
+                    windows.stream().mapToLong(BenchmarkTargetClock.LocalWindow::earliestEndNanos).min().orElseThrow(),
+                    windows.stream().mapToLong(BenchmarkTargetClock.LocalWindow::latestEndNanos).max().orElseThrow()));
+        }
+        if (workload.pilotProfile()) {
+            System.out.println("benchmark-pre-evaluation-output-timeline=" + JsonWriter.write(Map.of(
+                    "workload", workload.id(), "phase", phase.id(), "rows", workload.rows(),
+                    "sourceBatches", issued.batches().stream().map(batch -> Map.of("index", batch.index(),
+                            "issuedAtNanos", batch.issuedAtNanos(), "completedAtNanos", batch.completedAtNanos())).toList(),
+                    "cohortObservedAtNanos", timeline.cohortObservedAtNanos(), "fullObservedAtNanos", timeline.fullObservedAtNanos(),
+                    "resources", PipelineBenchmarkLiveRunIT.resourceEvidence(resources, issued.clockAnchor()),
+                    "targetObserverReadCosts", targets.readCosts(),
+                    "cohortServerOperationWallMillis", cohort.stream()
+                            .map(BenchmarkMongoDeliveryObserver.Delivery::serverOperationWallMillis).toList(),
+                    "performanceAcceptanceEligible", false)));
+        }
+        return new PhaseWindow(new MeasuredPhase(phase.id(), measuredCount,
                 firstIssued, issued.sourceCompletedAtNanos(), completedAckAt, expectedSourceChanges,
-                deliveries.size(), reportedRecordsOut, issued.clockAnchor(), issued.batches(), resources, Optional.of(timing)),
-                deliveries.stream().map(BenchmarkMongoDeliveryObserver.Delivery::durationNanos).toList(),
+                deliveries.size(), reportedRecordsOut, issued.clockAnchor(), issued.batches(), resources,
+                Optional.of(timing), Optional.of(timeline), workload.pilotProfile(), resourceWindow),
+                cohort.stream().map(BenchmarkMongoDeliveryObserver.Delivery::durationNanos).toList(),
                 resources, commands);
     }
 
@@ -469,6 +727,10 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             this.byTarget = byTarget;
         }
 
+        List<Map<String, Object>> readCosts() {
+            return byTarget.values().stream().map(BenchmarkMongoDeliveryObserver::diagnosticReadCosts).toList();
+        }
+
         static TargetWatchSet open(BenchmarkWorkloadDefinitions.Workload workload,
                 BenchmarkWorkloadDefinitions.Phase firstMeasured, BenchmarkForkEnvironment fork) {
             Map<String, BenchmarkMongoDeliveryObserver> opened = new LinkedHashMap<>();
@@ -515,11 +777,15 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         }
 
         List<BenchmarkMongoDeliveryObserver.Delivery> checkpoint(BenchmarkWorkloadDefinitions.Phase phase) {
-            List<BenchmarkMongoDeliveryObserver.Delivery> delivered = new ArrayList<>();
+            return checkpointStreams(phase).values().stream().flatMap(List::stream).toList();
+        }
+
+        Map<String, List<BenchmarkMongoDeliveryObserver.Delivery>> checkpointStreams(BenchmarkWorkloadDefinitions.Phase phase) {
+            Map<String, List<BenchmarkMongoDeliveryObserver.Delivery>> delivered = new LinkedHashMap<>();
             for (BenchmarkWorkloadDefinitions.TargetExpectation target : phase.targets()) {
-                delivered.addAll(observer(target).checkpoint(phase.id(), DELIVERY_WAIT));
+                delivered.put(targetId(target), observer(target).checkpoint(phase.id(), DELIVERY_WAIT));
             }
-            return List.copyOf(delivered);
+            return Map.copyOf(delivered);
         }
 
         Map<String, Long> observedCoverage() {

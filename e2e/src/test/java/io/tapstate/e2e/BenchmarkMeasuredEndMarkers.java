@@ -25,7 +25,7 @@ final class BenchmarkMeasuredEndMarkers {
         if (!workload.sourceChains().contains(chain)) {
             throw new IllegalArgumentException("unknown source chain " + chain.id() + " for " + workload.id());
         }
-        long lastSnapshotRow = BenchmarkWorkloadDefinitions.SNAPSHOT_ROWS;
+        long lastSnapshotRow = workload.rows();
         Map<String, Long> markers = switch (workload.id() + "/" + chain.sourceId() + "/" + chain.table()) {
             case "copy/src_bench_copy/bench_copy_orders",
                  "stateless/src_bench_stateless/bench_stateless_orders",

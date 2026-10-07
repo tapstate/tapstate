@@ -60,7 +60,8 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
         }
     }
 
-    record Delivery(String key, Kind kind, long issuedAtNanos, long observedAtNanos, long durationNanos) {
+    record Delivery(String key, Kind kind, long issuedAtNanos, long observedAtNanos, long durationNanos,
+                    Long serverOperationWallMillis) {
         Delivery {
             if (durationNanos < 0) {
                 throw new IllegalArgumentException("delivery duration must not be negative");
@@ -89,6 +90,24 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
     private final Map<String, ArrayDeque<OptionalChange>> optionalByKey = new HashMap<>();
     private final List<Delivery> deliveries = new ArrayList<>();
     private final Map<ObservedKey, Long> observedCoverage = new HashMap<>();
+    private final List<Map<String, Object>> slowReads = new ArrayList<>();
+    private long readCalls;
+    private long readNanos;
+    private long acceptNanos;
+    private long previousIterationEnded;
+    private final OperationClock operationClock = new OperationClock();
+
+    static final class OperationClock {
+        private Long previous;
+
+        boolean accept(Long current) {
+            if (current != null && previous != null && current < previous) {
+                return false;
+            }
+            if (current != null) { previous = current; }
+            return true;
+        }
+    }
 
     private String activePhase;
     private int phaseExpected;
@@ -303,9 +322,26 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                         return;
                     }
                 }
+                long started = System.nanoTime();
+                long schedulingGap = previousIterationEnded == 0 ? 0 : started - previousIterationEnded;
                 ChangeStreamDocument<Document> change = cursor.tryNext();
+                long completed = System.nanoTime();
                 if (change != null) {
-                    accept(change, System.nanoTime());
+                    accept(change, completed);
+                }
+                long accepted = System.nanoTime();
+                previousIterationEnded = accepted;
+                synchronized (lock) {
+                    readCalls++; readNanos += completed - started; acceptNanos += accepted - completed;
+                    if ((schedulingGap >= TimeUnit.MILLISECONDS.toNanos(50)
+                            || completed - started >= TimeUnit.MILLISECONDS.toNanos(150)
+                            || accepted - completed >= TimeUnit.MILLISECONDS.toNanos(50)) && slowReads.size() < 256) {
+                        slowReads.add(Map.of("startedAtNanos", started, "completedAtNanos", completed,
+                                "acceptCompletedAtNanos", accepted, "hadEvent", change != null,
+                                "beforeReadSchedulingGapNanos", schedulingGap,
+                                "observerJvmGcCollectionMillis", java.lang.management.ManagementFactory.getGarbageCollectorMXBeans()
+                                        .stream().mapToLong(bean -> Math.max(0, bean.getCollectionTime())).sum()));
+                    }
                 }
             }
         } catch (RuntimeException e) {
@@ -314,6 +350,14 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                     fail("target change-stream reader failed", e);
                 }
             }
+        }
+    }
+
+    Map<String, Object> diagnosticReadCosts() {
+        synchronized (lock) {
+            return Map.of("target", targetId, "readCalls", readCalls, "readNanos", readNanos,
+                    "acceptNanos", acceptNanos, "slowReads", List.copyOf(slowReads),
+                    "scope", "EXTERNAL_TARGET_OBSERVER_READ_AND_MATCH_PROCESSING");
         }
     }
 
@@ -395,7 +439,11 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                     fail("target change preceded its source batch for key " + key, null);
                     return;
                 }
-                deliveries.add(new Delivery(key, actual, expected.issuedAtNanos(), observedAtNanos, duration));
+                Long operationWall = change.getWallTime() == null ? null : change.getWallTime().getValue();
+                if (!operationClock.accept(operationWall)) {
+                    fail("target operation clock moved backward within its actual change stream", null); return;
+                }
+                deliveries.add(new Delivery(key, actual, expected.issuedAtNanos(), observedAtNanos, duration, operationWall));
             }
             observedCoverage.merge(new ObservedKey(expected.phaseId(), targetId, key, actual), 1L,
                     Math::addExact);

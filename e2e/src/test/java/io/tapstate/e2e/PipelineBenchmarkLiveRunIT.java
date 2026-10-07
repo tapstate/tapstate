@@ -52,7 +52,11 @@ class PipelineBenchmarkLiveRunIT {
             Map<String, Object> inputs = inputs(config);
             inputs.put("harness", harness);
             Map<String, Object> environment = environment();
-            report.begin(inputs, environment, workloads());
+            var steadyWorkloads = BenchmarkWorkloadDefinitions.all().stream()
+                    .map(workload -> BenchmarkWorkloadDefinitions.steadyPilot(workload.id())).toList();
+            inputs.put("measurementMethod", "FIXED_MIDDLE_SERVER_OPERATION_OUTPUT_V4");
+            inputs.put("steadyProfileRows", BenchmarkWorkloadDefinitions.STEADY_PILOT_ROWS);
+            report.begin(inputs, environment, workloads(steadyWorkloads));
 
             RealBenchmarkForkDriver driver = new RealBenchmarkForkDriver();
             PipelineBenchmarkHarness.Report result = PipelineBenchmarkHarness.run(
@@ -67,8 +71,9 @@ class PipelineBenchmarkLiveRunIT {
                             throw new AssertionError("completed fork evidence has the wrong identity: " + expectedId);
                         }
                         report.addFork(fork(evidence, completed, startedAt));
+                        evidence.requireSteadyStateWindow();
                         return completed;
-                    });
+                    }, steadyWorkloads);
             PipelineBenchmarkComparison.Evaluation evaluation = result.evaluation();
             report.finish(evaluation(evaluation), evaluation.passed());
             if (!evaluation.passed()) {
@@ -282,8 +287,12 @@ class PipelineBenchmarkLiveRunIT {
     }
 
     static List<Map<String, Object>> workloads() {
+        return workloads(BenchmarkWorkloadDefinitions.all());
+    }
+
+    static List<Map<String, Object>> workloads(List<BenchmarkWorkloadDefinitions.Workload> definitions) {
         List<Map<String, Object>> all = new ArrayList<>();
-        for (BenchmarkWorkloadDefinitions.Workload workload : BenchmarkWorkloadDefinitions.all()) {
+        for (BenchmarkWorkloadDefinitions.Workload workload : definitions) {
             List<Map<String, Object>> phases = new ArrayList<>();
             for (BenchmarkWorkloadDefinitions.Phase phase : workload.phases()) {
                 phases.add(object("id", phase.id(), "stage", phase.stage().name(),
@@ -431,7 +440,7 @@ class PipelineBenchmarkLiveRunIT {
                                 "inFlight", entry.getValue().inFlight())).toList()));
     }
 
-    /** Diagnostic fields are additive; the performance window and its arithmetic remain unchanged. */
+    /** Delivery timing and proof-confirmation timing remain separately reported and versioned. */
     static Map<String, Object> phaseEvidence(RealBenchmarkForkDriver.MeasuredPhase phase) {
         BenchmarkForkEnvironment.ClockAnchor anchor = phase.clockAnchor();
         return object(
@@ -442,7 +451,18 @@ class PipelineBenchmarkLiveRunIT {
                 "expectedSourceChanges", phase.expectedSourceChanges(),
                 "completedAckAtNanos", phase.completedAckAtNanos(),
                 "durationNanos", phase.completedAckAtNanos() - phase.firstIssuedAtNanos(),
-                "throughputRecordsPerSecond", phase.recordsOutPerSecond(),
+                "throughputRecordsPerSecond", phase.confirmationTiming().isPresent()
+                        ? phase.recordsOutPerSecond() : null,
+                "throughputMethod", phase.steadyOutputProfile() ? "FIXED_MIDDLE_SERVER_OPERATION_OUTPUT_V4" : "SOURCE_ISSUE_TO_OBSERVED_TARGET_V2",
+                "steadyStateEstablished", phase.steadyOutputEstablished(),
+                "steadyOutputRule", "FIXED_MIDDLE_COHORT_TEN_PROGRESS_BINS_HALF_TREND_AT_MOST_5_PERCENT",
+                "deliveryWindowNanos", phase.confirmationTiming().isPresent() ? phase.deliveryWindowNanos() : null,
+                "confirmationRecordsPerSecond", phase.confirmationRecordsPerSecond(),
+                "resourceAndCommandWindowScope", "SOURCE_ISSUE_THROUGH_PROOF_CONFIRMATION",
+                "operationResourceWindow", phase.operationResourceWindow().map(window -> object("state", "CALIBRATED_INTERIOR",
+                        "earliestStartNanos", window.earliestStartNanos(), "latestStartNanos", window.latestStartNanos(),
+                        "earliestEndNanos", window.earliestEndNanos(), "latestEndNanos", window.latestEndNanos()))
+                        .orElseGet(() -> object("state", "UNQUALIFIED")),
                 "observedDeliveries", phase.observedDeliveries(),
                 "reportedRecordsOut", phase.reportedRecordsOut(),
                 "confirmationTiming", phase.confirmationTiming().map(timing -> object(
@@ -456,7 +476,20 @@ class PipelineBenchmarkLiveRunIT {
                         "lastTargetObservedAtNanos", timing.lastTargetObservedAtNanos(),
                         "confirmationEndMinusLastTargetObservedNanos", timing.tableConfirmationCompletedAtNanos()
                                 - timing.lastTargetObservedAtNanos())).orElseGet(() -> object("state", "UNAVAILABLE")),
-                "idempotentWriteOverhead", phase.reportedRecordsOut() - phase.acknowledgedOutputs(),
+                "idempotentWriteOverhead", phase.reportedRecordsOut() - phase.observedDeliveries(),
+                "fullObservedDeliveries", phase.observedDeliveries(),
+                "measurementCohortDeliveries", phase.acknowledgedOutputs(),
+                "deliveryTimeline", phase.deliveryTimeline().map(timeline -> object("state", "RECORDED",
+                        "scope", "LOCAL_CHANGE_STREAM_OBSERVATIONS", "firstFullObservedAtNanos", timeline.firstFullObservedAtNanos(),
+                        "lastFullObservedAtNanos", timeline.lastFullObservedAtNanos(),
+                        "cohortFirstObservedAtNanos", timeline.cohortFirstObservedAtNanos(),
+                        "cohortLastObservedAtNanos", timeline.cohortLastObservedAtNanos(),
+                        "fullDeliveryCount", timeline.fullDeliveryCount(), "cohortDeliveryCount", timeline.cohortDeliveryCount(),
+                        "cohortObservedAtNanos", timeline.cohortObservedAtNanos(),
+                        "fullObservedAtNanos", timeline.fullObservedAtNanos(),
+                        "cohortServerOperationWallMillis", timeline.cohortServerOperationWallMillis(),
+                        "fullTimelineState", timeline.fullObservedAtNanos().isEmpty() ? "UNAVAILABLE" : "RECORDED"))
+                        .orElseGet(() -> object("state", "UNAVAILABLE")),
                 "firstIssuedAtUtcEarliest", anchor.earliestUtc(phase.firstIssuedAtNanos()).toString(),
                 "firstIssuedAtUtcLatest", anchor.latestUtc(phase.firstIssuedAtNanos()).toString(),
                 "sourceCompletedAtUtcEarliest", anchor.earliestUtc(phase.sourceCompletedAtNanos()).toString(),
@@ -495,8 +528,9 @@ class PipelineBenchmarkLiveRunIT {
                 "failureCount", diagnostics.failureCount(),
                 "totalDurationNanos", diagnostics.totalDurationNanos(),
                 "maxDurationNanos", diagnostics.maxDurationNanos(),
-                "durationScope", "EXTERNAL_READ_ONLY", "retention", "FIRST_AND_LAST",
-                "retainedAttemptLimit", BenchmarkResourceSampler.MAX_RETAINED_ATTEMPTS,
+                "durationScope", "EXTERNAL_READ_ONLY", "retention",
+                diagnostics.state().equals("COHORT_INTERVAL") ? "COHORT_INTERVAL" : "FIRST_AND_LAST",
+                "retainedAttemptLimit", diagnostics.retainedAttemptLimit(),
                 "omittedAttempts", diagnostics.omittedAttempts(),
                 "attempts", diagnostics.retainedAttempts().stream().map(attempt -> object(
                         "index", attempt.index(), "startedAtNanos", attempt.startedAtNanos(),

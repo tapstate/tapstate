@@ -50,8 +50,11 @@ class BenchmarkMeasurementDiagnosticsTest {
         assertThat(projected).containsEntry("durationNanos", 150L)
                 .containsEntry("sourceIssueDurationNanos", 110L)
                 .containsEntry("idempotentWriteOverhead", 2L)
-                .containsEntry("throughputRecordsPerSecond", 12_000 * 1_000_000_000.0 / 150);
+                .containsEntry("throughputRecordsPerSecond", null)
+                .containsEntry("confirmationRecordsPerSecond", 12_000 * 1_000_000_000.0 / 150);
         assertThat(object(projected.get("confirmationTiming"))).containsExactly(Map.entry("state", "UNAVAILABLE"));
+        assertThatThrownBy(phase::recordsOutPerSecond).isInstanceOf(AssertionError.class)
+                .hasMessageContaining("observed target delivery timing is unavailable");
         assertThat(object(projected.get("clockAnchor")))
                 .containsEntry("utc", utc.toString()).containsEntry("uncertaintyNanos", 40L)
                 .containsEntry("uncertaintyScope", "CLOCK_READ_BRACKET_ONLY");
@@ -73,7 +76,7 @@ class BenchmarkMeasurementDiagnosticsTest {
     }
 
     @Test
-    void confirmationIntervalsDoNotReplaceTheOriginalThroughputEndpoint() {
+    void deliveryAndConfirmationIntervalsKeepTheirSeparateMeanings() {
         var anchor = new BenchmarkForkEnvironment.ClockAnchor(Instant.EPOCH, 100, 140);
         var resources = new BenchmarkResourceSampler.Summary(70, 3, 1_500, 2_500, 2);
         var timing = new RealBenchmarkForkDriver.ConfirmationTiming(260, 280, 300, 200, 290);
@@ -81,7 +84,11 @@ class BenchmarkMeasurementDiagnosticsTest {
                 12_000, 12_000, 12_000, anchor, List.of(), resources, Optional.of(timing));
         var projected = PipelineBenchmarkLiveRunIT.phaseEvidence(phase);
         assertThat(projected).containsEntry("durationNanos", 150L)
-                .containsEntry("throughputRecordsPerSecond", 12_000 * 1_000_000_000.0 / 150);
+                .containsEntry("deliveryWindowNanos", 140L)
+                .containsEntry("throughputRecordsPerSecond", 12_000 * 1_000_000_000.0 / 140)
+                .containsEntry("confirmationRecordsPerSecond", 12_000 * 1_000_000_000.0 / 150)
+                .containsEntry("steadyStateEstablished", false)
+                .containsEntry("resourceAndCommandWindowScope", "SOURCE_ISSUE_THROUGH_PROOF_CONFIRMATION");
         assertThat(object(projected.get("confirmationTiming"))).containsEntry("state", "RECORDED")
                 .containsEntry("sourceMarkerWaitNanos", 20L).containsEntry("tableConfirmationNanos", 20L)
                 .containsEntry("firstTargetObservedAtNanos", 200L).containsEntry("lastTargetObservedAtNanos", 290L)
@@ -93,6 +100,117 @@ class BenchmarkMeasurementDiagnosticsTest {
                 .containsEntry("confirmationEndMinusLastTargetObservedNanos", -20L);
         assertThatThrownBy(() -> new RealBenchmarkForkDriver.ConfirmationTiming(280, 260, 300, 200, 290))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("moved backward");
+    }
+
+    @Test
+    void proofReadDelayCannotChangeTheRateOfTheSameObservedDeliveries() {
+        var anchor = new BenchmarkForkEnvironment.ClockAnchor(Instant.EPOCH, 100, 140);
+        var resources = new BenchmarkResourceSampler.Summary(70, 3, 1_500, 2_500, 2);
+        var fastProof = new RealBenchmarkForkDriver.MeasuredPhase("cdc-update", 12_000, 150, 180, 300,
+                12_000, 12_000, 12_000, anchor, List.of(), resources,
+                Optional.of(new RealBenchmarkForkDriver.ConfirmationTiming(180, 280, 300, 200, 290)));
+        var slowProof = new RealBenchmarkForkDriver.MeasuredPhase("cdc-update", 12_000, 150, 180, 900,
+                12_000, 12_000, 12_000, anchor, List.of(), resources,
+                Optional.of(new RealBenchmarkForkDriver.ConfirmationTiming(180, 880, 900, 200, 290)));
+        assertThat(slowProof.recordsOutPerSecond()).as("identical observed deliveries have an identical rate")
+                .isEqualTo(fastProof.recordsOutPerSecond());
+    }
+
+    @Test
+    void pilotCohortDoesNotMislabelOtherLogicalDeliveriesAsIdempotentReplay() {
+        var phase = new RealBenchmarkForkDriver.MeasuredPhase("cdc-update", 48_000, 150, 180, 900,
+                96_000, 96_000, 96_003, new BenchmarkForkEnvironment.ClockAnchor(Instant.EPOCH, 100, 140),
+                List.of(), new BenchmarkResourceSampler.Summary(70, 3, 1_500, 2_500, 2),
+                Optional.of(new RealBenchmarkForkDriver.ConfirmationTiming(180, 880, 900, 200, 700)));
+        assertThat(PipelineBenchmarkLiveRunIT.phaseEvidence(phase))
+                .containsEntry("idempotentWriteOverhead", 3L)
+                .containsEntry("fullObservedDeliveries", 96_000)
+                .containsEntry("measurementCohortDeliveries", 48_000L);
+    }
+
+    @Test
+    void deliveryTimelinesCannotInventMissingSamplesOrEscapeTheProfileBound() {
+        assertThatThrownBy(() -> new RealBenchmarkForkDriver.DeliveryTimeline(100, 500, 200, 400,
+                96_000, 2, List.of(200L))).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new RealBenchmarkForkDriver.DeliveryTimeline(100, 500, 200, 400,
+                192_001, 2, List.of(200L, 400L))).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new RealBenchmarkForkDriver.DeliveryTimeline(100, 500, 200, 400,
+                96_000, 3, List.of(200L, 150L, 400L))).isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("moved backward");
+        var timeline = new RealBenchmarkForkDriver.DeliveryTimeline(100, 500, 200, 400,
+                96_000, 2, List.of(200L, 400L));
+        assertThat(timeline.cohortObservedAtNanos()).containsExactly(200L, 400L);
+        assertThat(timeline.fullObservedAtNanos()).isEmpty();
+        assertThatThrownBy(() -> new RealBenchmarkForkDriver.DeliveryTimeline(100, 500, 200, 400,
+                4, 2, List.of(200L, 400L), List.of(100L, 500L))).isInstanceOf(IllegalArgumentException.class);
+        var full = new RealBenchmarkForkDriver.DeliveryTimeline(100, 500, 200, 400,
+                4, 2, List.of(200L, 400L), List.of(100L, 200L, 400L, 500L));
+        assertThat(full.fullObservedAtNanos()).containsExactly(100L, 200L, 400L, 500L);
+    }
+
+    @Test
+    void cohortResourceSliceExcludesSetupAndProofTailPeaksButRejectsMissingTrace() {
+        var log = new BenchmarkResourceSampler.AttemptLog();
+        log.append(10, 20, BenchmarkResourceSampler.Outcome.SUCCESS, null, reading(10, 1, 9000, 9000));
+        log.append(110, 120, BenchmarkResourceSampler.Outcome.SUCCESS, null, reading(100, 10, 1000, 2000));
+        log.append(210, 220, BenchmarkResourceSampler.Outcome.SUCCESS, null, reading(180, 12, 1500, 2500));
+        log.append(310, 320, BenchmarkResourceSampler.Outcome.SUCCESS, null, reading(250, 15, 9900, 9900));
+        var full = new BenchmarkResourceSampler.Summary(240, 14, 9900, 9900, 4, Optional.of(log.snapshot()));
+        var slice = BenchmarkResourceSampler.slice(full, 100, 250);
+        assertThat(slice.cpuNanos()).isEqualTo(80); assertThat(slice.gcCollectionMillis()).isEqualTo(2);
+        assertThat(slice.peakHeapBytes()).isEqualTo(1500); assertThat(slice.peakRssBytes()).isEqualTo(2500);
+        assertThat(slice.sampleCount()).isEqualTo(2);
+        assertThatThrownBy(() -> BenchmarkResourceSampler.slice(new BenchmarkResourceSampler.Summary(1, 1, 1, 1, 2), 100, 250))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("actual sampling trace");
+        var omitted = new BenchmarkResourceSampler.SamplingDiagnostics("COMPLETE", 5, 0, 40, 10, 1, log.snapshot().retainedAttempts());
+        assertThatThrownBy(() -> BenchmarkResourceSampler.slice(new BenchmarkResourceSampler.Summary(1, 1, 1, 1, 4, Optional.of(omitted)), 100, 250))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("complete bounded");
+    }
+
+    @Test
+    void declaredPhaseBudgetRetainsItsMiddleWhileDefaultDiagnosticBoundStaysUnchanged() {
+        var defaults = new BenchmarkResourceSampler.AttemptLog();
+        var phase = new BenchmarkResourceSampler.AttemptLog(1504);
+        for (int i=0;i<551;i++) {
+            var sample = reading(i, i, 1000, 2000);
+            defaults.append(i*1000L,i*1000L+100, BenchmarkResourceSampler.Outcome.SUCCESS,null,sample);
+            phase.append(i*1000L,i*1000L+100, BenchmarkResourceSampler.Outcome.SUCCESS,null,sample);
+        }
+        assertThat(defaults.snapshot().retainedAttempts()).hasSize(256);
+        assertThat(defaults.snapshot().omittedAttempts()).isEqualTo(295);
+        assertThat(phase.snapshot().retainedAttempts()).hasSize(551);
+        assertThat(phase.snapshot().omittedAttempts()).isZero();
+        var phaseSummary = new BenchmarkResourceSampler.Summary(550, 550, 1000, 2000, 551,
+                Optional.of(phase.snapshot()));
+        var serialized = PipelineBenchmarkLiveRunIT.resourceEvidence(phaseSummary,
+                new BenchmarkForkEnvironment.ClockAnchor(java.time.Instant.EPOCH, 0, 0));
+        assertThat(((Map<?, ?>) serialized.get("sampling")).get("retainedAttemptLimit")).isEqualTo(1504);
+        assertThatThrownBy(()->new BenchmarkResourceSampler.AttemptLog(4097))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("finite phase bound");
+    }
+
+    @Test
+    void streamArrivalDelayCannotChangeTheSameServerOperationOutputRate() {
+        var normal = new java.util.ArrayList<Long>(); var delayed = new java.util.ArrayList<Long>();
+        var operations = new java.util.ArrayList<Long>();
+        for (int i=0;i<12_000;i++) {
+            normal.add(i*1_000_000L); delayed.add(i*1_000_000L+(i>=6000?400_000_000L:0));
+            operations.add(1_000_000L+i);
+        }
+        var first = operationPhase(normal, operations); var second = operationPhase(delayed, operations);
+        assertThat(second.recordsOutPerSecond()).as("the same target operations keep their output rate")
+                .isEqualTo(first.recordsOutPerSecond());
+    }
+
+    private static RealBenchmarkForkDriver.MeasuredPhase operationPhase(List<Long> observed, List<Long> operations) {
+        long last = observed.getLast();
+        var timeline = new RealBenchmarkForkDriver.DeliveryTimeline(observed.getFirst(), last,
+                observed.getFirst(), last, observed.size(), observed.size(), observed, observed, operations);
+        return new RealBenchmarkForkDriver.MeasuredPhase("cdc-update", observed.size(), 1, 2, last+1000,
+                observed.size(), observed.size(), observed.size(), new BenchmarkForkEnvironment.ClockAnchor(Instant.EPOCH, 0, 1),
+                List.of(), new BenchmarkResourceSampler.Summary(1, 1, 1000, 1000, 2),
+                Optional.of(new RealBenchmarkForkDriver.ConfirmationTiming(2, last+500, last+1000, observed.getFirst(), last)),
+                Optional.of(timeline), true);
     }
 
     @Test

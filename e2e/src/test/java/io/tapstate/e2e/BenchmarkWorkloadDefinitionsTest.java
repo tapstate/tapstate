@@ -137,4 +137,55 @@ class BenchmarkWorkloadDefinitionsTest {
         assertThat(actual).isNotEqualTo(expected.checksum());
         assertThat(expected.rows()).isEqualTo(12_001);
     }
+
+    @Test
+    void theLargerPilotKeepsOldFixturesAndAllSemanticTargetAnswers() {
+        for (var original : BenchmarkWorkloadDefinitions.all()) {
+            var pilot = BenchmarkWorkloadDefinitions.steadyPilot(original.id());
+            assertThat(original.rows()).isEqualTo(12_000);
+            assertThat(pilot.rows()).isEqualTo(96_000).isLessThan(100_000);
+            String suffix = original.id().equals("stateless") ? ":0" : "";
+            assertThat(pilot.inFixedCohort("24000" + suffix)).isFalse();
+            assertThat(pilot.inFixedCohort("24001" + suffix)).isTrue();
+            assertThat(pilot.inFixedCohort("72000" + suffix)).isTrue();
+            assertThat(pilot.inFixedCohort("72001" + suffix)).isFalse();
+            assertThat(pilot.seed()).isEqualTo(original.seed());
+            assertThat(pilot.resources(SOURCE, "mongodb://127.0.0.1:27017/bench_target"))
+                    .isEqualTo(original.resources(SOURCE, "mongodb://127.0.0.1:27017/bench_target"));
+            assertThat(pilot.phase("cdc-update").batches()).hasSize(960);
+            for (var phase : pilot.phases()) {
+                if (!phase.measured()) { continue; }
+                assertThat(BenchmarkExpectedChanges.forPhase(pilot, phase).stream()
+                        .mapToLong(BenchmarkExpectedChanges.TargetPlan::totalChanges).sum())
+                        .isEqualTo(phase.expectedLogicalOutputChanges());
+            }
+            for (var chain : pilot.sourceChains()) {
+                var markers = BenchmarkMeasuredEndMarkers.forChain(pilot, chain);
+                if (markers.containsKey("cdc-update")) { assertThat(markers.get("cdc-update")).isEqualTo(96_000); }
+                if (markers.containsKey("cold-read")) { assertThat(markers.get("cold-read")).isEqualTo(396_000); }
+            }
+            assertThat(pilot.phase("terminal").targets()).allSatisfy(target ->
+                    assertThat(target.rows()).isEqualTo(original.id().equals("stateless") ? 96_002 : 96_001));
+        }
+    }
+
+    @Test
+    void statelessCohortKeepsBothActualUnwindKeysForEachSelectedRoot() {
+        var workload = BenchmarkWorkloadDefinitions.steadyPilot("stateless");
+        assertThat(workload.inFixedCohort("24002:0")).isTrue();
+        assertThat(workload.inFixedCohort("24002:1")).isTrue();
+        assertThat(workload.inFixedCohort("24000:0")).isFalse();
+        assertThat(workload.inFixedCohort("72002:1")).isFalse();
+    }
+
+    @Test
+    void statelessPilotSettlingRestoresTheExactMeasuredStartState() {
+        var pilot = BenchmarkWorkloadDefinitions.steadyPilot("stateless");
+        assertThat(pilot.phase("cdc-settling-raised").measured()).isFalse();
+        assertThat(pilot.phase("cdc-settling-restored").targets()).isEqualTo(pilot.phase("warm-up").targets());
+        assertThat(pilot.phase("cdc-settling-raised").targets()).isNotEqualTo(pilot.phase("warm-up").targets());
+        assertThat(pilot.phase("cdc-settling-raised").sql()).hasSize(240);
+        assertThat(pilot.phase("cdc-settling-restored").sql()).hasSize(240);
+        assertThat(BenchmarkWorkloadDefinitions.byId("stateless").phases()).hasSize(4);
+    }
 }

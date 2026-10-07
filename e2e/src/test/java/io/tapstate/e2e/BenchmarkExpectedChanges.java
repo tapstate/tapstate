@@ -72,7 +72,7 @@ final class BenchmarkExpectedChanges {
                     new EnumMap<>(BenchmarkWorkloadDefinitions.Projection.class);
             byProjection.keySet().forEach(projection -> targetBatch.put(projection, new ArrayList<>()));
             for (String sql : sourceBatch) {
-                Decoded decoded = decode(workload.id(), phase.stage(), sql);
+                Decoded decoded = decode(workload.id(), workload.rows(), phase.stage(), sql);
                 List<BenchmarkMongoDeliveryObserver.ExpectedChange> expected =
                         targetBatch.get(decoded.projection());
                 if (expected == null) {
@@ -137,7 +137,7 @@ final class BenchmarkExpectedChanges {
                            List<BenchmarkMongoDeliveryObserver.ExpectedChange> changes) {
     }
 
-    private static Decoded decode(String workload, BenchmarkWorkloadDefinitions.Stage stage, String sql) {
+    private static Decoded decode(String workload, int rows, BenchmarkWorkloadDefinitions.Stage stage, String sql) {
         if (stage == BenchmarkWorkloadDefinitions.Stage.COLD_READ && "stateful".equals(workload)) {
             return new Decoded(BenchmarkWorkloadDefinitions.Projection.NEST,
                     updatesFor(nestInsertRoots(sql, "cold")));
@@ -152,7 +152,7 @@ final class BenchmarkExpectedChanges {
         String table = update.group(1);
         long first = Long.parseLong(update.group(2));
         long last = Long.parseLong(update.group(3));
-        if (first < 1 || last < first || last > BenchmarkWorkloadDefinitions.SNAPSHOT_ROWS) {
+        if (first < 1 || last < first || last > rows) {
             throw new AssertionError("measured source update escaped the fixed row range: " + sql);
         }
         boolean evenOnly = update.group(4) != null;

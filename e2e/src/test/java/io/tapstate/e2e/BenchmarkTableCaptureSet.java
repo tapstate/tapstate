@@ -133,6 +133,55 @@ final class BenchmarkTableCaptureSet implements AutoCloseable {
         return List.copyOf(result);
     }
 
+    List<Map<String, Object>> unreadSamples() {
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Source source : sources.values()) {
+            long started = System.nanoTime();
+            Document before = documents.chain(source.physical());
+            String ring = SrsRingbuffer.ringName(source.physical(), source.logical().table());
+            Document bounds = documents.benchmarkLogBounds(ring);
+            Document cursor = documents.consumerOffset(source.physical(), source.binding().consumer());
+            Document after = documents.chain(source.physical());
+            long ended = System.nanoTime();
+            if (before == null || after == null || !integer(before.get("epoch")) || !integer(after.get("epoch"))
+                    || ((Number) before.get("epoch")).longValue() != source.epoch()
+                    || ((Number) after.get("epoch")).longValue() != source.epoch()) {
+                throw new AssertionError("capture epoch changed around unread-backlog diagnostic");
+            }
+            Document key = cursor == null ? null : cursor.get("_id", Document.class);
+            if (key == null || !source.physical().equals(key.get("chain"))
+                    || !source.binding().consumer().equals(key.get("pipeline"))
+                    || !source.physical().equals(cursor.get("miningChainId"))
+                    || !source.binding().consumer().equals(cursor.get("pipelineId"))
+                    || !source.logical().pipelineId().equals(cursor.get("ownerPipelineId"))
+                    || !source.logical().sourceId().equals(cursor.get("sourceNodeId"))) {
+                throw new AssertionError("unread diagnostic has a different source consumer");
+            }
+            Document reads = cursor.get("perTableSeq", Document.class);
+            Object read = reads == null ? null : reads.get(source.logical().table());
+            Object tail = bounds == null ? null : bounds.get("largestSequence");
+            Map<String, Object> sample = new LinkedHashMap<>();
+            sample.put("chain", source.physical()); sample.put("ring", ring); sample.put("epoch", source.epoch());
+            sample.put("consumer", source.binding().consumer()); sample.put("table", source.logical().table());
+            sample.put("readStartedAtNanos", started); sample.put("readCompletedAtNanos", ended);
+            sample.put("scope", "SEQUENTIAL_DURABLE_TAIL_AND_READ_CURSOR_POINT_READS");
+            if (!integer(read) || !integer(tail) || ((Number) read).longValue() < -1
+                    || ((Number) tail).longValue() < -1) { sample.put("state", "UNKNOWN"); }
+            else {
+                sample.put("tailSeq", ((Number) tail).longValue()); sample.put("readSeq", ((Number) read).longValue());
+                try {
+                    long unread = Math.subtractExact(((Number) tail).longValue(), ((Number) read).longValue());
+                    sample.put("state", unread < 0 ? "UNKNOWN" : "RECORDED");
+                    if (unread >= 0) { sample.put("unreadRecords", unread); }
+                } catch (ArithmeticException overflow) { sample.put("state", "UNKNOWN"); }
+            }
+            result.add(Map.copyOf(sample));
+        }
+        return List.copyOf(result);
+    }
+
+    private static boolean integer(Object value) { return value instanceof Integer || value instanceof Long; }
+
     private static ControlPlane.PositionChain physical(ControlPlane.PositionRead read,
             BenchmarkWorkloadDefinitions.SourceChain chain) {
         List<ControlPlane.PositionChain> matches = read.chains().stream()

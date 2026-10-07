@@ -157,6 +157,12 @@ final class StoreDocuments implements AutoCloseable {
                 .first();
     }
 
+    /** Indexed, exact ring bounds for a diagnostic read; not a snapshot with the consumer cursor. */
+    Document benchmarkLogBounds(String ring) {
+        return database.getCollection(MongoStorePort.SRS_LOG)
+                .find(new Document("_id", "srs-log-bounds:" + ring)).first();
+    }
+
     /** Frozen artifact and submitted-generation identity; older reference builds keep absent fields absent. */
     Document benchmarkRunIdentity(String pipelineId) {
         Document artifact = database.getCollection(MongoStorePort.ARTIFACTS)

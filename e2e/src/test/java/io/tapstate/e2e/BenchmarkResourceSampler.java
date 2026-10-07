@@ -26,9 +26,9 @@ final class BenchmarkResourceSampler implements AutoCloseable {
     private final ScheduledExecutorService worker = Executors.newSingleThreadScheduledExecutor(
             Thread.ofVirtual().name("benchmark-resource-sampler").factory());
     private final ResourceTotals resources = new ResourceTotals();
-    private final AttemptLog attempts = new AttemptLog();
+    private final AttemptLog attempts;
     private final Object lifecycle = new Object();
-    private volatile PublishedDiagnostics published = new PublishedDiagnostics(attempts.snapshot(), Optional.empty());
+    private volatile PublishedDiagnostics published;
     private Throwable failure;
     private volatile Throwable finalSampleFailure;
     private ScheduledFuture<?> periodicSamples;
@@ -38,6 +38,14 @@ final class BenchmarkResourceSampler implements AutoCloseable {
     private BenchmarkResourceSampler(BenchmarkProcessProbe probe,
                                      Supplier<BenchmarkProcessProbe.Snapshot> source, Duration interval,
                                      LongSupplier nanoTime, TerminationWaiter terminationWaiter) {
+        this(probe, source, interval, nanoTime, terminationWaiter, MAX_RETAINED_ATTEMPTS);
+    }
+
+    private BenchmarkResourceSampler(BenchmarkProcessProbe probe,
+                                     Supplier<BenchmarkProcessProbe.Snapshot> source, Duration interval,
+                                     LongSupplier nanoTime, TerminationWaiter terminationWaiter, int retention) {
+        attempts = new AttemptLog(retention);
+        published = new PublishedDiagnostics(attempts.snapshot(), Optional.empty());
         this.probe = probe;
         this.source = Objects.requireNonNull(source, "sample source");
         this.interval = Objects.requireNonNull(interval, "sample interval");
@@ -52,6 +60,14 @@ final class BenchmarkResourceSampler implements AutoCloseable {
         BenchmarkProcessProbe probe = BenchmarkProcessProbe.open(childPid);
         return new BenchmarkResourceSampler(probe, probe::sample, interval, System::nanoTime,
                 ScheduledExecutorService::awaitTermination);
+    }
+
+    static BenchmarkResourceSampler openForPhaseBudget(long childPid, Duration interval, Duration budget) {
+        int retained = Math.toIntExact(budget.toNanos() / interval.toNanos() + 4);
+        if (retained < 2 || retained > 4096) { throw new AssertionError("phase resource retention exceeds its declared finite budget"); }
+        BenchmarkProcessProbe probe = BenchmarkProcessProbe.open(childPid);
+        return new BenchmarkResourceSampler(probe, probe::sample, interval, System::nanoTime,
+                ScheduledExecutorService::awaitTermination, retained);
     }
 
     static BenchmarkResourceSampler from(Supplier<BenchmarkProcessProbe.Snapshot> source, Duration interval) {
@@ -211,6 +227,21 @@ final class BenchmarkResourceSampler implements AutoCloseable {
         return totals.summary(Optional.empty());
     }
 
+    static Summary slice(Summary full, long fromNanos, long toNanos) {
+        SamplingDiagnostics trace = full.sampling().orElseThrow(() -> new AssertionError("resource slice has no actual sampling trace"));
+        if (toNanos <= fromNanos || trace.omittedAttempts() != 0 || trace.failureCount() != 0) {
+            throw new AssertionError("resource slice requires a complete bounded successful trace");
+        }
+        var kept = trace.retainedAttempts().stream().filter(attempt -> attempt.startedAtNanos() >= fromNanos
+                && attempt.completedAtNanos() <= toNanos).toList();
+        var totals = new ResourceTotals();
+        for (var attempt : kept) { totals.add(attempt.reading()); }
+        return totals.summary(Optional.of(new SamplingDiagnostics("COHORT_INTERVAL", kept.size(), 0,
+                kept.stream().mapToLong(Attempt::durationNanos).sum(),
+                kept.stream().mapToLong(Attempt::durationNanos).max().orElse(0), 0, kept,
+                trace.retainedAttemptLimit())));
+    }
+
     record Summary(long cpuNanos, long gcCollectionMillis, long peakHeapBytes, long peakRssBytes, int sampleCount,
                    Optional<SamplingDiagnostics> sampling) {
         Summary {
@@ -244,7 +275,13 @@ final class BenchmarkResourceSampler implements AutoCloseable {
 
     /** Counts describe completed attempts; a read still in progress is separate failure evidence. */
     record SamplingDiagnostics(String state, long attemptCount, long failureCount, long totalDurationNanos,
-                               long maxDurationNanos, long omittedAttempts, List<Attempt> retainedAttempts) {
+                               long maxDurationNanos, long omittedAttempts, List<Attempt> retainedAttempts,
+                               int retainedAttemptLimit) {
+        SamplingDiagnostics(String state, long attemptCount, long failureCount, long totalDurationNanos,
+                            long maxDurationNanos, long omittedAttempts, List<Attempt> retainedAttempts) {
+            this(state, attemptCount, failureCount, totalDurationNanos, maxDurationNanos, omittedAttempts,
+                    retainedAttempts, MAX_RETAINED_ATTEMPTS);
+        }
         SamplingDiagnostics {
             retainedAttempts = List.copyOf(retainedAttempts);
         }
@@ -257,6 +294,12 @@ final class BenchmarkResourceSampler implements AutoCloseable {
 
     /** Keeps exact totals and bounded first/last attempts, including the final failed attempt. */
     static final class AttemptLog {
+        private final int retention;
+        AttemptLog() { this(MAX_RETAINED_ATTEMPTS); }
+        AttemptLog(int retention) {
+            if (retention < 2 || retention > 4096) { throw new IllegalArgumentException("resource trace retention must have a finite phase bound"); }
+            this.retention = retention;
+        }
         private final List<Attempt> first = new ArrayList<>();
         private final ArrayDeque<Attempt> last = new ArrayDeque<>();
         private long count;
@@ -272,10 +315,10 @@ final class BenchmarkResourceSampler implements AutoCloseable {
             }
             totalDuration = Math.addExact(totalDuration, attempt.durationNanos());
             maxDuration = Math.max(maxDuration, attempt.durationNanos());
-            if (first.size() < MAX_RETAINED_ATTEMPTS / 2) {
+            if (first.size() < retention / 2) {
                 first.add(attempt);
             } else {
-                if (last.size() == MAX_RETAINED_ATTEMPTS / 2) {
+                if (last.size() == retention - retention / 2) {
                     last.removeFirst();
                 }
                 last.addLast(attempt);
@@ -286,7 +329,7 @@ final class BenchmarkResourceSampler implements AutoCloseable {
             List<Attempt> retained = new ArrayList<>(first);
             retained.addAll(last);
             return new SamplingDiagnostics(count == 0 ? "NOT_STARTED" : failures == 0 ? "COMPLETE" : "FAILED",
-                    count, failures, totalDuration, maxDuration, count - retained.size(), retained);
+                    count, failures, totalDuration, maxDuration, count - retained.size(), retained, retention);
         }
     }
 

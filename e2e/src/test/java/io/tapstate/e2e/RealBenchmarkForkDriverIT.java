@@ -59,16 +59,19 @@ class RealBenchmarkForkDriverIT {
             RealBenchmarkForkDriver driver = mode.driver(applicationJar, artifact);
             int forkNumber = Integer.parseInt(System.getProperty(FORK_PROPERTY, "1"));
             assertThat(forkNumber).as("the diagnostic fork number").isBetween(1, 5);
+            boolean pilot = Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot");
+            var workload = pilot ? BenchmarkWorkloadDefinitions.steadyPilot(workloadId)
+                    : BenchmarkWorkloadDefinitions.byId(workloadId);
             PipelineBenchmarkHarness.ForkResult result = driver.run(
-                    BenchmarkWorkloadDefinitions.byId(workloadId), arm,
+                    workload, arm,
                     forkNumber, applicationJar);
 
             BenchmarkAckOracle.verify(List.of(result.correctness()));
-            int expectedMeasured = workloadId.equals("stateful") ? 36_000 : 12_000;
+            int expectedMeasured = (workloadId.equals("stateful") ? 3 : 1) * workload.rows() / (pilot ? 2 : 1);
             int expectedPhysical = switch (workloadId) {
-                case "copy" -> 12_001;
-                case "stateless" -> 12_002;
-                case "stateful" -> 36_002;
+                case "copy" -> workload.rows() + 1;
+                case "stateless" -> workload.rows() + 2;
+                case "stateful" -> workload.rows() * 3 + 2;
                 default -> throw new AssertionError("unrecognized benchmark workload " + workloadId);
             };
             assertThat(result.measurement().deliveryNanos()).hasSize(expectedMeasured);
@@ -124,6 +127,11 @@ class RealBenchmarkForkDriverIT {
                     System.out.println("benchmark-real-confirmation-timing="
                             + JsonWriter.write(Map.of("fork", evidence.forkId(), "phase", phase.id(),
                                     "timing", PipelineBenchmarkLiveRunIT.phaseEvidence(phase).get("confirmationTiming"))));
+                    if (pilot) {
+                        System.out.println("benchmark-real-pilot-phase="
+                                + JsonWriter.write(Map.of("fork", evidence.forkId(), "rows", workload.rows(),
+                                        "phase", PipelineBenchmarkLiveRunIT.phaseEvidence(phase))));
+                    }
                 });
             });
         }

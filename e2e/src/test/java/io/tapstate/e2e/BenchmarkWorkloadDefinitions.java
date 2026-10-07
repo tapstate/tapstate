@@ -28,6 +28,7 @@ import java.util.Objects;
 final class BenchmarkWorkloadDefinitions {
 
     static final int SNAPSHOT_ROWS = 12_000;
+    static final int STEADY_PILOT_ROWS = 96_000;
     static final long SEED = 424_242L;
 
     private static final String COPY = "copy";
@@ -59,6 +60,15 @@ final class BenchmarkWorkloadDefinitions {
     static Workload byId(String id) {
         return ALL.stream().filter(workload -> workload.id().equals(id)).findFirst()
                 .orElseThrow(() -> new IllegalArgumentException("unknown benchmark workload: " + id));
+    }
+
+    static Workload steadyPilot(String id) {
+        return switch (id) {
+            case COPY -> copy(STEADY_PILOT_ROWS);
+            case STATELESS -> stateless(STEADY_PILOT_ROWS);
+            case STATEFUL -> stateful(STEADY_PILOT_ROWS);
+            default -> throw new IllegalArgumentException("unknown steady pilot workload: " + id);
+        };
     }
 
     enum Database {
@@ -147,16 +157,39 @@ final class BenchmarkWorkloadDefinitions {
     record Workload(
             String id,
             long seed,
+            int rows,
             Database database,
             List<String> pipelineIds,
             List<SourceChain> sourceChains,
             List<String> setupSql,
             List<Phase> phases) {
+        Workload(String id, long seed, Database database, List<String> pipelineIds,
+                 List<SourceChain> sourceChains, List<String> setupSql, List<Phase> phases) {
+            this(id, seed, SNAPSHOT_ROWS, database, pipelineIds, sourceChains, setupSql, phases);
+        }
         Workload {
+            if (rows < 1 || rows >= 100_000 || rows % 4 != 0) {
+                throw new IllegalArgumentException("workload rows must preserve the reserved marker domains");
+            }
             pipelineIds = List.copyOf(pipelineIds);
             sourceChains = List.copyOf(sourceChains);
             setupSql = List.copyOf(setupSql);
             phases = List.copyOf(phases);
+        }
+
+        boolean pilotProfile() { return rows == STEADY_PILOT_ROWS; }
+
+        boolean inFixedCohort(String key) {
+            if (!pilotProfile()) { return true; }
+            String root = key;
+            if (id.equals(STATELESS)) {
+                if (!key.matches("[0-9]+:[01]")) { throw new AssertionError("stateless cohort key has no exact unwind element"); }
+                root = key.substring(0, key.indexOf(':'));
+            } else if (!key.matches("[0-9]+")) { throw new AssertionError("cohort key is not an exact root id"); }
+            long id;
+            try { id = Long.parseLong(root); }
+            catch (NumberFormatException invalid) { throw new AssertionError("target cohort key is not a root id", invalid); }
+            return id > rows / 4 && id <= rows * 3L / 4;
         }
 
         Map<String, String> resources(Map<String, Object> sourceConfig, String externalTargetUri) {
@@ -233,66 +266,92 @@ final class BenchmarkWorkloadDefinitions {
         return checksum(lines);
     }
 
-    private static Workload copy() {
+    private static Workload copy() { return copy(SNAPSHOT_ROWS); }
+
+    private static Workload copy(int rows) {
         SourceChain orders = chain(COPY_PIPELINE, "src_bench_copy", COPY_TABLE, 900_001);
         List<String> setup = new ArrayList<>();
         setup.add("CREATE TABLE " + COPY_TABLE
                 + " (id BIGINT PRIMARY KEY, amount BIGINT NOT NULL, payload VARCHAR(64) NOT NULL,"
                 + " marker VARCHAR(64))");
-        setup.addAll(inserts(COPY_TABLE, "id,amount,payload", 1, SNAPSHOT_ROWS,
+        setup.addAll(inserts(COPY_TABLE, "id,amount,payload", 1, rows,
                 id -> "(" + id + "," + copyAmount(id) + ",'payload-" + id + "')"));
 
         List<Phase> phases = List.of(
-                phase("snapshot", Stage.SNAPSHOT, false, SNAPSHOT_ROWS,
-                        List.of(), coverage(orders, "snapshot", SNAPSHOT_ROWS),
-                        copyTarget(0)),
+                phase("snapshot", Stage.SNAPSHOT, false, rows,
+                        List.of(), coverage(orders, "snapshot", rows),
+                        copyTarget(0, rows)),
                 phase("warm-up", Stage.WARM_UP, false, 128,
                         List.of("UPDATE " + COPY_TABLE + " SET amount = amount + 1 WHERE id BETWEEN 1 AND 128"),
-                        coverage(orders, "warm-up", 128), copyTarget(1)),
-                pacedPhase("cdc-update", Stage.CDC_UPDATE, SNAPSHOT_ROWS,
-                        updates(COPY_TABLE, "amount = amount + 1", 1, SNAPSHOT_ROWS, 100, ""),
-                        1, coverage(orders, "cdc-update", SNAPSHOT_ROWS), copyTarget(2)),
+                        coverage(orders, "warm-up", 128), copyTarget(1, rows)),
+                pacedPhase("cdc-update", Stage.CDC_UPDATE, rows,
+                        updates(COPY_TABLE, "amount = amount + 1", 1, rows, 100, ""),
+                        1, coverage(orders, "cdc-update", rows), copyTarget(2, rows)),
                 phase("terminal", Stage.TERMINAL, false, 1,
                         List.of("INSERT INTO " + COPY_TABLE
                                 + " (id,amount,payload,marker) VALUES (900001,7,'terminal','copy-orders-terminal')"),
-                        Map.of(orders.terminalLogicalId(), 1L), copyTarget(3)));
-        return new Workload(COPY, SEED, Database.MYSQL, List.of(COPY_PIPELINE),
+                        Map.of(orders.terminalLogicalId(), 1L), copyTarget(3, rows)));
+        return new Workload(COPY, SEED, rows, Database.MYSQL, List.of(COPY_PIPELINE),
                 List.of(orders), setup, phases);
     }
 
-    private static Workload stateless() {
+    private static Workload stateless() { return stateless(SNAPSHOT_ROWS); }
+
+    private static Workload stateless(int rows) {
         SourceChain orders = chain(STATELESS_PIPELINE, "src_bench_stateless", STATELESS_TABLE, 900_002);
         List<String> setup = new ArrayList<>();
         setup.add("CREATE TABLE " + STATELESS_TABLE
                 + " (id BIGINT PRIMARY KEY, qty BIGINT NOT NULL, region TEXT NOT NULL, items TEXT[] NOT NULL)");
         setup.add("ALTER TABLE " + STATELESS_TABLE + " REPLICA IDENTITY FULL");
-        setup.addAll(inserts(STATELESS_TABLE, "id,qty,region,items", 1, SNAPSHOT_ROWS,
+        setup.addAll(inserts(STATELESS_TABLE, "id,qty,region,items", 1, rows,
                 id -> "(" + id + "," + statelessQty(id) + ",'"
                         + (id % 2 == 0 ? "keep" : "skip") + "',ARRAY['item-" + id + "-a','item-" + id
                         + "-b'])"));
 
         List<Phase> phases = List.of(
-                phase("snapshot", Stage.SNAPSHOT, false, SNAPSHOT_ROWS,
-                        List.of(), coverage(orders, "snapshot", SNAPSHOT_ROWS),
-                        statelessTarget(0)),
+                phase("snapshot", Stage.SNAPSHOT, false, rows,
+                        List.of(), coverage(orders, "snapshot", rows),
+                        statelessTarget(0, rows)),
                 phase("warm-up", Stage.WARM_UP, false, 256,
                         List.of("UPDATE " + STATELESS_TABLE
                                 + " SET qty = qty + 1 WHERE id BETWEEN 1 AND 256 AND id % 2 = 0"),
-                        coverage(orders, "warm-up", 128), statelessTarget(1)),
-                pacedPhase("cdc-update", Stage.CDC_UPDATE, SNAPSHOT_ROWS,
-                        updates(STATELESS_TABLE, "qty = qty + 1", 1, SNAPSHOT_ROWS, 100,
+                        coverage(orders, "warm-up", 128), statelessTarget(1, rows)),
+                pacedPhase("cdc-update", Stage.CDC_UPDATE, rows,
+                        updates(STATELESS_TABLE, "qty = qty + 1", 1, rows, 100,
                                 " AND id % 2 = 0"),
-                        1, coverage(orders, "cdc-update", SNAPSHOT_ROWS / 2), statelessTarget(2)),
+                        1, coverage(orders, "cdc-update", rows / 2), statelessTarget(2, rows)),
                 phase("terminal", Stage.TERMINAL, false, 2,
                         List.of("INSERT INTO " + STATELESS_TABLE
                                 + " (id,qty,region,items) VALUES"
                                 + " (900002,7,'keep',ARRAY['terminal-left','terminal-right'])"),
-                        Map.of(orders.terminalLogicalId(), 1L), statelessTarget(3)));
-        return new Workload(STATELESS, SEED, Database.POSTGRES, List.of(STATELESS_PIPELINE),
+                        Map.of(orders.terminalLogicalId(), 1L), statelessTarget(3, rows)));
+        if (rows == STEADY_PILOT_ROWS) {
+            var prepared = new ArrayList<Phase>();
+            prepared.addAll(phases.subList(0, 2));
+            Workload base = new Workload(STATELESS, SEED, rows, Database.POSTGRES, List.of(STATELESS_PIPELINE),
+                    List.of(orders), setup, phases);
+            long probe = BenchmarkPreflightWrites.warmupRowId(base, orders);
+            long boundary = BenchmarkBoundaryWrites.forChain(base, orders).rowId();
+            long excluded = java.util.stream.LongStream.of(probe, boundary).distinct()
+                    .filter(value -> value >= 1 && value <= 24_000 && value % 2 == 0).count();
+            long warmRows = 12_000 - excluded;
+            String exclude = " AND id NOT IN (" + probe + "," + boundary + ")";
+            prepared.add(phase("cdc-settling-raised", Stage.WARM_UP, false, warmRows * 2,
+                    updates(STATELESS_TABLE, "qty = qty + 1", 1, 24_000, 100, " AND id % 2 = 0" + exclude),
+                    coverage(orders, "cdc-settling-raised", warmRows), statelessWarmTarget(rows, probe, boundary)));
+            prepared.add(phase("cdc-settling-restored", Stage.WARM_UP, false, warmRows * 2,
+                    updates(STATELESS_TABLE, "qty = qty - 1", 1, 24_000, 100, " AND id % 2 = 0" + exclude),
+                    coverage(orders, "cdc-settling-restored", warmRows), statelessTarget(1, rows)));
+            prepared.addAll(phases.subList(2, phases.size()));
+            phases = List.copyOf(prepared);
+        }
+        return new Workload(STATELESS, SEED, rows, Database.POSTGRES, List.of(STATELESS_PIPELINE),
                 List.of(orders), setup, phases);
     }
 
-    private static Workload stateful() {
+    private static Workload stateful() { return stateful(SNAPSHOT_ROWS); }
+
+    private static Workload stateful(int rows) {
         SourceChain joinOrders = chain(JOIN_PIPELINE, "src_bench_join_orders", JOIN_ORDERS, 900_011);
         SourceChain joinCustomers = chain(JOIN_PIPELINE, "src_bench_join_customers", JOIN_CUSTOMERS, 900_012);
         SourceChain nestOrders = chain(NEST_PIPELINE, "src_bench_nest_orders", NEST_ORDERS, 900_013);
@@ -310,11 +369,11 @@ final class BenchmarkWorkloadDefinitions {
                 + " marker VARCHAR(64))");
         setup.addAll(inserts(JOIN_CUSTOMERS, "id,name", 1, 32,
                 id -> "(" + id + ",'customer-" + id + "')"));
-        setup.addAll(inserts(JOIN_ORDERS, "id,customer_id,qty", 1, SNAPSHOT_ROWS,
+        setup.addAll(inserts(JOIN_ORDERS, "id,customer_id,qty", 1, rows,
                 id -> "(" + id + "," + customerId(id) + "," + joinQty(id) + ")"));
-        setup.addAll(inserts(NEST_ORDERS, "id,label", 1, SNAPSHOT_ROWS,
+        setup.addAll(inserts(NEST_ORDERS, "id,label", 1, rows,
                 id -> "(" + id + ",'root-" + id + "')"));
-        setup.addAll(inserts(NEST_ITEMS, "id,order_id,sku", 1, SNAPSHOT_ROWS,
+        setup.addAll(inserts(NEST_ITEMS, "id,order_id,sku", 1, rows,
                 id -> "(" + id + "," + id + ",'sku-" + id + "')"));
 
         List<String> warm = new ArrayList<>();
@@ -325,12 +384,12 @@ final class BenchmarkWorkloadDefinitions {
                 id -> "(" + (100_000 + id) + "," + id + ",'warm-" + id + "')"));
         List<String> hot = inserts(NEST_ITEMS, "id,order_id,sku", 1, 64,
                 id -> "(" + (200_000 + id) + ",1,'hot-" + id + "')");
-        List<String> cold = inserts(NEST_ITEMS, "id,order_id,sku", 1, SNAPSHOT_ROWS, 100,
+        List<String> cold = inserts(NEST_ITEMS, "id,order_id,sku", 1, rows, 100,
                 id -> "(" + (300_000 + id) + "," + id + ",'cold-" + id + "')");
         List<String> update = new ArrayList<>();
-        List<String> joinUpdates = updates(JOIN_ORDERS, "qty = qty + 1", 1, SNAPSHOT_ROWS, 100, "");
+        List<String> joinUpdates = updates(JOIN_ORDERS, "qty = qty + 1", 1, rows, 100, "");
         List<String> nestUpdates = updates(NEST_ITEMS, "sku = CONCAT(sku, 'u')",
-                1, SNAPSHOT_ROWS, 100, "");
+                1, rows, 100, "");
         for (int batch = 0; batch < joinUpdates.size(); batch++) {
             update.add(joinUpdates.get(batch));
             update.add(nestUpdates.get(batch));
@@ -348,26 +407,26 @@ final class BenchmarkWorkloadDefinitions {
                         + " (900014,900013,'terminal-item','nest-items-terminal')");
 
         List<Phase> phases = List.of(
-                phase("snapshot", Stage.SNAPSHOT, false, 2L * SNAPSHOT_ROWS, List.of(),
-                        coverage(Map.of(joinOrders, (long) SNAPSHOT_ROWS, joinCustomers, 32L,
-                                nestOrders, (long) SNAPSHOT_ROWS, nestItems, (long) SNAPSHOT_ROWS), "snapshot"),
-                        statefulTargets(0)),
+                phase("snapshot", Stage.SNAPSHOT, false, 2L * rows, List.of(),
+                        coverage(Map.of(joinOrders, (long) rows, joinCustomers, 32L,
+                                nestOrders, (long) rows, nestItems, (long) rows), "snapshot"),
+                        statefulTargets(0, rows)),
                 phase("warm-up", Stage.WARM_UP, false, 888, warm,
                         coverage(Map.of(joinOrders, 256L, joinCustomers, 1L,
                                 nestOrders, 1L, nestItems, 256L), "warm-up"),
-                        statefulTargets(1)),
+                        statefulTargets(1, rows)),
                 phase("hot-state", Stage.HOT_STATE, false, 64, hot,
-                        coverage(nestItems, "hot-state", 64), statefulTargets(2)),
-                pacedPhase("cold-read", Stage.COLD_READ, SNAPSHOT_ROWS, cold, 1,
-                        coverage(nestItems, "cold-read", SNAPSHOT_ROWS), statefulTargets(3)),
-                pacedPhase("cdc-update", Stage.CDC_UPDATE, 2L * SNAPSHOT_ROWS, update, 2,
-                        coverage(Map.of(joinOrders, (long) SNAPSHOT_ROWS,
-                                nestItems, (long) SNAPSHOT_ROWS), "cdc-update"), statefulTargets(4)),
+                        coverage(nestItems, "hot-state", 64), statefulTargets(2, rows)),
+                pacedPhase("cold-read", Stage.COLD_READ, rows, cold, 1,
+                        coverage(nestItems, "cold-read", rows), statefulTargets(3, rows)),
+                pacedPhase("cdc-update", Stage.CDC_UPDATE, 2L * rows, update, 2,
+                        coverage(Map.of(joinOrders, (long) rows,
+                                nestItems, (long) rows), "cdc-update"), statefulTargets(4, rows)),
                 phase("terminal", Stage.TERMINAL, false, 2, terminal,
                         Map.of(joinOrders.terminalLogicalId(), 1L, joinCustomers.terminalLogicalId(), 1L,
                                 nestOrders.terminalLogicalId(), 1L, nestItems.terminalLogicalId(), 1L),
-                        statefulTargets(5)));
-        return new Workload(STATEFUL, SEED, Database.MYSQL, List.of(JOIN_PIPELINE, NEST_PIPELINE),
+                        statefulTargets(5, rows)));
+        return new Workload(STATEFUL, SEED, rows, Database.MYSQL, List.of(JOIN_PIPELINE, NEST_PIPELINE),
                 List.of(joinOrders, joinCustomers, nestOrders, nestItems), setup, phases);
     }
 
@@ -551,9 +610,9 @@ final class BenchmarkWorkloadDefinitions {
         return Map.copyOf(result);
     }
 
-    private static TargetExpectation copyTarget(int phase) {
-        List<String> lines = new ArrayList<>(SNAPSHOT_ROWS + 1);
-        for (int id = 1; id <= SNAPSHOT_ROWS; id++) {
+    private static TargetExpectation copyTarget(int phase, int rows) {
+        List<String> lines = new ArrayList<>(rows + 1);
+        for (int id = 1; id <= rows; id++) {
             long amount = copyAmount(id) + (phase >= 1 && id <= 128 ? 1 : 0) + (phase >= 2 ? 1 : 0);
             lines.add(copyLine(id, amount, "payload-" + id, ""));
         }
@@ -564,9 +623,9 @@ final class BenchmarkWorkloadDefinitions {
                 Projection.COPY, lines.size(), checksum(lines));
     }
 
-    private static TargetExpectation statelessTarget(int phase) {
-        List<String> lines = new ArrayList<>(SNAPSHOT_ROWS + 2);
-        for (int id = 2; id <= SNAPSHOT_ROWS; id += 2) {
+    private static TargetExpectation statelessTarget(int phase, int rows) {
+        List<String> lines = new ArrayList<>(rows + 2);
+        for (int id = 2; id <= rows; id += 2) {
             long qty = statelessQty(id) + (phase >= 1 && id <= 256 ? 1 : 0) + (phase >= 2 ? 1 : 0);
             lines.add(statelessLine(id, 0, "item-" + id + "-a", qty, qty * 2));
             lines.add(statelessLine(id, 1, "item-" + id + "-b", qty, qty * 2));
@@ -579,10 +638,21 @@ final class BenchmarkWorkloadDefinitions {
                 Projection.STATELESS, lines.size(), checksum(lines));
     }
 
-    private static List<TargetExpectation> statefulTargets(int phase) {
-        List<String> join = new ArrayList<>(SNAPSHOT_ROWS + 1);
-        List<String> nest = new ArrayList<>(SNAPSHOT_ROWS + 1);
-        for (int id = 1; id <= SNAPSHOT_ROWS; id++) {
+    private static TargetExpectation statelessWarmTarget(int rows, long probe, long boundary) {
+        List<String> lines = new ArrayList<>(rows);
+        for (int id = 2; id <= rows; id += 2) {
+            long qty = statelessQty(id) + (id <= 256 ? 1 : 0) + (id <= 24_000 && id != probe && id != boundary ? 1 : 0);
+            lines.add(statelessLine(id, 0, "item-" + id + "-a", qty, qty * 2));
+            lines.add(statelessLine(id, 1, "item-" + id + "-b", qty, qty * 2));
+        }
+        return new TargetExpectation(STATELESS_PIPELINE, TargetLocation.EXTERNAL_MONGO, STATELESS_TABLE,
+                Projection.STATELESS, lines.size(), checksum(lines));
+    }
+
+    private static List<TargetExpectation> statefulTargets(int phase, int rows) {
+        List<String> join = new ArrayList<>(rows + 1);
+        List<String> nest = new ArrayList<>(rows + 1);
+        for (int id = 1; id <= rows; id++) {
             long qty = joinQty(id) + (phase >= 1 && id <= 256 ? 1 : 0) + (phase >= 4 ? 1 : 0);
             String customerName = phase >= 1 && customerId(id) == 1
                     ? "customer-1-warm" : "customer-" + customerId(id);

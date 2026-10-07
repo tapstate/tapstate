@@ -389,6 +389,36 @@ final class ControlPlane {
         return facts;
     }
 
+    record BenchmarkMember(String clusterId, String uuid, String hzAddress, String controlUrl) { }
+
+    BenchmarkMember benchmarkMember() {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        expect(response, 200, "read the owned benchmark member address");
+        Object parsed = JsonReader.parse(response.body());
+        if (!(parsed instanceof Map<?, ?> topology)
+                || !(topology.get("members") instanceof List<?> members) || members.size() != 1
+                || !(members.getFirst() instanceof Map<?, ?> member)
+                || !(member.get("memberUuid") instanceof String uuid)
+                || !(member.get("hzAddress") instanceof String address)) {
+            String shape = parsed instanceof Map<?, ?> map ? map.keySet().toString() : parsed.getClass().getSimpleName();
+            if (parsed instanceof Map<?, ?> map && map.get("members") instanceof List<?> values) {
+                shape += ";memberCount=" + values.size() + ";memberKeys="
+                        + values.stream().filter(Map.class::isInstance).map(Map.class::cast).map(Map::keySet).toList();
+            }
+            throw new AssertionError("benchmark requires its exact sole member address and identity; shape=" + shape);
+        }
+        return new BenchmarkMember(asText(topology.get("clusterId")), uuid, address, asText(member.get("controlUrl")));
+    }
+
+    Map<?, ?> benchmarkPipelineTopology(String pipeline) {
+        HttpResponse<String> response = send(authedGet("/api/cluster/members"));
+        expect(response, 200, "read the actual benchmark processor topology");
+        var matches = pipelinesOf(response.body()).stream().filter(Map.class::isInstance).map(Map.class::cast)
+                .filter(value -> pipeline.equals(value.get("pipelineId"))).toList();
+        if (matches.size() != 1) { throw new AssertionError("benchmark pipeline topology is absent or ambiguous"); }
+        return matches.getFirst();
+    }
+
     private static String asText(Object value) {
         return value == null ? null : String.valueOf(value);
     }

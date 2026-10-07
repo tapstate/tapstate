@@ -45,6 +45,13 @@ final class PipelineBenchmarkHarness {
     static Report run(Gate gate, Path baselineJar, Path candidateJar,
                       PipelineBenchmarkComparison.Workload target,
                       PipelineBenchmarkComparison.PrimaryMetric primary, ForkDriver driver) throws Exception {
+        return run(gate, baselineJar, candidateJar, target, primary, driver, BenchmarkWorkloadDefinitions.all());
+    }
+
+    static Report run(Gate gate, Path baselineJar, Path candidateJar,
+                      PipelineBenchmarkComparison.Workload target,
+                      PipelineBenchmarkComparison.PrimaryMetric primary, ForkDriver driver,
+                      List<BenchmarkWorkloadDefinitions.Workload> workloads) throws Exception {
         Objects.requireNonNull(gate, "gate");
         Objects.requireNonNull(driver, "driver");
         Path baseline = requireJar(baselineJar);
@@ -57,7 +64,7 @@ final class PipelineBenchmarkHarness {
                 new EnumMap<>(PipelineBenchmarkComparison.Workload.class);
         Map<PipelineBenchmarkComparison.Workload, List<PipelineBenchmarkComparison.Fork>> measurements =
                 new EnumMap<>(PipelineBenchmarkComparison.Workload.class);
-        for (BenchmarkWorkloadDefinitions.Workload workload : BenchmarkWorkloadDefinitions.all()) {
+        for (BenchmarkWorkloadDefinitions.Workload workload : workloads) {
             PipelineBenchmarkComparison.Workload kind = kindOf(workload.id());
             Map<String, String> frozenTerminals = expectedTerminals(workload);
             List<ForkResult> forks = new ArrayList<>();
