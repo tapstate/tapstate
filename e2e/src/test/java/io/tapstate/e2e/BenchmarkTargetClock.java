@@ -49,7 +49,11 @@ final class BenchmarkTargetClock {
         long serverElapsedMillis = Math.subtractExact(after.serverWallMillis(), before.serverWallMillis());
         if (minimumElapsedMillis < 0 || serverElapsedMillis < minimumElapsedMillis - 2
                 || serverElapsedMillis > maximumElapsedMillis + 2) {
-            throw new AssertionError("target server clock stepped outside its measured request uncertainty");
+            throw new AssertionError("target server clock stepped outside its measured request uncertainty"
+                    + "; before=" + before.evidence() + "; after=" + after.evidence()
+                    + "; serverElapsedMillis=" + serverElapsedMillis
+                    + "; minimumElapsedMillis=" + minimumElapsedMillis
+                    + "; maximumElapsedMillis=" + maximumElapsedMillis);
         }
         return Map.of("state", "QUALIFIED", "before", before.evidence(), "after", after.evidence(),
                 "serverElapsedMillis", serverElapsedMillis, "minimumElapsedMillis", minimumElapsedMillis,

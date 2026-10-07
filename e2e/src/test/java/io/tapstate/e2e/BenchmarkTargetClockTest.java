@@ -16,7 +16,11 @@ class BenchmarkTargetClockTest {
         assertThatThrownBy(()->BenchmarkTargetClock.validate(reading("one",1000,0,2),reading("two",1100,99,102)))
                 .isInstanceOf(AssertionError.class).hasMessageContaining("primary changed");
         assertThatThrownBy(()->BenchmarkTargetClock.validate(reading("one",1000,0,2),reading("one",1400,99,102)))
-                .isInstanceOf(AssertionError.class).hasMessageContaining("clock stepped");
+                .isInstanceOf(AssertionError.class).hasMessageContaining("clock stepped")
+                .hasMessageContaining("serverElapsedMillis=400")
+                .hasMessageContaining("minimumElapsedMillis=97")
+                .hasMessageContaining("maximumElapsedMillis=102")
+                .hasMessageContaining("processId=one");
     }
     @Test void operationResourceWindowRetainsEndpointUncertaintyAndRejectsUnbracketedTimes() {
         var before=reading("one",1000,0,2); var after=reading("one",1100,99,102);
