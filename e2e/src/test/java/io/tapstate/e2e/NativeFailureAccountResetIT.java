@@ -8,6 +8,7 @@ import io.tapstate.adapters.mongostore.MongoDesiredStore;
 import io.tapstate.adapters.mongostore.MongoObservationStore;
 import io.tapstate.adapters.mongostore.MongoStateStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.control.core.MonitorError;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.lifecycle.LifecycleError;
@@ -65,6 +66,7 @@ class NativeFailureAccountResetIT {
         Path output = Path.of(required("output"));
         Path root = PipelineBenchmarkLiveRunIT.harnessRoot();
         PipelineBenchmarkLiveRunIT.requireSafeOutput(output, root);
+        boolean firstCurrentWindow = Boolean.getBoolean(PREFIX + "first-current-window");
         Map<String, Object> inputs = inputHashes(root);
         Map<String, Object> connectors = new LinkedHashMap<>();
         for (String name : List.of("mysql", "postgres", "mongodb")) {
@@ -82,7 +84,8 @@ class NativeFailureAccountResetIT {
             report.begin(Map.of("purpose", "NATIVE_POSITIVE_FAILURE_ACCOUNT_RESET",
                     "application", PipelineBenchmarkLiveRunIT.artifact(jar), "expectedJarSha256", sha,
                     "harness", inputs, "connectors", connectors, "prometheusEndpoint", scrape.toString(),
-                    "historySampleInterval", "PT2S", "performanceAcceptanceEligible", false),
+                    "historySampleInterval", "PT2S", "performanceAcceptanceEligible", false,
+                    "firstCurrentWindowRequested", firstCurrentWindow),
                     PipelineBenchmarkLiveRunIT.environment(), List.of());
             try (var fork = BenchmarkForkEnvironment.open(workload, jar, "positive-failure-reset");
                     var mongo = MongoClients.create(fork.storeUri())) {
@@ -225,8 +228,26 @@ class NativeFailureAccountResetIT {
                     assertThat(folderCleared(retainedBoundary.records())
                             || exporterCleared(retainedBoundary.records(), oldProduced)).isFalse();
                     observer.requireFullBindingsBeforeStart();
-                    control.lifecycle(pipeline, LifecycleVerb.START);
-                    var reset = Await.answered("a real new RUNNING execution after STOP/START", WAIT, () ->
+                    Map<String, Object> windowAdmission = null;
+                    long resetDeadline = firstCurrentWindow ? System.nanoTime() + WAIT.toNanos() : 0;
+                    if (firstCurrentWindow) {
+                        var oldLatest = latest.readStored(pipeline).orElseThrow();
+                        assertPositiveOldLatest(oldLatest, old, oldAccount);
+                        var artifactBefore = database.getCollection(MongoStorePort.ARTIFACTS)
+                                .find(new Document("_id", pipeline)).first();
+                        var artifact = control.artifact(pipeline).orElseThrow();
+                        assertThat(artifactBefore).isNotNull();
+                        assertThat(artifactBefore.getString("contentHash")).isEqualTo(artifact.contentHash());
+                        var held = observer.armFirstAdmissionReturn(old, resetDeadline);
+                        try (held) {
+                            control.lifecycle(pipeline, LifecycleVerb.START);
+                            windowAdmission = held.awaitEntry();
+                            qualifyFirstCurrentWindow(observer, held, windowAdmission, report, database, latest,
+                                    desired, http, control, pipeline, old, oldLatest, oldAccount, artifactBefore, resetDeadline);
+                        } finally { report.addFork(held.evidence()); }
+                    } else { control.lifecycle(pipeline, LifecycleVerb.START); }
+                    var reset = Await.answered("a real new RUNNING execution after STOP/START",
+                            firstCurrentWindow ? remainingWindow(resetDeadline) : WAIT, () ->
                             latest.readStored(pipeline).filter(value -> value.scope().isPresent()
                                     && value.scope().orElseThrow().executionGeneration() > old.generation()
                                     && value.observation().state() == PipelineState.RUNNING
@@ -256,6 +277,24 @@ class NativeFailureAccountResetIT {
                             .map(NativeFailureAccountResetIT::object).noneMatch(metric -> ERRORS.equals(metric.get("name"))))
                             .as("the current SDK return contains no inherited error instrument").isTrue();
                     assertThat(observer.capturedJob(next)).isPresent();
+                    if (firstCurrentWindow) {
+                        var actualJob = observer.capturedJob(next).orElseThrow();
+                        var admitted = Objects.requireNonNull(windowAdmission);
+                        Map<String, Object> submitted = cleared.records().stream().filter(record -> good(record, "SUBMIT")
+                                && Objects.equals(record.get("admissionObject"), admitted.get("admissionObject"))
+                                && Objects.equals(record.get("ownershipReceiver"), admitted.get("receiver"))
+                                && Objects.equals(record.get("scope"), next.scope())).findFirst().orElseThrow();
+                        assertThat(submitted.get("fence")).isEqualTo(admitted.get("fence"));
+                        assertThat(submitted.get("job")).isEqualTo(actualJob.job());
+                        assertThat(submitted.get("executionJobObject")).isEqualTo(actualJob.executionObjectId());
+                        assertThat(submitted.get("proxy")).isEqualTo(actualJob.proxyId());
+                        assertThat(((Number) submitted.get("entryOrder")).longValue())
+                                .isGreaterThan(((Number) admitted.get("returnOrder")).longValue());
+                        report.addFork(Map.of("action", "first-current-window-followed-by-real-same-admission-submit",
+                                "admissionObject", admitted.get("admissionObject"), "submission", submitted,
+                                "currentScope", next.scope(), "currentPublication", reset.observation().observedAt().toString(),
+                                "claimedQualified", false, "preSubmitJobClaimed", false));
+                    }
                     var resetLogs = logs(http, control, observer.server().baseUrl(), pipeline);
                     assertThat(lines(resetLogs)).noneMatch(line -> sameLog(line, oldLog));
                     report.addFork(Map.of("action", "same-restored-jvm-reset-qualified",
@@ -278,13 +317,107 @@ class NativeFailureAccountResetIT {
                         .isEqualTo(input.getValue());
             }
             report.completeDiagnostic(Map.of("correctness", "POSITIVE_FAILURE_ACCOUNT_RESET_QUALIFIED",
-                    "performanceAcceptanceEligible", false, "unverified", List.of(
+                    "performanceAcceptanceEligible", false, "firstCurrentWindowQualified", firstCurrentWindow,
+                    "unverified", List.of(
                             "RECREATE_FAILURE_ACCOUNT_CLEANUP", "CLUSTER_EMITTING_MEMBER",
                             "OTHER_TELEMETRY_LIFECYCLE_SURFACES", "ALL_TELEMETRY_SURFACE_IDENTITIES")));
         } catch (Exception | Error failure) {
             try { report.fail(failure); } catch (RuntimeException reporting) { failure.addSuppressed(reporting); }
             throw failure;
         }
+    }
+
+    private static Duration remainingWindow(long deadline) {
+        long left = deadline - System.nanoTime();
+        assertThat(left).as("the admission window and first current frame share the original reset deadline").isPositive();
+        return Duration.ofNanos(left);
+    }
+    private static void assertPositiveOldLatest(ObservationStore.Stored value,
+            NativeTelemetryIdentityJdiSession.AuthorityReceipt old, Map<String, Object> account) {
+        assertThat(value.scope().orElseThrow().pipelineIncarnationId()).isEqualTo(old.incarnation());
+        assertThat(value.scope().orElseThrow().executionGeneration()).isEqualTo(old.generation());
+        assertThat(value.observation().state()).isEqualTo(PipelineState.STOPPED);
+        assertThat(object(account.get("scope"))).isEqualTo(old.scope());
+        assertThat(((Number) account.get("token")).longValue()).isPositive();
+        long count = ((Number) object(account.get("counts")).get(CODE)).longValue();
+        assertThat(count).isPositive();
+        assertThat(value.observation().facts().stream().filter(fact -> ERRORS.equals(fact.name())
+                && fact.type() == io.tapstate.core.lifecycle.MetricType.COUNTER && "{error}".equals(fact.unit()))
+                .flatMap(fact -> fact.points().stream()).anyMatch(point -> CODE.equals(point.attributes().get("code"))
+                        && Long.valueOf(count).equals(point.value()) && point.startTime() != null
+                        && point.startTime().toString().equals(account.get("countingSince"))))
+                .as("the retained physical predecessor has its actual positive error count and start").isTrue();
+    }
+    private static void qualifyFirstCurrentWindow(NativeTelemetryIdentityJdiSession observer,
+            NativeTelemetryIdentityJdiSession.AdmissionReturnPark held, Map<String, Object> admission,
+            BenchmarkLiveReport report, MongoDatabase database, MongoObservationStore latest,
+            MongoDesiredStore desired, HttpClient http, ControlPlane control, String pipeline,
+            NativeTelemetryIdentityJdiSession.AuthorityReceipt old, ObservationStore.Stored oldLatest,
+            Map<String, Object> oldAccount, Document artifactBefore, long deadline) throws Exception {
+        observer.check(); assertThat(held.held()).isTrue(); remainingWindow(deadline);
+        Map<String, Object> fence = object(admission.get("fence"));
+        long generation = ((Number) fence.get("executionGeneration")).longValue();
+        assertThat(generation).isEqualTo(Math.addExact(old.generation(), 1));
+        assertThat(admission.get("allowed")).isEqualTo(true);
+        assertThat(admission.get("admissionStatus")).isEqualTo("STANDALONE");
+        List<Document> actualRows = database.getCollection(MongoStorePort.WORKLOAD_CLAIMS)
+                .find(new Document("clusterId", old.clusterId()).append("resourceType", "PIPELINE_ACTUATION")
+                        .append("resourceId", pipeline)).limit(2).into(new ArrayList<>());
+        assertThat(actualRows).as("one exact scoped standalone coordination row").hasSize(1);
+        Document authority = actualRows.getFirst();
+        Document id = authority.get("_id", Document.class);
+        assertThat(id).isNotNull();
+        assertThat(((Number) authority.get("executionGeneration")).longValue()).isEqualTo(generation);
+        assertThat(JsonWriter.write(authority.get("_id"))).isEqualTo(old.coordinationId());
+        assertThat(id.getString("clusterId")).isEqualTo(old.clusterId());
+        assertThat(id.getString("resourceId")).isEqualTo(pipeline);
+        assertThat(id.getString("resourceType")).isEqualTo("PIPELINE_ACTUATION");
+        for (String lease : List.of("ownerNodeId", "ownerBootId", "claimGeneration", "leaseUntil")) {
+            assertThat(authority.containsKey(lease)).as("standalone admission creates no %s", lease).isFalse();
+        }
+        assertThat(database.getCollection(MongoStorePort.ARTIFACTS).find(new Document("_id", pipeline)).first())
+                .isEqualTo(artifactBefore);
+        assertThat(artifactBefore.getString("pipelineIncarnationId")).isEqualTo(old.incarnation());
+        assertThat(artifactBefore.getString("contentHash")).isNotBlank();
+        var intent = desired.read(pipeline).orElseThrow();
+        assertThat(intent.targetState()).isEqualTo(PipelineState.RUNNING);
+        var physicalBefore = latest.readStored(pipeline).orElseThrow();
+        assertPositiveOldLatest(physicalBefore, old, oldAccount);
+        Map<String, Object> replies = new LinkedHashMap<>();
+        for (String face : List.of("status", "metrics", "snapshot", "explain")) {
+            observer.check(); assertThat(held.held()).as("each negative read happens before submit is released").isTrue();
+            long left = Math.min(remainingWindow(deadline).toNanos(), held.remainingNanos());
+            var request = HttpRequest.newBuilder(observer.server().baseUrl().resolve("/api/pipelines/" + pipeline + "/" + face))
+                    .timeout(Duration.ofNanos(Math.min(left, Duration.ofSeconds(20).toNanos())))
+                    .header("Authorization", "Bearer " + control.credential()).GET().build();
+            var reply = http.send(request, HttpResponse.BodyHandlers.ofString());
+            assertThat(reply.body().getBytes(StandardCharsets.UTF_8).length).isLessThanOrEqualTo(MAX_BYTES);
+            assertThat(reply.statusCode()).isEqualTo(404);
+            Map<String, Object> body = object(JsonReader.parse(reply.body()));
+            assertThat(body.get("code")).isEqualTo(MonitorError.NO_OBSERVATION.code());
+            assertThat(object(body.get("params"))).isEqualTo(Map.of("pipeline", pipeline));
+            replies.put(face, Map.of("httpStatus", reply.statusCode(), "body", body));
+            observer.check(); assertThat(held.held()).isTrue();
+        }
+        assertThat(database.getCollection(MongoStorePort.WORKLOAD_CLAIMS).find(new Document("_id", id)).first())
+                .as("exact standalone authority remains stable across all four reads").isEqualTo(authority);
+        assertThat(database.getCollection(MongoStorePort.ARTIFACTS).find(new Document("_id", pipeline)).first())
+                .isEqualTo(artifactBefore);
+        assertThat(desired.read(pipeline)).contains(intent);
+        var physicalAfter = latest.readStored(pipeline).orElseThrow();
+        assertPositiveOldLatest(physicalAfter, old, oldAccount);
+        observer.check(); assertThat(held.held()).isTrue(); remainingWindow(deadline);
+        Map<String, Object> evidence = Map.of("action", "actual-admitted-pre-submit-first-current-window", "admission", admission,
+                "oldScope", old.scope(), "newDurableGeneration", generation, "coordination", authority.toJson(),
+                "artifact", artifactBefore.toJson(), "oldPositiveReads", Map.of(
+                        "initialObservedAt", oldLatest.observation().observedAt().toString(),
+                        "beforeObservedAt", physicalBefore.observation().observedAt().toString(),
+                        "afterObservedAt", physicalAfter.observation().observedAt().toString(),
+                        "accountToken", oldAccount.get("token"), "counts", oldAccount.get("counts"),
+                        "countingSince", oldAccount.get("countingSince")),
+                "replies", Map.copyOf(replies), "newJobAvailable", false, "pendingReconcileClaimed", false);
+        assertThat(JsonWriter.write(evidence).getBytes(StandardCharsets.UTF_8).length).isLessThanOrEqualTo(MAX_BYTES);
+        report.addFork(evidence);
     }
 
     private record Stage(List<Map<String, Object>> records, String body) { }
@@ -558,6 +691,14 @@ class NativeFailureAccountResetIT {
                 byte[] data = bytes.readNBytes(MAX_BYTES + 1);
                 assertThat(data.length).isLessThanOrEqualTo(MAX_BYTES);
                 inputs.put(type.getSimpleName() + "ExecutingClassSha256", digest(data));
+            }
+        }
+        if (Boolean.getBoolean(PREFIX + "first-current-window")) {
+            try (InputStream bytes = NativeTelemetryIdentityJdiSession.class.getResourceAsStream(
+                    "NativeTelemetryIdentityJdiSession$AdmissionReturnPark.class")) {
+                assertThat(bytes).isNotNull(); byte[] data = bytes.readNBytes(MAX_BYTES + 1);
+                assertThat(data.length).isLessThanOrEqualTo(MAX_BYTES);
+                inputs.put("AdmissionReturnParkExecutingClassSha256", digest(data));
             }
         }
         inputs.put("pausedProcessLossProtocolSource", PipelineBenchmarkLiveRunIT.artifact(root.resolve(

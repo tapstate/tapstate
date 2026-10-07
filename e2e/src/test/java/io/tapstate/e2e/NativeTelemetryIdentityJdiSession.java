@@ -399,6 +399,118 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         }
     }
 
+    /** Holds one genuine standalone admission return before its caller can submit the new execution. */
+    final class AdmissionReturnPark implements AutoCloseable {
+        private final AuthorityReceipt oldAuthority;
+        private final long deadline;
+        private final CompletableFuture<Map<String, Object>> entered = new CompletableFuture<>();
+        private EventSet held;
+        private Map<String, Object> receipt;
+        private long holdDeadline, releasedAtNanos;
+        private String releaseReason;
+        private boolean done, releasing;
+
+        private AdmissionReturnPark(AuthorityReceipt oldAuthority, long deadline) {
+            this.oldAuthority = oldAuthority; this.deadline = deadline;
+        }
+        Map<String, Object> awaitEntry() throws Exception {
+            try {
+                check();
+                long left = deadline - System.nanoTime();
+                if (left <= 0) { throw invalid("UNSELECTED: admission window deadline expired"); }
+                Map<String, Object> value = entered.get(left, TimeUnit.NANOSECONDS);
+                check();
+                if (!held()) { throw invalid("UNSELECTED: admission return was released before the caller read it"); }
+                return value;
+            } catch (Exception | Error problem) {
+                if (problem instanceof InterruptedException) { Thread.currentThread().interrupt(); }
+                try { close(); } catch (Throwable cleanup) { append(problem, cleanup); }
+                throw problem;
+            }
+        }
+        boolean held() {
+            synchronized (lock) {
+                check();
+                return held != null && !done && !releasing && System.nanoTime() - holdDeadline < 0;
+            }
+        }
+        long remainingNanos() {
+            synchronized (lock) {
+                if (!held()) { throw invalid("UNSELECTED: admission return is no longer held"); }
+                return holdDeadline - System.nanoTime();
+            }
+        }
+        Map<String, Object> evidence() {
+            synchronized (lock) {
+                Map<String, Object> out = new LinkedHashMap<>();
+                out.put("target", "ADMITTED_PRE_SUBMIT_WINDOW");
+                if (receipt != null) { out.put("admission", receipt); }
+                out.put("done", done); out.put("deadlineNanos", deadline); out.put("holdDeadlineNanos", holdDeadline);
+                out.put("releasedAtNanos", releasedAtNanos);
+                out.put("releaseReason", releaseReason == null ? "NOT_RELEASED" : releaseReason);
+                out.put("newJobClaimedDuringHold", false); out.put("claimedAdmissionQualified", false);
+                return Map.copyOf(out);
+            }
+        }
+        @Override public void close() {
+            releaseAdmissionReturnPark(this, "CALLER_RELEASE");
+            synchronized (lock) {
+                if (receipt != null && (!done || held != null || releasedAtNanos == 0
+                        || releasedAtNanos - holdDeadline > 0)) {
+                    throw invalid("UNSELECTED: admission return did not actually resume within its hold deadline");
+                }
+            }
+        }
+    }
+    private AdmissionReturnPark admissionReturnPark;
+    private boolean admissionReturnParkUsed;
+
+    AdmissionReturnPark armFirstAdmissionReturn(AuthorityReceipt oldAuthority, long deadline) {
+        synchronized (lock) {
+            check();
+            if (admissionReturnParkUsed || !restoredBeforeStartFinished || !authorities.contains(oldAuthority)
+                    || closing || closed || disconnected || ownedCrashRequested || command != null
+                    || sweepPark != null && !sweepPark.done || deadline - System.nanoTime() <= 0
+                    || deadline - System.nanoTime() > TimeUnit.MINUTES.toNanos(2)) {
+                throw invalid("UNSELECTED: invalid one-shot admission return request");
+            }
+            admissionReturnParkUsed = true;
+            return admissionReturnPark = new AdmissionReturnPark(oldAuthority, deadline);
+        }
+    }
+    private void releaseAdmissionReturnPark(AdmissionReturnPark expected, String reason) {
+        EventSet retained;
+        synchronized (lock) {
+            if (expected == null || expected != admissionReturnPark || expected.done || expected.releasing) { return; }
+            expected.releasing = true; retained = expected.held;
+        }
+        boolean resumed = false;
+        try {
+            if (retained != null) { retained.resume(); }
+            resumed = true;
+        } finally {
+            synchronized (lock) {
+                expected.releasing = false;
+                if (resumed) {
+                    expected.held = null; expected.done = true; expected.releaseReason = reason;
+                    expected.releasedAtNanos = System.nanoTime();
+                    if (!expected.entered.isDone()) {
+                        expected.entered.completeExceptionally(invalid("UNSELECTED: admission return was not observed: " + reason));
+                    }
+                }
+            }
+        }
+    }
+    private void releaseExpiredAdmissionReturnPark() {
+        AdmissionReturnPark current;
+        synchronized (lock) {
+            current = admissionReturnPark;
+            if (current == null || current.done || System.nanoTime() -
+                    (current.held == null ? current.deadline : current.holdDeadline) < 0) { return; }
+        }
+        releaseAdmissionReturnPark(current, "DEADLINE_RELEASE");
+    }
+
     /** One existing sweep ENTRY can hold its event thread while another member normally acquires Q. */
     final class PublisherSweepPark implements AutoCloseable {
         private final String keptPipeline, node, boot;
@@ -469,6 +581,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         synchronized (lock) {
             check();
             if (!joinedTakeoverObservationEnabled || sweepParkUsed || closing
+                    || admissionReturnPark != null && !admissionReturnPark.done
                     || keptPipeline == null || keptPipeline.isBlank() || node == null || node.isBlank()
                     || boot == null || boot.isBlank() || deadline - System.nanoTime() <= 0) {
                 throw invalid("UNSELECTED: invalid one-shot sweep parking request");
@@ -694,6 +807,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         try {
             while (running) {
                 releaseExpiredPublisherSweepPark();
+                releaseExpiredAdmissionReturnPark();
                 activeObservation = "EVENT_QUEUE";
                 EventSet set = vm.eventQueue().remove(publisherSweepPollMillis());
                 if (set != null) { handle(set); }
@@ -703,6 +817,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                     EventSet next;
                     while ((next = vm.eventQueue().remove(1)) != null) {
                         releaseExpiredPublisherSweepPark();
+                        releaseExpiredAdmissionReturnPark();
                         if (++drain > 2048) { throw invalid("phase event-drain budget exceeded"); }
                         handle(next);
                     }
@@ -716,6 +831,8 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             if (!observeOwnedCrashDisconnect("JDI_EXCEPTION:" + activeObservation)) { fail(gone); }
         } catch (Throwable problem) { fail(problem); }
         finally {
+            try { releaseAdmissionReturnPark(admissionReturnPark, "PUMP_EXIT"); }
+            catch (Throwable cleanup) { fail(cleanup); }
             try { releasePublisherSweepPark(sweepPark, "PUMP_EXIT"); }
             catch (Throwable cleanup) { fail(cleanup); }
         }
@@ -746,7 +863,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                         }
                         breakpoint(breakpoint);
                     }
-                    else if (event instanceof MethodExitEvent exit) { normalExit(exit); }
+                    else if (event instanceof MethodExitEvent exit) { if (normalExit(exit, set)) { parked = true; } }
                     else if (event instanceof ExceptionEvent exception) { exception(exception); }
                     else if (event instanceof ThreadDeathEvent death) { threadDeath(death); }
                     else if (event instanceof VMDeathEvent) {
@@ -1261,7 +1378,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         }
     }
 
-    private void normalExit(MethodExitEvent event) throws Exception {
+    private boolean normalExit(MethodExitEvent event, EventSet eventSet) throws Exception {
         ThreadState state = threads.get(event.thread().uniqueID());
         Call call = state == null ? null : state.calls.peek();
         if (call == null || (!call.qualified && !call.logCalibration) || call.exit != event.request()
@@ -1282,11 +1399,50 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         out.put("returnOrder", events);
         out.put("receiver", call.receiver.uniqueID()); out.put("normalReturn", true);
         if (call.logCalibration) { out.put("calibrationComplete", !out.containsKey("decoderStatus")); }
+        AdmissionReturnPark selected = selectAdmissionReturnPark(call, out, event, eventSet);
         addRecord(out);
         if (call.logCalibration) {
             logFamilyCalibration = Collections.unmodifiableMap(new LinkedHashMap<>(out));
         } else { totals.get(call.spec.target()).normal++; }
         state.calls.pop(); removeEmpty(state);
+        if (selected == null) { return false; }
+        selected.receipt = Collections.unmodifiableMap(new LinkedHashMap<>(out));
+        selected.held = eventSet; selected.entered.complete(selected.receipt);
+        return true;
+    }
+
+    private AdmissionReturnPark selectAdmissionReturnPark(Call call, Map<String, Object> out,
+            MethodExitEvent event, EventSet eventSet) throws Exception {
+        AdmissionReturnPark current = admissionReturnPark;
+        if (current == null || current.done || current.releasing || current.held != null
+                || System.nanoTime() - current.deadline >= 0 || call.spec.target() != Target.ADMISSION
+                || !Boolean.TRUE.equals(out.get("allowed"))) { return null; }
+        if (!unverified.isEmpty() || out.containsKey("decoderStatus")
+                || !Boolean.FALSE.equals(out.get("claimed")) || !"STANDALONE".equals(out.get("admissionStatus"))
+                || !current.oldAuthority.clusterId().equals(out.get("clusterId"))
+                || !(out.get("fence") instanceof Map<?, ?> fence)
+                || !pipeline.equals(fence.get("pipelineId"))
+                || !(fence.get("executionGeneration") instanceof Number generation)
+                || generation.longValue() != Math.addExact(current.oldAuthority.generation(), 1)
+                || !Long.valueOf(0).equals(fence.get("claimGeneration"))
+                || !List.of().equals(out.get("members")) || !Map.of().equals(out.get("claim"))) {
+            throw invalid("UNSELECTED: admission return lacks its exact decoded standalone fence");
+        }
+        Binding binding = bindings.get(Target.ADMISSION);
+        Method method = methods.get(Target.ADMISSION);
+        long pc = event.location().codeIndex();
+        if (eventSet.suspendPolicy() != EventRequest.SUSPEND_EVENT_THREAD || method.isObsolete()
+                || !binding.returns().contains(Math.toIntExact(pc)) || !event.location().method().equals(method)
+                || !Arrays.equals(method.bytecodes(), images.get(binding.type()).methods().get(binding.method() + binding.descriptor()))) {
+            throw invalid("UNSELECTED: admission return lost exact method provenance or event-thread suspension");
+        }
+        long at = System.nanoTime();
+        current.holdDeadline = Math.min(current.deadline, at + TimeUnit.SECONDS.toNanos(10));
+        out.put("admissionWindow", Map.of("jarSha256", sha, "type", binding.type(), "method", binding.method(),
+                "descriptor", binding.descriptor(), "codeSha256", binding.codeSha256(), "loaderId", binding.loaderId(),
+                "returnCodeIndex", pc, "threadId", event.thread().uniqueID(), "heldAtNanos", at,
+                "holdDeadlineNanos", current.holdDeadline));
+        return current;
     }
 
     private void returned(Call call, Value returned, ThreadState state, Map<String, Object> out,
@@ -2218,9 +2374,14 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         if (error != problem && error.getCause() != problem) { append(error, problem); }
         CompletableFuture<Boundary> waiting = command;
         if (waiting != null) { waiting.completeExceptionally(error); }
+        synchronized (lock) {
+            if (admissionReturnPark != null) { admissionReturnPark.entered.completeExceptionally(error); }
+        }
         detach(error);
     }
     private Throwable detach(Throwable primary) {
+        try { releaseAdmissionReturnPark(admissionReturnPark, "DETACH"); }
+        catch (Throwable problem) { primary = append(primary, problem); }
         try { releasePublisherSweepPark(sweepPark, "DETACH"); }
         catch (Throwable problem) { primary = append(primary, problem); }
         synchronized (lock) { localDisposeStarted = true; }
@@ -2247,7 +2408,8 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             synchronized (lock) {
                 check();
                 if (ownedCrashRequested || closing || closed || disconnected || command != null || !server.isAlive()
-                        || sweepPark != null && !sweepPark.done) { throw invalid("owned crash cannot be marked now"); }
+                        || sweepPark != null && !sweepPark.done
+                        || admissionReturnPark != null && !admissionReturnPark.done) { throw invalid("owned crash cannot be marked now"); }
                 crashOwnedPid = server.pid(); crashMarkedAtEvent = events; ownedCrashRequested = true;
                 return Map.of("ownedPid", crashOwnedPid, "markedAtEvent", crashMarkedAtEvent,
                         "callerMustKillOwnedProcess", true);
@@ -2358,6 +2520,7 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
             if (closed) { check(); if (terminal == null) { throw invalid("no qualified terminal boundary"); } return terminal; }
             Throwable primary = null;
             try {
+                releaseAdmissionReturnPark(admissionReturnPark, "OWNED_CLOSE");
                 releasePublisherSweepPark(sweepPark, "OWNED_CLOSE");
                 check();
                 synchronized (lock) { closing = true; }
