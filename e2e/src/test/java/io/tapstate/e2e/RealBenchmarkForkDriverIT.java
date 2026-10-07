@@ -121,6 +121,9 @@ class RealBenchmarkForkDriverIT {
                             anchor.earliestUtc(phase.firstIssuedAtNanos()), anchor.latestUtc(phase.firstIssuedAtNanos()),
                             phase.firstIssuedAtNanos(), phase.sourceCompletedAtNanos(), phase.completedAckAtNanos(),
                             phase.sourceBatches(), sampling);
+                    System.out.println("benchmark-real-confirmation-timing="
+                            + JsonWriter.write(Map.of("fork", evidence.forkId(), "phase", phase.id(),
+                                    "timing", PipelineBenchmarkLiveRunIT.phaseEvidence(phase).get("confirmationTiming"))));
                 });
             });
         }

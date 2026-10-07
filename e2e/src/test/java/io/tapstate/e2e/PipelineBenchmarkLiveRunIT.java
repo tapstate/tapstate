@@ -445,6 +445,17 @@ class PipelineBenchmarkLiveRunIT {
                 "throughputRecordsPerSecond", phase.recordsOutPerSecond(),
                 "observedDeliveries", phase.observedDeliveries(),
                 "reportedRecordsOut", phase.reportedRecordsOut(),
+                "confirmationTiming", phase.confirmationTiming().map(timing -> object(
+                        "state", "RECORDED", "scope", "LOCAL_OBSERVER_AND_PROOF_READ_INTERVALS",
+                        "sourceMarkerWaitStartedAtNanos", timing.sourceMarkerWaitStartedAtNanos(),
+                        "sourceMarkerWaitCompletedAtNanos", timing.sourceMarkerWaitCompletedAtNanos(),
+                        "tableConfirmationCompletedAtNanos", timing.tableConfirmationCompletedAtNanos(),
+                        "sourceMarkerWaitNanos", timing.sourceMarkerWaitCompletedAtNanos() - timing.sourceMarkerWaitStartedAtNanos(),
+                        "tableConfirmationNanos", timing.tableConfirmationCompletedAtNanos() - timing.sourceMarkerWaitCompletedAtNanos(),
+                        "firstTargetObservedAtNanos", timing.firstTargetObservedAtNanos(),
+                        "lastTargetObservedAtNanos", timing.lastTargetObservedAtNanos(),
+                        "confirmationEndMinusLastTargetObservedNanos", timing.tableConfirmationCompletedAtNanos()
+                                - timing.lastTargetObservedAtNanos())).orElseGet(() -> object("state", "UNAVAILABLE")),
                 "idempotentWriteOverhead", phase.reportedRecordsOut() - phase.acknowledgedOutputs(),
                 "firstIssuedAtUtcEarliest", anchor.earliestUtc(phase.firstIssuedAtNanos()).toString(),
                 "firstIssuedAtUtcLatest", anchor.latestUtc(phase.firstIssuedAtNanos()).toString(),

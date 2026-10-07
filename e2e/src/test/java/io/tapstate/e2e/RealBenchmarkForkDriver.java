@@ -26,16 +26,41 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
     private static final Duration COUNTER_POLL = Duration.ofMillis(100);
     private static final Duration PRE_WINDOW_QUIET = Duration.ofSeconds(3);
 
+    /** Local observation intervals distinguish data arrival from subsequent proof reads. */
+    record ConfirmationTiming(long sourceMarkerWaitStartedAtNanos, long sourceMarkerWaitCompletedAtNanos,
+                              long tableConfirmationCompletedAtNanos, long firstTargetObservedAtNanos,
+                              long lastTargetObservedAtNanos) {
+        ConfirmationTiming {
+            if (sourceMarkerWaitCompletedAtNanos < sourceMarkerWaitStartedAtNanos
+                    || tableConfirmationCompletedAtNanos < sourceMarkerWaitCompletedAtNanos
+                    || lastTargetObservedAtNanos < firstTargetObservedAtNanos) {
+                throw new IllegalArgumentException("confirmation observation intervals moved backward");
+            }
+        }
+    }
+
     record MeasuredPhase(String id, long acknowledgedOutputs, long firstIssuedAtNanos,
                          long sourceCompletedAtNanos, long completedAckAtNanos,
                          long expectedSourceChanges, int observedDeliveries, long reportedRecordsOut,
                          BenchmarkForkEnvironment.ClockAnchor clockAnchor,
                          List<BenchmarkForkEnvironment.BatchResult> sourceBatches,
-                         BenchmarkResourceSampler.Summary resources) {
+                         BenchmarkResourceSampler.Summary resources,
+                         Optional<ConfirmationTiming> confirmationTiming) {
+        MeasuredPhase(String id, long acknowledgedOutputs, long firstIssuedAtNanos,
+                      long sourceCompletedAtNanos, long completedAckAtNanos,
+                      long expectedSourceChanges, int observedDeliveries, long reportedRecordsOut,
+                      BenchmarkForkEnvironment.ClockAnchor clockAnchor,
+                      List<BenchmarkForkEnvironment.BatchResult> sourceBatches,
+                      BenchmarkResourceSampler.Summary resources) {
+            this(id, acknowledgedOutputs, firstIssuedAtNanos, sourceCompletedAtNanos, completedAckAtNanos,
+                    expectedSourceChanges, observedDeliveries, reportedRecordsOut, clockAnchor, sourceBatches,
+                    resources, Optional.empty());
+        }
         MeasuredPhase {
             Objects.requireNonNull(clockAnchor, "measured clock anchor");
             sourceBatches = List.copyOf(sourceBatches);
             Objects.requireNonNull(resources, "phase resource measurements");
+            Objects.requireNonNull(confirmationTiming, "confirmation timing availability");
         }
 
         double recordsOutPerSecond() {
@@ -252,6 +277,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         long initialAcknowledged = recordsOut(workload, fork.control());
         BenchmarkForkEnvironment.PhaseIssue issued;
         long completedAckAt;
+        long sourceMarkerWaitStartedAt;
+        long sourceMarkerWaitCompletedAt;
         BenchmarkResourceSampler.Summary resources;
         BenchmarkMongoCommandSampler.Summary commands;
         try (BenchmarkResourceSampler resourceSampler = BenchmarkResourceSampler.open(
@@ -270,7 +297,9 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             if (issued.batches().isEmpty()) {
                 throw new AssertionError("measured phase has no source batches: " + phase.id());
             }
+            sourceMarkerWaitStartedAt = System.nanoTime();
             captures.awaitMeasuredSourceMarkers(workload, phase);
+            sourceMarkerWaitCompletedAt = System.nanoTime();
             completedAckAt = tables.awaitMeasured(workload, phase.id());
             resources = resourceSampler.finish();
             commands = commandSampler.finish();
@@ -288,9 +317,14 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         long firstIssued = issued.batches().getFirst().issuedAtNanos();
         long expectedSourceChanges = phase.expectedLogicalCoverage().values().stream()
                 .mapToLong(Long::longValue).sum();
+        ConfirmationTiming timing = new ConfirmationTiming(sourceMarkerWaitStartedAt, sourceMarkerWaitCompletedAt,
+                completedAckAt, deliveries.stream().mapToLong(BenchmarkMongoDeliveryObserver.Delivery::observedAtNanos)
+                        .min().orElseThrow(),
+                deliveries.stream().mapToLong(BenchmarkMongoDeliveryObserver.Delivery::observedAtNanos)
+                        .max().orElseThrow());
         return new PhaseWindow(new MeasuredPhase(phase.id(), phase.expectedLogicalOutputChanges(),
                 firstIssued, issued.sourceCompletedAtNanos(), completedAckAt, expectedSourceChanges,
-                deliveries.size(), reportedRecordsOut, issued.clockAnchor(), issued.batches(), resources),
+                deliveries.size(), reportedRecordsOut, issued.clockAnchor(), issued.batches(), resources, Optional.of(timing)),
                 deliveries.stream().map(BenchmarkMongoDeliveryObserver.Delivery::durationNanos).toList(),
                 resources, commands);
     }

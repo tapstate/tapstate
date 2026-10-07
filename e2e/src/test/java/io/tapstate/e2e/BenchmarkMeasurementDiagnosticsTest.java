@@ -51,6 +51,7 @@ class BenchmarkMeasurementDiagnosticsTest {
                 .containsEntry("sourceIssueDurationNanos", 110L)
                 .containsEntry("idempotentWriteOverhead", 2L)
                 .containsEntry("throughputRecordsPerSecond", 12_000 * 1_000_000_000.0 / 150);
+        assertThat(object(projected.get("confirmationTiming"))).containsExactly(Map.entry("state", "UNAVAILABLE"));
         assertThat(object(projected.get("clockAnchor")))
                 .containsEntry("utc", utc.toString()).containsEntry("uncertaintyNanos", 40L)
                 .containsEntry("uncertaintyScope", "CLOCK_READ_BRACKET_ONLY");
@@ -68,6 +69,29 @@ class BenchmarkMeasurementDiagnosticsTest {
                 .containsEntry("totalDurationNanos", 13L).containsEntry("maxDurationNanos", 10L);
         assertThat(JsonReader.parse(JsonWriter.write(projected))).isInstanceOf(Map.class);
         assertThatThrownBy(() -> new BenchmarkForkEnvironment.ClockAnchor(utc, 140, 100))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("moved backward");
+    }
+
+    @Test
+    void confirmationIntervalsDoNotReplaceTheOriginalThroughputEndpoint() {
+        var anchor = new BenchmarkForkEnvironment.ClockAnchor(Instant.EPOCH, 100, 140);
+        var resources = new BenchmarkResourceSampler.Summary(70, 3, 1_500, 2_500, 2);
+        var timing = new RealBenchmarkForkDriver.ConfirmationTiming(260, 280, 300, 200, 290);
+        var phase = new RealBenchmarkForkDriver.MeasuredPhase("cdc-update", 12_000, 150, 260, 300,
+                12_000, 12_000, 12_000, anchor, List.of(), resources, Optional.of(timing));
+        var projected = PipelineBenchmarkLiveRunIT.phaseEvidence(phase);
+        assertThat(projected).containsEntry("durationNanos", 150L)
+                .containsEntry("throughputRecordsPerSecond", 12_000 * 1_000_000_000.0 / 150);
+        assertThat(object(projected.get("confirmationTiming"))).containsEntry("state", "RECORDED")
+                .containsEntry("sourceMarkerWaitNanos", 20L).containsEntry("tableConfirmationNanos", 20L)
+                .containsEntry("firstTargetObservedAtNanos", 200L).containsEntry("lastTargetObservedAtNanos", 290L)
+                .containsEntry("confirmationEndMinusLastTargetObservedNanos", 10L);
+        var delayedReader = new RealBenchmarkForkDriver.ConfirmationTiming(260, 280, 300, 200, 320);
+        var delayed = new RealBenchmarkForkDriver.MeasuredPhase("cdc-update", 12_000, 150, 260, 300,
+                12_000, 12_000, 12_000, anchor, List.of(), resources, Optional.of(delayedReader));
+        assertThat(object(PipelineBenchmarkLiveRunIT.phaseEvidence(delayed).get("confirmationTiming")))
+                .containsEntry("confirmationEndMinusLastTargetObservedNanos", -20L);
+        assertThatThrownBy(() -> new RealBenchmarkForkDriver.ConfirmationTiming(280, 260, 300, 200, 290))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("moved backward");
     }
 
