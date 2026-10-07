@@ -10,6 +10,15 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @RequiresDocker
 class RawHistorySerializationCostIT {
     @Test
+    void anUnusedRepresentationConversionCannotHideBehindUnchangedBinaryCounts() throws Exception {
+        try (var artifact = reactorArtifact()) {
+            assertThatThrownBy(() -> assertCost(BenchmarkJdiCostObserver.run(artifact, "store-raw-conversion",
+                    BenchmarkJdiCostObserver.Options.NORMAL, SharedMongo.replicaSetUrl("raw_history_conversion_cost"))))
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("raw publication representation conversions");
+        }
+    }
+
+    @Test
     void oneActualRawAppendBuildsAndEncodesExactlyItsKnownDocuments() throws Exception {
         try (var artifact = reactorArtifact()) {
             assertThat(artifact.reactorBuild).as("the separately validated build-local artifact policy").isTrue();
@@ -40,6 +49,8 @@ class RawHistorySerializationCostIT {
                 .as("one production rate document build").isEqualTo(new BenchmarkJdiCostObserver.Count(1, 1));
         assertThat(result.require(BenchmarkJdiCostObserver.Unit.BSON_BINARY_ENCODER_INVOCATION))
                 .as("raw publication binary encoder invocations").isEqualTo(new BenchmarkJdiCostObserver.Count(3, 3));
+        assertThat(result.require(BenchmarkJdiCostObserver.Unit.BSON_REPRESENTATION_CONVERSION))
+                .as("raw publication representation conversions").isEqualTo(new BenchmarkJdiCostObserver.Count(0, 0));
         assertThat(result.closedAndDrained()).isTrue();
         assertThat(result.methodEntryRequests()).isZero();
     }

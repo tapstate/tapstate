@@ -194,6 +194,7 @@ final class BenchmarkJdiCostObserver {
     private static final String TARGET = "io.tapstate.adapters.mongostore.BenchmarkJdiEncoderTarget";
     private static final String LATEST_TARGET = "io.tapstate.adapters.mongostore.BenchmarkJdiLatestEncoderTarget";
     private static final String LATEST_PUBLICATION_TARGET = "io.tapstate.adapters.mongostore.BenchmarkJdiLatestPublicationTarget";
+    private static final String HISTORY_PUBLICATION_TARGET = "io.tapstate.adapters.mongostore.BenchmarkJdiHistoryPublicationTarget";
     private static final String OBSERVATION = "io.tapstate.adapters.mongostore.MongoObservationStore";
     private static final String RATE = "io.tapstate.adapters.mongostore.MongoRateHistoryStore";
     private static final String LATEST = "io.tapstate.adapters.mongostore.LatestObservationPayloadCodec";
@@ -216,6 +217,10 @@ final class BenchmarkJdiCostObserver {
                     + "Lio/tapstate/adapters/mongostore/LatestObservationPayloadCodec$ChunkWriter;)"
                     + "Lio/tapstate/adapters/mongostore/LatestObservationPayloadCodec$Encoded;",
             Unit.LATEST_OBSERVATION_BINARY_ENCODER_INVOCATION, false);
+    private static final Signature EVENT_DOCUMENT = new Signature("io.tapstate.adapters.mongostore.MongoPipelineEventStore",
+            "toDocument", "(Lio/tapstate/core/lifecycle/PipelineEvent;)Lorg/bson/Document;", Unit.EVENT_DOCUMENT_BUILD, false);
+    private static final Signature ROLLUP_DOCUMENT = new Signature("io.tapstate.adapters.mongostore.MongoHistoryRollupStore",
+            "toDocument", "(Lio/tapstate/spi/store/HistoryRollupStore$Bucket;)Lorg/bson/Document;", Unit.ROLLUP_DOCUMENT_BUILD, false);
     private static final Signature SYNC_SEND = new Signature(CONNECTION, "sendMessage",
             "(Ljava/util/List;ILcom/mongodb/internal/connection/OperationContext;)V",
             Unit.SYNC_COMMAND_SEND, false);
@@ -229,7 +234,7 @@ final class BenchmarkJdiCostObserver {
             "mongodb-driver-sync-5.8.0.jar", "slf4j-api-2.0.18.jar");
     private static final List<String> TARGET_CLASSES = List.of(TARGET, LATEST_TARGET,
             LATEST_TARGET + "$Chunks", LATEST_TARGET + "$ChunkFixture",
-            LATEST_PUBLICATION_TARGET, LATEST_PUBLICATION_TARGET + "$InlineChunks");
+            LATEST_PUBLICATION_TARGET, LATEST_PUBLICATION_TARGET + "$InlineChunks", HISTORY_PUBLICATION_TARGET);
     private static final Duration TIMEOUT = Duration.ofSeconds(30);
 
     private BenchmarkJdiCostObserver() {
@@ -429,12 +434,16 @@ final class BenchmarkJdiCostObserver {
         boolean wire = mode.startsWith("wire");
         boolean store = mode.startsWith("store-");
         boolean storeLatest = mode.startsWith("store-latest");
+        boolean storeEvent = mode.startsWith("store-event");
+        boolean storeRollup = mode.startsWith("store-rollup");
         if (latest && !artifact.latestAvailable()) {
             throw invalid("latest binary encoder is unavailable in the selected arm");
         }
         List<Signature> signatures = latest ? List.of(LATEST_ENCODER)
                 : wire ? List.of(SYNC_SEND, ASYNC_SEND)
                 : storeLatest ? List.of(LATEST_ENCODER)
+                : storeEvent ? List.of(EVENT_DOCUMENT, ENCODERS.get(2))
+                : storeRollup ? List.of(ROLLUP_DOCUMENT, ENCODERS.get(2))
                 : store ? List.of(ENCODERS.get(1), ENCODERS.get(2)) : ENCODERS;
         ListeningConnector connector = Bootstrap.virtualMachineManager().listeningConnectors().stream()
                 .filter(item -> item.name().equals("com.sun.jdi.SocketListen"))
@@ -460,7 +469,8 @@ final class BenchmarkJdiCostObserver {
             Path java = Path.of(System.getProperty("java.home"), "bin", "java");
             ProcessBuilder builder = new ProcessBuilder(java.toString(),
                     "-agentlib:jdwp=transport=dt_socket,server=n,suspend=y,address=" + address,
-                    "-cp", artifact.classpath(), latest ? LATEST_TARGET : storeLatest ? LATEST_PUBLICATION_TARGET : TARGET, mode);
+                    "-cp", artifact.classpath(), latest ? LATEST_TARGET : storeLatest ? LATEST_PUBLICATION_TARGET
+                            : storeEvent || storeRollup ? HISTORY_PUBLICATION_TARGET : TARGET, mode);
             for (String variable : List.of("CLASSPATH", "JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS")) {
                 builder.environment().remove(variable);
             }
@@ -477,10 +487,10 @@ final class BenchmarkJdiCostObserver {
             }
             pump = new Pump(vm, artifact, signatures, options, store);
             pump.start();
-            protocol.await("READY", pump, artifact, latest, wire, storeLatest);
+            protocol.await("READY", pump, artifact, latest, wire, storeLatest, storeEvent, storeRollup);
             pump.begin();
             protocol.send("START");
-            protocol.await("DONE", pump, artifact, latest, wire, storeLatest);
+            protocol.await("DONE", pump, artifact, latest, wire, storeLatest, storeEvent, storeRollup);
             Summary summary = pump.finish();
             protocol.send("STOP");
             if (!child.waitFor(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS) || child.exitValue() != 0) {
@@ -592,7 +602,7 @@ final class BenchmarkJdiCostObserver {
     private record Site(Signature signature, boolean entry) {
     }
 
-    private record Pending(Signature signature, int frameCount, long connectionId, int requestId, WireKey wire) {
+    private record Pending(Signature signature, Unit unit, int frameCount, long connectionId, int requestId, WireKey wire) {
     }
 
     private static final class MutableCount {
@@ -638,6 +648,7 @@ final class BenchmarkJdiCostObserver {
             this.options = options;
             signatures.stream().filter(item -> item.unit() != null)
                     .forEach(item -> counts.put(item.unit(), new MutableCount()));
+            if (productionStore) { counts.put(Unit.BSON_REPRESENTATION_CONVERSION, new MutableCount()); }
             for (String type : signatures.stream().map(Signature::type).distinct().toList()) {
                 var request = vm.eventRequestManager().createClassPrepareRequest();
                 request.addClassFilter(type);
@@ -858,6 +869,7 @@ final class BenchmarkJdiCostObserver {
                 WireKey wire = null;
                 long connectionId = -1;
                 int requestId = -1;
+                Unit countedUnit = signature.unit();
                 if (signature.unit() == Unit.SYNC_COMMAND_SEND) {
                     if (arguments.size() != 3 || !(arguments.get(1) instanceof IntegerValue id)
                             || frame.thisObject() == null) {
@@ -869,10 +881,10 @@ final class BenchmarkJdiCostObserver {
                             Set.of("jdi_cost_witness", "admin", "local", "config"));
                     wireCounts.computeIfAbsent(wire, ignored -> new MutableCount()).entries++;
                 } else {
-                    encoderArguments(signature.unit(), arguments);
+                    countedUnit = encoderArguments(signature.unit(), arguments);
                 }
-                stack.push(new Pending(signature, frameCount, connectionId, requestId, wire));
-                counts.get(signature.unit()).entries++;
+                stack.push(new Pending(signature, countedUnit, frameCount, connectionId, requestId, wire));
+                counts.computeIfAbsent(countedUnit, ignored -> new MutableCount()).entries++;
             } else {
                 ArrayDeque<Pending> stack = pending.get(threadId);
                 Pending entry = stack == null || stack.isEmpty() ? null : stack.peek();
@@ -892,12 +904,14 @@ final class BenchmarkJdiCostObserver {
                 if (stack.isEmpty()) {
                     pending.remove(threadId);
                 }
-                counts.get(signature.unit()).returns++;
+                counts.get(entry.unit()).returns++;
             }
         }
 
-        private void encoderArguments(Unit unit, List<Value> arguments) throws Exception {
+        private Unit encoderArguments(Unit unit, List<Value> arguments) throws Exception {
             String expected = unit == Unit.RATE_DOCUMENT_BUILD ? "io.tapstate.core.lifecycle.RateSample"
+                    : unit == Unit.EVENT_DOCUMENT_BUILD ? "io.tapstate.core.lifecycle.PipelineEvent"
+                    : unit == Unit.ROLLUP_DOCUMENT_BUILD ? "io.tapstate.spi.store.HistoryRollupStore$Bucket"
                     : unit == Unit.BSON_BINARY_ENCODER_INVOCATION ? "org.bson.BsonBinaryWriter"
                     : "io.tapstate.core.lifecycle.Observation";
             int size = unit == Unit.BSON_BINARY_ENCODER_INVOCATION ? 3
@@ -905,8 +919,7 @@ final class BenchmarkJdiCostObserver {
             // A null writer is allowed through the entry so the missing normal return is observable.
             if (productionStore && unit == Unit.BSON_BINARY_ENCODER_INVOCATION && arguments.size() == 3
                     && arguments.getFirst() instanceof ObjectReference writer) {
-                requireBinaryWriter(writer);
-                return;
+                return writerUnit(writer);
             }
             if (arguments.size() != size || (arguments.getFirst() == null
                     && unit != Unit.BSON_BINARY_ENCODER_INVOCATION)
@@ -914,19 +927,21 @@ final class BenchmarkJdiCostObserver {
                     || !object.referenceType().name().equals(expected)))) {
                 throw invalid("the typed encoder arguments did not match the closed cost unit");
             }
+            return unit;
         }
 
-        private void requireBinaryWriter(ObjectReference writer) throws Exception {
+        private Unit writerUnit(ObjectReference writer) throws Exception {
             String appending = "com.mongodb.internal.connection.BsonWriterHelper$AppendingBsonWriter";
             Set<String> wrappers = Set.of(appending, "com.mongodb.internal.connection.FieldTrackingBsonWriter",
                     "com.mongodb.internal.connection.IdHoldingBsonWriter", "com.mongodb.internal.connection.SplittablePayloadBsonWriter");
             for (int depth = 0; depth < 8; depth++) {
                 ReferenceType type = writer.referenceType();
                 verifyWriter(type);
-                if (type.name().equals("org.bson.BsonBinaryWriter")) { return; }
+                if (type.name().equals("org.bson.BsonBinaryWriter")) { return Unit.BSON_BINARY_ENCODER_INVOCATION; }
+                if (type.name().equals("org.bson.BsonDocumentWriter")) { return Unit.BSON_REPRESENTATION_CONVERSION; }
                 if (type.name().equals(appending + "$InternalAppendingBsonBinaryWriter")
                         && type instanceof ClassType concrete && concrete.superclass().name().equals("org.bson.BsonBinaryWriter")) {
-                    verifyWriter(concrete.superclass()); return;
+                    verifyWriter(concrete.superclass()); return Unit.BSON_BINARY_ENCODER_INVOCATION;
                 }
                 if (!wrappers.contains(type.name())) { throw invalid("raw publication used an unmapped binary writer"); }
                 Field delegate = type.fieldByName("bsonWriter");
@@ -1166,7 +1181,8 @@ final class BenchmarkJdiCostObserver {
             }
         }
 
-        void await(String expected, Pump pump, Artifact artifact, boolean latest, boolean wire, boolean storeLatest) throws Exception {
+        void await(String expected, Pump pump, Artifact artifact, boolean latest, boolean wire,
+                boolean storeLatest, boolean storeEvent, boolean storeRollup) throws Exception {
             long deadline = System.nanoTime() + TIMEOUT.toNanos();
             while (System.nanoTime() < deadline) {
                 check();
@@ -1193,6 +1209,10 @@ final class BenchmarkJdiCostObserver {
                             : wire ? Set.of(OBSERVATION, RATE, BSON, CONNECTION,
                                     "io.tapstate.core.lifecycle.Observation")
                             : storeLatest ? Set.of(OBSERVATION, RATE, BSON, LATEST, "io.tapstate.core.lifecycle.Observation")
+                            : storeEvent ? Set.of(BSON, "io.tapstate.adapters.mongostore.MongoPipelineEventStore",
+                                    "io.tapstate.core.lifecycle.PipelineEvent")
+                            : storeRollup ? Set.of(BSON, "io.tapstate.adapters.mongostore.MongoHistoryRollupStore",
+                                    "io.tapstate.spi.store.HistoryRollupStore$Bucket")
                             : Set.of(OBSERVATION, RATE, BSON, "io.tapstate.core.lifecycle.Observation");
                     if (!origins.equals(required)) {
                         throw invalid("the complete pinned code-source roster was not reported");

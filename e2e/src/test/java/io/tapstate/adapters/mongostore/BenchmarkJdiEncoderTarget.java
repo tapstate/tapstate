@@ -163,6 +163,11 @@ public final class BenchmarkJdiEncoderTarget {
             ready();
             phase("RATE_BUILD");
             store.append(sample);
+            if (mode.equals("store-raw-conversion")) {
+                try (var writer = new org.bson.BsonDocumentWriter(new org.bson.BsonDocument())) {
+                    new DocumentCodec().encode(writer, new Document("redundant", 1L), EncoderContext.builder().build());
+                }
+            }
             if (mode.equals("store-raw-extra")) {
                 Document document = new Document("redundant", 1L);
                 try (BasicOutputBuffer output = new BasicOutputBuffer(); BsonBinaryWriter writer = new BsonBinaryWriter(output)) {
