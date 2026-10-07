@@ -89,9 +89,12 @@ supply a URI, or configure its namespaces and indexes. It is the current referen
 backing store — not a claim that Tapstate is MongoDB-only, and not a managed
 production database service.
 
-Alpha is single-node and not production-ready. It does not yet provide high
-availability, durable offset resume, exactly-once guarantees, a stable State Data API,
-or push/subscription delivery.
+The runtime starts as a single member by default, with an [opt-in cluster
+preview](docs/cluster/README.md). MongoDB persists control-plane state and recovery
+positions; [restart recovery](docs/quickstart-online.md#restart-recovery) depends on
+the source and read mode. Delivery is at-least-once. The preview is not
+production-ready and does not provide production-grade high availability,
+exactly-once guarantees, a stable State Data API, or push/subscription delivery.
 
 **The bundled store is not a security boundary.** It runs without authentication, and
 Tapstate's own control-plane data — users, tokens, audit records, connection
