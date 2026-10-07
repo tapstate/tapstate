@@ -65,6 +65,7 @@ class NativeRecreatePositiveTelemetryIT {
         Path output = Path.of(required("output"));
         Path root = PipelineBenchmarkLiveRunIT.harnessRoot();
         PipelineBenchmarkLiveRunIT.requireSafeOutput(output, root);
+        boolean retainedHistoryEvents = Boolean.getBoolean(PREFIX + "retained-history-events");
         Map<String, Object> inputs = inputHashes(root);
         Map<String, Object> connectors = new LinkedHashMap<>();
         for (String name : List.of("mysql", "postgres", "mongodb")) {
@@ -82,7 +83,8 @@ class NativeRecreatePositiveTelemetryIT {
             report.begin(Map.of("purpose", "NATIVE_POSITIVE_SAME_ID_RECREATE",
                     "application", PipelineBenchmarkLiveRunIT.artifact(jar), "expectedJarSha256", sha,
                     "harness", inputs, "connectors", connectors, "prometheusEndpoint", scrape.toString(),
-                    "historySampleInterval", "PT2S", "performanceAcceptanceEligible", false),
+                    "historySampleInterval", "PT2S", "performanceAcceptanceEligible", false,
+                    "retainedHistoryEventsRequested", retainedHistoryEvents),
                     PipelineBenchmarkLiveRunIT.environment(), List.of());
             try (var fork = BenchmarkForkEnvironment.open(workload, jar, "positive-failure-recreate");
                     var mongo = MongoClients.create(fork.storeUri())) {
@@ -143,6 +145,10 @@ class NativeRecreatePositiveTelemetryIT {
                                                     && CODE.equals(value.observation().failure().code())).isPresent(),
                             () -> "state=" + control.state(pipeline) + ", failure=" + control.failureCode(pipeline));
                     var failed = latest.readStored(pipeline).orElseThrow();
+                    var retainedTelemetry = retainedHistoryEvents
+                            ? new TelemetryMongoIdentityWitness(database, latest, report, pipeline,
+                                    paused.observation().observedAt().minusSeconds(1), WAIT) : null;
+                    TelemetryMongoIdentityWitness.RetainedCursor retainedCursor = null;
                     assertThat(failed.scope()).isEqualTo(paused.scope());
                     assertThat(failed.observation().observedAt()).isAfter(paused.observation().observedAt());
                     assertThat(authority(database, pipeline, failed).scope()).isEqualTo(old.scope());
@@ -173,6 +179,9 @@ class NativeRecreatePositiveTelemetryIT {
                     assertThat(lines(failureLogs)).anyMatch(line -> sameLog(line, oldLog));
                     report.addFork(Map.of("action", "positive-account-and-current-log", "account", oldAccount,
                             "logResponse", failureLogs, "oldScope", old.scope(), "ownedPid", observer.server().pid()));
+                    if (retainedTelemetry != null) {
+                        retainedTelemetry.captureIdentityOnly("positive-recreate-failed", failed, control, observer.server().baseUrl());
+                    }
 
                     control.stop(pipeline, false);
                     Await.until("the restored failed execution to stop without changing its scope", WAIT, () ->
@@ -225,6 +234,11 @@ class NativeRecreatePositiveTelemetryIT {
                     assertThat(retainedBoundary.decodedAndAuthorityBound()).isTrue();
                     assertThat(folderCleared(retainedBoundary.records(), oldAccountRecord)
                             || exporterCleared(retainedBoundary.records(), oldProduced)).isFalse();
+                    if (retainedTelemetry != null) {
+                        retainedTelemetry.captureIdentityOnly("positive-recreate-stopped", latest.readStored(pipeline).orElseThrow(),
+                                control, observer.server().baseUrl());
+                        retainedCursor = retainedTelemetry.beforeRecreation(control, observer.server().baseUrl());
+                    }
                     control.deleteArtifact(pipeline, originalArtifact.contentHash());
                     assertThat(control.artifact(pipeline)).isEmpty();
                     coordinationRetained(database, pipeline, old);
@@ -246,6 +260,10 @@ class NativeRecreatePositiveTelemetryIT {
                             "canonicalForm", recreatedArtifact.canonicalForm(),
                             "contentHash", recreatedArtifact.contentHash(), "currentLogResponse", beforeStartLogs,
                             "startRequested", false, "ownedPid", observer.server().pid()));
+                    if (retainedTelemetry != null) {
+                        retainedTelemetry.recreatedBeforeStart(Objects.requireNonNull(retainedCursor),
+                                control, observer.server().baseUrl());
+                    }
                     observer.requireFullBindingsBeforeStart();
                     control.lifecycle(pipeline, LifecycleVerb.START);
                     var reset = Await.answered("a real new RUNNING execution after same-ID recreation", WAIT, () ->
@@ -286,6 +304,10 @@ class NativeRecreatePositiveTelemetryIT {
                             "oldScope", old.scope(), "newScope", next.scope(),
                             "oldAccount", oldAccount, "newAccount", object(newAccountRecord.get("account")),
                             "currentLogResponse", resetLogs, "ownedPid", observer.server().pid()));
+                    if (retainedTelemetry != null) {
+                        retainedTelemetry.capture("positive-recreated-new-resource", latest.readStored(pipeline).orElseThrow(),
+                                control, observer.server().baseUrl(), true);
+                    }
                     control.stop(pipeline, false);
                     var terminal = observer.shutdownAndFinish();
                     report.addFork(terminal.evidence());

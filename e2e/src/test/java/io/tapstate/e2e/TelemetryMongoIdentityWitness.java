@@ -214,6 +214,7 @@ final class TelemetryMongoIdentityWitness {
             }
         }
         requirePublicBoundaries(segments, emitted.raw(), scope.pipelineIncarnationId());
+        requireNoFormerIncarnation(segments, events, emitted, scope);
         Map<String, Object> evidence = new LinkedHashMap<>();
         evidence.put("action", "mongo-telemetry-" + action);
         evidence.put("pipelineId", pipeline);
@@ -241,6 +242,34 @@ final class TelemetryMongoIdentityWitness {
         evidence.put("performanceAcceptanceEligible", false);
         report.addFork(evidence);
         issued.put(scope, selection);
+    }
+
+    private void requireNoFormerIncarnation(List<Map<?, ?>> segments, List<Map<?, ?>> events,
+            Emitted emitted, ObservationStore.Scope current) {
+        Set<Instant> oldTimes = emitted.raw().stream()
+                .filter(row -> !owner(row).pipelineIncarnationId().equals(current.pipelineIncarnationId()))
+                .map(row -> row.getDate("observedAt").toInstant()).collect(Collectors.toSet());
+        Set<String> oldEvents = emitted.events().stream()
+                .filter(row -> !owner(row).pipelineIncarnationId().equals(current.pipelineIncarnationId()))
+                .map(row -> String.valueOf(row.get("_id"))).collect(Collectors.toSet());
+        for (var previous : issued.entrySet()) {
+            if (!previous.getKey().pipelineIncarnationId().equals(current.pipelineIncarnationId())) {
+                oldEvents.addAll(previous.getValue().eventIds());
+                if (previous.getValue().intervalEnd() != null) { oldTimes.add(previous.getValue().intervalEnd()); }
+            }
+        }
+        // Public points carry time, not scope. A timestamp shared with an actual current row is ambiguous.
+        emitted.raw().stream().filter(row -> owner(row).pipelineIncarnationId().equals(current.pipelineIncarnationId()))
+                .map(row -> row.getDate("observedAt").toInstant()).forEach(oldTimes::remove);
+        for (Map<?, ?> segment : segments) {
+            for (Map<?, ?> point : mapRows(segment, "points")) {
+                assertThat(oldTimes).as("new-resource history has no exact former-resource sample timestamp")
+                        .doesNotContain(Instant.parse(String.valueOf(point.get("intervalEnd"))));
+            }
+        }
+        assertThat(events.stream().map(row -> String.valueOf(row.get("id"))).toList())
+                .as("new-resource events exclude all retained former-resource event identities")
+                .doesNotContainAnyElementsOf(oldEvents);
     }
 
     /** Qualifies identity and retained public output without claiming quiet-stage counter or raw-pair evidence. */
