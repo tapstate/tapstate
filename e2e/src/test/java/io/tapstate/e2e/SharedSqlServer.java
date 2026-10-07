@@ -50,8 +50,12 @@ final class SharedSqlServer {
                     "mcr.microsoft.com/mssql/server:2022-CU14-ubuntu-22.04")
                     .acceptLicense()
                     .withEnv("MSSQL_AGENT_ENABLED", "true")
+                    .withEnv("MSSQL_MEMORY_LIMIT_MB", "2048")
                     .withStartupTimeout(Duration.ofMinutes(5))
-                    .withCreateContainerCmdModifier(command -> command.withPlatform("linux/amd64"));
+                    .withCreateContainerCmdModifier(command -> {
+                        command.withPlatform("linux/amd64");
+                        command.getHostConfig().withMemory(3L * 1024 * 1024 * 1024);
+                    });
             long began = System.nanoTime();
             starting.start();
             container = starting;

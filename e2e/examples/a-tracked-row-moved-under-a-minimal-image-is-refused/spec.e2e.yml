@@ -51,6 +51,7 @@ steps:
   - start
   - await: { doc: { views.move_state: { where: { id: 1 }, size: { items: 1 } } } }
   - cdc: { src_move_items.move_items: { update: { where: { id: 1 }, set: { order_id: 2 } } } }
-  - await: { state: FAILED }
+  - await: { failure_code: nest.key-change-tracking-requires-before-image }
+  - assert: { state: FAILED }
   - assert: { failure_code: nest.key-change-tracking-requires-before-image }
   - assert: { count: { views.move_state: 2 } }

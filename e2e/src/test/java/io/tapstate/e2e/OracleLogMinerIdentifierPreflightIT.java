@@ -71,10 +71,8 @@ class OracleLogMinerIdentifierPreflightIT {
 
             control.lifecycle(PIPELINE, LifecycleVerb.START);
             Await.until("the unsupported LogMiner configuration to settle", TIMEOUT,
-                    () -> control.state(PIPELINE)
-                            .filter(state -> state == PipelineState.FAILED
-                                    || state == PipelineState.RUNNING)
-                            .isPresent(),
+                    () -> control.state(PIPELINE).filter(PipelineState.FAILED::equals).isPresent()
+                            && control.failureCode(PIPELINE).filter(FAILURE_CODE::equals).isPresent(),
                     () -> "state=" + control.state(PIPELINE)
                             + ", failure=" + control.failureCode(PIPELINE));
 
