@@ -399,9 +399,10 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         }
     }
 
-    /** Holds one genuine standalone admission return before its caller can submit the new execution. */
+    /** Holds one genuine admission return before its caller can submit the new execution. */
     final class AdmissionReturnPark implements AutoCloseable {
         private final AuthorityReceipt oldAuthority;
+        private final boolean claimed;
         private final long deadline;
         private final CompletableFuture<Map<String, Object>> entered = new CompletableFuture<>();
         private EventSet held;
@@ -410,8 +411,8 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
         private String releaseReason;
         private boolean done, releasing;
 
-        private AdmissionReturnPark(AuthorityReceipt oldAuthority, long deadline) {
-            this.oldAuthority = oldAuthority; this.deadline = deadline;
+        private AdmissionReturnPark(AuthorityReceipt oldAuthority, long deadline, boolean claimed) {
+            this.oldAuthority = oldAuthority; this.deadline = deadline; this.claimed = claimed;
         }
         Map<String, Object> awaitEntry() throws Exception {
             try {
@@ -448,7 +449,8 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                 out.put("done", done); out.put("deadlineNanos", deadline); out.put("holdDeadlineNanos", holdDeadline);
                 out.put("releasedAtNanos", releasedAtNanos);
                 out.put("releaseReason", releaseReason == null ? "NOT_RELEASED" : releaseReason);
-                out.put("newJobClaimedDuringHold", false); out.put("claimedAdmissionQualified", false);
+                out.put("newJobClaimedDuringHold", false);
+                out.put("claimedAdmissionQualified", claimed && receipt != null);
                 return Map.copyOf(out);
             }
         }
@@ -466,16 +468,22 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
     private boolean admissionReturnParkUsed;
 
     AdmissionReturnPark armFirstAdmissionReturn(AuthorityReceipt oldAuthority, long deadline) {
+        return armFirstAdmissionReturn(oldAuthority, deadline, false);
+    }
+    AdmissionReturnPark armClaimedFirstAdmissionReturn(AuthorityReceipt oldAuthority, long deadline) {
+        return armFirstAdmissionReturn(oldAuthority, deadline, true);
+    }
+    private AdmissionReturnPark armFirstAdmissionReturn(AuthorityReceipt oldAuthority, long deadline, boolean claimed) {
         synchronized (lock) {
             check();
-            if (admissionReturnParkUsed || !restoredBeforeStartFinished || !authorities.contains(oldAuthority)
+            if (admissionReturnParkUsed || !claimed && !restoredBeforeStartFinished || !authorities.contains(oldAuthority)
                     || closing || closed || disconnected || ownedCrashRequested || command != null
                     || sweepPark != null && !sweepPark.done || deadline - System.nanoTime() <= 0
                     || deadline - System.nanoTime() > TimeUnit.MINUTES.toNanos(2)) {
                 throw invalid("UNSELECTED: invalid one-shot admission return request");
             }
             admissionReturnParkUsed = true;
-            return admissionReturnPark = new AdmissionReturnPark(oldAuthority, deadline);
+            return admissionReturnPark = new AdmissionReturnPark(oldAuthority, deadline, claimed);
         }
     }
     private void releaseAdmissionReturnPark(AdmissionReturnPark expected, String reason) {
@@ -1418,15 +1426,22 @@ final class NativeTelemetryIdentityJdiSession implements AutoCloseable {
                 || System.nanoTime() - current.deadline >= 0 || call.spec.target() != Target.ADMISSION
                 || !Boolean.TRUE.equals(out.get("allowed"))) { return null; }
         if (!unverified.isEmpty() || out.containsKey("decoderStatus")
-                || !Boolean.FALSE.equals(out.get("claimed")) || !"STANDALONE".equals(out.get("admissionStatus"))
+                || !Boolean.valueOf(current.claimed).equals(out.get("claimed"))
+                || !(current.claimed ? "CLAIMED" : "STANDALONE").equals(out.get("admissionStatus"))
                 || !current.oldAuthority.clusterId().equals(out.get("clusterId"))
                 || !(out.get("fence") instanceof Map<?, ?> fence)
                 || !pipeline.equals(fence.get("pipelineId"))
                 || !(fence.get("executionGeneration") instanceof Number generation)
-                || generation.longValue() != Math.addExact(current.oldAuthority.generation(), 1)
-                || !Long.valueOf(0).equals(fence.get("claimGeneration"))
-                || !List.of().equals(out.get("members")) || !Map.of().equals(out.get("claim"))) {
-            throw invalid("UNSELECTED: admission return lacks its exact decoded standalone fence");
+                || generation.longValue() != Math.addExact(current.oldAuthority.generation(), 1)) {
+            throw invalid("UNSELECTED: admission return lacks its exact decoded next-generation fence");
+        }
+        if (!current.claimed && (!Long.valueOf(0).equals(fence.get("claimGeneration"))
+                || !List.of().equals(out.get("members")) || !Map.of().equals(out.get("claim")))) {
+            throw invalid("UNSELECTED: standalone admission has claimed context");
+        }
+        if (current.claimed) {
+            qualifyAdmission((Map<String, Object>) out.get("fence"), (List<String>) out.get("members"),
+                    (Map<String, Object>) out.get("claim"), true, call.entry);
         }
         Binding binding = bindings.get(Target.ADMISSION);
         Method method = methods.get(Target.ADMISSION);

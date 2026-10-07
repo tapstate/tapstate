@@ -12,6 +12,8 @@ import io.tapstate.adapters.mongostore.MongoStateStore;
 import io.tapstate.adapters.mongostore.MongoDesiredStore;
 import io.tapstate.adapters.mongostore.MongoWorkloadClaimStore;
 import io.tapstate.core.common.JsonWriter;
+import io.tapstate.core.common.JsonReader;
+import io.tapstate.control.core.MonitorError;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricAttributes;
@@ -48,6 +50,8 @@ import org.junit.jupiter.api.Timeout;
 import java.io.InputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.security.MessageDigest;
@@ -134,6 +138,9 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
     private static void runClaimedPositive(boolean replacement, boolean continuing, boolean independent, boolean cdcOnly) throws Exception {
         assertThat(independent && replacement).as("the independent calibration is a warm submission").isFalse();
         assertThat(cdcOnly && (!independent || continuing || replacement)).isFalse();
+        boolean firstCurrentWindow = Boolean.getBoolean(PREFIX + "first-current-window");
+        assertThat(!firstCurrentWindow || replacement && !continuing && !independent)
+                .as("the claimed first-current window selects the ordinary STOP/START reset case").isTrue();
         Assumptions.assumeTrue(List.of("jar", "sha256", "output").stream()
                 .anyMatch(name -> System.getProperty(PREFIX + name) != null),
                 "the claimed positive calibration needs named immutable inputs");
@@ -184,6 +191,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
             report.begin(Map.of("purpose", cdcOnly ? "NATIVE_INDEPENDENT_CDC_ONLY_CLAIMED_POSITIVE_TELEMETRY"
                             : independent ? "NATIVE_INDEPENDENT_CLAIMED_POSITIVE_TELEMETRY"
                             : continuing ? "NATIVE_CLAIMED_PARTIAL_SNAPSHOT_CONTINUE_POSITIVE"
+                            : firstCurrentWindow ? "NATIVE_CLAIMED_PRE_SUBMIT_CURRENT_WINDOW"
                             : replacement ? "NATIVE_CLAIMED_RESET_REPLACEMENT_POSITIVE" : "NATIVE_WARM_CLAIMED_POSITIVE_TELEMETRY",
                     "application", PipelineBenchmarkLiveRunIT.artifact(jar), "expectedJarSha256", sha,
                     "harness", inputs, "connectors", connectors, "clusterMembers", 2,
@@ -304,14 +312,20 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                             }, () -> "target rows=" + targetDatabase.getCollection(TABLE).countDocuments());
                 } else {
                     Await.until("the real claimed snapshot reaches Mongo", remaining(setupDeadline),
-                            () -> targetDatabase.getCollection(TABLE).countDocuments() == 3,
+                            () -> {
+                                if (replacement) { captureContinueBoundaries(sessions, records, report, "claimed-reset-initial-snapshot"); }
+                                return targetDatabase.getCollection(TABLE).countDocuments() == 3;
+                            },
                             () -> "target rows=" + targetDatabase.getCollection(TABLE).countDocuments());
                     assertRows(targetDatabase, 3);
                     try (var sql = source.createStatement()) {
                         sql.execute("INSERT INTO " + TABLE + " (id,amount,payload) VALUES (4,400,'native-4')");
                     }
                     Await.until("a real source CDC insert reaches Mongo", remaining(setupDeadline),
-                            () -> targetDatabase.getCollection(TABLE).countDocuments() == 4,
+                            () -> {
+                                if (replacement) { captureContinueBoundaries(sessions, records, report, "claimed-reset-initial-CDC"); }
+                                return targetDatabase.getCollection(TABLE).countDocuments() == 4;
+                            },
                             () -> "target rows=" + targetDatabase.getCollection(TABLE).countDocuments());
                     assertRows(targetDatabase, 4);
                 }
@@ -320,6 +334,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
             io.tapstate.spi.store.ObservationStore.Scope priorScope = null;
             Map<Map<String, String>, Instant> priorStarts = Map.of();
             List<MetricFact> pausedFacts = List.of();
+            Map<String, Object> windowAdmission = null;
             if (replacement) {
                 var first = Await.answered("the actual first claimed execution before replacement", remaining(setupDeadline),
                         () -> latest.readStored(PIPELINE).filter(value -> value.scope().isPresent()
@@ -378,14 +393,24 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                     nativeDeadline = System.nanoTime() + WAIT.toNanos();
                     cluster.first().lifecycle(PIPELINE, LifecycleVerb.RESUME);
                 } else {
-                    cluster.first().stop(PIPELINE, true);
-                    cluster.first().lifecycle(PIPELINE, LifecycleVerb.START);
+                    captureContinueBoundaries(sessions, records, report, "claimed-reset-before-STOP");
+                    cluster.first().stop(PIPELINE, !firstCurrentWindow);
+                    if (firstCurrentWindow) {
+                        nativeDeadline = System.nanoTime() + WAIT.toNanos();
+                        windowAdmission = claimedFirstCurrentWindow(sessions, report, database, latest, claims, key,
+                                cluster, firstReceipt, nativeDeadline);
+                        captureContinueBoundaries(sessions, records, report, "claimed-window-released-before-CDC");
+                        try (var sql = source.createStatement()) {
+                            sql.execute("INSERT INTO " + TABLE + " (id,amount,payload) VALUES (5,500,'native-5')");
+                        }
+                        report.addFork(Map.of("action", "actual-post-window-CDC-before-positive-counter-wait", "rowId", 5));
+                    } else { cluster.first().lifecycle(PIPELINE, LifecycleVerb.START); }
                 }
             }
             long deadline = nativeDeadline;
             var current = Await.answered("a real scoped positive claimed observation", remaining(deadline),
                     () -> {
-                        if (continuing) { captureContinueBoundaries(sessions, records, report, "claimed-continued-admission"); }
+                        if (replacement) { captureContinueBoundaries(sessions, records, report, "claimed-current-admission"); }
                         return latest.readStored(PIPELINE).filter(value -> value.scope().isPresent()
                             && value.observation().state() == PipelineState.RUNNING
                             && (!replacement || value.scope().orElseThrow().executionGeneration() == 2L)
@@ -426,7 +451,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                     "observationAt", current.observation().observedAt().toString()));
             NativeTelemetryIdentityJdiSession.ClaimedReplacement replacementProof = null;
             NativeTelemetryIdentityJdiSession.ClaimedSubmission submission;
-            if (replacement) {
+            if (replacement && !firstCurrentWindow) {
                 var captured = owner.claimedReplacement(receipt);
                 assertThat(captured).as("the actual adopted replacement admission and same submit Job are captured").isPresent();
                 replacementProof = captured.orElseThrow();
@@ -436,7 +461,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                 assertThat(captured).as("the actual ordinary admission and same submit Job are captured").isPresent();
                 submission = captured.orElseThrow();
             }
-            if (replacement) {
+            if (replacement && !firstCurrentWindow) {
                 assertThat(priorSubmission).isNotNull();
                 assertThat(replacementProof).isNotNull();
                 assertReplacementSlot(replacementProof, priorSubmission, receipt, continuing);
@@ -475,6 +500,31 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                         assertRows(targetDatabase, 5);
                     }
                 }
+            }
+            if (firstCurrentWindow) {
+                assertThat(windowAdmission).isNotNull();
+                assertThat(submission.admissionObjectId()).isEqualTo(((Number) windowAdmission.get("admissionObject")).longValue());
+                assertThat(submission.ownershipReceiverId()).isEqualTo(((Number) windowAdmission.get("receiver")).longValue());
+                assertThat(submission.fence()).isEqualTo(windowAdmission.get("fence"));
+                assertThat(withoutLease(submission.claim())).isEqualTo(withoutLease((Map<String, Object>) windowAdmission.get("claim")));
+                assertThat(scope.pipelineIncarnationId()).isEqualTo(priorScope.pipelineIncarnationId());
+                assertThat(scope.executionGeneration()).isEqualTo(Math.addExact(priorScope.executionGeneration(), 1));
+                assertThat(submission.job().job().get("jobId")).isNotEqualTo(priorSubmission.job().job().get("jobId"));
+                var resetStarts = counterStarts(current.observation());
+                assertThat(resetStarts).isNotEmpty();
+                for (var point : resetStarts.entrySet()) {
+                    Instant prior = priorStarts.get(point.getKey());
+                    if (prior != null) { assertThat(point.getValue()).isAfter(prior); }
+                }
+                try (var target = MongoClients.create(targetUri)) {
+                    var targetDatabase = target.getDatabase(new ConnectionString(targetUri).getDatabase());
+                    Await.until("CDC reaches the actual post-window Job's physical target", remaining(deadline),
+                            () -> targetDatabase.getCollection(TABLE).countDocuments() == 5,
+                            () -> "target rows=" + targetDatabase.getCollection(TABLE).countDocuments());
+                    assertRows(targetDatabase, 5);
+                }
+                report.addFork(Map.of("action", "claimed-first-current-window-followed-by-same-real-submission",
+                        "admission", windowAdmission, "job", submission.job().job(), "scope", receipt.scope()));
             }
             ObservationContinuation continueFloor = null;
             if (continuing) {
@@ -612,7 +662,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
             assertThat(matchingProduced(observed, body, receipt)).isTrue();
             assertThat(positiveScrape(body, PIPELINE)).isTrue();
             assertThat(boundary.decodedAndAuthorityBound()).isTrue();
-            if (replacement) { assertReplacementBridge(observed, replacementProof); }
+            if (replacement && !firstCurrentWindow) { assertReplacementBridge(observed, replacementProof); }
             else { assertBridge(observed, submission); }
             if (continuing) {
                 var bindEvents = new java.util.concurrent.atomic.AtomicReference<List<Document>>(List.of());
@@ -697,9 +747,9 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                 Map<String, Object> evidence = new LinkedHashMap<>(terminal.evidence());
                 evidence.put("observedNodeId", node);
                 report.addFork(evidence);
-                if (continuing) {
+                if (replacement) {
                     records.get(node).addAll(terminal.records());
-                    assertThat(records.get(node).size()).as("all retained CONTINUE native records, including close").isLessThanOrEqualTo(MAX_RECORDS);
+                    assertThat(records.get(node).size()).as("all retained native records, including close").isLessThanOrEqualTo(MAX_RECORDS);
                 }
                 assertThat(terminal.invocationDrainComplete()).isTrue();
                 assertThat(terminal.ownedVmDeath()).isTrue();
@@ -749,6 +799,83 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                     if (cleanup instanceof Exception exception) { throw exception; }
                     throw (Error) cleanup;
                 }
+            }
+        }
+    }
+
+    private static Map<String, Object> claimedFirstCurrentWindow(
+            Map<String, NativeTelemetryIdentityJdiSession> sessions, BenchmarkLiveReport report,
+            MongoDatabase database, MongoObservationStore latest, MongoWorkloadClaimStore claims, WorkloadClaimKey key,
+            TwoMemberCluster cluster, NativeTelemetryIdentityJdiSession.AuthorityReceipt old, long deadline) throws Exception {
+        var retained = Await.answered("the actual old scoped STOPPED frame before the claimed START", remaining(deadline),
+                () -> latest.readStored(PIPELINE).filter(value -> value.scope().isPresent()
+                        && value.scope().orElseThrow().pipelineIncarnationId().equals(old.incarnation())
+                        && value.scope().orElseThrow().executionGeneration() == old.generation()
+                        && value.observation().state() == PipelineState.STOPPED));
+        Document artifact = database.getCollection(MongoStorePort.ARTIFACTS).find(new Document("_id", PIPELINE)).first();
+        assertThat(artifact).isNotNull();
+        Map<String, NativeTelemetryIdentityJdiSession.AdmissionReturnPark> parks = new LinkedHashMap<>();
+        Throwable primary = null;
+        try {
+            for (var entry : sessions.entrySet()) {
+                parks.put(entry.getKey(), entry.getValue().armClaimedFirstAdmissionReturn(old, deadline));
+            }
+            cluster.first().lifecycle(PIPELINE, LifecycleVerb.START);
+            WorkloadClaim admitted = Await.answered("the actual next claimed generation before submit", remaining(deadline),
+                    () -> claims.read(key).filter(value -> value.leased()
+                            && value.claim().executionGeneration() == Math.addExact(old.generation(), 1))
+                            .map(value -> value.claim()));
+            var park = parks.get(admitted.owner().nodeId());
+            assertThat(park).isNotNull();
+            Map<String, Object> admission = park.awaitEntry();
+            assertThat(withoutLease((Map<String, Object>) admission.get("claim"))).isEqualTo(claimTuple(admitted));
+            assertThat(admission.get("members")).isEqualTo(List.of(TwoMemberCluster.NODE_A, TwoMemberCluster.NODE_B));
+            assertThat(park.held()).isTrue();
+            var heldLatest = latest.readStored(PIPELINE).orElseThrow();
+            assertThat(heldLatest.scope()).isEqualTo(retained.scope());
+            assertThat(heldLatest.observation().state()).isEqualTo(PipelineState.STOPPED);
+            HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
+            List<Map<String, Object>> reads = new ArrayList<>();
+            for (String node : List.of(TwoMemberCluster.NODE_A, TwoMemberCluster.NODE_B)) {
+                ControlPlane control = node.equals(TwoMemberCluster.NODE_A) ? cluster.first() : cluster.second();
+                for (String surface : List.of("status", "metrics", "snapshot", "explain")) {
+                    assertThat(park.held()).isTrue();
+                    long left = Math.min(deadline - System.nanoTime(), park.remainingNanos());
+                    assertThat(left).isPositive();
+                    URI uri = sessions.get(node).server().baseUrl().resolve("/api/pipelines/" + PIPELINE + "/" + surface);
+                    HttpResponse<String> response = http.send(HttpRequest.newBuilder(uri).timeout(Duration.ofNanos(left))
+                            .header("Authorization", "Bearer " + control.credential()).GET().build(), HttpResponse.BodyHandlers.ofString());
+                    assertThat(response.statusCode()).isEqualTo(404);
+                    assertThat(response.body().getBytes(StandardCharsets.UTF_8).length).isLessThanOrEqualTo(MAX_BYTES);
+                    assertThat(JsonReader.parse(response.body())).isInstanceOf(Map.class);
+                    Map<?, ?> body = (Map<?, ?>) JsonReader.parse(response.body());
+                    assertThat(body.get("code")).isEqualTo(MonitorError.NO_OBSERVATION.code());
+                    assertThat(body.get("params")).isEqualTo(Map.of("pipeline", PIPELINE));
+                    reads.add(Map.of("node", node, "surface", surface, "httpStatus", 404, "body", body));
+                }
+            }
+            assertThat(park.held()).isTrue();
+            assertThat(withoutLease(claimTuple(claims.read(key).filter(value -> value.leased()).orElseThrow().claim())))
+                    .isEqualTo(claimTuple(admitted));
+            assertThat(database.getCollection(MongoStorePort.ARTIFACTS).find(new Document("_id", PIPELINE)).first())
+                    .isEqualTo(artifact);
+            assertThat(latest.readStored(PIPELINE).orElseThrow().scope()).isEqualTo(retained.scope());
+            report.addFork(Map.of("action", "claimed-first-current-pre-submit-window", "admission", admission,
+                    "issuedClaim", claimTuple(admitted), "physicalOldScope", old.scope(), "publicReads", reads,
+                    "newJobClaimedDuringHold", false));
+            return admission;
+        } catch (Exception | Error failure) { primary = failure; throw failure; }
+        finally {
+            Throwable cleanup = null;
+            for (var park : parks.entrySet()) {
+                try { park.getValue().close(); report.addFork(Map.of("action", "claimed-admission-window-release",
+                        "node", park.getKey(), "evidence", park.getValue().evidence())); }
+                catch (Exception | Error failure) { if (cleanup == null) { cleanup = failure; } else { cleanup.addSuppressed(failure); } }
+            }
+            if (cleanup != null) {
+                if (primary != null) { primary.addSuppressed(cleanup); }
+                else if (cleanup instanceof Exception exception) { throw exception; }
+                else if (cleanup instanceof Error error) { throw error; }
             }
         }
     }
@@ -1407,6 +1534,15 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
         for (String name : List.of("DirectFixture", "DirectReady")) {
             String nested = NativeClaimedTelemetryPositiveCalibrationIT.class.getSimpleName() + "$" + name;
             try (InputStream stream = NativeClaimedTelemetryPositiveCalibrationIT.class.getResourceAsStream(nested + ".class")) {
+                assertThat(stream).isNotNull();
+                byte[] bytes = stream.readNBytes(MAX_BYTES + 1);
+                assertThat(bytes.length).isLessThanOrEqualTo(MAX_BYTES);
+                result.put(nested + "ExecutingClassSha256", digest(bytes));
+            }
+        }
+        if (Boolean.getBoolean(PREFIX + "first-current-window")) {
+            String nested = "NativeTelemetryIdentityJdiSession$AdmissionReturnPark";
+            try (InputStream stream = NativeTelemetryIdentityJdiSession.class.getResourceAsStream(nested + ".class")) {
                 assertThat(stream).isNotNull();
                 byte[] bytes = stream.readNBytes(MAX_BYTES + 1);
                 assertThat(bytes.length).isLessThanOrEqualTo(MAX_BYTES);
