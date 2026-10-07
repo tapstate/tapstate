@@ -141,7 +141,15 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
             default -> new LinkedHashSet<>();
         };
         for (Object item; (item = inbox.peek()) != null; ) {
-            handle(ordinal, (Envelope) item, filed);
+            if (item instanceof SettledPositions settled) {
+                // Registration copies are spoken for on their assembly path. Only this lookup's own
+                // rows settle here, behind the wakes already queued for earlier rows.
+                if (ordinal == ROWS) {
+                    SettledPositions.fold(owingNothing, settled.positions());
+                }
+            } else {
+                handle(ordinal, (Envelope) item, filed);
+            }
             inbox.remove();
             if (!flush()) {
                 return;
@@ -149,6 +157,18 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
         }
         sayWhatOwesNothing();
         flush();
+    }
+
+    /** Drains queued wakes and settlements even when no further row arrives after backpressure. */
+    @Override
+    public boolean tryProcess() {
+        sayWhatOwesNothing();
+        return flush();
+    }
+
+    @Override
+    public boolean complete() {
+        return tryProcess();
     }
 
     /**
@@ -192,9 +212,11 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
     private Set<Object> filedKeysIn(Inbox inbox, List<String> fields) {
         Collection<Object> named = new LinkedHashSet<>();
         for (Object item : inbox) {
-            named.add(NestKeys.valuesOf(NestKeys.rowOf((Envelope) item), fields));
+            if (!(item instanceof SettledPositions)) {
+                named.add(NestKeys.valuesOf(NestKeys.rowOf((Envelope) item), fields));
+            }
         }
-        return new LinkedHashSet<>(store.loadAll(named).keySet());
+        return named.isEmpty() ? new LinkedHashSet<>() : new LinkedHashSet<>(store.loadAll(named).keySet());
     }
 
     private void handle(int ordinal, Envelope event, Set<Object> filed) {
