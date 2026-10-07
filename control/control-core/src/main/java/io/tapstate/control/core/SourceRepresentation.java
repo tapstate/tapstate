@@ -96,6 +96,9 @@ public final class SourceRepresentation {
         Map<String, ConfigField> secrets = secretFields(connector(source.connector()));
         Map<String, Object> redactedConfig = new LinkedHashMap<>(source.config());
         secrets.keySet().forEach(redactedConfig::remove);
+        if (redactedConfig.get("uri") instanceof String uri) {
+            redactedConfig.put("uri", SourceReadProjection.redactUserInfo(uri));
+        }
         List<String> configuredSecrets = secrets.keySet().stream()
                 .filter(name -> source.config().containsKey(name)
                         && source.config().get(name) != null)

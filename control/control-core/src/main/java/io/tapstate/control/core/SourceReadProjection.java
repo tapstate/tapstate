@@ -75,7 +75,7 @@ final class SourceReadProjection {
         return false;
     }
 
-    static String redactUserInfo(String uri) {
+    public static String redactUserInfo(String uri) {
         Objects.requireNonNull(uri, "uri");
         UserInfo userInfo = findUserInfo(uri);
         if (userInfo == null) {

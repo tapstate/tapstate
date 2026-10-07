@@ -92,6 +92,15 @@ public final class ControlOperations {
     public static final Operation SOURCE_DELETE = new Operation(
             "source.delete", Scope.WRITE, true, null,
             "Delete one Source through the Server control API.", CLI_ONLY);
+    public static final Operation SAMPLE_SOURCE_LIST = new Operation(
+            "sample-source.list", Scope.READ, false, null,
+            "List sample databases configured by this deployment without disclosing credentials.", CLI_AND_REST);
+    public static final Operation SAMPLE_SOURCE_INSTALL = new Operation(
+            "sample-source.install", Scope.WRITE, true, null,
+            "Install configured sample databases as Sources for the current workspace.", CLI_AND_REST);
+    public static final Operation STATE_STORE_CONNECT = new Operation(
+            "state-store.connect", Scope.ADMIN, true, null,
+            "Configure the one Cloud MongoDB Atlas destination for materialized views.", CLI_AND_REST);
 
     // connection domain: each probing verb runs an external probe and persists its result for later query
     // and display, so it mutates persisted state (a write) and is audited; its read-back peer returns the
@@ -181,6 +190,10 @@ public final class ControlOperations {
     public static final Operation PIPELINE_CATALOG = new Operation(
             "pipeline.catalog", Scope.READ, false, null,
             "List a bounded page of Pipelines from the unified artifact-and-draft catalog, including lifecycle status.",
+            CLI_AND_REST);
+    public static final Operation VIEW_LIST = new Operation(
+            "view.list", Scope.READ, false, null,
+            "List materialized views and replicas with their location, maintaining pipeline, and freshness.",
             CLI_AND_REST);
     public static final Operation PIPELINE_GET = new Operation(
             "pipeline.get", Scope.READ, false, null,
@@ -327,6 +340,9 @@ public final class ControlOperations {
             SOURCE_SCHEMA,
             SOURCE_UPDATE,
             SOURCE_DELETE,
+            SAMPLE_SOURCE_LIST,
+            SAMPLE_SOURCE_INSTALL,
+            STATE_STORE_CONNECT,
             CONNECTION_TEST,
             CONNECTION_TEST_RESULT,
             CONNECTION_DISCOVER_SCHEMA,
@@ -341,6 +357,7 @@ public final class ControlOperations {
             CLUSTER_MEMBERS,
             PIPELINE_LIST,
             PIPELINE_CATALOG,
+            VIEW_LIST,
             PIPELINE_GET,
             PIPELINE_LAYOUT_GET,
             PIPELINE_LAYOUT_UPDATE,

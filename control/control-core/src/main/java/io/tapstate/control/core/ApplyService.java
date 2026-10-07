@@ -80,6 +80,10 @@ import java.util.function.Supplier;
  */
 public final class ApplyService {
 
+    private static boolean storeMarked(SourceResource source) {
+        return source.metadata() != null && "true".equals(source.metadata().labels().get("store"));
+    }
+
     private final Supplier<TapstateCatalog> catalog;
     private final ArtifactStore store;
     private final AuditGate auditGate;
@@ -188,6 +192,18 @@ public final class ApplyService {
             }
         }
         candidate.addAll(submitted);
+        List<SourceResource> markedStores = candidate.stream()
+                .filter(SourceResource.class::isInstance).map(SourceResource.class::cast)
+                .filter(source -> source.metadata() != null
+                        && "true".equals(source.metadata().labels().get("store"))).toList();
+        if (markedStores.size() > 1 || markedStores.stream().anyMatch(source ->
+                deploymentProfile != DeploymentProfile.CLOUD
+                        || !"mongodb-atlas".equals(source.connector())
+                        || source.mode() != null || source.tables() != null)) {
+            throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                    Map.of("reason", "Cloud allows exactly one MongoDB Atlas state store without capture settings"),
+                    null);
+        }
         TapstateCatalog liveCatalog = catalog.get();
         List<Resource> validationResources = validationResources(candidate, submitted, validationScope);
         Workspace workspace = Workspace.of(validationResources, liveCatalog);
@@ -366,6 +382,14 @@ public final class ApplyService {
         Objects.requireNonNull(principal, "principal");
         Objects.requireNonNull(resource, "resource");
         Objects.requireNonNull(operation, "operation");
+        if (resource instanceof SourceResource source
+                && (storeMarked(source)
+                    || store.get(source.id()).filter(SourceResource.class::isInstance)
+                            .map(SourceResource.class::cast).map(ApplyService::storeMarked).orElse(false))
+                && operation != ControlOperations.STATE_STORE_CONNECT) {
+            throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                    Map.of("reason", "the state store must be configured through its dedicated setup API"), null);
+        }
         ApplyPlan plan = planResources(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE);
         PreparedArtifact prepared = plan.artifacts().getFirst();
         if (live != null) {
@@ -486,6 +510,13 @@ public final class ApplyService {
         List<String> unreadablePipelineIds = inventory == null
                 ? List.of() : inventory.unreadablePipelineIds();
         for (PreparedArtifact prepared : plan.artifacts()) {
+            if (prepared.resource() instanceof SourceResource source
+                    && (storeMarked(source)
+                        || store.get(source.id()).filter(SourceResource.class::isInstance)
+                                .map(SourceResource.class::cast).map(ApplyService::storeMarked).orElse(false))) {
+                throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                        Map.of("reason", "artifact apply cannot change the state store"), null);
+            }
             ArtifactOutcome outcome = outcome(prepared);
             if (outcome.change() != ArtifactOutcome.Change.UNCHANGED) {
                 if (live != null && prepared.resource() instanceof SourceResource replacement) {

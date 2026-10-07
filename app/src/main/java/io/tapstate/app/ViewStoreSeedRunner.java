@@ -45,11 +45,17 @@ final class ViewStoreSeedRunner implements SmartInitializingSingleton {
     private final ArtifactStore artifacts;
     private final String serverStoreUri;
     private final String tlsCaFile;
+    private final boolean enabled;
 
     ViewStoreSeedRunner(ArtifactStore artifacts, String serverStoreUri, String tlsCaFile) {
+        this(artifacts, serverStoreUri, tlsCaFile, true);
+    }
+
+    ViewStoreSeedRunner(ArtifactStore artifacts, String serverStoreUri, String tlsCaFile, boolean enabled) {
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.serverStoreUri = Objects.requireNonNull(serverStoreUri, "serverStoreUri");
         this.tlsCaFile = tlsCaFile;
+        this.enabled = enabled;
     }
 
     @Override
@@ -58,6 +64,7 @@ final class ViewStoreSeedRunner implements SmartInitializingSingleton {
     }
 
     void seed() {
+        if (!enabled) return;
         String id = ViewTargetResolver.STATE_STORE_SOURCE_ID;
         if (trustCannotTravelInTheUri()) {
             // Seeding anyway would register a connection that can never be made: the connector would

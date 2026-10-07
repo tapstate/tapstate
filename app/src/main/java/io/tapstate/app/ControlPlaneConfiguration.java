@@ -54,6 +54,9 @@ import io.tapstate.control.core.PipelinePositionService;
 import io.tapstate.control.core.PipelineProjectionService;
 import io.tapstate.control.core.PipelineRepresentation;
 import io.tapstate.control.core.PipelineViewService;
+import io.tapstate.control.core.ViewCatalogService;
+import io.tapstate.control.core.SampleSourceService;
+import io.tapstate.control.core.StateStoreSetupService;
 import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.DataBrowserFollows;
@@ -456,13 +459,15 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    ViewStoreSeedRunner viewStoreSeedRunner(ArtifactStore artifactStore, MongoProperties mongoProperties) {
+    ViewStoreSeedRunner viewStoreSeedRunner(ArtifactStore artifactStore, MongoProperties mongoProperties,
+            @Value("${tapstate.deployment.profile:on-prem}") String deploymentProfile) {
         // The managed ArtifactStore, not the raw one behind it. Reaching past the decorator would make
         // this the one write in the process that skips secret tracking -- and the resource it writes is
         // built from the deployment's own store URI, which is the last one that should be the exception.
         // It changes nothing observable while the mongodb catalog marks `uri` non-secret; what it
         // removes is a seam where a later change to that marking would silently not apply here.
-        return new ViewStoreSeedRunner(artifactStore, mongoProperties.getUri(), mongoProperties.getTlsCaFile());
+        return new ViewStoreSeedRunner(artifactStore, mongoProperties.getUri(), mongoProperties.getTlsCaFile(),
+                !"cloud".equalsIgnoreCase(deploymentProfile));
     }
 
     @Bean
@@ -699,6 +704,22 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
+    SampleSourceService sampleSourceService(SourceProjectionService sources, SchemaDiscoveryService discovery,
+            ConnectionTestService connections, ConnectorCatalogView connectors,
+            @Value("${tapstate.sample.host:113.98.206.139}") String host,
+            @Value("${tapstate.sample.password:}") String password) {
+        return new SampleSourceService(sources, discovery, connections, connectors, host, password);
+    }
+
+    @Bean
+    StateStoreSetupService stateStoreSetupService(ApplyService apply, ArtifactQueryService artifacts,
+            SourceRepresentation representation, ConnectionTestService connections,
+            @Value("${tapstate.deployment.profile:on-prem}") String deploymentProfile) {
+        return new StateStoreSetupService(apply, artifacts, representation,
+                DeploymentProfile.parse(deploymentProfile), connections);
+    }
+
+    @Bean
     PipelineRepresentation pipelineRepresentation() {
         return new PipelineRepresentation();
     }
@@ -709,6 +730,13 @@ class ControlPlaneConfiguration {
             PipelineRepresentation representation,
             PipelineObservationQueryService observations) {
         return new PipelineViewService(artifactQueryService, representation, observations);
+    }
+
+    @Bean
+    ViewCatalogService viewCatalogService(ArtifactQueryService artifacts,
+            PipelineObservationQueryService observations, DataBrowserService browser,
+            SourceSchemaQueryService schemas) {
+        return new ViewCatalogService(artifacts, observations, browser, schemas);
     }
 
     @Bean

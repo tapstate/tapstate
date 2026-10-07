@@ -63,10 +63,12 @@ class DataPlaneActuationConfiguration {
      */
     @Bean
     DagSource dagSource(StorePort storePort, NestSettings nestSettings, ConnectionTester connectionTester,
-            HazelcastInstance hazelcastMember) {
+            HazelcastInstance hazelcastMember,
+            @Value("${tapstate.deployment.profile:on-prem}") String deploymentProfile) {
         return new StoreBackedDagSource(storePort, nestSettings,
                 StoreReachability.probing(connectionTester, STORE_PROBE_TIMEOUT),
-                SourcePlacement.on(hazelcastMember.getCluster().getLocalMember().getAddress()));
+                SourcePlacement.on(hazelcastMember.getCluster().getLocalMember().getAddress()),
+                "cloud".equalsIgnoreCase(deploymentProfile));
     }
 
     @Bean

@@ -102,6 +102,7 @@ final class StoreBackedDagSource implements DagSource {
     private final SourceSchemaCopy sourceSchemaCopy;
     private final StepSchemaRecord stepSchemaRecord;
     private final SourcePlacement sourcePlacement;
+    private final boolean requireMarkedStore;
 
     StoreBackedDagSource(StorePort storePort) {
         this(storePort, assembledSinkWriterBinder());
@@ -129,6 +130,13 @@ final class StoreBackedDagSource implements DagSource {
         this(storePort, assembledSinkWriterBinder(), nestSettings, storeReachability, sourcePlacement);
     }
 
+    StoreBackedDagSource(
+            StorePort storePort, NestSettings nestSettings, StoreReachability storeReachability,
+            SourcePlacement sourcePlacement, boolean requireMarkedStore) {
+        this(storePort, assembledSinkWriterBinder(), nestSettings, storeReachability, sourcePlacement,
+                Objects.requireNonNull(storePort, "storePort").artifacts(), requireMarkedStore);
+    }
+
     /**
      * The binder the product is assembled with, named rather than written inline at each construction.
      *
@@ -150,7 +158,8 @@ final class StoreBackedDagSource implements DagSource {
     public StartPreparation prepareStart(String pipelineId, String defaultDatabase) {
         ReadOnlyArtifactSnapshot snapshot = ReadOnlyArtifactSnapshot.capture(storePort.artifacts());
         StoreBackedDagSource captured = new StoreBackedDagSource(
-                storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement, snapshot);
+                storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement, snapshot,
+                requireMarkedStore);
         captured.validateStart(pipelineId);
         NestCapacity capacity = captured.capacityOf(pipelineId);
         Set<OperatorStateLocation> locations = captured.stateLocations(pipelineId, defaultDatabase);
@@ -219,6 +228,13 @@ final class StoreBackedDagSource implements DagSource {
     private StoreBackedDagSource(
             StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
             StoreReachability storeReachability, SourcePlacement sourcePlacement, ArtifactStore artifactStore) {
+        this(storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement, artifactStore, false);
+    }
+
+    private StoreBackedDagSource(
+            StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
+            StoreReachability storeReachability, SourcePlacement sourcePlacement, ArtifactStore artifactStore,
+            boolean requireMarkedStore) {
         this.storePort = Objects.requireNonNull(storePort, "storePort");
         this.artifactStore = Objects.requireNonNull(artifactStore, "artifactStore");
         this.sinkWriterBinder = Objects.requireNonNull(sinkWriterBinder, "sinkWriterBinder");
@@ -229,6 +245,7 @@ final class StoreBackedDagSource implements DagSource {
         this.sourceSchemaCopy = new SourceSchemaCopy(this.storePort.derivedSchemas());
         this.stepSchemaRecord = new StepSchemaRecord(this.storePort.derivedSchemas());
         this.sourcePlacement = Objects.requireNonNull(sourcePlacement, "sourcePlacement");
+        this.requireMarkedStore = requireMarkedStore;
     }
 
     @Override
@@ -1563,7 +1580,22 @@ final class StoreBackedDagSource implements DagSource {
         // Resolve first: it holds the simpler facts - a missing key among them - and a view without a
         // key has nothing for the identity gate to compare. Review found the reverse order turning the
         // coded missing-key refusal into a bare NullPointerException inside the gate.
-        ViewTargetResolver.ViewTarget target = ViewTargetResolver.resolve(inline);
+        List<SourceResource> markedStores = artifacts().list().stream()
+                .filter(SourceResource.class::isInstance)
+                .map(SourceResource.class::cast)
+                .filter(source -> source.metadata() != null
+                        && "true".equals(source.metadata().labels().get("store")))
+                .toList();
+        if (markedStores.size() > 1) {
+            throw new IllegalStateException("Multiple marked state stores");
+        }
+        if (requireMarkedStore && markedStores.isEmpty()) {
+            throw new TapstateException(ActuationError.VIEW_STORE_NOT_CONFIGURED,
+                    Map.of("store", "atlas-store"), null);
+        }
+        String storeId = markedStores.isEmpty()
+                ? ViewTargetResolver.STATE_STORE_SOURCE_ID : markedStores.getFirst().id();
+        ViewTargetResolver.ViewTarget target = ViewTargetResolver.resolve(inline, storeId);
         boolean alternateKey = requireKeyIsTheFeedIdentity(
                 pipeline, inline, targets, tablesBySourceId);
         // Coded rather than bare, unlike a source the author named: this store is the deployment's, so
