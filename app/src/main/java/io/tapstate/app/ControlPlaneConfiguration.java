@@ -716,15 +716,17 @@ class ControlPlaneConfiguration {
     @Bean
     PipelineExplainService pipelineExplainService(
             ArtifactQueryService artifactQueryService, CurrentObservationReader observations, Clock clock,
-            LifecyclePendingRegistry pending, StorePort storePort, ObservationScopeRegistry scopes,
+            LifecyclePendingRegistry pending, StorePort storePort, ObjectProvider<ObservationScopeRegistry> scopes,
             ClusterMembershipGate membership, ClusterProperties cluster, ClusterIdentityStore identities) {
         String clusterId = cluster.getProfile() == ClusterProperties.Profile.SINGLE
                 ? DataPlaneActuationConfiguration.standaloneClusterId(cluster, identities) : cluster.getId();
-        LifecyclePendingProjection projection = new LifecyclePendingProjection(pending, storePort, scopes,
-                membership, clusterId);
+        ObservationScopeRegistry local = scopes.getIfAvailable();
+        LifecyclePendingProjection projection = local == null ? null
+                : new LifecyclePendingProjection(pending, storePort, local, membership, clusterId);
         ExplanationCatalog messages = ExplanationCatalog.bundled();
         return new PipelineExplainService(
-                artifactQueryService, observations, clock, messages::render, projection::pending);
+                artifactQueryService, observations, clock, messages::render,
+                projection == null ? pending::pending : projection::pending);
     }
 
     /**

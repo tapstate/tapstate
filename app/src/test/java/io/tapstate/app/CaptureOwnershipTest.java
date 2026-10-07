@@ -91,7 +91,7 @@ class CaptureOwnershipTest {
      * record says the last one got to, so asking again on a later pass costs time and nothing else.
      */
     @Test
-    void aCaptureIsNotTakenOverWhileAPipelineOnItIsStillReadingItsLoad() {
+    void aCaptureIsNotTakenOverWhileAPipelineOnItIsStillReadingItsLoad() throws InterruptedException {
         InMemoryStorePort store = new InMemoryStorePort(artifactsWith(ReadMode.SNAPSHOT_AND_CDC, "p", "q"));
         MemoryClaims raw = new MemoryClaims();
         ClusterMembershipGate gate = eligibleGate();
@@ -110,6 +110,8 @@ class CaptureOwnershipTest {
         AtomicBoolean reading = new AtomicBoolean(true);
         CaptureRun loading = mock(CaptureRun.class);
         when(loading.loading()).thenAnswer(invocation -> reading.get());
+        when(loading.awaitLoaded(org.mockito.ArgumentMatchers.any(Duration.class)))
+                .thenAnswer(invocation -> !reading.get());
         CaptureAttacher joining = (spec, handoff, startTail) -> {
             if (startTail) {
                 tails.incrementAndGet();
