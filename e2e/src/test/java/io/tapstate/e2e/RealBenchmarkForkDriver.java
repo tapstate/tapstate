@@ -43,7 +43,17 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                             long cohortFirstObservedAtNanos, long cohortLastObservedAtNanos,
                             long fullDeliveryCount, long cohortDeliveryCount,
                             List<Long> cohortObservedAtNanos, List<Long> fullObservedAtNanos,
-                            List<Long> cohortServerOperationWallMillis) {
+                            List<Long> cohortServerOperationWallMillis,
+                            List<List<Long>> cohortOperationStreams) {
+        DeliveryTimeline(long firstFullObservedAtNanos, long lastFullObservedAtNanos,
+                         long cohortFirstObservedAtNanos, long cohortLastObservedAtNanos,
+                         long fullDeliveryCount, long cohortDeliveryCount, List<Long> cohortObservedAtNanos,
+                         List<Long> fullObservedAtNanos, List<Long> cohortServerOperationWallMillis) {
+            this(firstFullObservedAtNanos, lastFullObservedAtNanos, cohortFirstObservedAtNanos, cohortLastObservedAtNanos,
+                    fullDeliveryCount, cohortDeliveryCount, cohortObservedAtNanos, fullObservedAtNanos,
+                    cohortServerOperationWallMillis, cohortServerOperationWallMillis.isEmpty() ? List.of()
+                            : List.of(cohortServerOperationWallMillis));
+        }
         DeliveryTimeline(long firstFullObservedAtNanos, long lastFullObservedAtNanos,
                          long cohortFirstObservedAtNanos, long cohortLastObservedAtNanos,
                          long fullDeliveryCount, long cohortDeliveryCount, List<Long> cohortObservedAtNanos) {
@@ -61,6 +71,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             cohortObservedAtNanos = List.copyOf(cohortObservedAtNanos);
             fullObservedAtNanos = List.copyOf(fullObservedAtNanos);
             cohortServerOperationWallMillis = java.util.Collections.unmodifiableList(new ArrayList<>(cohortServerOperationWallMillis));
+            cohortOperationStreams = cohortOperationStreams.stream().map(List::copyOf).toList();
             if (fullDeliveryCount <= 0 || fullDeliveryCount > 192_000 || cohortDeliveryCount <= 0
                     || cohortDeliveryCount > fullDeliveryCount || cohortObservedAtNanos.size() != cohortDeliveryCount
                     || firstFullObservedAtNanos > cohortFirstObservedAtNanos
@@ -87,6 +98,17 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     }
                 }
             }
+        }
+
+        BenchmarkSteadyOutputWindow.Reading operationWindow() {
+            if (cohortServerOperationWallMillis.size() != cohortObservedAtNanos.size()) {
+                throw new AssertionError("operation and observed delivery cohorts differ");
+            }
+            if (!BenchmarkSteadyOutputWindow.mergeValidatedOperationStreams(cohortOperationStreams)
+                    .equals(cohortServerOperationWallMillis)) {
+                throw new AssertionError("per-target operation streams differ from their full cohort");
+            }
+            return BenchmarkSteadyOutputWindow.readCommonOperations(cohortOperationStreams);
         }
     }
 
@@ -141,8 +163,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         double recordsOutPerSecond() {
             if (steadyOutputProfile) {
                 var timeline = deliveryTimeline.orElseThrow();
-                return BenchmarkSteadyOutputWindow.readOperationCohort(timeline.cohortServerOperationWallMillis(),
-                        timeline.cohortObservedAtNanos()).recordsPerSecond();
+                return timeline.operationWindow().recordsPerSecond();
             }
             long duration = deliveryWindowNanos();
             if (duration <= 0 || acknowledgedOutputs <= 0) {
@@ -154,8 +175,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         long deliveryWindowNanos() {
             if (steadyOutputProfile) {
                 var timeline = deliveryTimeline.orElseThrow();
-                var window = BenchmarkSteadyOutputWindow.readOperationCohort(timeline.cohortServerOperationWallMillis(),
-                        timeline.cohortObservedAtNanos());
+                var window = timeline.operationWindow();
                 return window.endedAtNanos() - window.startedAtNanos();
             }
             return confirmationTiming.orElseThrow(() -> new AssertionError(
@@ -171,7 +191,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         boolean steadyOutputEstablished() {
             if (!steadyOutputProfile || deliveryTimeline.isEmpty() || confirmationTiming.isEmpty()) { return false; }
             var timeline = deliveryTimeline.orElseThrow();
-            BenchmarkSteadyOutputWindow.readOperationCohort(timeline.cohortServerOperationWallMillis(), timeline.cohortObservedAtNanos());
+            timeline.operationWindow();
             return true;
         }
     }
@@ -208,7 +228,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             if (!workload.pilotProfile()) { throw new AssertionError("steady output requires the predeclared load profile"); }
             for (var phase : phases) {
                 var timeline = phase.deliveryTimeline().orElseThrow(() -> new AssertionError("steady output has no complete timeline"));
-                BenchmarkSteadyOutputWindow.readOperationCohort(timeline.cohortServerOperationWallMillis(), timeline.cohortObservedAtNanos());
+                timeline.operationWindow();
             }
         }
     }
@@ -356,8 +376,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 if (workload.pilotProfile()) {
                     long windowEvents = measured.stream().mapToLong(phase -> {
                         var timeline = phase.deliveryTimeline().orElseThrow();
-                        return BenchmarkSteadyOutputWindow.readOperationCohort(timeline.cohortServerOperationWallMillis(),
-                                timeline.cohortObservedAtNanos()).completedDeliveries();
+                        return timeline.operationWindow().completedDeliveries();
                     }).sum();
                     throughput = windowEvents * 1_000_000_000.0 / duration;
                 } else { throughput = completed * 1_000_000_000.0 / duration; }
@@ -544,24 +563,27 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                         .min().orElseThrow(),
                 cohort.stream().mapToLong(BenchmarkMongoDeliveryObserver.Delivery::observedAtNanos)
                         .max().orElseThrow());
+        List<List<Long>> operationStreams = targetStreams.values().stream()
+                .map(stream -> stream.stream().filter(delivery -> workload.inFixedCohort(delivery.key()))
+                        .map(BenchmarkMongoDeliveryObserver.Delivery::serverOperationWallMillis).toList())
+                .filter(stream -> !stream.isEmpty()).toList();
         var timeline = new DeliveryTimeline(
                 deliveries.stream().mapToLong(BenchmarkMongoDeliveryObserver.Delivery::observedAtNanos).min().orElseThrow(),
                 deliveries.stream().mapToLong(BenchmarkMongoDeliveryObserver.Delivery::observedAtNanos).max().orElseThrow(),
                 timing.firstTargetObservedAtNanos(), timing.lastTargetObservedAtNanos(), deliveries.size(), cohort.size(),
                 cohort.stream().map(BenchmarkMongoDeliveryObserver.Delivery::observedAtNanos).sorted().toList(),
                 deliveries.stream().map(BenchmarkMongoDeliveryObserver.Delivery::observedAtNanos).sorted().toList(),
-                BenchmarkSteadyOutputWindow.mergeValidatedOperationStreams(targetStreams.values().stream()
-                        .map(stream -> stream.stream().filter(delivery -> workload.inFixedCohort(delivery.key()))
-                                .map(BenchmarkMongoDeliveryObserver.Delivery::serverOperationWallMillis).toList())
-                        .filter(stream -> !stream.isEmpty()).toList()));
+                BenchmarkSteadyOutputWindow.mergeValidatedOperationStreams(operationStreams), operationStreams);
+        long commonFirst = operationStreams.stream().mapToLong(List::getFirst).max().orElseThrow();
+        long commonLast = operationStreams.stream().mapToLong(List::getLast).min().orElseThrow();
         Optional<BenchmarkTargetClock.LocalWindow> resourceWindow = targetClockBefore == null ? Optional.empty()
                 : Optional.of(BenchmarkTargetClock.mapWindow(targetClockBefore, targetClockAfter,
-                        timeline.cohortServerOperationWallMillis().getFirst(), timeline.cohortServerOperationWallMillis().getLast()));
+                        commonFirst, commonLast));
         if (targetClocksBefore.size() > 1) {
             List<BenchmarkTargetClock.LocalWindow> windows = new ArrayList<>();
             for (int i=0;i<targetClocksBefore.size();i++) {
                 windows.add(BenchmarkTargetClock.mapWindow(targetClocksBefore.get(i), targetClocksAfter.get(i),
-                        timeline.cohortServerOperationWallMillis().getFirst(), timeline.cohortServerOperationWallMillis().getLast()));
+                        commonFirst, commonLast));
             }
             resourceWindow = Optional.of(new BenchmarkTargetClock.LocalWindow(
                     windows.stream().mapToLong(BenchmarkTargetClock.LocalWindow::earliestStartNanos).min().orElseThrow(),
@@ -570,16 +592,18 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     windows.stream().mapToLong(BenchmarkTargetClock.LocalWindow::latestEndNanos).max().orElseThrow()));
         }
         if (workload.pilotProfile()) {
-            System.out.println("benchmark-pre-evaluation-output-timeline=" + JsonWriter.write(Map.of(
-                    "workload", workload.id(), "phase", phase.id(), "rows", workload.rows(),
-                    "sourceBatches", issued.batches().stream().map(batch -> Map.of("index", batch.index(),
-                            "issuedAtNanos", batch.issuedAtNanos(), "completedAtNanos", batch.completedAtNanos())).toList(),
-                    "cohortObservedAtNanos", timeline.cohortObservedAtNanos(), "fullObservedAtNanos", timeline.fullObservedAtNanos(),
-                    "resources", PipelineBenchmarkLiveRunIT.resourceEvidence(resources, issued.clockAnchor()),
-                    "targetObserverReadCosts", targets.readCosts(),
-                    "cohortServerOperationWallMillis", cohort.stream()
-                            .map(BenchmarkMongoDeliveryObserver.Delivery::serverOperationWallMillis).toList(),
-                    "performanceAcceptanceEligible", false)));
+            System.out.println("benchmark-pre-evaluation-output-timeline=" + JsonWriter.write(Map.ofEntries(
+                    Map.entry("workload", workload.id()), Map.entry("phase", phase.id()), Map.entry("rows", workload.rows()),
+                    Map.entry("sourceBatches", issued.batches().stream().map(batch -> Map.of("index", batch.index(),
+                            "issuedAtNanos", batch.issuedAtNanos(), "completedAtNanos", batch.completedAtNanos())).toList()),
+                    Map.entry("cohortObservedAtNanos", timeline.cohortObservedAtNanos()),
+                    Map.entry("fullObservedAtNanos", timeline.fullObservedAtNanos()),
+                    Map.entry("resources", PipelineBenchmarkLiveRunIT.resourceEvidence(resources, issued.clockAnchor())),
+                    Map.entry("targetObserverReadCosts", targets.readCosts()),
+                    Map.entry("cohortServerOperationWallMillis", cohort.stream()
+                            .map(BenchmarkMongoDeliveryObserver.Delivery::serverOperationWallMillis).toList()),
+                    Map.entry("cohortOperationStreams", operationStreams),
+                    Map.entry("performanceAcceptanceEligible", false))));
         }
         return new PhaseWindow(new MeasuredPhase(phase.id(), measuredCount,
                 firstIssued, issued.sourceCompletedAtNanos(), completedAckAt, expectedSourceChanges,

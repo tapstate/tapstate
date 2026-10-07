@@ -6,6 +6,27 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class BenchmarkSteadyOutputWindowTest {
+    @Test void independentlySteadyTargetsCannotCreateAnApparentRateTrend() {
+        var faster = new ArrayList<Long>();
+        var slower = new ArrayList<Long>();
+        for (int i = 0; i < 48_000; i++) {
+            faster.add(1_000_000L + i);
+            slower.add(1_000_000L + i * 2L);
+        }
+        assertThat(BenchmarkSteadyOutputWindow.readServerOperations(faster).recordsPerSecond()).isEqualTo(1_000);
+        assertThat(BenchmarkSteadyOutputWindow.readServerOperations(slower).recordsPerSecond()).isEqualTo(500);
+        var common = BenchmarkSteadyOutputWindow.readCommonOperations(java.util.List.of(faster, slower));
+        assertThat(common.completedDeliveries()).isEqualTo(71_998);
+        assertThat(common.recordsPerSecond()).isEqualTo(71_998 * 1_000.0 / 47_999);
+        assertThatThrownBy(() -> BenchmarkSteadyOutputWindow.readCommonOperations(
+                java.util.List.of(faster, slower.stream().map(value -> value + 100_000).toList())))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("no common interval");
+        var tied = BenchmarkSteadyOutputWindow.readCommonOperations(java.util.List.of(faster, faster));
+        assertThat(tied.completedDeliveries()).as("both start ties are excluded and both end ties are retained")
+                .isEqualTo(95_998);
+        assertThat(tied.recordsPerSecond()).isEqualTo(2_000);
+    }
+
     @Test void exactFivePercentTrendIsAcceptedButOneMoreEventIsRejected() {
         assertThat(BenchmarkSteadyOutputWindow.read(trendTimeline(10_500)).completedDeliveries())
                 .isEqualTo(20_500);

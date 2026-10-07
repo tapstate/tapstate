@@ -18,16 +18,25 @@ final class BenchmarkSteadyOutputWindow {
         long first = times.getFirst(), last = times.getLast();
         long duration = last - first;
         if (duration <= 0) { throw new AssertionError("fixed output cohort has no positive observed interval"); }
+        return readWindow(times, first, last);
+    }
+
+    private static Reading readWindow(List<Long> times, long first, long last) {
+        long duration = last - first;
         long[] bins = new long[BINS];
-        long previous = first;
-        // The first observed event defines the open lower boundary; all later events are counted once.
-        for (int i = 1; i < times.size(); i++) {
+        long previous = Long.MIN_VALUE;
+        long completed = 0;
+        // Every operation in the same open-lower, closed-upper interval is counted once.
+        for (int i = 0; i < times.size(); i++) {
             long at = times.get(i);
             if (at < previous) { throw new AssertionError("fixed output cohort timeline moved backward"); }
             previous = at;
+            if (at <= first || at > last) { continue; }
             int bin = (int) Math.min(BINS - 1, Math.floor(((double) (at - first) * BINS) / duration));
             bins[bin]++;
+            completed++;
         }
+        if (completed < 10_000) { throw new AssertionError("common output interval has fewer than ten thousand completed deliveries"); }
         long early = 0, late = 0;
         List<Long> counts = new ArrayList<>();
         for (int i = 0; i < BINS; i++) {
@@ -40,7 +49,7 @@ final class BenchmarkSteadyOutputWindow {
         if (Math.multiplyExact(Math.abs(late - early), 20) > early) {
             throw new AssertionError("fixed output cohort has excessive first-to-last-half trend");
         }
-        return new Reading(first, last, times.size() - 1L, counts, trend, (times.size() - 1L) * 1e9 / duration);
+        return new Reading(first, last, completed, counts, trend, completed * 1e9 / duration);
     }
 
     static Reading readServerOperations(List<Long> wallMillis) {
@@ -57,6 +66,18 @@ final class BenchmarkSteadyOutputWindow {
             if (observedNanos.get(i)<observedNanos.get(i-1)) { throw new AssertionError("local observed delivery cohort moved backward"); }
         }
         return readServerOperations(wallMillis);
+    }
+
+    static Reading readCommonOperations(List<List<Long>> streams) {
+        var merged = mergeValidatedOperationStreams(streams);
+        if (merged.size() < 10_000 || merged.size() > 96_000 || streams.stream().anyMatch(List::isEmpty)) {
+            throw new AssertionError("common operation streams lack their bounded cohorts");
+        }
+        long first = streams.stream().mapToLong(List::getFirst).max().orElseThrow();
+        long last = streams.stream().mapToLong(List::getLast).min().orElseThrow();
+        if (last <= first) { throw new AssertionError("target output streams have no common interval"); }
+        return readWindow(merged.stream().map(value -> Math.multiplyExact(value, 1_000_000L)).toList(),
+                Math.multiplyExact(first, 1_000_000L), Math.multiplyExact(last, 1_000_000L));
     }
 
     static List<Long> mergeValidatedOperationStreams(List<List<Long>> streams) {

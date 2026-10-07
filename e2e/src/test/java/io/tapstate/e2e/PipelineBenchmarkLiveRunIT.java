@@ -54,7 +54,7 @@ class PipelineBenchmarkLiveRunIT {
             Map<String, Object> environment = environment();
             var steadyWorkloads = BenchmarkWorkloadDefinitions.all().stream()
                     .map(workload -> BenchmarkWorkloadDefinitions.steadyPilot(workload.id())).toList();
-            inputs.put("measurementMethod", "FIXED_MIDDLE_SERVER_OPERATION_OUTPUT_V4");
+            inputs.put("measurementMethod", "FIXED_MIDDLE_COMMON_OPERATION_INTERVAL_V5");
             inputs.put("steadyProfileRows", BenchmarkWorkloadDefinitions.STEADY_PILOT_ROWS);
             inputs.put("loadDiagnosticsEnabled", Boolean.getBoolean("tapstate.e2e.benchmark.load-diagnostics"));
             report.begin(inputs, environment, workloads(steadyWorkloads));
@@ -454,10 +454,14 @@ class PipelineBenchmarkLiveRunIT {
                 "durationNanos", phase.completedAckAtNanos() - phase.firstIssuedAtNanos(),
                 "throughputRecordsPerSecond", phase.confirmationTiming().isPresent()
                         ? phase.recordsOutPerSecond() : null,
-                "throughputMethod", phase.steadyOutputProfile() ? "FIXED_MIDDLE_SERVER_OPERATION_OUTPUT_V4" : "SOURCE_ISSUE_TO_OBSERVED_TARGET_V2",
+                "throughputMethod", phase.steadyOutputProfile() ? "FIXED_MIDDLE_COMMON_OPERATION_INTERVAL_V5" : "SOURCE_ISSUE_TO_OBSERVED_TARGET_V2",
                 "steadyStateEstablished", phase.steadyOutputEstablished(),
-                "steadyOutputRule", "FIXED_MIDDLE_COHORT_TEN_PROGRESS_BINS_HALF_TREND_AT_MOST_5_PERCENT",
+                "steadyOutputRule", "COMMON_ACTIVE_INTERVAL_TEN_PROGRESS_BINS_HALF_TREND_AT_MOST_5_PERCENT",
+                "throughputWindowScope", "COMMON_ACTIVE_TARGET_INTERVAL_OPEN_START_CLOSED_END",
                 "deliveryWindowNanos", phase.confirmationTiming().isPresent() ? phase.deliveryWindowNanos() : null,
+                "throughputWindowCompletedDeliveries", phase.steadyOutputProfile()
+                        ? phase.deliveryTimeline().orElseThrow().operationWindow().completedDeliveries() : phase.acknowledgedOutputs(),
+                "latencyCohortScope", "ALL_FIXED_MIDDLE_DELIVERIES_SOURCE_ISSUE_TO_LOCAL_OBSERVATION",
                 "confirmationRecordsPerSecond", phase.confirmationRecordsPerSecond(),
                 "resourceAndCommandWindowScope", "SOURCE_ISSUE_THROUGH_PROOF_CONFIRMATION",
                 "operationResourceWindow", phase.operationResourceWindow().map(window -> object("state", "CALIBRATED_INTERIOR",
@@ -489,6 +493,7 @@ class PipelineBenchmarkLiveRunIT {
                         "cohortObservedAtNanos", timeline.cohortObservedAtNanos(),
                         "fullObservedAtNanos", timeline.fullObservedAtNanos(),
                         "cohortServerOperationWallMillis", timeline.cohortServerOperationWallMillis(),
+                        "cohortOperationStreams", timeline.cohortOperationStreams(),
                         "fullTimelineState", timeline.fullObservedAtNanos().isEmpty() ? "UNAVAILABLE" : "RECORDED"))
                         .orElseGet(() -> object("state", "UNAVAILABLE")),
                 "firstIssuedAtUtcEarliest", anchor.earliestUtc(phase.firstIssuedAtNanos()).toString(),
