@@ -109,8 +109,13 @@ class RealRebuildHandoffCrashIT {
         Map<String, Object> connectors = Map.of("mysql", PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor("mysql")),
                 "mongodb", PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor("mongodb")));
         BenchmarkLiveReport report = new BenchmarkLiveReport(output);
+        boolean directCounts = Boolean.getBoolean(PREFIX + "direct-counts");
+        if (directCounts && cut != RebuildHandoffJdiSession.Cut.PRE_ADMISSION) {
+            throw new AssertionError("snapshot admission command qualification selects PRE_ADMISSION only");
+        }
         report.begin(Map.of("purpose", "REAL_STANDALONE_REBUILD_CRASH", "cut", cut.name(),
                         "application", application, "connectors", connectors, "rows", ROWS,
+                        "directCounts", directCounts,
                         "serverLogDirectory", logDirectory.toString()),
                 Map.of("kind", "correctness-only", "discoveryMode", "none"), List.of());
         try {
@@ -120,7 +125,9 @@ class RealRebuildHandoffCrashIT {
             String storeUri = SharedMongo.replicaSetUrl("rebuild_crash_" + suffix + "_store");
             String targetUri = SharedMongo.replicaSetUrl("rebuild_crash_" + suffix + "_target");
             String operatorDatabase = "rebuild_crash_" + suffix + "_operator";
-            try (MongoClient storeClient = MongoClients.create(storeUri); MongoClient targetClient = MongoClients.create(targetUri)) {
+            try (NativeCoordinationProfile profile = directCounts ? NativeCoordinationProfile.openOwned(storeUri) : null;
+                    MongoClient storeClient = MongoClients.create(storeUri); MongoClient targetClient = MongoClients.create(targetUri)) {
+                String nativeStoreUri = profile == null ? storeUri : profile.nativeUri();
                 MongoDatabase database = storeClient.getDatabase(new ConnectionString(storeUri).getDatabase());
                 MongoDatabase target = targetClient.getDatabase(new ConnectionString(targetUri).getDatabase());
                 var actual = new MongoStateStore(database.getCollection(MongoStorePort.PIPELINE_STATE));
@@ -132,7 +139,7 @@ class RealRebuildHandoffCrashIT {
                 ObservationContinuation savedFloor;
                 long killedPid;
                 try (RebuildHandoffJdiSession first = RebuildHandoffJdiSession.start(
-                        storeUri, operatorDatabase, jar, PIPELINE, TABLE, cut, logDirectory, "first")) {
+                        nativeStoreUri, operatorDatabase, jar, PIPELINE, TABLE, cut, logDirectory, "first")) {
                     report.addFork(Map.of("action", "owned-first-process-ready", "pid", first.server().pid(),
                             "retainedServerOutput", first.retainedOutput().toString()));
                     ControlPlane control = new ControlPlane(first.server().baseUrl());
@@ -141,6 +148,7 @@ class RealRebuildHandoffCrashIT {
                     control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
                     control.apply(resources(source, targetUri));
                     control.discoverSchema("bulk_source", "mysql", source);
+                    recordAdmissionCommands(profile, report, database, "setup-without-start", 0, 0);
                     control.lifecycle(PIPELINE, LifecycleVerb.START);
                     var beforePause = Await.answered("real partial snapshot delivery with known counters and histogram", SETUP_WAIT,
                             () -> latest.readStored(PIPELINE).filter(value -> value.scope().isPresent()
@@ -162,6 +170,8 @@ class RealRebuildHandoffCrashIT {
                     assertThat(paused.scope()).isEqualTo(beforePause.scope());
                     assertThat(generation(database)).isEqualTo(oldScope.executionGeneration());
                     assertThat(desired.read(PIPELINE).orElseThrow().targetState()).isEqualTo(PipelineState.PAUSED);
+                    recordAdmissionCommands(profile, report, database, "first-start-and-snapshot-pause", 2,
+                            oldScope.executionGeneration());
                     first.arm(oldScope);
                     control.lifecycle(PIPELINE, LifecycleVerb.RESUME);
                     RebuildHandoffJdiSession.Held held = first.awaitHeld(SETUP_WAIT);
@@ -196,11 +206,13 @@ class RealRebuildHandoffCrashIT {
                     assertThat(desired.read(PIPELINE)).contains(marker.originalDesired());
                     assertThat(generation(database)).isEqualTo(marker.writerAuthority().executionGeneration());
                 }
+                recordAdmissionCommands(profile, report, database, "resume-held-before-admission-and-crash", 0,
+                        oldScope.executionGeneration());
 
                 // These changes happen while the process is absent, against the same physical source log.
                 mutateDuringCrash(source);
                 try (RebuildHandoffJdiSession restarted = RebuildHandoffJdiSession.start(
-                        storeUri, operatorDatabase, jar, PIPELINE, TABLE, null, logDirectory, "restarted")) {
+                        nativeStoreUri, operatorDatabase, jar, PIPELINE, TABLE, null, logDirectory, "restarted")) {
                     report.addFork(Map.of("action", "owned-restarted-process-ready", "pid", restarted.server().pid(),
                             "retainedServerOutput", restarted.retainedOutput().toString()));
                     assertThat(restarted.server().pid()).isNotEqualTo(killedPid);
@@ -240,6 +252,8 @@ class RealRebuildHandoffCrashIT {
                             "cumulative", factsEvidence(firstKnown.publicValue().observation().facts()),
                             "durableGeneration", expectedGeneration));
                     assertThat(firstKnown.raw().job().bootId()).isNotEqualTo(marker.source().oldJob().bootId());
+                    recordAdmissionCommands(profile, report, database, "same-store-snapshot-rebuild-admitted", 1,
+                            expectedGeneration);
                     if (marker.successor() != null) {
                         assertThat(firstKnown.raw().job().bootId()).isNotEqualTo(marker.successor().submissionBootId());
                     }
@@ -302,6 +316,8 @@ class RealRebuildHandoffCrashIT {
                     assertThat(generation(database)).as("freshness ticks do not admit further executions").isEqualTo(expectedGeneration);
                     assertThat(desired.read(PIPELINE)).contains(marker.originalDesired());
                     assertThat(control.errorCount(PIPELINE)).contains(0L);
+                    recordAdmissionCommands(profile, report, database, "snapshot-CDC-and-unchanged-observation-ticks", 0,
+                            expectedGeneration);
                     report.addFork(Map.of("action", "real-process-recovered", "pid", restarted.server().pid(),
                             "serverOutput", restarted.retainedOutput().toString(), "scope", RebuildHandoffJdiSession.scopeEvidence(expected),
                             "job", RebuildHandoffJdiSession.jobEvidence(repeated.raw().job()),
@@ -313,6 +329,8 @@ class RealRebuildHandoffCrashIT {
                             () -> actual.read(PIPELINE).map(value -> StateJson.parse(value.stateJson()))
                                     .filter(PipelineState.STOPPED::equals).isPresent(), () -> "actual=" + actual.read(PIPELINE));
                 }
+                recordAdmissionCommands(profile, report, database, "final-stop-and-process-shutdown", 0,
+                        Math.incrementExact(oldScope.executionGeneration()));
             }
             assertThat(PipelineBenchmarkLiveRunIT.artifact(jar)).isEqualTo(application);
             assertThat(PipelineBenchmarkLiveRunIT.artifact(ConnectorJars.pathFor("mysql"))).isEqualTo(connectors.get("mysql"));
@@ -324,6 +342,60 @@ class RealRebuildHandoffCrashIT {
             try { report.fail(failure); } catch (RuntimeException recording) { failure.addSuppressed(recording); }
             throw failure;
         }
+    }
+
+    private static void recordAdmissionCommands(NativeCoordinationProfile profile, BenchmarkLiveReport report,
+            MongoDatabase database, String action, long attempts, long expectedGeneration) {
+        if (profile == null) { return; }
+        var boundary = profile.boundary(action);
+        assertThat(boundary.count(NativeCoordinationProfile.Family.ADVANCE_STANDALONE))
+                .as("%s physical standalone allocation attempts", action).isEqualTo(attempts);
+        for (var family : List.of(NativeCoordinationProfile.Family.ACQUIRE, NativeCoordinationProfile.Family.RENEW,
+                NativeCoordinationProfile.Family.RELEASE, NativeCoordinationProfile.Family.ADVANCE_UNDER_CLAIM,
+                NativeCoordinationProfile.Family.RECORD_EXECUTION_FAILURE)) {
+            assertThat(boundary.count(family)).as("%s has no native lease operation %s", action, family).isZero();
+        }
+        List<Document> authorities = database.getCollection(MongoStorePort.WORKLOAD_CLAIMS)
+                .find(new Document("resourceType", "PIPELINE_ACTUATION").append("resourceId", PIPELINE))
+                .limit(2).into(new ArrayList<>());
+        assertThat(authorities).hasSize(expectedGeneration == 0 ? 0 : 1);
+        Map<String, Object> authorityEvidence = Map.of("state", "ABSENT");
+        if (!authorities.isEmpty()) {
+            Document authority = authorities.getFirst();
+            assertThat(((Number) authority.get("executionGeneration")).longValue()).isEqualTo(expectedGeneration);
+            Document key = authority.get("_id", Document.class);
+            assertThat(key).isNotNull();
+            assertThat(key.keySet()).containsExactlyInAnyOrder("clusterId", "resourceType", "resourceId");
+            for (String field : List.of("clusterId", "resourceType", "resourceId")) {
+                assertThat(key.getString(field)).isNotBlank().isEqualTo(authority.getString(field));
+            }
+            assertThat(key.getString("resourceType")).isEqualTo("PIPELINE_ACTUATION");
+            assertThat(key.getString("resourceId")).isEqualTo(PIPELINE);
+            NativeCoordinationProfile.Key factual = new NativeCoordinationProfile.Key(key.getString("clusterId"),
+                    key.getString("resourceType"), key.getString("resourceId"));
+            for (String field : List.of("ownerNodeId", "ownerBootId", "claimGeneration", "leaseUntil")) {
+                assertThat(authority.containsKey(field)).as("standalone has no %s", field).isFalse();
+            }
+            var advances = boundary.operations().stream()
+                    .filter(operation -> operation.family() == NativeCoordinationProfile.Family.ADVANCE_STANDALONE).toList();
+            assertThat(advances).allSatisfy(operation -> {
+                assertThat(operation.key()).isEqualTo(factual);
+                assertThat(operation.errorCode()).isNull();
+            });
+            if (attempts == 2) {
+                assertThat(advances).extracting(NativeCoordinationProfile.Operation::upsert).containsExactly(false, true);
+                assertThat(expectedGeneration).isEqualTo(1);
+            } else { assertThat(advances).allSatisfy(operation -> assertThat(operation.upsert()).isFalse()); }
+            authorityEvidence = Map.of("state", "PRESENT", "key", key.toJson(),
+                    "executionGeneration", expectedGeneration, "leaseFieldsAbsent", true);
+        }
+        Map<String, Object> evidence = new LinkedHashMap<>(boundary.evidence());
+        evidence.put("expectedPhysicalAdvanceAttempts", attempts);
+        evidence.put("factualAuthority", authorityEvidence);
+        evidence.put("generationCommitEvidence", expectedGeneration == 0 ? "ABSENT_AUTHORITY" : "DURABLE_AUTHORITY_DOCUMENT");
+        evidence.put("jobProofFromProfile", false);
+        evidence.put("logicalMethodCountsInferred", false);
+        report.addFork(evidence);
     }
 
     private static Stream<RebuildHandoffJdiSession.Cut> crashCuts() {
