@@ -56,6 +56,7 @@ class PipelineBenchmarkLiveRunIT {
                     .map(workload -> BenchmarkWorkloadDefinitions.steadyPilot(workload.id())).toList();
             inputs.put("measurementMethod", "FIXED_MIDDLE_SERVER_OPERATION_OUTPUT_V4");
             inputs.put("steadyProfileRows", BenchmarkWorkloadDefinitions.STEADY_PILOT_ROWS);
+            inputs.put("loadDiagnosticsEnabled", Boolean.getBoolean("tapstate.e2e.benchmark.load-diagnostics"));
             report.begin(inputs, environment, workloads(steadyWorkloads));
 
             RealBenchmarkForkDriver driver = new RealBenchmarkForkDriver();

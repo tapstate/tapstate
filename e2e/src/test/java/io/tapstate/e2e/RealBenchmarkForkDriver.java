@@ -411,7 +411,9 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 ? targetClockUris.stream().map(BenchmarkTargetClock::read).toList() : List.of();
         if (!targetClocksBefore.isEmpty()) { BenchmarkTargetClock.requireSharedClock(targetClocksBefore); }
         BenchmarkTargetClock.Reading targetClockBefore = targetClocksBefore.isEmpty() ? null : targetClocksBefore.getFirst();
-        BenchmarkNativeQueueProbe nativeProbe = workload.pilotProfile()
+        boolean loadDiagnostics = workload.pilotProfile()
+                && Boolean.getBoolean("tapstate.e2e.benchmark.load-diagnostics");
+        BenchmarkNativeQueueProbe nativeProbe = loadDiagnostics
                 ? new BenchmarkNativeQueueProbe(fork.control(), fork.server().baseUrl().toString(), "tapstate",
                         new com.hazelcast.config.MetricsConfig().getCollectionFrequencySeconds()) : null;
         BenchmarkUnreadSampler nativeQueues = null;
@@ -419,7 +421,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         try {
             nativeQueues = nativeProbe == null ? null : new BenchmarkUnreadSampler(() ->
                     workload.pipelineIds().stream().map(nativeProbe::read).toList());
-            unread = workload.pilotProfile() ? new BenchmarkUnreadSampler(tables) : null;
+            unread = loadDiagnostics ? new BenchmarkUnreadSampler(tables) : null;
         } catch (RuntimeException | Error failure) {
             if (nativeQueues != null) {
                 try { nativeQueues.close(); } catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
