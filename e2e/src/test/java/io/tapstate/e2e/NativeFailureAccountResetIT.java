@@ -67,6 +67,7 @@ class NativeFailureAccountResetIT {
         Path root = PipelineBenchmarkLiveRunIT.harnessRoot();
         PipelineBenchmarkLiveRunIT.requireSafeOutput(output, root);
         boolean firstCurrentWindow = Boolean.getBoolean(PREFIX + "first-current-window");
+        boolean retainedHistoryEvents = Boolean.getBoolean(PREFIX + "retained-history-events");
         Map<String, Object> inputs = inputHashes(root);
         Map<String, Object> connectors = new LinkedHashMap<>();
         for (String name : List.of("mysql", "postgres", "mongodb")) {
@@ -85,7 +86,8 @@ class NativeFailureAccountResetIT {
                     "application", PipelineBenchmarkLiveRunIT.artifact(jar), "expectedJarSha256", sha,
                     "harness", inputs, "connectors", connectors, "prometheusEndpoint", scrape.toString(),
                     "historySampleInterval", "PT2S", "performanceAcceptanceEligible", false,
-                    "firstCurrentWindowRequested", firstCurrentWindow),
+                    "firstCurrentWindowRequested", firstCurrentWindow,
+                    "retainedHistoryEventsRequested", retainedHistoryEvents),
                     PipelineBenchmarkLiveRunIT.environment(), List.of());
             try (var fork = BenchmarkForkEnvironment.open(workload, jar, "positive-failure-reset");
                     var mongo = MongoClients.create(fork.storeUri())) {
@@ -146,6 +148,10 @@ class NativeFailureAccountResetIT {
                                                     && CODE.equals(value.observation().failure().code())).isPresent(),
                             () -> "state=" + control.state(pipeline) + ", failure=" + control.failureCode(pipeline));
                     var failed = latest.readStored(pipeline).orElseThrow();
+                    var retainedTelemetry = retainedHistoryEvents
+                            ? new TelemetryMongoIdentityWitness(database, latest, report, pipeline,
+                                    paused.observation().observedAt().minusSeconds(1), WAIT) : null;
+                    Document retainedFailure = null;
                     assertThat(failed.scope()).isEqualTo(paused.scope());
                     assertThat(failed.observation().observedAt()).isAfter(paused.observation().observedAt());
                     assertThat(authority(database, pipeline, failed).scope()).isEqualTo(old.scope());
@@ -176,6 +182,11 @@ class NativeFailureAccountResetIT {
                     assertThat(lines(failureLogs)).anyMatch(line -> sameLog(line, oldLog));
                     report.addFork(Map.of("action", "positive-account-and-current-log", "account", oldAccount,
                             "logResponse", failureLogs, "oldScope", old.scope(), "ownedPid", observer.server().pid()));
+                    if (retainedTelemetry != null) {
+                        retainedTelemetry.captureIdentityOnly("positive-failed", failed, control, observer.server().baseUrl());
+                        retainedFailure = requireRetainedFailureEvent(database, report, control, observer.server().baseUrl(),
+                                old, paused.observation().observedAt().minusSeconds(1), null, "failure-before-STOP");
+                    }
 
                     control.stop(pipeline, false);
                     Await.until("the restored failed execution to stop without changing its scope", WAIT, () ->
@@ -227,6 +238,10 @@ class NativeFailureAccountResetIT {
                     assertThat(retainedBoundary.decodedAndAuthorityBound()).isTrue();
                     assertThat(folderCleared(retainedBoundary.records())
                             || exporterCleared(retainedBoundary.records(), oldProduced)).isFalse();
+                    if (retainedTelemetry != null) {
+                        retainedTelemetry.captureIdentityOnly("positive-stopped-retained", latest.readStored(pipeline).orElseThrow(),
+                                control, observer.server().baseUrl());
+                    }
                     observer.requireFullBindingsBeforeStart();
                     Map<String, Object> windowAdmission = null;
                     long resetDeadline = firstCurrentWindow ? System.nanoTime() + WAIT.toNanos() : 0;
@@ -301,6 +316,12 @@ class NativeFailureAccountResetIT {
                             "oldScope", old.scope(), "newScope", next.scope(),
                             "oldAccount", oldAccount, "newAccount", object(newAccountRecord.get("account")),
                             "currentLogResponse", resetLogs, "ownedPid", observer.server().pid()));
+                    if (retainedTelemetry != null) {
+                        retainedTelemetry.capture("positive-reset-new-execution", latest.readStored(pipeline).orElseThrow(),
+                                control, observer.server().baseUrl(), true);
+                        requireRetainedFailureEvent(database, report, control, observer.server().baseUrl(), old,
+                                paused.observation().observedAt().minusSeconds(1), retainedFailure, "failure-after-recovery");
+                    }
                     control.stop(pipeline, false);
                     var terminal = observer.shutdownAndFinish();
                     report.addFork(terminal.evidence());
@@ -325,6 +346,56 @@ class NativeFailureAccountResetIT {
             try { report.fail(failure); } catch (RuntimeException reporting) { failure.addSuppressed(reporting); }
             throw failure;
         }
+    }
+
+    private static Document requireRetainedFailureEvent(MongoDatabase database, BenchmarkLiveReport report,
+            ControlPlane control, URI base, NativeTelemetryIdentityJdiSession.AuthorityReceipt old,
+            Instant from, Document previous, String stage) {
+        long deadline = System.nanoTime() + WAIT.toNanos();
+        Document event = Await.answered("the actual scoped coded failure event at " + stage, remainingWindow(deadline), () -> {
+            Document filter = new Document("pipelineId", old.pipelineId()).append("pipelineIncarnationId", old.incarnation())
+                    .append("executionGeneration", old.generation()).append("kind", "FAILURE")
+                    .append("failure.code", CODE);
+            if (previous != null) { filter.append("_id", previous.get("_id")); }
+            Document actual = database.getCollection(MongoStorePort.PIPELINE_EVENTS).find(filter)
+                    .maxTime(remainingWindow(deadline).toNanos(), java.util.concurrent.TimeUnit.NANOSECONDS).first();
+            return Optional.ofNullable(actual);
+        });
+        assertThat(event.get("failure", Document.class)).containsEntry("code", CODE)
+                .containsEntry("params", new Document("pipeline", old.pipelineId()));
+        if (previous != null) { assertThat(event).as("recovery preserves the exact physical failure event").isEqualTo(previous); }
+        Instant to = Instant.now();
+        String path = "/api/pipelines/" + old.pipelineId() + "/events?from="
+                + java.net.URLEncoder.encode(from.toString(), StandardCharsets.UTF_8) + "&to="
+                + java.net.URLEncoder.encode(to.toString(), StandardCharsets.UTF_8) + "&limit=500";
+        HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(20)).build();
+        HttpRequest request = HttpRequest.newBuilder(base.resolve(path))
+                .timeout(remainingWindow(deadline)).header("Authorization", "Bearer " + control.credential()).GET().build();
+        try {
+            HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+            assertThat(response.statusCode()).isEqualTo(200);
+            assertThat(response.body().getBytes(StandardCharsets.UTF_8).length)
+                    .as("the complete retained failure page stays inside the existing response byte budget")
+                    .isLessThanOrEqualTo(MAX_BYTES);
+            Map<String, Object> page = object(JsonReader.parse(response.body()));
+            assertThat(page).containsEntry("completeness", "BEST_EFFORT").containsEntry("nextCursor", null);
+            assertThat(page.get("events")).isInstanceOf(List.class);
+            List<Map<String, Object>> rows = ((List<?>) page.get("events")).stream()
+                    .map(NativeFailureAccountResetIT::object).toList();
+            assertThat(rows).hasSizeLessThanOrEqualTo(500);
+            List<Map<String, Object>> selected = rows.stream()
+                    .filter(row -> event.getString("_id").equals(row.get("id"))).toList();
+            assertThat(selected).hasSize(1);
+            assertThat(selected.getFirst()).containsEntry("kind", "FAILURE");
+            assertThat(object(selected.getFirst().get("failure"))).containsEntry("code", CODE)
+                    .containsEntry("params", Map.of("pipeline", old.pipelineId()));
+            report.addFork(Map.of("action", stage, "physicalEvent", event.toJson(), "publicEvent", selected.getFirst(),
+                    "scope", old.scope(), "httpStatus", response.statusCode(), "completeHistoryClaimed", false));
+        } catch (java.io.IOException failure) { throw new java.io.UncheckedIOException(failure); }
+        catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt(); throw new AssertionError("failure event query interrupted", interrupted);
+        }
+        return new Document(event);
     }
 
     private static Duration remainingWindow(long deadline) {
