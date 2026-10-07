@@ -18,10 +18,10 @@ final class BenchmarkSteadyOutputWindow {
         long first = times.getFirst(), last = times.getLast();
         long duration = last - first;
         if (duration <= 0) { throw new AssertionError("fixed output cohort has no positive observed interval"); }
-        return readWindow(times, first, last);
+        return readWindow(times, first, last, true);
     }
 
-    private static Reading readWindow(List<Long> times, long first, long last) {
+    private static Reading readWindow(List<Long> times, long first, long last, boolean qualify) {
         long duration = last - first;
         long[] bins = new long[BINS];
         long previous = Long.MIN_VALUE;
@@ -40,16 +40,13 @@ final class BenchmarkSteadyOutputWindow {
         long early = 0, late = 0;
         List<Long> counts = new ArrayList<>();
         for (int i = 0; i < BINS; i++) {
-            if (bins[i] == 0) { throw new AssertionError("fixed output cohort contains an idle time bin"); }
             counts.add(bins[i]);
             if (i < BINS / 2) { early += bins[i]; } else { late += bins[i]; }
         }
         double trend = Math.abs((double) late / early - 1);
-        // Integer counts preserve the inclusive five-percent boundary without rounding it upward.
-        if (Math.multiplyExact(Math.abs(late - early), 20) > early) {
-            throw new AssertionError("fixed output cohort has excessive first-to-last-half trend");
-        }
-        return new Reading(first, last, completed, counts, trend, completed * 1e9 / duration);
+        var reading = new Reading(first, last, completed, counts, trend, completed * 1e9 / duration);
+        if (qualify) { requireSteady(reading); }
+        return reading;
     }
 
     static Reading readServerOperations(List<Long> wallMillis) {
@@ -69,6 +66,10 @@ final class BenchmarkSteadyOutputWindow {
     }
 
     static Reading readCommonOperations(List<List<Long>> streams) {
+        return readCommonOperations(streams, true);
+    }
+
+    static Reading readCommonOperations(List<List<Long>> streams, boolean qualify) {
         var merged = mergeValidatedOperationStreams(streams);
         if (merged.size() < 10_000 || merged.size() > 96_000 || streams.stream().anyMatch(List::isEmpty)) {
             throw new AssertionError("common operation streams lack their bounded cohorts");
@@ -77,7 +78,19 @@ final class BenchmarkSteadyOutputWindow {
         long last = streams.stream().mapToLong(List::getLast).min().orElseThrow();
         if (last <= first) { throw new AssertionError("target output streams have no common interval"); }
         return readWindow(merged.stream().map(value -> Math.multiplyExact(value, 1_000_000L)).toList(),
-                Math.multiplyExact(first, 1_000_000L), Math.multiplyExact(last, 1_000_000L));
+                Math.multiplyExact(first, 1_000_000L), Math.multiplyExact(last, 1_000_000L), qualify);
+    }
+
+    static void requireSteady(Reading reading) {
+        if (reading.fixedBins().stream().anyMatch(count -> count == 0)) {
+            throw new AssertionError("fixed output cohort contains an idle time bin");
+        }
+        long early = reading.fixedBins().subList(0, BINS / 2).stream().mapToLong(Long::longValue).sum();
+        long late = reading.fixedBins().subList(BINS / 2, BINS).stream().mapToLong(Long::longValue).sum();
+        // Integer counts preserve the inclusive five-percent boundary without rounding it upward.
+        if (Math.multiplyExact(Math.abs(late - early), 20) > early) {
+            throw new AssertionError("fixed output cohort has excessive first-to-last-half trend");
+        }
     }
 
     static List<Long> mergeValidatedOperationStreams(List<List<Long>> streams) {

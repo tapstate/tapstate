@@ -108,7 +108,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     .equals(cohortServerOperationWallMillis)) {
                 throw new AssertionError("per-target operation streams differ from their full cohort");
             }
-            return BenchmarkSteadyOutputWindow.readCommonOperations(cohortOperationStreams);
+            return BenchmarkSteadyOutputWindow.readCommonOperations(cohortOperationStreams, false);
         }
     }
 
@@ -191,7 +191,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         boolean steadyOutputEstablished() {
             if (!steadyOutputProfile || deliveryTimeline.isEmpty() || confirmationTiming.isEmpty()) { return false; }
             var timeline = deliveryTimeline.orElseThrow();
-            timeline.operationWindow();
+            try { BenchmarkSteadyOutputWindow.requireSteady(timeline.operationWindow()); }
+            catch (AssertionError notSteady) { return false; }
             return true;
         }
     }
@@ -228,7 +229,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             if (!workload.pilotProfile()) { throw new AssertionError("steady output requires the predeclared load profile"); }
             for (var phase : phases) {
                 var timeline = phase.deliveryTimeline().orElseThrow(() -> new AssertionError("steady output has no complete timeline"));
-                timeline.operationWindow();
+                BenchmarkSteadyOutputWindow.requireSteady(timeline.operationWindow());
             }
         }
     }

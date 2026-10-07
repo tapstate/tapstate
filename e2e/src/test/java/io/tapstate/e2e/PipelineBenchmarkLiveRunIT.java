@@ -60,6 +60,7 @@ class PipelineBenchmarkLiveRunIT {
             report.begin(inputs, environment, workloads(steadyWorkloads));
 
             RealBenchmarkForkDriver driver = new RealBenchmarkForkDriver();
+            List<String> qualificationFailures = new ArrayList<>();
             PipelineBenchmarkHarness.Report result = PipelineBenchmarkHarness.run(
                     config.gate(), config.baselineJar(), config.candidateJar(),
                     config.target(), config.primary(), (workload, arm, armFork, jar) -> {
@@ -72,13 +73,19 @@ class PipelineBenchmarkLiveRunIT {
                             throw new AssertionError("completed fork evidence has the wrong identity: " + expectedId);
                         }
                         report.addFork(fork(evidence, completed, startedAt));
-                        evidence.requireSteadyStateWindow();
+                        try { evidence.requireSteadyStateWindow(); }
+                        catch (AssertionError unqualified) {
+                            qualificationFailures.add(expectedId + ": " + unqualified.getMessage());
+                        }
                         return completed;
                     }, steadyWorkloads);
             PipelineBenchmarkComparison.Evaluation evaluation = result.evaluation();
-            report.finish(evaluation(evaluation), evaluation.passed());
-            if (!evaluation.passed()) {
+            boolean passed = evaluation.passed() && qualificationFailures.isEmpty();
+            Map<String, Object> finalEvaluation = qualifiedEvaluation(evaluation, qualificationFailures);
+            report.finish(finalEvaluation, passed);
+            if (!passed) {
                 throw new AssertionError("live benchmark gate failed: " + evaluation.failures()
+                        + "; qualification failures: " + qualificationFailures
                         + "; raw evidence: " + report.output());
             }
         } catch (Exception | Error failure) {
@@ -461,6 +468,10 @@ class PipelineBenchmarkLiveRunIT {
                 "deliveryWindowNanos", phase.confirmationTiming().isPresent() ? phase.deliveryWindowNanos() : null,
                 "throughputWindowCompletedDeliveries", phase.steadyOutputProfile()
                         ? phase.deliveryTimeline().orElseThrow().operationWindow().completedDeliveries() : phase.acknowledgedOutputs(),
+                "outputWindowDiagnostics", phase.steadyOutputProfile()
+                        ? object("fixedBins", phase.deliveryTimeline().orElseThrow().operationWindow().fixedBins(),
+                                "halfTrend", Double.isFinite(phase.deliveryTimeline().orElseThrow().operationWindow().halfTrend())
+                                        ? phase.deliveryTimeline().orElseThrow().operationWindow().halfTrend() : null) : null,
                 "latencyCohortScope", "ALL_FIXED_MIDDLE_DELIVERIES_SOURCE_ISSUE_TO_LOCAL_OBSERVATION",
                 "confirmationRecordsPerSecond", phase.confirmationRecordsPerSecond(),
                 "resourceAndCommandWindowScope", "SOURCE_ISSUE_THROUGH_PROOF_CONFIRMATION",
@@ -570,6 +581,14 @@ class PipelineBenchmarkLiveRunIT {
                         "candidate", summary(entry.getValue().candidate()))));
         return object("passed", evaluation.passed(), "failures", evaluation.failures(),
                 "workloads", workloads);
+    }
+
+    static Map<String, Object> qualifiedEvaluation(PipelineBenchmarkComparison.Evaluation evaluation,
+                                                 List<String> qualificationFailures) {
+        Map<String, Object> result = evaluation(evaluation);
+        result.put("passed", evaluation.passed() && qualificationFailures.isEmpty());
+        result.put("qualificationFailures", List.copyOf(qualificationFailures));
+        return result;
     }
 
     private static Map<String, Object> summary(PipelineBenchmarkComparison.Summary summary) {

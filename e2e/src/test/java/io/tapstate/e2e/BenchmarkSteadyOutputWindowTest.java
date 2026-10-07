@@ -6,6 +6,27 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class BenchmarkSteadyOutputWindowTest {
+    @Test void rejectedTrendStillRetainsTheCompleteMeasuredReading() {
+        var stream = trendTimeline(10_501);
+        var reading = BenchmarkSteadyOutputWindow.readCommonOperations(java.util.List.of(stream), false);
+        assertThat(reading.completedDeliveries()).isEqualTo(20_501);
+        assertThat(reading.fixedBins()).hasSize(10);
+        assertThat(reading.recordsPerSecond()).isEqualTo(20_501);
+        assertThatThrownBy(() -> BenchmarkSteadyOutputWindow.requireSteady(reading))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("trend");
+    }
+
+    @Test void aRecordedIdleWindowStillFailsQualification() {
+        var operations = new ArrayList<Long>();
+        operations.add(0L);
+        for (int i = 0; i < 12_000; i++) { operations.add(1_000_000L + i); }
+        var reading = BenchmarkSteadyOutputWindow.readCommonOperations(java.util.List.of(operations), false);
+        assertThat(reading.completedDeliveries()).isEqualTo(12_000);
+        assertThat(reading.fixedBins()).contains(0L);
+        assertThatThrownBy(() -> BenchmarkSteadyOutputWindow.requireSteady(reading))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("idle time bin");
+    }
+
     @Test void independentlySteadyTargetsCannotCreateAnApparentRateTrend() {
         var faster = new ArrayList<Long>();
         var slower = new ArrayList<Long>();

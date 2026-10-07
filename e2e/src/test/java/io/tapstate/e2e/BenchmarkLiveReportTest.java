@@ -19,6 +19,17 @@ class BenchmarkLiveReportTest {
     Path directory;
 
     @Test
+    void passingCostNumbersCannotOverrideAFailedForkQualification() {
+        var cost = new PipelineBenchmarkComparison.Evaluation(Map.of(), List.of());
+        assertThat(cost.passed()).isTrue();
+        assertThat(PipelineBenchmarkLiveRunIT.qualifiedEvaluation(cost, List.of()))
+                .containsEntry("passed", true);
+        assertThat(PipelineBenchmarkLiveRunIT.qualifiedEvaluation(cost, List.of("copy-A-1: trend")))
+                .containsEntry("passed", false)
+                .containsEntry("qualificationFailures", List.of("copy-A-1: trend"));
+    }
+
+    @Test
     void aFailureRetainsTheLastCompletedForkOnDisk() throws Exception {
         Path output = directory.resolve("raw.json");
         BenchmarkLiveReport report = new BenchmarkLiveReport(output);
