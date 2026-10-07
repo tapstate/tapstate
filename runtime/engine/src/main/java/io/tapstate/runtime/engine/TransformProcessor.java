@@ -26,7 +26,8 @@ import java.util.Objects;
  * port is a pure function that never sets a position, so the adapter stamps the inbound event's
  * position onto every event the port returns. A fan-out's several outputs all share the one inbound
  * position; its completion is the sink's concern (every output must settle before the position is
- * acked). An inbound event with no position stamps none.
+ * acked). A dropped event settles its positions with a marker on the same edge, behind earlier output.
+ * An inbound event with no position stamps none.
  *
  * <p>Emit-side backpressure is the adapter's concern too: the flat mapper resumes a partially emitted
  * event when the outbox is full, so the port stays a pure function that does not pace itself.
@@ -41,7 +42,7 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
         return Stage.TRANSFORM;
     }
 
-    private final FlatMapper<Envelope, Envelope> flatMapper;
+    private final FlatMapper<Envelope, Object> flatMapper;
     private final LevelBounds bounds;
     // Times each row through the port, which is this stage's unit of work. Counts for nobody until init
     // says whether there is a job to report into.
@@ -73,7 +74,12 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
             // the outbox's pace, which is the substrate's time and not this stage's.
             long started = timer.begin();
             try {
-                return Traversers.traverseIterable(port.transform(event))
+                List<Envelope> outputs = port.transform(event);
+                if (outputs.isEmpty() && !event.positions().isEmpty()) {
+                    // No record will carry this position to the sink, so settle it on the same ordered edge.
+                    return Traversers.singleton(new SettledPositions(event.positions()));
+                }
+                return Traversers.traverseIterable(outputs)
                         .map(out -> out.withPositions(event.positions()));
             } finally {
                 timer.end(started);
