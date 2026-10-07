@@ -884,6 +884,10 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
                 });
                 Object readerOffset = MysqlResumeOffset.forReader(connector.connectorId(), startOffset,
                         connector.context().getStateMap(), () -> InstanceFactory.instance(JsonParser.class));
+                if (resumeAt != null) {
+                    readerOffset = PostgresResumeOffset.forReader(connector.connectorId(), readerOffset,
+                            () -> InstanceFactory.instance(JsonParser.class));
+                }
                 stream.streamRead(connector.context(), config.streams(), readerOffset, BATCH_SIZE, consumer);
                 return null;
             });
