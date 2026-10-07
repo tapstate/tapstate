@@ -23,6 +23,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.IntConsumer;
+import java.util.function.BooleanSupplier;
 
 /**
  * An independent PDK reader for one benchmark source chain. It proves its present-start stream is
@@ -130,7 +131,7 @@ final class BenchmarkTerminalCapture implements AutoCloseable {
             if (remaining == 0) {
                 throw new AssertionError("sidecar did not observe warm-up row " + warmupRowId + " on " + table);
             }
-            listener.waitForChange(remaining);
+            listener.waitForChange(remaining, listener::warmupSeen);
         }
     }
 
@@ -149,7 +150,7 @@ final class BenchmarkTerminalCapture implements AutoCloseable {
             if (remaining == 0) {
                 throw new AssertionError("sidecar did not observe terminal row " + terminalRowId + " on " + table);
             }
-            listener.waitForChange(remaining);
+            listener.waitForChange(remaining, listener::terminalSeen);
         }
     }
 
@@ -171,7 +172,7 @@ final class BenchmarkTerminalCapture implements AutoCloseable {
             if (remaining == 0) {
                 throw new AssertionError("sidecar did not observe a restored boundary row on " + table);
             }
-            listener.waitForChange(remaining);
+            listener.waitForChange(remaining, listener::boundarySeen);
         }
     }
 
@@ -194,7 +195,7 @@ final class BenchmarkTerminalCapture implements AutoCloseable {
             if (remaining == 0) {
                 throw new AssertionError("sidecar did not observe measured-end row for " + phaseId);
             }
-            listener.waitForChange(remaining);
+            listener.waitForChange(remaining, () -> listener.measuredToken(phaseId) != null);
         }
     }
 
@@ -471,11 +472,12 @@ final class BenchmarkTerminalCapture implements AutoCloseable {
             }
         }
 
-        void waitForChange(long nanos) {
+        void waitForChange(long nanos, BooleanSupplier complete) {
             if (nanos <= 0) {
                 return;
             }
             synchronized (monitor) {
+                if (failure != null || complete.getAsBoolean()) { return; }
                 try {
                     TimeUnit.NANOSECONDS.timedWait(monitor, nanos);
                 } catch (InterruptedException interrupted) {
