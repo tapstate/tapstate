@@ -364,4 +364,28 @@
       </plugin>
     </plugins>
   </build>
+
+  <profiles>
+    <profile>
+      <id>benchmark-dual-gc-diagnostics</id>
+      <activation>
+        <property>
+          <name>tapstate.e2e.benchmark-smoke.dual-gc-diagnostics</name>
+          <value>true</value>
+        </property>
+      </activation>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <configuration>
+              <!-- Keep the module opening and the existing exclusion of the parent coverage agent. -->
+              <argLine>--add-opens java.base/java.lang=ALL-UNNAMED "-Xlog:gc*,safepoint:file=${tapstate.e2e.benchmark-smoke.dual-gc-directory}/driver-%p.log:utctime,uptimenanos,level,tags:filecount=1,filesize=4m"</argLine>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>

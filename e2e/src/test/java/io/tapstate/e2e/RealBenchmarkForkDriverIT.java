@@ -65,8 +65,17 @@ class RealBenchmarkForkDriverIT {
             if (jvmDiagnostics && mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN) {
                 throw new AssertionError("JVM gap diagnostics require an independent plain artifact run");
             }
-            RealBenchmarkForkDriver driver = jvmDiagnostics
-                    ? new RealBenchmarkForkDriver(BenchmarkJvmDiagnostics::start)
+            boolean dualGcDiagnostics = Boolean.getBoolean(BenchmarkDualGcDiagnostics.ENABLED_PROPERTY);
+            if (dualGcDiagnostics && (!"copy".equals(workloadId)
+                    || arm != PipelineBenchmarkComparison.Arm.B
+                    || mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN || jvmDiagnostics)) {
+                throw new AssertionError("owned dual GC diagnostics require one plain copy B fork without JFR");
+            }
+            BenchmarkDualGcDiagnostics.Session dualGc = dualGcDiagnostics
+                    ? BenchmarkDualGcDiagnostics.open() : null;
+            RealBenchmarkForkDriver driver = dualGc != null
+                    ? new RealBenchmarkForkDriver(dualGc::start)
+                    : jvmDiagnostics ? new RealBenchmarkForkDriver(BenchmarkJvmDiagnostics::start)
                     : mode.driver(applicationJar, artifact);
             int forkNumber = Integer.parseInt(System.getProperty(FORK_PROPERTY, "1"));
             assertThat(forkNumber).as("the diagnostic fork number").isBetween(1, 5);
@@ -78,6 +87,10 @@ class RealBenchmarkForkDriverIT {
             if ((settlingCalibration || fullSettlingCalibration)
                     && (!pilot || pacedCalibration || (settlingCalibration && fullSettlingCalibration))) {
                 throw new AssertionError("settling calibration requires the original larger schedule and cannot mix calibrations");
+            }
+            if (dualGcDiagnostics && (!pilot || !fullSettlingCalibration
+                    || settlingCalibration || pacedCalibration || forkOutput == null)) {
+                throw new AssertionError("owned dual GC diagnostics require the unchanged full-settling profile and exact fork output");
             }
             var workload = fullSettlingCalibration ? BenchmarkWorkloadDefinitions.cdcFullSettlingCalibration(workloadId)
                     : settlingCalibration ? BenchmarkWorkloadDefinitions.cdcSettlingCalibration(workloadId)
@@ -172,6 +185,9 @@ class RealBenchmarkForkDriverIT {
                         : settlingCalibration ? "FIXED_FIRST_QUARTER_CDC_SETTLING_CALIBRATION"
                         : pacedCalibration ? "FIXED_PACING_CALIBRATION_5MS_50MS" : "ORIGINAL_BATCH_SCHEDULE";
                 String json = JsonWriter.write(Map.of(
+                        "forkOutputSchemaVersion", 2,
+                        "dualGcDiagnostics", dualGc == null
+                                ? Map.of("schemaVersion", 1, "enabled", false) : dualGc.evidence(),
                         "formalPerformance", false,
                         "performanceAcceptanceEligible", false,
                         "acceptanceEvaluated", false,
