@@ -756,6 +756,12 @@ class LifecycleVerbsOnRealChainE2ETest {
      * that the reading is stamped at all is asserted once, separately, where it means something.
      */
     private void assertReadFaceReports(String pipelineId, PipelineState expected) {
+        // A status change during native sampling invalidates that frame; the next real tick publishes it.
+        awaitCondition(() -> {
+            driver.reconcile();
+            return store.observations().read(pipelineId)
+                    .filter(value -> value.state() == expected && value.failure() == null).isPresent();
+        }, () -> "current observation has not caught up to " + expected + ": " + store.observations().read(pipelineId));
         assertThat(readFaces.status(pipelineId))
                 .returns(pipelineId, PipelineStatus::pipelineId)
                 .returns(expected, PipelineStatus::state)

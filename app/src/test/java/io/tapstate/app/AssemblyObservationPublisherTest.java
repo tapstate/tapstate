@@ -52,7 +52,7 @@ class AssemblyObservationPublisherTest {
     void bindsOneCompleteDeliveryReadingAndKeepsAnUnavailableReadingAbsent() {
         InMemoryStorePort store = new InMemoryStorePort(new InMemoryArtifactStore());
         store.state().create(PIPELINE, StateJson.of(PipelineState.RUNNING), T0);
-        Engine engine = mock(Engine.class);
+        Engine engine = metricEngine();
         DeliveryReading measured = new DeliveryReading(Map.of(TABLE, Map.of("i", 4L)),
                 Map.of(TABLE, 40L), Map.of(TABLE, T0.toEpochMilli()), T0, Map.of());
         when(engine.deliveryReading(PIPELINE)).thenReturn(measured, DeliveryReading.NONE);
@@ -84,7 +84,7 @@ class AssemblyObservationPublisherTest {
     void bindsCompleteActiveBusinessWorkWithoutRedatingTheCollectedSample() {
         InMemoryStorePort store = new InMemoryStorePort(new InMemoryArtifactStore());
         store.state().create(PIPELINE, StateJson.of(PipelineState.RUNNING), T0);
-        Engine engine = mock(Engine.class);
+        Engine engine = metricEngine();
         when(engine.stageRuntimeReading(PIPELINE)).thenReturn(new StageRuntimeReading(
                 new StageWorkReading(Map.of("transform", 1L), T0), StageQueueReading.NONE));
         ObservationPublisher publisher = new RuntimeConvergenceConfiguration()
@@ -106,7 +106,7 @@ class AssemblyObservationPublisherTest {
     void bindsCompleteOutputRetryFactsAndRetainsOtherStageFactsWhenOutputBecomesUnavailable() {
         InMemoryStorePort store = new InMemoryStorePort(new InMemoryArtifactStore());
         store.state().create(PIPELINE, StateJson.of(PipelineState.RUNNING), T0);
-        Engine engine = mock(Engine.class);
+        Engine engine = metricEngine();
         StageWorkReading work = new StageWorkReading(Map.of("transform", 1L), T0);
         StageQueueReading queues = new StageQueueReading(Map.of("transform", new StageQueueReading.Sample(
                 new QueueReading(2, 16, 4), T0)));
@@ -152,6 +152,9 @@ class AssemblyObservationPublisherTest {
         HazelcastInstance member = mock(HazelcastInstance.class);
         JetService jet = mock(JetService.class);
         when(member.getJet()).thenReturn(jet);
+        com.hazelcast.cluster.Cluster cluster = mock(com.hazelcast.cluster.Cluster.class);
+        when(member.getCluster()).thenReturn(cluster);
+        when(cluster.getMembers()).thenReturn(java.util.Set.of());
         when(jet.getJob(anyString())).thenReturn(null);
         ObservationPublisher publisher =
                 new RuntimeConvergenceConfiguration()
@@ -178,7 +181,7 @@ class AssemblyObservationPublisherTest {
         // real nest job. What is pinned is that the factory binds the port at all - a publisher built
         // without it goes on projecting every other statistic, and the one reading that tells a stalled
         // frontier's two causes apart is simply never there to be missed.
-        Engine engine = mock(Engine.class);
+        Engine engine = metricEngine();
         when(engine.frontierGaps(PIPELINE)).thenReturn(Map.of(TABLE, 480L));
         ObservationPublisher publisher = new RuntimeConvergenceConfiguration()
                 .observationPublisher(store, engine, new NoOpCaptureCoordinator());
@@ -194,7 +197,7 @@ class AssemblyObservationPublisherTest {
     void projectsOnlyMeasuredSinkBatchesFromTheEnginePort() {
         InMemoryStorePort store = new InMemoryStorePort(new InMemoryArtifactStore());
         store.state().create(PIPELINE, StateJson.of(PipelineState.RUNNING), T0);
-        Engine engine = mock(Engine.class);
+        Engine engine = metricEngine();
         when(engine.sinkBatchReading(PIPELINE)).thenReturn(
                 new SinkBatchReading(1, 2, 2, 1, 1, null, null, null, T0));
 
@@ -213,7 +216,7 @@ class AssemblyObservationPublisherTest {
     void projectsOnlyMeasuredInputQueuePressureFromTheEnginePort() {
         InMemoryStorePort store = new InMemoryStorePort(new InMemoryArtifactStore());
         store.state().create(PIPELINE, StateJson.of(PipelineState.RUNNING), T0);
-        Engine engine = mock(Engine.class);
+        Engine engine = metricEngine();
         when(engine.queueReading(PIPELINE)).thenReturn(Optional.of(new QueueReading(64, 64, 64)));
 
         ObservationPublisher publisher = new RuntimeConvergenceConfiguration()
@@ -233,5 +236,15 @@ class AssemblyObservationPublisherTest {
                         assertThat(point.value()).isEqualTo(64L);
                     });
                 });
+    }
+    private static Engine metricEngine() {
+        Engine engine = mock(Engine.class);
+        // Native identity sampling is an explicit boundary double; the assembly wiring remains real.
+        when(engine.openObservationMetrics(anyString())).thenAnswer(ignored -> {
+            var session = mock(Engine.ObservationMetricsSession.class);
+            when(session.current()).thenReturn(true);
+            return session;
+        });
+        return engine;
     }
 }
