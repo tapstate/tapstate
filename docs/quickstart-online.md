@@ -54,8 +54,10 @@ outside the catalog remain the operator's responsibility. This deployment allowa
 certification claim: this preview certifies MongoDB write support only. Applying a cloud pipeline
 whose sync names another connector is refused; reading through it is unaffected.
 
-Db2 is accepted as a source-only **unverified preview**, outside the certified table: no
-release lane reads a live Db2 database, and Db2 reads have not yet been verified against one.
+Db2 is accepted as a source-only **preview**, outside the certified table: no release lane
+reads a live Db2 database. Snapshot, change capture of inserts, updates and deletes, and
+continuation across a server restart were verified by hand against Db2 LUW 11.5.5 in both
+change-capture modes below.
 Db2 is supported as a source only. Its connector can write, but its catalog row is not
 sink-capable, so a `serve.sync` naming a `db2` connection is refused on-prem as well as in
 the cloud profile, and no authoring surface offers it as a target. Db2 LUW reads take a
@@ -67,7 +69,8 @@ client prepared once on that host with `db2-native-runtime-setup.sh` from the sa
 the published jar carries the native bridge but not the runtime archive it loads. The
 published server image runs as a non-root user and is not prepared for this mode. Without
 `useNativeMiner`, the connector reads changes from a raw log server at the configured
-`rawLogServerHost` and `rawLogServerPort`.
+`rawLogServerHost` and `rawLogServerPort`; that mode is experimental and not supported for
+production use, where the native mode is the one to run.
 
 Reads are verified on Oracle Free 23 and SQL Server 2022, and across MySQL, PostgreSQL
 and MongoDB, with snapshot and CDC inserts, updates and deletes. Decimal validation includes a persisted MySQL DECIMAL(18,4) model, large values,
