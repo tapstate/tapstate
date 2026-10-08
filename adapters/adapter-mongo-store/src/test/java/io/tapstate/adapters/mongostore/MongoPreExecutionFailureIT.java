@@ -1,10 +1,12 @@
 package io.tapstate.adapters.mongostore;
 
 import com.mongodb.ConnectionString;
+import com.mongodb.MongoException;
 import com.mongodb.MongoClientSettings;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.MongoCollection;
 import com.mongodb.event.CommandListener;
 import com.mongodb.event.CommandStartedEvent;
 import io.tapstate.core.common.TapstateException;
@@ -13,6 +15,10 @@ import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
+import io.tapstate.core.lifecycle.MetricAttributes;
+import io.tapstate.core.lifecycle.MetricFact;
+import io.tapstate.core.lifecycle.MetricPoint;
+import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.core.model.Resource;
@@ -20,11 +26,17 @@ import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.PreExecutionFailure;
+import io.tapstate.spi.store.ObservationContinuation;
+import io.tapstate.spi.store.StopAuthority;
+import io.tapstate.spi.store.StopReservation;
 import io.tapstate.testsupport.RequiresDocker;
 import java.time.Instant;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -34,6 +46,8 @@ import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.Arguments;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
@@ -138,6 +152,31 @@ class MongoPreExecutionFailureIT {
             assertThatThrownBy(() -> f.observations.readStored(PIPE)).isInstanceOfSatisfying(TapstateException.class,
                     failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
         }
+    }
+
+    @ParameterizedTest
+    @MethodSource("malformedOwnerFields")
+    void malformedPrivateOwnerFieldsAreCodedAndNeverReadTheLegacyFallback(String field, Object value) {
+        try (Fixture f = new Fixture(false)) {
+            assertThat(f.observations.savePreExecutionFailure(f.failure(AT, SOURCE), f.receipt)).isTrue();
+            f.db.getCollection("observations").insertOne(MongoObservationStore.toDocument(f.running(AT)));
+            f.db.getCollection("observations").updateOne(new Document("_id", MongoLatestObservationStorage.manifestKey(PIPE)),
+                    new Document("$set", new Document("current." + field, value)));
+            assertThatThrownBy(() -> f.observations.readStored(PIPE)).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+        }
+    }
+
+    private static java.util.stream.Stream<Arguments> malformedOwnerFields() {
+        return java.util.stream.Stream.of(
+                Arguments.of("diagnosticOwner.version", 2),
+                Arguments.of("diagnosticOwner.checkpointEpoch", 1.5),
+                Arguments.of("diagnosticOwner.checkpointDigest", "not-a-digest"),
+                Arguments.of("diagnosticOwner.pipelineId", "another-pipeline"),
+                Arguments.of("diagnosticOwner.pipelineIncarnationId", "another-incarnation"),
+                Arguments.of("diagnosticOwner.generationFrontier", new Document("presence", "ABSENT").append("value", 0L)),
+                Arguments.of("diagnosticOwner.generationFrontier", new Document("presence", "PRESENT").append("value", 0L)),
+                Arguments.of("executionGeneration", 1L));
     }
 
     @Test
@@ -245,6 +284,175 @@ class MongoPreExecutionFailureIT {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void aLiveContinueMustCoverTheLatestPublicTotalBeforeAColdDiagnosticCanReplaceIt(boolean legacy) {
+        try (Fixture f = new Fixture(true)) {
+            var scope = new ObservationStore.Scope(f.incarnation, 1);
+            f.saveSource(sourceObservation(7, AT), scope, legacy);
+            StopReservation marker = f.seedLiveContinue(scope);
+            var first = f.observations.saveContinuation(PIPE, marker, Optional.empty(), floor(marker, 7)).orElseThrow();
+            f.saveSource(sourceObservation(8, AT.plusSeconds(1)), scope, legacy);
+
+            assertThat(f.observations.savePreExecutionFailure(f.failure(AT.plusSeconds(2), SOURCE), f.receipt)).isFalse();
+            assertThat(f.observations.preExecutionFailureInputsCurrent(f.receipt.owner())).isTrue();
+            assertThat(f.observations.read(PIPE)).contains(sourceObservation(8, AT.plusSeconds(1)));
+            assertThat(f.observations.readContinuation(PIPE).orElseThrow().receipt()).isEqualTo(first);
+            assertThat(f.observations.readContinuation(PIPE).orElseThrow().continuation().baselineFacts())
+                    .containsExactly(records(7, AT));
+
+            var updated = f.observations.saveContinuation(PIPE, marker, Optional.of(first), floor(marker, 8)).orElseThrow();
+            assertThat(f.observations.savePreExecutionFailure(f.failure(AT.plusSeconds(3), SOURCE), f.receipt)).isTrue();
+            MongoObservationStore cold = f.newStore(f.db.getCollection("chunks"));
+            assertThat(cold.read(PIPE)).contains(f.failure(AT.plusSeconds(3), SOURCE));
+            assertThat(cold.isCurrentPreExecutionFailure(f.receipt.owner())).isTrue();
+            assertThat(cold.readContinuation(PIPE).orElseThrow().receipt()).isEqualTo(updated);
+            assertThat(cold.readContinuation(PIPE).orElseThrow().continuation().baselineFacts())
+                    .containsExactly(records(8, AT));
+            assertThat(f.claims.currentGeneration(CLUSTER, PIPE)).isEqualTo(OptionalLong.of(1));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void aConcurrentSourceChangeConflictsWithTheActualDiagnosticCommit(boolean legacy) throws Exception {
+        CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1);
+        AtomicBoolean armed = new AtomicBoolean();
+        CommandListener listener = new CommandListener() {
+            @Override public void commandStarted(CommandStartedEvent event) {
+                if (!event.getCommandName().equals("update")
+                        || !event.getCommand().getString("update").getValue().equals("observations")) { return; }
+                var query = event.getCommand().getArray("updates").getFirst().asDocument().getDocument("q");
+                var id = query.get("_id");
+                if (id == null || legacy != id.isString() || id.isString() && !id.asString().getValue().equals(PIPE)
+                        || !armed.compareAndSet(true, false)) { return; }
+                entered.countDown();
+                try {
+                    if (!release.await(10, TimeUnit.SECONDS)) { throw new AssertionError("source guard was not released"); }
+                } catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+            }
+        };
+        try (Fixture f = new Fixture(true, listener); var worker = Executors.newSingleThreadExecutor()) {
+            var scope = new ObservationStore.Scope(f.incarnation, 1);
+            f.saveSource(sourceObservation(7, AT), scope, legacy);
+            StopReservation marker = f.seedLiveContinue(scope);
+            var first = f.observations.saveContinuation(PIPE, marker, Optional.empty(), floor(marker, 7)).orElseThrow();
+            armed.set(true);
+            var result = worker.submit(() -> f.observations.savePreExecutionFailure(f.failure(AT.plusSeconds(2), SOURCE), f.receipt));
+            try {
+                assertThat(entered.await(10, TimeUnit.SECONDS)).isTrue();
+                f.saveSource(sourceObservation(8, AT.plusSeconds(1)), scope, legacy);
+            } finally { release.countDown(); }
+            assertThat(result.get(15, TimeUnit.SECONDS)).isFalse();
+            assertThat(f.observations.read(PIPE)).contains(sourceObservation(8, AT.plusSeconds(1)));
+            assertThat(f.observations.readContinuation(PIPE).orElseThrow().receipt()).isEqualTo(first);
+            assertThat(f.observations.readStored(PIPE).orElseThrow().refusal()).isEmpty();
+        }
+    }
+
+    @Test
+    void aSourcePayloadOutageKeepsItsKnownFloorAndTheOriginalCauseRetryable() {
+        try (Fixture f = new Fixture(true)) {
+            var scope = new ObservationStore.Scope(f.incarnation, 1);
+            Observation source = new Observation(PIPE, PipelineState.PAUSED, Map.of("records.out", 8L), Map.of(),
+                    Map.of("orders", "x".repeat(600 * 1024)), null, AT, List.of(records(8, AT)));
+            assertThat(f.observations.saveScoped(source, scope)).isTrue();
+            StopReservation marker = f.seedLiveContinue(scope);
+            var first = f.observations.saveContinuation(PIPE, marker, Optional.empty(), floor(marker, 7)).orElseThrow();
+            AtomicBoolean unavailable = new AtomicBoolean(true);
+            MongoObservationStore outage = f.newStore(failOneFind(f.db.getCollection("chunks"), unavailable));
+            assertThatThrownBy(() -> outage.savePreExecutionFailure(f.failure(AT.plusSeconds(1), SOURCE), f.receipt))
+                    .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+            assertThat(unavailable).isFalse();
+            assertThat(f.observations.read(PIPE)).contains(source);
+            assertThat(f.observations.readContinuation(PIPE).orElseThrow().receipt()).isEqualTo(first);
+            assertThat(outage.preExecutionFailureInputsCurrent(f.receipt.owner())).isTrue();
+            assertThat(outage.savePreExecutionFailure(f.failure(AT.plusSeconds(2), SOURCE), f.receipt)).isFalse();
+            f.observations.saveContinuation(PIPE, marker, Optional.of(first), floor(marker, 8)).orElseThrow();
+            assertThat(outage.savePreExecutionFailure(f.failure(AT.plusSeconds(3), SOURCE), f.receipt)).isTrue();
+            assertThat(f.newStore(f.db.getCollection("chunks")).read(PIPE)).contains(f.failure(AT.plusSeconds(3), SOURCE));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void aReadableUnknownSourceStaysUnknownAcrossTheDiagnosticAndColdRefresh(boolean legacy) {
+        try (Fixture f = new Fixture(true)) {
+            var scope = new ObservationStore.Scope(f.incarnation, 1);
+            f.saveSource(f.running(AT), scope, legacy);
+            StopReservation marker = f.seedLiveContinue(scope);
+            var unknown = new ObservationContinuation(marker.token(), scope, Optional.empty(), Optional.empty(), List.of(), List.of());
+            var retained = f.observations.saveContinuation(PIPE, marker, Optional.empty(), unknown).orElseThrow();
+            assertThat(retained.knownBaseline()).isFalse();
+            assertThat(f.observations.savePreExecutionFailure(f.failure(AT.plusSeconds(1), SOURCE), f.receipt)).isTrue();
+            MongoObservationStore cold = f.newStore(f.db.getCollection("chunks"));
+            assertThat(cold.refreshPreExecutionFailure(PIPE, AT.plusSeconds(2))).isTrue();
+            assertThat(cold.read(PIPE)).contains(f.failure(AT.plusSeconds(2), SOURCE));
+            assertThat(cold.readContinuation(PIPE).orElseThrow().continuation()).isEqualTo(unknown);
+            assertThat(cold.readContinuation(PIPE).orElseThrow().receipt()).isEqualTo(retained);
+            assertThat(cold.read(PIPE).orElseThrow().metrics()).isEmpty();
+            assertThat(cold.read(PIPE).orElseThrow().facts()).isEmpty();
+        }
+    }
+
+    @Test
+    void onlyTheOriginalQualifiedResetCanClearTheCarrierAfterDiagnosticPublication() {
+        try (Fixture f = new Fixture(true)) {
+            var scope = new ObservationStore.Scope(f.incarnation, 1);
+            f.saveSource(sourceObservation(7, AT), scope, false);
+            StopReservation marker = f.seedLiveContinue(scope);
+            var first = f.observations.saveContinuation(PIPE, marker, Optional.empty(), floor(marker, 7)).orElseThrow();
+            StopReservation reset = withPolicy(marker, StopReservation.CounterPolicy.RESET, marker.writerAuthority());
+            f.db.getCollection("states").updateOne(new Document("_id", PIPE),
+                    new Document("$set", new Document(StopReservationDocument.FIELD, StopReservationDocument.write(reset))));
+            assertThat(f.observations.savePreExecutionFailure(f.failure(AT.plusSeconds(1), SOURCE), f.receipt)).isTrue();
+            assertThat(f.observations.readContinuation(PIPE).orElseThrow().receipt()).isEqualTo(first);
+            assertThat(f.observations.clearContinuation(PIPE, withPolicy(reset, reset.counterPolicy(),
+                    StopAuthority.standalone(CLUSTER, 2)), first)).isFalse();
+            assertThat(f.observations.readContinuation(PIPE).orElseThrow().receipt()).isEqualTo(first);
+            assertThat(f.observations.clearContinuation(PIPE, reset, first)).isTrue();
+            MongoObservationStore cold = f.newStore(f.db.getCollection("chunks"));
+            assertThat(cold.refreshPreExecutionFailure(PIPE, AT.plusSeconds(2))).isTrue();
+            assertThat(cold.readContinuation(PIPE)).isEmpty();
+            assertThat(cold.read(PIPE)).contains(f.failure(AT.plusSeconds(2), SOURCE));
+        }
+    }
+
+    private static StopReservation withPolicy(StopReservation marker, StopReservation.CounterPolicy policy, StopAuthority authority) {
+        return new StopReservation(marker.pipelineId(), marker.token(), marker.sourceEpoch(), marker.reservedEpoch(),
+                marker.originalDesired(), marker.source(), marker.phase(), policy, authority, marker.successor(), marker.formatVersion());
+    }
+
+    private static ObservationContinuation floor(StopReservation marker, long value) {
+        return new ObservationContinuation(marker.token(), marker.source().scope(), Optional.empty(), Optional.empty(),
+                List.of(records(value, AT)), List.of());
+    }
+
+    private static Observation sourceObservation(long value, Instant at) {
+        return new Observation(PIPE, PipelineState.PAUSED, Map.of("records.out", value), Map.of(), Map.of(), null, at, List.of(records(value, at)));
+    }
+
+    private static MetricFact records(long value, Instant at) {
+        return MetricFact.single("tapstate.pipeline.records", MetricType.COUNTER, "{record}", MetricPoint.accumulated(
+                Map.of(MetricAttributes.PIPELINE_ID, PIPE, MetricAttributes.TABLE_ID, "orders", MetricAttributes.DIRECTION, "out"),
+                AT.minusSeconds(60), at, value));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static MongoCollection<Document> failOneFind(MongoCollection<Document> target, AtomicBoolean armed) {
+        return (MongoCollection<Document>) Proxy.newProxyInstance(MongoCollection.class.getClassLoader(),
+                new Class<?>[] {MongoCollection.class}, (proxy, method, arguments) -> {
+                    if (method.getName().equals("find") && armed.compareAndSet(true, false)) {
+                        throw new MongoException("source payload is temporarily unavailable");
+                    }
+                    try {
+                        Object result = method.invoke(target, arguments);
+                        return result instanceof MongoCollection<?> collection
+                                ? failOneFind((MongoCollection<Document>) collection, armed) : result;
+                    } catch (InvocationTargetException failure) { throw failure.getCause(); }
+                });
+    }
+
     private static Resource source(int port) {
         return new DslParser().parse("version: tapstate/v1\nkind: source\nid: src_x\nconnector: mysql\nconfig:\n  host: localhost\n  port: "
                 + port + "\ntables: [orders]\n");
@@ -288,6 +496,26 @@ class MongoPreExecutionFailureIT {
                     new ObservationFailure("actuation.source-schema-not-discovered", Map.of("source", source)), at, List.of());
         }
         Observation running(Instant at) { return new Observation(PIPE, PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, at, List.of()); }
+        MongoObservationStore newStore(MongoCollection<Document> chunks) {
+            return new MongoObservationStore(client, db.getCollection("observations"), chunks, state.handoffWrites());
+        }
+        void saveSource(Observation observation, ObservationStore.Scope scope, boolean legacy) {
+            if (!legacy) { assertThat(observations.saveScoped(observation, scope)).isTrue(); return; }
+            Document document = MongoObservationStore.toDocument(observation)
+                    .append("pipelineIncarnationId", scope.pipelineIncarnationId()).append("executionGeneration", scope.executionGeneration());
+            db.getCollection("observations").replaceOne(new Document("_id", PIPE), document,
+                    new com.mongodb.client.model.ReplaceOptions().upsert(true));
+        }
+        StopReservation seedLiveContinue(ObservationStore.Scope scope) {
+            // Seed the conditional durable shape; this is not a native replacement or a revival of a retired marker.
+            StopReservation marker = new StopReservation(PIPE, UUID.randomUUID().toString(), 0, receipt.checkpoint().epoch(),
+                    receipt.desired(), new StopReservation.Source(CLUSTER, scope, null), StopReservation.Phase.REPLACEMENT_PENDING,
+                    StopReservation.CounterPolicy.CONTINUE, StopAuthority.standalone(CLUSTER, scope.executionGeneration()), null,
+                    StopReservation.CURRENT_FORMAT);
+            db.getCollection("states").updateOne(new Document("_id", PIPE),
+                    new Document("$set", new Document(StopReservationDocument.FIELD, StopReservationDocument.write(marker))));
+            return marker;
+        }
         @Override public void close() { db.drop(); client.close(); }
     }
 }

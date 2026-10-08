@@ -107,6 +107,8 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
             if (current != null) { previous = current; }
             return true;
         }
+
+        Long previousWallMillis() { return previous; }
     }
 
     private String activePhase;
@@ -441,7 +443,11 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                 }
                 Long operationWall = change.getWallTime() == null ? null : change.getWallTime().getValue();
                 if (!operationClock.accept(operationWall)) {
-                    fail("target operation clock moved backward within its actual change stream", null); return;
+                    fail("target operation clock moved backward within its actual change stream"
+                            + "; namespace=" + namespace + "; target=" + targetId + "; phase=" + activePhase
+                            + "; key=" + key + "; previousWallMillis=" + operationClock.previousWallMillis()
+                            + "; currentWallMillis=" + operationWall + "; clusterTime=" + change.getClusterTime()
+                            + "; observedAtNanos=" + observedAtNanos, null); return;
                 }
                 deliveries.add(new Delivery(key, actual, expected.issuedAtNanos(), observedAtNanos, duration, operationWall));
             }
