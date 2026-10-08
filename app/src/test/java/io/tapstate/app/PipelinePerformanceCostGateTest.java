@@ -272,12 +272,11 @@ class PipelinePerformanceCostGateTest {
                             .singleElement().satisfies(item -> assertThat(item).containsEntry("qty", 2L));
                     // A leaf embed goes directly to the assembler: three drains mean three load/save pairs.
                     // Only the two later loads find state, hence three encodes and two decodes. Join has
-                    // three driver reads (page count, fact, dimension), two nonempty final-projection
-                    // reads (fact batch, dimension), and two empty batch requests for the ordered
-                    // position-only words. All seven API calls count; the two empty requests incur
-                    // no map IO. Its four writes are dimension, fact, reverse-index and the completed
+                    // three driver reads (page count, fact, dimension) and two final-projection
+                    // reads (fact batch, dimension). Position-only words make no state requests.
+                    // All five API calls count. Its four writes are dimension, fact, reverse-index and the completed
                     // fact-batch marker, which makes mirrored rows safe to reuse after a failed run.
-                    ledger.expect(4, 0, 7, 4, cold.snapshot(), 10);
+                    ledger.expect(4, 0, 5, 4, cold.snapshot(), 10);
                 }
             }
         }
@@ -345,7 +344,7 @@ class PipelinePerformanceCostGateTest {
             assertThat(this.writes).as("target writes").isEqualTo(writes);
             assertThat(this.transforms).as("stateless port calls").isEqualTo(transforms);
             assertThat(this.joinReads).as("Join store API reads").isEqualTo(joinReads);
-            assertThat(joinEmptyBatchReads).as("Join empty batch API requests").isEqualTo(joinReads > 0 ? 2 : 0);
+            assertThat(joinEmptyBatchReads).as("Join empty batch API requests").isZero();
             assertThat(this.joinWrites).as("Join store API writes").isEqualTo(joinWrites);
             boolean stateful = joinReads > 0;
             assertThat(cold.loads()).as("Nest cold loads").isEqualTo(stateful ? 3 : 0);
