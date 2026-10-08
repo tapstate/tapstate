@@ -12,6 +12,8 @@ import com.mongodb.client.model.changestream.FullDocument;
 import com.mongodb.client.model.changestream.OperationType;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.runtime.srs.SrsRingbuffer;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.testsupport.DockerGate;
 import org.bson.Document;
 import org.junit.jupiter.api.Assumptions;
@@ -27,7 +29,6 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -202,56 +203,124 @@ class BenchmarkTerminalTargetChangesIT {
                                 .allMatch(chain -> control.targetAckForIfPresent(chain).isPresent()),
                         () -> workload.sourceChains().stream().map(chain -> chain.id() + "="
                                 + control.targetAckForIfPresent(chain).isPresent()).toList().toString());
-                Map<String, String> ackBeforeTerminal = new LinkedHashMap<>();
-                for (BenchmarkWorkloadDefinitions.SourceChain chain : workload.sourceChains()) {
-                    ackBeforeTerminal.put(chain.id(), control.targetAckFor(chain));
-                }
-
-                try (MongoChangeStreamCursor<ChangeStreamDocument<Document>> joinChanges =
-                                viewsMongo.getDatabase("views").watch()
-                                        .fullDocument(FullDocument.UPDATE_LOOKUP)
-                                        .maxAwaitTime(100, TimeUnit.MILLISECONDS).cursor();
-                        MongoChangeStreamCursor<ChangeStreamDocument<Document>> nestChanges =
-                                targetMongo.getDatabase(new ConnectionString(targetUri).getDatabase()).watch()
-                                        .fullDocument(FullDocument.UPDATE_LOOKUP)
-                                        .maxAwaitTime(100, TimeUnit.MILLISECONDS).cursor()) {
-                    try (Statement statement = source.createStatement()) {
-                        for (String sql : workload.phase("terminal").sql()) {
-                            statement.execute(sql);
+                try (StoreDocuments documents = StoreDocuments.at(storeUri)) {
+                    Map<String, TerminalBinding> bindings = terminalBindings(workload, control, documents);
+                    List<BenchmarkTableTerminalObserver.Marker> markers = workload.sourceChains().stream()
+                            .map(chain -> new BenchmarkTableTerminalObserver.Marker(chain.terminalLogicalId(),
+                                    SrsRingbuffer.ringName(bindings.get(chain.id()).binding().physicalChain(), chain.table()),
+                                    "i", chain.terminalRowId(), "marker", BenchmarkTableCaptureSet.terminalValue(chain))).toList();
+                    try (BenchmarkTableTerminalObserver terminals = BenchmarkTableTerminalObserver.open(
+                                storeUri, new ConnectionString(storeUri).getDatabase(), markers);
+                            MongoChangeStreamCursor<ChangeStreamDocument<Document>> joinChanges =
+                                    viewsMongo.getDatabase("views").watch()
+                                            .fullDocument(FullDocument.UPDATE_LOOKUP)
+                                            .maxAwaitTime(100, TimeUnit.MILLISECONDS).cursor();
+                            MongoChangeStreamCursor<ChangeStreamDocument<Document>> nestChanges =
+                                    targetMongo.getDatabase(new ConnectionString(targetUri).getDatabase()).watch()
+                                            .fullDocument(FullDocument.UPDATE_LOOKUP)
+                                            .maxAwaitTime(100, TimeUnit.MILLISECONDS).cursor()) {
+                        try (Statement statement = source.createStatement()) {
+                            for (String sql : workload.phase("terminal").sql()) {
+                                statement.execute(sql);
+                            }
                         }
+                        Await.until("terminal join and assembled nest rows", BOUND,
+                                () -> join.find(Filters.eq("order_id", 900_011L)).first() != null
+                                        && hasItem(nest.find(Filters.eq("id", 900_013L)).first(), 900_014L),
+                                () -> "join=" + join.find(Filters.eq("order_id", 900_011L)).first()
+                                        + " nest=" + nest.find(Filters.eq("id", 900_013L)).first());
+
+                        String joinBarrier = barrier(viewsMongo, "views");
+                        String nestDatabase = new ConnectionString(targetUri).getDatabase();
+                        String nestBarrier = barrier(targetMongo, nestDatabase);
+                        List<OperationType> joinOps = untilBarrier(joinChanges, "views", "bench_join_output",
+                                "order_id", 900_011L, joinBarrier);
+                        List<OperationType> nestOps = untilBarrier(nestChanges, nestDatabase, "bench_nest_orders",
+                                "id", 900_013L, nestBarrier);
+
+                        long deadline = System.nanoTime() + Duration.ofSeconds(45).toNanos();
+                        for (var chain : workload.sourceChains()) {
+                            var point = terminals.await(chain.terminalLogicalId(),
+                                    remainingTerminalBudget(deadline));
+                            TerminalBinding expected = bindings.get(chain.id());
+                            assertThat(point.epoch()).as("the exact terminal capture generation").isEqualTo(expected.epoch());
+                            Await.until("every writer confirms the terminal table point for " + chain.id(),
+                                    remainingTerminalBudget(deadline),
+                                    () -> terminalConfirmed(chain, expected, point, control, documents),
+                                    () -> "point=" + point + ", cursor=" + documents.consumerOffset(
+                                            expected.binding().physicalChain(), expected.binding().consumer()));
+                        }
+                        System.out.printf("benchmark-terminal-shape join=%s nest=%s%n", joinOps, nestOps);
+
+                        assertThat(joinOps).as("join terminal physical writes").containsExactly(OperationType.INSERT);
+                        assertThat(nestOps).as("nest terminal physical writes")
+                                .isIn(List.of(OperationType.INSERT),
+                                        List.of(OperationType.INSERT, OperationType.UPDATE));
                     }
-                    Await.until("terminal join and assembled nest rows", BOUND,
-                            () -> join.find(Filters.eq("order_id", 900_011L)).first() != null
-                                    && hasItem(nest.find(Filters.eq("id", 900_013L)).first(), 900_014L),
-                            () -> "join=" + join.find(Filters.eq("order_id", 900_011L)).first()
-                                    + " nest=" + nest.find(Filters.eq("id", 900_013L)).first());
-
-                    String joinBarrier = barrier(viewsMongo, "views");
-                    String nestDatabase = new ConnectionString(targetUri).getDatabase();
-                    String nestBarrier = barrier(targetMongo, nestDatabase);
-                    List<OperationType> joinOps = untilBarrier(joinChanges, "views", "bench_join_output",
-                            "order_id", 900_011L, joinBarrier);
-                    List<OperationType> nestOps = untilBarrier(nestChanges, nestDatabase, "bench_nest_orders",
-                            "id", 900_013L, nestBarrier);
-
-                    Await.until("terminal ACKs advanced for every stateful source", Duration.ofSeconds(45),
-                            () -> workload.sourceChains().stream()
-                                    .allMatch(chain -> control.targetAckForIfPresent(chain)
-                                            .filter(after -> !Objects.equals(after, ackBeforeTerminal.get(chain.id())))
-                                            .isPresent()),
-                            () -> workload.sourceChains().stream().map(chain -> chain.id() + "="
-                                    + control.targetAckForIfPresent(chain)
-                                            .filter(after -> !Objects.equals(after, ackBeforeTerminal.get(chain.id())))
-                                            .isPresent()).toList().toString());
-                    System.out.printf("benchmark-terminal-shape join=%s nest=%s%n", joinOps, nestOps);
-
-                    assertThat(joinOps).as("join terminal physical writes").containsExactly(OperationType.INSERT);
-                    assertThat(nestOps).as("nest terminal physical writes")
-                            .isIn(List.of(OperationType.INSERT),
-                                    List.of(OperationType.INSERT, OperationType.UPDATE));
                 }
             }
         }
+    }
+
+    private record TerminalBinding(BenchmarkTableAckGate.Binding binding, long epoch, Document runIdentity) { }
+
+    private static Duration remainingTerminalBudget(long deadline) {
+        long left = deadline - System.nanoTime();
+        if (left <= 0) { throw new AssertionError("terminal table confirmation exceeded its shared deadline"); }
+        return Duration.ofNanos(left);
+    }
+
+    private static Map<String, TerminalBinding> terminalBindings(BenchmarkWorkloadDefinitions.Workload workload,
+            ControlPlane control, StoreDocuments documents) {
+        Map<String, TerminalBinding> result = new LinkedHashMap<>();
+        for (var chain : workload.sourceChains()) {
+            var association = terminalAssociation(control, chain);
+            Document root = documents.chain(association.chainId());
+            assertThat(root).isNotNull();
+            long epoch = captureEpoch(root);
+            assertThat(epoch).isPositive();
+            String consumer = SrsConsumerId.of(chain.pipelineId(), chain.sourceId()).value();
+            var binding = BenchmarkTableAckGate.bind(association.chainId(), chain.pipelineId(), chain.sourceId(),
+                    chain.table(), documents.consumerOffset(association.chainId(), consumer));
+            result.put(chain.id(), new TerminalBinding(binding, epoch, documents.benchmarkRunIdentity(chain.pipelineId())));
+        }
+        return Map.copyOf(result);
+    }
+
+    private static ControlPlane.PositionChain terminalAssociation(ControlPlane control,
+            BenchmarkWorkloadDefinitions.SourceChain chain) {
+        var read = control.positionRead(chain.pipelineId());
+        assertThat(read.pipelineId()).isEqualTo(chain.pipelineId());
+        var matches = read.chains().stream().filter(value -> value.sourceId().equals(chain.sourceId())
+                && value.tables().equals(List.of(chain.table()))).toList();
+        assertThat(matches).as("the exact physical source/table association").hasSize(1);
+        return matches.getFirst();
+    }
+
+    private static boolean terminalConfirmed(BenchmarkWorkloadDefinitions.SourceChain chain, TerminalBinding expected,
+            BenchmarkTableTerminalObserver.Point point, ControlPlane control, StoreDocuments documents) {
+        assertThat(terminalAssociation(control, chain).chainId()).isEqualTo(expected.binding().physicalChain());
+        Document root = documents.chain(expected.binding().physicalChain());
+        assertThat(root).isNotNull();
+        assertThat(captureEpoch(root)).isEqualTo(expected.epoch());
+        assertThat(documents.benchmarkRunIdentity(chain.pipelineId())).isEqualTo(expected.runIdentity());
+        if (!BenchmarkTableAckGate.covers(expected.binding(), point, documents.consumerOffset(
+                expected.binding().physicalChain(), expected.binding().consumer()))) { return false; }
+        assertThat(terminalAssociation(control, chain).chainId()).isEqualTo(expected.binding().physicalChain());
+        Document after = documents.chain(expected.binding().physicalChain());
+        assertThat(after).isNotNull();
+        assertThat(captureEpoch(after)).isEqualTo(expected.epoch());
+        assertThat(documents.benchmarkRunIdentity(chain.pipelineId())).isEqualTo(expected.runIdentity());
+        return BenchmarkTableAckGate.covers(expected.binding(), point, documents.consumerOffset(
+                expected.binding().physicalChain(), expected.binding().consumer()));
+    }
+
+    static long captureEpoch(Document root) {
+        Object value = root.get("epoch");
+        if (!(value instanceof Integer || value instanceof Long)) {
+            throw new AssertionError("terminal source capture epoch is not an exact stored integer");
+        }
+        return ((Number) value).longValue();
     }
 
     private static boolean hasItem(Document root, long itemId) {

@@ -206,7 +206,7 @@ final class BenchmarkTableCaptureSet implements AutoCloseable {
                 BenchmarkMeasuredEndMarkers.operation(phase).symbol(), row, field, value);
     }
 
-    private static String terminalValue(BenchmarkWorkloadDefinitions.SourceChain chain) {
+    static String terminalValue(BenchmarkWorkloadDefinitions.SourceChain chain) {
         return switch (chain.table()) {
             case "bench_copy_orders" -> "copy-orders-terminal";
             case "bench_join_orders" -> "join-orders-terminal";
