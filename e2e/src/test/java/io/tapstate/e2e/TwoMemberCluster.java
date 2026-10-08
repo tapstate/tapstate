@@ -165,9 +165,9 @@ final class TwoMemberCluster implements AutoCloseable {
         return NODE_A.equals(requireKnown(nodeId)) ? first : second;
     }
 
+    /** The staging directory a witness named for the member, or null for one the member's launch makes and clears. */
     private static Path staging(String nodeId, Map<String, Path> stagingByNode) {
-        Path named = stagingByNode.get(nodeId);
-        return named != null ? named : ServerHandle.privateStagingDirectory();
+        return stagingByNode.get(nodeId);
     }
 
     private static String requireKnown(String nodeId) {

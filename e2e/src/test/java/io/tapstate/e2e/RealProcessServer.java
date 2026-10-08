@@ -51,11 +51,18 @@ final class RealProcessServer implements ServerHandle {
     private final Process process;
     private final URI baseUrl;
     private final Path output;
+    private final Path stagingDirectory;
+    // Whether the launch made the directory itself, and so deletes it as it ends; one a witness named is the
+    // witness's to keep or clear.
+    private final boolean ownsStagingDirectory;
 
-    private RealProcessServer(Process process, URI baseUrl, Path output) {
+    private RealProcessServer(Process process, URI baseUrl, Path output, Path stagingDirectory,
+            boolean ownsStagingDirectory) {
         this.process = process;
         this.baseUrl = baseUrl;
         this.output = output;
+        this.stagingDirectory = stagingDirectory;
+        this.ownsStagingDirectory = ownsStagingDirectory;
     }
 
     /** Launches the deliverable and returns once its health probe answers. */
@@ -104,12 +111,12 @@ final class RealProcessServer implements ServerHandle {
      */
     static RealProcessServer start(String storeUri, String listenAddress,
             IntFunction<List<String>> extraArguments) {
-        return start(storeUri, listenAddress, ServerHandle.privateStagingDirectory(), extraArguments);
+        return healthy(launching(storeUri, bootJar(), listenAddress, extraArguments));
     }
 
     /**
      * The same, staging the connectors it resolves into {@code stagingDirectory} rather than a directory of this
-     * launch's own.
+     * launch's own, which it then leaves where it is when it ends; null for a directory of the launch's own.
      *
      * <p>For a witness whose subject is a member that cannot stage what it is asked to load. A parameter rather than
      * something a caller appends, for the reason the listen address is one: the standing setting would be joined
@@ -117,15 +124,8 @@ final class RealProcessServer implements ServerHandle {
      */
     static RealProcessServer start(String storeUri, String listenAddress, Path stagingDirectory,
             IntFunction<List<String>> extraArguments) {
-        RealProcessServer server = launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, bootJar(), listenAddress,
-                List.of(), stagingDirectory, extraArguments);
-        try {
-            awaitHealthy(server.process, server.baseUrl, server.output);
-        } catch (RuntimeException | AssertionError e) {
-            server.process.destroyForcibly();
-            throw e;
-        }
-        return server;
+        return healthy(launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, bootJar(), listenAddress,
+                List.of(), stagingDirectory, extraArguments));
     }
 
     /**
@@ -146,14 +146,7 @@ final class RealProcessServer implements ServerHandle {
 
     private static RealProcessServer start(String storeUri, String operatorStateDatabase, Path jar,
             List<String> additionalArguments) {
-        RealProcessServer server = launching(storeUri, operatorStateDatabase, jar, additionalArguments);
-        try {
-            awaitHealthy(server.process, server.baseUrl, server.output);
-        } catch (RuntimeException | AssertionError e) {
-            server.process.destroyForcibly();
-            throw e;
-        }
-        return server;
+        return healthy(launching(storeUri, operatorStateDatabase, jar, additionalArguments));
     }
 
     /**
@@ -170,6 +163,12 @@ final class RealProcessServer implements ServerHandle {
     /** The same, launching the jar named rather than the one this reactor built. See {@link #start(String, Path)}. */
     static RealProcessServer launching(String storeUri, Path jar) {
         return launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, jar);
+    }
+
+    /** The same, staging into the directory a witness names, which the launch leaves where it is as it ends. */
+    static RealProcessServer launching(String storeUri, Path jar, Path stagingDirectory) {
+        return launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, jar, LOOPBACK, List.of(), stagingDirectory,
+                port -> List.of());
     }
 
     private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar) {
@@ -203,8 +202,7 @@ final class RealProcessServer implements ServerHandle {
 
     private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
             String listenAddress, IntFunction<List<String>> extraArguments) {
-        return launching(storeUri, operatorStateDatabase, jar, listenAddress, List.of(),
-                ServerHandle.privateStagingDirectory(), extraArguments);
+        return launching(storeUri, operatorStateDatabase, jar, listenAddress, List.of(), null, extraArguments);
     }
 
     /**
@@ -215,12 +213,26 @@ final class RealProcessServer implements ServerHandle {
      * handed to the product instead they would be settings nobody reads.
      */
     static RealProcessServer startInJvm(String storeUri, List<String> jvmOptions) {
-        RealProcessServer server = launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, bootJar(), LOOPBACK,
-                jvmOptions, ServerHandle.privateStagingDirectory(), port -> List.of());
+        return healthy(launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, bootJar(), LOOPBACK,
+                jvmOptions, null, port -> List.of()));
+    }
+
+    /**
+     * Returns the launch once its health probe answers, and ends it otherwise.
+     *
+     * <p>A launch that never came up is not handed to anybody, so nobody else will ever end it or clear
+     * up after it. Whatever goes wrong doing that is attached to the failure rather than replacing it:
+     * why the server did not come up is the thing a reader needs.
+     */
+    private static RealProcessServer healthy(RealProcessServer server) {
         try {
             awaitHealthy(server.process, server.baseUrl, server.output);
         } catch (RuntimeException | AssertionError e) {
-            server.process.destroyForcibly();
+            try {
+                server.kill();
+            } catch (RuntimeException | AssertionError cleanup) {
+                e.addSuppressed(cleanup);
+            }
             throw e;
         }
         return server;
@@ -235,9 +247,11 @@ final class RealProcessServer implements ServerHandle {
         URI baseUrl = URI.create("http://" + LOOPBACK + ":" + port);
         Path workingDirectory = workingDirectory();
         Path output = workingDirectory.resolve("server.out");
+        boolean owned = stagingDirectory == null;
+        Path staging = owned ? ServerHandle.privateStagingDirectory() : stagingDirectory;
         Process process = launch(jar, jvmOptions, port, listenAddress, storeUri, operatorStateDatabase,
-                stagingDirectory, workingDirectory, output, extraArguments.apply(port));
-        return new RealProcessServer(process, baseUrl, output);
+                workingDirectory, output, staging, extraArguments.apply(port));
+        return new RealProcessServer(process, baseUrl, output, staging, owned);
     }
 
     /**
@@ -257,6 +271,8 @@ final class RealProcessServer implements ServerHandle {
             Thread.currentThread().interrupt();
             throw new AssertionError("interrupted while waiting for the killed server to go away", e);
         }
+        // The harness's own leftovers, not the server's: a crash witness may never close what it killed.
+        discardOwnStagingDirectory();
     }
 
     @Override
@@ -279,6 +295,11 @@ final class RealProcessServer implements ServerHandle {
      */
     long pid() {
         return process.pid();
+    }
+
+    /** Where this launch staged its connectors, for a witness that the directory goes when the launch does. */
+    Path stagingDirectory() {
+        return stagingDirectory;
     }
 
     /** Whether it is still running, so a witness waiting on it can tell waiting from waiting forever. */
@@ -313,11 +334,18 @@ final class RealProcessServer implements ServerHandle {
             Thread.currentThread().interrupt();
             process.destroyForcibly();
         }
+        discardOwnStagingDirectory();
+    }
+
+    private void discardOwnStagingDirectory() {
+        if (ownsStagingDirectory) {
+            ServerHandle.discardStagingDirectory(stagingDirectory);
+        }
     }
 
     private static Process launch(Path jar, List<String> jvmOptions, int port, String listenAddress,
-            String storeUri, String operatorStateDatabase, Path stagingDirectory, Path workingDirectory, Path output,
-            List<String> extraArguments) {
+            String storeUri, String operatorStateDatabase, Path workingDirectory, Path output,
+            Path stagingDirectory, List<String> extraArguments) {
         List<String> command = new ArrayList<>();
         command.add(javaBinary());
         command.addAll(jvmOptions);
