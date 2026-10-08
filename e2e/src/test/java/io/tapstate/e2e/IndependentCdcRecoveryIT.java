@@ -8,9 +8,13 @@ import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.MongoSrsLogStore;
+import io.tapstate.adapters.mongostore.MongoObservationStore;
+import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.runtime.engine.EngineError;
 import io.tapstate.runtime.srs.CaptureError;
 import io.tapstate.runtime.srs.SrsRingbuffer;
 import io.tapstate.spi.store.SrsConsumerId;
@@ -255,8 +259,14 @@ class IndependentCdcRecoveryIT {
         try (MongoClient reader = MongoClients.create(fixture.storeUri())) {
             MongoDatabase database = database(reader, fixture.storeUri());
             Document high;
+            long originalExecution;
+            MongoObservationStore latest = new MongoObservationStore(reader,
+                    SystemCollections.PIPELINE_OBSERVATION.on(database),
+                    SystemCollections.PIPELINE_OBSERVATION_CHUNKS.on(database));
             try (RealProcessServer first = RealProcessServer.start(fixture.storeUri())) {
                 high = pendingWindow(start(first, fixture, "snapshot_and_cdc", true, false), fixture, database, MAIL);
+                originalExecution = executionGeneration(database);
+                assertThat(originalExecution).isPositive();
                 first.kill();
             }
             MongoCollection<Document> log = database.getCollection(MongoStorePort.SRS_LOG);
@@ -286,9 +296,52 @@ class IndependentCdcRecoveryIT {
                 awaitState(control, ROOT_PIPELINE, PipelineState.FAILED);
                 String code = loss == LostHistory.OLD_PROGRESS
                         ? CaptureError.RECOVERY_PROGRESS_UNPROVEN.code() : CaptureError.RECOVERY_LOG_GAP.code();
-                Await.until("the failed pipeline to expose its recovery diagnostic", TIMEOUT,
-                        () -> control.logs(ROOT_PIPELINE).contains(code),
-                        () -> control.logs(ROOT_PIPELINE));
+                String publishedCode = loss == LostHistory.OLD_PROGRESS ? code : EngineError.JOB_FAILED.code();
+                Await.until("the failed pipeline to publish its phase-qualified failure", TIMEOUT,
+                        () -> control.failureCode(ROOT_PIPELINE).filter(publishedCode::equals).isPresent(),
+                        () -> "state=" + control.state(ROOT_PIPELINE) + ", code=" + control.failureCode(ROOT_PIPELINE));
+                if (loss == LostHistory.OLD_PROGRESS) {
+                    var refused = latest.readStored(ROOT_PIPELINE).orElseThrow();
+                    assertThat(refused.refusal()).isPresent();
+                    assertThat(refused.refusal().orElseThrow().generationFrontier())
+                            .isEqualTo(java.util.OptionalLong.of(originalExecution));
+                    assertThat(refused.scope()).isEmpty();
+                    assertThat(refused.observation().failure().code()).isEqualTo(code);
+                    assertThat(refused.observation().failure().params())
+                            .isEqualTo(Map.of("pipeline", ROOT_PIPELINE, "source", ROOT_SOURCE));
+                    assertThat(refused.observation().metrics()).isEmpty();
+                    assertThat(refused.observation().snapshot()).isEmpty();
+                    assertThat(refused.observation().positions()).isEmpty();
+                    assertThat(refused.observation().facts()).isEmpty();
+                    assertThat(executionGeneration(database))
+                            .as("an ambiguous checkpoint is refused before a new execution is admitted")
+                            .isEqualTo(originalExecution);
+                    Await.until("the original pre-execution refusal to reach the owned server log", TIMEOUT,
+                            () -> CdcRecoveryFixture.lines(second.output()).stream()
+                                    .anyMatch(line -> line.contains("start was refused [" + code + "]")),
+                            () -> second.output().toString());
+                    String currentLogs = control.logs(ROOT_PIPELINE);
+                    assertThat(currentLogs).as("current logs must be read successfully").startsWith("200 ");
+                    Object parsedLogs = JsonReader.parse(currentLogs.substring(4));
+                    assertThat(parsedLogs).isInstanceOf(Map.class);
+                    Map<?, ?> logBody = (Map<?, ?>) parsedLogs;
+                    assertThat(logBody.get("pipelineId")).isEqualTo(ROOT_PIPELINE);
+                    assertThat(logBody.get("lines")).isInstanceOf(List.class);
+                    assertThat((List<?>) logBody.get("lines")).allSatisfy(line -> {
+                        assertThat(line).isInstanceOf(Map.class);
+                        Map<?, ?> logLine = (Map<?, ?>) line;
+                        assertThat(logLine.get("timestampMillis")).isInstanceOf(Number.class);
+                        assertThat(logLine.get("level")).isInstanceOf(String.class);
+                        assertThat(logLine.get("message")).isInstanceOf(String.class);
+                        assertThat((String) logLine.get("message"))
+                                .as("a new start refusal must not be attributed to the previous execution")
+                                .doesNotContain(code);
+                    });
+                } else {
+                    Await.until("the failed execution to expose its recovery diagnostic", TIMEOUT,
+                            () -> control.logs(ROOT_PIPELINE).contains(code),
+                            () -> control.logs(ROOT_PIPELINE));
+                }
                 assertThat(priority(fixture.rootTarget(), ROOT, "1")).isEqualTo("Low");
                 assertThat(database.getCollection(MongoStorePort.SRS_META).countDocuments()).isPositive();
                 if (loss == LostHistory.OLD_PROGRESS) {
@@ -299,6 +352,14 @@ class IndependentCdcRecoveryIT {
                 }
             }
         }
+    }
+
+    private static long executionGeneration(MongoDatabase database) {
+        Document claim = SystemCollections.WORKLOAD_CLAIMS.on(database)
+                .find(new Document("resourceType", "PIPELINE_ACTUATION").append("resourceId", ROOT_PIPELINE))
+                .first();
+        assertThat(claim).as("the pipeline's actual durable execution authority").isNotNull();
+        return number(claim, "executionGeneration");
     }
 
     private static Document pendingWindow(ControlPlane control, Fixture fixture, MongoDatabase database,
