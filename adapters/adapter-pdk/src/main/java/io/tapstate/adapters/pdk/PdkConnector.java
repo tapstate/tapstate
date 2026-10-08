@@ -32,7 +32,11 @@ import java.util.Map;
  * per-operation drive (init / read / write / stop) and its own coded failures belong to the ports.
  *
  * <p>The connector is driven with its own class loader installed as the thread context loader, the way
- * a real connector reaches its isolated runtime; {@link #close()} closes that loader. Constructing a
+ * a real connector reaches its isolated runtime. That loader is the one every open of the same artifact
+ * shares for the life of the process ({@link ConnectorClassLoader#shared}), so {@link #close()} releases
+ * this handle and leaves the loader to the others: a connector that loads a JNI library can load it only
+ * through the first loader that does, and each test, discovery and pipeline open of it must find that
+ * loader again. Constructing a
  * real connector bootstraps the PDK runtime through the host loader, so the host must carry it: the
  * assembly root does, so a real connector constructs here. A build whose host omits the runtime drives
  * only synthetic connectors that bind to the frozen contract alone.
@@ -127,7 +131,7 @@ final class PdkConnector implements AutoCloseable {
 
         ConnectorClassLoader loader;
         try {
-            loader = ConnectorClassLoader.open(ref.classpath());
+            loader = ConnectorClassLoader.shared(ref.classpath());
         } catch (RuntimeException e) {
             throw loadFailed(connectorId, e);
         }
@@ -194,8 +198,8 @@ final class PdkConnector implements AutoCloseable {
             opened = true;
             return result;
         } finally {
-            // Close the loader on every failure path — a coded load/class error, an escaping VM error,
-            // anything — so a construction failure never leaks the connector's open jar handle.
+            // Release the loader on every failure path — a coded load/class error, an escaping VM error,
+            // anything. A shared loader stays open for the artifact's other opens; this is a no-op on it.
             if (!opened) {
                 closeQuietly(loader);
             }
