@@ -119,6 +119,88 @@ public final class Engine {
     private final StageQueueAccounts stageQueueAccounts = new StageQueueAccounts(MAX_QUEUE_ACCOUNTS);
 
     private final Map<String, QueueAccount> queueAccounts = new LinkedHashMap<>(16, 0.75f, true);
+    private final ThreadLocal<ObservationMetricsSession> observationMetrics = new ThreadLocal<>();
+
+    /** A synchronous, thread-confined native sample for one observation preparation. */
+    public final class ObservationMetricsSession implements AutoCloseable {
+        private final String pipelineId;
+        private final Thread owner = Thread.currentThread();
+        private final Job originalJob;
+        private final long originalJobId;
+        private final JobStatus originalStatus;
+        private final Set<String> originalMembers;
+        private JobMetrics sampled;
+        private boolean attempted;
+        private boolean invalid;
+        private boolean closed;
+
+        private ObservationMetricsSession(String pipelineId) {
+            this.pipelineId = Objects.requireNonNull(pipelineId, "pipelineId");
+            this.originalJob = liveJob(pipelineId);
+            this.originalJobId = originalJob == null ? -1 : originalJob.getId();
+            this.originalStatus = originalJob == null ? null : originalJob.getStatus();
+            this.originalMembers = memberIds();
+        }
+
+        private void requireOpen() {
+            if (owner != Thread.currentThread() || closed || observationMetrics.get() != this) {
+                throw new IllegalStateException("observation native session is not open on its owning thread");
+            }
+        }
+
+        public boolean current() {
+            requireOpen();
+            Job now = liveJob(pipelineId);
+            if (!originalMembers.equals(memberIds())
+                    || (originalJob == null ? now != null : now == null || now.getId() != originalJobId
+                            || now.getStatus() != originalStatus)) {
+                invalid = true;
+            }
+            return !invalid;
+        }
+
+        private JobMetrics read(String pipeline, Job job) {
+            requireOpen();
+            if (!pipelineId.equals(pipeline)) {
+                throw new IllegalStateException("observation native session was used by another pipeline");
+            }
+            if (!current() || originalJob == null || job.getId() != originalJobId) {
+                invalid = true;
+                return JobMetrics.of(Map.of());
+            }
+            if (!attempted) {
+                attempted = true;
+                sampled = job.getMetrics();
+            }
+            if (sampled == null) {
+                invalid = true;
+                return JobMetrics.of(Map.of());
+            }
+            return current() ? sampled : JobMetrics.of(Map.of());
+        }
+
+        @Override public void close() {
+            requireOpen();
+            closed = true;
+            sampled = null;
+            observationMetrics.remove();
+        }
+    }
+
+    /** Nested preparations are refused so one frame cannot silently borrow another frame's sample. */
+    public ObservationMetricsSession openObservationMetrics(String pipelineId) {
+        if (observationMetrics.get() != null) {
+            throw new IllegalStateException("observation native sessions cannot be nested");
+        }
+        ObservationMetricsSession opened = new ObservationMetricsSession(pipelineId);
+        observationMetrics.set(opened);
+        return opened;
+    }
+
+    private JobMetrics metricsFor(String pipelineId, Job job) {
+        ObservationMetricsSession session = observationMetrics.get();
+        return session == null ? job.getMetrics() : session.read(pipelineId, job);
+    }
 
     public Engine(HazelcastInstance member) {
         this(member, (OperatorStateStores) null);
@@ -563,7 +645,7 @@ public final class Engine {
         if (job == null) {
             return OptionalLong.empty();
         }
-        long reached = job.getMetrics().get(MetricNames.RECEIVED_COUNT).stream()
+        long reached = metricsFor(pipelineId, job).get(MetricNames.RECEIVED_COUNT).stream()
                 .filter(Engine::isOutputSink)
                 .mapToLong(Measurement::value)
                 .sum();
@@ -684,7 +766,7 @@ public final class Engine {
      */
     public Map<String, Map<String, Long>> recordsDelivered(String pipelineId) {
         Job job = liveJob(pipelineId);
-        return job == null ? Map.of() : deliveredRowsIn(job.getMetrics());
+        return job == null ? Map.of() : deliveredRowsIn(metricsFor(pipelineId, job));
     }
 
     /**
@@ -701,7 +783,7 @@ public final class Engine {
         if (members.isEmpty()) {
             return DeliveryReading.NONE;
         }
-        JobMetrics collected = job.getMetrics();
+        JobMetrics collected = metricsFor(pipelineId, job);
         if (job.getStatus().isTerminal() || !members.equals(memberIds())) {
             return DeliveryReading.NONE;
         }
@@ -827,7 +909,7 @@ public final class Engine {
      */
     public Map<String, Long> bytesDelivered(String pipelineId) {
         Job job = liveJob(pipelineId);
-        return job == null ? Map.of() : settledBytesIn(job.getMetrics());
+        return job == null ? Map.of() : settledBytesIn(metricsFor(pipelineId, job));
     }
 
     /**
@@ -858,7 +940,7 @@ public final class Engine {
      */
     public Map<String, HistogramValue> deliveryDurations(String pipelineId) {
         Job job = liveJob(pipelineId);
-        return job == null ? Map.of() : settledDurationsIn(job.getMetrics());
+        return job == null ? Map.of() : settledDurationsIn(metricsFor(pipelineId, job));
     }
 
     /**
@@ -925,7 +1007,7 @@ public final class Engine {
      */
     public StageReading stageDurations(String pipelineId) {
         Job job = liveJob(pipelineId);
-        return job == null ? StageReading.NONE : stageDurationsIn(job.getMetrics());
+        return job == null ? StageReading.NONE : stageDurationsIn(metricsFor(pipelineId, job));
     }
 
     /** Complete current-job business work only; sampled processor slots are not scheduler utilization. */
@@ -950,7 +1032,7 @@ public final class Engine {
         }
         StageQueueAccounts.ReadTicket ticket = stageQueueAccounts.ticket(pipelineId, job.getId());
         Set<String> members = memberIds();
-        JobMetrics collected = job.getMetrics();
+        JobMetrics collected = metricsFor(pipelineId, job);
         Job current = liveJob(pipelineId);
         if (current == null || current.getId() != job.getId() || job.getStatus() != JobStatus.RUNNING
                 || !members.equals(memberIds())) {
@@ -1430,7 +1512,7 @@ public final class Engine {
     /** Batch handoff, write completion and sink-side backpressure measured by the live job. */
     public SinkBatchReading sinkBatchReading(String pipelineId) {
         Job job = liveJob(pipelineId);
-        return job == null ? SinkBatchReading.NONE : sinkBatchReadingIn(job.getMetrics());
+        return job == null ? SinkBatchReading.NONE : sinkBatchReadingIn(metricsFor(pipelineId, job));
     }
 
     /**
@@ -1449,7 +1531,7 @@ public final class Engine {
             }
             return Optional.empty();
         }
-        Optional<QueueSample> sampled = queueSampleIn(job.getMetrics(), job.getIdString());
+        Optional<QueueSample> sampled = queueSampleIn(metricsFor(pipelineId, job), job.getIdString());
         if (sampled.isEmpty()) {
             return Optional.empty();
         }
@@ -1684,7 +1766,7 @@ public final class Engine {
         if (job == null) {
             return OptionalLong.empty();
         }
-        return countingSinceIn(job.getMetrics());
+        return countingSinceIn(metricsFor(pipelineId, job));
     }
 
     private static OptionalLong countingSinceIn(JobMetrics collected) {
@@ -1719,7 +1801,7 @@ public final class Engine {
      */
     private Map<String, Long> byChain(String pipelineId, Function<String, String> chainOf) {
         Job job = liveJob(pipelineId);
-        return job == null ? Map.of() : highestIn(job.getMetrics(), chainOf);
+        return job == null ? Map.of() : highestIn(metricsFor(pipelineId, job), chainOf);
     }
 
     /**
@@ -1759,7 +1841,7 @@ public final class Engine {
         if (job == null) {
             return Map.of();
         }
-        JobMetrics collected = job.getMetrics();
+        JobMetrics collected = metricsFor(pipelineId, job);
         Map<String, Map<String, Long>> byNamespace = new HashMap<>();
         for (String metric : collected.metrics()) {
             NestStateMetricNames.Reading reading = NestStateMetricNames.readingOf(metric);
@@ -1795,7 +1877,7 @@ public final class Engine {
             return Map.of();
         }
         String jobTag = Util.idToString(job.getId());
-        JobMetrics collected = job.getMetrics();
+        JobMetrics collected = metricsFor(pipelineId, job);
         if (job.getStatus().isTerminal() || !members.equals(memberIds())) {
             return Map.of();
         }

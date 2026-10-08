@@ -591,9 +591,18 @@ class EngineTest {
         DeliveryReading reading = DeliveryReading.NONE;
         long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
         while (System.nanoTime() - deadline < 0) {
-            reading = engine.deliveryReading("orders-pipe");
-            if (reading.start().isPresent() && reading.rowsByTableAndOp().containsKey("orders")) {
-                break;
+            try (Engine.ObservationMetricsSession session = engine.openObservationMetrics("orders-pipe")) {
+                reading = engine.deliveryReading("orders-pipe");
+                if (reading.start().isPresent() && reading.rowsByTableAndOp().containsKey("orders")) {
+                    assertThat(session.current()).isTrue();
+                    // Received records and settled deliveries are distinct counters in the native sample.
+                    OptionalLong received = engine.recordCount("orders-pipe");
+                    assertThat(received).isPresent();
+                    assertThat(engine.recordCount("orders-pipe")).isEqualTo(received);
+                    assertThat(engine.deliveryReading("orders-pipe")).isEqualTo(reading);
+                    assertThat(session.current()).isTrue();
+                    break;
+                }
             }
             Thread.sleep(50);
         }

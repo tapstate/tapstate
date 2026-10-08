@@ -414,6 +414,23 @@ public final class ObservationPublisher {
         StageRuntimeReading read(String pipelineId);
     }
 
+    /** One preparation-local native sample; it cannot outlive the synchronous preparation. */
+    public interface PreparationSession extends AutoCloseable {
+        boolean current();
+        @Override void close();
+    }
+
+    @FunctionalInterface
+    public interface PreparationSessions {
+        PreparationSession open(String pipelineId);
+    }
+
+    private static final PreparationSessions NO_NATIVE_SESSION = id -> new PreparationSession() {
+        @Override public boolean current() { return true; }
+        @Override public void close() { }
+    };
+    private final PreparationSessions preparationSessions;
+
     private final StageRuntimeFacts stageRuntime;
     private final Function<String, SinkBatchReading> sinkBatches;
     private final Function<String, Optional<QueueReading>> queues;
@@ -836,6 +853,27 @@ public final class ObservationPublisher {
             Function<String, SinkBatchReading> sinkBatches, Function<String, Optional<QueueReading>> queues,
             Function<String, Map<String, StateStoreCostReading>> stateCosts,
             StageRuntimeFacts stageRuntime, Function<String, SnapshotReading> runSnapshots, Clock clock) {
+        this(state, observations, recordCounts, positions, snapshots, frontierGaps, nestStateReadings,
+                coldLayer, frontierStalls, frontierStall, nestDeadLetters, joinRecomputeDone,
+                joinRecomputeExpected, captures, deliveries, stages, sinkBatches, queues, stateCosts,
+                stageRuntime, runSnapshots, clock, NO_NATIVE_SESSION);
+    }
+
+    /** Shares a bounded native session across the sources of one prepared observation. */
+    public ObservationPublisher(StateStore state, ObservationStore observations,
+            Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
+            Function<String, SnapshotReading> snapshots, Function<String, Map<String, Long>> frontierGaps,
+            Function<String, Map<String, NestStateReading>> nestStateReadings, NestColdLayerWatch coldLayer,
+            Function<String, Map<String, Long>> frontierStalls, FrontierStallWatch frontierStall,
+            Function<String, Map<String, Long>> nestDeadLetters,
+            Function<String, Map<String, Long>> joinRecomputeDone,
+            Function<String, Map<String, Long>> joinRecomputeExpected, Function<String, CaptureReading> captures,
+            Function<String, DeliveryReading> deliveries, Function<String, StageReading> stages,
+            Function<String, SinkBatchReading> sinkBatches, Function<String, Optional<QueueReading>> queues,
+            Function<String, Map<String, StateStoreCostReading>> stateCosts,
+            StageRuntimeFacts stageRuntime, Function<String, SnapshotReading> runSnapshots, Clock clock,
+            PreparationSessions preparationSessions) {
+        this.preparationSessions = Objects.requireNonNull(preparationSessions, "preparationSessions");
         this.stageRuntime = Objects.requireNonNull(stageRuntime, "stageRuntime");
         this.captures = Objects.requireNonNull(captures, "captures");
         this.deliveries = Objects.requireNonNull(deliveries, "deliveries");
@@ -967,6 +1005,14 @@ public final class ObservationPublisher {
     }
 
     private Optional<Prepared> prepare(String pipelineId, ObservationFailure failure, ObservationStore.Scope scope,
+            BooleanSupplier current, Runnable failureCaptured) {
+        try (PreparationSession session = preparationSessions.open(pipelineId)) {
+            return prepareInSession(pipelineId, failure, scope,
+                    () -> current.getAsBoolean() && session.current(), failureCaptured);
+        }
+    }
+
+    private Optional<Prepared> prepareInSession(String pipelineId, ObservationFailure failure, ObservationStore.Scope scope,
             BooleanSupplier current, Runnable failureCaptured) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         if (!current.getAsBoolean()) { return Optional.empty(); }

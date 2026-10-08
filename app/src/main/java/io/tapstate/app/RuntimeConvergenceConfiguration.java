@@ -114,7 +114,13 @@ class RuntimeConvergenceConfiguration {
                 engine::stateStoreCostReadings,
                 (ObservationPublisher.StageRuntimeFacts) engine::stageRuntimeReading,
                 captureCoordinator::runSnapshotProgress,
-                Clock.systemUTC());
+                Clock.systemUTC(), id -> {
+                    Engine.ObservationMetricsSession nativeSession = engine.openObservationMetrics(id);
+                    return new ObservationPublisher.PreparationSession() {
+                        @Override public boolean current() { return nativeSession.current(); }
+                        @Override public void close() { nativeSession.close(); }
+                    };
+                });
     }
 
     /** Reads the sink's complete delivery tuple from one live job-metrics collection. */
