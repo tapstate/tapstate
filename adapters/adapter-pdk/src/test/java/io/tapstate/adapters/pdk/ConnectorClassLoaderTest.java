@@ -9,6 +9,7 @@ import java.net.URLConnection;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.List;
 import java.util.Map;
 
@@ -92,6 +93,62 @@ class ConnectorClassLoaderTest {
             Class<?> shared = loader.load("net.sf.cglib.beans.BeanMap");
             assertThat(shared).isSameAs(hostBeanMap);
         }
+    }
+
+    /**
+     * Every caller over one artifact gets the one loader, and so the one copy of each class: a connector that
+     * binds a JNI library to the loader it was loaded through finds that loader again on its next open.
+     * {@code open} still gives each caller a loader of its own.
+     */
+    @Test
+    void everyCallerOverOneArtifactSharesOneLoader(@TempDir Path dir) throws Exception {
+        Path jar = widgetJar(dir, "A");
+        ConnectorClassLoader first = ConnectorClassLoader.shared(List.of(jar));
+        ConnectorClassLoader second = ConnectorClassLoader.shared(List.of(jar));
+        assertThat(second).isSameAs(first);
+        assertThat(second.load("synthetic.Widget")).isSameAs(first.load("synthetic.Widget"));
+        try (ConnectorClassLoader own = ConnectorClassLoader.open(List.of(jar))) {
+            assertThat(own.load("synthetic.Widget")).isNotSameAs(first.load("synthetic.Widget"));
+        }
+    }
+
+    @Test
+    void sharedLoadersOverDifferentArtifactsStayIsolated(@TempDir Path dir) throws Exception {
+        Path jarA = widgetJar(dir.resolve("a"), "A");
+        Path jarB = widgetJar(dir.resolve("b"), "B");
+        Class<?> wa = ConnectorClassLoader.shared(List.of(jarA)).load("synthetic.Widget");
+        Class<?> wb = ConnectorClassLoader.shared(List.of(jarB)).load("synthetic.Widget");
+        assertThat(wa).isNotSameAs(wb);
+        assertThat(wa.getMethod("tag").invoke(wa.getDeclaredConstructor().newInstance())).isEqualTo("A");
+        assertThat(wb.getMethod("tag").invoke(wb.getDeclaredConstructor().newInstance())).isEqualTo("B");
+    }
+
+    /** One caller finishing with a shared loader must not take it from the others: its close does nothing. */
+    @Test
+    void closingASharedLoaderLeavesItToTheOtherCallers(@TempDir Path dir) throws Exception {
+        Path jar = messagesJar(dir);
+        ConnectorClassLoader shared = ConnectorClassLoader.shared(List.of(jar));
+        shared.close();
+        Class<?> widget = ConnectorClassLoader.shared(List.of(jar)).load("synthetic.Widget");
+        assertThat(widget.getClassLoader()).isSameAs(shared.load("synthetic.Widget").getClassLoader());
+        try (InputStream messages = widget.getClassLoader().getResourceAsStream(MESSAGES_ENTRY)) {
+            assertThat(messages.readAllBytes()).isEqualTo(MESSAGES);
+        }
+    }
+
+    /** A jar replaced in place is a different artifact, and gets its own classes rather than the old ones. */
+    @Test
+    void aJarReplacedInPlaceGetsALoaderOfItsOwn(@TempDir Path dir) throws Exception {
+        Path jar = dir.resolve("connector.jar");
+        Files.copy(widgetJar(dir.resolve("a"), "A"), jar);
+        Class<?> before = ConnectorClassLoader.shared(List.of(jar)).load("synthetic.Widget");
+
+        Files.copy(widgetJar(dir.resolve("b"), "a longer marker"), jar, StandardCopyOption.REPLACE_EXISTING);
+        Class<?> after = ConnectorClassLoader.shared(List.of(jar)).load("synthetic.Widget");
+
+        assertThat(after).isNotSameAs(before);
+        assertThat(after.getMethod("tag").invoke(after.getDeclaredConstructor().newInstance()))
+                .isEqualTo("a longer marker");
     }
 
     @Test
