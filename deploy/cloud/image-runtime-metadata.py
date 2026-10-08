@@ -12,8 +12,8 @@ SPEC = importlib.util.spec_from_file_location("runtime_web_provenance", ROOT / "
 assert SPEC is not None and SPEC.loader is not None
 PROVENANCE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PROVENANCE)
-SDK = "BOOT-INF/lib/cloud-control-plane-sdk-0.1.1-a2319ac0-SNAPSHOT.jar"
-SDK_SHA = "5e8a3e63f74bbb95a1b1cf7ed61579312e9b90d6d8b1c33847bcb2f0050645b3"
+SDK = "BOOT-INF/lib/cloud-control-plane-sdk-0.1.1-f039a380-SNAPSHOT.jar"
+SDK_SHA = "eac6071501cbda2834174af51db8e5c5ebbdfd408136575a3f0585f5edb1f5c1"
 
 
 def metadata(jar_path: Path, image_path: Path, profile: str, lock: Path) -> dict:
