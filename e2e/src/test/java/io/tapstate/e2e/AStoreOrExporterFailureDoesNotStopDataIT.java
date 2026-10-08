@@ -3,6 +3,9 @@ package io.tapstate.e2e;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
+import io.tapstate.adapters.mongostore.MongoConnection;
+import io.tapstate.adapters.mongostore.MongoConnectionSettings;
+import io.tapstate.adapters.mongostore.MongoDesiredStore;
 import io.tapstate.adapters.mongostore.MongoObservationStore;
 import io.tapstate.adapters.mongostore.MongoStateStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
@@ -33,6 +36,7 @@ import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -171,6 +175,8 @@ class AStoreOrExporterFailureDoesNotStopDataIT {
         String jarSha = PipelineBenchmarkLiveRunIT.sha256(jar);
         try (MongoClient admin = MongoClients.create(STORE.getReplicaSetUrl());
                 MongoEndpoints targetMongo = new MongoEndpoints();
+                MongoConnection qualification = new MongoConnection(
+                        new MongoConnectionSettings(rawStoreUri, null, Duration.ofSeconds(5)));
                 ExecutionAdmissionJdiSession observer = ExecutionAdmissionJdiSession.start(
                         storeUri, "admission_cas_operator", jar, PIPELINE)) {
             RealProcessServer server = observer.server();
@@ -199,6 +205,9 @@ class AStoreOrExporterFailureDoesNotStopDataIT {
             }
             assertThat(initial.bindings()).hasSize(2);
             MongoDatabase database = admin.getDatabase(databaseName);
+            MongoDesiredStore desired = new MongoDesiredStore(database.getCollection(MongoStorePort.PIPELINE_DESIRED));
+            qualification.verifyConnectivity();
+            ObservationStore latest = new MongoStorePort(qualification, "admission_cas_operator").observations();
             long oldGeneration = generation(database);
             assertThat(oldGeneration).isPositive();
             control.stop(PIPELINE, false);
@@ -210,6 +219,7 @@ class AStoreOrExporterFailureDoesNotStopDataIT {
             configureFault(admin, true, databaseName, appName, "workload_claims", "findAndModify");
             ExecutionAdmissionJdiSession.Boundary failed;
             String refusalCode;
+            io.tapstate.spi.store.PreExecutionFailure.Owner refusalOwner;
             try {
                 control.lifecycle(PIPELINE, LifecycleVerb.START);
                 Await.until("the actual durable advance to fail with its canonical code", WAIT,
@@ -231,6 +241,18 @@ class AStoreOrExporterFailureDoesNotStopDataIT {
                 assertThat(afterSubmit).isEqualTo(beforeSubmit);
                 assertThat(generation(database)).isEqualTo(oldGeneration);
                 assertThat(checkpointState(database)).isEqualTo(PipelineState.FAILED);
+                var refused = latest.readStored(PIPELINE).orElseThrow();
+                assertThat(refused.scope()).as("a failed advance did not admit another execution").isEmpty();
+                refusalOwner = refused.refusal().orElseThrow();
+                assertThat(refusalOwner.pipelineId()).isEqualTo(PIPELINE);
+                assertThat(refusalOwner.generationFrontier()).isEqualTo(OptionalLong.of(oldGeneration));
+                assertThat(latest.isCurrentPreExecutionFailure(refusalOwner)).isTrue();
+                assertThat(refused.observation().state()).isEqualTo(PipelineState.FAILED);
+                assertThat(refused.observation().failure().code()).isEqualTo(refusalCode);
+                assertThat(refused.observation().metrics()).isEmpty();
+                assertThat(refused.observation().snapshot()).isEmpty();
+                assertThat(refused.observation().positions()).isEmpty();
+                assertThat(refused.observation().facts()).isEmpty();
                 Document claim = database.getCollection(MongoStorePort.WORKLOAD_CLAIMS)
                         .find(new Document("resourceType", "PIPELINE_ACTUATION").append("resourceId", PIPELINE)).first();
                 assertThat(claim).isNotNull();
@@ -240,11 +262,30 @@ class AStoreOrExporterFailureDoesNotStopDataIT {
             }
             System.out.printf("admission-failure-cleanup meta=%s%n", physicalCaptureDiagnostic(database));
             control.stop(PIPELINE, false);
-            Await.until("failed admission to reach a restartable stopped state", WAIT,
-                    // A final observation from the preceding run may already say STOPPED.
+            var stoppedIntent = desired.read(PIPELINE).orElseThrow();
+            assertThat(stoppedIntent.targetState()).isEqualTo(PipelineState.STOPPED);
+            assertThat(stoppedIntent.purgeState()).isFalse();
+            Await.until("the refused admission to stop and invalidate its public diagnostic", WAIT,
+                    // No new execution exists. Empty here requires the canonical HTTP 404 no-observation response.
                     () -> checkpointState(database) == PipelineState.STOPPED
-                            && control.state(PIPELINE).filter(PipelineState.STOPPED::equals).isPresent(),
-                    () -> "checkpoint=" + checkpointState(database) + ", state=" + control.state(PIPELINE));
+                            && desired.read(PIPELINE).filter(stoppedIntent::equals).isPresent()
+                            && control.state(PIPELINE).isEmpty(),
+                    () -> "checkpoint=" + checkpointState(database) + ", intent=" + desired.read(PIPELINE)
+                            + ", state=" + control.state(PIPELINE) + ", code=" + control.failureCode(PIPELINE));
+            assertThat(latest.isCurrentPreExecutionFailure(refusalOwner))
+                    .as("the failed receipt cannot answer for the changed STOPPED intent and checkpoint").isFalse();
+            assertThat(latest.readStored(PIPELINE).flatMap(ObservationStore.Stored::scope))
+                    .as("a positive frontier alone must not recreate the previous execution owner").isEmpty();
+            assertThat(control.failureCode(PIPELINE)).as("the invalidated refusal is not current").isEmpty();
+            assertThat(generation(database)).isEqualTo(oldGeneration);
+            var stopped = observer.boundary();
+            assertThat(stopped.drained()).isTrue();
+            assertThat(stopped.counts().get(ExecutionAdmissionJdiSession.Target.SUBMIT_JOB))
+                    .as("stopping a refused attempt must not submit a job")
+                    .isEqualTo(failed.counts().get(ExecutionAdmissionJdiSession.Target.SUBMIT_JOB));
+            assertThat(stopped.counts().get(ExecutionAdmissionJdiSession.Target.ADVANCE_STANDALONE))
+                    .as("stopping a refused attempt must not allocate an execution")
+                    .isEqualTo(failed.counts().get(ExecutionAdmissionJdiSession.Target.ADVANCE_STANDALONE));
             control.lifecycle(PIPELINE, LifecycleVerb.START);
             System.out.printf("admission-recovery-start serverOutput=%s failureCounts=%s%n",
                     server.output(), failed.counts());
