@@ -1,5 +1,7 @@
 package io.tapstate.e2e;
 
+import io.tapstate.control.core.MonitorError;
+import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.testsupport.DockerGate;
 
@@ -16,6 +18,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -102,13 +105,19 @@ class AttributesAreAttributesNotNameSuffixesIT {
                 control.discoverSchema("src_items", "mysql", config);
                 control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
 
-                // Both families arrive with the first collection of the running job's statistics, and not
-                // before: a run that has not published either is waited out, never read as "no attributes".
-                Await.until("the frontier and nest readings of the running job to be published", SETTLE,
-                        () -> fact(control, FRONTIER_GAP).isPresent() && fact(control, NEST_ENTRIES).isPresent(),
-                        () -> control.metrics(PIPELINE_ID));
+                // Chain readings become measurable independently. Keep one complete published response
+                // so the facts and flat face below are assertions about the same measurement.
+                String rootNamespace = "nest." + PIPELINE_ID + "." + NEST_STEP + ".";
+                AtomicReference<String> lastMetrics = new AtomicReference<>("not read yet");
+                MetricsSnapshot published;
+                try {
+                    published = Await.answered("both chain points and the nest namespace in one metrics response", SETTLE,
+                            () -> completeMetrics(control, rootNamespace, lastMetrics));
+                } catch (AssertionError | RuntimeException failure) {
+                    throw new AssertionError(failure.getMessage() + "; last metrics response: " + lastMetrics.get(), failure);
+                }
 
-                Map<String, Object> gap = fact(control, FRONTIER_GAP).orElseThrow();
+                Map<String, Object> gap = fact(published, FRONTIER_GAP).orElseThrow();
                 assertThat(pointWhere(gap, CHAIN, PARENT_TABLE))
                         .as("the frontier distance of the orders chain is selected by its chain attribute; "
                                 + "a family that still spelled the chain into its name has no point to select")
@@ -123,12 +132,8 @@ class AttributesAreAttributesNotNameSuffixesIT {
                         .as("the second chain is another point of the same fact, not another fact")
                         .isPresent();
 
-                Map<String, Object> entries = fact(control, NEST_ENTRIES).orElseThrow();
-                String rootNamespace = "nest." + PIPELINE_ID + "." + NEST_STEP + ".";
-                Map<String, Object> rootPoint = ((List<Map<String, Object>>) entries.get("points")).stream()
-                        .filter(point -> attributeOf(point, NAMESPACE).map(ns -> ns.startsWith(rootNamespace))
-                                .orElse(false))
-                        .findFirst()
+                Map<String, Object> entries = fact(published, NEST_ENTRIES).orElseThrow();
+                Map<String, Object> rootPoint = namespacePoint(entries, rootNamespace)
                         .orElseThrow(() -> new AssertionError(
                                 "no nest entries point carries a namespace of this pipeline's nest step: "
                                         + entries));
@@ -139,17 +144,17 @@ class AttributesAreAttributesNotNameSuffixesIT {
 
                 // The flat face is untouched by the migration: the same readings sit under the keys every
                 // reader of that face was built against, and each carries the number that is on the point.
-                Map<String, Long> flatGaps = control.metricsNamed(PIPELINE_ID, FRONTIER_GAP_FLAT);
+                Map<String, Long> flatGaps = published.flat();
                 assertThat(flatGaps)
                         .as("the flat face still spells the orders chain's distance under its old key")
                         .containsEntry(FRONTIER_GAP_FLAT + PARENT_TABLE, ((Number) ordersPoint.get("value")).longValue());
                 String rootNamespaceValue = attributeOf(rootPoint, NAMESPACE).orElseThrow();
-                assertThat(control.metricsNamed(PIPELINE_ID, NEST_ENTRIES_FLAT))
+                assertThat(published.flat())
                         .as("and the nest level's entries under its old key, with the value that is on the point")
                         .containsEntry(NEST_ENTRIES_FLAT + rootNamespaceValue,
                                 ((Number) rootPoint.get("value")).longValue());
 
-                assertThat(control.metricFacts(PIPELINE_ID))
+                assertThat(published.facts())
                         .extracting(fact -> (String) fact.get("name"))
                         .as("no fact is left under a prefix that spelled its dimension into its name")
                         .noneMatch(name -> RETIRED_FACT_PREFIXES.stream().anyMatch(name::startsWith));
@@ -157,10 +162,85 @@ class AttributesAreAttributesNotNameSuffixesIT {
         }
     }
 
-    /** The fact named {@code name} on the metrics face right now, or empty while it is not published. */
-    private static Optional<Map<String, Object>> fact(ControlPlane control, String name) {
-        return control.metricFacts(PIPELINE_ID).stream()
-                .filter(fact -> name.equals(fact.get("name")))
+    private record MetricsSnapshot(List<Map<String, Object>> facts, Map<String, Long> flat) { }
+
+    /** Only missing measurements are pending; a malformed published response stays a failed contract. */
+    @SuppressWarnings("unchecked")
+    private static Optional<MetricsSnapshot> completeMetrics(ControlPlane control, String rootNamespace,
+            AtomicReference<String> lastMetrics) {
+        String response = control.metrics(PIPELINE_ID);
+        lastMetrics.set(response);
+        assertThat(response.length()).as("an HTTP status and metrics body").isGreaterThan(4);
+        assertThat(response.charAt(3)).isEqualTo(' ');
+        assertThat(response.substring(0, 3)).as("metrics HTTP status must be success or a qualified pending refusal")
+                .isIn("200", "404");
+        Object parsed;
+        try {
+            parsed = JsonReader.parse(response.substring(4));
+        } catch (RuntimeException failure) {
+            throw new AssertionError("metrics response was not valid JSON: " + response, failure);
+        }
+        assertThat(parsed).as("the metrics response is an object").isInstanceOf(Map.class);
+        Map<?, ?> body = (Map<?, ?>) parsed;
+        if (response.startsWith("404 ") && MonitorError.NO_OBSERVATION.code().equals(body.get("code"))) {
+            assertThat(body.get("params")).isInstanceOf(Map.class);
+            assertThat(((Map<?, ?>) body.get("params")).get("pipeline")).isEqualTo(PIPELINE_ID);
+            return Optional.empty();
+        }
+        assertThat(response).as("current metrics must be read successfully").startsWith("200 ");
+        assertThat(body.get("pipelineId")).isEqualTo(PIPELINE_ID);
+        assertThat(body.get("facts")).isInstanceOf(List.class);
+        assertThat(body.get("metrics")).isInstanceOf(Map.class);
+        List<Map<String, Object>> facts = new java.util.ArrayList<>();
+        for (Object value : (List<?>) body.get("facts")) {
+            assertThat(value).as("each published fact is an object").isInstanceOf(Map.class);
+            Map<String, Object> metric = (Map<String, Object>) value;
+            assertThat(metric.get("name")).isInstanceOf(String.class);
+            assertThat(metric.get("points")).isInstanceOf(List.class);
+            for (Object pointValue : (List<?>) metric.get("points")) {
+                assertThat(pointValue).as("each published point is an object").isInstanceOf(Map.class);
+                Map<?, ?> point = (Map<?, ?>) pointValue;
+                assertThat(point.get("attributes")).isInstanceOf(Map.class);
+                Map<?, ?> attributes = (Map<?, ?>) point.get("attributes");
+                attributes.forEach((key, attribute) -> {
+                    assertThat(key).isInstanceOf(String.class);
+                    assertThat(attribute).isInstanceOf(String.class);
+                });
+                if (FRONTIER_GAP.equals(metric.get("name")) || NEST_ENTRIES.equals(metric.get("name"))) {
+                    String dimension = FRONTIER_GAP.equals(metric.get("name")) ? CHAIN : NAMESPACE;
+                    assertThat(attributes.get(dimension)).as("the selected fact's dimension").isInstanceOf(String.class);
+                    Object reading = point.get("value");
+                    assertThat(reading instanceof Integer || reading instanceof Long)
+                            .as("the selected gauge's exact integer reading").isTrue();
+                    assertThat(point.get("histogram")).as("the selected gauge is a scalar reading").isNull();
+                }
+            }
+            facts.add(metric);
+        }
+        Map<String, Long> flat = new LinkedHashMap<>();
+        ((Map<?, ?>) body.get("metrics")).forEach((key, value) -> {
+            assertThat(key).isInstanceOf(String.class);
+            assertThat(value instanceof Integer || value instanceof Long)
+                    .as("the flat face carries exact integer readings").isTrue();
+            flat.put((String) key, ((Number) value).longValue());
+        });
+        MetricsSnapshot snapshot = new MetricsSnapshot(List.copyOf(facts), Map.copyOf(flat));
+        return fact(snapshot, FRONTIER_GAP)
+                .filter(gap -> pointWhere(gap, CHAIN, PARENT_TABLE).isPresent()
+                        && pointWhere(gap, CHAIN, CHILD_TABLE).isPresent())
+                .flatMap(gap -> fact(snapshot, NEST_ENTRIES)
+                        .filter(entries -> namespacePoint(entries, rootNamespace).isPresent()))
+                .map(ignored -> snapshot);
+    }
+
+    private static Optional<Map<String, Object>> fact(MetricsSnapshot snapshot, String name) {
+        return snapshot.facts().stream().filter(fact -> name.equals(fact.get("name"))).findFirst();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Optional<Map<String, Object>> namespacePoint(Map<String, Object> fact, String prefix) {
+        return ((List<Map<String, Object>>) fact.get("points")).stream()
+                .filter(point -> attributeOf(point, NAMESPACE).map(namespace -> namespace.startsWith(prefix)).orElse(false))
                 .findFirst();
     }
 
