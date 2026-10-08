@@ -8,6 +8,8 @@ import io.tapstate.adapters.mongostore.MongoDesiredStore;
 import io.tapstate.adapters.mongostore.MongoObservationStore;
 import io.tapstate.adapters.mongostore.MongoStateStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.adapters.mongostore.SystemCollections;
+import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
@@ -25,6 +27,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.OptionalLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -120,6 +123,8 @@ class ASrsSwitchWhilePausedCarriesOnFromTheRecordedPositionIT {
             assertThat(paused.observation().failure()).isNull();
             assertThat(paused.observation().observedAt()).isNotNull();
             var scope = paused.scope().orElseThrow();
+            long originalExecution = executionGeneration(state, suffix);
+            assertThat(originalExecution).isPositive().isEqualTo(scope.executionGeneration());
             var pausedActual = actual.read(suffix).orElseThrow();
             assertThat(StateJson.parse(pausedActual.stateJson())).isEqualTo(PipelineState.PAUSED);
             Document savedRecovery = consumer(state, sharedChain, suffix);
@@ -158,8 +163,11 @@ class ASrsSwitchWhilePausedCarriesOnFromTheRecordedPositionIT {
             assertThat(resumedIntent.targetState()).isEqualTo(PipelineState.RUNNING);
             assertThat(resumedIntent.purgeState()).isFalse();
 
-            var refused = Await.answered("the current scoped FAILED observation for the refused mode switch", TIMEOUT,
-                    () -> latest.readStored(suffix).filter(value -> value.scope().filter(scope::equals).isPresent()
+            var refused = Await.answered("the current pre-execution FAILED diagnostic for the refused mode switch", TIMEOUT,
+                    () -> latest.readStored(suffix).filter(value -> value.scope().isEmpty()
+                            && value.refusal().filter(owner -> owner.pipelineId().equals(suffix)
+                                    && owner.pipelineIncarnationId().equals(scope.pipelineIncarnationId())
+                                    && owner.generationFrontier().equals(OptionalLong.of(originalExecution))).isPresent()
                             && value.observation().state() == PipelineState.FAILED
                             && value.observation().failure() != null
                             && value.observation().observedAt() != null
@@ -167,11 +175,40 @@ class ASrsSwitchWhilePausedCarriesOnFromTheRecordedPositionIT {
                             && actual.read(suffix).map(checkpoint -> StateJson.parse(checkpoint.stateJson()))
                                     .filter(PipelineState.FAILED::equals).isPresent()
                             && control.state(suffix).filter(PipelineState.FAILED::equals).isPresent()));
+            assertThat(refused.scope()).as("a refused replacement has no new execution owner").isEmpty();
+            var refusalOwner = refused.refusal().orElseThrow();
+            assertThat(refusalOwner.generationFrontier()).isEqualTo(OptionalLong.of(originalExecution));
+            assertThat(refusalOwner.pipelineIncarnationId()).isEqualTo(scope.pipelineIncarnationId());
+            assertThat(refusalOwner.checkpointEpoch()).isEqualTo(actual.read(suffix).orElseThrow().epoch());
+            assertThat(executionGeneration(state, suffix))
+                    .as("the retained mode switch is refused before admitting another execution")
+                    .isEqualTo(originalExecution);
+            assertThat(refused.observation().metrics()).isEmpty();
+            assertThat(refused.observation().snapshot()).isEmpty();
+            assertThat(refused.observation().positions()).isEmpty();
+            assertThat(refused.observation().facts()).isEmpty();
             assertThat(refused.observation().failure().code())
                     .isEqualTo(CaptureError.RECOVERY_PROGRESS_UNPROVEN.code());
             assertThat(refused.observation().failure().params()).containsEntry("pipeline", suffix)
                     .containsEntry("source", SOURCE_ID);
             assertThat(control.failureCode(suffix)).contains(CaptureError.RECOVERY_PROGRESS_UNPROVEN.code());
+            String currentLogs = control.logs(suffix);
+            assertThat(currentLogs).as("current logs must be read successfully").startsWith("200 ");
+            Object parsedLogs = JsonReader.parse(currentLogs.substring(4));
+            assertThat(parsedLogs).isInstanceOf(Map.class);
+            Map<?, ?> logBody = (Map<?, ?>) parsedLogs;
+            assertThat(logBody.get("pipelineId")).isEqualTo(suffix);
+            assertThat(logBody.get("lines")).isInstanceOf(List.class);
+            assertThat((List<?>) logBody.get("lines")).allSatisfy(line -> {
+                assertThat(line).isInstanceOf(Map.class);
+                Map<?, ?> logLine = (Map<?, ?>) line;
+                assertThat(logLine.get("timestampMillis")).isInstanceOf(Number.class);
+                assertThat(logLine.get("level")).isInstanceOf(String.class);
+                assertThat(logLine.get("message")).isInstanceOf(String.class);
+                assertThat((String) logLine.get("message"))
+                        .as("a refused replacement must not borrow the previous execution's log scope")
+                        .doesNotContain(CaptureError.RECOVERY_PROGRESS_UNPROVEN.code());
+            });
             assertThat(actual.read(suffix).orElseThrow().epoch()).isGreaterThan(pausedActual.epoch());
             assertThat(desired.read(suffix)).contains(resumedIntent);
             assertThat(consumer(state, sharedChain, suffix))
@@ -189,6 +226,18 @@ class ASrsSwitchWhilePausedCarriesOnFromTheRecordedPositionIT {
             assertThat(namesOf(mongo, target, ADDED_WHILE_PAUSED)).isEmpty();
             assertThat(namesOf(mongo, target, CHANGED_BEFORE)).containsExactly(BEFORE_PAUSE);
         }
+    }
+
+    /** Reads the same durable execution authority used by the runtime, without assigning an execution. */
+    private static long executionGeneration(MongoDatabase state, String pipelineId) {
+        Document claim = SystemCollections.WORKLOAD_CLAIMS.on(state)
+                .find(new Document("resourceType", "PIPELINE_ACTUATION").append("resourceId", pipelineId))
+                .first();
+        assertThat(claim).as("the pipeline's actual durable execution authority").isNotNull();
+        Object generation = claim.get("executionGeneration");
+        assertThat(generation instanceof Integer || generation instanceof Long)
+                .as("the persisted execution generation is an exact integer").isTrue();
+        return ((Number) generation).longValue();
     }
 
     /** Everything up to and including the start. The pipeline begins with the buffer on. */
