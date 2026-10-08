@@ -13,7 +13,13 @@ public record CloudSessionRecord(
         boolean revoked,
         Instant createdAt,
         Instant lastUsedAt,
-        Instant idleExpiresAt) {
+        Instant idleExpiresAt,
+        CloudSessionContext clusterContext) {
+
+    public CloudSessionRecord(CloudSessionIdentity identity, String jwtId, String secretHash, String userId,
+            String scope, boolean revoked, Instant createdAt, Instant lastUsedAt, Instant idleExpiresAt) {
+        this(identity, jwtId, secretHash, userId, scope, revoked, createdAt, lastUsedAt, idleExpiresAt, null);
+    }
 
     public CloudSessionRecord {
         Objects.requireNonNull(identity, "identity");

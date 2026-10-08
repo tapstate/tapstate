@@ -9,6 +9,7 @@ import io.tapstate.cloud.sdk.client.JwtVerificationException;
 import io.tapstate.cloud.sdk.model.StatusReportRequest;
 import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.CloudCodeExchanger;
+import io.tapstate.control.core.CloudCodeExchangeResult;
 import io.tapstate.control.core.CloudJwtValidator;
 import io.tapstate.control.core.CloudLoginIdentity;
 import io.tapstate.control.core.CloudRuntimeStatus;
@@ -16,12 +17,14 @@ import io.tapstate.control.core.CloudSessionCallbackVerifier;
 import io.tapstate.control.core.CloudStatusSender;
 import io.tapstate.control.core.Scope;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.CloudSessionContext;
 import io.tapstate.spi.store.CloudSessionIdentity;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 
 import java.time.Instant;
+import java.lang.reflect.InvocationTargetException;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -51,12 +54,18 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
 
     @Override
     public String exchange(String exchangeCode, String clusterId) {
+        return exchangeWithContext(exchangeCode, clusterId).jwt();
+    }
+
+    @Override
+    public CloudCodeExchangeResult exchangeWithContext(String exchangeCode, String clusterId) {
         if (!settings.clusterId().equals(clusterId)) {
             logValidationFailure("code-exchange", "configured-cluster-mismatch");
             throw CloudAuthenticationService.unavailable();
         }
         try {
-            return sdk.exchange(exchangeCode).jwt();
+            ExchangeResult result = sdk.exchange(exchangeCode);
+            return new CloudCodeExchangeResult(result.jwt(), result.context());
         } catch (ProviderFailure unavailable) {
             throw CloudAuthenticationService.unavailable();
         }
@@ -92,7 +101,8 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
                 return Optional.empty();
             }
             return Optional.of(new CloudLoginIdentity(
-                    expectedDeployment, claims.userId(), claims.jwtId(), scope, claims.expiresAt()));
+                    expectedDeployment, claims.userId(), claims.organizationId(), claims.clusterId(),
+                    claims.jwtId(), scope, claims.expiresAt()));
         } catch (ProviderFailure unavailable) {
             return Optional.empty();
         } catch (IllegalArgumentException invalid) {
@@ -186,9 +196,25 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
         void report(String clusterId, String nonce, CloudRuntimeStatus status, String token);
     }
 
-    record ExchangeResult(String jwt) {
+    record ExchangeResult(
+            String jwt, String organizationId, String clusterId,
+            String organizationName, String clusterName, String region) {
+        ExchangeResult(String jwt) {
+            this(jwt, null, null, null, null, null);
+        }
+
         ExchangeResult {
             if (!text(jwt)) throw new ProviderFailure();
+            boolean noContext = organizationId == null && clusterId == null
+                    && organizationName == null && clusterName == null && region == null;
+            boolean completeContext = text(organizationId) && text(clusterId)
+                    && text(organizationName) && text(clusterName) && text(region);
+            if (!noContext && !completeContext) throw new ProviderFailure();
+        }
+
+        CloudSessionContext context() {
+            return organizationId == null ? null
+                    : new CloudSessionContext(organizationId, clusterId, organizationName, clusterName, region);
         }
     }
 
@@ -223,9 +249,29 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
         @Override
         public ExchangeResult exchange(String code) {
             try {
-                return new ExchangeResult(sdk.exchangeForJwt(code).jwt());
+                var exchanged = sdk.exchangeForJwt(code);
+                String organizationName = optionalText(exchanged, "organizationName");
+                String clusterName = optionalText(exchanged, "clusterName");
+                String region = optionalText(exchanged, "region");
+                if (!text(exchanged.orgId()) || !text(exchanged.clusterId())
+                        || !text(organizationName) || !text(clusterName) || !text(region)) {
+                    return new ExchangeResult(exchanged.jwt());
+                }
+                return new ExchangeResult(exchanged.jwt(), exchanged.orgId(), exchanged.clusterId(),
+                        organizationName, clusterName, region);
             } catch (CloudControlPlaneException failure) {
                 logExchangeFailure(failure);
+                throw new ProviderFailure();
+            }
+        }
+
+        private static String optionalText(Object value, String accessor) {
+            try {
+                Object result = value.getClass().getMethod(accessor).invoke(value);
+                return result instanceof String text ? text : null;
+            } catch (NoSuchMethodException unavailableInPublishedSdk) {
+                return null;
+            } catch (IllegalAccessException | InvocationTargetException failure) {
                 throw new ProviderFailure();
             }
         }

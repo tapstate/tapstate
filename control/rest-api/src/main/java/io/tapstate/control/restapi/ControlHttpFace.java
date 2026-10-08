@@ -45,6 +45,7 @@ import java.util.List;
         PipelinePositionController.class,
         PipelineStreamConfiguration.class, ClusterController.class, HealthController.class,
         VersionController.class, AuthController.class, CloudAuthController.class, CurrentUserController.class,
+        ClusterContextController.class,
         IssuerDiscoveryController.class, TokenController.class,
         SourceController.class,
         ConnectorIconController.class,

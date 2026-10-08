@@ -174,6 +174,10 @@ public final class ControlOperations {
     // like every other verb) rather than an anonymous endpoint — only the process-liveness probe stays
     // outside the registry. Reading topology mutates nothing, so it is read-scoped and unaudited.
     public static final Operation CLUSTER_MEMBERS = new Operation("cluster.members", Scope.READ, false, null, CLI_ONLY);
+    public static final Operation CLUSTER_CONTEXT = new Operation(
+            "cluster.context", Scope.READ, false, null,
+            "Read the organization and Cluster display context bound to the authenticated Cloud session.",
+            Map.of(Frontend.REST, Maturity.CURRENT));
 
     // pipeline domain: static projection reads, conditional definition replacement, and the four lifecycle
     // verbs. Definition replacement is audited as an artifact write; each lifecycle verb writes the
@@ -350,6 +354,7 @@ public final class ControlOperations {
             DATA_BROWSER_FIND,
             DATA_BROWSER_STATS,
             CLUSTER_MEMBERS,
+            CLUSTER_CONTEXT,
             PIPELINE_LIST,
             PIPELINE_CATALOG,
             PIPELINE_GET,

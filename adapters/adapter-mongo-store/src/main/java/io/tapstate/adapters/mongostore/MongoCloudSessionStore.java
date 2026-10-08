@@ -10,6 +10,7 @@ import com.mongodb.client.model.ReturnDocument;
 import com.mongodb.client.model.UpdateOptions;
 import com.mongodb.client.model.Updates;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.CloudSessionContext;
 import io.tapstate.spi.store.CloudSessionIdentity;
 import io.tapstate.spi.store.CloudSessionRecord;
 import io.tapstate.spi.store.CloudSessionStore;
@@ -122,7 +123,7 @@ public final class MongoCloudSessionStore implements CloudSessionStore {
 
     static Document toDocument(CloudSessionRecord record) {
         CloudSessionIdentity identity = record.identity();
-        return new Document("_id", sessionKey(identity, record.jwtId()))
+        Document document = new Document("_id", sessionKey(identity, record.jwtId()))
                 .append("origin", ORIGIN)
                 .append("issuer", identity.issuer())
                 .append("organizationId", identity.organizationId())
@@ -135,6 +136,15 @@ public final class MongoCloudSessionStore implements CloudSessionStore {
                 .append("createdAt", record.createdAt().toEpochMilli())
                 .append("lastUsedAt", record.lastUsedAt().toEpochMilli())
                 .append("idleExpiresAt", record.idleExpiresAt().toEpochMilli());
+        if (record.clusterContext() != null) {
+            CloudSessionContext context = record.clusterContext();
+            document.append("clusterContext", new Document("organizationId", context.organizationId())
+                    .append("clusterId", context.clusterId())
+                    .append("organizationName", context.organizationName())
+                    .append("clusterName", context.clusterName())
+                    .append("region", context.region()));
+        }
+        return document;
     }
 
     static Optional<CloudSessionRecord> toRecord(Document document) {
@@ -158,7 +168,22 @@ public final class MongoCloudSessionStore implements CloudSessionStore {
         return Optional.of(new CloudSessionRecord(identity, jwtId,
                 text(document, "secretHash"), text(document, "userId"), text(document, "scope"),
                 (Boolean) revoked, instant(document, "createdAt"), instant(document, "lastUsedAt"),
-                instant(document, "idleExpiresAt")));
+                instant(document, "idleExpiresAt"), readClusterContext(document.get("clusterContext"))));
+    }
+
+    private static CloudSessionContext readClusterContext(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof Document document)) {
+            throw unreadable("clusterContext");
+        }
+        try {
+            return new CloudSessionContext(text(document, "organizationId"), text(document, "clusterId"),
+                    text(document, "organizationName"), text(document, "clusterName"), text(document, "region"));
+        } catch (IllegalArgumentException invalid) {
+            throw unreadable("clusterContext");
+        }
     }
 
     static Binary sessionKey(CloudSessionIdentity identity, String jwtId) {
