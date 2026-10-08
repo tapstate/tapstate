@@ -38,7 +38,7 @@ class ConnectorCatalogViewTest {
             {
               "id": "acme", "name": "Acme", "displayName": "Acme", "icon": "icons/acme.png",
               "group": "database", "modes": ["snapshot"], "discovery": "catalog",
-              "sink": {"capable": false, "writeSemantics": []}, "pushOut": false, "config": [],
+              "sink": {"capable": true, "writeSemantics": ["upsert", "append"]}, "pushOut": false, "config": [],
               "provenance": {"specPath": "spec.json", "specContentHash": "h",
                 "pdkApiVersion": "1.0.0", "requiredLevel": null, "modeSource": {"snapshot": "derived"}}
             }
@@ -176,6 +176,7 @@ class ConnectorCatalogViewTest {
         assertThat(summaries).extracting(ConnectorSummary::id).containsExactly("acme");
         assertThat(summaries.get(0).origin()).isEqualTo("registered");
         assertThat(summaries.get(0).modes()).contains("snapshot");
+        assertThat(summaries.get(0).writeModes()).containsExactly("upsert", "append");
     }
 
     @Test

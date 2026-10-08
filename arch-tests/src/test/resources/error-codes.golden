@@ -68,7 +68,10 @@ capture.cluster-refused-the-read
 capture.cluster-refused-writes
 capture.event-table-not-selected
 capture.no-ring-to-attach
+capture.recovery-log-gap
+capture.recovery-progress-unproven
 capture.snapshot-reports-no-seam
+capture.srs-not-recoverable
 capture.start-from-outside-window
 capture.start-from-unparsable
 cli.alias-install-dir-unknown
@@ -124,6 +127,7 @@ cli.workspace-has-no-pipeline
 cli.workspace-not-writable
 cli.workspace-unreadable
 cluster.membership-unreadable
+connector.acknowledge-failed
 connector.ambiguous-connector-class
 connector.ambiguous-registration
 connector.api-level-incompatible
@@ -149,6 +153,7 @@ connector.read-abandoned
 connector.read-failed
 connector.read-timeout
 connector.registration-conflict
+connector.release-failed
 connector.spec-invalid
 connector.spec-not-found
 connector.state-unreadable
@@ -220,6 +225,7 @@ io.document-unreadable
 io.schema-read-contention
 io.schema-write-contention
 io.sink-writer-progress-ambiguous
+io.srs-progress-unproven
 io.store-unauthorized
 io.store-unavailable
 io.workload-claim-fenced
@@ -268,6 +274,13 @@ nest.state-far-exceeds-memory-budget
 nest.state-paths-changed
 nest.state-served-from-cold-layer
 nest.tombstone-limit-exceeded
+pipeline-draft.already-exists
+pipeline-draft.artifact-conflict
+pipeline-draft.invalid
+pipeline-draft.mode-conflict
+pipeline-draft.not-found
+pipeline-draft.precondition-required
+pipeline-draft.revision-conflict
 pipeline.already-exists
 pipeline.id-mismatch
 pipeline.not-found

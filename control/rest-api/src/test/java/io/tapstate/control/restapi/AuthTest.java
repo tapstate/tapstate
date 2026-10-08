@@ -28,6 +28,8 @@ import io.tapstate.control.core.LoginService;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.PasswordHasher;
 import io.tapstate.control.core.PipelineLifecycleService;
+import io.tapstate.control.core.PipelineCatalogService;
+import io.tapstate.control.core.PipelineDraftService;
 import io.tapstate.control.core.PipelineLayoutService;
 import io.tapstate.control.core.PipelineLogQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
@@ -64,6 +66,9 @@ import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.PipelineLayout;
 import io.tapstate.spi.store.PipelineLayoutStore;
+import io.tapstate.spi.store.PipelineDraft;
+import io.tapstate.spi.store.PipelineDraftMutation;
+import io.tapstate.spi.store.PipelineDraftStore;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.spi.store.SessionRecord;
@@ -867,6 +872,41 @@ class AuthTest {
         PipelineViewService pipelineViewService(
                 ArtifactQueryService artifacts, PipelineRepresentation representation) {
             return new PipelineViewService(artifacts, representation);
+        }
+
+        @Bean
+        PipelineDraftStore pipelineDraftStore() {
+            return new PipelineDraftStore() {
+                @Override public Optional<PipelineDraft> get(String pipelineId) { return Optional.empty(); }
+                @Override public List<PipelineDraft> list() { return List.of(); }
+                @Override public PipelineDraftMutation create(PipelineDraft draft) {
+                    throw new UnsupportedOperationException("draft writes are not exercised by this double");
+                }
+                @Override public PipelineDraftMutation replace(
+                        String pipelineId, long expectedRevision, PipelineDraft replacement) {
+                    throw new UnsupportedOperationException("draft writes are not exercised by this double");
+                }
+                @Override public PipelineDraftMutation delete(String pipelineId, long expectedRevision) {
+                    throw new UnsupportedOperationException("draft writes are not exercised by this double");
+                }
+                @Override public PipelineDraftMutation publish(PipelineDraft.Publication publication) {
+                    throw new UnsupportedOperationException("draft writes are not exercised by this double");
+                }
+            };
+        }
+
+        @Bean
+        PipelineDraftService pipelineDraftService(PipelineDraftStore drafts) {
+            return new PipelineDraftService(drafts);
+        }
+
+        @Bean
+        PipelineCatalogService pipelineCatalogService(
+                ArtifactQueryService artifacts,
+                PipelineDraftService drafts,
+                DesiredStore desired,
+                PipelineObservationQueryService observations) {
+            return new PipelineCatalogService(artifacts, drafts, desired, observations);
         }
 
         @Bean

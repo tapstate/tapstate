@@ -20,6 +20,7 @@ import io.tapstate.spi.store.OperatorStateStore;
 import io.tapstate.spi.store.OperatorStateStores;
 import io.tapstate.spi.store.RateHistoryStore;
 import io.tapstate.spi.store.PipelineLayoutStore;
+import io.tapstate.spi.store.PipelineDraftStore;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SrsLogStore;
 import io.tapstate.spi.store.SrsMetaStore;
@@ -66,6 +67,8 @@ public final class MongoStorePort implements StorePort {
     public static final String PIPELINE_RATE_HISTORY = "pipeline_rate_history";
     /** The collection holding one editor-only canvas layout per pipeline. */
     public static final String PIPELINE_LAYOUTS = "pipeline_layouts";
+    /** The collection holding durable, server-owned Pipeline authoring drafts. */
+    public static final String PIPELINE_DRAFTS = "pipeline_drafts";
     /** The collection holding the registered connection configurations. */
     public static final String CONNECTIONS = "connections";
     /** The collection holding one discovered source model per connection. */
@@ -133,6 +136,7 @@ public final class MongoStorePort implements StorePort {
     private final ObservationStore observations;
     private final RateHistoryStore rateHistory;
     private final PipelineLayoutStore layouts;
+    private final PipelineDraftStore drafts;
     private final WorkloadClaimStore workloadClaims;
     private final ClusterMembershipStore clusterMembership;
     private final SrsMetaStore meta;
@@ -192,6 +196,8 @@ public final class MongoStorePort implements StorePort {
         OperatorStateStore defaultState = operatorStateStores.inDatabase(operatorStateStores.defaultDatabase());
         this.keyedState = defaultState.state();
         this.nestDeadLetters = defaultState.deadLetters();
+        this.drafts = new MongoPipelineDraftStore(connection.client(),
+                SystemCollections.PIPELINE_DRAFTS.on(database), SystemCollections.ARTIFACTS.on(database));
     }
 
     static String requireOperatorStateDatabase(String name, String controlDatabase) {
@@ -279,6 +285,11 @@ public final class MongoStorePort implements StorePort {
     @Override
     public PipelineLayoutStore layouts() {
         return layouts;
+    }
+
+    @Override
+    public PipelineDraftStore drafts() {
+        return drafts;
     }
 
     @Override

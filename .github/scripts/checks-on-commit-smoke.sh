@@ -259,7 +259,7 @@ expect "a missing --sha is a usage error"        2 "--sha"      --required build
 expect "neither source of names is a usage error" 2 "--required" --sha "$sha"
 
 # --- a required check that cannot run on this commit at all -----------------------------------------
-# Two of the contexts the branch ruleset requires are `pull_request`-only workflows, so they never
+# Some of the contexts the branch ruleset requires are `pull_request`-only workflows, so they never
 # produce a check-run on a commit that sits on the default branch, and a release cut from one used to
 # stop here forever. The answer is on the pull request whose merge produced this commit -- but only
 # when that pull request's head carries the same tree, because then there is no combination of
@@ -274,6 +274,40 @@ trees deadbeef deadbeef
 expect "a check absent here but green on the merged head passes" 0 "clean:" --sha "$sha" --required build,dco
 expect "and it says which commit answered for it"                0 "$head_sha" --sha "$sha" --required build,dco
 refute "and it is not reported as never having run"                "never ran" --sha "$sha" --required build,dco
+
+# All PR-only contexts keep their same-tree fallback. Checks produced on a push or a dispatch
+# cannot borrow it, even when the PR's tree is identical and the PR checks have already passed.
+reset
+runs $'build\tcompleted\tsuccess'
+runs_head $'dco\tcompleted\tsuccess' $'e2e-admission\tcompleted\tsuccess' \
+  $'docs-classification\tcompleted\tsuccess' $'docs-impact\tcompleted\tsuccess'
+pulls "$head_sha"
+trees deadbeef deadbeef
+expect "all PR-only contexts can borrow a same-tree head" 0 "clean:" \
+  --sha "$sha" --required build,dco,e2e-admission,docs-classification,docs-impact
+
+reset
+runs $'build\tcompleted\tsuccess'
+runs_head $'sonarqube\tcompleted\tsuccess' $'no-cjk\tcompleted\tsuccess' \
+  $'real-connectors\tcompleted\tsuccess' $'join-perf\tcompleted\tsuccess' \
+  $'future-check\tcompleted\tsuccess'
+pulls "$head_sha"
+trees deadbeef deadbeef
+for name in sonarqube no-cjk real-connectors join-perf future-check; do
+  expect "an unreported $name cannot borrow a green head" 3 "'$name' never ran" \
+    --sha "$sha" --required "build,$name"
+done
+
+# A declined PR-only fallback is cached, but it is not the reason a push check is absent.
+reset
+runs ''
+runs_head $'dco\tcompleted\tsuccess' $'build\tcompleted\tsuccess'
+pulls "$head_sha"
+trees deadbeef 0ther777
+expect "a missing push check is not a declined PR verdict" 3 "'build' never ran" \
+  --sha "$sha" --required dco,build
+refute "and the push check is not reported as a different tree" "'build' did not run" \
+  --sha "$sha" --required dco,build
 
 # The guard. If the merge produced a tree the head never had, the head's green says nothing about
 # what is being released, and the refusal has to come back.
@@ -347,6 +381,26 @@ reset
 ruleset '  no-agent-footprint  '
 runs $'no-agent-footprint\tcompleted\tsuccess'
 expect "a name is trimmed without losing its last letter" 0 "clean:" --sha "$sha" --from-ruleset main
+
+# Keep the pin/gate-1 timing regression in the existing CI and release smoke entry point.
+if python3 "$here/checks-on-commit-push-pending-test.py" \
+    PendingPushChecksTest.test_pin_waits_before_the_push_build_check_exists; then
+  printf '  ok    %s\n' "pin and gate 1 both wait for the pending push"
+  passed=$((passed + 1))
+else
+  printf '  FAIL  %s\n' "pin and gate 1 both wait for the pending push"
+  failed=$((failed + 1))
+fi
+
+# Gate 8 must read the performance lane, not this release's dispatcher.
+if python3 "$here/release-join-perf-pending-test.py" \
+    JoinPerformanceReleaseGateTest.test_gate_waits_for_lane_after_dispatcher_succeeds; then
+  printf '  ok    %s\n' "gate 8 waits for the join performance lane"
+  passed=$((passed + 1))
+else
+  printf '  FAIL  %s\n' "gate 8 waits for the join performance lane"
+  failed=$((failed + 1))
+fi
 
 printf '\n%s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" = 0 ]

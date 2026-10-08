@@ -23,6 +23,7 @@ import io.tapstate.spi.store.StorePort;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * In-memory {@link StorePort} for the assembly-layer tests: it supplies real desired, state and observation
@@ -38,7 +39,7 @@ final class InMemoryStorePort implements StorePort {
     private final InMemoryRateHistoryStore rateHistory = new InMemoryRateHistoryStore();
     private final InMemoryArtifactStore artifacts;
     private final InMemorySrsMetaStore meta = new InMemorySrsMetaStore();
-    private final InMemorySrsLogStore srsLog = new InMemorySrsLogStore();
+    private final SrsLogStore srsLog;
     private final InMemorySchemaStore schemas = new InMemorySchemaStore();
     private final InMemoryDerivedSchemaStore derivedSchemas = new InMemoryDerivedSchemaStore();
     private final InMemoryKeyedStateStore keyedState = new InMemoryKeyedStateStore();
@@ -65,7 +66,12 @@ final class InMemoryStorePort implements StorePort {
     }
 
     InMemoryStorePort(InMemoryArtifactStore artifacts) {
+        this(artifacts, new InMemorySrsLogStore());
+    }
+
+    InMemoryStorePort(InMemoryArtifactStore artifacts, SrsLogStore srsLog) {
         this.artifacts = artifacts;
+        this.srsLog = Objects.requireNonNull(srsLog, "srsLog");
     }
 
     @Override

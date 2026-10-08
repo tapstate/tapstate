@@ -16,7 +16,21 @@ import java.util.Map;
 final class SharedOracle {
     private static final String PASSWORD = "Tapstate_Test_42";
     private static final String USER = "C##TAPSTATE";
+    private static final Duration STARTUP_BUDGET = Duration.ofMinutes(5);
     private static OracleContainer container;
+
+    // DriverManager hands a caller only a driver registered from a class loader that caller can see, and it
+    // discovers drivers once, on its first use, through the context class loader of whichever thread uses it
+    // first. In a JVM that has already run a server, that thread can be a connector's, whose own loader cannot
+    // see this classpath, and the container does not load the driver either: it waits on its log, not on a
+    // connection. So the driver is registered from here, where every caller of this fixture can see it.
+    static {
+        try {
+            DriverManager.registerDriver(new oracle.jdbc.OracleDriver());
+        } catch (SQLException error) {
+            throw new ExceptionInInitializerError(error);
+        }
+    }
 
     private SharedOracle() {
     }
@@ -70,12 +84,14 @@ final class SharedOracle {
         DockerGate.require();
         OracleContainer starting = new OracleContainer("gvenzl/oracle-free:23-slim-faststart")
                 .withPassword(PASSWORD)
-                .withStartupTimeout(Duration.ofMinutes(5));
+                .withStartupTimeout(STARTUP_BUDGET);
         long began = System.nanoTime();
         starting.start();
         try {
+            // Supplemental logging waits for in-flight transactions after the database reopens.
+            // Give that wait the same bounded budget as container startup.
             var result = starting.execInContainer("bash", "-c", """
-                    timeout 120 sqlplus -s / as sysdba <<'SQL'
+                    timeout %d sqlplus -s / as sysdba <<'SQL'
                     WHENEVER SQLERROR EXIT SQL.SQLCODE
                     SHUTDOWN IMMEDIATE;
                     STARTUP MOUNT;
@@ -94,7 +110,7 @@ final class SharedOracle {
                     ALTER SYSTEM REGISTER;
                     EXIT;
                     SQL
-                    """);
+                    """.formatted(STARTUP_BUDGET.toSeconds()));
             if (result.getExitCode() != 0) {
                 throw new EnvelopeException("cannot enable Oracle change capture: " + result.getStdout() + result.getStderr());
             }

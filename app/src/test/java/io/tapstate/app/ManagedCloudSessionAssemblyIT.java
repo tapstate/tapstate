@@ -162,6 +162,8 @@ class ManagedCloudSessionAssemblyIT {
                 }
                 String cookieA = cookies.get(ports.userA.jwtId());
                 String cookieB = cookies.get(ports.userB.jwtId());
+                assertPipelineCatalog(client, cookieA, ports);
+                assertPipelineCatalog(client, cookieB, ports);
                 SourceResource original = (SourceResource) context.getBean(ArtifactStore.class)
                         .get(ports.userA.sourceId()).orElseThrow();
                 // Attribution preserves the creator; it does not introduce a per-user resource ACL.
@@ -209,6 +211,7 @@ class ManagedCloudSessionAssemblyIT {
                 assertThat(status(client, cookieB, ports.userB.sourceId())).isEqualTo(200);
                 assertCurrentUserRefused(client, cookieA);
                 assertCurrentUser(client, cookieB, ports.userB.userId());
+                assertPipelineCatalog(client, cookieB, ports);
                 for (ControlledLogin login : ports.logins) {
                     for (String id : List.of(login.sourceId(), login.pipelineId())) {
                         assertThat(attributed(restarted, client, stored, cookieB, id, login.userId()))
@@ -274,6 +277,29 @@ class ManagedCloudSessionAssemblyIT {
                     return response.bodyTo(String.class);
                 });
         assertThat(body).contains("control.unauthenticated").doesNotContain(cookie);
+    }
+
+    private static void assertPipelineCatalog(RestClient client, String cookie, TwoUserPorts ports) {
+        Map<?, ?> body = client.get().uri("/api/pipelines").header(HttpHeaders.COOKIE, cookie)
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode().value()).isEqualTo(200);
+                    assertThat(response.getHeaders().get(HttpHeaders.SET_COOKIE)).isNull();
+                    return response.bodyTo(Map.class);
+                });
+        assertThat(body.keySet().stream().map(String::valueOf).toList()).containsExactly("items");
+        assertThat(body.get("items")).isInstanceOf(List.class);
+        List<?> items = (List<?>) body.get("items");
+        assertThat(items).hasSize(2);
+        assertThat(items.stream().map(item -> String.valueOf(((Map<?, ?>) item).get("id"))).toList())
+                .containsExactlyInAnyOrder(ports.userA.pipelineId(), ports.userB.pipelineId());
+        for (Object value : items) {
+            Map<?, ?> item = (Map<?, ?>) value;
+            assertThat(item.get("name")).isEqualTo(item.get("id"));
+            assertThat(item.get("hasArtifact")).isEqualTo(true);
+            assertThat(item.get("status")).isInstanceOf(Map.class);
+        }
+        assertThat(body.toString()).doesNotContain(cookie, TwoUserPorts.STATIC_TOKEN,
+                "config", "password", "db.example", "jwt", "jti");
     }
 
     private static RestClient client(ConfigurableApplicationContext context) {

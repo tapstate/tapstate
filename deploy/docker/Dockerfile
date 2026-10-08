@@ -38,7 +38,7 @@ FROM eclipse-temurin:21-jre AS runtime-base
 # Common OCI self-description. Only the public server target associates its package with the
 # public source repository; the Cloud target retains independent package metadata.
 LABEL org.opencontainers.image.title="Tapstate server" \
-      org.opencontainers.image.description="Preview runtime: single-node, in-memory; a restart replays from the source rather than resuming a persisted offset. Not for production." \
+      org.opencontainers.image.description="Preview runtime: a single member by default, with opt-in cluster mode and MongoDB-persisted control-plane state and recovery positions. Restart recovery depends on the source and read mode; delivery is at-least-once. Not for production." \
       org.opencontainers.image.url="https://tapstate.com" \
       org.opencontainers.image.documentation="https://github.com/tapstate/tapstate/blob/main/docs/quickstart-online.md" \
       org.opencontainers.image.licenses="Apache-2.0" \

@@ -50,6 +50,7 @@ import java.util.List;
         ConnectorIconController.class,
         PipelineViewController.class,
         PipelineLayoutController.class,
+        PipelineDraftController.class,
         SourceDraftController.class,
         DerivedSchemaController.class,
         ApiExceptionHandler.class})

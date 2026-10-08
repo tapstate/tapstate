@@ -452,6 +452,17 @@ class ApplyServiceTest {
     }
 
     @Test
+    void draftPublicationPlanningAlsoRefusesToChangeTheLivePipelinesBufferingSwitch() {
+        service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
+        ApplyService guarded = guardedWith(PipelineState.RUNNING);
+        Resource replacement = new DslParser().parse(PINNED_OFF_PIPELINE);
+
+        assertThatThrownBy(() -> guarded.planDraftPublication(replacement))
+                .isInstanceOfSatisfying(TapstateException.class, refused ->
+                        assertThat(refused.code()).isEqualTo(SourceError.SRS_CHANGE_WHILE_RUNNING));
+    }
+
+    @Test
     void typedReplaceFailsClosedWhenALivePipelineIsUnreadable() {
         service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
         String sourceBefore = stored("orders_src");

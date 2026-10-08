@@ -108,21 +108,27 @@ final class TwoMemberCluster implements AutoCloseable {
         int memberPortB = RealProcessServer.reservePort();
         String seeds = bindAddress + ":" + memberPortA + "," + bindAddress + ":" + memberPortB;
 
-        java.util.function.IntFunction<List<String>> firstArguments = httpPort -> arguments(
-                clusterId, NODE_A, memberPortA, seeds, httpPort, bindAddress, nodeSessionTtl);
-        RealProcessServer first = concurrent
-                ? RealProcessServer.launching(storeUri, "0.0.0.0", firstArguments)
-                : RealProcessServer.start(storeUri, "0.0.0.0", firstArguments);
+        RealProcessServer first = null;
         RealProcessServer second;
         try {
+            java.util.function.IntFunction<List<String>> firstArguments = httpPort -> arguments(
+                    clusterId, NODE_A, memberPortA, seeds, httpPort, bindAddress, nodeSessionTtl);
+            first = concurrent
+                    ? RealProcessServer.launching(storeUri, "0.0.0.0", firstArguments)
+                    : RealProcessServer.start(storeUri, "0.0.0.0", firstArguments);
             java.util.function.IntFunction<List<String>> secondArguments = httpPort -> arguments(
                     clusterId, NODE_B, memberPortB, seeds, httpPort, bindAddress, nodeSessionTtl);
             second = concurrent
                     ? RealProcessServer.launching(storeUri, "0.0.0.0", secondArguments)
                     : RealProcessServer.start(storeUri, "0.0.0.0", secondArguments);
         } catch (RuntimeException | Error failure) {
-            first.close();
+            if (first != null) {
+                first.close();
+            }
             throw failure;
+        } finally {
+            RealProcessServer.releasePort(memberPortA);
+            RealProcessServer.releasePort(memberPortB);
         }
         TwoMemberCluster cluster = new TwoMemberCluster(
                 first, second, storeUri, clusterId, bindAddress, seeds, nodeSessionTtl);

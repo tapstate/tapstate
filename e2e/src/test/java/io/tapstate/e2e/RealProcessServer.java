@@ -3,13 +3,16 @@ package io.tapstate.e2e;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.InetAddress;
-import java.net.ServerSocket;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.function.IntFunction;
 import java.util.concurrent.TimeUnit;
 
@@ -32,8 +35,8 @@ final class RealProcessServer implements ServerHandle {
      * <p>A case whose subject is a member of a cluster widens the listen to every address with a later
      * argument of its own - such a member is refused unless it advertises somewhere another member can
      * reach it. It is still dialled here, and it has to be: the first admin is created over a channel
-     * the server accepts only from this address. {@link #freePort()} reserves on this address too, so
-     * widening the listen cannot hand a case somebody else's server on it.
+     * the server accepts only from this address. {@link #freePort()} reserves across local addresses,
+     * so widening the listen cannot hand a case somebody else's server on it.
      */
     private static final String LOOPBACK = "127.0.0.1";
 
@@ -41,14 +44,20 @@ final class RealProcessServer implements ServerHandle {
     private static final Duration POLL_INTERVAL = Duration.ofMillis(250);
     private static final Duration SHUTDOWN_BUDGET = Duration.ofSeconds(20);
 
+    // Keep closed reservations too: a delayed launch or cleanup must never refer to a port handed
+    // to a later launch in this JVM. Open reservations protect members not yet launched from reuse.
+    private static final Map<Integer, Socket> PORT_RESERVATIONS = new LinkedHashMap<>();
+
     private final Process process;
     private final URI baseUrl;
     private final Path output;
+    private final Path stagingDirectory;
 
-    private RealProcessServer(Process process, URI baseUrl, Path output) {
+    private RealProcessServer(Process process, URI baseUrl, Path output, Path stagingDirectory) {
         this.process = process;
         this.baseUrl = baseUrl;
         this.output = output;
+        this.stagingDirectory = stagingDirectory;
     }
 
     /** Launches the deliverable and returns once its health probe answers. */
@@ -102,14 +111,7 @@ final class RealProcessServer implements ServerHandle {
      */
     static RealProcessServer start(String storeUri, String listenAddress,
             IntFunction<List<String>> extraArguments) {
-        RealProcessServer server = launching(storeUri, bootJar(), listenAddress, extraArguments);
-        try {
-            awaitHealthy(server.process, server.baseUrl, server.output);
-        } catch (RuntimeException | AssertionError e) {
-            server.process.destroyForcibly();
-            throw e;
-        }
-        return server;
+        return healthy(launching(storeUri, bootJar(), listenAddress, extraArguments));
     }
 
     /**
@@ -130,14 +132,7 @@ final class RealProcessServer implements ServerHandle {
 
     private static RealProcessServer start(String storeUri, String operatorStateDatabase, Path jar,
             List<String> additionalArguments) {
-        RealProcessServer server = launching(storeUri, operatorStateDatabase, jar, additionalArguments);
-        try {
-            awaitHealthy(server.process, server.baseUrl, server.output);
-        } catch (RuntimeException | AssertionError e) {
-            server.process.destroyForcibly();
-            throw e;
-        }
-        return server;
+        return healthy(launching(storeUri, operatorStateDatabase, jar, additionalArguments));
     }
 
     /**
@@ -198,12 +193,26 @@ final class RealProcessServer implements ServerHandle {
      * handed to the product instead they would be settings nobody reads.
      */
     static RealProcessServer startInJvm(String storeUri, List<String> jvmOptions) {
-        RealProcessServer server = launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, bootJar(), LOOPBACK,
-                jvmOptions, port -> List.of());
+        return healthy(launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, bootJar(), LOOPBACK,
+                jvmOptions, port -> List.of()));
+    }
+
+    /**
+     * Returns the launch once its health probe answers, and ends it otherwise.
+     *
+     * <p>A launch that never came up is not handed to anybody, so nobody else will ever end it or clear
+     * up after it. Whatever goes wrong doing that is attached to the failure rather than replacing it:
+     * why the server did not come up is the thing a reader needs.
+     */
+    private static RealProcessServer healthy(RealProcessServer server) {
         try {
             awaitHealthy(server.process, server.baseUrl, server.output);
         } catch (RuntimeException | AssertionError e) {
-            server.process.destroyForcibly();
+            try {
+                server.kill();
+            } catch (RuntimeException | AssertionError cleanup) {
+                e.addSuppressed(cleanup);
+            }
             throw e;
         }
         return server;
@@ -217,9 +226,10 @@ final class RealProcessServer implements ServerHandle {
         URI baseUrl = URI.create("http://" + LOOPBACK + ":" + port);
         Path workingDirectory = workingDirectory();
         Path output = workingDirectory.resolve("server.out");
+        Path stagingDirectory = ServerHandle.privateStagingDirectory();
         Process process = launch(jar, jvmOptions, port, listenAddress, storeUri, operatorStateDatabase,
-                workingDirectory, output, extraArguments.apply(port));
-        return new RealProcessServer(process, baseUrl, output);
+                workingDirectory, output, stagingDirectory, extraArguments.apply(port));
+        return new RealProcessServer(process, baseUrl, output, stagingDirectory);
     }
 
     /**
@@ -239,6 +249,8 @@ final class RealProcessServer implements ServerHandle {
             Thread.currentThread().interrupt();
             throw new AssertionError("interrupted while waiting for the killed server to go away", e);
         }
+        // The harness's own leftovers, not the server's: a crash witness may never close what it killed.
+        ServerHandle.discardStagingDirectory(stagingDirectory);
     }
 
     @Override
@@ -253,6 +265,11 @@ final class RealProcessServer implements ServerHandle {
      */
     Path output() {
         return output;
+    }
+
+    /** Where this launch staged its connectors, for a witness that the directory goes when the launch does. */
+    Path stagingDirectory() {
+        return stagingDirectory;
     }
 
     /** Whether it is still running, so a witness waiting on it can tell waiting from waiting forever. */
@@ -303,11 +320,12 @@ final class RealProcessServer implements ServerHandle {
             Thread.currentThread().interrupt();
             process.destroyForcibly();
         }
+        ServerHandle.discardStagingDirectory(stagingDirectory);
     }
 
     private static Process launch(Path jar, List<String> jvmOptions, int port, String listenAddress,
             String storeUri, String operatorStateDatabase, Path workingDirectory, Path output,
-            List<String> extraArguments) {
+            Path stagingDirectory, List<String> extraArguments) {
         List<String> command = new ArrayList<>();
         command.add(javaBinary());
         command.addAll(jvmOptions);
@@ -316,7 +334,7 @@ final class RealProcessServer implements ServerHandle {
                 jar.toString(),
                 // The role the deliverable is documented to take; parsed by the product before Spring starts.
                 "--role=all",
-                // Bound to the loopback, which is where freePort() reserved it and where the probe and
+                // Bound to the loopback, which is where the probe and
                 // every case dial it. Left to itself the product binds the wildcard, and a wildcard bind
                 // does not own 127.0.0.1:<port> -- a process already holding that port on the loopback
                 // keeps receiving the requests, and this server answers none of them.
@@ -328,13 +346,14 @@ final class RealProcessServer implements ServerHandle {
                 "--tapstate.store.mongo.server-selection-timeout=5s",
                 // A staging directory of this launch's own, for the same reason the other tier gets one:
                 // the cache is content-addressed and reused, so a shared one serves a stale connector.
-                "--" + ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + ServerHandle.privateStagingDirectory(),
+                "--" + ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + stagingDirectory,
                 "--" + ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID));
         // After the standing ones, and additional to them rather than replacing any: a repeated option
         // is joined with the earlier one by comma rather than winning over it, so anything a case needs
         // to set differently is a parameter above instead of an argument here.
         command.addAll(extraArguments);
         try {
+            releaseLaunchPorts(port, extraArguments);
             return new ProcessBuilder(command)
                     .directory(workingDirectory.toFile())
                     .redirectErrorStream(true)
@@ -396,29 +415,58 @@ final class RealProcessServer implements ServerHandle {
      * A port nothing is listening on, for a caller that has to know one before anything is launched -
      * two members pointed at each other cannot both be told the other's address afterwards.
      *
-     * <p>Reserved by binding and releasing, so it is free at the moment it is answered and not promised
-     * beyond that. Two calls never answer the same port while both are outstanding, which is what a
-     * caller lining up a pair needs.
+     * <p>The reservation stays bound until the process or link takes it. Two calls never answer the
+     * same port, and a member waiting for its turn to launch cannot lose its port to an earlier
+     * member's outbound connection.
      */
     static int reservePort() {
         return freePort();
     }
 
-    private static int freePort() {
-        // The product cannot be asked for the port it chose from outside its JVM, so the port is chosen
-        // here and handed to it. The socket is closed before the launch, which leaves a small window -
-        // the alternative, a fixed port, turns any busy machine into a permanent failure instead.
-        //
-        // Reserved on the loopback specifically, because that is the address the server is launched on
-        // and the address every case dials. A wildcard reservation proves only that the port is free on
-        // some address: the allocator hands one out even when another local process already holds it on
-        // 127.0.0.1, and that holder is the one a loopback connection reaches. Asking on the same address
-        // is also what narrows the window above to a racer binding this exact address, rather than any
-        // holder that was already there before the reservation was made.
-        try (ServerSocket socket = new ServerSocket(0, 0, InetAddress.getLoopbackAddress())) {
-            return socket.getLocalPort();
+    private static synchronized int freePort() {
+        try {
+            while (true) {
+                Socket socket = new Socket();
+                try {
+                    // Members bind a routable address, links bind loopback, and HTTP can bind both.
+                    // Disallow address reuse so the reservation owns the port on every local address.
+                    // A bound client socket reserves without listening to a member's discovery dials.
+                    socket.setReuseAddress(false);
+                    socket.bind(new InetSocketAddress(InetAddress.getByName("0.0.0.0"), 0));
+                    int port = socket.getLocalPort();
+                    if (!PORT_RESERVATIONS.containsKey(port)) {
+                        PORT_RESERVATIONS.put(port, socket);
+                        return port;
+                    }
+                } catch (IOException failure) {
+                    socket.close();
+                    throw failure;
+                }
+                socket.close();
+            }
         } catch (IOException e) {
             throw new UncheckedIOException("could not reserve a port for the server", e);
+        }
+    }
+
+    /** Releases only a reservation made here, immediately before its listener takes the port. */
+    static synchronized void releasePort(int port) {
+        Socket socket = PORT_RESERVATIONS.get(port);
+        if (socket != null) {
+            try {
+                socket.close();
+            } catch (IOException e) {
+                throw new UncheckedIOException("could not release reserved port " + port, e);
+            }
+        }
+    }
+
+    private static synchronized void releaseLaunchPorts(int httpPort, List<String> extraArguments) {
+        releasePort(httpPort);
+        for (int reserved : PORT_RESERVATIONS.keySet()) {
+            if (extraArguments.contains("--tapstate.hz.member-port=" + reserved)) {
+                releasePort(reserved);
+            }
         }
     }
 

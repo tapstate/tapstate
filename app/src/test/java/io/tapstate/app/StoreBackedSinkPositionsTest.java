@@ -15,6 +15,9 @@ import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.spi.store.DiscoveredSourceModel;
+import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.ConsumerProgressKind;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import java.util.List;
@@ -32,6 +35,50 @@ import org.junit.jupiter.api.Test;
 class StoreBackedSinkPositionsTest {
 
     private static final String PIPELINE = "orders-pipe";
+
+    @Test
+    void tablesOnOneSharedPhysicalSourceReadTheirOwnNodesConfirmedProgress() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        SourceResource cases = source("cases_src", "support_case", "crm");
+        SourceResource mail = source("mail_src", "emailmessage", "crm");
+        artifacts.save(cases);
+        artifacts.save(mail);
+        artifacts.save(pipeline(PIPELINE, cases.id(), mail.id()));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        String chain = chainOf(cases);
+        assertThat(chainOf(mail)).isEqualTo(chain);
+        store.meta().create(chain, null);
+        store.meta().upsertConsumerOffset(chain, new ConsumerOffset(
+                SrsConsumerId.of(PIPELINE, cases.id()).value(), Map.of("support_case", 2L), null,
+                List.of(), null, 0L, Map.of("support_case", new ChainPosition(new SourceOrder(1, 1), "low")),
+                ConsumerProgressKind.SRS));
+        store.meta().upsertConsumerOffset(chain, new ConsumerOffset(
+                SrsConsumerId.of(PIPELINE, mail.id()).value(), Map.of("emailmessage", 1_000L), null,
+                List.of(), null, 0L,
+                Map.of("emailmessage", new ChainPosition(new SourceOrder(1, 1_000), "mail-after-high")),
+                ConsumerProgressKind.SRS));
+
+        assertThat(new StoreBackedSinkPositions(store).apply(PIPELINE))
+                .containsOnly(entry("support_case", "low"), entry("emailmessage", "mail-after-high"));
+    }
+
+    @Test
+    void anOldMultiTablePositionIsNotProjectedToAnUnconfirmedTable() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        SourceResource source = new SourceResource("crm_src", null, "fake", Map.of("host", "crm"),
+                SourceMode.CDC, List.of(TableRef.literal("support_case"), TableRef.literal("emailmessage")),
+                null, null);
+        artifacts.save(source);
+        artifacts.save(pipeline(PIPELINE, source.id()));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        String chain = chainOf(source);
+        store.meta().create(chain, null);
+        store.meta().upsertConsumerOffset(chain, new ConsumerOffset(PIPELINE,
+                Map.of("support_case", 2L, "emailmessage", 1_000L),
+                new ChainPosition(new SourceOrder(1, 1_000), "mail-after-high")));
+
+        assertThat(new StoreBackedSinkPositions(store).apply(PIPELINE)).isEmpty();
+    }
 
     @Test
     void keysTheSinkAckedPositionByTheTableItsSourceReads() {

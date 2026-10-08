@@ -22,10 +22,12 @@ Its shaded PDK JAR exposes batch and stream read functions, but no real Amazon R
 snapshot, binlog CDC, or restart-continuation run has been completed. It is not a write target.
 Real-service validation is tracked in [issue #529](https://github.com/tapstate/tapstate/issues/529).
 
-A `serve.sync` element installs onto the `mongodb` kind and no other,
-on any of its accepted ids. Applying a pipeline whose sync names one of the other
-certified connectors is refused, naming that connector and the document the element is
-written in; reading through it is unaffected.
+A `serve.sync` element in cloud mode installs only onto `mongodb` or `mongodb-atlas`.
+On-prem deployments may write to catalog connectors marked sink-capable, except source-only ids
+such as `aws-rds-mysql`. Private connectors outside the catalog remain the operator's responsibility.
+This deployment allowance is not a certification claim: this preview certifies MongoDB write
+support only. Applying a cloud pipeline whose sync names another connector is refused; reading
+through it is unaffected.
 
 Reads are verified on Oracle Free 23 and SQL Server 2022, and across the other kinds,
 with snapshot and CDC inserts, updates and deletes.

@@ -8,6 +8,7 @@ import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.Job;
+import com.hazelcast.jet.config.JobConfig;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Processor;
@@ -163,6 +164,21 @@ class NestDagRunTest {
     }
 
     @Test
+    void filtersBeforeATrackedNestDropRootsAndChildrenWithoutStoppingTheJob() {
+        DAG dag = ordersWithItems(
+                List.of(row("order_id", 1, "code", "A"), row("order_id", 2, "keep", false)),
+                List.of(row("item_id", 10, "order_id", 1, "sku", "s10"),
+                        row("item_id", 11, "order_id", 1, "keep", false)),
+                false, true, true);
+
+        member.getJet().newJob(dag, new JobConfig().setName("filtered_nest")).join();
+
+        Map<Object, Map<String, Object>> documents = latestPerRoot();
+        assertThat(documents.keySet()).containsExactly(1);
+        assertThat(items(documents.get(1))).containsExactly(row("item_id", 10, "order_id", 1, "sku", "s10"));
+    }
+
+    @Test
     void theSeamThatReadsBackTheDurableFrontierIsBoundOnTheMemberRunningTheAssembler() {
         DAG dag = ordersWithItems(List.of(row("order_id", 1, "code", "A")),
                 List.of(row("item_id", 10, "order_id", 1, "sku", "s10")));
@@ -263,19 +279,32 @@ class NestDagRunTest {
 
     private static DAG ordersWithItems(List<Map<String, Object>> orders, List<Map<String, Object>> items,
             boolean endless, boolean trackKeyChanges) {
+        return ordersWithItems(orders, items, endless, trackKeyChanges, false);
+    }
+
+    private static DAG ordersWithItems(List<Map<String, Object>> orders, List<Map<String, Object>> items,
+            boolean endless, boolean trackKeyChanges, boolean filtered) {
         Embed item = new Embed("item", Map.of("order_id", "order_id"), EmbedAs.ARRAY, "items",
                 List.of("item_id"), null, trackKeyChanges ? Boolean.TRUE : null, null);
         TransformBody.Nest body = new TransformBody.Nest(null, null,
                 new NestRoot("order", List.of("order_id"), null, null, List.of(item)));
 
         Map<String, FromRef> aliases = new LinkedHashMap<>();
-        aliases.put("order", FromRef.literal("orders"));
-        aliases.put("item", FromRef.literal("order_items"));
+        aliases.put("order", FromRef.literal(filtered ? "kept_orders" : "orders"));
+        aliases.put("item", FromRef.literal(filtered ? "kept_items" : "order_items"));
         Step step = Step.inline("order_doc", FromClause.aliases(aliases), body, null);
+        List<Step> steps = new ArrayList<>();
+        if (filtered) {
+            steps.add(Step.inline("kept_orders", FromClause.list(FromRef.literal("orders")),
+                    new TransformBody.Filter("!has(row.keep) || row.keep"), null));
+            steps.add(Step.inline("kept_items", FromClause.list(FromRef.literal("order_items")),
+                    new TransformBody.Filter("!has(row.keep) || row.keep"), null));
+        }
+        steps.add(step);
 
         PipelineResource pipeline = new PipelineResource("p", null,
                 List.of(SourceRef.bare("orders"), SourceRef.bare("order_items")),
-                List.of(step), null,
+                steps, null,
                 new ServeBlock.Inline("serve", FromRef.literal("order_doc"),
                         List.of(new SyncElement("sync_1", "dest", null, null, null)), null, null),
                 null, null);
@@ -290,7 +319,13 @@ class NestDagRunTest {
 
         DagBindings bindings = new DagBindings(
                 sources::get,
-                s -> (SupplierEx<TransformPort>) () -> event -> List.of(event),
+                s -> {
+                    boolean isFilter = s instanceof Step.Inline inline
+                            && inline.body() instanceof TransformBody.Filter;
+                    return (SupplierEx<TransformPort>) () -> event ->
+                            isFilter && Boolean.FALSE.equals(event.after().get("keep"))
+                                    ? List.of() : List.of(event);
+                },
                 syncElement -> (SupplierEx<SinkWriter>) CollectingSinkWriter::new,
                 ref -> List.of(((FromRef.Literal) ref).ref()),
                 new NestBinding(tables::get, HeapNestStores.onHeap(),

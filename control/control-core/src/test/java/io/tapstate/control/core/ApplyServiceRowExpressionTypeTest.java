@@ -190,6 +190,33 @@ class ApplyServiceRowExpressionTypeTest {
     }
 
     @Test
+    void applyAcceptsAChoiceAfterDecimalColumnsAreReplacedByIntegers() {
+        discovered("src_orders", "orders", Map.of("a", TapstateType.DECIMAL, "b", TapstateType.DECIMAL));
+        String pipeline = """
+                version: tapstate/v1
+                kind: pipeline
+                id: orders_out
+                source: src_orders
+                transforms:
+                  - { id: numbers, from: [orders], type: map, fields: { a: 1, b: 2 } }
+                  - id: choose
+                    from: [numbers]
+                    type: map
+                    fields: { chosen: "=has(after.a) ? after.a : after.b" }
+                serve:
+                  from: choose
+                  sync: [ { id: out, source: tgt_mg, write_mode: upsert } ]
+                """;
+        List<ArtifactDraft> drafts = List.of(new ArtifactDraft("src_orders.tap.yml", SOURCE),
+                new ArtifactDraft("tgt_mg.tap.yml", TARGET),
+                new ArtifactDraft("orders_out.tap.yml", pipeline));
+
+        assertThat(service.validate(drafts).valid()).isTrue();
+        assertThatCode(() -> service.apply("tester", drafts)).doesNotThrowAnyException();
+        assertThat(artifacts.get("orders_out")).isPresent();
+    }
+
+    @Test
     @DisplayName("reading a row field from a source apply cannot find a model for is refused, naming it")
     void anUndiscoveredSourceIsRefused() {
         DslException thrown = catchThrowableOfType(DslException.class,

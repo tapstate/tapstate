@@ -133,6 +133,27 @@ public final class SqlFrontEnd {
         return Optional.ofNullable(outOfBounds(statement));
     }
 
+    /**
+     * Returns the preserved, driving source of a join statement without resolving its columns.
+     *
+     * <p>This is the same leftmost source used by {@link JoinPlan#factSource()}, including the
+     * rewrite of a right outer join. Callers that need output fields or validate the query against
+     * discovered schemas should use {@link #derive(String, List)} instead.
+     */
+    public static JoinTree.Source factSource(String sql) {
+        SqlNode statement;
+        try {
+            statement = SqlParser.create(sql, PARSER).parseStmt();
+        } catch (SqlParseException e) {
+            throw new SqlFrontEndException(e.getMessage(), e);
+        }
+        JoinTree from = tree(selectOf(statement).getFrom());
+        while (from instanceof JoinTree.Join join) {
+            from = join.left();
+        }
+        return (JoinTree.Source) from;
+    }
+
     private static Unsupported outOfBounds(SqlNode statement) {
         if (statement instanceof SqlOrderBy ordered) {
             // all three arrive wrapped the same way, and all three mean the published row set is

@@ -11,9 +11,8 @@ import java.util.Map;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * This release installs a sync onto one connector. A pipeline naming another supported connector as
- * its write target comes back from the running product as a coded refusal naming that connector, and
- * none of the batch is filed.
+ * A pipeline naming a connector without sink capability comes back from the running product as a
+ * coded refusal naming that connector, and none of the batch is filed.
  *
  * <p>It is settled here rather than in a unit case because of where the rule lives. The document is
  * valid offline — the grammar has always let a sync name any connection, and the offline corpus still
@@ -44,11 +43,11 @@ class AnUnsupportedTargetConnectorIsRefusedAtApplyIT {
             tables: [ orders ]
             """;
 
-    private static final String PG_TARGET = """
+    private static final String UNSUPPORTED_TARGET = """
             version: tapstate/v1
             kind: source
             id: tgt_out
-            connector: postgres
+            connector: ai-chat
             config: { host: 10.30.0.6, database: dw, username: w, password: p }
             """;
 
@@ -116,15 +115,15 @@ class AnUnsupportedTargetConnectorIsRefusedAtApplyIT {
 
             ControlPlane.Refusal refusal = control.applyExpectingRefusal(Map.of(
                     "src_orders.tap.yml", SOURCE,
-                    "tgt_out.tap.yml", PG_TARGET,
+                    "tgt_out.tap.yml", UNSUPPORTED_TARGET,
                     "orders_out.tap.yml", PIPELINE));
 
             assertThat(refusal.code())
-                    .as("the code refusing a sync onto a connector this release does not write to")
+                    .as("the code refusing a sync onto a connector without sink capability")
                     .isEqualTo(UNSUPPORTED_TARGET_CONNECTOR);
             assertThat(refusal.params())
                     .as("the connector and the connection naming it are what send the author to the fix")
-                    .containsEntry("connector", "postgres")
+                    .containsEntry("connector", "ai-chat")
                     .containsEntry("source", "tgt_out");
             assertThat(control.artifactIds())
                     .as("what the server holds after refusing the batch")
@@ -150,7 +149,7 @@ class AnUnsupportedTargetConnectorIsRefusedAtApplyIT {
             // A connection is filed on its own and referred to afterwards, which is how a deployment
             // is built up. Nothing about the document says which role it will be asked for, so filing
             // it is accepted.
-            control.apply(Map.of("tgt_out.tap.yml", PG_TARGET));
+            control.apply(Map.of("tgt_out.tap.yml", UNSUPPORTED_TARGET));
 
             ControlPlane.Refusal refusal = control.applyExpectingRefusal(Map.of(
                     "src_orders.tap.yml", SOURCE,
@@ -161,7 +160,7 @@ class AnUnsupportedTargetConnectorIsRefusedAtApplyIT {
             assertThat(refusal.params())
                     .as("the document to edit is the definition the element is written in, and the "
                             + "field path is the one that resolves in it")
-                    .containsEntry("connector", "postgres")
+                    .containsEntry("connector", "ai-chat")
                     .containsEntry("resource", "out")
                     .containsEntry("path", "sync[0].source");
             assertThat(control.artifactIds())

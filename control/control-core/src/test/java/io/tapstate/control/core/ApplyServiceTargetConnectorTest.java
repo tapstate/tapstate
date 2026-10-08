@@ -12,6 +12,8 @@ import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.ArtifactBatchWrite;
+import io.tapstate.spi.store.ArtifactWrite;
 import io.tapstate.spi.store.SchemaStore;
 import java.time.Clock;
 import java.time.Instant;
@@ -109,81 +111,90 @@ class ApplyServiceTargetConnectorTest {
     }
 
     @Test
-    @DisplayName("apply refuses a sync writing through a supported connector that is not the write target")
-    void applyRefusesAnotherSupportedConnector() {
+    @DisplayName("apply refuses a source whose connector is not sink-capable")
+    void applyRefusesANonSinkConnector() {
         DslException thrown = catchThrowableOfType(DslException.class, () -> service.apply("tester",
-                batch("tgt_pg", target("tgt_pg", "postgres",
-                        "{ host: 10.30.0.6, database: dw, username: w, password: p }"))));
+                batch("tgt_ai", target("tgt_ai", "ai-chat", "{}"))));
 
         assertThat(thrown.code()).isEqualTo(DslError.UNSUPPORTED_TARGET_CONNECTOR);
         assertThat(thrown.args())
-                .containsEntry("connector", "postgres")
-                .containsEntry("source", "tgt_pg");
+                .containsEntry("connector", "ai-chat")
+                .containsEntry("source", "tgt_ai");
     }
 
     @Test
     @DisplayName("a refused apply writes nothing, so the refused pipeline is not left stored")
     void aRefusedApplyStoresNothing() {
         catchThrowableOfType(DslException.class, () -> service.apply("tester",
-                batch("tgt_pg", target("tgt_pg", "postgres",
-                        "{ host: 10.30.0.6, database: dw, username: w, password: p }"))));
+                batch("tgt_ai", target("tgt_ai", "ai-chat", "{}"))));
 
         assertThat(artifacts.get("orders_out")).isEmpty();
-        assertThat(artifacts.get("tgt_pg")).isEmpty();
+        assertThat(artifacts.get("tgt_ai")).isEmpty();
         assertThat(artifacts.saved).isEmpty();
     }
 
     @Test
-    @DisplayName("the same batch applies once the sync writes through the supported connector")
-    void applyAcceptsTheSupportedConnector() {
-        // Same reader, same pipeline, same everything but the connector under the target — so what
-        // the case above refused is the connector and not the shape of the batch.
+    @DisplayName("on-prem accepts any catalog connector that declares sink capability")
+    void applyAcceptsAnySinkConnector() {
         assertThatCode(() -> service.apply("tester",
-                batch("tgt_mg", target("tgt_mg", "mongodb", "{ uri: \"mongodb://10.30.0.11:27017/ods\" }"))))
+                batch("tgt_pg", target("tgt_pg", "postgres",
+                        "{ host: 10.30.0.6, database: dw, username: w, password: p }"))))
                 .doesNotThrowAnyException();
         assertThat(artifacts.get("orders_out")).isPresent();
+    }
+
+    @Test
+    @DisplayName("cloud deployments permit MongoDB and Atlas targets but refuse relational sinks")
+    void cloudAllowsMongoDbAndAtlasTargets() {
+        ApplyService cloud = new ApplyService(
+                TapstateCatalog::load, new InMemoryArtifactStore(),
+                new AuditGate(record -> { }, FIXED_CLOCK), new InMemorySchemaStore(),
+                PlanAdvisories.none(), SchemaDerivation.none(), null, DeploymentProfile.CLOUD);
+
+        DslException refused = catchThrowableOfType(DslException.class, () -> cloud.apply("tester",
+                batch("tgt_pg", target("tgt_pg", "postgres",
+                        "{ host: 10.30.0.6, database: dw, username: w, password: p }"))));
+        assertThat(refused.code()).isEqualTo(DslError.UNSUPPORTED_TARGET_CONNECTOR);
+
+        assertThatCode(() -> cloud.apply("tester", batch("tgt_atlas",
+                target("tgt_atlas", "mongodb-atlas", "{ uri: \"mongodb://10.30.0.11:27017/ods\" }"))))
+                .doesNotThrowAnyException();
+        assertThatCode(() -> cloud.apply("tester", batch("tgt_mongo",
+                target("tgt_mongo", "mongodb", "{ uri: \"mongodb://10.30.0.12:27017/ods\" }"))))
+                .doesNotThrowAnyException();
     }
 
     // ---- what a deployment already holds ---------------------------------------------------
 
     @Test
-    @DisplayName("a typed pipeline write is refused for a definition and a target it only references")
-    void aTypedPipelineWriteIsRefusedForADefinitionAndTargetItOnlyReferences() {
-        // The typed face submits one document. Everything the pipeline writes through is stored, so a
-        // rule resolving ids within the submitted set has nothing to judge and installs the write.
+    @DisplayName("a typed pipeline write may use a stored sink-capable target")
+    void aTypedPipelineWriteAcceptsStoredSinkTarget() {
         DslParser parser = new DslParser();
         artifacts.landDirectly(parser.parse(READ_SOURCE));
         artifacts.landDirectly(parser.parse(target("tgt_pg", "postgres",
                 "{ host: 10.30.0.6, database: dw, username: w, password: p }")));
         artifacts.landDirectly(parser.parse(SERVE_DEFINITION));
 
-        DslException thrown = catchThrowableOfType(DslException.class, () ->
-                service.create("tester", parser.parse(PIPELINE_USING_THE_DEFINITION)));
-
-        assertThat(thrown.code()).isEqualTo(DslError.UNSUPPORTED_TARGET_CONNECTOR);
-        assertThat(thrown.args()).containsEntry("connector", "postgres").containsEntry("resource", "out");
-        assertThat(artifacts.get("orders_out")).isEmpty();
+        assertThatCode(() -> service.create("tester", parser.parse(PIPELINE_USING_THE_DEFINITION)))
+                .doesNotThrowAnyException();
+        assertThat(artifacts.get("orders_out")).isPresent();
     }
 
     @Test
-    @DisplayName("apply refuses a sync written in a serve definition, and stores nothing")
-    void applyRefusesASyncCarriedByAServeDefinition() {
+    @DisplayName("apply accepts a sync in a serve definition when its target is sink-capable")
+    void applyAcceptsASyncCarriedByAServeDefinition() {
         // Nothing existence-checks a standalone definition's sinks — the reference closure visits an
         // inline serve only — so a definition is the one place a sync can name a target the batch
         // never carried. A rule resolving ids within the submitted set finds nothing here.
         service.apply("tester", List.of(new ArtifactDraft("tgt_pg.tap.yml",
                 target("tgt_pg", "postgres", "{ host: 10.30.0.6, database: dw, username: w, password: p }"))));
 
-        DslException thrown = catchThrowableOfType(DslException.class, () -> service.apply("tester",
+        assertThatCode(() -> service.apply("tester",
                 List.of(new ArtifactDraft("src_orders.tap.yml", READ_SOURCE),
                         new ArtifactDraft("out.tap.yml", SERVE_DEFINITION),
-                        new ArtifactDraft("orders_out.tap.yml", PIPELINE_USING_THE_DEFINITION))));
-
-        assertThat(thrown.code()).isEqualTo(DslError.UNSUPPORTED_TARGET_CONNECTOR);
-        assertThat(thrown.args()).containsEntry("resource", "out");
-        assertThat(thrown.path()).isEqualTo("sync[0].source");
-        assertThat(artifacts.get("orders_out")).isEmpty();
-        assertThat(artifacts.get("out")).isEmpty();
+                        new ArtifactDraft("orders_out.tap.yml", PIPELINE_USING_THE_DEFINITION))))
+                .doesNotThrowAnyException();
+        assertThat(artifacts.get("orders_out")).isPresent();
     }
 
     @Test
@@ -231,6 +242,16 @@ class ApplyServiceTargetConnectorTest {
             }
             saveAll(artifacts);
             return Optional.empty();
+        }
+
+        @Override
+        public ArtifactBatchWrite writeAll(List<ArtifactWrite> writes) {
+            Map<String, String> preconditions = new LinkedHashMap<>();
+            writes.forEach((write) -> preconditions.putAll(write.readPreconditions()));
+            Optional<String> refused = saveAll(writes.stream().map(ArtifactWrite::resource).toList(), preconditions);
+            return refused.map(id -> ArtifactBatchWrite.refused(id,
+                    io.tapstate.spi.store.ArtifactMutation.VERSION_CONFLICT))
+                    .orElseGet(ArtifactBatchWrite::applied);
         }
 
         /** Puts a resource in the store without going through apply, the way an earlier release left it. */
