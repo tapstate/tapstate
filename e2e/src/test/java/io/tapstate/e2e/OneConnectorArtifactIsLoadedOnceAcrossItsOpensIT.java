@@ -26,12 +26,13 @@ import static org.assertj.core.api.Assertions.assertThat;
  * pipeline on its own, which opens the connector once to find its starting position and again to read the
  * stream. No connector in this build carries a native library, so the witness is what that failure follows
  * from: the harness connector records each initialization of its class, with the jar and the loader, and a
- * class is initialized once per loader. One open per loader would leave three lines for the staged jar.
+ * class is initialized once per loader. Registration reads the connector's capabilities through the staged
+ * jar as well, so one open per loader would leave four lines for it.
  *
  * <p>The lines are read for the jar the server staged and nothing else. Registering the artifact also
- * probes it, from a copy of its own and through a loader of its own that it closes, which is a separate
- * matter this does not judge. The specification vocabulary has no word for a class's initializations,
- * which is why this is Java.
+ * inspects a copy of its own through a loader of its own that it closes, which is a separate matter this
+ * does not judge. The specification vocabulary has no word for a class's initializations, which is why
+ * this is Java.
  */
 class OneConnectorArtifactIsLoadedOnceAcrossItsOpensIT {
 

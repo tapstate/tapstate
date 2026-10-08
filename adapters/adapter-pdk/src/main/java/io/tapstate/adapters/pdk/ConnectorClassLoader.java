@@ -71,8 +71,10 @@ public final class ConnectorClassLoader implements AutoCloseable {
      * connector loaded through it could not be loaded through a replacement anyway.
      *
      * <p>Keyed by each file's path, size and modification time, so a jar replaced in place gets a loader of
-     * its own instead of the classes of the jar that used to be there. Registered artifacts are staged
-     * under their content hash and never change in place.
+     * its own instead of the classes of the jar that used to be there. That cuts both ways: a file replaced
+     * by identical bytes is another key too, and its callers would split across two loaders. Registered
+     * artifacts are staged under their content hash and never replaced once staged, which is what keeps
+     * every open of one of them on one loader.
      */
     public static ConnectorClassLoader shared(List<Path> classpath) {
         return SHARED.computeIfAbsent(ArtifactKey.of(classpath),
