@@ -125,55 +125,11 @@ public final class PipelineConverger {
                 || (stampedAt == null && actual == PipelineState.PAUSED)
                 || (actual == PipelineState.STOPPED && actuator.isCarryingAJob(pipelineId))));
 
-        if (target == PipelineState.RUNNING && actual == PipelineState.RUNNING) {
-            // A pipeline believed running whose job has died converges to the observable FAILED state,
-            // rather than reporting RUNNING over a dead job. The failure cause rides out on the result so
-            // the driver can surface it. A converge-side transition, never a user verb.
-            Optional<Throwable> failure = actuator.failure(pipelineId);
-            if (failure.isPresent()) {
-                decisions.accept(new PendingDecision(intent.orElseThrow(), actualDoc, PendingAction.STOP));
-                ConvergeResult driven =
-                        driveTo(pipelineId, PipelineState.FAILED, false, actualDoc.orElse(null), false);
-                return driven.checkpoint()
-                        .map(checkpoint -> ConvergeResult.failed(checkpoint, failure.get(),
-                                driven.transitionFrom()))
-                        .orElse(driven);
-            }
-            // Nothing failed and nothing is carrying it: this process has come up to a checkpoint an
-            // earlier one wrote. The state already matches the intent, so the drive below would call
-            // this converged and actuate nothing - which is how a pipeline ends up reporting RUNNING,
-            // with no errors, over a data plane that does not exist. Put a job behind it instead.
-            //
-            // A start rather than a resume: a resume continues a job that is being held, and there is
-            // no job here to continue. The fresh run re-reads its source position from the store, which
-            // is where the previous process's progress was recorded, so this resumes the work without
-            // resuming the job. Submitting is absent-safe, and the guard is "no job is carrying it"
-            // rather than "this process did not start it", so the next tick actuates nothing.
-            if (!actuator.isCarryingAJob(pipelineId) && !rebuild) {
-                decisions.accept(new PendingDecision(intent.orElseThrow(), actualDoc, PendingAction.START));
-                ConvergeResult.ExecutionBoundary submission = null;
-                var receipt = new java.util.concurrent.atomic.AtomicReference<io.tapstate.spi.store.PreExecutionFailure.Attempt>();
-                try (LifecycleActuator.PreparedStart prepared = actuator.prepareStart(pipelineId, intent.orElseThrow(),
-                        actualDoc.orElseThrow(), receipt::set)) {
-                    prepared.submit();
-                    var source = prepared.submittedSource().orElse(null);
-                    if (source != null && source.scope() != null && source.oldJob() != null) {
-                        submission = new ConvergeResult.ExecutionBoundary(source.scope(), actualDoc.orElseThrow().epoch(),
-                                PipelineState.RUNNING, clock.instant(), false);
-                    }
-                } catch (StartDeferred waiting) {
-                    return ConvergeResult.startDeferred(actualDoc.orElseThrow(), waiting.reason());
-                } catch (TapstateException refused) {
-                    // Same refusal, third road. This one is the worst of the three to let escape: the
-                    // checkpoint already says RUNNING, so an escaping throw leaves every read face
-                    // answering healthy over a data plane that was never built, and the loop retries
-                    // for the life of the process. A store that is unreachable when a process comes up
-                    // is exactly the condition the coded refusal exists for.
-                    return failedBeforeStart(pipelineId, refused, actualDoc.orElseThrow(), intent.orElseThrow(), receipt.get());
-                }
-                ConvergeResult restored = ConvergeResult.converged(actualDoc.orElseThrow());
-                return submission == null ? restored : restored.withExecutionBoundary(submission);
-            }
+        // An owed restart reaches its fenced stop/start before checking the old run's failure.
+        // Otherwise that failure would consume the accepted stamp without performing its restart or clear.
+        if (target == PipelineState.RUNNING && actual == PipelineState.RUNNING && !rebuildOwed) {
+            return convergeRunning(pipelineId, actualDoc.orElseThrow(), intent.orElseThrow(),
+                    purgeState, rebuild, decisions);
         }
 
         if (target == PipelineState.PAUSED && actual == PipelineState.PAUSED) {
@@ -196,27 +152,7 @@ public final class PipelineConverger {
 
         if ((target == PipelineState.RUNNING || target == PipelineState.PAUSED)
                 && actual == PipelineState.FAILED && !rebuildOwed) {
-            rebuilds.recordFailure(pipelineId);
-            // A run that died because the cluster changed under it is the one death this loop may answer
-            // by itself, and it is asked here rather than where the death was observed so that the
-            // failure is recorded and published first: whatever is decided next, nobody is left reading a
-            // healthy pipeline over a dead job while it is being decided. The admission bounds itself --
-            // a yes that never runs out is a restart loop wearing the word "recovery".
-            if (target == PipelineState.RUNNING && rebuilds.admits(pipelineId)) {
-                decisions.accept(new PendingDecision(intent.orElseThrow(), actualDoc, PendingAction.START));
-                return driveTo(pipelineId, target, false, actualDoc.orElse(null), false, true, false, intent.get(), decisions)
-                        .recoveringExecution();
-            }
-            // Otherwise a failed run stays failed: re-driving it toward RUNNING would restart the dead job
-            // on every tick, and toward PAUSED would try every tick to hold a job that is gone, be refused,
-            // and fail the pipeline over again. The user recovers by stopping it then starting a fresh
-            // run -- which arrives as the one instruction above, and that is let through: it is somebody
-            // saying so once, which is the whole difference from this loop noticing the same death every
-            // second.
-            // actual is FAILED only when the checkpoint was read and parsed, so
-            // the doc is necessarily present; orElseThrow makes that invariant explicit and fail-loud.
-            decisions.accept(new PendingDecision(intent.orElseThrow(), actualDoc, PendingAction.NONE));
-            return ConvergeResult.converged(actualDoc.orElseThrow());
+            return convergeFailed(pipelineId, target, actualDoc.orElseThrow(), intent.orElseThrow(), decisions);
         }
 
         if (target == PipelineState.RUNNING && actual == PipelineState.COMPLETED && !rebuildOwed) {
@@ -235,6 +171,87 @@ public final class PipelineConverger {
         decisions.accept(new PendingDecision(intent.orElseThrow(), actualDoc, action));
         return driveTo(pipelineId, target, true, actualDoc.orElse(null), purgeState, rebuild, rebuildOwed,
                 intent.get(), decisions);
+    }
+
+    private ConvergeResult convergeRunning(String pipelineId, CheckpointDoc current, DesiredState intent,
+            boolean purgeState, boolean rebuild, Consumer<PendingDecision> decisions) {
+        // A pipeline believed running whose job has died converges to the observable FAILED state,
+        // rather than reporting RUNNING over a dead job. The failure cause rides out on the result so
+        // the driver can surface it. A converge-side transition, never a user verb.
+        Optional<Throwable> failure = actuator.failure(pipelineId);
+        if (failure.isPresent()) {
+            decisions.accept(new PendingDecision(intent, Optional.of(current), PendingAction.STOP));
+            ConvergeResult driven =
+                    driveTo(pipelineId, PipelineState.FAILED, false, current, false);
+            return driven.checkpoint()
+                    .map(checkpoint -> ConvergeResult.failed(checkpoint, failure.get(),
+                            driven.transitionFrom()))
+                    .orElse(driven);
+        }
+        // Nothing failed and nothing is carrying it: this process has come up to a checkpoint an
+        // earlier one wrote. The state already matches the intent, so the drive below would call
+        // this converged and actuate nothing - which is how a pipeline ends up reporting RUNNING,
+        // with no errors, over a data plane that does not exist. Put a job behind it instead.
+        //
+        // A start rather than a resume: a resume continues a job that is being held, and there is
+        // no job here to continue. The fresh run re-reads its source position from the store, which
+        // is where the previous process's progress was recorded, so this resumes the work without
+        // resuming the job. Submitting is absent-safe, and the guard is "no job is carrying it"
+        // rather than "this process did not start it", so the next tick actuates nothing.
+        if (!actuator.isCarryingAJob(pipelineId) && !rebuild) {
+            decisions.accept(new PendingDecision(intent, Optional.of(current), PendingAction.START));
+            ConvergeResult.ExecutionBoundary submission = null;
+            var receipt = new java.util.concurrent.atomic.AtomicReference<io.tapstate.spi.store.PreExecutionFailure.Attempt>();
+            try (LifecycleActuator.PreparedStart prepared = actuator.prepareStart(pipelineId, intent,
+                    current, receipt::set)) {
+                prepared.submit();
+                var source = prepared.submittedSource().orElse(null);
+                if (source != null && source.scope() != null && source.oldJob() != null) {
+                    submission = new ConvergeResult.ExecutionBoundary(source.scope(), current.epoch(),
+                            PipelineState.RUNNING, clock.instant(), false);
+                }
+            } catch (StartDeferred waiting) {
+                return ConvergeResult.startDeferred(current, waiting.reason());
+            } catch (TapstateException refused) {
+                // Same refusal, third road. This one is the worst of the three to let escape: the
+                // checkpoint already says RUNNING, so an escaping throw leaves every read face
+                // answering healthy over a data plane that was never built, and the loop retries
+                // for the life of the process. A store that is unreachable when a process comes up
+                // is exactly the condition the coded refusal exists for.
+                return failedBeforeStart(pipelineId, refused, current, intent, receipt.get());
+            }
+            ConvergeResult restored = ConvergeResult.converged(current);
+            return submission == null ? restored : restored.withExecutionBoundary(submission);
+        }
+        decisions.accept(new PendingDecision(intent, Optional.of(current),
+                rebuild ? PendingAction.START : PendingAction.NONE));
+        return driveTo(pipelineId, PipelineState.RUNNING, true, current, purgeState, rebuild, false,
+                intent, decisions);
+    }
+
+    private ConvergeResult convergeFailed(String pipelineId, PipelineState target, CheckpointDoc current,
+            DesiredState intent, Consumer<PendingDecision> decisions) {
+        rebuilds.recordFailure(pipelineId);
+        // A run that died because the cluster changed under it is the one death this loop may answer
+        // by itself, and it is asked here rather than where the death was observed so that the
+        // failure is recorded and published first: whatever is decided next, nobody is left reading a
+        // healthy pipeline over a dead job while it is being decided. The admission bounds itself --
+        // a yes that never runs out is a restart loop wearing the word "recovery".
+        if (target == PipelineState.RUNNING && rebuilds.admits(pipelineId)) {
+            decisions.accept(new PendingDecision(intent, Optional.of(current), PendingAction.START));
+            return driveTo(pipelineId, target, false, current, false, true, false, intent, decisions)
+                    .recoveringExecution();
+        }
+        // Otherwise a failed run stays failed: re-driving it toward RUNNING would restart the dead job
+        // on every tick, and toward PAUSED would try every tick to hold a job that is gone, be refused,
+        // and fail the pipeline over again. The user recovers by stopping it then starting a fresh
+        // run -- which arrives as the one instruction above, and that is let through: it is somebody
+        // saying so once, which is the whole difference from this loop noticing the same death every
+        // second.
+        // actual is FAILED only when the checkpoint was read and parsed, so
+        // the doc is necessarily present; orElseThrow makes that invariant explicit and fail-loud.
+        decisions.accept(new PendingDecision(intent, Optional.of(current), PendingAction.NONE));
+        return ConvergeResult.converged(current);
     }
 
     /**

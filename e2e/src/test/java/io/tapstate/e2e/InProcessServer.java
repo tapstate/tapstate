@@ -8,6 +8,7 @@ import org.springframework.scheduling.config.ScheduledTask;
 import org.springframework.scheduling.config.ScheduledTaskHolder;
 
 import java.net.URI;
+import java.nio.file.Path;
 
 /**
  * The product booted inside the test JVM, from its real assembly root.
@@ -27,10 +28,16 @@ final class InProcessServer implements ServerHandle {
 
     private final ConfigurableApplicationContext context;
     private final URI baseUrl;
+    private final Path stagingDirectory;
 
     InProcessServer(ConfigurableApplicationContext context, URI baseUrl) {
+        this(context, baseUrl, null);
+    }
+
+    private InProcessServer(ConfigurableApplicationContext context, URI baseUrl, Path stagingDirectory) {
         this.context = context;
         this.baseUrl = baseUrl;
+        this.stagingDirectory = stagingDirectory;
     }
 
     /** Boots the assembly against the given store and returns once its surface is listening. */
@@ -40,7 +47,25 @@ final class InProcessServer implements ServerHandle {
 
     /** Boots the assembly with an explicit operator-state database. */
     static InProcessServer start(String storeUri, String operatorStateDatabase) {
-        ConfigurableApplicationContext context = new SpringApplicationBuilder(Bootstrap.class)
+        Path stagingDirectory = ServerHandle.privateStagingDirectory();
+        ConfigurableApplicationContext context;
+        try {
+            context = boot(storeUri, operatorStateDatabase, stagingDirectory);
+        } catch (RuntimeException e) {
+            // Failed Spring destruction carries no confirmed source-end receipt for this launch.
+            e.addSuppressed(new IllegalStateException(
+                    "source termination is unconfirmed; staging retained at " + stagingDirectory));
+            throw e;
+        }
+        int port = ((WebServerApplicationContext) context).getWebServer().getPort();
+        // The literal address, not the name: "localhost" resolves to both 127.0.0.1 and ::1, and only
+        // one of those is the address bound below.
+        return new InProcessServer(context, URI.create("http://127.0.0.1:" + port), stagingDirectory);
+    }
+
+    private static ConfigurableApplicationContext boot(String storeUri, String operatorStateDatabase,
+            Path stagingDirectory) {
+        return new SpringApplicationBuilder(Bootstrap.class)
                 .properties(
                         "tapstate.store.mongo.enabled=true",
                         "tapstate.store.mongo.uri=" + storeUri,
@@ -49,7 +74,7 @@ final class InProcessServer implements ServerHandle {
                         "tapstate.store.mongo.server-selection-timeout=5s",
                         // This tier's working directory is the harness's own module, and the setting's
                         // default is relative to it.
-                        ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + ServerHandle.privateStagingDirectory(),
+                        ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + stagingDirectory,
                         ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID)
                 // Port zero, then read back what was granted: a hard-coded port turns a busy machine
                 // into a flaky suite. Both are command-line arguments rather than default properties
@@ -64,10 +89,6 @@ final class InProcessServer implements ServerHandle {
                 // status the stranger returns. Binding the loopback makes the collision impossible,
                 // because the allocator will not hand out a loopback port that is already taken.
                 .run("--server.address=127.0.0.1", "--server.port=0");
-        int port = ((WebServerApplicationContext) context).getWebServer().getPort();
-        // The literal address, not the name: "localhost" resolves to both 127.0.0.1 and ::1, and only
-        // one of those is the address bound above.
-        return new InProcessServer(context, URI.create("http://127.0.0.1:" + port));
     }
 
     @Override
@@ -120,7 +141,12 @@ final class InProcessServer implements ServerHandle {
 
     @Override
     public void close() {
-        if (!context.isActive()) { return; }
+        if (!context.isActive()) {
+            if (sourcesEnded && stagingDirectory != null) {
+                ServerHandle.discardStagingDirectory(stagingDirectory);
+            }
+            return;
+        }
         java.util.function.BooleanSupplier captured = () -> false;
         Throwable failure = null;
         try {
@@ -136,5 +162,9 @@ final class InProcessServer implements ServerHandle {
         if (failure instanceof RuntimeException refused) { throw refused; }
         if (failure instanceof Error defect) { throw defect; }
         sourcesEnded = captured.getAsBoolean();
+        // A closed context alone does not prove that every source worker has ended.
+        if (sourcesEnded && stagingDirectory != null) {
+            ServerHandle.discardStagingDirectory(stagingDirectory);
+        }
     }
 }

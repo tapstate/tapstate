@@ -47,6 +47,48 @@ class JoinProjectionProcessorTest {
     }
 
     @Test
+    void aSettlementMarkerWaitsForRefusedProjectionsAndIsForwardedOnce() throws Exception {
+        CountingJoinStores stores = new CountingJoinStores(4);
+        stores.putDimensionRow("c", JoinKey.of(List.of(1L)).name(), Map.of("id", 1L, "name", "Ada"));
+        List<JoinUpdate> arrivals = new ArrayList<>();
+        for (long id = 10; id < 13; id++) {
+            String key = JoinKey.of(List.of(id)).name();
+            stores.putFact(key, Map.of("id", id, "customer_id", 1L));
+            arrivals.add(new JoinUpdate(key, Envelope.insert(1, "joined", Map.of("order_id", id), null)));
+        }
+        JoinProjectionProcessor processor = new JoinProjectionProcessor(
+                new JoinProjection(JoinProjectionTest.plan(), List.of("id"), "joined", stores));
+        TestOutbox outbox = new TestOutbox(new int[] {1}, 1);
+        processor.init(outbox, new TestProcessorContext());
+        SettledPositions word = new SettledPositions(
+                Map.of("orders", new ChainPosition(new SourceOrder(1, 7), "p7")));
+        TestInbox inbox = new TestInbox(List.of(arrivals.get(0), arrivals.get(1), word, arrivals.get(2)));
+        List<Object> emitted = new ArrayList<>();
+
+        processor.process(0, inbox);
+        assertThat(inbox.isEmpty()).isFalse();
+        assertThat(stores.batchReads).isEqualTo(1);
+        for (int attempt = 0; attempt < 6 && !inbox.isEmpty(); attempt++) {
+            outbox.drainQueueAndReset(0, emitted, false);
+            processor.process(0, inbox);
+        }
+        outbox.drainQueueAndReset(0, emitted, false);
+
+        assertThat(inbox.isEmpty()).isTrue();
+        assertThat(emitted).extracting(item -> item instanceof Envelope row
+                        ? row.after().get("order_id") : item)
+                .containsExactly(10L, 11L, word, 12L);
+        assertThat(stores.batchReads).isEqualTo(2);
+        assertThat(stores.singleReads).isZero();
+
+        processor.process(0, new TestInbox(List.of(word)));
+        List<Object> markerOnly = new ArrayList<>();
+        outbox.drainQueueAndReset(0, markerOnly, false);
+        assertThat(markerOnly).containsExactly(word);
+        assertThat(stores.batchReads).isEqualTo(2);
+    }
+
+    @Test
     void backpressureDoesNotRepeatOrLoseABatchedProjection() throws Exception {
         CountingJoinStores stores = new CountingJoinStores(4);
         stores.putDimensionRow("c", JoinKey.of(List.of(1L)).name(), Map.of("id", 1L, "name", "Ada"));

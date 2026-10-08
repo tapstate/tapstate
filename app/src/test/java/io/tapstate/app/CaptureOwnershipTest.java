@@ -1241,6 +1241,37 @@ class CaptureOwnershipTest {
         assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(10));
     }
 
+    @Test
+    void aTakenOverTailUsesTheRemainingPipelineAfterTheFirstJoinerStops() {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith("p", "q", "r"));
+        MemoryClaims claims = new MemoryClaims();
+        List<String> starts = new ArrayList<>();
+        Member a = new Member("node-a", store, claims, TTL, starts);
+        Member b = new Member("node-b", store, claims, TTL, starts);
+        try {
+            a.captures.startCapture("p");
+            b.captures.startCapture("q");
+            b.captures.startCapture("r");
+            assertThat(starts).containsExactly(
+                    "node-a p opened the tail", "node-b q attached", "node-b r attached");
+
+            b.captures.stopCapture("q", false);
+            a.captures.stopCapture("p", false);
+            b.captures.tailWhatNobodyTails();
+
+            assertThat(starts)
+                    .as("the takeover tail belongs to r, the pipeline still running on this member")
+                    .containsExactly("node-a p opened the tail", "node-b q attached", "node-b r attached",
+                            "node-b r opened the tail");
+        } finally {
+            b.captures.stopCapture("r", false);
+            b.captures.stopCapture("q", false);
+            a.captures.stopCapture("p", false);
+            b.captures.close();
+            a.captures.close();
+        }
+    }
+
     /**
      * When the member holding a capture stops the last of its own pipelines on it, a member whose
      * pipelines still read that capture takes the tail over, so they go on receiving changes.

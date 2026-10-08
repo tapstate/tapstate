@@ -46,6 +46,27 @@ class TransformProcessorTest {
                 .expectOutput(List.of());
     }
 
+    @Test
+    void filter_settles_the_position_of_a_dropped_change() {
+        TransformPort dropAll = e -> List.of();
+        Map<String, ChainPosition> positions =
+                Map.of("orders", new ChainPosition(new SourceOrder(1, 7), "p7"));
+        TestSupport.verifyProcessor(() -> new TransformProcessor(dropAll))
+                .input(List.of(event(1).withPositions(positions)))
+                .expectOutput(List.of(new SettledPositions(positions)));
+    }
+
+    @Test
+    void a_dropped_change_settles_between_the_fan_outs_on_either_side() {
+        TransformPort fanOutOrDrop = e -> e.after().get("id").equals(2) ? List.of() : List.of(e, e);
+        Envelope before = event(1).withPosition(new ChainPosition(new SourceOrder(1, 6), "p6"));
+        Envelope dropped = event(2).withPosition(new ChainPosition(new SourceOrder(1, 7), "p7"));
+        Envelope after = event(3).withPosition(new ChainPosition(new SourceOrder(1, 8), "p8"));
+        TestSupport.verifyProcessor(() -> new TransformProcessor(fanOutOrDrop))
+                .input(List.of(before, dropped, after))
+                .expectOutput(List.of(before, before, new SettledPositions(dropped.positions()), after, after));
+    }
+
     /**
      * Word that a chain got past changes with nothing to deliver for them is not a change, and a port is a
      * pure function over rows - so it is passed on rather than handed to one. A nest may be followed by a

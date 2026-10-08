@@ -51,11 +51,13 @@ final class RealProcessServer implements ServerHandle {
     private final Process process;
     private final URI baseUrl;
     private final Path output;
+    private final Path stagingDirectory;
 
-    private RealProcessServer(Process process, URI baseUrl, Path output) {
+    RealProcessServer(Process process, URI baseUrl, Path output, Path stagingDirectory) {
         this.process = process;
         this.baseUrl = baseUrl;
         this.output = output;
+        this.stagingDirectory = stagingDirectory;
     }
 
     /** Launches the deliverable and returns once its health probe answers. */
@@ -104,14 +106,7 @@ final class RealProcessServer implements ServerHandle {
      */
     static RealProcessServer start(String storeUri, String listenAddress,
             IntFunction<List<String>> extraArguments) {
-        RealProcessServer server = launching(storeUri, bootJar(), listenAddress, extraArguments);
-        try {
-            awaitHealthy(server.process, server.baseUrl, server.output);
-        } catch (RuntimeException | AssertionError e) {
-            server.process.destroyForcibly();
-            throw e;
-        }
-        return server;
+        return healthy(launching(storeUri, bootJar(), listenAddress, extraArguments));
     }
 
     /**
@@ -137,14 +132,7 @@ final class RealProcessServer implements ServerHandle {
 
     static RealProcessServer start(String storeUri, String operatorStateDatabase, Path jar,
             List<String> additionalArguments) {
-        RealProcessServer server = launching(storeUri, operatorStateDatabase, jar, additionalArguments);
-        try {
-            awaitHealthy(server.process, server.baseUrl, server.output);
-        } catch (RuntimeException | AssertionError e) {
-            server.process.destroyForcibly();
-            throw e;
-        }
-        return server;
+        return healthy(launching(storeUri, operatorStateDatabase, jar, additionalArguments));
     }
 
     /** Starts an explicit artifact and operator store on the address required by a cluster member. */
@@ -156,15 +144,8 @@ final class RealProcessServer implements ServerHandle {
     /** Starts an owned cluster process with explicit JVM options before the application arguments. */
     static RealProcessServer start(String storeUri, String operatorStateDatabase, Path jar,
             String listenAddress, IntFunction<List<String>> extraArguments, List<String> jvmArguments) {
-        RealProcessServer server = launching(storeUri, operatorStateDatabase, jar, listenAddress, extraArguments,
-                List.copyOf(jvmArguments));
-        try {
-            awaitHealthy(server.process, server.baseUrl, server.output);
-        } catch (RuntimeException | AssertionError e) {
-            server.process.destroyForcibly();
-            throw e;
-        }
-        return server;
+        return healthy(launching(storeUri, operatorStateDatabase, jar, listenAddress, extraArguments,
+                List.copyOf(jvmArguments)));
     }
 
     /**
@@ -246,12 +227,26 @@ final class RealProcessServer implements ServerHandle {
      * handed to the product instead they would be settings nobody reads.
      */
     static RealProcessServer startInJvm(String storeUri, List<String> jvmOptions) {
-        RealProcessServer server = launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, bootJar(), LOOPBACK,
-                jvmOptions, port -> List.of());
+        return healthy(launching(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, bootJar(), LOOPBACK,
+                jvmOptions, port -> List.of()));
+    }
+
+    /**
+     * Returns the launch once its health probe answers, and ends it otherwise.
+     *
+     * <p>A launch that never came up is not handed to anybody, so nobody else will ever end it or clear
+     * up after it. Whatever goes wrong doing that is attached to the failure rather than replacing it:
+     * why the server did not come up is the thing a reader needs.
+     */
+    private static RealProcessServer healthy(RealProcessServer server) {
         try {
             awaitHealthy(server.process, server.baseUrl, server.output);
         } catch (RuntimeException | AssertionError e) {
-            server.process.destroyForcibly();
+            try {
+                server.kill();
+            } catch (RuntimeException | AssertionError cleanup) {
+                e.addSuppressed(cleanup);
+            }
             throw e;
         }
         return server;
@@ -270,9 +265,21 @@ final class RealProcessServer implements ServerHandle {
         URI baseUrl = URI.create("http://" + LOOPBACK + ":" + port);
         Path workingDirectory = workingDirectory();
         Path output = workingDirectory.resolve("server.out");
-        Process process = launch(jar, jvmOptions, port, listenAddress, storeUri, operatorStateDatabase,
-                workingDirectory, output, extraArguments.apply(port));
-        return new RealProcessServer(process, baseUrl, output);
+        Path stagingDirectory = ServerHandle.privateStagingDirectory();
+        Process process;
+        try {
+            process = launch(jar, jvmOptions, port, listenAddress, storeUri, operatorStateDatabase,
+                    workingDirectory, output, stagingDirectory, extraArguments.apply(port));
+        } catch (RuntimeException | Error failure) {
+            // No child was returned; these pre-launch artifacts have no live process using them.
+            try {
+                ServerHandle.discardStagingDirectory(stagingDirectory);
+            } catch (RuntimeException cleanup) {
+                failure.addSuppressed(cleanup);
+            }
+            throw failure;
+        }
+        return new RealProcessServer(process, baseUrl, output, stagingDirectory);
     }
 
     /**
@@ -287,11 +294,15 @@ final class RealProcessServer implements ServerHandle {
     void kill() {
         process.destroyForcibly();
         try {
-            process.waitFor(SHUTDOWN_BUDGET.toMillis(), TimeUnit.MILLISECONDS);
+            if (!process.waitFor(SHUTDOWN_BUDGET.toMillis(), TimeUnit.MILLISECONDS) || process.isAlive()) {
+                throw new AssertionError("the killed server did not end within " + SHUTDOWN_BUDGET);
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new AssertionError("interrupted while waiting for the killed server to go away", e);
         }
+        // The harness's own leftovers, not the server's: a crash witness may never close what it killed.
+        ServerHandle.discardStagingDirectory(stagingDirectory);
     }
 
     @Override
@@ -306,6 +317,11 @@ final class RealProcessServer implements ServerHandle {
      */
     Path output() {
         return output;
+    }
+
+    /** Where this launch staged its connectors, for a witness that the directory goes when the launch does. */
+    Path stagingDirectory() {
+        return stagingDirectory;
     }
 
     /** Whether it is still running, so a witness waiting on it can tell waiting from waiting forever. */
@@ -352,11 +368,14 @@ final class RealProcessServer implements ServerHandle {
             Thread.currentThread().interrupt();
             process.destroyForcibly();
         }
+        if (!process.isAlive()) {
+            ServerHandle.discardStagingDirectory(stagingDirectory);
+        }
     }
 
     private static Process launch(Path jar, List<String> jvmOptions, int port, String listenAddress,
             String storeUri, String operatorStateDatabase, Path workingDirectory, Path output,
-            List<String> extraArguments) {
+            Path stagingDirectory, List<String> extraArguments) {
         List<String> command = new ArrayList<>();
         command.add(javaBinary());
         command.addAll(jvmOptions);
@@ -377,7 +396,7 @@ final class RealProcessServer implements ServerHandle {
                 "--tapstate.store.mongo.server-selection-timeout=5s",
                 // A staging directory of this launch's own, for the same reason the other tier gets one:
                 // the cache is content-addressed and reused, so a shared one serves a stale connector.
-                "--" + ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + ServerHandle.privateStagingDirectory(),
+                "--" + ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + stagingDirectory,
                 "--" + ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID));
         // After the standing ones, and additional to them rather than replacing any: a repeated option
         // is joined with the earlier one by comma rather than winning over it, so anything a case needs

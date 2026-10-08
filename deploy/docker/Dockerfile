@@ -39,7 +39,7 @@ FROM eclipse-temurin:21-jre
 # registry renders the repository README on the package page; the description states the preview
 # posture up front so the image is not mistaken for a production default.
 LABEL org.opencontainers.image.title="Tapstate server" \
-      org.opencontainers.image.description="Preview runtime: single-node, in-memory; a restart replays from the source rather than resuming a persisted offset. Not for production." \
+      org.opencontainers.image.description="Preview runtime: a single member by default, with opt-in cluster mode and MongoDB-persisted control-plane state and recovery positions. Restart recovery depends on the source and read mode; delivery is at-least-once. Not for production." \
       org.opencontainers.image.source="https://github.com/tapstate/tapstate" \
       org.opencontainers.image.url="https://tapstate.com" \
       org.opencontainers.image.documentation="https://github.com/tapstate/tapstate/blob/main/docs/quickstart-online.md" \

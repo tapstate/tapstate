@@ -397,9 +397,10 @@ public final class NestDag {
         }
     }
 
-    /** Reads the key off the fields a row carries it in. */
+    /** Reads a row's key, or routes a settlement with no row to the shared settlement lane. */
     private static FunctionEx<Object, Object> fieldKey(List<String> fields) {
-        return item -> NestKeys.valuesOf(NestKeys.rowOf((Envelope) item), fields);
+        return item -> item instanceof SettledPositions ? SETTLED_POSITIONS_LANE
+                : NestKeys.valuesOf(NestKeys.rowOf((Envelope) item), fields);
     }
 
     /**
@@ -410,6 +411,9 @@ public final class NestDag {
      */
     private static FunctionEx<Object, Object> leavingKey(List<String> fields) {
         return item -> {
+            if (item instanceof SettledPositions) {
+                return SETTLED_POSITIONS_LANE;
+            }
             Envelope event = (Envelope) item;
             Map<String, Object> was = event.before();
             return NestKeys.valuesOf(was == null ? NestKeys.rowOf(event) : was, fields);

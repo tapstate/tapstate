@@ -39,7 +39,8 @@ import java.util.Objects;
  * publishing its row twice. So taking them in and sending what they mean are separate steps here, and
  * only the sending is retried.
  *
- * <p><b>What is offered is taken in a whole delivery at a time rather than an item at a time.</b> The
+ * <p><b>Rows are taken in a batch rather than an item at a time.</b> A settlement marker ends a batch
+ * and follows all of its output before the next batch is taken in. The
  * driver reads the fact mirror once for the keys a batch is about to ask about, which is one round
  * trip for a delivery instead of one per row; handing it one item per call would leave that read
  * asking for a single key every time, which is the same number of trips the batching exists to
@@ -82,11 +83,11 @@ public final class JoinProcessor extends AbstractProcessor implements Staged, Dy
                 driver::lowestPendingOn);
     }
 
-    /** Whether what is currently being offered has already been taken into the state. */
-    private boolean taken;
+    /** How many arrivals before the next settlement marker have already been taken into the state. */
+    private int taken;
 
     /**
-     * Takes in everything being offered, then sends as much of what it means as the outbox will hold.
+     * Takes in each run of rows before a settlement marker, then sends what the outbox will hold.
      *
      * <p>The items are left where they are until all of it has gone out, which is how the substrate is
      * told there is more to do: it offers the same delivery again, and {@link #taken} is what keeps it
@@ -117,30 +118,38 @@ public final class JoinProcessor extends AbstractProcessor implements Staged, Dy
             throw new IllegalStateException(
                     "a join vertex was given an edge on ordinal " + ordinal + ", which names no source");
         }
-        if (!taken) {
-            List<SourceChange> changes = new ArrayList<>(inbox.size());
-            // Reading rather than draining: what is not sent yet has to still be there to be offered
-            // again, and it is the sending that decides, not this.
-            for (Object item : inbox) {
-                if (item instanceof SettledPositions word) {
-                    if (!changes.isEmpty()) {
-                        driver.absorb(changes);
-                        changes.clear();
+        while (!inbox.isEmpty()) {
+            if (inbox.peek() instanceof SettledPositions) {
+                // Finish earlier recomputes before promising that a later position has settled.
+                if (!driver.drainItems(this::tryEmit) || !tryEmit(inbox.peek())) {
+                    return;
+                }
+                inbox.poll();
+                if (bounds != null && !bounds.release(this::tryEmit)) {
+                    return;
+                }
+                continue;
+            }
+            if (taken == 0) {
+                List<SourceChange> changes = new ArrayList<>(inbox.size());
+                // Keep batching contiguous rows, but never absorb rows beyond a settlement marker.
+                for (Object item : inbox) {
+                    if (item instanceof SettledPositions) {
+                        break;
                     }
-                    driver.absorbWord(word);
-                } else {
                     changes.add(new SourceChange(source, (Envelope) item));
                 }
-            }
-            if (!changes.isEmpty()) {
                 driver.absorb(changes);
+                taken = changes.size();
             }
-            taken = true;
-        }
-        if (driver.drainItems(this::tryEmit)
-                && (bounds == null || bounds.release(this::tryEmit))) {
-            inbox.clear();
-            taken = false;
+            if (!driver.drainItems(this::tryEmit)
+                    || (bounds != null && !bounds.release(this::tryEmit))) {
+                return;
+            }
+            for (int i = 0; i < taken; i++) {
+                inbox.poll();
+            }
+            taken = 0;
         }
     }
 

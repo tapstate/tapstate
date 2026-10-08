@@ -221,7 +221,8 @@ class ConnectorAcceptanceGatesTest {
             "mysql", "aliyun-rds-mysql", "aws-rds-mysql", "polar-db-mysql", "mysql-pxc",
             "postgres", "aliyun-rds-postgres", "aliyun-adb-postgres", "polar-db-postgres",
             "tencent-db-postgres",
-            "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb", "oracle", "sqlserver");
+            "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb", "oracle", "sqlserver",
+            "db2");
 
     @Test
     @DisplayName("what a shipped deployment accepts out of the box is exactly this set")

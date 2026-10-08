@@ -5,6 +5,7 @@ import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.StateJson;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -786,6 +787,64 @@ class PipelineConvergerTest {
 
         assertThat(actuator.calls()).doesNotContain("stop:p1:purge");
         assertThat(actuator.rebuildingStops()).isEqualTo(1);
+    }
+
+    @Test
+    void anOwedRerunClearsBeforeStartingWhenThePreviousJobIsAbsent() {
+        converge(RUNNING);
+        long epoch = state.read("p1").orElseThrow().epoch();
+        desired.save(new DesiredState("p1", RUNNING, REV, true, null, true, epoch));
+        actuator.carryingNothing();
+        actuator.reset();
+
+        converger.converge("p1");
+
+        assertThat(actuator.calls()).containsExactly("stop:p1:purge", "start:p1");
+        // Reserve, durable STOPPED, and RUNNING each fence a new checkpoint epoch.
+        assertThat(state.read("p1").orElseThrow().epoch()).isEqualTo(epoch + 3);
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(RUNNING));
+        actuator.reset();
+        converger.converge("p1");
+        assertThat(actuator.calls()).as("the accepted rerun is carried out once").isEmpty();
+    }
+
+    @Test
+    void anOwedRestartThatKeepsStateReplacesThePreviousFailedRun() {
+        converge(RUNNING);
+        long epoch = state.read("p1").orElseThrow().epoch();
+        desired.save(new DesiredState("p1", RUNNING, REV, false, null, true, epoch));
+        actuator.failWith(new TapstateException(
+                LifecycleError.PIPELINE_NOT_RUNNABLE, Map.of("pipeline", "p1"), null));
+        actuator.reset();
+
+        ConvergeResult result = converger.converge("p1");
+
+        assertThat(result.status()).isEqualTo(CONVERGED);
+        assertThat(result.failure()).isEmpty();
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(RUNNING));
+        assertThat(actuator.calls()).containsExactly("stop:p1:keep", "start:p1");
+    }
+
+    @Test
+    void aFailureAfterTheAcceptedRestartIsCarriedOutStillFailsTheNewRun() {
+        converge(RUNNING);
+        long epoch = state.read("p1").orElseThrow().epoch();
+        desired.save(new DesiredState("p1", RUNNING, REV, true, null, true, epoch));
+        converger.converge("p1");
+        TapstateException cause = new TapstateException(
+                LifecycleError.PIPELINE_NOT_RUNNABLE, Map.of("pipeline", "p1"), null);
+        actuator.failWith(cause);
+        actuator.reset();
+
+        ConvergeResult result = converger.converge("p1");
+
+        assertThat(result.status()).isEqualTo(ConvergeStatus.FAILED);
+        assertThat(result.failure()).contains(cause);
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(FAILED));
+        assertThat(actuator.calls()).containsExactly("stop:p1:keep");
+        actuator.reset();
+        converger.converge("p1");
+        assertThat(actuator.calls()).as("a spent restart cannot restart a new failure on every tick").isEmpty();
     }
 
     /** Without it, a resume is still a resume -- the held job is continued, not rebuilt. */

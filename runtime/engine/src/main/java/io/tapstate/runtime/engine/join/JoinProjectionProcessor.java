@@ -21,7 +21,6 @@ import io.tapstate.runtime.engine.SettledPositions;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
@@ -40,7 +39,7 @@ final class JoinProjectionProcessor extends AbstractProcessor implements Staged,
     private final JoinProjection projection;
     private final Deque<Object> pending = new ArrayDeque<>();
     private final LevelBounds bounds;
-    private boolean taken;
+    private int taken;
 
     JoinProjectionProcessor(JoinProjection projection) {
         this(projection, null, null);
@@ -71,22 +70,31 @@ final class JoinProjectionProcessor extends AbstractProcessor implements Staged,
     }
 
     private void processTimed(Inbox inbox) {
-        if (!taken) {
-            List<JoinUpdate> arrivals = new ArrayList<>(inbox.size());
-            for (Object item : inbox) {
-                if (item instanceof JoinUpdate update) {
-                    arrivals.add(update);
+        while (!inbox.isEmpty()) {
+            if (taken == 0) {
+                if (inbox.peek() instanceof SettledPositions word) {
+                    pending.add(word);
+                    taken = 1;
+                } else {
+                    List<JoinUpdate> arrivals = new ArrayList<>(inbox.size());
+                    // A marker follows all output from the rows before it, including a refused emission.
+                    for (Object item : inbox) {
+                        if (item instanceof SettledPositions) {
+                            break;
+                        }
+                        arrivals.add((JoinUpdate) item);
+                    }
+                    pending.addAll(projection.refresh(arrivals));
+                    taken = arrivals.size();
                 }
             }
-            Iterator<Envelope> projected = projection.refresh(arrivals).iterator();
-            for (Object item : inbox) {
-                pending.add(item instanceof SettledPositions ? item : projected.next());
+            if (!drainPending()) {
+                return;
             }
-            taken = true;
-        }
-        if (drainPending()) {
-            inbox.clear();
-            taken = false;
+            for (int i = 0; i < taken; i++) {
+                inbox.poll();
+            }
+            taken = 0;
         }
     }
 

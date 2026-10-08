@@ -983,7 +983,10 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         }
     }
 
-    /** Reads an admitted owner only from a still-live exact attachment of this physical capture. */
+    /**
+     * Reads an admitted owner only from a still-live exact attachment of this physical capture.
+     * A first joiner may have left before takeover; its spec and handoff cannot stand in for a live reader.
+     */
     private JoinedReader joinedReader(CaptureId captureId, JoinedCapture capture) {
         JoinedReader unscoped = null;
         for (String pipeline : List.copyOf(capture.pipelines)) {

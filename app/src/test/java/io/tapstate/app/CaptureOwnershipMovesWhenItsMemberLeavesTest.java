@@ -45,8 +45,6 @@ import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
-import java.io.IOException;
-import java.net.ServerSocket;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -102,18 +100,18 @@ class CaptureOwnershipMovesWhenItsMemberLeavesTest {
     private InMemorySrsLogStore log;
 
     @BeforeEach
-    void startTwoMembers() throws IOException {
+    void startTwoMembers() {
         log = new InMemorySrsLogStore();
-        int[] ports = twoFreePorts();
         String cluster = "capture-handover-" + System.nanoTime();
-        first = Hazelcast.newHazelcastInstance(config(cluster, ports[0], ports, log));
-        second = Hazelcast.newHazelcastInstance(config(cluster, ports[1], ports, log));
+        first = Hazelcast.newHazelcastInstance(config(cluster, List.of(), log));
+        second = Hazelcast.newHazelcastInstance(config(cluster,
+                List.of("127.0.0.1:" + first.getCluster().getLocalMember().getAddress().getPort()), log));
         awaitMembers(first, 2);
     }
 
     @AfterEach
     void stopBothMembers() {
-        for (HazelcastInstance member : List.of(first, second)) {
+        for (HazelcastInstance member : new HazelcastInstance[] {first, second}) {
             if (member != null && member.getLifecycleService().isRunning()) {
                 member.shutdown();
             }
@@ -248,17 +246,17 @@ class CaptureOwnershipMovesWhenItsMemberLeavesTest {
         }
     }
 
-    private static Config config(String cluster, int port, int[] ports, InMemorySrsLogStore log) {
+    private static Config config(String cluster, List<String> members, InMemorySrsLogStore log) {
         Config config = new Config();
         config.setClusterName(cluster);
         config.setProperty("hazelcast.phone.home.enabled", "false");
         config.setProperty("hazelcast.shutdownhook.enabled", "false");
-        config.getNetworkConfig().setPort(port).setPortAutoIncrement(false);
+        config.getNetworkConfig().setPort(0).setPortAutoIncrement(false);
         config.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");
         config.getNetworkConfig().getJoin().getMulticastConfig().setEnabled(false);
         config.getNetworkConfig().getJoin().getAutoDetectionConfig().setEnabled(false);
         config.getNetworkConfig().getJoin().getTcpIpConfig().setEnabled(true)
-                .setMembers(List.of("127.0.0.1:" + ports[0], "127.0.0.1:" + ports[1]));
+                .setMembers(members);
         config.getJetConfig().setEnabled(false);
         // One synchronous backup, which is what a clustered member configures: the ring must outlive the
         // member that owned its partition, or terminating one would take the chain with it.
@@ -272,12 +270,6 @@ class CaptureOwnershipMovesWhenItsMemberLeavesTest {
         config.getSerializationConfig().addSerializerConfig(
                 new SerializerConfig().setImplementation(new SrsItemSerializer()).setTypeClass(SrsItem.class));
         return config;
-    }
-
-    private static int[] twoFreePorts() throws IOException {
-        try (ServerSocket one = new ServerSocket(0); ServerSocket other = new ServerSocket(0)) {
-            return new int[] {one.getLocalPort(), other.getLocalPort()};
-        }
     }
 
     /** A source fed by the case, recording the start it was asked to read from. */
