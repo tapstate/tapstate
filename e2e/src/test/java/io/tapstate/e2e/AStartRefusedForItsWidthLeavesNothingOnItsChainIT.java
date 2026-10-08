@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.testsupport.DockerGate;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -79,7 +80,7 @@ class AStartRefusedForItsWidthLeavesNothingOnItsChainIT {
             assertThat(control.state(RUNNING)).contains(PipelineState.RUNNING);
             assertThat(documents.miningChainIds()).hasSize(1);
             assertThat(documents.consumersOf(documents.miningChainIds().iterator().next()))
-                    .as("the refused start joined no chain").containsExactly(RUNNING);
+                    .as("the refused start joined no chain").containsExactly(SrsConsumerId.of(RUNNING, SOURCE).value());
         }
     }
 

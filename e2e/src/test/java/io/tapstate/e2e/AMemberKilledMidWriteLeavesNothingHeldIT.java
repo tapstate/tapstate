@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import io.tapstate.adapters.mongostore.MongoConnection;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.testsupport.DockerGate;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -90,7 +91,8 @@ class AMemberKilledMidWriteLeavesNothingHeldIT {
                         .findFirst()
                         .orElseThrow(() -> new AssertionError("the cluster lists no boot of " + killed));
                 String chain = documents.miningChainIds().stream()
-                        .filter(candidate -> documents.consumersOf(candidate).contains(PIPELINE))
+                        .filter(candidate -> documents.consumersOf(candidate)
+                                .contains(SrsConsumerId.of(PIPELINE, SOURCE_ID).value()))
                         .findFirst()
                         .orElseThrow(() -> new AssertionError("no chain carries " + PIPELINE));
                 ControlPlane survivor = cluster.memberOtherThan(killed);

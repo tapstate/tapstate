@@ -1962,16 +1962,14 @@ final class StoreBackedDagSource implements DagSource {
      * pipeline's retained state has to be cleared and its data loaded again, or a new starting point accepted on
      * purpose. Where reading starts is not progress a sink made, so a ring cursor alone does not count.
      *
-     * <p>Progress a pipeline recorded on a chain under its own name, from before each of its source nodes kept a
-     * record of its own there, cannot say which source node it was made for, whatever it holds - a confirmed
-     * position, a finished load or a writer's progress - so it is refused wherever it is found.
-     *
-     * <p>And before each sink kept its own progress, a source node kept one confirmed position - moved by
+     * <p>Before each sink kept its own progress, a source node kept one confirmed position - moved by
      * whichever of its sinks confirmed first - and one list of the loads its sinks had finished. Where more than
      * one sink reads it, that position may be one only the fastest sink reached, and resuming from it would skip
      * for good what a slower sink had not written; so such progress, with nothing kept per writer beside it, is
-     * refused too. A source node only one sink reads is exempt, since whatever position it holds, that sink
-     * reached.
+     * refused. A source node only one sink reads is exempt, since whatever position it holds, that sink
+     * reached. Progress a pipeline kept under its own name, from before each of its source nodes had a record of
+     * its own, is the capture's to refuse as it registers the source, with the diagnostic for recovery it cannot
+     * prove.
      */
     private void refuseProgressNoSinkCanAnswerFor(
             String pipelineId, PipelineResource pipeline, Map<String, SourceVertex> sourceVertices) {
@@ -1990,15 +1988,6 @@ final class StoreBackedDagSource implements DagSource {
                     pipeline, FromClause.list(view.from()), sourceKeyByTable, sourceKeysById, sourceVertices, stepIds);
             sourceNodesOf(read, sourceVertices).forEach(node -> sinksBySource.merge(node, 1, Integer::sum));
         }
-        Map<String, Integer> sinksByChain = new LinkedHashMap<>();
-        sourceVertices.values().forEach(vertex -> sinksByChain.merge(vertex.resolution().chainId().value(),
-                sinksBySource.getOrDefault(SourceNode.of(vertex), 1), Math::max));
-        sinksByChain.forEach((chain, sinks) -> {
-            if (heldUnderItsOwnName(chain, pipelineId)) {
-                throw new TapstateException(sinks > 1 ? IoError.SINK_WRITER_PROGRESS_AMBIGUOUS
-                        : IoError.SRS_PROGRESS_UNPROVEN, Map.of("pipeline", pipelineId), null);
-            }
-        });
         sinksBySource.forEach((node, sinks) -> {
             if (sinks > 1 && heldForEverySinkAtOnce(node.chain(), node.consumerId())) {
                 throw new TapstateException(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS, Map.of("pipeline", pipelineId),
@@ -2023,21 +2012,6 @@ final class StoreBackedDagSource implements DagSource {
             }
         });
         return nodes;
-    }
-
-    /**
-     * Whether {@code pipelineId} holds sink progress on {@code chain} under its own name - a confirmed position,
-     * a table's confirmation, a load marked finished, or a writer's progress.
-     */
-    private boolean heldUnderItsOwnName(String chain, String pipelineId) {
-        boolean recorded = storePort.meta().read(chain)
-                .flatMap(meta -> meta.consumerOffset(pipelineId))
-                .map(consumer -> consumer.sinkAcked() != null || !consumer.sinkAckedByTable().isEmpty()
-                        || !consumer.snapshotCompletedTables().isEmpty())
-                .orElse(false);
-        return recorded || storePort.meta().writerRun(chain, pipelineId)
-                .map(run -> run.progress().values().stream().anyMatch(byWriter -> !byWriter.isEmpty()))
-                .orElse(false);
     }
 
     /**

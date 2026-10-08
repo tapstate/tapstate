@@ -820,13 +820,13 @@ class StoreBackedDagSourceTest {
         String chain = SourceCaptureResolution.of(source).chainId().value();
         store.meta().create(chain, null);
         store.meta().advanceSinkAcked(
-                chain, "p", "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
+                chain, SOURCE_NODE, "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("p"))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> assertThat(((TapstateException) thrown).code())
                         .isEqualTo(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS));
-        assertThat(store.meta().ringDoneThrough(chain, "p"))
+        assertThat(store.meta().ringDoneThrough(chain, SOURCE_NODE))
                 .containsEntry("orders", 100L);
     }
 
@@ -835,7 +835,7 @@ class StoreBackedDagSourceTest {
         FakeStorePort store = new FakeStorePort();
         String chain = servedBy(store, "fast", "slow");
         store.meta().advanceSinkAcked(
-                chain, "p", "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
+                chain, SOURCE_NODE, "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
         assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("p"))
                 .isInstanceOf(TapstateException.class);
 
@@ -856,34 +856,6 @@ class StoreBackedDagSourceTest {
     }
 
     @Test
-    void a_single_sink_is_refused_progress_kept_under_its_pipelines_own_name() {
-        FakeStorePort store = new FakeStorePort();
-        String chain = servedBy(store, "only");
-        store.meta().advanceSinkAcked(
-                chain, "p", "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
-
-        // Kept before each source node had a record of its own on the chain, it cannot say which source node it
-        // was made for, however few sinks read it.
-        assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("p"))
-                .isInstanceOf(TapstateException.class)
-                .satisfies(thrown -> assertThat(((TapstateException) thrown).code())
-                        .isEqualTo(IoError.SRS_PROGRESS_UNPROVEN));
-    }
-
-    @Test
-    void a_multi_sink_source_node_is_refused_a_position_kept_for_every_sink_at_once() {
-        FakeStorePort store = new FakeStorePort();
-        String chain = servedBy(store, "fast", "slow");
-        store.meta().advanceSinkAcked(
-                chain, SOURCE_NODE, "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
-
-        assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("p"))
-                .isInstanceOf(TapstateException.class)
-                .satisfies(thrown -> assertThat(((TapstateException) thrown).code())
-                        .isEqualTo(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS));
-    }
-
-    @Test
     void a_position_at_the_loads_seam_is_no_progress_that_two_sinks_could_disagree_on() {
         FakeStorePort store = new FakeStorePort();
         String chain = servedBy(store, "fast", "slow");
@@ -897,7 +869,7 @@ class StoreBackedDagSourceTest {
     void a_ring_cursor_alone_is_no_progress_that_two_sinks_could_disagree_on() {
         FakeStorePort store = new FakeStorePort();
         String chain = servedBy(store, "fast", "slow");
-        store.meta().startRingAfter(chain, "p", "orders", 40);
+        store.meta().startRingAfter(chain, SOURCE_NODE, "orders", 40);
 
         assertThat(vertexNames(new StoreBackedDagSource(store).dagFor("p"))).contains("orders_src");
     }
