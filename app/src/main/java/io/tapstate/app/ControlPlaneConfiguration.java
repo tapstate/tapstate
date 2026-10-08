@@ -57,6 +57,7 @@ import io.tapstate.control.core.PipelineRepresentation;
 import io.tapstate.control.core.PipelineViewService;
 import io.tapstate.control.core.ViewCatalogService;
 import io.tapstate.control.core.SampleSourceService;
+import io.tapstate.control.core.SampleSourceCredentialsProvider;
 import io.tapstate.control.core.StateStoreSetupService;
 import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
@@ -72,6 +73,7 @@ import io.tapstate.control.core.SourceConfigRevealAuthorizer;
 import io.tapstate.control.core.SourceConfigRevealService;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.tapstate.control.core.SourceRepresentation;
 import io.tapstate.control.core.SourceSchemaQueryService;
 import io.tapstate.control.core.SessionService;
@@ -779,11 +781,21 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    SampleSourceService sampleSourceService(SourceProjectionService sources, SchemaDiscoveryService discovery,
-            ConnectionTestService connections, ConnectorCatalogView connectors,
+    SampleSourceCredentialsProvider sampleSourceCredentialsProvider(
+            CloudRuntimeSettings cloudSettings, ObjectMapper objectMapper,
             @Value("${tapstate.sample.host:113.98.206.139}") String host,
             @Value("${tapstate.sample.password:}") String password) {
-        return new SampleSourceService(sources, discovery, connections, connectors, host, password);
+        if (cloudSettings.cloud()) {
+            return new CloudSampleSourceCredentialsProvider(cloudSettings, objectMapper);
+        }
+        return new ConfiguredSampleSourceCredentialsProvider(host, password);
+    }
+
+    @Bean
+    SampleSourceService sampleSourceService(SourceProjectionService sources, SchemaDiscoveryService discovery,
+            ConnectionTestService connections, ConnectorCatalogView connectors,
+            SampleSourceCredentialsProvider credentialsProvider) {
+        return new SampleSourceService(sources, discovery, connections, connectors, credentialsProvider);
     }
 
     @Bean
