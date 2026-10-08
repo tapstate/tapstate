@@ -4,6 +4,7 @@ import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 
@@ -38,8 +39,15 @@ import org.springframework.context.event.EventListener;
  * shorter than the lease, so the window closes before the lease it was cut from could expire. The
  * interval is measured on the monotonic clock, so moving the node's wall clock cannot widen it.
  *
- * <p>One scheduler thread drives the claims. Failure recording and shutdown alone synchronize so a
- * close that starts first cannot be followed by a durable verdict that calls its dying run independent.
+ * <p>Two threads use the claims. The convergence pass acquires them, advances them for each run and judges
+ * the runs under them; {@link #renewDue()}, on a renewer of its own, keeps every held claim's lease running.
+ * The pass is one thread over every pipeline this member drives, and a single start can hold it for longer
+ * than a lease: renewed only from the pass, every claim the member held ran out behind one slow start and
+ * was taken over from a member that was still there. Everything here synchronizes on this object, so a
+ * renewal always carries the claim the pass last moved -- the store matches a renewal on the claim's exact
+ * generations, and one sent with a claim the pass has just advanced past would read as the claim lost. The
+ * same lock keeps a close that starts first from being followed by a durable verdict that calls its dying
+ * run independent.
  */
 final class PipelineActuationOwnership {
 
@@ -161,7 +169,7 @@ final class PipelineActuationOwnership {
     }
 
     /** Answers whether this member drives {@code pipelineId} right now, renewing or acquiring when due. */
-    Permit permit(String pipelineId) {
+    synchronized Permit permit(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         if (closing) {
             return Permit.denied();
@@ -219,14 +227,14 @@ final class PipelineActuationOwnership {
      * checks a start makes ahead of everything a run opens. Until a run takes a generation of its own, the
      * failure that refusal records is the refusal's, which no member leaving answers for.
      */
-    void startRefusedBeforeItsRun(String pipelineId) {
+    synchronized void startRefusedBeforeItsRun(String pipelineId) {
         Held state = held.get(Objects.requireNonNull(pipelineId, "pipelineId"));
         if (state != null && state.claim != null) {
             state.startRefusedAtGeneration = state.claim.executionGeneration();
         }
     }
 
-    Execution beginExecution(String pipelineId) {
+    synchronized Execution beginExecution(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         if (closing) {
             return Execution.refused();
@@ -348,7 +356,7 @@ final class PipelineActuationOwnership {
      * before it, and judged by that run - inherited, or planned over a member that has gone - every
      * refused start would read as the same death again and spend a rebuild meant for a departure.
      */
-    Departure departure(String pipelineId, long settlingNanos) {
+    synchronized Departure departure(String pipelineId, long settlingNanos) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         if (!fenced) {
             return Departure.ALONE;
@@ -387,8 +395,63 @@ final class PipelineActuationOwnership {
         return Departure.A_MEMBER_LEFT;
     }
 
+    /**
+     * Renews every claim this member holds whose renewal is due, whatever the convergence pass is doing.
+     * Called on a renewer of its own, so a start that holds the pass for longer than a lease -- an
+     * overloaded host, a slow source, many tables -- runs out no claim of this member, its own included.
+     * A claim the store will not renew is dropped here exactly as the pass would drop it, and the pass
+     * takes it from there.
+     */
+    synchronized void renewDue() {
+        if (!fenced || closing) {
+            return;
+        }
+        long now = nanoTime.getAsLong();
+        for (Held state : held.values()) {
+            if (state.claim != null && state.contacted && now - state.nextContactNanos >= 0) {
+                renew(state, now);
+            }
+        }
+    }
+
+    /**
+     * Whether the run {@code fence} names is still this member's to submit, asked of the store right before
+     * submitting it. A start can outlast a lease, and the renewer that keeps the claim alive through it can
+     * still lose it -- the store out of reach, the process paused, another member taking the pipeline over.
+     * A run submitted over a claim this member no longer holds dies at its first write, and the member that
+     * holds the pipeline then reads that death as the pipeline's.
+     *
+     * <p>Read rather than renewed: what is asked is who holds the run's generations now, and a renewal is
+     * also refused for a claim granted under a topology revision a member joining has since moved, which
+     * the same owner takes again on its next pass under the same generations. True on a single node, where
+     * nothing is fenced.
+     */
+    boolean proveExecution(ExecutionFence fence) {
+        if (!fenced || fence == null) {
+            return true;
+        }
+        if (closing) {
+            return false;
+        }
+        WorkloadClaimKey key =
+                new WorkloadClaimKey(clusterId, WorkloadClaimType.PIPELINE_ACTUATION, fence.pipelineId());
+        Optional<WorkloadClaimReading> reading;
+        try {
+            reading = claims.read(key);
+        } catch (RuntimeException unreachable) {
+            return false;
+        }
+        // The claim generation alone says whose tenure it is: every change of holder takes the next one, a
+        // restarted member included, so a match on it is a match on this member.
+        return reading.filter(WorkloadClaimReading::leased)
+                .map(WorkloadClaimReading::claim)
+                .filter(claim -> claim.claimGeneration() == fence.claimGeneration()
+                        && claim.executionGeneration() == fence.executionGeneration())
+                .isPresent();
+    }
+
     /** The execution generation the claim this member holds for {@code pipelineId} carries, or zero. */
-    long heldExecutionGeneration(String pipelineId) {
+    synchronized long heldExecutionGeneration(String pipelineId) {
         Held state = fenced ? held.get(pipelineId) : null;
         return state == null || state.claim == null ? 0 : state.claim.executionGeneration();
     }
@@ -462,7 +525,7 @@ final class PipelineActuationOwnership {
      * it. Empty when this member is driving no run of that pipeline, or when nothing is committed:
      * those are "this member cannot say", which is not the same answer as "nobody is waiting".
      */
-    Map<String, MemberRunState> runMembership(String pipelineId) {
+    synchronized Map<String, MemberRunState> runMembership(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Held state = fenced ? held.get(pipelineId) : null;
         ClusterMembership current = fenced ? membership.committed() : null;
@@ -518,7 +581,7 @@ final class PipelineActuationOwnership {
      * this member named as its driver until the lease runs out. Releasing expires the lease and leaves the
      * generation where it is, so the next holder still moves forward from it.
      */
-    void retain(Collection<String> pipelineIds) {
+    synchronized void retain(Collection<String> pipelineIds) {
         if (!fenced) {
             return;
         }

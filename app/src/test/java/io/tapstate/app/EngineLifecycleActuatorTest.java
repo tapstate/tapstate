@@ -40,6 +40,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -354,6 +356,82 @@ class EngineLifecycleActuatorTest {
         }
     }
 
+    /**
+     * A start holds the pass from the moment it takes its run's generation until it submits the job, and it
+     * can take longer than a lease: an overloaded host, a slow source, many tables. The claim behind the run
+     * is renewed throughout, so the run it submits is one its own members let write. Renewed only between
+     * passes, the claim ran out under the start, and the members refused the run it had just submitted.
+     */
+    @Test
+    void aStartThatOutlastsALeaseSubmitsARunItsOwnMembersAuthorize() {
+        InMemoryWorkloadClaimStore store = new InMemoryWorkloadClaimStore();
+        AtomicLong nanos = new AtomicLong();
+        PipelineActuationOwnership ownership = clusteredOwnership(store, nanos::get, "node-a");
+        assertThat(ownership.permit(PIPE).granted()).isTrue();
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        RecordingDagSource dagSource = new RecordingDagSource(events);
+        // Inside the capture start, while the pass is held: only the renewer moves, as it does on its own thread.
+        coordinator.jobAbsentProbe = () -> {
+            for (int second = 0; second <= 30; second += 5) {
+                store.elapse(Duration.ofSeconds(5));
+                nanos.addAndGet(Duration.ofSeconds(5).toNanos());
+                ownership.renewDue();
+            }
+            return true;
+        };
+        LifecycleActuator actuator = new EngineLifecycleActuator(
+                new Engine(member), dagSource, coordinator, teardown(), ownership);
+        coordinator.jobTerminalProbe = () -> awaitTerminal(member.getJet().getJob(PIPE));
+
+        actuator.start(PIPE);
+        try (ExecutionAuthorization guard =
+                     new ExecutionAuthorization("cluster-a", store, Duration.ofSeconds(10), nanos::get)) {
+            assertThat(member.getJet().getJob(PIPE)).as("the run was submitted").isNotNull();
+            assertThat(guard.authorized(dagSource.fences.get(0)))
+                    .as("and its members may write for it, more than a lease after its generation was taken")
+                    .isTrue();
+        } finally {
+            actuator.stop(PIPE, true);
+        }
+    }
+
+    /**
+     * A start whose claim was taken over while it ran submits nothing. Its members would refuse the run at its
+     * first write; submitted, the run dies as it starts, and the member now holding the pipeline reads that
+     * death as the pipeline's. The capture the start opened is closed again keeping the position, so the
+     * holder opens its own over it.
+     */
+    @Test
+    void aStartWhoseClaimIsTakenOverWhileItRunsSubmitsNothingAndClosesTheCaptureItOpened() {
+        InMemoryWorkloadClaimStore store = new InMemoryWorkloadClaimStore();
+        AtomicLong nanos = new AtomicLong();
+        PipelineActuationOwnership nodeA = clusteredOwnership(store, nanos::get, "node-a");
+        PipelineActuationOwnership nodeB = clusteredOwnership(store, nanos::get, "node-b");
+        assertThat(nodeA.permit(PIPE).granted()).isTrue();
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
+        RecordingDagSource dagSource = new RecordingDagSource(events);
+        // Nothing on this member renews for longer than a lease -- its store out of reach, or the process
+        // paused -- and another member takes the pipeline over in the meantime.
+        coordinator.jobAbsentProbe = () -> {
+            store.elapse(Duration.ofSeconds(31));
+            nanos.addAndGet(Duration.ofSeconds(31).toNanos());
+            assertThat(nodeB.permit(PIPE).granted()).as("another member took the pipeline over").isTrue();
+            return true;
+        };
+        LifecycleActuator actuator = new EngineLifecycleActuator(
+                new Engine(member), dagSource, coordinator, teardown(), nodeA);
+
+        actuator.start(PIPE);
+
+        assertThat(member.getJet().getJob(PIPE))
+                .as("no run was submitted over a claim this member no longer holds").isNull();
+        assertThat(events)
+                .as("and the capture it opened was closed again, keeping the pipeline's position")
+                .containsSubsequence("startCapture:" + PIPE, "stopCapture:" + PIPE + "[keep][jobLive]");
+    }
+
     @Test
     void reportsNoFailureWhenNeitherTheJobNorTheCaptureHasFailed() {
         RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(new CopyOnWriteArrayList<>());
@@ -465,15 +543,21 @@ class EngineLifecycleActuatorTest {
      */
     /** A member that holds its cluster's pipelines, so a start of one is granted a run to be fenced to. */
     private PipelineActuationOwnership clusteredOwnership() {
+        return clusteredOwnership(new InMemoryWorkloadClaimStore(), () -> 0L, "node-a");
+    }
+
+    /** The same, as one of several members over {@code store}, on the monotonic clock {@code nanos}. */
+    private static PipelineActuationOwnership clusteredOwnership(
+            InMemoryWorkloadClaimStore store, LongSupplier nanos, String node) {
         ClusterProperties properties = new ClusterProperties();
         properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
         ClusterMembershipGate gate = new ClusterMembershipGate(properties);
         gate.install(new ClusterMembership("cluster-a", 7, Set.of("node-a", "node-b", "node-c")));
         gate.canCommit(Set.of("node-a", "node-b"));
-        ClusterWorkloadClaims claims = new ClusterWorkloadClaims(new InMemoryWorkloadClaimStore(), gate);
+        ClusterWorkloadClaims claims = new ClusterWorkloadClaims(store, gate);
         return new PipelineActuationOwnership(
-                "cluster-a", new WorkloadOwner("node-a", "boot-a"), gate, claims,
-                Duration.ofSeconds(30), Duration.ofSeconds(10), () -> 0L);
+                "cluster-a", new WorkloadOwner(node, "boot-" + node), gate, claims,
+                Duration.ofSeconds(30), Duration.ofSeconds(10), nanos);
     }
 
     private NestStateTeardown teardown() {

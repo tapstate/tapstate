@@ -175,6 +175,19 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // Capture opens the SRS generation that source vertices compile into the DAG, so the topology is built
         // only now, from the plan worked out above.
         DagSource.StartPlan plan = planned.build(execution.fence());
+        // Proved once more, against the store, before anything is recorded or submitted. Everything above can
+        // take longer than a lease, and the renewer keeping the claim alive through it can still lose it: the
+        // store out of reach, the process paused, another member taking the pipeline over. A run submitted over
+        // a claim this member no longer holds dies at its first write, and whoever holds the pipeline then reads
+        // that death as the pipeline's. Not recorded as failed, for the reason a start refused its generation
+        // is not: the member that holds the pipeline puts a run behind it, over a capture this start closes
+        // again keeping its position.
+        if (!actuation.proveExecution(execution.fence())) {
+            LOG.warn("Not submitting pipeline {} on this member: the claim its run was taken under could not "
+                    + "be proved once the start was ready to submit it", pipelineId);
+            captureCoordinator.stopCapture(pipelineId, false);
+            return;
+        }
         // Written down before the run is submitted, so a reader never finds a run executing on a plan nobody
         // recorded; a run that goes on to fail keeps its plan until the next start replaces it or a stop lets go.
         // Compared with the plan of the run before - lost to a failed member, a stop or a restart - so a node

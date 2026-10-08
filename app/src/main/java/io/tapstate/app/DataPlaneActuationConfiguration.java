@@ -228,6 +228,20 @@ class DataPlaneActuationConfiguration {
                 clusterProperties.getWorkloadClaimTtl(), clusterProperties.getWorkloadClaimRenewInterval());
     }
 
+    /**
+     * Keeps the actuation claims renewed apart from the convergence pass, which a single start can hold for
+     * longer than a lease. Nothing to renew on a single node.
+     */
+    @Bean(destroyMethod = "close")
+    ActuationClaimRenewer actuationClaimRenewer(
+            PipelineActuationOwnership pipelineActuationOwnership, ClusterProperties clusterProperties) {
+        if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
+            return ActuationClaimRenewer.inactive();
+        }
+        return new ActuationClaimRenewer(
+                pipelineActuationOwnership, clusterProperties.getWorkloadClaimRenewInterval());
+    }
+
     @Bean
     PipelineCaptureCoordinator pipelineCaptureCoordinator(
             StorePort storePort, CaptureRunUnit captureRunUnit, SrsCoordinator srsCoordinator,

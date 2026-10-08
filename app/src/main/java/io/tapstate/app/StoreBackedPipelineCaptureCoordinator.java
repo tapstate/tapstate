@@ -91,6 +91,14 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
     private final Map<CaptureId, OwnedCapture> ownedCaptures = new LinkedHashMap<>();
 
     /**
+     * The claims this member has taken on captures it has not opened yet, each renewed from the moment it
+     * was taken. Opening a capture can take longer than a lease, and a claim nothing renewed meanwhile has
+     * run out by the time its tail is open. Handed to the capture once it is open, or closed -- which lets
+     * the claim go -- when the start that took it does not get that far.
+     */
+    private final Map<CaptureId, CaptureClaimLease> openingLeases = new LinkedHashMap<>();
+
+    /**
      * The pipelines here reading a capture another member holds, by capture. Kept for the moment this
      * member takes such a capture over, by a start of its own or because nobody tails it any more: its
      * tail then runs for these pipelines as well, and has to outlast the last of them rather than the
@@ -222,7 +230,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                             try {
                                 run = captureAttacher.start(spec.withCaptureFence(permit.fence()), handoff, true);
                             } catch (RuntimeException | Error failure) {
-                                ownership.release(permit.claim());
+                                letGo(captureId, permit);
                                 throw failure;
                             }
                             // Pipelines here that joined this capture while another member held it read the
@@ -453,17 +461,39 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      * out by its lease; saying so on the failure the start ends with is all that is left to do.
      */
     private void releaseUnopened(Map<CaptureId, CaptureOwnership.Permit> permits, Throwable failure) {
-        for (CaptureOwnership.Permit permit : permits.values()) {
-            if (!permit.acquired()) {
+        for (Map.Entry<CaptureId, CaptureOwnership.Permit> entry : permits.entrySet()) {
+            if (!entry.getValue().acquired()) {
                 continue;
             }
             try {
-                ownership.release(permit.claim());
+                letGo(entry.getKey(), entry.getValue());
             } catch (RuntimeException unreleased) {
                 failure.addSuppressed(unreleased);
             }
         }
         permits.clear();
+    }
+
+    /** {@code permit} as taken: an acquired claim is renewed from now on, until it is opened or let go. */
+    private CaptureOwnership.Permit renewedFromNow(CaptureId captureId, CaptureOwnership.Permit permit) {
+        if (permit.acquired() && permit.claim() != null) {
+            CaptureClaimLease replaced = openingLeases.put(
+                    captureId, new CaptureClaimLease(ownership, permit.claim(), claimRenewInterval));
+            if (replaced != null) {
+                replaced.close();
+            }
+        }
+        return permit;
+    }
+
+    /** Lets go of a claim taken for a capture that is not going to be opened, and stops renewing it. */
+    private void letGo(CaptureId captureId, CaptureOwnership.Permit permit) {
+        CaptureClaimLease opening = openingLeases.remove(captureId);
+        if (opening != null) {
+            opening.close();
+        } else {
+            ownership.release(permit.claim());
+        }
     }
 
     /**
@@ -531,11 +561,13 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         OwnedCapture owned = new OwnedCapture(run, permit, pipelines);
         ownedCaptures.put(captureId, owned);
         lookForCapturesNobodyTails();
-        owned.lease = permit.claim() == null
-                ? CaptureClaimLease.unfenced()
-                : new CaptureClaimLease(
-                        ownership, permit.claim(), claimRenewInterval,
-                        () -> captureClaimLost(captureId, owned));
+        CaptureClaimLease opening = openingLeases.remove(captureId);
+        owned.lease = permit.claim() == null ? CaptureClaimLease.unfenced()
+                : opening != null ? opening
+                : new CaptureClaimLease(ownership, permit.claim(), claimRenewInterval);
+        // Bound last, once the capture is recorded as owned: a claim lost while it was being opened is
+        // answered right here, and the answer has to find the capture it stops.
+        owned.lease.onLost(() -> captureClaimLost(captureId, owned));
     }
 
     /**
@@ -564,7 +596,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             if (stillLoading(capture.pipelines.keySet())) {
                 continue;
             }
-            CaptureOwnership.Permit permit = ownership.acquire(entry.getKey());
+            CaptureOwnership.Permit permit = renewedFromNow(entry.getKey(), ownership.acquire(entry.getKey()));
             if (!permit.acquired()) {
                 continue;
             }
@@ -574,7 +606,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 tail = captureAttacher.start(
                         pipeline.tailSpec.withCaptureFence(permit.fence()), pipeline.tailPassthrough, true);
             } catch (RuntimeException failure) {
-                ownership.release(permit.claim());
+                letGo(entry.getKey(), permit);
                 LOG.warn("Could not open the tail of capture {} for pipelines {} here; asking again later",
                         entry.getKey().value(), capture.pipelines.keySet(), failure);
                 continue;
@@ -672,7 +704,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      * pipeline's load only sits lower -- beneath changes it would have sat beneath anyway.
      */
     private CaptureOwnership.Permit permitOrNotYet(String pipelineId, CaptureId captureId, CaptureRunSpec spec) {
-        CaptureOwnership.Permit permit = ownership.acquire(captureId);
+        CaptureOwnership.Permit permit = renewedFromNow(captureId, ownership.acquire(captureId));
         if (permit.acquired() || spec.readMode() == ReadMode.SNAPSHOT_ONLY
                 || aRingIsOpen(spec.miningChainId().value())) {
             ringWaits.remove(captureId);
