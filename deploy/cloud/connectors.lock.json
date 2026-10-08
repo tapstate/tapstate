@@ -1,0 +1,73 @@
+{
+  "schemaVersion": 2,
+  "connectors": [
+    {
+      "id": "mysql",
+      "bytes": 47131206,
+      "sha256": "34def7fca33fdf80f9d7e5561b2a2d9b7a2733fd06da9974359bbb77066ca0e2",
+      "upstreamRevision": "2060cffd45f41b6bcd634381ede351358315d360",
+      "pdkApiVersion": "2.0.5-SNAPSHOT",
+      "specPath": "mysql-spec.json"
+    },
+    {
+      "id": "mongodb",
+      "bytes": 20400364,
+      "sha256": "7fbdbf1ef2965053c9c5e6d28c0c21c3aa2818938ab758b965cc278d61e0c7b4",
+      "upstreamRevision": "519cb888df99f3a9d0bf45a24cb8c5ff5b742714",
+      "pdkApiVersion": "2.0.7-SNAPSHOT",
+      "specPath": "spec.json"
+    },
+    {
+      "id": "postgres",
+      "bytes": 52771466,
+      "sha256": "535aaaed34594dcc9e2dd1937efc4b91865911f11de624aca555b59a609053ee",
+      "upstreamRevision": "d889798ec2840ded765d3b176e2e0e20e40c7863",
+      "pdkApiVersion": "2.0.5-SNAPSHOT",
+      "specPath": "spec_postgres.json"
+    },
+    {
+      "id": "oracle",
+      "bytes": 36837471,
+      "sha256": "5e273f48ff9ee935881db3863bbbf165e91d86edb9aae3f929f1b835b13c3151",
+      "upstreamRevision": "2768502d588175b0d7f3c3ba1e3c097f27867857",
+      "pdkApiVersion": "2.0.9-SNAPSHOT",
+      "specPath": "spec_oracle.json"
+    },
+    {
+      "id": "sqlserver",
+      "bytes": 16232120,
+      "sha256": "3254471003dbb5cb6512610efae34bc35f4d4a77c8c02cfbf9fc883659a4c826",
+      "upstreamRevision": "2768502d588175b0d7f3c3ba1e3c097f27867857",
+      "pdkApiVersion": "2.0.9-SNAPSHOT",
+      "specPath": "mssql-spec.json"
+    },
+    {
+      "id": "mongodb-atlas",
+      "bytes": 19764088,
+      "sha256": "2f70bfe42baafcadb0c2d88042e173156c714f508d5089ce7eb8eab7edaa8e18",
+      "upstreamRevision": "cc13816bf624b4b8974bd4c3aa5a0ff34bce013d",
+      "pdkApiVersion": "2.0.5-SNAPSHOT",
+      "specPath": "atlas-spec.json"
+    },
+    {
+      "id": "aws-rds-mysql",
+      "bytes": 47043627,
+      "sha256": "c70999b64201fbcfbe7b34acf9f6fa1b1d8aa357b3db770bbcab980deed9b399",
+      "upstreamRevision": "cc13816bf624b4b8974bd4c3aa5a0ff34bce013d",
+      "pdkApiVersion": "2.0.5-SNAPSHOT",
+      "specPath": "aws-rds-mysql-spec.json"
+    }
+  ],
+  "licenseFiles": [
+    {
+      "name": "MICROSOFT-MIT-LICENSE.txt",
+      "bytes": 1036,
+      "sha256": "508a77d2e7b51d98adeed32648ad124b7b30241a8e70b2e72c99f92d8e5874d1"
+    },
+    {
+      "name": "ORACLE-FREE-USE-TERMS.txt",
+      "bytes": 5757,
+      "sha256": "9fbfd2ffce3ffef4e6a87912f416c8d8eeda7f344640121f4728544693b4418d"
+    }
+  ]
+}

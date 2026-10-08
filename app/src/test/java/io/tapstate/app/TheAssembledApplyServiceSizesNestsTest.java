@@ -113,7 +113,7 @@ class TheAssembledApplyServiceSizesNestsTest {
                 // behind it to answer at all. Named rather than defaulted, so an assembly that derives
                 // nothing says so.
                 SchemaDerivation.none(),
-                new LivePipelines(new InMemoryDesiredStore(), new InMemoryStateStore()), "on-prem");
+                new LivePipelines(new InMemoryDesiredStore(), new InMemoryStateStore()));
     }
 
     /** One customer table of {@code rows} rows, plus the two the tree also reads. */

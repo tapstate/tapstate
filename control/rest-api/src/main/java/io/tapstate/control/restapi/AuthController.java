@@ -3,15 +3,19 @@ package io.tapstate.control.restapi;
 import io.tapstate.control.core.BootstrapService;
 import io.tapstate.control.core.CallerOrigin;
 import io.tapstate.control.core.AccessTokenGrant;
+import io.tapstate.control.core.AuthenticationMode;
 import io.tapstate.control.core.ClusterIdentityService;
 import io.tapstate.control.core.ClusterIdentityView;
 import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.CreatedSession;
+import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.LoginService;
 import io.tapstate.control.core.Scope;
 import io.tapstate.control.core.SessionService;
 import io.tapstate.core.common.TapstateException;
 import jakarta.servlet.http.HttpServletRequest;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Controller;
@@ -44,20 +48,34 @@ class AuthController {
     private final SessionService sessionService;
     private final ClusterIdentityService clusterIdentityService;
     private final BootstrapService bootstrapService;
+    private final AuthenticationMode authenticationMode;
+    private final ObjectProvider<CloudAuthenticationService> cloudAuthentication;
 
     AuthController(
             LoginService loginService,
             SessionService sessionService,
             ClusterIdentityService clusterIdentityService,
-            BootstrapService bootstrapService) {
+            BootstrapService bootstrapService,
+            ObjectProvider<AuthenticationMode> authenticationModes) {
+        this(loginService, sessionService, clusterIdentityService, bootstrapService, authenticationModes, null);
+    }
+
+    @Autowired
+    AuthController(
+            LoginService loginService, SessionService sessionService, ClusterIdentityService clusterIdentityService,
+            BootstrapService bootstrapService, ObjectProvider<AuthenticationMode> authenticationModes,
+            ObjectProvider<CloudAuthenticationService> cloudAuthentication) {
         this.loginService = loginService;
         this.sessionService = sessionService;
         this.clusterIdentityService = clusterIdentityService;
         this.bootstrapService = bootstrapService;
+        this.authenticationMode = authenticationModes.getIfAvailable(() -> AuthenticationMode.ON_PREM);
+        this.cloudAuthentication = cloudAuthentication;
     }
 
     @PostMapping(AuthWire.LOGIN_PATH)
     ResponseEntity<LoginResponse> login(@RequestBody LoginRequest request) {
+        requireOnPremAuthentication();
         // A missing / blank credential field is a malformed request (a 400), distinct from a present-but-wrong
         // credential (the auth-failed 401 the service raises); refuse it here before the service's bare guard.
         MalformedRequest.requireText(request.username(), "a `username` is required");
@@ -80,6 +98,7 @@ class AuthController {
 
     @PostMapping(AuthWire.SESSION_PATH)
     ResponseEntity<SessionExchangeResponse> session(HttpServletRequest request) {
+        requireOnPremAuthentication();
         String token = requiredSessionCredential(request);
         ClusterIdentityView identity = clusterIdentityService.identityView();
         AccessTokenGrant grant = sessionService.exchange(token, identity.issuer())
@@ -91,6 +110,24 @@ class AuthController {
 
     @PostMapping(AuthWire.LOGOUT_PATH)
     ResponseEntity<Void> logout(HttpServletRequest request) {
+        if (authenticationMode == AuthenticationMode.CLOUD) {
+            CloudAuthenticationService cloud = cloudAuthentication == null
+                    ? null : cloudAuthentication.getIfAvailable();
+            if (cloud == null) {
+                throw CloudAuthenticationService.unavailable();
+            }
+            if (request.getHeaders(HttpHeaders.AUTHORIZATION).hasMoreElements()
+                    || !CloudSessionCookies.permitsCookieRequest(request)) {
+                throw unauthenticated();
+            }
+            String cookie = CloudSessionCookies.read(request).orElseThrow(AuthController::unauthenticated);
+            if (!cloud.logout(cookie)) {
+                throw unauthenticated();
+            }
+            return ResponseEntity.noContent().header(HttpHeaders.SET_COOKIE, CloudSessionCookies.clear())
+                    .header(HttpHeaders.CACHE_CONTROL, "no-store").build();
+        }
+        requireOnPremAuthentication();
         String token = requiredSessionCredential(request);
         String issuer = clusterIdentityService.identityView().issuer();
         if (!sessionService.logout(token, issuer)) {
@@ -101,6 +138,7 @@ class AuthController {
 
     @PostMapping("/auth/bootstrap")
     ResponseEntity<Void> bootstrap(@RequestBody BootstrapRequest request, HttpServletRequest http) {
+        requireOnPremAuthentication();
         // A missing / blank credential is refused as a coded 400 before the service builds the User — a blank
         // password would otherwise be hashed into a non-blank hash and silently create an empty-password admin.
         MalformedRequest.requireText(request.username(), "a `username` is required");
@@ -121,6 +159,13 @@ class AuthController {
 
     private static TapstateException unauthenticated() {
         return new TapstateException(ControlError.UNAUTHENTICATED, Map.of(), null);
+    }
+
+    private void requireOnPremAuthentication() {
+        if (authenticationMode != AuthenticationMode.ON_PREM) {
+            throw new TapstateException(ControlError.AUTH_MODE_UNAVAILABLE,
+                    Map.of("mode", authenticationMode.name().toLowerCase(java.util.Locale.ROOT)), null);
+        }
     }
 
     private static List<String> scopesFor(Scope grade) {

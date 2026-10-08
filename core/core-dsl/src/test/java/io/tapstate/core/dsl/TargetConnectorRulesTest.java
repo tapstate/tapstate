@@ -8,12 +8,15 @@ import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.model.Resource;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
-/** The target role is authorized by connector sink capability, narrowed to Atlas in cloud. */
+/** Target roles follow catalog capabilities on-prem and MongoDB/Atlas scope in cloud. */
 class TargetConnectorRulesTest {
 
     private static final TapstateCatalog CATALOG = TapstateCatalog.load();
@@ -79,9 +82,12 @@ class TargetConnectorRulesTest {
 
     private static void validate(boolean cloud, List<String> submitted, List<String> stored) {
         List<Resource> batch = parse(submitted.toArray(String[]::new));
-        List<Resource> known = new ArrayList<>(parse(stored.toArray(String[]::new)));
+        Set<String> submittedIds = batch.stream().map(Resource::id).collect(Collectors.toSet());
+        List<Resource> storedResources = parse(stored.toArray(String[]::new));
+        List<Resource> known = new ArrayList<>(
+                storedResources.stream().filter(resource -> !submittedIds.contains(resource.id())).toList());
         known.addAll(batch);
-        TargetConnectorRules.validate(batch, known, CATALOG, cloud);
+        TargetConnectorRules.validate(batch, known, storedResources, CATALOG, cloud);
     }
 
     @Test
@@ -99,7 +105,7 @@ class TargetConnectorRulesTest {
     }
 
     @Test
-    void cloudRefusesConnectorsOutsideTheAtlasCatalogEntry() {
+    void cloudRefusesConnectorsOutsideTheMongoDbAndAtlasCatalogEntries() {
         Throwable thrown = catchThrowable(() -> validate(true, READ_SOURCE,
                 target("private-sink", "acme-warehouse"), pipelineWritingTo("private-sink")));
         assertThat(thrown).isInstanceOf(DslException.class);
@@ -107,7 +113,8 @@ class TargetConnectorRulesTest {
     }
 
     static Stream<String> sinkConnectors() {
-        return CATALOG.all().stream().filter(entry -> entry.sink().capable()).map(entry -> entry.id());
+        return CATALOG.all().stream().filter(entry -> entry.sink().capable())
+                .map(entry -> entry.id()).filter(id -> !"aws-rds-mysql".equals(id));
     }
 
     @ParameterizedTest(name = "on-prem permits sink connector {0}")
@@ -129,13 +136,34 @@ class TargetConnectorRulesTest {
     }
 
     @Test
-    void cloudAcceptsAtlasAndRefusesOtherSinkConnectors() {
+    void cloudAcceptsMongoDbAndAtlasAndRefusesOtherSinkConnectors() {
+        assertThatCode(() -> validate(true, READ_SOURCE, target("mongo", "mongodb"),
+                pipelineWritingTo("mongo"))).doesNotThrowAnyException();
         assertThatCode(() -> validate(true, READ_SOURCE, target("atlas", "mongodb-atlas"),
                 pipelineWritingTo("atlas"))).doesNotThrowAnyException();
         Throwable thrown = catchThrowable(() -> validate(true, READ_SOURCE, target("pg", "postgres"),
                 pipelineWritingTo("pg")));
         assertThat(thrown).isInstanceOf(DslException.class);
         assertThat(((DslException) thrown).args()).containsEntry("connector", "postgres");
+    }
+
+    @Test
+    void db2IsReadButRefusedAsASyncTargetInEveryDeployment() {
+        // The connector's own jar can write; this release supports it as a source only, and that
+        // boundary has to hold on-prem too, where any sink-capable catalog connector is otherwise allowed.
+        String db2Source = READ_SOURCE.replace("connector: mysql", "connector: db2");
+        assertThatCode(() -> validate(false, db2Source, target("tgt_mg", "mongodb"),
+                pipelineWritingTo("tgt_mg"))).doesNotThrowAnyException();
+
+        for (boolean cloud : new boolean[] {false, true}) {
+            Throwable thrown = catchThrowable(() -> validate(cloud, READ_SOURCE, target("tgt_db2", "db2"),
+                    pipelineWritingTo("tgt_db2")));
+            assertThat(thrown).as("cloud=%s", cloud).isInstanceOf(DslException.class);
+            DslException error = (DslException) thrown;
+            assertThat(error.code()).isEqualTo(DslError.UNSUPPORTED_TARGET_CONNECTOR);
+            assertThat(error.path()).isEqualTo("serve.sync[0].source");
+            assertThat(error.args()).containsEntry("connector", "db2").containsEntry("source", "tgt_db2");
+        }
     }
 
     @Test
@@ -152,6 +180,69 @@ class TargetConnectorRulesTest {
         assertThatCode(() -> validate(false,
                 List.of(rotatedSource),
                 List.of(READ_SOURCE, target("tgt", "ai-chat"), pipelineWritingTo("tgt"))))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    void judgesAStoredPipelineWhenTheTargetItWritesToIsMovedOntoARefusedConnector() {
+        Throwable thrown = catchThrowable(() -> validate(false,
+                List.of(target("tgt", "db2")),
+                List.of(READ_SOURCE, target("tgt", "mongodb"), pipelineWritingTo("tgt"))));
+
+        assertThat(thrown).isInstanceOf(DslException.class);
+        DslException error = (DslException) thrown;
+        assertThat(error.code()).isEqualTo(DslError.UNSUPPORTED_TARGET_CONNECTOR);
+        assertThat(error.path()).isEqualTo("serve.sync[0].source");
+        assertThat(error.args()).containsEntry("connector", "db2").containsEntry("source", "tgt")
+                .containsEntry("resource", "p");
+    }
+
+    @Test
+    void judgesAStoredServeDefinitionWhenItsTargetIsMovedOntoARefusedConnector() {
+        Throwable thrown = catchThrowable(() -> validate(false,
+                List.of(target("tgt", "db2")),
+                List.of(READ_SOURCE, target("tgt", "mongodb"), definitionWritingTo("tgt"), DEFINITION_USING)));
+
+        assertThat(thrown).isInstanceOf(DslException.class);
+        DslException error = (DslException) thrown;
+        assertThat(error.path()).isEqualTo("sync[0].source");
+        assertThat(error.args()).containsEntry("connector", "db2").containsEntry("resource", "out");
+    }
+
+    @Test
+    void judgesANewSourceAStoredDefinitionAlreadyWritesTo() {
+        // A definition's sync targets are not existence-checked, so one can name a connection before it is filed.
+        Throwable thrown = catchThrowable(() -> validate(false,
+                List.of(target("tgt", "db2")), List.of(definitionWritingTo("tgt"))));
+
+        assertThat(thrown).isInstanceOf(DslException.class);
+        assertThat(((DslException) thrown).args()).containsEntry("connector", "db2").containsEntry("resource", "out");
+    }
+
+    @Test
+    void anEditThatKeepsATargetsConnectorIsNotJudgedAsATarget() {
+        // What an upgrade can inherit: a target on a connector this release no longer writes through.
+        // Rotating its password is not the edit that made it a target.
+        String rotated = target("tgt", "ai-chat") + "config: { password: rotated }\n";
+        assertThatCode(() -> validate(false,
+                List.of(rotated), List.of(READ_SOURCE, target("tgt", "ai-chat"), pipelineWritingTo("tgt"))))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    void judgesOnlyTheElementsWritingToTheSourceWhoseConnectorChanged() {
+        String writingToBoth = """
+                version: tapstate/v1
+                kind: pipeline
+                id: p
+                source: src_my
+                serve:
+                  from: orders
+                  sync: [ { id: old, source: tgt_old }, { id: s, source: tgt } ]
+                """;
+        assertThatCode(() -> validate(false,
+                List.of(target("tgt", "postgres")),
+                List.of(READ_SOURCE, target("tgt_old", "ai-chat"), target("tgt", "mongodb"), writingToBoth)))
                 .doesNotThrowAnyException();
     }
 

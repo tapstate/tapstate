@@ -64,6 +64,7 @@
          4.1.x rides Spring Framework 7 (Jakarta EE 11 / Jackson 3 default) and runs on JDK 21. -->
     <spring.boot.version>4.1.0</spring.boot.version>
     <spring-ai.version>2.0.0</spring-ai.version>
+    <cloud.sdk.version>0.1.1-f039a380-SNAPSHOT</cloud.sdk.version>
 
     <!-- All plugin versions pinned (enforced by requirePluginVersions) -->
     <plugin.assembly.version>3.7.1</plugin.assembly.version>
@@ -92,17 +93,20 @@
   </properties>
 
   <repositories>
-    <!-- The PDK contract (io.tapdata:*) is published only to the tapdata nexus as a SNAPSHOT, not to
-         Maven Central. This nexus is public and anonymously readable, so declaring it here lets CI and
-         a fresh clone resolve the PDK with no credentials and no local settings.xml. It is scoped to
-         snapshots only, so Maven Central remains the sole source for every release dependency and the
-         build does not route release traffic through the nexus; the nexus is consulted only for the
-         io.tapdata snapshot contract. The PDK runtime and the connectors are not reactor dependencies. -->
+    <!-- Tapdata's Nexus is anonymously readable and owns the PDK snapshot plus Tapstate Cloud SDK
+         artifacts. Snapshot and release traffic stay separated so a mutable build cannot satisfy a
+         release coordinate and Maven Central remains available for public third-party dependencies. -->
     <repository>
       <id>nexus-snapshots</id>
       <url>https://nexus.tapdata.net/repository/maven-snapshots/</url>
       <releases><enabled>false</enabled></releases>
       <snapshots><enabled>true</enabled></snapshots>
+    </repository>
+    <repository>
+      <id>nexus-releases</id>
+      <url>https://nexus.tapdata.net/repository/maven-releases/</url>
+      <releases><enabled>true</enabled></releases>
+      <snapshots><enabled>false</enabled></snapshots>
     </repository>
   </repositories>
 

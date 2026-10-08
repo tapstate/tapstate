@@ -1,6 +1,7 @@
 package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.ControlError;
+import io.tapstate.control.core.CloudAuthenticationObserver;
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.messages.MessageCatalog;
@@ -10,6 +11,9 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import jakarta.servlet.http.HttpServletRequest;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
 
 import java.util.Map;
 import java.util.TreeMap;
@@ -42,6 +46,7 @@ class ApiExceptionHandler {
 
     @ExceptionHandler(TapstateException.class)
     ResponseEntity<ApiError> handle(TapstateException e) {
+        markCloudError(e.code());
         MessageCatalog.Rendered rendered = catalog.render(e.code(), e.args());
         // Sorted so the params render identically regardless of throw-site order (a stable machine contract).
         ApiError body = new ApiError(e.code().code(), new TreeMap<>(e.args()), rendered.message());
@@ -64,9 +69,22 @@ class ApiExceptionHandler {
      */
     @ExceptionHandler(BadRequestCodedException.class)
     ResponseEntity<ApiError> handle(BadRequestCodedException e) {
+        markCloudError(e.code());
         MessageCatalog.Rendered rendered = catalog.render(e.code(), e.args());
         ApiError body = new ApiError(e.code().code(), new TreeMap<>(e.args()), rendered.message());
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).cacheControl(CacheControl.noStore()).body(body);
+    }
+
+    private static void markCloudError(TapstateErrorCode code) {
+        if (RequestContextHolder.getRequestAttributes() instanceof ServletRequestAttributes attributes) {
+            markCloudError(attributes.getRequest(), code);
+        }
+    }
+
+    static void markCloudError(HttpServletRequest request, TapstateErrorCode code) {
+        if (request != null && request.getAttribute(CloudAuthenticationObserver.REQUEST_ID_CONTEXT_KEY) != null) {
+            request.setAttribute(CloudAuthenticationObserver.ERROR_CODE_CONTEXT_KEY, code.code());
+        }
     }
 
     /**
@@ -82,6 +100,8 @@ class ApiExceptionHandler {
     static HttpStatus statusFor(TapstateErrorCode code) {
         return switch (code.code()) {
             case "control.auth-failed", "control.unauthenticated" -> HttpStatus.UNAUTHORIZED;
+            case "control.cloud-auth-unavailable" -> HttpStatus.SERVICE_UNAVAILABLE;
+            case "control.auth-mode-unavailable" -> HttpStatus.FORBIDDEN;
             case "control.forbidden", "control.bootstrap-forbidden" -> HttpStatus.FORBIDDEN;
             case "control.bootstrap-closed" -> HttpStatus.CONFLICT;
             case "source.id-mismatch" -> HttpStatus.BAD_REQUEST;

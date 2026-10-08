@@ -39,7 +39,9 @@ connector is loaded through the same plugin interface.
 
 ## Connector support boundary
 
-This preview certifies the following database kinds, with certification scoped by direction:
+This preview certifies the following database kinds, with certification scoped by direction.
+The certified `mongodb-atlas` managed id belongs to the MongoDB kind and is described below rather
+than being presented as another database kind:
 
 | Database | Connector kind | Certified use |
 |---|---|---|
@@ -49,19 +51,45 @@ This preview certifies the following database kinds, with certification scoped b
 | Oracle | `oracle` | Read |
 | SQL Server | `sqlserver` | Read |
 
-A `serve.sync` element in the cloud deployment profile installs only onto MongoDB Atlas.
-On-prem deployments may write to any catalog connector marked sink-capable; private connectors
-outside the catalog remain the operator's responsibility. This deployment allowance is not a
-certification claim: this preview certifies MongoDB write support only. Applying a cloud pipeline
-whose sync names another connector is refused; reading through it is unaffected.
+`aws-rds-mysql` is available as a source-only **unverified preview**, outside the certified table.
+Its shaded PDK JAR exposes batch and stream read functions, but no real Amazon RDS for MySQL
+snapshot, binlog CDC, or restart-continuation run has been completed. It is not a write target.
+Real-service validation is tracked in [issue #529](https://github.com/tapstate/tapstate/issues/529).
 
-Reads are verified on Oracle Free 23 and SQL Server 2022, and across the other
-kinds, with snapshot and CDC inserts, updates and deletes. Decimal validation includes a persisted MySQL DECIMAL(18,4) model, large values,
+A `serve.sync` element in cloud mode installs only onto `mongodb` or `mongodb-atlas`.
+On-prem deployments may write to catalog connectors marked sink-capable, except source-only ids
+such as `aws-rds-mysql`. Private connectors outside the catalog remain the operator's responsibility.
+This deployment allowance is not a certification claim: this preview certifies MongoDB write
+support only. Applying a cloud pipeline whose sync names another connector is refused; reading
+through it is unaffected.
+
+Db2 is accepted as a source-only **preview**, outside the certified table: no release lane
+reads a live Db2 database. Snapshot, change capture of inserts, updates and deletes, and
+continuation across a server restart were verified by hand against Db2 LUW 11.5.5 in both
+change-capture modes below.
+Db2 is supported as a source only. Its connector can write, but its catalog row is not
+sink-capable, so a `serve.sync` naming a `db2` connection is refused on-prem as well as in
+the cloud profile, and so is editing a connection that a `serve.sync` already writes to onto
+`connector: db2`. The CLI's pipeline and serve wizards can still offer a Db2 connection as a
+sync target; applying the result is what refuses it. Db2 LUW reads take a
+snapshot and then capture changes; the database needs archive logging, and each captured
+table `DATA CAPTURE CHANGES`. Change capture has two modes. With `useNativeMiner: true` the
+connector reads the log in-process through IBM's db2ReadLog API. That needs the server on
+Linux x86_64, running as root at least for the first Db2 connection, and the IBM Db2 runtime
+client prepared once on that host with `db2-native-runtime-setup.sh` from the same release:
+the published jar carries the native bridge but not the runtime archive it loads. The
+published server image runs as a non-root user and is not prepared for this mode. Without
+`useNativeMiner`, the connector reads changes from a raw log server at the configured
+`rawLogServerHost` and `rawLogServerPort`; that mode is experimental and not supported for
+production use, where the native mode is the one to run.
+
+Reads are verified on Oracle Free 23 and SQL Server 2022, and across MySQL, PostgreSQL
+and MongoDB, with snapshot and CDC inserts, updates and deletes. Decimal validation includes a persisted MySQL DECIMAL(18,4) model, large values,
 negative fractions and CDC updates. This is not an exhaustive cross-version or
-all-data-type matrix. The default accepted set contains 16 connector ids
-across these five database kinds, including existing managed variants of MySQL,
+all-data-type matrix. The default accepted set contains 17 connector ids: the Db2 preview,
+and 16 across these five database kinds, including existing managed variants of MySQL,
 PostgreSQL and MongoDB. Those managed variants have not been live-verified individually.
-Other managed variants of Oracle and SQL Server are outside the default accepted set.
+Other managed variants of Oracle, SQL Server and Db2 are outside the default accepted set.
 
 `tapstate.connectors.also-accept-ids` lets an operator accept additional connector ids
 on this server. Configuring it puts that server outside the supported configuration;
@@ -77,16 +105,27 @@ stored by an older build need schema rediscovery before automatic target creatio
 Missing or inconsistent decimal metadata is refused before writing; computed decimal
 outputs without a declared numeric domain cannot be auto-created safely.
 
-Oracle and SQL Server connector jars are published as separate assets on the floating
+Oracle, SQL Server and Db2 connector jars are published as separate assets on the floating
 `connectors-preview` release. They remain outside versioned Tapstate releases and are not
-downloaded by the three-database quickstart unless you explicitly run `register oracle` or
-`register sqlserver`. The Oracle jar bundles `ojdbc8`, `orai18n`, and `xdb` 21.5.0.0 under
+downloaded by the three-database quickstart unless you explicitly run `register oracle`,
+`register sqlserver` or `register db2`. The Oracle jar bundles `ojdbc8`, `orai18n`, and `xdb` 21.5.0.0 under
 the Oracle Free Use Terms; the SQL Server jar bundles Microsoft JDBC Driver 12.2.0 under
-the MIT License. Those dependency terms govern only the bundled drivers and do not change
-Tapstate's Apache-2.0 license. The Oracle and SQL Server implementations are paid connector
+the MIT License; the Db2 jar bundles IBM Data Server Driver for JDBC and SQLJ 4.25.13 under
+IBM's International Program License Agreement. Those dependency terms govern only the bundled drivers and do not change
+Tapstate's Apache-2.0 license. The Oracle, SQL Server and Db2 implementations are paid connector
 implementations; their use remains subject to the applicable Tapdata agreement. The upstream
 enterprise connector repository has no LICENSE file;
 publishing these binary assets does not relicense that source repository.
+
+The `mongodb-atlas` jar is a separate asset on the same floating release. It is not part of the
+three-database quickstart download; use `register mongodb-atlas` to install the verified bytes
+explicitly. The jar carries bundled third-party license and notice texts under `META-INF/`;
+publishing the binary does not grant a license to the upstream connector source repository.
+
+The `aws-rds-mysql` jar is also a separate, explicit-download asset on that release. Use
+`register aws-rds-mysql` only with the preview limitation above in mind; publishing and
+registering the JAR do not certify snapshot or CDC against a real Amazon RDS instance. It
+bundles MySQL Connector/J 8.0; see the in-JAR license manual and [`NOTICE`](../NOTICE).
 
 The Oracle Free 23 source example uses `autoLog: false`: the connector's automatic
 miner requests `CONTINUOUS_MINE`, which that database no longer supports. Keep
@@ -295,12 +334,13 @@ The jars are shaded and carry their own drivers on an isolated loader;
 `mysql-connector.jar` bundles Oracle MySQL Connector/J under GPL-2.0 with the Universal
 FOSS Exception (see [`NOTICE`](../NOTICE)).
 
-The same release carries Oracle and SQL Server for an explicit registration. From an
+The same release carries Oracle, SQL Server and Db2 for an explicit registration. From an
 authenticated CLI session, give `register` the published connector id instead of a local path:
 
 ```console
 tapstate(admin@127.0.0.1:8080)> register oracle
 tapstate(admin@127.0.0.1:8080)> register sqlserver
+tapstate(admin@127.0.0.1:8080)> register db2
 ```
 
 The CLI downloads `<id>-connector.jar` from `connectors-preview` and uploads the bytes to

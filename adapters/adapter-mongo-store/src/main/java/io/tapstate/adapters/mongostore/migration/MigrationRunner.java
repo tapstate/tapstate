@@ -1,5 +1,9 @@
 package io.tapstate.adapters.mongostore.migration;
 
+import com.mongodb.MongoCommandException;
+import com.mongodb.MongoException;
+import com.mongodb.MongoSecurityException;
+import com.mongodb.MongoWriteException;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.ChangeSet;
 import io.tapstate.adapters.mongostore.MigrationError;
@@ -54,7 +58,7 @@ public final class MigrationRunner {
                     new V4DiscardInventedPositions(), new V5SplitSourceSchemas(), new V6SplitDerivedSchemas(),
                     new V7RepairBlankPipelines(), new V8DiscardViewSchemaPolicies(),
                     new V9RateHistoryIndexes(), new V10SrsConsumerOffsetIndexes(),
-                    new V11RateHistoryKeysetIndex());
+                    new V11RateHistoryKeysetIndex(), new V12EncryptSourceConfigs());
 
     /**
      * The highest version this build knows. A store above it is one this build must not open: it was
@@ -263,6 +267,11 @@ public final class MigrationRunner {
         long startedAt = System.nanoTime();
         try {
             changeSet.up(database, fence);
+        } catch (MongoException driverFailure) {
+            // Driver messages, responses and causes can contain the values a migration touched.
+            // Preserve the failed step, but carry only a fixed type and numeric server code.
+            throw new TapstateException(MigrationError.CHANGESET_FAILED,
+                    Map.of("changeset", name, "cause", driverFailureDetail(driverFailure)), null);
         } catch (RuntimeException e) {
             // The recorded version stays at the changeset before this one, so the next start runs this
             // one again from the top -- which is why every changeset has to be re-runnable.
@@ -279,6 +288,22 @@ public final class MigrationRunner {
         }
         LOG.info("system data changeset {} (version {}) completed in {} ms",
                 name, changeSet.version(), (System.nanoTime() - startedAt) / 1_000_000L);
+    }
+
+    private static String driverFailureDetail(MongoException failure) {
+        int code = failure.getCode();
+        String type;
+        if (failure instanceof MongoWriteException write) {
+            type = "MongoWriteException";
+            code = write.getError().getCode();
+        } else if (failure instanceof MongoCommandException) {
+            type = "MongoCommandException";
+        } else if (failure instanceof MongoSecurityException) {
+            type = "MongoSecurityException";
+        } else {
+            type = "MongoException";
+        }
+        return code > 0 ? type + " code=" + code : type;
     }
 
     private static void sleep(Duration duration) {

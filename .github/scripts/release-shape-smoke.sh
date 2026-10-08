@@ -76,9 +76,9 @@ hasnt "the publish path retires no branches of its own" satellites 'unbranch'
 # does not need the approval, is the failure this file exists for. Checked over every job there is,
 # so a new one is covered without this list being edited.
 for j in $jobs_list; do
-  case "$j" in publish|satellites) continue ;; esac
+  case "$j" in publish|satellites|cloud-ghcr) continue ;; esac
   body="$(job "$j")"
-  if grep -qE 'imagetools create|docker push|push: true|draft=false|--latest=|make_latest|satellites[.]sh release|docs-release[.]sh settle' <<<"$body"; then
+  if grep -qE 'imagetools create|docker push|ghcr-publish[.]sh publish|push: true|draft=false|--latest=|make_latest|satellites[.]sh release|docs-release[.]sh settle' <<<"$body"; then
     bad "no irreversible act in '$j'" \
         "$(grep -E 'imagetools create|docker push|push: true|draft=false|--latest=|make_latest|satellites[.]sh release|docs-release[.]sh settle' <<<"$body" | head -1)"
   else
@@ -91,6 +91,92 @@ has   "the image is built into an archive"      server-image 'type=oci'
 has   "and explicitly not pushed"               server-image 'push: false'
 has   "and the archive is what gets pushed"     publish      'oci-layout://'
 hasnt "the image is not rebuilt after approval" publish      'build-push-action'
+
+# The two deployment profiles compile different Web authentication behavior. Both use the same
+# staging and Boot JAR path, but Cloud must never inherit the ordinary image's on-prem bundle.
+has   "the ordinary image builds through the attested producer" server-image 'build-web-assets[.]sh'
+has   "the ordinary image explicitly requests the on-prem profile" server-image '\-\-web-profile onprem'
+has   "Cloud builds its own Web-bearing Boot JAR"         cloud-server-jar 'name: cloud-server-boot-jar-sealed'
+has   "Cloud builds through the same attested producer" cloud-server-jar 'build-web-assets[.]sh'
+has   "Cloud explicitly requests the Cloud Web profile" cloud-server-jar '\-\-web-profile cloud'
+has   "the freeze records the immutable Web commit" version 'web_sha:.*steps[.]web-pin[.]outputs[.]sha'
+has   "OP consumes the frozen Web commit" server-image 'ref:.*needs[.]version[.]outputs[.]web_sha'
+has   "Cloud consumes that same frozen Web commit" cloud-server-jar 'ref:.*needs[.]version[.]outputs[.]web_sha'
+has   "Cloud staging consumes an explicit Console URL" cloud-server-jar '\-\-cloud-console-url'
+has   "Cloud retains the producer normalized Console URL" cloud-server-jar 'cloud_console_url:.*steps[.]web-provenance[.]outputs[.]cloud-console-url'
+has   "OP labels its independent Web profile" server-image 'TAPSTATE_WEB_PROFILE=onprem'
+has   "Cloud labels its independent Web profile" cloud-image 'TAPSTATE_WEB_PROFILE=cloud'
+has   "Cloud receives the producer Console URL without shell interpolation" cloud-image 'CLOUD_CONSOLE_URL:.*needs[.]cloud-server-jar[.]outputs[.]cloud_console_url'
+# shellcheck disable=SC2016
+has   "Cloud labels the producer Console URL" cloud-image 'TAPSTATE_WEB_CLOUD_CONSOLE_URL=\$CLOUD_CONSOLE_URL'
+has   "Cloud checks the producer Boot byte digest" cloud-image '\-\-boot-jar-sha256.*needs[.]cloud-server-jar[.]outputs[.]boot_jar_sha256'
+has   "OP provenance checks the producer Boot byte digest" draft '\-\-boot-jar-sha256.*needs[.]server-image[.]outputs[.]boot_jar_sha256'
+has   "Cloud compiles an explicit Console return URL"     cloud-server-jar 'VITE_CLOUD_CONSOLE_URL:'
+has   "Cloud reads release Web configuration from its environment" cloud-server-jar 'environment: cloud-ghcr-release'
+has   "Cloud waits for its profile-specific Boot JAR"     cloud-image 'needs:.*cloud-server-jar'
+has   "Cloud downloads that exact Boot JAR"               cloud-image 'name: cloud-server-boot-jar-sealed'
+has   "Cloud uses the checked-in connector lock"    cloud-image 'deploy/cloud/connectors.lock.json'
+has   "Cloud stages published connector bytes"      cloud-image 'stage-connectors[.]py'
+has   "Cloud builds its own OCI archive"             cloud-image 'type=oci'
+has   "Cloud verifies its Boot JAR and seed bytes"  cloud-image 'verify-image[.]py'
+has   "Cloud compares the server Boot JAR"           cloud-image '\-\-boot-jar'
+has   "Cloud checks Web files and revision"         cloud-image 'web-provenance[.]py create'
+has   "Cloud retains the checked archive"           cloud-image 'name: cloud-image-sealed'
+has   "a failed Cloud image blocks approval"         gates       'needs:.*cloud-image'
+hasnt "Cloud does not rebuild Web"                   cloud-image 'pnpm build|prepare-web-assets[.]sh|mvn .*package'
+has   "Cloud runtime proof waits for the paired OP image" cloud-image 'needs:.*server-image'
+has   "Cloud runtime proof downloads the already-built OP archive" cloud-image 'name: server-image'
+has   "the OP archive is verified before the paired runtime proof" cloud-image 'onprem-web-provenance-check[.]json'
+has   "paired OP proof checks its exact Boot byte digest" cloud-image '\-\-boot-jar-sha256.*needs[.]server-image[.]outputs[.]boot_jar_sha256'
+has   "the runtime importer selects an explicit native Linux architecture" cloud-image 'skopeo .*\-\-override-os linux .*\-\-override-arch'
+has   "the runtime importer consumes the checked OCI archive" cloud-image 'oci-archive:'
+has   "the runtime importer only creates a local Docker archive" cloud-image 'docker-archive:'
+# shellcheck disable=SC2016
+has   "the immutable loaded image is exported for exact config proof" cloud-image 'docker image save .*"\$image_id"'
+# shellcheck disable=SC2016
+has   "loaded raw config bytes match the selected original OCI configs" cloud-image 'test "\$loaded_config_digest" = "\$expected_config_digest"'
+has   "loaded rootfs diff IDs are checked" cloud-image 'json [.]RootFS[.]Layers'
+has   "the original publish archives remain unchanged" cloud-image 'sha256sum \-\-check .*runtime-image-archives[.]sha256'
+# shellcheck disable=SC2016
+has   "real container smoke receives immutable image IDs" cloud-image 'cloud-image-smoke[.]sh "\$\{images\[0\]\}" "\$\{images\[1\]\}"'
+hasnt "runtime proof cannot rebuild the checked image" cloud-image '(^|[[:space:]])\-\-build([[:space:]]|$)'
+hasnt "a failed runtime proof cannot be ignored" cloud-image 'continue-on-error:|cloud-image-smoke[.]sh.*\|\|'
+
+cloud_verify_at="$(job cloud-image | grep -n 'verify-image[.]py' | head -1 | cut -d: -f1)"
+onprem_verify_at="$(job cloud-image | grep -n 'onprem-web-provenance-check[.]json' | head -1 | cut -d: -f1)"
+cloud_runtime_at="$(job cloud-image | grep -n 'cloud-image-smoke[.]sh' | head -1 | cut -d: -f1)"
+cloud_seal_at="$(job cloud-image | grep -n 'seal-cloud-artifact[.]mjs seal' | head -1 | cut -d: -f1)"
+cloud_upload_at="$(job cloud-image | grep -n 'actions/upload-artifact' | head -1 | cut -d: -f1)"
+if [ -n "$cloud_verify_at" ] && [ -n "$onprem_verify_at" ] && [ -n "$cloud_runtime_at" ] \
+    && [ -n "$cloud_seal_at" ] && [ -n "$cloud_upload_at" ] \
+    && [ "$cloud_verify_at" -lt "$onprem_verify_at" ] \
+    && [ "$onprem_verify_at" -lt "$cloud_runtime_at" ] \
+    && [ "$cloud_runtime_at" -lt "$cloud_seal_at" ] \
+    && [ "$cloud_seal_at" -lt "$cloud_upload_at" ]; then
+  ok "static validation precedes real runtime proof, sealing and upload"
+else
+  bad "static validation precedes real runtime proof, sealing and upload" \
+    "Cloud verify ${cloud_verify_at:-none}, OP verify ${onprem_verify_at:-none}, runtime ${cloud_runtime_at:-none}, seal ${cloud_seal_at:-none}, upload ${cloud_upload_at:-none}"
+fi
+
+# Cloud publishes only through release, after the same approval as OP. Intermediate artifacts
+# must remain authenticated ciphertext even though this repository's Actions runs are public.
+has   "Cloud GHCR waits until satellite publication is complete" cloud-ghcr 'needs:.*satellites'
+has   "Cloud GHCR consumes the checked sealed archive" cloud-ghcr 'name: cloud-image-sealed'
+has   "Cloud GHCR uses the production environment" cloud-ghcr 'environment: cloud-ghcr-release'
+has   "Cloud GHCR uses the checked digest publisher" cloud-ghcr 'ghcr-publish[.]sh publish'
+has   "Cloud and OP use the same release version" cloud-ghcr 'needs[.]version[.]outputs[.]version'
+has   "Cloud GHCR publishes the verified archive digest" cloud-ghcr 'needs[.]cloud-image[.]outputs[.]digest'
+hasnt "Cloud never rebuilds the approved image" cloud-ghcr 'buildx build|build-push-action'
+hasnt "Cloud never downloads connector bytes again" cloud-ghcr 'stage-connectors|release download'
+has   "cleanup waits for final Cloud publication" cleanup 'needs:.*cloud-ghcr'
+has   "Cloud Boot JAR is sealed before public artifact storage" cloud-server-jar 'seal-cloud-artifact[.]mjs seal'
+has   "Cloud OCI is sealed before public artifact storage" cloud-image 'seal-cloud-artifact[.]mjs seal'
+has   "Cloud Boot JAR opens only with its producing attempt context" cloud-image 'needs[.]cloud-server-jar[.]outputs[.]sealed_context'
+has   "Cloud OCI opens only with its producing attempt context" cloud-ghcr 'needs[.]cloud-image[.]outputs[.]sealed_context'
+hasnt "the public artifact path cannot contain a plaintext Boot JAR" cloud-server-jar 'path: app/target/app-.*boot[.]jar'
+hasnt "the public artifact path cannot contain a plaintext Cloud OCI" cloud-image 'path:.*cloud-image[.]tar'
+hasnt "Cloud GHCR never receives AWS credentials" cloud-ghcr 'AWS_|ECR_|configure-aws-credentials'
 
 # C6. The publish step edits the existing release; it never re-sends a body. Re-running the action
 # that assembled the draft would overwrite whatever the approver wrote, and nothing would say so.
@@ -264,7 +350,7 @@ has "the performance lane is judged by the same reader as every other check" \
 # from a correct one on every dispatch from `main`: same tree, same artifacts, same green run. It
 # diverges only on the case the input exists for, and there it builds the wrong line's code under the
 # right line's version number and publishes it -- with nothing red anywhere.
-for j in cli-native server-image connectors join-perf gates draft publish; do
+for j in cli-native server-image cloud-server-jar cloud-image connectors join-perf gates draft publish; do
   has "$j builds the commit the version job resolved" "$j" 'ref: \$\{\{ needs\.version\.outputs\.sha \}\}'
 done
 # And the release that comes out says so, which is the half a reader can check afterwards.

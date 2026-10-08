@@ -144,8 +144,8 @@ class ApplyServiceTargetConnectorTest {
     }
 
     @Test
-    @DisplayName("cloud deployments narrow the sink catalog to MongoDB Atlas")
-    void cloudOnlyAllowsAtlasTargets() {
+    @DisplayName("cloud deployments permit MongoDB and Atlas targets but refuse relational sinks")
+    void cloudAllowsMongoDbAndAtlasTargets() {
         ApplyService cloud = new ApplyService(
                 TapstateCatalog::load, new InMemoryArtifactStore(),
                 new AuditGate(record -> { }, FIXED_CLOCK), new InMemorySchemaStore(),
@@ -158,6 +158,9 @@ class ApplyServiceTargetConnectorTest {
 
         assertThatCode(() -> cloud.apply("tester", batch("tgt_atlas",
                 target("tgt_atlas", "mongodb-atlas", "{ uri: \"mongodb://10.30.0.11:27017/ods\" }"))))
+                .doesNotThrowAnyException();
+        assertThatCode(() -> cloud.apply("tester", batch("tgt_mongo",
+                target("tgt_mongo", "mongodb", "{ uri: \"mongodb://10.30.0.12:27017/ods\" }"))))
                 .doesNotThrowAnyException();
     }
 
@@ -192,6 +195,35 @@ class ApplyServiceTargetConnectorTest {
                         new ArtifactDraft("orders_out.tap.yml", PIPELINE_USING_THE_DEFINITION))))
                 .doesNotThrowAnyException();
         assertThat(artifacts.get("orders_out")).isPresent();
+    }
+
+    @Test
+    @DisplayName("moving a stored pipeline's target onto a refused connector is refused, typed or in a batch")
+    void movingAStoredTargetOntoARefusedConnectorIsRefused() {
+        // A pipeline accepted onto a MongoDB target, whose connection is then edited to Db2: the pipeline
+        // is not resubmitted, and without judging it here the next run would write through Db2.
+        DslParser parser = new DslParser();
+        String mongoTarget = target("tgt_out", "mongodb", "{ uri: \"mongodb://10.30.0.11:27017/ods\" }");
+        String db2Target = target("tgt_out", "db2", "{ host: 10.30.0.9, port: 50000, database: SAMPLE, schema: APP }");
+        artifacts.landDirectly(parser.parse(READ_SOURCE));
+        artifacts.landDirectly(parser.parse(mongoTarget));
+        artifacts.landDirectly(parser.parse(pipelineWritingTo("tgt_out")));
+        Resource stored = artifacts.get("tgt_out").orElseThrow();
+
+        DslException typed = catchThrowableOfType(DslException.class, () -> service.replace("tester",
+                parser.parse(db2Target), CanonicalHash.of(stored)));
+        DslException batched = catchThrowableOfType(DslException.class, () -> service.apply("tester",
+                List.of(new ArtifactDraft("tgt_out.tap.yml", db2Target))));
+
+        assertThat(typed).as("the typed replace").isNotNull();
+        assertThat(batched).as("the batch apply").isNotNull();
+        for (DslException refused : List.of(typed, batched)) {
+            assertThat(refused.code()).isEqualTo(DslError.UNSUPPORTED_TARGET_CONNECTOR);
+            assertThat(refused.args()).containsEntry("connector", "db2").containsEntry("source", "tgt_out")
+                    .containsEntry("resource", "orders_out");
+        }
+        assertThat(artifacts.get("tgt_out")).contains(stored);
+        assertThat(artifacts.saved).isEmpty();
     }
 
     @Test

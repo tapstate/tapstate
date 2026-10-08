@@ -51,8 +51,9 @@ public final class ControlOperations {
     // compute for itself; without this read on the same face, that verb is callable and unusable.
     public static final Operation ARTIFACT_GET = mcp(
             "artifact.get", Scope.READ, false,
-            "Read one applied resource of any kind by id, as its canonical tapstate/v1 YAML plus the "
-                    + "content hash of those exact bytes. Pass that hash back as the expectedContentHash "
+            "Read one applied resource of any kind by id, as canonical tapstate/v1 YAML plus its stored "
+                    + "resource content hash. Source config is omitted; its hash belongs to the complete stored "
+                    + "resource, not the displayed YAML. Pass the returned hash back as expectedContentHash "
                     + "of a removal, or as a per-resource precondition when applying an edit.");
     public static final Operation ARTIFACT_LIST = new Operation("artifact.list", Scope.READ, false, null, CLI_ONLY);
     // The removal verb, one path for every kind. It destroys a named resource for good, which no other
@@ -83,6 +84,10 @@ public final class ControlOperations {
     public static final Operation SOURCE_GET = new Operation(
             "source.get", Scope.READ, false, ControlApiSchema.ref("source.get"),
             "Get one Source with secret-redacted config and configured-secret field names.", CLI_ONLY);
+    public static final Operation SOURCE_REVEAL_CONFIG = new Operation(
+            "source.reveal-config", Scope.ADMIN, true, ControlApiSchema.ref("source.reveal-config"),
+            "Reserved single-Source plaintext config flow. This release has no successful production "
+                    + "authorizer and exposes it on no CLI, MCP, or Web face.", Map.of());
     public static final Operation SOURCE_SCHEMA = new Operation(
             "source.schema", Scope.READ, false, null,
             "Read a Source's latest discovered schema, limited to the tables that Source declares.", CLI_ONLY);
@@ -178,6 +183,10 @@ public final class ControlOperations {
     // like every other verb) rather than an anonymous endpoint — only the process-liveness probe stays
     // outside the registry. Reading topology mutates nothing, so it is read-scoped and unaudited.
     public static final Operation CLUSTER_MEMBERS = new Operation("cluster.members", Scope.READ, false, null, CLI_ONLY);
+    public static final Operation CLUSTER_CONTEXT = new Operation(
+            "cluster.context", Scope.READ, false, null,
+            "Read the organization and Cluster display context bound to the authenticated Cloud session.",
+            Map.of(Frontend.REST, Maturity.CURRENT));
 
     // pipeline domain: static projection reads, conditional definition replacement, and the four lifecycle
     // verbs. Definition replacement is audited as an artifact write; each lifecycle verb writes the
@@ -318,7 +327,12 @@ public final class ControlOperations {
     public static final Operation PIPELINE_ACCEPT_DERIVED_SCHEMA = new Operation(
             "pipeline.accept-derived-schema", Scope.WRITE, true, null, CLI_ONLY);
 
-    // security domain: all admin-scoped. The mutating ones are audited; the list queries are not.
+    // The HTTP face projects the CLI-staged inventory; the current user read stays off MCP.
+    public static final Operation AUTH_CURRENT_USER = new Operation(
+            "auth.current-user", Scope.READ, false, null,
+            "Read the current verified user's identity and granted scopes without credentials or profile data.",
+            CLI_ONLY);
+    // Administration remains admin-scoped. The mutating operations are audited; list queries are not.
     public static final Operation USER_CREATE = new Operation("user.create", Scope.ADMIN, true, null, CLI_ONLY);
     public static final Operation USER_PASSWD = new Operation("user.passwd", Scope.ADMIN, true, null, CLI_ONLY);
     public static final Operation USER_LIST = new Operation("user.list", Scope.ADMIN, false, null, CLI_ONLY);
@@ -337,6 +351,7 @@ public final class ControlOperations {
             SOURCE_DRAFT,
             SOURCE_LIST,
             SOURCE_GET,
+            SOURCE_REVEAL_CONFIG,
             SOURCE_SCHEMA,
             SOURCE_UPDATE,
             SOURCE_DELETE,
@@ -355,6 +370,7 @@ public final class ControlOperations {
             DATA_BROWSER_FIND,
             DATA_BROWSER_STATS,
             CLUSTER_MEMBERS,
+            CLUSTER_CONTEXT,
             PIPELINE_LIST,
             PIPELINE_CATALOG,
             VIEW_LIST,
@@ -385,6 +401,7 @@ public final class ControlOperations {
             PIPELINE_SET_POSITION,
             PIPELINE_DERIVED_SCHEMA,
             PIPELINE_ACCEPT_DERIVED_SCHEMA,
+            AUTH_CURRENT_USER,
             USER_CREATE,
             USER_PASSWD,
             USER_LIST,

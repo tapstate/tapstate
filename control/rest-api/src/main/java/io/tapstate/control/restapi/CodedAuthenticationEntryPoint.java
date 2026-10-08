@@ -20,6 +20,6 @@ final class CodedAuthenticationEntryPoint implements AuthenticationEntryPoint {
     @Override
     public void commence(HttpServletRequest request, HttpServletResponse response,
             AuthenticationException authenticationException) throws IOException {
-        errors.unauthenticated(response);
+        errors.unauthenticated(request, response);
     }
 }
