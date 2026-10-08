@@ -17,6 +17,25 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /** The same frozen workload definitions are consumed by both application jars. */
 class BenchmarkWorkloadDefinitionsTest {
+    @Test void copySettlingUsesOnlyTheUnmeasuredFirstQuarterAndRestoresTheExactMeasuredStart() {
+        var pilot = BenchmarkWorkloadDefinitions.cdcSettlingCalibration("copy");
+        assertThat(pilot.phase("cdc-settling-raised").measured()).isFalse();
+        assertThat(pilot.phase("cdc-settling-restored").measured()).isFalse();
+        assertThat(pilot.phase("cdc-settling-restored").targets()).isEqualTo(pilot.phase("warm-up").targets());
+        assertThat(pilot.phase("cdc-settling-raised").targets()).isNotEqualTo(pilot.phase("warm-up").targets());
+        assertThat(pilot.phase("cdc-settling-raised").sql()).hasSize(240).allSatisfy(sql ->
+                assertThat(sql).contains("amount = amount + 1").contains("id NOT IN"));
+        assertThat(pilot.phase("cdc-settling-restored").sql()).hasSize(240).allSatisfy(sql ->
+                assertThat(sql).contains("amount = amount - 1").contains("id NOT IN"));
+        assertThat(pilot.phase("cdc-update").batches()).hasSize(960);
+        assertThat(pilot.phase("cdc-update").expectedLogicalOutputChanges()).isEqualTo(96_000);
+        assertThat(pilot.phase("cdc-update").batchInterval()).isEqualTo(Duration.ofMillis(1));
+        assertThat(pilot.inFixedCohort("24000")).isFalse();
+        assertThat(pilot.inFixedCohort("24001")).isTrue();
+        assertThat(BenchmarkWorkloadDefinitions.byId("copy").phases()).hasSize(4);
+        assertThat(BenchmarkWorkloadDefinitions.steadyPilot("copy").phases()).hasSize(4);
+        assertThat(pilot.phase("cdc-update")).isEqualTo(BenchmarkWorkloadDefinitions.steadyPilot("copy").phase("cdc-update"));
+    }
     @Test
     void fixedPacingCalibrationChangesOnlyThePredeclaredMeasuredBatchSchedule() {
         for (String id : List.of("copy", "stateless", "stateful")) {

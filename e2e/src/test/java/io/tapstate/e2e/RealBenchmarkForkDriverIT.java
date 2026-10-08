@@ -61,15 +61,21 @@ class RealBenchmarkForkDriverIT {
             assertThat(forkNumber).as("the diagnostic fork number").isBetween(1, 5);
             boolean pilot = Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot");
             boolean pacedCalibration = Boolean.getBoolean("tapstate.e2e.benchmark-smoke.paced-calibration");
+            boolean settlingCalibration = Boolean.getBoolean("tapstate.e2e.benchmark-smoke.cdc-settling-calibration");
             if (pacedCalibration && !pilot) { throw new AssertionError("paced calibration requires the declared larger profile"); }
-            var workload = pacedCalibration ? BenchmarkWorkloadDefinitions.pacedCalibration(workloadId)
+            if (settlingCalibration && (!pilot || pacedCalibration)) {
+                throw new AssertionError("settling calibration requires the original larger schedule and cannot mix calibrations");
+            }
+            var workload = settlingCalibration ? BenchmarkWorkloadDefinitions.cdcSettlingCalibration(workloadId)
+                    : pacedCalibration ? BenchmarkWorkloadDefinitions.pacedCalibration(workloadId)
                     : pilot ? BenchmarkWorkloadDefinitions.steadyPilot(workloadId)
                     : BenchmarkWorkloadDefinitions.byId(workloadId);
             PipelineBenchmarkHarness.ForkResult result = driver.run(
                     workload, arm,
                     forkNumber, applicationJar);
             System.out.println("benchmark-source-schedule=" + JsonWriter.write(Map.of(
-                    "profile", pacedCalibration ? "FIXED_PACING_CALIBRATION_5MS_50MS" : "ORIGINAL_BATCH_SCHEDULE",
+                    "profile", settlingCalibration ? "FIXED_FIRST_QUARTER_CDC_SETTLING_CALIBRATION"
+                            : pacedCalibration ? "FIXED_PACING_CALIBRATION_5MS_50MS" : "ORIGINAL_BATCH_SCHEDULE",
                     "rows", workload.rows(), "phases", workload.phases().stream().filter(
                             BenchmarkWorkloadDefinitions.Phase::measured).map(phase -> Map.of(
                                     "id", phase.id(), "batchIntervalMillis", phase.batchInterval().toMillis(),
