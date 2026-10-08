@@ -8,7 +8,8 @@ import io.tapstate.core.model.SourceMode;
 /**
  * Merges a connector's structural facts ({@link NormalizedSpec}) with its derived capability bitmap
  * into a {@link ConnectorCatalogEntry}: resolves modes (overlay, then upstream declaration, then
- * derived defaults), sink capability and write semantics (overlay, then derived), the refined group, the discovery axis and the push-out flag,
+ * derived defaults), sink capability and write semantics (overlay, then derived, then withdrawn for a
+ * source-only connector), the refined group, the discovery axis and the push-out flag,
  * then stamps provenance. This is the shared merge — the same rules the runtime server-register path
  * will reuse — so it lives in the core ring and depends on no build tooling.
  */
@@ -48,6 +49,12 @@ public final class CatalogEntryAssembler {
                 capabilities.contains(DerivedCapability.WRITE_RECORD),
                 spec.dmlInsertAlternatives(),
                 spec.hasDmlUpdatePolicy());
+        // Last, and over a declaration too: a connector this release supports as a source only is not
+        // a target, whatever its jar can write. Applied here because both callers come through here,
+        // so the bundled row and the row a registration derives cannot disagree about it.
+        if (OfficialConnectors.isSourceOnly(spec.id())) {
+            sink = new SinkCapability(false, List.of());
+        }
 
         ConnectorGroup group = GroupRules.refine(spec.tagGroup(), modeResolution.modes(), spec.id());
         Discovery discovery = DiscoveryRules.fromGroup(group);
