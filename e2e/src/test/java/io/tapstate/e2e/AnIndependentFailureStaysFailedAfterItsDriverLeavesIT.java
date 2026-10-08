@@ -1,7 +1,9 @@
 package io.tapstate.e2e;
 
+import io.tapstate.adapters.pdk.ConnectorError;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.runtime.engine.EngineError;
 import io.tapstate.testsupport.DockerGate;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -47,12 +49,12 @@ class AnIndependentFailureStaysFailedAfterItsDriverLeavesIT {
                 control.apply(resources(source, target));
                 control.lifecycle(PIPELINE, LifecycleVerb.START);
 
-                Await.until("the sink's own failure to be recorded", Duration.ofMinutes(1),
-                        () -> control.state(PIPELINE).filter(PipelineState.FAILED::equals).isPresent(),
-                        () -> "state = " + control.state(PIPELINE));
+                String failureCode = Await.answered("the sink's FAILED status and coded cause to be published",
+                        Duration.ofMinutes(1),
+                        () -> control.failureCodeInState(PIPELINE, PipelineState.FAILED));
                 // Status can report the coded sink failure or its Jet wrapper. The member log
                 // identifies the sink failure; the handover assertions below guard the behavior.
-                assertThat(control.failureCode(PIPELINE)).isPresent();
+                assertThat(failureCode).isIn(ConnectorError.WRITE_FAILED.code(), EngineError.JOB_FAILED.code());
                 String driver = control.pipelineControllerOf(PIPELINE).orElseThrow();
                 assertThat(Files.readString(cluster.processCarrying(driver).output()))
                         .contains("connector.write-failed");

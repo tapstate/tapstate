@@ -1352,6 +1352,26 @@ final class ControlPlane {
         return interpretFailureCode(response.statusCode(), response.body(), pipelineId);
     }
 
+    /** Reads a state and its coded cause in one published status, rather than two moving reads. */
+    Optional<String> failureCodeInState(String pipelineId, PipelineState requiredState) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/status"));
+        return interpretFailureCodeInState(response.statusCode(), response.body(), pipelineId, requiredState);
+    }
+
+    static Optional<String> interpretFailureCodeInState(
+            int status, String body, String pipelineId, PipelineState requiredState) {
+        Optional<PipelineState> state = interpretState(status, body, pipelineId);
+        if (state.isEmpty()) {
+            return Optional.empty();
+        }
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> answer)
+                || !pipelineId.equals(answer.get("pipelineId"))) {
+            throw new AssertionError("status answered for another pipeline: " + body);
+        }
+        Optional<String> code = interpretFailureCode(status, body, pipelineId);
+        return state.filter(requiredState::equals).isPresent() ? code : Optional.empty();
+    }
+
     /**
      * What a status answer is allowed to say about a failure, read the way the two above are: only the
      * product's own {@code monitor.no-observation} code reads as "nothing published yet", every other refusal

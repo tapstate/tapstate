@@ -36,6 +36,36 @@ class ControlPlaneTest {
                 .isEmpty();
     }
 
+    @Test
+    void waitsForTheFailedStateAndItsCauseInTheSameStatus() {
+        String code = LifecycleError.UNKNOWN_PIPELINE.code();
+        assertThat(ControlPlane.interpretFailureCodeInState(200, status("FAILED"), PIPELINE,
+                PipelineState.FAILED)).isEmpty();
+        String pending = JsonWriter.write(Map.of("pipelineId", PIPELINE, "state", "RUNNING",
+                "failure", Map.of("code", code)));
+        assertThat(ControlPlane.interpretFailureCodeInState(200, pending, PIPELINE,
+                PipelineState.FAILED)).isEmpty();
+        String failed = JsonWriter.write(Map.of("pipelineId", PIPELINE, "state", "FAILED",
+                "failure", Map.of("code", code)));
+        assertThat(ControlPlane.interpretFailureCodeInState(200, failed, PIPELINE,
+                PipelineState.FAILED)).contains(code);
+    }
+
+    @Test
+    void aCombinedFailureReadKeepsRefusalsAndMalformedAnswersLoud() {
+        assertThat(ControlPlane.interpretFailureCodeInState(404, coded(MonitorError.NO_OBSERVATION.code()),
+                PIPELINE, PipelineState.FAILED)).isEmpty();
+        assertThatThrownBy(() -> ControlPlane.interpretFailureCodeInState(500, "boom", PIPELINE,
+                PipelineState.FAILED)).isInstanceOf(AssertionError.class).hasMessageContaining("got 500");
+        String other = JsonWriter.write(Map.of("pipelineId", "other", "state", "FAILED"));
+        assertThatThrownBy(() -> ControlPlane.interpretFailureCodeInState(200, other, PIPELINE,
+                PipelineState.FAILED)).isInstanceOf(AssertionError.class).hasMessageContaining("another pipeline");
+        String missingCode = JsonWriter.write(Map.of("pipelineId", PIPELINE, "state", "FAILED",
+                "failure", Map.of("message", "failed")));
+        assertThatThrownBy(() -> ControlPlane.interpretFailureCodeInState(200, missingCode, PIPELINE,
+                PipelineState.FAILED)).isInstanceOf(AssertionError.class).hasMessageContaining("no code");
+    }
+
     /**
      * The rule is written on the code and not on the status, so a 404 that means something else stays loud.
      * The status read serves only this one code today, so no live server can produce the answer below - the
