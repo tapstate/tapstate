@@ -18,6 +18,7 @@ import java.net.http.HttpResponse;
 import java.net.http.WebSocket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
@@ -84,6 +85,7 @@ final class ControlPlane {
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(TIMEOUT).build();
 
     private String credential;
+    private boolean cloudCookie;
 
     ControlPlane(URI baseUrl) {
         this.baseUrl = baseUrl;
@@ -149,6 +151,43 @@ final class ControlPlane {
             throw new AssertionError("login returned no token: " + login.body());
         }
         credential = token;
+        cloudCookie = false;
+    }
+
+    /** Redeems one code once; the real SDK and server create the local session. */
+    String exchangeCloudCode(String code) {
+        HttpResponse<String> response = send(get("/auth/exchange?code=" + urlSegment(code)));
+        expect(response, 302, "redeem the Cloud handoff");
+        String header = response.headers().firstValue("Set-Cookie")
+                .orElseThrow(() -> new AssertionError("the handoff returned no session cookie"));
+        List<String> attributes = java.util.Arrays.stream(header.split(";")).skip(1).map(String::strip).toList();
+        if (attributes.stream().noneMatch("HttpOnly"::equalsIgnoreCase)
+                || attributes.stream().noneMatch("Secure"::equalsIgnoreCase)) {
+            throw new AssertionError("the handoff returned an unprotected session cookie");
+        }
+        useCloudSessionCookie(header.substring(0, header.indexOf(';')));
+        return credential;
+    }
+
+    /** Reuses the persisted Cloud session after a server restart without redeeming another code. */
+    void useCloudSessionCookie(String cookie) {
+        if (cookie == null || cookie.isBlank()) throw new IllegalArgumentException("a session cookie is required");
+        credential = cookie;
+        cloudCookie = true;
+    }
+
+    /** A fresh timestamp rules out a retained observation from the process that was replaced. */
+    Optional<Instant> observedAt(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + urlSegment(pipelineId) + "/status"));
+        if (response.statusCode() == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(response.body()))) {
+            return Optional.empty();
+        }
+        expect(response, 200, "read the observation time of " + pipelineId);
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> answer)
+                || !(answer.get("observedAt") instanceof String time)) {
+            throw new AssertionError("the pipeline status returned no observation time");
+        }
+        return Optional.of(Instant.parse(time));
     }
 
     /**
@@ -566,12 +605,10 @@ final class ControlPlane {
         expect(current, 200, "read the source " + sourceId + " before deleting it");
         String tag = current.headers().firstValue("ETag")
                 .orElseThrow(() -> new AssertionError("the source " + sourceId + " came back with no ETag"));
-        HttpRequest request = HttpRequest.newBuilder(baseUrl.resolve("/api/sources/" + sourceId))
+        HttpRequest request = authenticate(HttpRequest.newBuilder(baseUrl.resolve("/api/sources/" + sourceId))
                 .timeout(TIMEOUT)
-                .header("Authorization", "Bearer " + requireCredential())
                 .header("If-Match", tag)
-                .DELETE()
-                .build();
+                .DELETE()).build();
         HttpResponse<String> response = send(request);
         if (response.statusCode() != 204 && response.statusCode() != 200) {
             throw new AssertionError("could not delete the source " + sourceId + ": HTTP "
@@ -886,6 +923,9 @@ final class ControlPlane {
      * behind counts against the host's ceiling for the rest of the JVM.
      */
     Follow follow(String sourceId, String collection, Map<String, Object> filter) {
+        if (cloudCookie) {
+            throw new IllegalStateException("this WebSocket harness supports only on-prem Bearer authentication");
+        }
         String path = "/api/data-browser/" + sourceId + "/" + collection + "/tail";
         String query = filter == null
                 ? ""
@@ -1785,10 +1825,9 @@ final class ControlPlane {
      * refusal of a removal that carried no precondition in the first place.
      */
     private HttpRequest authedDelete(String id, String expectedContentHash) {
-        HttpRequest.Builder builder = HttpRequest.newBuilder(baseUrl.resolve("/api/artifacts/" + urlSegment(id)))
+        HttpRequest.Builder builder = authenticate(HttpRequest.newBuilder(baseUrl.resolve("/api/artifacts/" + urlSegment(id)))
                 .timeout(TIMEOUT)
-                .header("Authorization", "Bearer " + requireCredential())
-                .DELETE();
+                .DELETE());
         if (expectedContentHash != null) {
             builder.header("If-Match", "\"" + expectedContentHash + "\"");
         }
@@ -1796,11 +1835,9 @@ final class ControlPlane {
     }
 
     private HttpRequest authedGet(String path) {
-        return HttpRequest.newBuilder(baseUrl.resolve(path))
+        return authenticate(HttpRequest.newBuilder(baseUrl.resolve(path))
                 .timeout(TIMEOUT)
-                .header("Authorization", "Bearer " + requireCredential())
-                .GET()
-                .build();
+                .GET()).build();
     }
 
     private HttpRequest post(String path, String body) {
@@ -1813,12 +1850,10 @@ final class ControlPlane {
 
     /** The same request as a replacement rather than a submission, for the one face that takes a PUT. */
     private HttpRequest authedPut(String path, String body) {
-        return HttpRequest.newBuilder(baseUrl.resolve(path))
+        return authenticate(HttpRequest.newBuilder(baseUrl.resolve(path))
                 .timeout(TIMEOUT)
                 .header("Content-Type", "application/json")
-                .header("Authorization", "Bearer " + requireCredential())
-                .PUT(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
-                .build();
+                .PUT(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))).build();
     }
 
     private HttpRequest authed(String path, String body) {
@@ -1827,12 +1862,28 @@ final class ControlPlane {
 
     /** The same request with a bound of the caller's own, for a body large enough to need one. */
     private HttpRequest authed(String path, String body, Duration timeout) {
-        return HttpRequest.newBuilder(baseUrl.resolve(path))
+        return authenticate(HttpRequest.newBuilder(baseUrl.resolve(path))
                 .timeout(timeout)
                 .header("Content-Type", "application/json")
-                .header("Authorization", "Bearer " + requireCredential())
-                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
-                .build();
+                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))).build();
+    }
+
+    private HttpRequest.Builder authenticate(HttpRequest.Builder request) {
+        return cloudCookie
+                ? request.header("Cookie", requireCredential()).header("Origin", baseUrl.toString())
+                : request.header("Authorization", "Bearer " + requireCredential());
+    }
+
+    /** The typed Source wire, including its caller-visible ETag precondition. */
+    HttpResponse<String> sourceRequest(String method, String path, Map<String, ?> body, String etag, int status) {
+        HttpRequest.Builder request = authenticate(HttpRequest.newBuilder(baseUrl.resolve(path)).timeout(TIMEOUT))
+                .header("Content-Type", "application/json");
+        if (etag != null) request.header("If-Match", etag);
+        request.method(method, body == null ? HttpRequest.BodyPublishers.noBody()
+                : HttpRequest.BodyPublishers.ofString(JsonWriter.write(body), StandardCharsets.UTF_8));
+        HttpResponse<String> response = send(request.build());
+        expect(response, status, method + " " + path);
+        return response;
     }
 
     /**

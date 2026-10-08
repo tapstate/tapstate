@@ -600,6 +600,39 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     }
 
     @Override
+    public ConnectionSettingsOutcome connectionSettings(URI baseUrl, String credential, String id) {
+        try {
+            HttpRequest request = authed(baseUrl, "/api/sources/" + urlSegment(id), credential).GET().build();
+            HttpResponse<String> response =
+                    send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200) {
+                if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> body)
+                        || !id.equals(body.get("id"))
+                        || !(body.get("connector") instanceof String connector) || connector.isBlank()
+                        || !(body.get("config") instanceof Map<?, ?> config)) {
+                    return new ConnectionSettingsOutcome.Unreachable();
+                }
+                Map<String, Object> settings = new LinkedHashMap<>();
+                for (var entry : config.entrySet()) {
+                    if (!(entry.getKey() instanceof String key)) {
+                        return new ConnectionSettingsOutcome.Unreachable();
+                    }
+                    settings.put(key, entry.getValue());
+                }
+                return new ConnectionSettingsOutcome.Found(connector, settings);
+            }
+            if (response.statusCode() == 404) return new ConnectionSettingsOutcome.Absent();
+            Rejection rejected = rejection(response.body(), "The server refused the Source read.");
+            return new ConnectionSettingsOutcome.Rejected(rejected.code(), rejected.message());
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return new ConnectionSettingsOutcome.Unreachable();
+        } catch (IOException | RuntimeException failure) {
+            return new ConnectionSettingsOutcome.Unreachable();
+        }
+    }
+
+    @Override
     public ConnectionTestOutcome test(
             URI baseUrl, String credential, String id, String connectorId, Map<String, Object> settings) {
         try {

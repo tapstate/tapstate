@@ -239,8 +239,10 @@ class MongoArtifactStoreIT {
             assertThat(outcome.refusedId()).isEqualTo("orders");
             assertThat(outcome.refusal()).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
             assertThat(collection.find(new Document("_id", "orders_sync")).first()).isNull();
-            assertThat(storedBody(collection, "orders"))
-                    .isEqualTo(bodyOf(changedSource));
+            assertThat(store.get("orders")).contains(changedSource);
+            assertThat(storedBody(collection, "orders").get("config"))
+                    .isInstanceOf(String.class)
+                    .asString().startsWith("tscfg:1:").doesNotContain("replica");
         });
     }
 
@@ -283,11 +285,11 @@ class MongoArtifactStoreIT {
                             assertThat(outcome.refusal()).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
                         });
 
-                Map<String, Object> expectedBody = alphaOutcome.appliedSuccessfully()
-                        ? bodyOf(alphaReplacement)
-                        : bodyOf(betaReplacement);
-                assertThat(storedBody(collection, "orders"))
-                        .isEqualTo(expectedBody);
+                Resource winner = alphaOutcome.appliedSuccessfully() ? alphaReplacement : betaReplacement;
+                assertThat(store.get("orders")).contains(winner);
+                assertThat(storedBody(collection, "orders").get("config"))
+                        .isInstanceOf(String.class)
+                        .asString().startsWith("tscfg:1:").doesNotContain("alpha", "beta");
             } catch (Exception error) {
                 throw new AssertionError("concurrent replace test failed", error);
             }
@@ -459,7 +461,7 @@ class MongoArtifactStoreIT {
             MongoDatabase database = client.getDatabase("tapstate");
             MongoCollection<Document> collection = database.getCollection("artifacts");
             collection.drop();
-            MongoArtifactStore store = new MongoArtifactStore(client, collection);
+            MongoArtifactStore store = new MongoArtifactStore(client, collection, new SourceConfigCipher(new byte[32]));
             store.saveAll(List.of(PARSER.parse(ORDERS), PARSER.parse(ORDERS_SYNC)));
             // Built by the product from the row's own declaration rather than written out here: a test
             // that created its own index would keep passing over a release that ships none.
@@ -498,11 +500,6 @@ class MongoArtifactStoreIT {
         return plain(body);
     }
 
-    /** The body {@code resource} is stored as, to compare against {@link #storedBody}. */
-    private static Map<String, Object> bodyOf(Resource resource) {
-        return plain(WRITER.tree(resource));
-    }
-
     /**
      * The same map with every nested map flattened to one type. A body goes to the driver as plain
      * maps and comes back as {@code Document}s, and {@code Document.equals} answers false to anything
@@ -533,7 +530,7 @@ class MongoArtifactStoreIT {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
             MongoCollection<Document> collection = client.getDatabase("tapstate").getCollection("artifacts");
             collection.drop();
-            test.run(new MongoArtifactStore(client, collection), collection);
+            test.run(new MongoArtifactStore(client, collection, new SourceConfigCipher(new byte[32])), collection);
         }
     }
 }

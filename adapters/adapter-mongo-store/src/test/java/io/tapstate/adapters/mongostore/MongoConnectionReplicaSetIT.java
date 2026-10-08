@@ -58,7 +58,7 @@ class MongoConnectionReplicaSetIT {
     void verifySucceedsWhenAddressingTheMemberDirectly() {
         // A containerized server cannot use topology discovery: the set member advertises the address
         // its host reaches it by, which resolves to nothing inside another container. Addressing the
-        // member directly skips discovery, and this asserts the replica-set gate still passes when it
+        // member directly skips discovery, and this asserts the topology gate still passes when it
         // does. The gate reads setName out of the hello response -- a field the server reports about
         // itself -- so it is indifferent to the driver running a single-server topology. Were the gate
         // ever rewritten to inspect the driver's topology type instead, it would start rejecting every

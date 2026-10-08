@@ -662,6 +662,11 @@ class PipelineObservationApiTest {
         }
 
         @Bean
+        CredentialAuthenticator credentialAuthenticator(TokenService tokens, TokenSigner signer) {
+            return new CredentialAuthenticator(tokens, signer);
+        }
+
+        @Bean
         OperationRegistry operationRegistry() {
             return ControlOperations.registry();
         }

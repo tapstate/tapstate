@@ -70,6 +70,11 @@ final class RealProcessServer implements ServerHandle {
         return start(storeUri, SharedMongo.OPERATOR_STATE_DATABASE, bootJar(), additionalArguments);
     }
 
+    /** Keeps a focused witness's durable operator state in its own deployment database. */
+    static RealProcessServer start(String storeUri, String operatorStateDatabase, List<String> additionalArguments) {
+        return start(storeUri, operatorStateDatabase, bootJar(), additionalArguments);
+    }
+
     /** Launches the deliverable with an explicit operator-state database. */
     static RealProcessServer start(String storeUri, String operatorStateDatabase) {
         return start(storeUri, operatorStateDatabase, bootJar());
@@ -270,6 +275,22 @@ final class RealProcessServer implements ServerHandle {
     /** Whether it is still running, so a witness waiting on it can tell waiting from waiting forever. */
     boolean isAlive() {
         return process.isAlive();
+    }
+
+    /** Waits for all startup runners, not merely the earlier Tomcat health response. */
+    void awaitReady() {
+        ControlPlane control = new ControlPlane(baseUrl);
+        Await.until("the process to complete application startup", STARTUP_BUDGET, () -> {
+            if (!process.isAlive()) {
+                throw new AssertionError("the server exited with status " + process.exitValue()
+                        + " before application readiness; its output was:\n" + tail());
+            }
+            try {
+                return Files.readString(output).contains("Tapstate application is ready") && control.healthy();
+            } catch (IOException failure) {
+                throw new UncheckedIOException("could not read application readiness", failure);
+            }
+        }, this::tail);
     }
 
     /**

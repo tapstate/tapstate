@@ -16,6 +16,8 @@ public class CodedFailureAnalyzer extends AbstractFailureAnalyzer<TapstateExcept
     @Override
     protected FailureAnalysis analyze(Throwable rootFailure, TapstateException cause) {
         MessageCatalog.Rendered rendered = MessageCatalog.bundled().render(cause.code(), cause.args());
-        return new FailureAnalysis(rendered.message(), rendered.solution(), cause);
+        // Early environment failures may never produce an exception stack. Keep their stable code
+        // visible alongside the catalog text, without dumping parameters or the cause chain.
+        return new FailureAnalysis("[" + cause.code().code() + "] " + rendered.message(), rendered.solution(), cause);
     }
 }

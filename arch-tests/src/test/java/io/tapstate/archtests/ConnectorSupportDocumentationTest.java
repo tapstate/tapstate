@@ -69,7 +69,6 @@ class ConnectorSupportDocumentationTest {
                             "remain the operator's responsibility",
                             "This deployment allowance is not a",
                             "certification claim",
-                            "this preview certifies MongoDB write support only",
                             "Applying a cloud pipeline",
                             "whose sync names another connector is refused",
                             "Oracle Free 23", "SQL Server 2022", "DECIMAL(18,4)", "schema rediscovery",

@@ -18,9 +18,12 @@ class SourceDraftServiceTest {
 
     @Test
     void rendersAValidatedSourceWithoutPersistingIt() {
-        SourceDraftResult result = service().draft(draft(null, null, null, List.of()));
+        SourceDraft request = draft(null, null, null, List.of());
+        SourceDraftResult result = service().draft(request);
 
         assertThat(result.yaml()).contains("kind: source", "id: orders", "connector: mysql");
+        assertThat(request.toString()).doesNotContain("secret");
+        assertThat(result.toString()).doesNotContain("secret");
     }
 
     @Test

@@ -42,6 +42,12 @@ def check(workflows, contexts):
     assert 'ci-shard.sh run' in shards and 'ci-aggregate.sh pack' in shards
     assert 'install' in shards and '-DskipTests' in shards and 'RUNNER_TEMP/m2' in shards
     assert 'if-no-files-found: error' in shards, 'missing shard artifact must fail'
+    for job in ('test-shards', 'build', 'image-smoke'):
+        body = ci.get(job, '')
+        assert 'repository: tapstate/tapstate-cloud' in body, f'{job} must obtain the unpublished Cloud SDK'
+        assert 'ref: ${{ env.CLOUD_SDK_REVISION }}' in body, f'{job} must pin the Cloud SDK revision'
+        assert '-DskipSdkGeneration=true' in body and '-pl client/java -am' in body, \
+            f'{job} must install the project-owned SDK facade'
     sonar = ci.get('sonarqube', '')
     sonar_name = '    name: sonarqube'
     assert sonar_name in sonar.splitlines(), 'sonarqube must keep its exact name on analysis events'
@@ -69,6 +75,7 @@ for original, replacement in [
     ('  build:', '  build:\n    strategy:\n      matrix: {part: [1, 2]}'),
     ('ci-aggregate.sh verify', 'echo verification-removed'),
     ('    name: sonarqube', '    name: sonar-renamed'),
+    ('repository: tapstate/tapstate-cloud', 'repository: tapstate/missing-cloud-sdk'),
 ]:
     assert original in workflows['ci.yml'], f'mutation target absent: {original}'
     mutated = {**workflows, 'ci.yml': workflows['ci.yml'].replace(original, replacement, 1)}
@@ -77,5 +84,5 @@ for original, replacement in [
     except AssertionError:
         continue
     raise AssertionError(f'workflow mutation escaped: {replacement}')
-print('ci-shape smoke: workflow contracts and 4 mutations passed')
+print('ci-shape smoke: workflow contracts and 5 mutations passed')
 PY

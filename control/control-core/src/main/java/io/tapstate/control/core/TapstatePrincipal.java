@@ -28,7 +28,8 @@ public record TapstatePrincipal(
         }
         scopes = Set.copyOf(scopes);
         tokenId = Objects.requireNonNull(tokenId, "tokenId");
-        if (credentialType == CredentialType.HUMAN_JWT && tokenId.isPresent()) {
+        if ((credentialType == CredentialType.HUMAN_JWT || credentialType == CredentialType.CLOUD_SESSION)
+                && tokenId.isPresent()) {
             throw new IllegalArgumentException("a human JWT must not carry a machine token id");
         }
         if (credentialType == CredentialType.MACHINE_TOKEN && tokenId.isEmpty()) {
@@ -49,6 +50,13 @@ public record TapstatePrincipal(
         return new TapstatePrincipal(
                 verified.subject(), CredentialType.MACHINE_TOKEN, scopesFor(verified.scope()),
                 Optional.of(verified.subject()));
+    }
+
+    /** Builds a principal whose authority is the local managed session, not a browser-held Cloud JWT. */
+    public static TapstatePrincipal cloudSession(VerifiedToken verified) {
+        Objects.requireNonNull(verified, "verified");
+        return new TapstatePrincipal(verified.subject(), CredentialType.CLOUD_SESSION,
+                scopesFor(verified.scope()), Optional.empty());
     }
 
     /** Whether this verified identity carries the requested operation grade. */

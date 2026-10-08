@@ -71,12 +71,14 @@ class CliFaceProjectionGatesTest {
      * oversight. The security domain has no face anywhere — no command and no endpoint — so nothing
      * invokes those verbs today; the first administrator is created through the bootstrap entry point
      * instead. Frontend-only source and connector details/icons, the unified Pipeline catalog, and
-     * Pipeline draft authoring/rebase endpoints are HTTP contracts with no command shape yet.
+     * Pipeline draft authoring/rebase endpoints and the authenticated current-user read are HTTP
+     * contracts with no command shape yet.
      *
      * <p>An entry here is a reviewed decision, not a running to-do list: an operation added to the
      * registry with no verb must turn this gate red, and deleting its entry is how it earns one.
      */
     private static final Set<String> DEFERRED_WITH_NO_VERB = Set.of(
+            "auth.current-user",
             "connector.get",
             "connector.icon",
             "source.create", "source.delete", "source.draft", "source.get", "source.list", "source.schema",

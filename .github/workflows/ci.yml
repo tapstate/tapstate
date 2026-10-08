@@ -76,6 +76,11 @@ jobs:
         run: .github/scripts/ci-maven-cache.sh seed "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
       - name: Build the reactor without running tests
         run: mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install
+      - name: Prepare pinned public inputs for Cloud startup witnesses
+        if: matrix.shard == 'rest'
+        run: |
+          python3 deploy/cloud/prepare-test-inputs.py --output "$RUNNER_TEMP/cloud-test-release"
+          echo "TAPSTATE_TEST_CLOUD_RELEASE_DIR=$RUNNER_TEMP/cloud-test-release" >> "$GITHUB_ENV"
       - name: Execute exactly this shard
         env:
           SHARD: ${{ matrix.shard }}
@@ -377,8 +382,12 @@ jobs:
           shellcheck deploy/docker/dockerfile-smoke.sh
           shellcheck deploy/docker/dockerfile-smoke-test.sh
           shellcheck scripts/prepare-web-assets.sh
+          shellcheck scripts/build-web-assets.sh
           shellcheck scripts/prepare-web-assets-smoke.sh
+          shellcheck deploy/cloud/ghcr-publish.sh deploy/cloud/ghcr-publish-smoke.sh
+          shellcheck deploy/cloud/cloud-image-smoke.sh
           python3 -m py_compile .github/scripts/web-provenance.py .github/scripts/web-provenance-smoke.py
+          python3 -m py_compile scripts/web-assets-profile.py scripts/web-assets-profile-smoke.py
           shellcheck -s sh deploy/install-site/assemble.sh
           shellcheck -s sh deploy/install-site/verify-published.sh
           shellcheck deploy/install-site/verify-smoke.sh
@@ -402,6 +411,16 @@ jobs:
         run: bash scripts/prepare-web-assets-smoke.sh
       - name: Web release provenance cases
         run: python3 .github/scripts/web-provenance-smoke.py
+      - name: Cloud connector input and test-preparation cases
+        run: python3 deploy/cloud/stage-connectors-test.py
+      - name: Cloud image runtime helper cases
+        run: |
+          node --test deploy/cloud/image-runtime-probe.test.mjs
+          PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/image-runtime-metadata-test.py
+      - name: Public Cloud GHCR publisher cases
+        run: bash deploy/cloud/ghcr-publish-smoke.sh
+      - name: Authenticated Cloud artifact cases
+        run: node --test scripts/seal-cloud-artifact.test.mjs
       - name: install-site verifier smoke
         run: bash deploy/install-site/verify-smoke.sh
 

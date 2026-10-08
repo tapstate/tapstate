@@ -63,19 +63,21 @@ class SourceConnectionResolverTest {
 
     @Test
     void restoresOnlyTheMatchingAtlasUriDisplayForConnectionOperations() {
-        String original = "mongodb+srv://probe:sentinel-secret@cluster.example/test";
+        String original = "mongodb+srv://alice:pa%40ss@cluster.example/test";
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource(
-                "atlas", null, "mongodb-atlas", Map.of("uri", original),
+                "atlas", null, "mongodb-atlas", Map.of("isUri", true, "uri", original),
                 null, null, null, null));
         SourceConnectionResolver resolver = new SourceConnectionResolver(artifacts);
 
-        ConnectionConfig resolved = resolver.resolve("atlas", "mongodb-atlas",
-                Map.of("uri", "mongodb+srv://<redacted>@cluster.example/test"));
+        ConnectionConfig kept = resolver.resolve("atlas", "mongodb-atlas",
+                Map.of("isUri", true, "uri", "mongodb+srv://<redacted>@cluster.example/test"));
+        assertThat(kept.settings()).containsEntry("uri", original);
+        assertThat(resolver.resolve("atlas", "mongodb-atlas", Map.of("isUri", true)).settings())
+                .containsEntry("uri", original);
 
-        assertThat(resolved.settings()).containsEntry("uri", original);
         assertThatThrownBy(() -> resolver.resolve("atlas", "mongodb-atlas",
-                Map.of("uri", "mongodb+srv://<redacted>@other.example/test")))
+                Map.of("isUri", true, "uri", "mongodb+srv://<redacted>@other.example/test")))
                 .isInstanceOfSatisfying(TapstateException.class, error ->
                         assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
     }

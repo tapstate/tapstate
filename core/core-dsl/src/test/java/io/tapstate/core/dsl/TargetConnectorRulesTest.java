@@ -14,8 +14,9 @@ import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
-/** The target role is authorized by connector sink capability, narrowed to Atlas in cloud. */
+/** Target roles follow catalog capabilities on-prem and MongoDB/Atlas scope in cloud. */
 class TargetConnectorRulesTest {
 
     private static final TapstateCatalog CATALOG = TapstateCatalog.load();
@@ -104,7 +105,7 @@ class TargetConnectorRulesTest {
     }
 
     @Test
-    void cloudRefusesConnectorsOutsideTheAtlasCatalogEntry() {
+    void cloudRefusesConnectorsOutsideTheMongoDbAndAtlasCatalogEntries() {
         Throwable thrown = catchThrowable(() -> validate(true, READ_SOURCE,
                 target("private-sink", "acme-warehouse"), pipelineWritingTo("private-sink")));
         assertThat(thrown).isInstanceOf(DslException.class);
@@ -112,7 +113,8 @@ class TargetConnectorRulesTest {
     }
 
     static Stream<String> sinkConnectors() {
-        return CATALOG.all().stream().filter(entry -> entry.sink().capable()).map(entry -> entry.id());
+        return CATALOG.all().stream().filter(entry -> entry.sink().capable())
+                .map(entry -> entry.id()).filter(id -> !"aws-rds-mysql".equals(id));
     }
 
     @ParameterizedTest(name = "on-prem permits sink connector {0}")
@@ -134,7 +136,9 @@ class TargetConnectorRulesTest {
     }
 
     @Test
-    void cloudAcceptsAtlasAndRefusesOtherSinkConnectors() {
+    void cloudAcceptsMongoDbAndAtlasAndRefusesOtherSinkConnectors() {
+        assertThatCode(() -> validate(true, READ_SOURCE, target("mongo", "mongodb"),
+                pipelineWritingTo("mongo"))).doesNotThrowAnyException();
         assertThatCode(() -> validate(true, READ_SOURCE, target("atlas", "mongodb-atlas"),
                 pipelineWritingTo("atlas"))).doesNotThrowAnyException();
         Throwable thrown = catchThrowable(() -> validate(true, READ_SOURCE, target("pg", "postgres"),

@@ -144,8 +144,8 @@ class ApplyServiceTargetConnectorTest {
     }
 
     @Test
-    @DisplayName("cloud deployments narrow the sink catalog to MongoDB Atlas")
-    void cloudOnlyAllowsAtlasTargets() {
+    @DisplayName("cloud deployments permit MongoDB and Atlas targets but refuse relational sinks")
+    void cloudAllowsMongoDbAndAtlasTargets() {
         ApplyService cloud = new ApplyService(
                 TapstateCatalog::load, new InMemoryArtifactStore(),
                 new AuditGate(record -> { }, FIXED_CLOCK), new InMemorySchemaStore(),
@@ -158,6 +158,9 @@ class ApplyServiceTargetConnectorTest {
 
         assertThatCode(() -> cloud.apply("tester", batch("tgt_atlas",
                 target("tgt_atlas", "mongodb-atlas", "{ uri: \"mongodb://10.30.0.11:27017/ods\" }"))))
+                .doesNotThrowAnyException();
+        assertThatCode(() -> cloud.apply("tester", batch("tgt_mongo",
+                target("tgt_mongo", "mongodb", "{ uri: \"mongodb://10.30.0.12:27017/ods\" }"))))
                 .doesNotThrowAnyException();
     }
 

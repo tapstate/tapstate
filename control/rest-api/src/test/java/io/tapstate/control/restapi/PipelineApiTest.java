@@ -19,6 +19,7 @@ import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.control.core.ConnectorRegisterService;
 import io.tapstate.control.core.ClusterIdentityService;
 import io.tapstate.control.core.ControlOperations;
+import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.CredentialAuthenticator;
 import io.tapstate.control.core.DataBrowserFollows;
 import io.tapstate.control.core.DataBrowserService;
@@ -179,6 +180,68 @@ class PipelineApiTest {
     }
 
     // ---- the four verbs round-trip through the service ----
+
+    @Test
+    void browserPipelineMetadataRoundTripsWithoutDerivedBeanProperties() {
+        String token = machineToken(Scope.WRITE);
+        Map<String, Object> input = new LinkedHashMap<>(Map.of(
+                "id", "metadata_round_trip", "metadata", Map.of("labels", Map.of(), "description", "draft"),
+                "sources", List.of(), "transforms", List.of()));
+        ResponseEntity<Map> created = client().post().uri("/api/pipelines")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(input).retrieve().toEntity(Map.class);
+        Map<String, Object> echoedMetadata = new LinkedHashMap<>((Map<String, Object>) created.getBody().get("metadata"));
+        echoedMetadata.put("description", "updated through the browser");
+        input.put("metadata", echoedMetadata);
+        ResponseEntity<Map> replaced = client().put().uri("/api/pipelines/metadata_round_trip")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .header(HttpHeaders.IF_MATCH, created.getHeaders().getETag())
+                .contentType(MediaType.APPLICATION_JSON).body(input).exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+                    return ResponseEntity.status(response.getStatusCode()).headers(response.getHeaders())
+                            .body(response.bodyTo(Map.class));
+                });
+        assertThat((Map<String, Object>) replaced.getBody().get("metadata"))
+                .containsOnlyKeys("labels", "description");
+        assertThat(((Map<?, ?>) replaced.getBody().get("metadata")).get("description"))
+                .isEqualTo("updated through the browser");
+    }
+
+    @Test
+    void aCachedDerivedMetadataFlagIsIgnoredWithoutAcceptingUnknownMetadataFields() {
+        String token = machineToken(Scope.WRITE);
+        Map<String, Object> metadata = new LinkedHashMap<>(Map.of("labels", Map.of(), "description", "draft", "empty", false));
+        Map<String, Object> input = new LinkedHashMap<>(Map.of(
+                "id", "legacy_metadata", "metadata", metadata, "sources", List.of(), "transforms", List.of()));
+        Map<String, Object> created = client().post().uri("/api/pipelines")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(input).retrieve().body(Map.class);
+        assertThat((Map<String, Object>) created.get("metadata")).doesNotContainKey("empty");
+        metadata.put("unknown_metadata_field", true);
+        input.put("id", "unknown_metadata");
+        client().post().uri("/api/pipelines")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(input).exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+                    assertThat(response.bodyTo(ApiError.class).code()).isEqualTo(ControlError.MALFORMED_REQUEST.code());
+                    return null;
+                });
+    }
+
+    @Test
+    void provenanceOnlySourceMetadataKeepsTheNullableDescriptionInPipelineResponses() {
+        context.getBean(FakeArtifactStore.class).seed(SOURCE_X.replace(
+                "id: src_x", "id: src_x\nmetadata: {cloud: true, user_id: fixture-cloud-user}"));
+        Map<?, ?> pipeline = client().get().uri("/api/pipelines/pl1")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(Map.class);
+        Map<?, ?> source = (Map<?, ?>) ((List<?>) pipeline.get("sources")).getFirst();
+        Map<String, Object> metadata = (Map<String, Object>) source.get("metadata");
+        assertThat(metadata).containsKey("description");
+        assertThat(metadata.get("description")).isNull();
+        assertThat(metadata).containsEntry("cloud", true).containsEntry("user_id", "fixture-cloud-user");
+        assertThat(metadata).doesNotContainKey("empty");
+    }
 
     @Test
     void createPersistsABlankEditorDraftBeforeTheFirstTypedDagSave() {
