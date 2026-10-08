@@ -61,7 +61,9 @@ continuation across a server restart were verified by hand against Db2 LUW 11.5.
 change-capture modes below.
 Db2 is supported as a source only. Its connector can write, but its catalog row is not
 sink-capable, so a `serve.sync` naming a `db2` connection is refused on-prem as well as in
-the cloud profile, and no authoring surface offers it as a target. Db2 LUW reads take a
+the cloud profile, and so is editing a connection that a `serve.sync` already writes to onto
+`connector: db2`. The CLI's pipeline and serve wizards can still offer a Db2 connection as a
+sync target; applying the result is what refuses it. Db2 LUW reads take a
 snapshot and then capture changes; the database needs archive logging, and each captured
 table `DATA CAPTURE CHANGES`. Change capture has two modes. With `useNativeMiner: true` the
 connector reads the log in-process through IBM's db2ReadLog API. That needs the server on

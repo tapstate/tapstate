@@ -8,6 +8,8 @@ import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.model.Resource;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -79,9 +81,12 @@ class TargetConnectorRulesTest {
 
     private static void validate(boolean cloud, List<String> submitted, List<String> stored) {
         List<Resource> batch = parse(submitted.toArray(String[]::new));
-        List<Resource> known = new ArrayList<>(parse(stored.toArray(String[]::new)));
+        Set<String> submittedIds = batch.stream().map(Resource::id).collect(Collectors.toSet());
+        List<Resource> storedResources = parse(stored.toArray(String[]::new));
+        List<Resource> known = new ArrayList<>(
+                storedResources.stream().filter(resource -> !submittedIds.contains(resource.id())).toList());
         known.addAll(batch);
-        TargetConnectorRules.validate(batch, known, CATALOG, cloud);
+        TargetConnectorRules.validate(batch, known, storedResources, CATALOG, cloud);
     }
 
     @Test
@@ -171,6 +176,69 @@ class TargetConnectorRulesTest {
         assertThatCode(() -> validate(false,
                 List.of(rotatedSource),
                 List.of(READ_SOURCE, target("tgt", "ai-chat"), pipelineWritingTo("tgt"))))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    void judgesAStoredPipelineWhenTheTargetItWritesToIsMovedOntoARefusedConnector() {
+        Throwable thrown = catchThrowable(() -> validate(false,
+                List.of(target("tgt", "db2")),
+                List.of(READ_SOURCE, target("tgt", "mongodb"), pipelineWritingTo("tgt"))));
+
+        assertThat(thrown).isInstanceOf(DslException.class);
+        DslException error = (DslException) thrown;
+        assertThat(error.code()).isEqualTo(DslError.UNSUPPORTED_TARGET_CONNECTOR);
+        assertThat(error.path()).isEqualTo("serve.sync[0].source");
+        assertThat(error.args()).containsEntry("connector", "db2").containsEntry("source", "tgt")
+                .containsEntry("resource", "p");
+    }
+
+    @Test
+    void judgesAStoredServeDefinitionWhenItsTargetIsMovedOntoARefusedConnector() {
+        Throwable thrown = catchThrowable(() -> validate(false,
+                List.of(target("tgt", "db2")),
+                List.of(READ_SOURCE, target("tgt", "mongodb"), definitionWritingTo("tgt"), DEFINITION_USING)));
+
+        assertThat(thrown).isInstanceOf(DslException.class);
+        DslException error = (DslException) thrown;
+        assertThat(error.path()).isEqualTo("sync[0].source");
+        assertThat(error.args()).containsEntry("connector", "db2").containsEntry("resource", "out");
+    }
+
+    @Test
+    void judgesANewSourceAStoredDefinitionAlreadyWritesTo() {
+        // A definition's sync targets are not existence-checked, so one can name a connection before it is filed.
+        Throwable thrown = catchThrowable(() -> validate(false,
+                List.of(target("tgt", "db2")), List.of(definitionWritingTo("tgt"))));
+
+        assertThat(thrown).isInstanceOf(DslException.class);
+        assertThat(((DslException) thrown).args()).containsEntry("connector", "db2").containsEntry("resource", "out");
+    }
+
+    @Test
+    void anEditThatKeepsATargetsConnectorIsNotJudgedAsATarget() {
+        // What an upgrade can inherit: a target on a connector this release no longer writes through.
+        // Rotating its password is not the edit that made it a target.
+        String rotated = target("tgt", "ai-chat") + "config: { password: rotated }\n";
+        assertThatCode(() -> validate(false,
+                List.of(rotated), List.of(READ_SOURCE, target("tgt", "ai-chat"), pipelineWritingTo("tgt"))))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    void judgesOnlyTheElementsWritingToTheSourceWhoseConnectorChanged() {
+        String writingToBoth = """
+                version: tapstate/v1
+                kind: pipeline
+                id: p
+                source: src_my
+                serve:
+                  from: orders
+                  sync: [ { id: old, source: tgt_old }, { id: s, source: tgt } ]
+                """;
+        assertThatCode(() -> validate(false,
+                List.of(target("tgt", "postgres")),
+                List.of(READ_SOURCE, target("tgt_old", "ai-chat"), target("tgt", "mongodb"), writingToBoth)))
                 .doesNotThrowAnyException();
     }
 

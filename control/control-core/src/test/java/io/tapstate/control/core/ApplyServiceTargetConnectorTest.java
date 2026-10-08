@@ -195,6 +195,35 @@ class ApplyServiceTargetConnectorTest {
     }
 
     @Test
+    @DisplayName("moving a stored pipeline's target onto a refused connector is refused, typed or in a batch")
+    void movingAStoredTargetOntoARefusedConnectorIsRefused() {
+        // A pipeline accepted onto a MongoDB target, whose connection is then edited to Db2: the pipeline
+        // is not resubmitted, and without judging it here the next run would write through Db2.
+        DslParser parser = new DslParser();
+        String mongoTarget = target("tgt_out", "mongodb", "{ uri: \"mongodb://10.30.0.11:27017/ods\" }");
+        String db2Target = target("tgt_out", "db2", "{ host: 10.30.0.9, port: 50000, database: SAMPLE, schema: APP }");
+        artifacts.landDirectly(parser.parse(READ_SOURCE));
+        artifacts.landDirectly(parser.parse(mongoTarget));
+        artifacts.landDirectly(parser.parse(pipelineWritingTo("tgt_out")));
+        Resource stored = artifacts.get("tgt_out").orElseThrow();
+
+        DslException typed = catchThrowableOfType(DslException.class, () -> service.replace("tester",
+                parser.parse(db2Target), CanonicalHash.of(stored)));
+        DslException batched = catchThrowableOfType(DslException.class, () -> service.apply("tester",
+                List.of(new ArtifactDraft("tgt_out.tap.yml", db2Target))));
+
+        assertThat(typed).as("the typed replace").isNotNull();
+        assertThat(batched).as("the batch apply").isNotNull();
+        for (DslException refused : List.of(typed, batched)) {
+            assertThat(refused.code()).isEqualTo(DslError.UNSUPPORTED_TARGET_CONNECTOR);
+            assertThat(refused.args()).containsEntry("connector", "db2").containsEntry("source", "tgt_out")
+                    .containsEntry("resource", "orders_out");
+        }
+        assertThat(artifacts.get("tgt_out")).contains(stored);
+        assertThat(artifacts.saved).isEmpty();
+    }
+
+    @Test
     @DisplayName("a typed source edit is not refused for a stored pipeline the closure only pulled in")
     void aTypedSourceEditIsNotRefusedForAPipelineItOnlyPulledIn() {
         // The state an upgrade inherits: a pipeline filed while a relational target was still
