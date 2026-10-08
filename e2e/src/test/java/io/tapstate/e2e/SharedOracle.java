@@ -112,17 +112,42 @@ final class SharedOracle {
                     SQL
                     """.formatted(STARTUP_BUDGET.toSeconds()));
             if (result.getExitCode() != 0) {
+                System.err.printf("oracle-fixture-main-sql-result container=%s exitCode=%d%n",
+                        starting.getContainerId(), result.getExitCode());
                 throw new EnvelopeException("cannot enable Oracle change capture: " + result.getStdout() + result.getStderr());
             }
             container = starting;
             System.out.printf("Oracle source fixture ready in %.1f seconds%n", (System.nanoTime() - began) / 1_000_000_000.0);
             return container;
         } catch (Exception error) {
-            starting.stop();
-            if (error instanceof InterruptedException) {
+            boolean diagnosticInterrupted = false;
+            try { diagnosticInterrupted = captureProbeDiagnostics(starting); }
+            finally { starting.stop(); }
+            if (error instanceof InterruptedException || diagnosticInterrupted) {
                 Thread.currentThread().interrupt();
             }
             throw new EnvelopeException("cannot initialize Oracle source fixture", error);
         }
+    }
+
+    /** Collects only files from the controlled image before its existing teardown removes them. */
+    static boolean captureProbeDiagnostics(OracleContainer server) {
+        try {
+            var result = server.execInContainer("bash", "-c", """
+                    if [ -f /tmp/tapstate-collect-probe.sh ]; then
+                      timeout 3 bash /tmp/tapstate-collect-probe.sh
+                    fi
+                    """);
+            if (!result.getStdout().isBlank() || !result.getStderr().isBlank()
+                    || result.getExitCode() != 0) {
+                System.err.printf("oracle-fixture-probe-collection container=%s exitCode=%d%n%s%n%s%n",
+                        server.getContainerId(), result.getExitCode(), result.getStdout(), result.getStderr());
+            }
+        } catch (Exception diagnosticFailure) {
+            System.err.printf("oracle-fixture-probe-collection state=UNKNOWN failure=%s message=%s%n",
+                    diagnosticFailure.getClass().getName(), diagnosticFailure.getMessage());
+            return diagnosticFailure instanceof InterruptedException;
+        }
+        return false;
     }
 }

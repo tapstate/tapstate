@@ -1,0 +1,43 @@
+#!/bin/bash
+set -eu
+input=$(mktemp)
+cat > "$input"
+if grep -q 'ALTER DATABASE ADD SUPPLEMENTAL LOG DATA' "$input"; then
+  directory=/tmp/tapstate-capture-probe
+  mkdir -p "$directory"
+  printf '%s\n' "$BASHPID" > "$directory/main.pid"
+  bash /tmp/tapstate-probe-stage.sh main-before-sqlplus
+  awk '
+    BEGIN {
+      print "SET ECHO ON"
+      print "SET TIMING ON"
+      print "SPOOL /tmp/tapstate-capture-probe/main.log"
+    }
+    /^SHUTDOWN IMMEDIATE;/ { stage = "shutdown" }
+    /^STARTUP MOUNT;/ { stage = "startup-mount" }
+    /^ALTER DATABASE ARCHIVELOG;/ { stage = "archivelog" }
+    /^ALTER DATABASE OPEN;/ { stage = "database-open" }
+    /^BEGIN$/ { print "HOST bash /tmp/tapstate-probe-stage.sh pdb-open-before" }
+    /^ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;/ {
+      print "HOST bash /tmp/tapstate-hold-transaction.sh"
+      stage = "supplemental-logging"
+    }
+    /^ALTER DATABASE FORCE LOGGING;/ { stage = "force-logging" }
+    /^CREATE USER C##TAPSTATE / { stage = "create-user" }
+    /^GRANT DBA, LOGMINING / { stage = "grant-user" }
+    /^ALTER SYSTEM REGISTER;/ { stage = "register" }
+    /^EXIT;/ {
+      print "HOST bash /tmp/tapstate-probe-stage.sh main-before-exit"
+      print "SPOOL OFF"
+    }
+    {
+      if (stage != "") print "HOST bash /tmp/tapstate-probe-stage.sh " stage "-before"
+      print
+      if (stage != "") print "HOST bash /tmp/tapstate-probe-stage.sh " stage "-after"
+      stage = ""
+    }
+    /^\/$/ { print "HOST bash /tmp/tapstate-probe-stage.sh pdb-open-after" }
+  ' "$input" > "$input.delayed"
+  input="$input.delayed"
+fi
+exec "$ORACLE_HOME/bin/sqlplus-probe-real" "$@" < "$input"
