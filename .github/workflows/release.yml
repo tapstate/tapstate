@@ -468,6 +468,7 @@ jobs:
           echo "Dispatched the real-connector lane on ${GITHUB_REF_NAME} (${tip})."
 
   join-perf:
+    name: dispatch-join-perf
     # The join operator's performance lane, started here for the same reason as the connector one
     # above: the ordinary build runs three of its scenarios on one tier, so a release could otherwise
     # go out having never had the other eight measured, or the resident and cold tiers looked at at
@@ -530,10 +531,14 @@ jobs:
           shellcheck .github/scripts/checks-on-commit.sh .github/scripts/checks-on-commit-smoke.sh \
             .github/scripts/docs-gate.sh .github/scripts/docs-gate-smoke.sh \
             .github/scripts/release-notes.sh .github/scripts/release-notes-smoke.sh \
+            .github/scripts/release-notes-read-failure-smoke.sh \
+            .github/scripts/_pr-read.sh .github/scripts/_pr-read-smoke.sh \
             .github/scripts/docs-impact.sh .github/scripts/_pr-section.sh
+          bash .github/scripts/_pr-read-smoke.sh
           bash .github/scripts/checks-on-commit-smoke.sh
           bash .github/scripts/docs-gate-smoke.sh
           bash .github/scripts/release-notes-smoke.sh
+          bash .github/scripts/release-notes-read-failure-smoke.sh
 
       # 1. The required checks ran on this commit and were green. Not "the last run was green" -- the
       #    set is read from the branch's rules at this moment rather than copied into this file, and

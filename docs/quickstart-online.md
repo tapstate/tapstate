@@ -6,9 +6,10 @@ target: https://tapstate.dev/docs/quickstart-online
 
 # Quick start: the online runtime (preview)
 
-> **Preview / POC.** Tapstate's runtime is an early slice: a single-node, in-memory
-> engine that executes your `.tap.yml` resources as live pipelines. It is enough to
-> run a real end-to-end sync, but it is **not** production-hardened — see
+> **Preview / POC.** Tapstate's runtime executes your `.tap.yml` resources as live
+> pipelines. It starts as a single member by default; [cluster mode](cluster/README.md)
+> is an opt-in preview. Control-plane state and recovery positions persist in MongoDB.
+> It is enough to run a real end-to-end sync, but it is **not** production-hardened — see
 > [Limitations](#limitations) before you rely on it. The offline authoring CLI is
 > covered in the [main README](../README.md); this page is the runtime.
 >
@@ -794,8 +795,10 @@ In the REPL:
 tapstate(admin@127.0.0.1:8080)> stop order_pipeline
 This clears what the pipeline accumulated:
   - what its operators had assembled, and the changes they could not assemble
+  - what its connectors had kept for a later drive
   - the position it had read and confirmed up to
   - what the shared mining chain had read, once this is the last pipeline reading it
+  - what its source connector set up on the source to read changes, such as a replication slot, once this is the last pipeline reading through it
 The run after this one has no position to carry on from.
 Your target database is not touched either way.
 Clear order_pipeline? Type yes to go ahead [no]: yes
@@ -956,12 +959,13 @@ This runtime is a preview. Known constraints in this slice:
   publishes no host port, so the threshold is a token rather than network reach. Do
   not put data in this deployment that its own users should not see; isolating the two
   needs authentication or a second instance, and this preview has neither.
-- **Single node, in-memory.** No multi-node HA. A server restart does **not** resume
-  from a persisted offset — it replays from the source (idempotent upsert absorbs the
-  overlap). Durable resume / exactly-once are not in this preview.
-- **Preview builds.** Until the first release, the server image is assembled locally
-  and the CLI is built from source; a published image and a CLI installer remove
-  those steps.
+- **Single member by default.** This demo runs one member. [Cluster mode](cluster/README.md)
+  is an opt-in preview, with its own configuration and safety requirements.
+- **Recovery depends on the source and read mode.** MongoDB retains control-plane
+  state and recovery positions. [Restart recovery](#restart-recovery) can replay
+  unconfirmed work and requires the connector's source history to remain available.
+- **At-least-once delivery.** Retries and restarts can deliver records again;
+  idempotent upserts absorb overlap, but there is no exactly-once guarantee.
 - **`logs` is thin.** The per-pipeline `logs` face is a node-local operational tail
   and is often sparse; full runtime detail is in the server process log.
 - **No CLI bootstrap verb.** The compose stack creates the first admin for you; on
@@ -969,3 +973,31 @@ This runtime is a preview. Known constraints in this slice:
 - **Temporary connections and machine tokens are process-scoped.** A persistent human
   session is created only by `auth login` against a named context; `connect`,
   `--connect`, `--token`, and `TAPSTATE_TOKEN` never create or update that cache.
+
+### Restart recovery
+
+A single-member process restart with the same MongoDB data re-adopts pipelines
+recorded as running. Keep the store volume and operator-state database: recovery
+positions and state are part of that data. Completed finite runs stay completed;
+failed runs require an explicit recovery action.
+
+All supported database sources use the connector capture path. The runtime passes
+the recorded position back to that connector; recovery depends on the connector
+accepting it and the required source change history still being available. There
+is no blanket guarantee of recovery after that history expires.
+
+| Read mode | Recovery of a running pipeline after a single-member restart |
+| --- | --- |
+| `snapshot_and_cdc` (default) | Skip tables whose initial load this pipeline's sinks already confirmed. Read each unconfirmed table again from the beginning, keeping its recorded snapshot generation and original pre-snapshot CDC position, then resume changes from the recorded position. There is no durable cursor within an unfinished table's snapshot. |
+| `cdc_only` | Take no initial snapshot. Reopen CDC at a saved source checkpoint or proven start anchor. The configured initial `start_from` applies only to fresh initialization. If a previously started channel has neither anchor, restart is refused with `capture.recovery-progress-unproven` and the pipeline becomes `FAILED`. |
+| `snapshot_only` | Read the selected data again for an interrupted active load. There is no CDC recovery chain or durable snapshot row cursor. |
+
+For `capture.recovery-progress-unproven`, keep the retained state for diagnosis.
+Perform a full reload, or explicitly accept a new CDC-only baseline and the missing
+interval. The runtime does not clear retained state automatically.
+
+With shared SRS enabled, capture resumes from its persisted source checkpoint and
+each pipeline source continues from its own recorded per-table progress in the
+durable change log. With SRS disabled, each source uses its own capture channel
+and saved source checkpoint. Both paths can replay unconfirmed records; delivery
+remains at-least-once.

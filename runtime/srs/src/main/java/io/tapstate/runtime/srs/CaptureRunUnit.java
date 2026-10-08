@@ -91,12 +91,27 @@ public final class CaptureRunUnit {
     /** The fallback for direct callers that do not supply the product's durable per-pipeline generation. */
     private final AtomicLong chainlessSnapshotEpoch = new AtomicLong();
     private final ConcurrentMap<String, SharedTail> sharedTails = new ConcurrentHashMap<>();
+    /** Tells each tail's source how far it may release, for as long as this unit is open. */
+    private final SourceAcknowledgements sourceAcknowledgements = new SourceAcknowledgements();
 
     public CaptureRunUnit(CapturePort port, SrsCoordinator coordinator, SrsMetaStore meta, HazelcastInstance hz) {
         this.port = Objects.requireNonNull(port, "port");
         this.coordinator = Objects.requireNonNull(coordinator, "coordinator");
         this.meta = Objects.requireNonNull(meta, "meta");
         this.hz = Objects.requireNonNull(hz, "hz");
+    }
+
+    /**
+     * Stops telling the sources of this unit's tails how far they may release: the reads that follow each tail
+     * end, with the thread that makes them. The tails themselves are closed by the runs that hold them.
+     */
+    public void close() {
+        sourceAcknowledgements.close();
+    }
+
+    /** Whether this unit still tells its tails' sources how far they may release. */
+    boolean acknowledging() {
+        return !sourceAcknowledgements.stopped();
     }
 
     /**
@@ -172,6 +187,30 @@ public final class CaptureRunUnit {
      */
     public CaptureRun begin(CaptureRunSpec spec, CaptureHandoff handoff, boolean startTail) {
         return open(spec, handoff, startTail, true);
+    }
+
+    /**
+     * Lets go of what {@code spec}'s source connector set up on the source to read changes -- a replication
+     * slot -- through the notes its change tail reads: the physical capture's for a tail through the shared
+     * write-through rings, and the node's own for one read directly. A read with no change tail set nothing
+     * up for one. Answers what the source refused to let go of, for the caller to report.
+     *
+     * <p>For the caller to call once nobody reads through those notes any more and the state they belong to
+     * is being cleared: after the chain's record is gone, and before the notes are. Released while anyone
+     * still reads through them, a stream would go on over a slot that is gone; released while the record
+     * still stands, a start in between would resume from a position the source no longer keeps.
+     */
+    public Optional<TapstateException> release(CaptureRunSpec spec) {
+        Objects.requireNonNull(spec, "spec");
+        ConsumptionPlan plan = ConsumptionPlan.of(spec.readMode(), spec.srsEnabled());
+        if (!plan.tail()) {
+            return Optional.empty();
+        }
+        // The same notes the tail opens over -- see openTail -- or the release finds nothing they recorded.
+        CaptureConfig config = plan.sharedRing() && durableLog() != null
+                ? spec.config().sharing(sharedNotes(spec, spec.miningChainId().value()))
+                : spec.config();
+        return port.release(config);
     }
 
     private CaptureRun open(CaptureRunSpec spec, CaptureHandoff handoff, boolean startTail, boolean inBackground) {
@@ -472,9 +511,12 @@ public final class CaptureRunUnit {
         private final AtomicLong batchOrder;
         private volatile boolean closed;
         private List<String> serving = List.of();
-        private Subscription subscription;
+        /** The stream running now; read without the lock, so an acknowledgement never waits on a widening. */
+        private final AtomicReference<Subscription> subscription = new AtomicReference<>();
         private final String firstSeam;
         private long nextTrim;
+        /** Tells the source how far it may release, through whichever stream is running when it is told. */
+        private final Subscription acknowledgements;
 
         private SharedTail(CaptureRunSpec spec, String chain, long epoch, String seam,
                 CaptureHealth health, SrsLogStore log) {
@@ -489,6 +531,21 @@ public final class CaptureRunUnit {
                     .map(position -> Math.max(0L, position.order().seq())).orElse(0L);
             this.batchOrder = new AtomicLong(recorded);
             open();
+            // A write-through checkpoint only: on this capture a restart resumes from nothing else. A widening
+            // replaces the stream, and the stream that replaced it is the one told from then on.
+            this.acknowledgements = sourceAcknowledgements.follow(meta, chain, new Subscription() {
+                @Override
+                public void acknowledge(SourcePosition durable) {
+                    Subscription current = subscription.get();
+                    if (current != null) {
+                        current.acknowledge(durable);
+                    }
+                }
+
+                @Override
+                public void close() {
+                }
+            }, health, true);
         }
 
         private synchronized void open() {
@@ -522,7 +579,7 @@ public final class CaptureRunUnit {
                     .orElseGet(() -> tailStart(meta, chain, spec.consumerId(), firstSeam, CaptureStart.present()));
             refuseAnInstantThisBufferWillNeverReach(spec.startFrom(), start, spec.retention());
             serving = tables;
-            subscription = CdcPhase.runDurable(port, config, start, routes, health, batchOrder);
+            subscription.set(CdcPhase.runDurable(port, config, start, routes, health, batchOrder));
         }
 
         private void trim(String table, String ring, Collection<ConsumerOffset> consumers,
@@ -569,8 +626,9 @@ public final class CaptureRunUnit {
                 return;
             }
             try {
-                if (subscription != null) {
-                    subscription.close();
+                Subscription running = subscription.get();
+                if (running != null) {
+                    running.close();
                 }
                 open();
             } catch (RuntimeException | Error failure) {
@@ -585,8 +643,10 @@ public final class CaptureRunUnit {
             }
             closed = true;
             sharedTails.remove(chain, this);
-            if (subscription != null) {
-                subscription.close();
+            acknowledgements.close();
+            Subscription running = subscription.get();
+            if (running != null) {
+                running.close();
             }
         }
     }
@@ -672,7 +732,8 @@ public final class CaptureRunUnit {
             }
             CaptureStart minerStart = tailStart(meta, cid, spec.consumerId(), ownSeam, CaptureStart.present());
             refuseAnInstantThisBufferWillNeverReach(spec.startFrom(), minerStart, spec.retention());
-            return Optional.of(CdcPhase.run(port, spec.config(), minerStart, routes, health));
+            return Optional.of(sourceAcknowledgements.follow(
+                    meta, cid, CdcPhase.run(port, spec.config(), minerStart, routes, health), health, false));
         }
         if (plan.directTail()) {
             // Direct capture has no shared replay log. It resumes from this channel's safely processed
@@ -686,7 +747,7 @@ public final class CaptureRunUnit {
             String anchor = start instanceof CaptureStart.Resume resume ? resume.position().token() : null;
             meta.beginDirectCapture(directChain, spec.consumerId(), epoch, anchor);
             Map<String, Long> targets = new LinkedHashMap<>();
-            return Optional.of(port.cdc(
+            Subscription direct = port.cdc(
                     spec.config(), start, health.recording(new CaptureStartedListener() {
                         @Override
                         public void onStart(SourcePosition position) {
@@ -714,7 +775,9 @@ public final class CaptureRunUnit {
                                     Map.copyOf(targets)));
                             ordered.forEach(passthrough);
                         }
-                    })));
+                    }));
+            // Bounded by what this channel's targets confirmed: a direct channel has no log to replay from.
+            return Optional.of(sourceAcknowledgements.follow(meta, directChain, direct, health, false));
         }
         return Optional.empty();
     }
