@@ -8,14 +8,19 @@ import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
+import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.ManagedViewStore;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.ServeResource;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.TransformResource;
 import io.tapstate.core.model.ViewResource;
+import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.SourceMode;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
@@ -203,6 +208,64 @@ class ArtifactMutationServiceTest {
         assertThat(store.get("orders")).isPresent();
         assertThat(store.get("alpha")).isPresent();
         assertThat(store.get("zeta")).isPresent();
+    }
+
+    @Test
+    void viewStoreDeleteNamesInlineAndReusableConsumersOnceInSortedOrder() {
+        SourceResource views = new SourceResource(
+                ManagedViewStore.SOURCE_ID, null, "mongodb", Map.of("uri", "mongodb://mongo/my_views"),
+                null, null, null, null);
+        PipelineResource inline = new PipelineResource(
+                "zeta", null, List.of(SourceRef.bare("orders")), null,
+                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "id", null),
+                new ServeBlock.Inline(null, FromRef.literal("orders"),
+                        List.of(new SyncElement("copy", views.id(), null, null, null)), null, null),
+                null, null);
+        PipelineResource reused = new PipelineResource(
+                "alpha", null, List.of(SourceRef.bare("orders")), null,
+                new ViewBlock.Use(null, "shared_view", FromRef.literal("orders")),
+                null, null, null);
+        ViewResource shared = new ViewResource("shared_view", null, "id", null, null);
+        store.saveAll(List.of(views, source("orders"), inline, reused, shared));
+        state.put(reused.id(), PipelineState.RUNNING);
+
+        assertArtifactError(
+                () -> service.delete(PRINCIPAL, views.id(), hash(views)),
+                ArtifactError.IN_USE,
+                Map.of("id", views.id(), "referrers", List.of("alpha", "zeta")));
+
+        assertThat(store.get(views.id())).contains(views);
+        assertThat(store.get(inline.id())).contains(inline);
+        assertThat(store.get(reused.id())).contains(reused);
+        assertThat(auditStore.records).isEmpty();
+        assertThat(followsStopped).isEmpty();
+    }
+
+    @Test
+    void viewStoreWithoutAnyDeclaringViewCanStillBeDeleted() {
+        SourceResource views = source(ManagedViewStore.SOURCE_ID);
+        store.saveAll(List.of(views, source("orders"), pipelineReading("reader", "orders")));
+
+        service.delete(PRINCIPAL, views.id(), hash(views));
+
+        assertThat(store.get(views.id())).isEmpty();
+        assertThat(store.get("reader")).isPresent();
+    }
+
+    @Test
+    void anInlineViewDoesNotBlockDeletingAnUnrelatedSource() {
+        SourceResource unrelated = source("unrelated");
+        PipelineResource inline = new PipelineResource(
+                "reader", null, List.of(SourceRef.bare("orders")), null,
+                new ViewBlock.Inline("order_state", FromRef.literal("orders"), "id", null),
+                null, null, null);
+        store.saveAll(List.of(unrelated, source("orders"), source(ManagedViewStore.SOURCE_ID), inline));
+
+        service.delete(PRINCIPAL, unrelated.id(), hash(unrelated));
+
+        assertThat(store.get(unrelated.id())).isEmpty();
+        assertThat(store.get(ManagedViewStore.SOURCE_ID)).isPresent();
+        assertThat(store.get(inline.id())).contains(inline);
     }
 
     @Test

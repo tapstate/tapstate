@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.model.ManagedViewStore;
 import io.tapstate.core.model.Storage;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.spi.sink.TargetIndex;
@@ -26,11 +27,9 @@ import java.util.Objects;
 final class ViewTargetResolver {
 
     /**
-     * The source id of the managed state store every view materializes into. The one place the
-     * deployment's name for that store is written down: the value travels into the target address
-     * rather than being repeated at each use, so renaming the store is a single edit here.
+     * The source id every view materializes into, shared with the control-plane deletion check.
      */
-    static final String STATE_STORE_SOURCE_ID = "views";
+    static final String STATE_STORE_SOURCE_ID = ManagedViewStore.SOURCE_ID;
 
     private ViewTargetResolver() {
     }

@@ -5,6 +5,7 @@ import io.tapstate.core.dsl.ReferenceGraph;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
+import io.tapstate.core.model.ManagedViewStore;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
@@ -22,6 +23,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * Removal of an applied resource, one path for every kind. Deletion is real: the document leaves the
@@ -429,12 +431,19 @@ public final class ArtifactMutationService {
     }
 
     private void refuseWhenReferenced(String id, List<Resource> stored) {
-        List<String> referrers = ReferenceGraph.of(stored).referencedBy(id).stream()
-                .map(ReferenceGraph.Edge::id)
-                .sorted()
-                .toList();
+        Set<String> referrers = new TreeSet<>();
+        ReferenceGraph.of(stored).referencedBy(id).forEach(edge -> referrers.add(edge.id()));
+        if (ManagedViewStore.SOURCE_ID.equals(id)) {
+            // Inline and reusable views both materialize into this source without naming it.
+            // The dependency exists even when the declaring pipeline has never run.
+            for (Resource resource : stored) {
+                if (resource instanceof PipelineResource pipeline && pipeline.view() != null) {
+                    referrers.add(pipeline.id());
+                }
+            }
+        }
         if (!referrers.isEmpty()) {
-            throw error(ArtifactError.IN_USE, Map.of("id", id, "referrers", referrers));
+            throw error(ArtifactError.IN_USE, Map.of("id", id, "referrers", List.copyOf(referrers)));
         }
     }
 
