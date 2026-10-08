@@ -8,6 +8,8 @@ import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.StateJson;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -802,6 +804,57 @@ class PipelineConvergerTest {
     private void converge(io.tapstate.core.lifecycle.PipelineState target) {
         desired.save(new DesiredState("p1", target, REV));
         converger.converge("p1");
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = io.tapstate.core.lifecycle.PipelineState.class, names = {"NEW", "RUNNING"})
+    void aDelayedStartRefusalCannotFailANewerCheckpoint(io.tapstate.core.lifecycle.PipelineState initial) {
+        state.create("p1", StateJson.of(initial), T0);
+        desired.save(new DesiredState("p1", RUNNING, REV));
+        LifecycleActuator refusing = refusingPreparation(() ->
+                state.applySwap("p1", 0L, StateJson.of(STOPPED), T0.plusSeconds(1)));
+
+        ConvergeResult result = new PipelineConverger(desired, state, refusing,
+                Clock.fixed(T0.plusSeconds(2), ZoneOffset.UTC)).converge("p1");
+
+        assertThat(result.status()).isEqualTo(SUPERSEDED);
+        assertThat(result.failure()).isEmpty();
+        assertThat(state.read("p1")).contains(new CheckpointDoc("p1", StateJson.of(STOPPED),
+                1L, T0.plusSeconds(1)));
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = io.tapstate.core.lifecycle.PipelineState.class, names = {"NEW", "RUNNING"})
+    void aDelayedStartRefusalCannotBorrowANewerIntent(io.tapstate.core.lifecycle.PipelineState initial) {
+        state.create("p1", StateJson.of(initial), T0);
+        desired.save(new DesiredState("p1", RUNNING, REV));
+        DesiredState replacement = new DesiredState("p1", STOPPED, "rev-2", true);
+        LifecycleActuator refusing = refusingPreparation(() -> desired.save(replacement));
+
+        ConvergeResult result = new PipelineConverger(desired, state, refusing,
+                Clock.fixed(T0.plusSeconds(2), ZoneOffset.UTC)).converge("p1");
+
+        assertThat(result.status()).isEqualTo(SUPERSEDED);
+        assertThat(result.failure()).isEmpty();
+        assertThat(state.read("p1")).contains(new CheckpointDoc("p1", StateJson.of(initial), 0L, T0));
+        assertThat(desired.read("p1")).contains(replacement);
+    }
+
+    private LifecycleActuator refusingPreparation(Runnable competition) {
+        return new LifecycleActuator() {
+            @Override public PreparedStart prepareStart(String pipelineId) {
+                competition.run();
+                throw new TapstateException(new StubCode("actuation.store-unreachable"),
+                        Map.of("store", "state"), null);
+            }
+            @Override public void start(String pipelineId) { throw new AssertionError("start was refused"); }
+            @Override public void pause(String pipelineId) { }
+            @Override public void resume(String pipelineId) { }
+            @Override public void stop(String pipelineId, boolean purgeState) { }
+            @Override public Optional<Throwable> failure(String pipelineId) { return Optional.empty(); }
+            @Override public Optional<Throwable> lost(String pipelineId) { return Optional.empty(); }
+            @Override public boolean isCarryingAJob(String pipelineId) { return false; }
+        };
     }
 
     private void convergeStopping(boolean purgeState) {

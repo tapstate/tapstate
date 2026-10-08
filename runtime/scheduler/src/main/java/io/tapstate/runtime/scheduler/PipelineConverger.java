@@ -167,7 +167,7 @@ public final class PipelineConverger {
                     // answering healthy over a data plane that was never built, and the loop retries
                     // for the life of the process. A store that is unreachable when a process comes up
                     // is exactly the condition the coded refusal exists for.
-                    return failedWith(pipelineId, refused);
+                    return failedWith(pipelineId, refused, actualDoc.orElseThrow(), intent.orElseThrow());
                 }
                 ConvergeResult restored = ConvergeResult.converged(actualDoc.orElseThrow());
                 return submission == null ? restored : restored.withExecutionBoundary(submission);
@@ -305,7 +305,7 @@ public final class PipelineConverger {
                     } catch (StartDeferred waiting) {
                         return ConvergeResult.startDeferred(current, waiting.reason());
                     } catch (TapstateException refused) {
-                        return failedWith(pipelineId, refused);
+                        return failedWith(pipelineId, refused, current, stopIntent);
                     }
                 }
                 CasOutcome outcome = state.compareAndSwap(pipelineId, current.epoch(), targetJson, clock.instant());
@@ -322,7 +322,7 @@ public final class PipelineConverger {
                     } catch (TapstateException refused) {
                         // A coded refusal after a transition is an observable pipeline failure. Internal
                         // admission waits are handled above, before the transition.
-                        return failedWith(pipelineId, refused);
+                        return failedWith(pipelineId, refused, applied.next(), stopIntent);
                     }
                     return ConvergeResult.converged(applied.next(), from);
                 }
@@ -672,9 +672,14 @@ public final class PipelineConverger {
      * it as the observation's coded failure. Shared with the dead-job path, which reaches the same state
      * by a different road.
      */
-    private ConvergeResult failedWith(String pipelineId, Throwable cause) {
+    private ConvergeResult failedWith(String pipelineId, Throwable cause, CheckpointDoc expected,
+            DesiredState originalIntent) {
+        if (Thread.currentThread().isInterrupted() || originalIntent == null
+                || desired.read(pipelineId).filter(originalIntent::equals).isEmpty()) {
+            return ConvergeResult.superseded();
+        }
         ConvergeResult driven =
-                driveTo(pipelineId, PipelineState.FAILED, false, requireCheckpoint(pipelineId), false);
+                driveTo(pipelineId, PipelineState.FAILED, false, expected, false);
         return driven.checkpoint()
                 .map(checkpoint -> ConvergeResult.failed(checkpoint, cause,
                         driven.transitionFrom()))
