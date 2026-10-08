@@ -54,7 +54,7 @@ class PipelineBenchmarkLiveRunIT {
             Map<String, Object> environment = environment();
             var steadyWorkloads = BenchmarkWorkloadDefinitions.all().stream()
                     .map(workload -> BenchmarkWorkloadDefinitions.steadyPilot(workload.id())).toList();
-            inputs.put("measurementMethod", "FIXED_MIDDLE_COMMON_OPERATION_INTERVAL_V5");
+            inputs.put("measurementMethod", "FIXED_MIDDLE_COMMON_CHRONOLOGICAL_OPERATION_INTERVAL_V6");
             inputs.put("steadyProfileRows", BenchmarkWorkloadDefinitions.STEADY_PILOT_ROWS);
             inputs.put("loadDiagnosticsEnabled", Boolean.getBoolean("tapstate.e2e.benchmark.load-diagnostics"));
             report.begin(inputs, environment, workloads(steadyWorkloads));
@@ -461,7 +461,7 @@ class PipelineBenchmarkLiveRunIT {
                 "durationNanos", phase.completedAckAtNanos() - phase.firstIssuedAtNanos(),
                 "throughputRecordsPerSecond", phase.confirmationTiming().isPresent()
                         ? phase.recordsOutPerSecond() : null,
-                "throughputMethod", phase.steadyOutputProfile() ? "FIXED_MIDDLE_COMMON_OPERATION_INTERVAL_V5" : "SOURCE_ISSUE_TO_OBSERVED_TARGET_V2",
+                "throughputMethod", phase.steadyOutputProfile() ? "FIXED_MIDDLE_COMMON_CHRONOLOGICAL_OPERATION_INTERVAL_V6" : "SOURCE_ISSUE_TO_OBSERVED_TARGET_V2",
                 "steadyStateEstablished", phase.steadyOutputEstablished(),
                 "steadyOutputRule", "COMMON_ACTIVE_INTERVAL_TEN_PROGRESS_BINS_HALF_TREND_AT_MOST_5_PERCENT",
                 "throughputWindowScope", "COMMON_ACTIVE_TARGET_INTERVAL_OPEN_START_CLOSED_END",

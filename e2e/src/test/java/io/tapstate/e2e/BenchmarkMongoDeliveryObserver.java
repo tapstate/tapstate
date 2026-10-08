@@ -95,20 +95,18 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
     private long readNanos;
     private long acceptNanos;
     private long previousIterationEnded;
-    private final OperationClock operationClock = new OperationClock();
+    private final OperationOrder operationOrder = new OperationOrder();
 
-    static final class OperationClock {
-        private Long previous;
+    static final class OperationOrder {
+        private org.bson.BsonTimestamp previous;
 
-        boolean accept(Long current) {
-            if (current != null && previous != null && current < previous) {
-                return false;
-            }
-            if (current != null) { previous = current; }
+        boolean accept(org.bson.BsonTimestamp current) {
+            if (current == null || previous != null && current.compareTo(previous) < 0) { return false; }
+            previous = current;
             return true;
         }
 
-        Long previousWallMillis() { return previous; }
+        org.bson.BsonTimestamp previousClusterTime() { return previous; }
     }
 
     private String activePhase;
@@ -442,10 +440,10 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                     return;
                 }
                 Long operationWall = change.getWallTime() == null ? null : change.getWallTime().getValue();
-                if (!operationClock.accept(operationWall)) {
-                    fail("target operation clock moved backward within its actual change stream"
+                if (!operationOrder.accept(change.getClusterTime())) {
+                    fail("target logical operation time is missing or moved backward within its actual change stream"
                             + "; namespace=" + namespace + "; target=" + targetId + "; phase=" + activePhase
-                            + "; key=" + key + "; previousWallMillis=" + operationClock.previousWallMillis()
+                            + "; key=" + key + "; previousClusterTime=" + operationOrder.previousClusterTime()
                             + "; currentWallMillis=" + operationWall + "; clusterTime=" + change.getClusterTime()
                             + "; observedAtNanos=" + observedAtNanos, null); return;
                 }

@@ -6,6 +6,29 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class BenchmarkSteadyOutputWindowTest {
+    @Test void ordinaryConcurrentOperationsKeepTheirExactTemporalCohortDespiteAdjacentWallTimeInversions() {
+        var ordered = new ArrayList<Long>();
+        for (int i = 0; i < 12_000; i++) { ordered.add(1_000_000L + i); }
+        var nativeOrder = new ArrayList<>(ordered);
+        java.util.Collections.swap(nativeOrder, 0, 1);
+        java.util.Collections.swap(nativeOrder, 499, 500);
+        java.util.Collections.swap(nativeOrder, 11_998, 11_999);
+        assertThat(BenchmarkSteadyOutputWindow.readServerOperations(nativeOrder))
+                .as("logical operation order may interleave independently sampled wall dates by one millisecond")
+                .isEqualTo(BenchmarkSteadyOutputWindow.readServerOperations(ordered));
+    }
+
+    @Test void fixedCommonOperationBoundsUseEveryOriginalTimestampRatherThanTheLogicalStreamEndpoints() {
+        var ordered = new ArrayList<Long>();
+        for (int i = 0; i < 12_000; i++) { ordered.add(1_000_000L + i); }
+        var nativeOrder = new ArrayList<>(ordered);
+        java.util.Collections.swap(nativeOrder, 0, 1);
+        java.util.Collections.swap(nativeOrder, 11_998, 11_999);
+        var second = ordered.stream().map(value -> value + 7).toList();
+        assertThat(BenchmarkSteadyOutputWindow.readCommonOperations(java.util.List.of(nativeOrder, second)))
+                .isEqualTo(BenchmarkSteadyOutputWindow.readCommonOperations(java.util.List.of(ordered, second)));
+    }
+
     @Test void rejectedTrendStillRetainsTheCompleteMeasuredReading() {
         var stream = trendTimeline(10_501);
         var reading = BenchmarkSteadyOutputWindow.readCommonOperations(java.util.List.of(stream), false);
@@ -55,13 +78,14 @@ class BenchmarkSteadyOutputWindowTest {
                 .isInstanceOf(AssertionError.class).hasMessageContaining("trend");
     }
 
-    @Test void missingOperationTimeCannotEraseAnAlreadyObservedClockValue() {
-        var clock = new BenchmarkMongoDeliveryObserver.OperationClock();
-        assertThat(clock.accept(2_000L)).isTrue();
-        assertThat(clock.accept(null)).isTrue();
-        assertThat(clock.accept(1_500L)).isFalse();
-        assertThat(clock.accept(2_000L)).isTrue();
-        assertThat(clock.accept(2_001L)).isTrue();
+    @Test void missingLogicalTimeCannotEraseAnAlreadyObservedOperationOrder() {
+        var order = new BenchmarkMongoDeliveryObserver.OperationOrder();
+        assertThat(order.accept(new org.bson.BsonTimestamp(2_000, 1))).isTrue();
+        assertThat(order.accept(null)).isFalse();
+        assertThat(order.accept(new org.bson.BsonTimestamp(1_500, 1))).isFalse();
+        assertThat(order.accept(new org.bson.BsonTimestamp(2_000, 0))).isFalse();
+        assertThat(order.accept(new org.bson.BsonTimestamp(2_000, 1))).isTrue();
+        assertThat(order.accept(new org.bson.BsonTimestamp(2_000, 2))).isTrue();
     }
 
     private static java.util.List<Long> trendTimeline(int late) {
@@ -104,12 +128,18 @@ class BenchmarkSteadyOutputWindowTest {
         var missing = new ArrayList<>(operations); missing.set(500, null);
         assertThatThrownBy(()->BenchmarkSteadyOutputWindow.readServerOperations(missing)).isInstanceOf(AssertionError.class).hasMessageContaining("unavailable");
         var backward = new ArrayList<>(operations); backward.set(500, operations.get(499)-1);
-        assertThatThrownBy(()->BenchmarkSteadyOutputWindow.readServerOperations(backward)).isInstanceOf(AssertionError.class).hasMessageContaining("backward");
+        assertThat(BenchmarkSteadyOutputWindow.readServerOperations(backward).completedDeliveries()).isEqualTo(11_999);
+        var observedBackward = new ArrayList<>(observed); observedBackward.set(500, observed.get(499)-1);
+        assertThatThrownBy(() -> BenchmarkSteadyOutputWindow.readOperationCohort(operations, observedBackward))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("local observed delivery cohort moved backward");
     }
-    @Test void eachStreamMustBeOrderedBeforeAValidCrossStreamMerge() {
+    @Test void chronologicalMergePreservesEveryOperationAndRejectsMissingWallTime() {
         assertThat(BenchmarkSteadyOutputWindow.mergeValidatedOperationStreams(java.util.List.of(java.util.List.of(1L,3L),java.util.List.of(2L,4L))))
                 .containsExactly(1L,2L,3L,4L);
-        assertThatThrownBy(()->BenchmarkSteadyOutputWindow.mergeValidatedOperationStreams(java.util.List.of(java.util.List.of(3L,1L),java.util.List.of(2L,4L))))
-                .isInstanceOf(AssertionError.class).hasMessageContaining("before stream merge");
+        assertThat(BenchmarkSteadyOutputWindow.mergeValidatedOperationStreams(java.util.List.of(java.util.List.of(3L,1L),java.util.List.of(2L,4L))))
+                .containsExactly(1L,2L,3L,4L);
+        var missing = new ArrayList<Long>(); missing.add(3L); missing.add(null);
+        assertThatThrownBy(() -> BenchmarkSteadyOutputWindow.mergeValidatedOperationStreams(java.util.List.of(missing)))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("missing");
     }
 }

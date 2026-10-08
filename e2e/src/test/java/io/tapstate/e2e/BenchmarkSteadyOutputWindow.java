@@ -51,7 +51,9 @@ final class BenchmarkSteadyOutputWindow {
 
     static Reading readServerOperations(List<Long> wallMillis) {
         if (wallMillis.stream().anyMatch(java.util.Objects::isNull)) { throw new AssertionError("target operation timeline is unavailable"); }
-        var nanos = wallMillis.stream().map(value -> Math.multiplyExact(value, 1_000_000L)).toList();
+        // Logical oplog order is validated by the observer. Concurrent writes independently sample
+        // server wall dates, so temporal bins use every original timestamp in chronological order.
+        var nanos = wallMillis.stream().sorted().map(value -> Math.multiplyExact(value, 1_000_000L)).toList();
         return read(nanos);
     }
 
@@ -74,9 +76,8 @@ final class BenchmarkSteadyOutputWindow {
         if (merged.size() < 10_000 || merged.size() > 96_000 || streams.stream().anyMatch(List::isEmpty)) {
             throw new AssertionError("common operation streams lack their bounded cohorts");
         }
-        long first = streams.stream().mapToLong(List::getFirst).max().orElseThrow();
-        long last = streams.stream().mapToLong(List::getLast).min().orElseThrow();
-        if (last <= first) { throw new AssertionError("target output streams have no common interval"); }
+        var interval = commonIntervalMillis(streams);
+        long first = interval.first(), last = interval.last();
         return readWindow(merged.stream().map(value -> Math.multiplyExact(value, 1_000_000L)).toList(),
                 Math.multiplyExact(first, 1_000_000L), Math.multiplyExact(last, 1_000_000L), qualify);
     }
@@ -98,12 +99,31 @@ final class BenchmarkSteadyOutputWindow {
         var merged = new ArrayList<Long>();
         for (List<Long> stream : streams) {
             for (int i=0;i<stream.size();i++) {
-                if (stream.get(i)==null || i>0 && stream.get(i)<stream.get(i-1)) {
-                    throw new AssertionError("target operation clock is missing or moved backward before stream merge");
+                if (stream.get(i)==null) {
+                    throw new AssertionError("target operation clock is missing before stream merge");
                 }
             }
             merged.addAll(stream);
         }
         merged.sort(Long::compare); return List.copyOf(merged);
+    }
+
+    record ServerInterval(long first, long last) { }
+
+    static ServerInterval commonIntervalMillis(List<List<Long>> streams) {
+        if (streams.isEmpty() || streams.size() > 2 || streams.stream().anyMatch(List::isEmpty)) {
+            throw new AssertionError("operation stream set differs from fixed targets");
+        }
+        long first = Long.MIN_VALUE, last = Long.MAX_VALUE;
+        for (List<Long> stream : streams) {
+            long minimum = Long.MAX_VALUE, maximum = Long.MIN_VALUE;
+            for (Long value : stream) {
+                if (value == null) { throw new AssertionError("target operation clock is missing before stream merge"); }
+                minimum = Math.min(minimum, value); maximum = Math.max(maximum, value);
+            }
+            first = Math.max(first, minimum); last = Math.min(last, maximum);
+        }
+        if (last <= first) { throw new AssertionError("target output streams have no common interval"); }
+        return new ServerInterval(first, last);
     }
 }

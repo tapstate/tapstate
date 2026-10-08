@@ -575,8 +575,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 cohort.stream().map(BenchmarkMongoDeliveryObserver.Delivery::observedAtNanos).sorted().toList(),
                 deliveries.stream().map(BenchmarkMongoDeliveryObserver.Delivery::observedAtNanos).sorted().toList(),
                 BenchmarkSteadyOutputWindow.mergeValidatedOperationStreams(operationStreams), operationStreams);
-        long commonFirst = operationStreams.stream().mapToLong(List::getFirst).max().orElseThrow();
-        long commonLast = operationStreams.stream().mapToLong(List::getLast).min().orElseThrow();
+        var commonInterval = BenchmarkSteadyOutputWindow.commonIntervalMillis(operationStreams);
+        long commonFirst = commonInterval.first(), commonLast = commonInterval.last();
         Optional<BenchmarkTargetClock.LocalWindow> resourceWindow = targetClockBefore == null ? Optional.empty()
                 : Optional.of(BenchmarkTargetClock.mapWindow(targetClockBefore, targetClockAfter,
                         commonFirst, commonLast));
