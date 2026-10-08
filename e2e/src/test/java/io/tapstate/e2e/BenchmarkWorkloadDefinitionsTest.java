@@ -17,6 +17,85 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /** The same frozen workload definitions are consumed by both application jars. */
 class BenchmarkWorkloadDefinitionsTest {
+    @Test void fullSettlingKeepsEveryProtocolMarkerOutWhileWarmingTheWholeFixedCohort() {
+        var workload = BenchmarkWorkloadDefinitions.cdcFullSettlingCalibration("copy");
+        var chain = workload.sourceChains().getFirst();
+        long probe = BenchmarkPreflightWrites.warmupRowId(workload, chain);
+        long boundary = BenchmarkBoundaryWrites.forChain(workload, chain).rowId();
+        var ends = BenchmarkMeasuredEndMarkers.forChain(workload, chain).values();
+        assertThat(ends).containsExactly(96_000L);
+        var protectedRows = new HashSet<Long>(ends);
+        protectedRows.add(probe);
+        protectedRows.add(boundary);
+        assertThat(protectedRows).allSatisfy(row ->
+                assertThat(workload.inFixedCohort(Long.toString(row))).isFalse());
+        for (String phaseId : List.of("cdc-settling-raised", "cdc-settling-restored")) {
+            var phase = workload.phase(phaseId);
+            assertThat(phase.expectedLogicalOutputChanges()).isEqualTo(95_997L);
+            assertThat(phase.sql()).allSatisfy(sql -> {
+                assertThat(sql).contains("id NOT IN (");
+                int begin = sql.indexOf("id NOT IN (") + "id NOT IN (".length();
+                int end = sql.indexOf(')', begin);
+                var excluded = java.util.Arrays.stream(sql.substring(begin, end).split(","))
+                        .map(String::trim).map(Long::valueOf).collect(java.util.stream.Collectors.toSet());
+                assertThat(excluded).containsAll(protectedRows);
+                assertThat(excluded).allSatisfy(row ->
+                        assertThat(workload.inFixedCohort(Long.toString(row))).isFalse());
+            });
+        }
+        assertThat(BenchmarkWorkloadDefinitions.cdcSettlingCalibration("copy")
+                .phase("cdc-settling-raised").expectedLogicalOutputChanges()).isEqualTo(23_998L);
+    }
+    @Test void largerSetupDoesNotExtendMeasuredOrTerminalCompletionBudgets() {
+        var original = BenchmarkWorkloadDefinitions.byId("copy");
+        assertThat(BenchmarkForkEnvironment.targetWait(original, original.phase("snapshot")))
+                .isEqualTo(Duration.ofMinutes(5));
+        assertThat(BenchmarkForkEnvironment.targetWait(original, original.phase("warm-up")))
+                .isEqualTo(Duration.ofMinutes(5));
+        var full = BenchmarkWorkloadDefinitions.cdcFullSettlingCalibration("copy");
+        for (String id : List.of("snapshot", "warm-up", "cdc-settling-raised", "cdc-settling-restored")) {
+            assertThat(BenchmarkForkEnvironment.targetWait(full, full.phase(id)))
+                    .isEqualTo(Duration.ofMinutes(40));
+        }
+        for (String id : List.of("cdc-update", "terminal")) {
+            assertThat(BenchmarkForkEnvironment.targetWait(full, full.phase(id)))
+                    .isEqualTo(Duration.ofMinutes(5));
+        }
+    }
+    @Test void fullCopyCdcSettlingRestoresTheOriginalMeasuredInputAndKeepsDiagnosticProfilesSeparate() {
+        var original = BenchmarkWorkloadDefinitions.steadyPilot("copy");
+        var diagnostic = BenchmarkWorkloadDefinitions.cdcFullSettlingCalibration("copy");
+        assertThat(diagnostic.setupSql()).isEqualTo(original.setupSql());
+        assertThat(diagnostic.sourceChains()).isEqualTo(original.sourceChains());
+        assertThat(diagnostic.phase("snapshot")).isEqualTo(original.phase("snapshot"));
+        assertThat(diagnostic.phase("warm-up")).isEqualTo(original.phase("warm-up"));
+        assertThat(diagnostic.phase("cdc-update")).isEqualTo(original.phase("cdc-update"));
+        assertThat(diagnostic.phase("terminal")).isEqualTo(original.phase("terminal"));
+        var chain = diagnostic.sourceChains().getFirst();
+        long probe = BenchmarkPreflightWrites.warmupRowId(diagnostic, chain);
+        long boundary = BenchmarkBoundaryWrites.forChain(diagnostic, chain).rowId();
+        long measuredEnd = BenchmarkMeasuredEndMarkers.forChain(diagnostic, chain).get("cdc-update");
+        long excluded = java.util.stream.LongStream.of(probe, boundary, measuredEnd).distinct()
+                .filter(id -> id >= 1 && id <= diagnostic.rows()).count();
+        for (String id : List.of("cdc-settling-raised", "cdc-settling-restored")) {
+            var phase = diagnostic.phase(id);
+            assertThat(phase.measured()).isFalse();
+            assertThat(phase.expectedLogicalOutputChanges()).isEqualTo(diagnostic.rows() - excluded);
+            assertThat(phase.sql()).hasSize(960).allSatisfy(sql ->
+                    assertThat(sql).contains("id NOT IN (" + probe + "," + boundary + "," + measuredEnd + ")"));
+        }
+        assertThat(diagnostic.phase("cdc-settling-raised").targets())
+                .isNotEqualTo(original.phase("warm-up").targets());
+        assertThat(diagnostic.phase("cdc-settling-restored").targets())
+                .isEqualTo(original.phase("warm-up").targets());
+        assertThat(original.phases()).hasSize(4);
+        assertThat(BenchmarkWorkloadDefinitions.cdcSettlingCalibration("copy")
+                .phase("cdc-settling-raised").sql()).hasSize(240);
+        for (String id : List.of("stateless", "stateful")) {
+            org.assertj.core.api.Assertions.assertThatIllegalArgumentException()
+                    .isThrownBy(() -> BenchmarkWorkloadDefinitions.cdcFullSettlingCalibration(id));
+        }
+    }
     @Test void copySettlingUsesOnlyTheUnmeasuredFirstQuarterAndRestoresTheExactMeasuredStart() {
         var pilot = BenchmarkWorkloadDefinitions.cdcSettlingCalibration("copy");
         assertThat(pilot.phase("cdc-settling-raised").measured()).isFalse();

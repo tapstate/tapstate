@@ -74,7 +74,13 @@ final class BenchmarkWorkloadDefinitions {
     /** An explicit diagnostic candidate; it cannot silently change the formal workload profile. */
     static Workload cdcSettlingCalibration(String id) {
         if (!COPY.equals(id)) { throw new IllegalArgumentException("first-quarter settling calibration only supports copy"); }
-        return copy(STEADY_PILOT_ROWS, true);
+        return copy(STEADY_PILOT_ROWS, 24_000);
+    }
+
+    /** One fixed, reversible full-data CDC warm-up candidate, isolated from formal profiles. */
+    static Workload cdcFullSettlingCalibration(String id) {
+        if (!COPY.equals(id)) { throw new IllegalArgumentException("full CDC settling calibration only supports copy"); }
+        return copy(STEADY_PILOT_ROWS, STEADY_PILOT_ROWS);
     }
 
     static Workload pacedCalibration(String id) {
@@ -285,9 +291,9 @@ final class BenchmarkWorkloadDefinitions {
 
     private static Workload copy() { return copy(SNAPSHOT_ROWS); }
 
-    private static Workload copy(int rows) { return copy(rows, false); }
+    private static Workload copy(int rows) { return copy(rows, 0); }
 
-    private static Workload copy(int rows, boolean settlingCalibration) {
+    private static Workload copy(int rows, int settlingRows) {
         SourceChain orders = chain(COPY_PIPELINE, "src_bench_copy", COPY_TABLE, 900_001);
         List<String> setup = new ArrayList<>();
         setup.add("CREATE TABLE " + COPY_TABLE
@@ -310,21 +316,30 @@ final class BenchmarkWorkloadDefinitions {
                         List.of("INSERT INTO " + COPY_TABLE
                                 + " (id,amount,payload,marker) VALUES (900001,7,'terminal','copy-orders-terminal')"),
                         Map.of(orders.terminalLogicalId(), 1L), copyTarget(3, rows)));
-        if (rows == STEADY_PILOT_ROWS && settlingCalibration) {
+        if (rows == STEADY_PILOT_ROWS && settlingRows > 0) {
             Workload base = new Workload(COPY, SEED, rows, Database.MYSQL, List.of(COPY_PIPELINE), List.of(orders), setup, phases);
             long probe = BenchmarkPreflightWrites.warmupRowId(base, orders);
             long boundary = BenchmarkBoundaryWrites.forChain(base, orders).rowId();
-            long excluded = java.util.stream.LongStream.of(probe, boundary).distinct()
-                    .filter(value -> value >= 1 && value <= 24_000).count();
-            long warmRows = 24_000 - excluded;
-            String exclude = " AND id NOT IN (" + probe + "," + boundary + ")";
+            var protectedRows = java.util.stream.LongStream.concat(
+                    java.util.stream.LongStream.of(probe, boundary),
+                    BenchmarkMeasuredEndMarkers.forChain(base, orders).values().stream()
+                            .mapToLong(Long::longValue).filter(id -> id >= 1 && id <= settlingRows))
+                    .distinct().boxed().toList();
+            if (protectedRows.stream().anyMatch(id -> base.inFixedCohort(Long.toString(id)))) {
+                throw new IllegalStateException("settling protocol markers must stay outside the fixed cohort");
+            }
+            long excluded = protectedRows.stream().mapToLong(Long::longValue)
+                    .filter(value -> value >= 1 && value <= settlingRows).count();
+            long warmRows = settlingRows - excluded;
+            String exclude = " AND id NOT IN (" + protectedRows.stream().map(String::valueOf)
+                    .collect(java.util.stream.Collectors.joining(",")) + ")";
             var prepared = new ArrayList<Phase>();
             prepared.addAll(phases.subList(0, 2));
             prepared.add(phase("cdc-settling-raised", Stage.WARM_UP, false, warmRows,
-                    updates(COPY_TABLE, "amount = amount + 1", 1, 24_000, 100, exclude),
-                    coverage(orders, "cdc-settling-raised", warmRows), copyWarmTarget(rows, probe, boundary)));
+                    updates(COPY_TABLE, "amount = amount + 1", 1, settlingRows, 100, exclude),
+                    coverage(orders, "cdc-settling-raised", warmRows), copyWarmTarget(rows, protectedRows, settlingRows)));
             prepared.add(phase("cdc-settling-restored", Stage.WARM_UP, false, warmRows,
-                    updates(COPY_TABLE, "amount = amount - 1", 1, 24_000, 100, exclude),
+                    updates(COPY_TABLE, "amount = amount - 1", 1, settlingRows, 100, exclude),
                     coverage(orders, "cdc-settling-restored", warmRows), copyTarget(1, rows)));
             prepared.addAll(phases.subList(2, phases.size()));
             phases = List.copyOf(prepared);
@@ -661,11 +676,11 @@ final class BenchmarkWorkloadDefinitions {
                 Projection.COPY, lines.size(), checksum(lines));
     }
 
-    private static TargetExpectation copyWarmTarget(int rows, long probe, long boundary) {
+    private static TargetExpectation copyWarmTarget(int rows, List<Long> protectedRows, int settlingRows) {
         var lines = new ArrayList<String>();
         for (int id = 1; id <= rows; id++) {
             long amount = copyAmount(id) + (id <= 128 ? 1 : 0)
-                    + (id <= 24_000 && id != probe && id != boundary ? 1 : 0);
+                    + (id <= settlingRows && !protectedRows.contains((long) id) ? 1 : 0);
             lines.add(copyLine(id, amount, "payload-" + id, ""));
         }
         return new TargetExpectation(COPY_PIPELINE, TargetLocation.EXTERNAL_MONGO, COPY_TABLE,

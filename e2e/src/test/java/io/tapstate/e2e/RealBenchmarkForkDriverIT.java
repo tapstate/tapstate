@@ -62,11 +62,14 @@ class RealBenchmarkForkDriverIT {
             boolean pilot = Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot");
             boolean pacedCalibration = Boolean.getBoolean("tapstate.e2e.benchmark-smoke.paced-calibration");
             boolean settlingCalibration = Boolean.getBoolean("tapstate.e2e.benchmark-smoke.cdc-settling-calibration");
+            boolean fullSettlingCalibration = Boolean.getBoolean("tapstate.e2e.benchmark-smoke.full-cdc-settling-calibration");
             if (pacedCalibration && !pilot) { throw new AssertionError("paced calibration requires the declared larger profile"); }
-            if (settlingCalibration && (!pilot || pacedCalibration)) {
+            if ((settlingCalibration || fullSettlingCalibration)
+                    && (!pilot || pacedCalibration || (settlingCalibration && fullSettlingCalibration))) {
                 throw new AssertionError("settling calibration requires the original larger schedule and cannot mix calibrations");
             }
-            var workload = settlingCalibration ? BenchmarkWorkloadDefinitions.cdcSettlingCalibration(workloadId)
+            var workload = fullSettlingCalibration ? BenchmarkWorkloadDefinitions.cdcFullSettlingCalibration(workloadId)
+                    : settlingCalibration ? BenchmarkWorkloadDefinitions.cdcSettlingCalibration(workloadId)
                     : pacedCalibration ? BenchmarkWorkloadDefinitions.pacedCalibration(workloadId)
                     : pilot ? BenchmarkWorkloadDefinitions.steadyPilot(workloadId)
                     : BenchmarkWorkloadDefinitions.byId(workloadId);
@@ -74,7 +77,8 @@ class RealBenchmarkForkDriverIT {
                     workload, arm,
                     forkNumber, applicationJar);
             System.out.println("benchmark-source-schedule=" + JsonWriter.write(Map.of(
-                    "profile", settlingCalibration ? "FIXED_FIRST_QUARTER_CDC_SETTLING_CALIBRATION"
+                    "profile", fullSettlingCalibration ? "FIXED_FULL_CDC_SETTLING_CALIBRATION"
+                            : settlingCalibration ? "FIXED_FIRST_QUARTER_CDC_SETTLING_CALIBRATION"
                             : pacedCalibration ? "FIXED_PACING_CALIBRATION_5MS_50MS" : "ORIGINAL_BATCH_SCHEDULE",
                     "rows", workload.rows(), "phases", workload.phases().stream().filter(
                             BenchmarkWorkloadDefinitions.Phase::measured).map(phase -> Map.of(

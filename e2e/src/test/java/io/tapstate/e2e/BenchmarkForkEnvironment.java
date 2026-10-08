@@ -427,29 +427,59 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
         return List.copyOf(results);
     }
 
+    /** Only larger non-measured setup scales with its fixed source population. */
+    static Duration targetWait(BenchmarkWorkloadDefinitions.Workload workload,
+            BenchmarkWorkloadDefinitions.Phase phase) {
+        if (phase.measured() || (phase.stage() != BenchmarkWorkloadDefinitions.Stage.SNAPSHOT
+                && phase.stage() != BenchmarkWorkloadDefinitions.Stage.WARM_UP)) {
+            return TARGET_WAIT;
+        }
+        long populations = Math.max(1L, (workload.rows() + BenchmarkWorkloadDefinitions.SNAPSHOT_ROWS - 1L)
+                / BenchmarkWorkloadDefinitions.SNAPSHOT_ROWS);
+        return TARGET_WAIT.multipliedBy(populations);
+    }
+
     private List<TargetResult> awaitTargets(BenchmarkWorkloadDefinitions.Phase phase) throws Exception {
-        long deadline = System.nanoTime() + TARGET_WAIT.toNanos();
+        Duration budget = targetWait(workload, phase);
+        long started = System.nanoTime();
+        long deadline = started + budget.toNanos();
+        int rounds = 0;
+        boolean matched = false;
         List<TargetResult> latest;
-        do {
-            latest = phase.targets().stream().map(this::readTarget).toList();
-            if (latest.stream().allMatch(TargetResult::matches)) {
-                return latest;
-            }
-            if (System.nanoTime() >= deadline) {
-                String timeout = "fork " + forkId + " phase " + phase.id()
-                        + " did not reach target count/checksum: " + latest;
-                if (workload.id().equals("stateful")
-                        && phase.stage() == BenchmarkWorkloadDefinitions.Stage.COLD_READ) {
-                    try {
-                        timeout += "; " + nestColdReadDiagnostics(phase);
-                    } catch (RuntimeException | AssertionError diagnosticFailure) {
-                        timeout += "; nest diagnostic unavailable: " + diagnosticFailure;
-                    }
+        try {
+            do {
+                rounds++;
+                latest = phase.targets().stream().map(this::readTarget).toList();
+                if (latest.stream().allMatch(TargetResult::matches)) {
+                    matched = true;
+                    return latest;
                 }
-                throw new AssertionError(timeout);
+                if (System.nanoTime() >= deadline) {
+                    String timeout = "fork " + forkId + " phase " + phase.id()
+                            + " did not reach target count/checksum: " + latest;
+                    if (workload.id().equals("stateful")
+                            && phase.stage() == BenchmarkWorkloadDefinitions.Stage.COLD_READ) {
+                        try {
+                            timeout += "; " + nestColdReadDiagnostics(phase);
+                        } catch (RuntimeException | AssertionError diagnosticFailure) {
+                            timeout += "; nest diagnostic unavailable: " + diagnosticFailure;
+                        }
+                    }
+                    throw new AssertionError(timeout);
+                }
+                TimeUnit.NANOSECONDS.sleep(TARGET_POLL.toNanos());
+            } while (true);
+        } finally {
+            if (!phase.measured() && (phase.stage() == BenchmarkWorkloadDefinitions.Stage.SNAPSHOT
+                    || phase.stage() == BenchmarkWorkloadDefinitions.Stage.WARM_UP)) {
+                // This is a polling budget between complete reads, not a server command timeout.
+                System.out.println("benchmark-setup-target-wait=" + io.tapstate.core.common.JsonWriter.write(Map.of(
+                        "fork", forkId, "phase", phase.id(), "rows", workload.rows(),
+                        "pollingBudgetNanos", budget.toNanos(), "elapsedNanos", System.nanoTime() - started,
+                        "targetReadRounds", rounds, "matched", matched,
+                        "performanceAcceptanceEligible", false)));
             }
-            TimeUnit.NANOSECONDS.sleep(TARGET_POLL.toNanos());
-        } while (true);
+        }
     }
 
     /** Read only on timeout: distinguish absent cold children from a wrong value on complete roots. */
