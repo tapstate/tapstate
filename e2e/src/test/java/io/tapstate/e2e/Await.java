@@ -47,7 +47,7 @@ final class Await {
                 throw new AssertionError("timed out after " + Duration.ofNanos(System.nanoTime() - start)
                         + " (bound " + bound + ") waiting for " + what + "; last read " + lastReading.get());
             }
-            sleep();
+            sleep(POLL);
         }
     }
 
@@ -64,6 +64,12 @@ final class Await {
 
     /** The same with a bound of the caller's own. See {@link #until(String, Duration, BooleanSupplier, Supplier)}. */
     static <T> T answered(String what, Duration bound, Supplier<Optional<T>> reading) {
+        return answered(what, bound, POLL, reading);
+    }
+
+    /** A caller may preserve its already declared point-read cadence without creating another wait primitive. */
+    static <T> T answered(String what, Duration bound, Duration poll, Supplier<Optional<T>> reading) {
+        if (poll.isZero() || poll.isNegative()) { throw new IllegalArgumentException("a poll cadence is positive"); }
         long start = System.nanoTime();
         long deadline = start + bound.toNanos();
         while (true) {
@@ -75,13 +81,13 @@ final class Await {
                 throw new AssertionError("timed out after " + Duration.ofNanos(System.nanoTime() - start)
                         + " (bound " + bound + ") waiting for " + what + "; nothing was ever answered");
             }
-            sleep();
+            sleep(poll);
         }
     }
 
-    private static void sleep() {
+    private static void sleep(Duration poll) {
         try {
-            Thread.sleep(POLL.toMillis());
+            Thread.sleep(poll.toMillis());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new AssertionError("interrupted while waiting for a condition", e);

@@ -29,8 +29,8 @@ class PreExecutionFailureUpgradeGateIT {
             assertThat(SystemCollections.SYSTEM_META.on(db).find(new Document("_id", "schema")).first().getInteger("installedVersion")).isEqualTo(18);
         }
         try (var old = RealProcessServer.launching(uri, previous)) {
-            long until = System.nanoTime() + Duration.ofSeconds(30).toNanos();
-            while (old.isAlive() && System.nanoTime() < until) { Thread.sleep(100); }
+            Await.answered("the previous binary to finish its version refusal", Duration.ofSeconds(30), Duration.ofMillis(100),
+                    () -> old.isAlive() ? java.util.Optional.empty() : java.util.Optional.of(old.exitValue()));
             assertThat(old.isAlive()).isFalse();
             assertThat(old.exitValue()).isNotZero();
             String output = Files.readString(old.output());

@@ -9,7 +9,6 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
 
 /** Binds frozen source markers to their own table log and every persisted target writer. */
 final class BenchmarkTableCaptureSet implements AutoCloseable {
@@ -90,7 +89,8 @@ final class BenchmarkTableCaptureSet implements AutoCloseable {
         if (left <= 0) { throw new AssertionError("table confirmation deadline expired before its marker"); }
         var point = observer.await(marker, Duration.ofNanos(left));
         if (point.epoch() != source.epoch()) { throw new AssertionError("source capture generation changed within fork"); }
-        while (true) {
+        return Await.answered("every target writer to confirm the exact table marker",
+                Duration.ofNanos(deadline - System.nanoTime()), Duration.ofMillis(100), () -> {
             observer.check();
             var association = physical(fork.control().positionRead(chain.pipelineId()), chain);
             Document root = documents.chain(source.physical());
@@ -120,11 +120,10 @@ final class BenchmarkTableCaptureSet implements AutoCloseable {
                 receipts.add(Map.of("proofKind", "TABLE_ORDER", "markerId", marker, "ring", point.ring(),
                         "epoch", point.epoch(), "seq", point.seq(), "actualConsumerId", source.binding().consumer(),
                         "expectedWriters", source.binding().writers(), "readConsistency", "SEQUENTIAL_POINT_READS"));
-                return new Result(source, point, cursor);
+                return java.util.Optional.of(new Result(source, point, cursor));
             }
-            if (System.nanoTime() >= deadline) { throw new AssertionError("not every target writer confirmed the exact table marker"); }
-            TimeUnit.MILLISECONDS.sleep(100);
-        }
+            return java.util.Optional.empty();
+        });
     }
 
     List<Map<String, Object>> receipts() {

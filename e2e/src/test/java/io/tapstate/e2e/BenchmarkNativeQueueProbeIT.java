@@ -20,12 +20,10 @@ class BenchmarkNativeQueueProbeIT {
             fork.runPhase(workload.phases().getFirst(), true);
             try (var probe = new BenchmarkNativeQueueProbe(fork.control(), fork.server().baseUrl().toString(), "tapstate",
                     new com.hazelcast.config.MetricsConfig().getCollectionFrequencySeconds())) {
-                var sample = probe.read(workload.pipelineIds().getFirst());
-                long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
-                while ("UNKNOWN".equals(sample.get("state")) && System.nanoTime() < deadline) {
-                    java.util.concurrent.TimeUnit.MILLISECONDS.sleep(250);
-                    sample = probe.read(workload.pipelineIds().getFirst());
-                }
+                var sample = Await.answered("the actual native queue roster", java.time.Duration.ofSeconds(10), () -> {
+                    var current = probe.read(workload.pipelineIds().getFirst());
+                    return "UNKNOWN".equals(current.get("state")) ? java.util.Optional.empty() : java.util.Optional.of(current);
+                });
                 assertThat(sample).containsEntry("pipeline", workload.pipelineIds().getFirst());
                 assertThat(sample).as("native queue family must actually be available for load qualification")
                         .containsEntry("state", "RECORDED");
