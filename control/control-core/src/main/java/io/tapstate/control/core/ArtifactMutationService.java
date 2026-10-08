@@ -253,7 +253,7 @@ public final class ArtifactMutationService {
         // A read-only inventory may omit a row this build cannot reconstruct. A destructive check may
         // not: without the resource, its references are unknown rather than absent, so the strict list
         // fails closed before any audit record or deletion is written.
-        refuseWhenReferenced(id, store.list());
+        refuseWhenReferenced(target, store.list());
         if (target instanceof PipelineResource) {
             refuseWhenNotStopped(id);
         }
@@ -430,10 +430,11 @@ public final class ArtifactMutationService {
         }
     }
 
-    private void refuseWhenReferenced(String id, List<Resource> stored) {
+    private void refuseWhenReferenced(Resource target, List<Resource> stored) {
+        String id = target.id();
         Set<String> referrers = new TreeSet<>();
         ReferenceGraph.of(stored).referencedBy(id).forEach(edge -> referrers.add(edge.id()));
-        if (ManagedViewStore.SOURCE_ID.equals(id)) {
+        if (target instanceof SourceResource && ManagedViewStore.SOURCE_ID.equals(id)) {
             // Inline and reusable views both materialize into this source without naming it.
             // The dependency exists even when the declaring pipeline has never run.
             for (Resource resource : stored) {

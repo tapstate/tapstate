@@ -1,6 +1,8 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.dsl.ReferenceGraph;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.CasOutcome;
@@ -250,6 +252,49 @@ class ArtifactMutationServiceTest {
 
         assertThat(store.get(views.id())).isEmpty();
         assertThat(store.get("reader")).isPresent();
+    }
+
+    @Test
+    void aPipelineNamedViewsWithAnInlineViewCanBeAppliedAndDeletedAfterTheSourceIsRemoved() {
+        SourceResource views = new SourceResource(
+                ManagedViewStore.SOURCE_ID, null, "mongodb", Map.of("uri", "mongodb://mongo/views"),
+                null, null, null, null);
+        store.save(views);
+        service.delete(PRINCIPAL, views.id(), hash(views));
+        assertThat(store.get(views.id())).isEmpty();
+
+        ApplyService apply = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK),
+                new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none());
+        apply.apply(PRINCIPAL, List.of(
+                new ArtifactDraft(null, """
+                        version: tapstate/v1
+                        kind: source
+                        id: orders_src
+                        connector: mongodb
+                        config: { uri: "mongodb://mongo/orders" }
+                        mode: cdc
+                        tables: [orders]
+                        """),
+                new ArtifactDraft(null, """
+                        version: tapstate/v1
+                        kind: pipeline
+                        id: views
+                        source: orders_src
+                        view:
+                          id: order_state
+                          from: orders
+                          primary_key: id
+                        """)));
+        PipelineResource pipeline = (PipelineResource) store.get(views.id()).orElseThrow();
+        assertThat(pipeline.view()).isInstanceOf(ViewBlock.Inline.class);
+        assertThat(ReferenceGraph.of(store.list()).referencedBy(pipeline.id())).isEmpty();
+
+        service.delete(PRINCIPAL, pipeline.id(), hash(pipeline));
+
+        assertThat(store.get(pipeline.id())).isEmpty();
+        assertThat(store.get("orders_src")).isPresent();
+        assertThat(followsStopped).containsExactly(views.id());
     }
 
     @Test
