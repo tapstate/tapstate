@@ -92,6 +92,28 @@ import java.util.stream.Stream;
 @TapConnectorClass("e2e-file-spec.json")
 public class CsvConnector implements TapConnector {
 
+    /**
+     * The system property every initialization of this class appends a line to: the jar it was loaded
+     * from, and the identity of the loader that loaded it.
+     *
+     * <p>It is the observable form of what a connector binding a JNI library depends on. The JVM ties such
+     * a library to the first class loader that loads it, so a host must reach one connector artifact through
+     * one loader however many times it opens it; and a class is initialized once per loader, so one line per
+     * staged jar says it does, and a line per test, discovery or pipeline says it does not. No connector in
+     * this build can carry a native library to witness that directly. A system property crosses the
+     * isolating loader because it is the JDK's, which is all this class may touch.
+     */
+    public static final String INITIALIZATIONS = "tapstate.e2e.connector-class-initializations";
+
+    static {
+        String line = CsvConnector.class.getProtectionDomain().getCodeSource().getLocation()
+                + " " + System.identityHashCode(CsvConnector.class.getClassLoader());
+        synchronized (System.getProperties()) {
+            String recorded = System.getProperty(INITIALIZATIONS, "");
+            System.setProperty(INITIALIZATIONS, recorded.isEmpty() ? line : recorded + "\n" + line);
+        }
+    }
+
     /** The setting naming the directory this connector reads and writes: a plain filesystem path. */
     private static final String URI = "uri";
 

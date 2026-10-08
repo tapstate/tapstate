@@ -6,9 +6,9 @@ import io.tapstate.spi.store.ConnectorRegistry;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -28,6 +28,9 @@ import java.util.stream.Collectors;
  * surfaces as an unchecked I/O exception.
  */
 public final class RegistryConnectorProvisioner implements ConnectorProvisioner {
+
+    /** Held while an artifact is staged, so two resolves in this process never both write one. */
+    private static final Object STAGING = new Object();
 
     private final ConnectorRegistry registry;
     private final ConnectorIntrospector introspector;
@@ -68,29 +71,41 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
     /**
      * The path to the artifact staged under its content hash: it writes the store's bytes into the cache
      * the first time the hash is seen and reuses the file every time after, so an already-staged hash is
-     * never re-fetched. The write goes through a temp file moved into place, so a reader never sees a
+     * never re-fetched. The write goes through a temp file renamed into place, so a reader never sees a
      * half-written jar.
+     *
+     * <p>A staged file is never replaced, not even by the identical bytes of a second stager. A running
+     * server keeps one class loader per staged artifact, keyed by the file as it first found it, and a
+     * file replaced under that key reads as another artifact: the connector would then be split across two
+     * loaders, which a connector holding a native library cannot survive. So staging in this process is
+     * serialized and checks again once it holds the lock, and a file another process staged first is kept
+     * rather than renamed over.
      */
     private Path stage(String connectorId, String contentHash) {
         Path target = cacheDir.resolve(contentHash + ".jar");
         if (Files.exists(target)) {
             return target;
         }
-        byte[] bytes = registry.artifact(contentHash).orElseThrow(() ->
-                new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null));
-        try {
-            Files.createDirectories(cacheDir);
-            Path tmp = Files.createTempFile(cacheDir, contentHash, ".tmp");
-            try {
-                Files.write(tmp, bytes);
-                // Content-addressed: any concurrently-staged file under this hash holds identical bytes,
-                // so replacing it is safe.
-                Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-            } finally {
-                Files.deleteIfExists(tmp);
+        synchronized (STAGING) {
+            if (Files.exists(target)) {
+                return target;
             }
-        } catch (IOException e) {
-            throw new UncheckedIOException("staging connector artifact " + target, e);
+            byte[] bytes = registry.artifact(contentHash).orElseThrow(() ->
+                    new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null));
+            try {
+                Files.createDirectories(cacheDir);
+                Path tmp = Files.createTempFile(cacheDir, contentHash, ".tmp");
+                try {
+                    Files.write(tmp, bytes);
+                    Files.move(tmp, target);
+                } catch (FileAlreadyExistsException stagedElsewhere) {
+                    // Content-addressed: the file already there holds these same bytes, and it stays.
+                } finally {
+                    Files.deleteIfExists(tmp);
+                }
+            } catch (IOException e) {
+                throw new UncheckedIOException("staging connector artifact " + target, e);
+            }
         }
         return target;
     }
