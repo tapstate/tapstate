@@ -56,7 +56,13 @@ class RealBenchmarkForkDriverIT {
                 applicationJar, arm == PipelineBenchmarkComparison.Arm.A ? BenchmarkJdiCostObserver.Arm.REFERENCE
                         : BenchmarkJdiCostObserver.Arm.OBSERVABILITY, BenchmarkJdiCostObserver.selectedArtifactSet());
         try (artifact) {
-            RealBenchmarkForkDriver driver = mode.driver(applicationJar, artifact);
+            boolean jvmDiagnostics = Boolean.getBoolean("tapstate.e2e.benchmark-smoke.jvm-gap-diagnostics");
+            if (jvmDiagnostics && mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN) {
+                throw new AssertionError("JVM gap diagnostics require an independent plain artifact run");
+            }
+            RealBenchmarkForkDriver driver = jvmDiagnostics
+                    ? new RealBenchmarkForkDriver(BenchmarkJvmDiagnostics::start)
+                    : mode.driver(applicationJar, artifact);
             int forkNumber = Integer.parseInt(System.getProperty(FORK_PROPERTY, "1"));
             assertThat(forkNumber).as("the diagnostic fork number").isBetween(1, 5);
             boolean pilot = Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot");

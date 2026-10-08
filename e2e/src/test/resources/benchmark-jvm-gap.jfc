@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration version="2.0" label="Owned JVM gap diagnostics" description="Pause and I/O timing only" provider="Tapstate">
+  <event name="jdk.ActiveRecording">
+    <setting name="enabled">true</setting>
+    <setting name="period">beginChunk</setting>
+  </event>
+  <event name="jdk.DataLoss">
+    <setting name="enabled">true</setting>
+  </event>
+  <event name="jdk.Shutdown">
+    <setting name="enabled">true</setting>
+    <setting name="stackTrace">false</setting>
+  </event>
+  <event name="jdk.SafepointBegin">
+    <setting name="enabled">true</setting>
+    <setting name="threshold">0 ms</setting>
+  </event>
+  <event name="jdk.SafepointEnd">
+    <setting name="enabled">true</setting>
+    <setting name="threshold">0 ms</setting>
+  </event>
+  <event name="jdk.ExecuteVMOperation">
+    <setting name="enabled">true</setting>
+    <setting name="threshold">10 ms</setting>
+    <setting name="stackTrace">true</setting>
+  </event>
+  <event name="jdk.GarbageCollection">
+    <setting name="enabled">true</setting>
+    <setting name="threshold">0 ms</setting>
+  </event>
+  <event name="jdk.GCPhasePause">
+    <setting name="enabled">true</setting>
+    <setting name="threshold">0 ms</setting>
+  </event>
+  <event name="jdk.ExecutionSample">
+    <setting name="enabled">true</setting>
+    <setting name="period">20 ms</setting>
+  </event>
+  <event name="jdk.NativeMethodSample">
+    <setting name="enabled">true</setting>
+    <setting name="period">20 ms</setting>
+  </event>
+  <event name="jdk.ThreadPark">
+    <setting name="enabled">true</setting>
+    <setting name="threshold">10 ms</setting>
+    <setting name="stackTrace">true</setting>
+  </event>
+  <event name="jdk.JavaMonitorEnter">
+    <setting name="enabled">true</setting>
+    <setting name="threshold">10 ms</setting>
+    <setting name="stackTrace">true</setting>
+  </event>
+  <event name="jdk.SocketRead">
+    <setting name="enabled">true</setting>
+    <setting name="threshold">10 ms</setting>
+    <setting name="stackTrace">true</setting>
+  </event>
+  <event name="jdk.SocketWrite">
+    <setting name="enabled">true</setting>
+    <setting name="threshold">10 ms</setting>
+    <setting name="stackTrace">true</setting>
+  </event>
+  <event name="jdk.FileRead">
+    <setting name="enabled">true</setting>
+    <setting name="threshold">10 ms</setting>
+    <setting name="stackTrace">true</setting>
+  </event>
+  <event name="jdk.FileWrite">
+    <setting name="enabled">true</setting>
+    <setting name="threshold">10 ms</setting>
+    <setting name="stackTrace">true</setting>
+  </event>
+  <event name="jdk.CPULoad">
+    <setting name="enabled">true</setting>
+    <setting name="period">200 ms</setting>
+  </event>
+  <event name="jdk.ThreadCPULoad">
+    <setting name="enabled">true</setting>
+    <setting name="period">200 ms</setting>
+  </event>
+  <event name="jdk.InitialEnvironmentVariable">
+    <setting name="enabled">false</setting>
+  </event>
+  <event name="jdk.InitialSystemProperty">
+    <setting name="enabled">false</setting>
+  </event>
+  <event name="jdk.SystemProcess">
+    <setting name="enabled">false</setting>
+  </event>
+  <event name="jdk.JVMInformation">
+    <setting name="enabled">false</setting>
+  </event>
+</configuration>
