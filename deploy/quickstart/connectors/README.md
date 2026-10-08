@@ -29,17 +29,31 @@ This deployment allowance is not a certification claim: this preview certifies M
 support only. Applying a cloud pipeline whose sync names another connector is refused; reading
 through it is unaffected.
 
-Reads are verified on Oracle Free 23 and SQL Server 2022, and across the other kinds,
-with snapshot and CDC inserts, updates and deletes.
+Db2 is accepted as a source-only **preview**, outside the certified table: no release lane
+reads a live Db2 database. Snapshot, change capture of inserts, updates and deletes, and
+continuation across a server restart were verified by hand against Db2 LUW 11.5.5 in both
+change-capture modes below.
+Db2 is supported as a source only. Its connector can write, but its catalog row is not
+sink-capable, so a `serve.sync` naming a `db2` connection is refused on-prem as well as in
+the cloud profile. Change capture needs archive logging on the database and
+`DATA CAPTURE CHANGES` on each captured table. With `useNativeMiner: true` the connector reads
+the log in-process; that needs the server on Linux x86_64, running as root at least for the
+first Db2 connection, and the IBM Db2 runtime client prepared once on that host with
+`db2-native-runtime-setup.sh` from the same release. Otherwise it reads from a raw log server
+at `rawLogServerHost` and `rawLogServerPort`; that mode is experimental and not supported for
+production use.
+
+Reads are verified on Oracle Free 23 and SQL Server 2022, and across MySQL, PostgreSQL and
+MongoDB, with snapshot and CDC inserts, updates and deletes.
 Decimal validation includes a persisted MySQL DECIMAL(18,4) model, large values,
 negative fractions and CDC updates. This is not an exhaustive cross-version or
-all-data-type matrix. The default accepted set contains 16 connector ids
-across these five database kinds, including existing managed variants of MySQL,
+all-data-type matrix. The default accepted set contains 17 connector ids: the Db2 preview,
+and 16 across these five database kinds, including existing managed variants of MySQL,
 PostgreSQL and MongoDB. Except for `mongodb-atlas`, those managed variants have not been
 live-verified individually. The Atlas connector was verified with snapshot and change-stream
 reads, restart continuation, and target writes against a real Atlas deployment in the existing
 on-prem runtime; Cloud-mode verification is pending.
-Other managed variants of Oracle and SQL Server are outside the default accepted set.
+Other managed variants of Oracle, SQL Server and Db2 are outside the default accepted set.
 
 `tapstate.connectors.also-accept-ids` lets an operator accept additional connector ids
 on this server. Configuring it puts that server outside the supported configuration;
@@ -55,7 +69,7 @@ stored by an older build need schema rediscovery before automatic target creatio
 Missing or inconsistent decimal metadata is refused before writing; computed decimal
 outputs without a declared numeric domain cannot be auto-created safely.
 
-Oracle, SQL Server, MongoDB Atlas, and AWS RDS MySQL connector jars are separate assets on the floating
+Oracle, SQL Server, Db2, MongoDB Atlas, and AWS RDS MySQL connector jars are separate assets on the floating
 `connectors-preview` release. They remain outside versioned Tapstate releases and this
 three-database quickstart does not fetch them automatically. An authenticated CLI can
 download and register each one explicitly:
@@ -65,12 +79,15 @@ tapstate register oracle
 tapstate register sqlserver
 tapstate register mongodb-atlas
 tapstate register aws-rds-mysql
+tapstate register db2
 ```
 
 The Oracle jar bundles `ojdbc8`, `orai18n`, and `xdb` 21.5.0.0 under the
-Oracle Free Use Terms; the SQL Server jar bundles Microsoft JDBC Driver 12.2.0 under the MIT License.
+Oracle Free Use Terms; the SQL Server jar bundles Microsoft JDBC Driver 12.2.0 under the MIT License;
+the Db2 jar bundles IBM Data Server Driver for JDBC and SQLJ 4.25.13 under
+IBM's International Program License Agreement.
 Those dependency terms govern only the bundled drivers and do not change Tapstate's Apache-2.0
-license. The Oracle and SQL Server implementations are paid connector implementations; their use
+license. The Oracle, SQL Server and Db2 implementations are paid connector implementations; their use
 remains subject to the applicable Tapdata agreement.
 The upstream enterprise connector repository has no LICENSE file; publishing these binary
 assets does not relicense that source repository.

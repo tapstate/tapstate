@@ -62,13 +62,19 @@ class ConnectorSupportDocumentationTest {
                             "On-prem deployments may write to catalog connectors marked sink-capable",
                             "except source-only ids",
                             "Private connectors",
+                            "source-only **preview**", "outside the certified table",
+                            "verified by hand against Db2 LUW 11.5.5", "not supported for",
+                            "Db2 is supported as a source only", "refused on-prem as well as in",
+                            "DATA CAPTURE CHANGES", "useNativeMiner: true", "Linux x86_64",
+                            "db2-native-runtime-setup.sh", "raw log server",
                             "remain the operator's responsibility",
                             "This deployment allowance is not a",
                             "certification claim",
                             "Applying a cloud pipeline",
                             "whose sync names another connector is refused",
                             "Oracle Free 23", "SQL Server 2022", "DECIMAL(18,4)", "schema rediscovery",
-                            "16 connector ids", "managed variants", "Except for `mongodb-atlas`",
+                            "17 connector ids", "16 across these five database kinds",
+                            "managed variants", "Except for `mongodb-atlas`",
                             "live-verified individually", "Atlas connector was verified",
                             "Cloud-mode verification is pending", "`aws-rds-mysql`", "unverified preview",
                             "issue #529",
@@ -76,8 +82,9 @@ class ConnectorSupportDocumentationTest {
                             "server's actual accepted set", "including any additional ids",
                             "separate assets", "`connectors-preview`", "versioned Tapstate releases",
                             "register oracle", "register sqlserver", "register mongodb-atlas",
-                            "register aws-rds-mysql", "Oracle Free Use Terms",
-                            "Microsoft JDBC Driver 12.2.0", "no LICENSE file");
+                            "register aws-rds-mysql", "register db2", "Oracle Free Use Terms",
+                            "Microsoft JDBC Driver 12.2.0", "IBM Data Server Driver for JDBC and SQLJ 4.25.13",
+                            "International Program License Agreement", "no LICENSE file");
             assertThat(text).as("certification remains narrower than allowed deployment targets in %s", document)
                     .containsPattern("this preview certifies MongoDB write\\s+support only");
         }

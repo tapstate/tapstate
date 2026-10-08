@@ -22,6 +22,8 @@ final class InMemoryConnectorRegistry implements ConnectorRegistry {
     private final List<ConnectorRegistration> registrations = new ArrayList<>();
     private final Map<String, byte[]> bytesByHash = new LinkedHashMap<>();
     int artifactCalls;
+    /** Runs on every {@link #artifact} fetch before the bytes are returned; a test sets it to act mid-fetch. */
+    Runnable onArtifactFetch = () -> { };
 
     @Override
     public RegistrationOutcome register(
@@ -46,6 +48,7 @@ final class InMemoryConnectorRegistry implements ConnectorRegistry {
     @Override
     public Optional<byte[]> artifact(String contentHash) {
         artifactCalls++;
+        onArtifactFetch.run();
         byte[] bytes = bytesByHash.get(contentHash);
         return bytes == null ? Optional.empty() : Optional.of(bytes.clone());
     }

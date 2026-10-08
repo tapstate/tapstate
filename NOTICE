@@ -38,9 +38,12 @@ drivers on an isolated class loader:
   * sqlserver-connector.jar bundles Microsoft JDBC Driver for SQL Server 12.2.0,
     licensed under the MIT License.
 
+  * db2-connector.jar bundles IBM Data Server Driver for JDBC and SQLJ 4.25.13,
+    governed by IBM's International Program License Agreement.
+
 The release carries companion copies of the Oracle Free Use Terms and the
 Microsoft MIT License beside the enterprise jars; the other jars carry their
 dependency notices under META-INF/. Those terms govern only the bundled drivers
 and dependencies identified above; they do not alter the Apache-2.0 license of
-Tapstate itself. The Oracle and SQL Server implementations are paid connector
+Tapstate itself. The Oracle, SQL Server and Db2 implementations are paid connector
 implementations; their use remains subject to the applicable Tapdata agreement.
