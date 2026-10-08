@@ -121,7 +121,18 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                          Optional<ConfirmationTiming> confirmationTiming,
                          Optional<DeliveryTimeline> deliveryTimeline,
                          boolean steadyOutputProfile,
-                         Optional<BenchmarkTargetClock.LocalWindow> operationResourceWindow) {
+                         Optional<BenchmarkTargetClock.LocalWindow> operationResourceWindow,
+                         Map<String, Object> targetClockEvidence) {
+        MeasuredPhase(String id, long acknowledgedOutputs, long firstIssuedAtNanos, long sourceCompletedAtNanos,
+                      long completedAckAtNanos, long expectedSourceChanges, int observedDeliveries, long reportedRecordsOut,
+                      BenchmarkForkEnvironment.ClockAnchor clockAnchor, List<BenchmarkForkEnvironment.BatchResult> sourceBatches,
+                      BenchmarkResourceSampler.Summary resources, Optional<ConfirmationTiming> confirmationTiming,
+                      Optional<DeliveryTimeline> deliveryTimeline, boolean steadyOutputProfile,
+                      Optional<BenchmarkTargetClock.LocalWindow> operationResourceWindow) {
+            this(id, acknowledgedOutputs, firstIssuedAtNanos, sourceCompletedAtNanos, completedAckAtNanos,
+                    expectedSourceChanges, observedDeliveries, reportedRecordsOut, clockAnchor, sourceBatches,
+                    resources, confirmationTiming, deliveryTimeline, steadyOutputProfile, operationResourceWindow, Map.of());
+        }
         MeasuredPhase(String id, long acknowledgedOutputs, long firstIssuedAtNanos, long sourceCompletedAtNanos,
                       long completedAckAtNanos, long expectedSourceChanges, int observedDeliveries, long reportedRecordsOut,
                       BenchmarkForkEnvironment.ClockAnchor clockAnchor, List<BenchmarkForkEnvironment.BatchResult> sourceBatches,
@@ -158,6 +169,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             Objects.requireNonNull(confirmationTiming, "confirmation timing availability");
             Objects.requireNonNull(deliveryTimeline, "delivery timeline availability");
             Objects.requireNonNull(operationResourceWindow, "operation resource window availability");
+            targetClockEvidence = Map.copyOf(targetClockEvidence);
         }
 
         double recordsOutPerSecond() {
@@ -228,6 +240,11 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         void requireSteadyStateWindow() {
             if (!workload.pilotProfile()) { throw new AssertionError("steady output requires the predeclared load profile"); }
             for (var phase : phases) {
+                if (!"QUALIFIED".equals(phase.targetClockEvidence().get("state"))
+                        || !(phase.targetClockEvidence().get("sampledInterior") instanceof Map<?, ?> interior)
+                        || !"QUALIFIED_SAMPLED_INTERIOR".equals(interior.get("state"))) {
+                    throw new AssertionError("steady output lacks its qualified outer and sampled interior clocks");
+                }
                 var timeline = phase.deliveryTimeline().orElseThrow(() -> new AssertionError("steady output has no complete timeline"));
                 BenchmarkSteadyOutputWindow.requireSteady(timeline.operationWindow());
             }
@@ -431,6 +448,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 ? targetClockUris.stream().map(BenchmarkTargetClock::read).toList() : List.of();
         if (!targetClocksBefore.isEmpty()) { BenchmarkTargetClock.requireSharedClock(targetClocksBefore); }
         BenchmarkTargetClock.Reading targetClockBefore = targetClocksBefore.isEmpty() ? null : targetClocksBefore.getFirst();
+        Map<String, Object> interiorClockEvidence = Map.of();
+        List<BenchmarkTargetClock.Reading> interiorClockReadings = List.of();
         boolean loadDiagnostics = workload.pilotProfile()
                 && Boolean.getBoolean("tapstate.e2e.benchmark.load-diagnostics");
         BenchmarkNativeQueueProbe nativeProbe = loadDiagnostics
@@ -455,7 +474,9 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         try (BenchmarkResourceSampler resourceSampler = workload.pilotProfile()
                 ? BenchmarkResourceSampler.openForPhaseBudget(fork.server().pid(), RESOURCE_INTERVAL, ACK_WAIT)
                 : BenchmarkResourceSampler.open(fork.server().pid(), RESOURCE_INTERVAL);
-             BenchmarkMongoCommandSampler commandSampler = BenchmarkMongoCommandSampler.open(fork.storeUri())) {
+             BenchmarkMongoCommandSampler commandSampler = BenchmarkMongoCommandSampler.open(fork.storeUri());
+             BenchmarkTargetClockSampler clockSampler = targetClockBefore == null ? null
+                     : BenchmarkTargetClockSampler.open(targetClockUris.getFirst())) {
             resourceSampler.start();
             commandSampler.start();
             issued = fork.issuePhase(phase, true, (current, batchIndex, issuedAt, sql) -> {
@@ -475,6 +496,12 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             completedAckAt = tables.awaitMeasured(workload, phase.id());
             resources = resourceSampler.finish();
             commands = commandSampler.finish();
+            if (clockSampler != null) {
+                clockSampler.close();
+                interiorClockEvidence = clockSampler.evidence();
+                interiorClockReadings = clockSampler.readings();
+                BenchmarkTargetClock.validate(targetClockBefore, interiorClockReadings.getFirst());
+            }
         } catch (BenchmarkResourceSampler.SamplingFailure failure) {
             phaseFailure = failure.inPhase(phase.id());
             throw (BenchmarkResourceSampler.SamplingFailure) phaseFailure;
@@ -527,14 +554,21 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             for (int i=0;i<targetClocksBefore.size();i++) { BenchmarkTargetClock.validate(targetClocksBefore.get(i), targetClocksAfter.get(i)); }
         }
         BenchmarkTargetClock.Reading targetClockAfter = targetClocksAfter.isEmpty() ? null : targetClocksAfter.getFirst();
-        Map<String, Object> targetClockEvidence = targetClockBefore == null
+        if (!interiorClockReadings.isEmpty()) {
+            BenchmarkTargetClock.validate(interiorClockReadings.getLast(), targetClockAfter);
+        }
+        Map<String, Object> outerClockEvidence = targetClockBefore == null
                 ? Map.of("state", "UNQUALIFIED", "reason", "MULTI_TARGET_CLOCKS_NOT_YET_CALIBRATED")
                 : BenchmarkTargetClock.validate(targetClockBefore, targetClockAfter);
+        var clockProof = new LinkedHashMap<String, Object>(outerClockEvidence);
+        clockProof.put("sampledInterior", interiorClockEvidence);
+        Map<String, Object> targetClockEvidence = Map.copyOf(clockProof);
         if (workload.pilotProfile()) {
             System.out.println("benchmark-target-clock=" + JsonWriter.write(Map.of("workload", workload.id(),
                     "phase", phase.id(), "calibration", targetClockEvidence,
                     "targetClockUriCount", targetClockUris.size(), "allBefore", targetClocksBefore.stream().map(BenchmarkTargetClock.Reading::evidence).toList(),
-                    "allAfter", targetClocksAfter.stream().map(BenchmarkTargetClock.Reading::evidence).toList())));
+                    "allAfter", targetClocksAfter.stream().map(BenchmarkTargetClock.Reading::evidence).toList(),
+                    "sampledInterior", interiorClockEvidence)));
         }
         var targetStreams = targets.checkpointStreams(phase);
         List<BenchmarkMongoDeliveryObserver.Delivery> deliveries = targetStreams.values().stream().flatMap(List::stream).toList();
@@ -609,7 +643,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         return new PhaseWindow(new MeasuredPhase(phase.id(), measuredCount,
                 firstIssued, issued.sourceCompletedAtNanos(), completedAckAt, expectedSourceChanges,
                 deliveries.size(), reportedRecordsOut, issued.clockAnchor(), issued.batches(), resources,
-                Optional.of(timing), Optional.of(timeline), workload.pilotProfile(), resourceWindow),
+                Optional.of(timing), Optional.of(timeline), workload.pilotProfile(), resourceWindow, targetClockEvidence),
                 cohort.stream().map(BenchmarkMongoDeliveryObserver.Delivery::durationNanos).toList(),
                 resources, commands);
     }

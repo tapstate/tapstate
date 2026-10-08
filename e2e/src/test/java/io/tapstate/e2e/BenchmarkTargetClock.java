@@ -9,6 +9,22 @@ import java.util.Map;
 /** Server clock reads are bracketed outside workload timing and bind one actual target primary. */
 final class BenchmarkTargetClock {
     private BenchmarkTargetClock() { }
+    static final int ENDPOINT_RESOLUTION_ERROR_MILLIS = 2;
+    static final int INTERIOR_SAMPLE_INTERVAL_MILLIS = 200;
+    static final int MAX_INTERIOR_SAMPLE_GAP_MILLIS = 500;
+    static final int MAX_INTERIOR_SAMPLES = 6_000;
+
+    /** Bounded native sample uncertainty cannot hide a cumulative interior clock rollback. */
+    static final class WallSamples {
+        private Long highWater;
+        boolean accept(Long current) {
+            if (current == null || highWater != null && current < highWater
+                    && Math.subtractExact(highWater, current) > ENDPOINT_RESOLUTION_ERROR_MILLIS) { return false; }
+            highWater = highWater == null ? current : Math.max(highWater, current);
+            return true;
+        }
+        Long highWaterMillis() { return highWater; }
+    }
     record Reading(String primary, String processId, long serverWallMillis,
                    long startedAtNanos, long completedAtNanos, long localUtcBeforeMillis, long localUtcAfterMillis) {
         Reading {
@@ -28,8 +44,13 @@ final class BenchmarkTargetClock {
         if (address.getDatabase() == null) { throw new AssertionError("target clock needs the owned database URI"); }
         try (var client = MongoClients.create(uri)) {
             client.getDatabase("admin").runCommand(new Document("ping", 1));
+            return read(client.getDatabase("admin"));
+        }
+    }
+
+    static Reading read(com.mongodb.client.MongoDatabase admin) {
             long utcBefore = System.currentTimeMillis(); long began = System.nanoTime();
-            Document hello = client.getDatabase("admin").runCommand(new Document("hello", 1));
+            Document hello = admin.runCommand(new Document("hello", 1));
             long ended = System.nanoTime(); long utcAfter = System.currentTimeMillis();
             Document topology = hello.get("topologyVersion", Document.class);
             if (!(hello.get("localTime") instanceof Date date) || topology == null
@@ -37,7 +58,6 @@ final class BenchmarkTargetClock {
                 throw new AssertionError("actual target primary clock provenance is incomplete");
             }
             return new Reading(primary, topology.get("processId").toString(), date.getTime(), began, ended, utcBefore, utcAfter);
-        }
     }
 
     static Map<String, Object> validate(Reading before, Reading after) {
@@ -47,8 +67,8 @@ final class BenchmarkTargetClock {
         long minimumElapsedMillis = (after.startedAtNanos() - before.completedAtNanos()) / 1_000_000L;
         long maximumElapsedMillis = (after.completedAtNanos() - before.startedAtNanos()) / 1_000_000L;
         long serverElapsedMillis = Math.subtractExact(after.serverWallMillis(), before.serverWallMillis());
-        if (minimumElapsedMillis < 0 || serverElapsedMillis < minimumElapsedMillis - 2
-                || serverElapsedMillis > maximumElapsedMillis + 2) {
+        if (minimumElapsedMillis < 0 || serverElapsedMillis < minimumElapsedMillis - ENDPOINT_RESOLUTION_ERROR_MILLIS
+                || serverElapsedMillis > maximumElapsedMillis + ENDPOINT_RESOLUTION_ERROR_MILLIS) {
             throw new AssertionError("target server clock stepped outside its measured request uncertainty"
                     + "; before=" + before.evidence() + "; after=" + after.evidence()
                     + "; serverElapsedMillis=" + serverElapsedMillis
@@ -57,7 +77,26 @@ final class BenchmarkTargetClock {
         }
         return Map.of("state", "QUALIFIED", "before", before.evidence(), "after", after.evidence(),
                 "serverElapsedMillis", serverElapsedMillis, "minimumElapsedMillis", minimumElapsedMillis,
-                "maximumElapsedMillis", maximumElapsedMillis, "endpointResolutionErrorMillis", 2);
+                "maximumElapsedMillis", maximumElapsedMillis, "endpointResolutionErrorMillis", ENDPOINT_RESOLUTION_ERROR_MILLIS);
+    }
+
+    static Map<String, Object> validateSeries(java.util.List<Reading> readings) {
+        if (readings.size() < 3 || readings.size() > MAX_INTERIOR_SAMPLES) {
+            throw new AssertionError("target clock lacks bounded interior samples");
+        }
+        long maximumGap = 0;
+        for (int i = 1; i < readings.size(); i++) {
+            Reading before = readings.get(i - 1), after = readings.get(i);
+            validate(before, after);
+            long gap = Math.max(0, (after.startedAtNanos() - before.completedAtNanos()) / 1_000_000L);
+            maximumGap = Math.max(maximumGap, gap);
+            if (gap > MAX_INTERIOR_SAMPLE_GAP_MILLIS) { throw new AssertionError("target clock has an unqualified interior sampling gap"); }
+        }
+        return Map.of("state", "QUALIFIED_SAMPLED_INTERIOR", "samples", readings.size(),
+                "sampleIntervalMillis", INTERIOR_SAMPLE_INTERVAL_MILLIS, "maximumObservedGapMillis", maximumGap,
+                "maximumAllowedGapMillis", MAX_INTERIOR_SAMPLE_GAP_MILLIS,
+                "endpointResolutionErrorMillis", ENDPOINT_RESOLUTION_ERROR_MILLIS,
+                "readings", readings.stream().map(Reading::evidence).toList());
     }
 
     static long earliestLocalNanos(Reading bracket, long serverWallMillis) {
@@ -76,7 +115,7 @@ final class BenchmarkTargetClock {
                 || lastServerWallMillis <= firstServerWallMillis) {
             throw new AssertionError("target operation endpoints are outside their actual clock brackets");
         }
-        long error = 2_000_000L;
+        long error = ENDPOINT_RESOLUTION_ERROR_MILLIS * 1_000_000L;
         long earlyStart = Math.min(earliestLocalNanos(before, firstServerWallMillis), earliestLocalNanos(after, firstServerWallMillis)) - error;
         long lateStart = Math.max(latestLocalNanos(before, firstServerWallMillis), latestLocalNanos(after, firstServerWallMillis)) + error;
         long earlyEnd = Math.min(earliestLocalNanos(before, lastServerWallMillis), earliestLocalNanos(after, lastServerWallMillis)) - error;

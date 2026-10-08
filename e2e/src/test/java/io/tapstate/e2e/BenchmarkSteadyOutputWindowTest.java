@@ -6,6 +6,25 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class BenchmarkSteadyOutputWindowTest {
+    @Test void anInteriorClockStepAndReturnCannotHideBehindOrderedLogicalTimeAndValidOuterBrackets() {
+        long base = 1_000_000;
+        var before = new BenchmarkTargetClock.Reading("owned:27017", "one", base, 0, 2_000_000, base - 1, base + 1);
+        var after = new BenchmarkTargetClock.Reading("owned:27017", "one", base + 30_000,
+                29_999_000_000L, 30_002_000_000L, base + 29_999, base + 30_001);
+        assertThat(BenchmarkTargetClock.validate(before, after)).containsEntry("state", "QUALIFIED");
+        var logical = new BenchmarkMongoDeliveryObserver.OperationOrder();
+        var wall = new ArrayList<Long>();
+        for (int i = 0; i < 12_000; i++) {
+            assertThat(logical.accept(new org.bson.BsonTimestamp(2_000, i))).isTrue();
+            wall.add(base + i - (i >= 6_000 ? 1_000 : 0));
+        }
+        assertThatThrownBy(() -> BenchmarkSteadyOutputWindow.readCommonOperations(java.util.List.of(wall)))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("beyond clock uncertainty");
+        assertThatThrownBy(() -> BenchmarkSteadyOutputWindow.commonIntervalMillis(java.util.List.of(wall)))
+                .as("the same unsafe temporal slice cannot be mapped into a resource window")
+                .isInstanceOf(AssertionError.class).hasMessageContaining("beyond clock uncertainty");
+    }
+
     @Test void ordinaryConcurrentOperationsKeepTheirExactTemporalCohortDespiteAdjacentWallTimeInversions() {
         var ordered = new ArrayList<Long>();
         for (int i = 0; i < 12_000; i++) { ordered.add(1_000_000L + i); }

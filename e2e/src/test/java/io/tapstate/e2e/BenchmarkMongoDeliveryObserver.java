@@ -96,6 +96,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
     private long acceptNanos;
     private long previousIterationEnded;
     private final OperationOrder operationOrder = new OperationOrder();
+    private final BenchmarkTargetClock.WallSamples operationWalls = new BenchmarkTargetClock.WallSamples();
 
     static final class OperationOrder {
         private org.bson.BsonTimestamp previous;
@@ -446,6 +447,13 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                             + "; key=" + key + "; previousClusterTime=" + operationOrder.previousClusterTime()
                             + "; currentWallMillis=" + operationWall + "; clusterTime=" + change.getClusterTime()
                             + "; observedAtNanos=" + observedAtNanos, null); return;
+                }
+                if (!operationWalls.accept(operationWall)) {
+                    fail("target operation clock is missing or moved backward beyond clock uncertainty"
+                            + "; namespace=" + namespace + "; target=" + targetId + "; phase=" + activePhase
+                            + "; key=" + key + "; highWaterMillis=" + operationWalls.highWaterMillis()
+                            + "; currentWallMillis=" + operationWall + "; clusterTime=" + change.getClusterTime()
+                            + "; uncertaintyMillis=" + BenchmarkTargetClock.ENDPOINT_RESOLUTION_ERROR_MILLIS, null); return;
                 }
                 deliveries.add(new Delivery(key, actual, expected.issuedAtNanos(), observedAtNanos, duration, operationWall));
             }

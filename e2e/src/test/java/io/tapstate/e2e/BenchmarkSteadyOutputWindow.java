@@ -51,6 +51,7 @@ final class BenchmarkSteadyOutputWindow {
 
     static Reading readServerOperations(List<Long> wallMillis) {
         if (wallMillis.stream().anyMatch(java.util.Objects::isNull)) { throw new AssertionError("target operation timeline is unavailable"); }
+        validateWallSamples(wallMillis);
         // Logical oplog order is validated by the observer. Concurrent writes independently sample
         // server wall dates, so temporal bins use every original timestamp in chronological order.
         var nanos = wallMillis.stream().sorted().map(value -> Math.multiplyExact(value, 1_000_000L)).toList();
@@ -98,11 +99,7 @@ final class BenchmarkSteadyOutputWindow {
         if (streams.isEmpty() || streams.size() > 2) { throw new AssertionError("operation stream set differs from fixed targets"); }
         var merged = new ArrayList<Long>();
         for (List<Long> stream : streams) {
-            for (int i=0;i<stream.size();i++) {
-                if (stream.get(i)==null) {
-                    throw new AssertionError("target operation clock is missing before stream merge");
-                }
-            }
+            validateWallSamples(stream);
             merged.addAll(stream);
         }
         merged.sort(Long::compare); return List.copyOf(merged);
@@ -116,6 +113,7 @@ final class BenchmarkSteadyOutputWindow {
         }
         long first = Long.MIN_VALUE, last = Long.MAX_VALUE;
         for (List<Long> stream : streams) {
+            validateWallSamples(stream);
             long minimum = Long.MAX_VALUE, maximum = Long.MIN_VALUE;
             for (Long value : stream) {
                 if (value == null) { throw new AssertionError("target operation clock is missing before stream merge"); }
@@ -125,5 +123,16 @@ final class BenchmarkSteadyOutputWindow {
         }
         if (last <= first) { throw new AssertionError("target output streams have no common interval"); }
         return new ServerInterval(first, last);
+    }
+
+    private static void validateWallSamples(List<Long> stream) {
+        var samples = new BenchmarkTargetClock.WallSamples();
+        for (Long current : stream) {
+            if (!samples.accept(current)) {
+                throw new AssertionError("target operation clock is missing or moved backward beyond clock uncertainty"
+                        + "; highWaterMillis=" + samples.highWaterMillis() + "; currentWallMillis=" + current
+                        + "; uncertaintyMillis=" + BenchmarkTargetClock.ENDPOINT_RESOLUTION_ERROR_MILLIS);
+            }
+        }
     }
 }
