@@ -230,7 +230,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                             Set<String> pipelines = new LinkedHashSet<>(List.of(pipelineId));
                             JoinedCapture joined = joinedCaptures.remove(captureId);
                             if (joined != null) {
-                                pipelines.addAll(joined.pipelines);
+                                pipelines.addAll(joined.pipelines.keySet());
                             }
                             own(captureId, run, permit, pipelines);
                         } else {
@@ -238,8 +238,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                             // that: its own load where its record says one is owed, then the changes the
                             // other member's tail writes into the shared ring.
                             run = captureAttacher.start(spec, handoff, false);
-                            joinedCaptures.computeIfAbsent(captureId, ignored -> new JoinedCapture(spec, handoff))
-                                    .pipelines.add(pipelineId);
+                            joinedCaptures.computeIfAbsent(captureId, ignored -> new JoinedCapture(spec))
+                                    .join(spec, handoff);
                             lookForCapturesNobodyTails();
                         }
                     }
@@ -507,20 +507,24 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      */
     private static final class JoinedCapture {
         private final boolean tails;
-        private final CaptureRunSpec tailSpec;
-        private final CaptureHandoff tailPassthrough;
-        private final Set<String> pipelines = new LinkedHashSet<>();
+        private final Map<String, JoinedPipeline> pipelines = new LinkedHashMap<>();
 
-        private JoinedCapture(CaptureRunSpec joinedWith, CaptureHandoff passthrough) {
+        private JoinedCapture(CaptureRunSpec joinedWith) {
             // A snapshot-only read has no tail for anybody to take over.
             this.tails = joinedWith.readMode() != ReadMode.SNAPSHOT_ONLY;
-            this.tailSpec = new CaptureRunSpec(
+        }
+
+        private void join(CaptureRunSpec joinedWith, CaptureHandoff passthrough) {
+            CaptureRunSpec tailSpec = new CaptureRunSpec(
                     joinedWith.config(), ReadMode.CDC_ONLY, joinedWith.srsKey(), joinedWith.srsEnabled(),
                     joinedWith.sourceId(), joinedWith.pipelineId(), joinedWith.startFrom(),
                     joinedWith.retention(), joinedWith.schemaVer(), joinedWith.snapshotEpoch())
                     .withConsumerId(joinedWith.consumerId());
-            this.tailPassthrough = passthrough;
+            pipelines.putIfAbsent(joinedWith.pipelineId(), new JoinedPipeline(tailSpec, passthrough));
         }
+    }
+
+    private record JoinedPipeline(CaptureRunSpec tailSpec, CaptureHandoff tailPassthrough) {
     }
 
     private void own(CaptureId captureId, CaptureRun run, CaptureOwnership.Permit permit, Set<String> pipelines) {
@@ -557,7 +561,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             // for a tail with no ring -- and a change ahead of a snapshot row of the same key is overwritten by
             // the older value. The tail resumes from where the durable record says the last one got to, so
             // asking again on a later pass costs a delay and nothing more.
-            if (stillLoading(capture.pipelines)) {
+            if (stillLoading(capture.pipelines.keySet())) {
                 continue;
             }
             CaptureOwnership.Permit permit = ownership.acquire(entry.getKey());
@@ -566,18 +570,19 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             }
             CaptureRun tail;
             try {
+                JoinedPipeline pipeline = capture.pipelines.values().iterator().next();
                 tail = captureAttacher.start(
-                        capture.tailSpec.withCaptureFence(permit.fence()), capture.tailPassthrough, true);
+                        pipeline.tailSpec.withCaptureFence(permit.fence()), pipeline.tailPassthrough, true);
             } catch (RuntimeException failure) {
                 ownership.release(permit.claim());
                 LOG.warn("Could not open the tail of capture {} for pipelines {} here; asking again later",
-                        entry.getKey().value(), capture.pipelines, failure);
+                        entry.getKey().value(), capture.pipelines.keySet(), failure);
                 continue;
             }
             joined.remove();
-            own(entry.getKey(), tail, permit, capture.pipelines);
+            own(entry.getKey(), tail, permit, capture.pipelines.keySet());
             LOG.info("Took over the tail of capture {} for pipelines {} here", entry.getKey().value(),
-                    capture.pipelines);
+                    capture.pipelines.keySet());
         }
     }
 
