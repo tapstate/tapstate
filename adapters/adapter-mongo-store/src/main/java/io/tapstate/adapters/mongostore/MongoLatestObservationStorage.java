@@ -360,6 +360,10 @@ final class MongoLatestObservationStorage {
                 .append(REVISION, 1).append(LEGACY_FALLBACK, 1).append(LEGACY_RESIDUE, 1)
                 .append(CURRENT + "." + INCARNATION, 1).append(CURRENT + "." + GENERATION, 1)
                 .append(PENDING + "." + INCARNATION, 1).append(PENDING + "." + GENERATION, 1)
+                .append(CURRENT + "." + PreExecutionFailureOwnerCodec.KIND, 1)
+                .append(CURRENT + "." + PreExecutionFailureOwnerCodec.OWNER, 1)
+                .append(PENDING + "." + PreExecutionFailureOwnerCodec.KIND, 1)
+                .append(PENDING + "." + PreExecutionFailureOwnerCodec.OWNER, 1)
                 .append(MongoObservationContinuation.CONTINUATION + ".sourceScope", 1)
                 .append(MongoObservationContinuation.CONTINUATION + ".target.scope", 1)
                 .append(MongoObservationContinuation.CONTINUATION + ".baselineOrigin.scope", 1)
@@ -376,15 +380,16 @@ final class MongoLatestObservationStorage {
             validateHeader(manifest, encodeCursor(key), owner);
             String revision = manifest.getString(REVISION);
             List<ObservationStore.Scope> scopes = new ArrayList<>(2);
+            List<io.tapstate.spi.store.PreExecutionFailure.Owner> refusals = new ArrayList<>(2);
             if ((manifest.containsKey(CURRENT) && manifest.get(CURRENT) == null)
                     || (manifest.containsKey(PENDING) && manifest.get(PENDING) == null)) {
                 throw corrupt(encodeCursor(key), "latest manifest descriptors");
             }
-            addScope(manifest.get(CURRENT), scopes, encodeCursor(key), CURRENT);
-            addScope(manifest.get(PENDING), scopes, encodeCursor(key), PENDING);
+            addScope(manifest.get(CURRENT), scopes, refusals, encodeCursor(key), CURRENT);
+            addScope(manifest.get(PENDING), scopes, refusals, encodeCursor(key), PENDING);
             addPrivateScopes(manifest.get(MongoObservationContinuation.CONTINUATION), scopes, encodeCursor(key));
             addPrivateScopes(manifest.get(MongoObservationContinuation.CONTINUATION_PENDING), scopes, encodeCursor(key));
-            snapshots.add(new ObservationStore.ManifestSnapshot(encodeCursor(key), revision, scopes));
+            snapshots.add(new ObservationStore.ManifestSnapshot(encodeCursor(key), revision, scopes, refusals));
         }
         return List.copyOf(snapshots);
     }
@@ -818,7 +823,9 @@ final class MongoLatestObservationStorage {
 
     private ObservationStore.Stored readCurrent(String pipelineId, Binary key, Binary owner, Document current,
             ReadDeadline deadline) {
-        ObservationStore.Scope scope = readScope(current, pipelineId, CURRENT);
+        var refusal = current.containsKey(PreExecutionFailureOwnerCodec.KIND)
+                ? PreExecutionFailureOwnerCodec.read(pipelineId, current) : null;
+        ObservationStore.Scope scope = refusal == null ? readScope(current, pipelineId, CURRENT) : null;
         Instant observedAt = requireDate(current.get(OBSERVED_AT), pipelineId, CURRENT + "." + OBSERVED_AT);
         int encoding = requirePositiveInt(current.get(ENCODING), pipelineId, CURRENT + "." + ENCODING);
         if (!LatestObservationPayloadCodec.supportsVersion(encoding)) {
@@ -847,7 +854,12 @@ final class MongoLatestObservationStorage {
         if (!pipelineId.equals(observation.pipelineId()) || !observedAt.equals(observation.observedAt())) {
             throw corrupt(pipelineId, CURRENT);
         }
-        return new ObservationStore.Stored(observation, Optional.of(scope));
+        if (refusal != null && (observation.state() != io.tapstate.core.lifecycle.PipelineState.FAILED
+                || observation.failure() == null || !observation.metrics().isEmpty() || !observation.snapshot().isEmpty()
+                || !observation.positions().isEmpty() || !observation.facts().isEmpty())) {
+            throw corrupt(pipelineId, "latest diagnostic payload");
+        }
+        return new ObservationStore.Stored(observation, Optional.ofNullable(scope), Optional.ofNullable(refusal));
     }
 
     private Observation readChunks(String pipelineId, Binary key, Binary owner, String token,
@@ -1156,7 +1168,7 @@ final class MongoLatestObservationStorage {
                 .updateOne(filter, update).getMatchedCount()) != 0;
     }
 
-    private void writeChunk(String pipelineId, Binary key, Binary owner, String token,
+    void writeChunk(String pipelineId, Binary key, Binary owner, String token,
             LatestObservationPayloadCodec.Chunk chunk) {
         Document document = chunkDocument(key, owner, token, chunk);
         Binary id = document.get("_id", Binary.class);
@@ -1196,17 +1208,22 @@ final class MongoLatestObservationStorage {
         List<Document> allowed = new java.util.ArrayList<>();
         allowed.add(new Document(CURRENT, new Document("$exists", false)));
         allowed.add(new Document(CURRENT + "." + GENERATION,
-                new Document("$lt", scope.executionGeneration())));
+                new Document("$lt", scope.executionGeneration()))
+                .append(CURRENT + "." + PreExecutionFailureOwnerCodec.KIND, new Document("$exists", false)));
+        allowed.add(executionReplacesRefusal(CURRENT, scope));
         allowed.add(new Document(CURRENT + "." + INCARNATION, scope.pipelineIncarnationId())
                 .append(CURRENT + "." + GENERATION, scope.executionGeneration())
+                .append(CURRENT + "." + PreExecutionFailureOwnerCodec.KIND, new Document("$exists", false))
                 .append(CURRENT + "." + OBSERVED_AT, new Document("$lt", Date.from(observedAt))));
         if (allowEqualUnknown) {
             allowed.add(new Document(CURRENT + "." + INCARNATION, scope.pipelineIncarnationId())
                     .append(CURRENT + "." + GENERATION, scope.executionGeneration())
+                    .append(CURRENT + "." + PreExecutionFailureOwnerCodec.KIND, new Document("$exists", false))
                     .append(CURRENT + "." + OBSERVED_AT, Date.from(observedAt)));
         } else if (exactDigest != null) {
             allowed.add(new Document(CURRENT + "." + INCARNATION, scope.pipelineIncarnationId())
                     .append(CURRENT + "." + GENERATION, scope.executionGeneration())
+                    .append(CURRENT + "." + PreExecutionFailureOwnerCodec.KIND, new Document("$exists", false))
                     .append(CURRENT + "." + OBSERVED_AT, Date.from(observedAt))
                     .append(CURRENT + "." + MODE, exactMode)
                     .append(CURRENT + "." + DIGEST, new Binary(exactDigest)));
@@ -1218,6 +1235,7 @@ final class MongoLatestObservationStorage {
         return new Document("$or", List.of(
                 new Document(PENDING, new Document("$exists", false)),
                 new Document(PENDING + "." + GENERATION, new Document("$lt", scope.executionGeneration())),
+                executionReplacesRefusal(PENDING, scope),
                 expiredPending()));
     }
 
@@ -1225,7 +1243,16 @@ final class MongoLatestObservationStorage {
         return new Document("$or", List.of(
                 new Document(PENDING, new Document("$exists", false)),
                 new Document(PENDING + "." + GENERATION, new Document("$lt", scope.executionGeneration())),
+                executionReplacesRefusal(PENDING, scope),
                 expiredPending()));
+    }
+
+    private static Document executionReplacesRefusal(String field, ObservationStore.Scope scope) {
+        String frontier = field + "." + PreExecutionFailureOwnerCodec.OWNER + ".generationFrontier";
+        return new Document(field + "." + PreExecutionFailureOwnerCodec.KIND, PreExecutionFailureOwnerCodec.REFUSAL)
+                .append("$or", List.of(new Document(frontier + ".presence", "ABSENT"),
+                        new Document(frontier + ".presence", "PRESENT").append(frontier + ".value",
+                                new Document("$lt", scope.executionGeneration()))));
     }
 
     private static Document expiredPending() {
@@ -1364,15 +1391,26 @@ final class MongoLatestObservationStorage {
         }
     }
 
-    private static void addScope(Object raw, List<ObservationStore.Scope> scopes, String id, String field) {
+    private static void addScope(Object raw, List<ObservationStore.Scope> scopes,
+            List<io.tapstate.spi.store.PreExecutionFailure.Owner> refusals, String id, String field) {
         if (raw == null) {
             return;
         }
         Document descriptor = requireDocument(raw, id, field);
+        if (descriptor.containsKey(PreExecutionFailureOwnerCodec.KIND)) {
+            var refusal = readScannedRefusal(descriptor, id);
+            if (!refusals.contains(refusal)) { refusals.add(refusal); }
+            return;
+        }
         ObservationStore.Scope scope = readScope(descriptor, id, field);
         if (!scopes.contains(scope)) {
             scopes.add(scope);
         }
+    }
+
+    private static io.tapstate.spi.store.PreExecutionFailure.Owner readScannedRefusal(Document descriptor, String id) {
+        Document owner = requireDocument(descriptor.get(PreExecutionFailureOwnerCodec.OWNER), id, "diagnostic owner");
+        return PreExecutionFailureOwnerCodec.read(requireString(owner.get("pipelineId"), id, "diagnostic pipeline"), descriptor);
     }
 
     private static void addPrivateScopes(Object raw, List<ObservationStore.Scope> scopes, String id) {
@@ -1404,7 +1442,8 @@ final class MongoLatestObservationStorage {
             throw corrupt(pipelineId, PENDING);
         }
         requireString(pending.get(TOKEN), pipelineId, PENDING + "." + TOKEN);
-        readScope(pending, pipelineId, PENDING);
+        if (pending.containsKey(PreExecutionFailureOwnerCodec.KIND)) { readScannedRefusal(pending, pipelineId); }
+        else { readScope(pending, pipelineId, PENDING); }
         requireDate(pending.get(OBSERVED_AT), pipelineId, PENDING + "." + OBSERVED_AT);
         requireDate(pending.get("publishUntil"), pipelineId, PENDING + ".publishUntil");
         if (!LatestObservationPayloadCodec.supportsVersion(

@@ -25,6 +25,13 @@ import java.util.function.Function;
  */
 interface DagSource {
 
+    default StartPreparation prepareStart(String pipelineId, String defaultDatabase,
+            java.util.function.Consumer<ArtifactStore> captured) {
+        StartPreparation prepared = prepareStart(pipelineId, defaultDatabase);
+        prepared.artifactSnapshot().ifPresent(captured);
+        return prepared;
+    }
+
     /**
      * Captures and validates the pipeline revision this start will use, then returns a deferred builder.
      * The deferment lets an outstanding teardown finish before DAG construction reads or records shape

@@ -22,7 +22,11 @@ public interface ObservationStore {
     int MAX_LATEST_SCAN_BATCH = 256;
 
     /** Internal owner of a published observation; neither field is part of the public observation. */
-    record Scope(String pipelineIncarnationId, long executionGeneration) {
+    sealed interface Owner permits Scope, PreExecutionFailure.Owner {
+        String pipelineIncarnationId();
+    }
+
+    record Scope(String pipelineIncarnationId, long executionGeneration) implements Owner {
         public Scope {
             Objects.requireNonNull(pipelineIncarnationId, "pipelineIncarnationId");
             if (pipelineIncarnationId.isBlank() || executionGeneration <= 0) {
@@ -32,10 +36,20 @@ public interface ObservationStore {
     }
 
     /** Stored projection and its optional internal owner; absence means a legacy unscoped document. */
-    record Stored(Observation observation, Optional<Scope> scope) {
+    record Stored(Observation observation, Optional<Scope> scope, Optional<PreExecutionFailure.Owner> refusal) {
         public Stored {
             Objects.requireNonNull(observation, "observation");
             Objects.requireNonNull(scope, "scope");
+            Objects.requireNonNull(refusal, "refusal");
+            if (scope.isPresent() && refusal.isPresent()) {
+                throw new IllegalArgumentException("one current observation has exactly one private owner");
+            }
+            if (refusal.filter(owner -> !owner.pipelineId().equals(observation.pipelineId())).isPresent()) {
+                throw new IllegalArgumentException("a refusal frame belongs to its actual pipeline owner");
+            }
+        }
+        public Stored(Observation observation, Optional<Scope> scope) {
+            this(observation, scope, Optional.empty());
         }
     }
 
@@ -133,14 +147,22 @@ public interface ObservationStore {
     }
 
     /** Digest-keyed manifest snapshot for bounded cold cleanup; cursor and revision are opaque. */
-    record ManifestSnapshot(String cursor, String revision, List<Scope> scopes) {
+    record ManifestSnapshot(String cursor, String revision, List<Scope> scopes, List<PreExecutionFailure.Owner> refusals) {
         public ManifestSnapshot {
             Objects.requireNonNull(cursor, "cursor");
             Objects.requireNonNull(revision, "revision");
             scopes = List.copyOf(Objects.requireNonNull(scopes, "scopes"));
+            refusals = List.copyOf(Objects.requireNonNull(refusals, "refusals"));
             if (cursor.isBlank() || revision.isBlank()) {
                 throw new IllegalArgumentException("a manifest snapshot needs cursor and revision");
             }
+        }
+        public ManifestSnapshot(String cursor, String revision, List<Scope> scopes) {
+            this(cursor, revision, scopes, List.of());
+        }
+        public java.util.stream.Stream<String> incarnations() {
+            return java.util.stream.Stream.concat(scopes.stream().map(Scope::pipelineIncarnationId),
+                    refusals.stream().map(PreExecutionFailure.Owner::pipelineIncarnationId)).distinct();
         }
     }
 
@@ -165,6 +187,22 @@ public interface ObservationStore {
     default boolean saveScoped(Observation observation, Scope scope) {
         throw new UnsupportedOperationException("scoped observation writes are unavailable");
     }
+
+    /** Cold publication of a factual refusal under its original complete lifecycle receipt. */
+    default boolean savePreExecutionFailure(Observation observation, PreExecutionFailure.Receipt receipt) {
+        throw new UnsupportedOperationException("pre-execution refusal publication is unavailable");
+    }
+
+    /** Cold read proof over one consistent view of the actual checkpoint, intent, artifacts and authority. */
+    default boolean isCurrentPreExecutionFailure(PreExecutionFailure.Owner owner) {
+        return false;
+    }
+
+    /** Reobserves an already published, still-qualified refusal without creating or rebinding its owner. */
+    default boolean refreshPreExecutionFailure(String pipelineId, Instant observedAt) { return false; }
+
+    /** Distinguishes a still-live original input proof awaiting floor transfer from an obsolete request. */
+    default boolean preExecutionFailureInputsCurrent(PreExecutionFailure.Owner owner) { return false; }
 
     /** Publishes one prepared public frame and, when requested, its matching private producer checkpoint. */
     default PublicationResult saveScoped(Observation observation, Scope scope, ContinuationWrite write) {

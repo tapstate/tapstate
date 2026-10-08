@@ -414,7 +414,8 @@ class MongoLatestObservationProtocolIT {
                 assertThat(find.getDocument("projection").keySet()).containsExactlyInAnyOrder(
                         "_id", "formatVersion", "ownerDigest", "revision", "legacyFallback", "legacyResidue",
                         "current.pipelineIncarnationId", "current.executionGeneration",
-                        "pending.pipelineIncarnationId", "pending.executionGeneration",
+                    "pending.pipelineIncarnationId", "pending.executionGeneration",
+                    "current.ownerKind", "current.diagnosticOwner", "pending.ownerKind", "pending.diagnosticOwner",
                         "continuation.sourceScope", "continuation.target.scope", "continuation.baselineOrigin.scope",
                         "continuationPending.sourceScope", "continuationPending.target.scope",
                         "continuationPending.baselineOrigin.scope");

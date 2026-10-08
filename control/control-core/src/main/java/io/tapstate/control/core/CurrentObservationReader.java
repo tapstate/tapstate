@@ -4,6 +4,7 @@ import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ExecutionGenerationStore;
 import io.tapstate.spi.store.ObservationStore;
+import io.tapstate.core.lifecycle.PipelineState;
 
 import java.util.Objects;
 import java.util.Optional;
@@ -34,14 +35,25 @@ public final class CurrentObservationReader {
         if (incarnation.isEmpty()) {
             // Upgrade-era resources retain their old pipeline-id interpretation until assigned an identity.
             return observations.readStored(pipelineId)
-                    .filter(stored -> stored.scope().isEmpty()).map(ObservationStore.Stored::observation);
+                    .filter(stored -> stored.scope().isEmpty() && stored.refusal().isEmpty())
+                    .map(ObservationStore.Stored::observation);
         }
         OptionalLong generation = generations.currentGeneration(clusterId, pipelineId);
-        if (generation.isEmpty()) {
-            return Optional.empty();
+        Optional<ObservationStore.Stored> saved = observations.readStored(pipelineId);
+        if (saved.flatMap(ObservationStore.Stored::refusal).isPresent()) {
+            var stored = saved.orElseThrow();
+            var owner = stored.refusal().orElseThrow();
+            var frame = stored.observation();
+            return pipelineId.equals(owner.pipelineId()) && clusterId.equals(owner.clusterId())
+                    && incarnation.orElseThrow().equals(owner.pipelineIncarnationId())
+                    && frame.state() == PipelineState.FAILED && frame.failure() != null
+                    && frame.metrics().isEmpty() && frame.snapshot().isEmpty() && frame.positions().isEmpty()
+                    && frame.facts().isEmpty() && observations.isCurrentPreExecutionFailure(owner)
+                    ? Optional.of(frame) : Optional.empty();
         }
+        if (generation.isEmpty()) { return Optional.empty(); }
         ObservationStore.Scope expected = new ObservationStore.Scope(incarnation.get(), generation.getAsLong());
-        return observations.readStored(pipelineId)
+        return saved
                 .filter(stored -> stored.scope().filter(expected::equals).isPresent())
                 .map(ObservationStore.Stored::observation);
     }

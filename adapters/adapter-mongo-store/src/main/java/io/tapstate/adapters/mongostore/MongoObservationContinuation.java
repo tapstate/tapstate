@@ -319,7 +319,7 @@ final class MongoObservationContinuation {
                         .append("legacyFallback", true).append("legacyResidue", legacyExists)), new UpdateOptions().upsert(true));
     }
 
-    private static boolean expectedMatches(Document header, Optional<ObservationStore.ContinuationReceipt> previous) {
+    static boolean expectedMatches(Document header, Optional<ObservationStore.ContinuationReceipt> previous) {
         if (previous.isEmpty()) { return !header.containsKey(CONTINUATION); }
         return header.get(CONTINUATION) instanceof Document present
                 && previous.orElseThrow().revision().equals(present.get("revision"))

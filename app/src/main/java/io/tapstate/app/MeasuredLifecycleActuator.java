@@ -23,13 +23,26 @@ final class MeasuredLifecycleActuator implements LifecycleActuator {
 
     @Override
     public PreparedStart prepareStart(String pipelineId) {
+        return measuredStart(() -> delegate.prepareStart(pipelineId));
+    }
+
+    @Override
+    public PreparedStart prepareStart(String pipelineId, io.tapstate.core.lifecycle.DesiredState desired,
+            io.tapstate.core.lifecycle.CheckpointDoc checkpoint,
+            java.util.function.Consumer<io.tapstate.spi.store.PreExecutionFailure.Attempt> captured) {
+        return measuredStart(() -> delegate.prepareStart(pipelineId, desired, checkpoint, captured));
+    }
+
+    private PreparedStart measuredStart(java.util.function.Supplier<PreparedStart> preparation) {
         long began = System.nanoTime();
         try {
-            PreparedStart prepared = delegate.prepareStart(pipelineId);
+            PreparedStart prepared = preparation.get();
             long preparationNanos = System.nanoTime() - began;
             AtomicBoolean recorded = new AtomicBoolean();
             return new PreparedStart() {
                 private long workNanos = preparationNanos;
+
+                @Override public Optional<StopReservation.Source> submittedSource() { return prepared.submittedSource(); }
 
                 @Override
                 public void submit() {
@@ -63,9 +76,20 @@ final class MeasuredLifecycleActuator implements LifecycleActuator {
     @Override
     public PreparedReplacement prepareReplacement(StopReservation reservation, ReplacementAdmission admission,
             Predicate<StopReservation> current) {
+        return measuredReplacement(() -> delegate.prepareReplacement(reservation, admission, current));
+    }
+
+    @Override
+    public PreparedReplacement prepareReplacement(StopReservation reservation, ReplacementAdmission admission,
+            Predicate<StopReservation> current, io.tapstate.core.lifecycle.CheckpointDoc checkpoint,
+            java.util.function.Consumer<io.tapstate.spi.store.PreExecutionFailure.Attempt> captured) {
+        return measuredReplacement(() -> delegate.prepareReplacement(reservation, admission, current, checkpoint, captured));
+    }
+
+    private PreparedReplacement measuredReplacement(java.util.function.Supplier<PreparedReplacement> preparation) {
         long began = System.nanoTime();
         try {
-            PreparedReplacement prepared = delegate.prepareReplacement(reservation, admission, current);
+            PreparedReplacement prepared = preparation.get();
             long preparationNanos = System.nanoTime() - began;
             return new PreparedReplacement() {
                 private long workNanos = preparationNanos;
@@ -73,6 +97,7 @@ final class MeasuredLifecycleActuator implements LifecycleActuator {
 
                 @Override public StopReservation admitted() { return prepared.admitted(); }
                 @Override public Optional<StopReservation.JobIdentity> submittedJob() { return prepared.submittedJob(); }
+                @Override public Optional<StopReservation.Source> submittedSource() { return prepared.submittedSource(); }
                 @Override public void submit() {
                     long submitting = System.nanoTime();
                     try { prepared.submit(); }
@@ -94,6 +119,10 @@ final class MeasuredLifecycleActuator implements LifecycleActuator {
             facts.recordVerb(LifecycleWorkDispatcher.Verb.START, System.nanoTime() - began);
             throw failure;
         }
+    }
+
+    @Override public boolean stillPreExecution(io.tapstate.spi.store.PreExecutionFailure.Attempt attempt) {
+        return delegate.stillPreExecution(attempt);
     }
 
     @Override public Optional<SuccessorInspection> inspectSuccessor(StopReservation reservation,

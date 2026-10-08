@@ -66,6 +66,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     private final ObservationScopeRegistry observationScopes;
     private final ObservationPublisher observationPublisher;
     private final ObservationStore observations;
+    private final io.tapstate.spi.store.ExecutionGenerationStore generations;
 
     EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
             NestStateTeardown stateTeardown, PipelineActuationOwnership actuation) {
@@ -83,6 +84,15 @@ final class EngineLifecycleActuator implements LifecycleActuator {
             NestStateTeardown stateTeardown, PipelineActuationOwnership actuation,
             PipelineIncarnationService incarnations, ObservationScopeRegistry observationScopes,
             ObservationPublisher observationPublisher, ObservationStore observations) {
+        this(engine, dagSource, captureCoordinator, stateTeardown, actuation, incarnations, observationScopes,
+                observationPublisher, observations, null);
+    }
+
+    EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
+            NestStateTeardown stateTeardown, PipelineActuationOwnership actuation,
+            PipelineIncarnationService incarnations, ObservationScopeRegistry observationScopes,
+            ObservationPublisher observationPublisher, ObservationStore observations,
+            io.tapstate.spi.store.ExecutionGenerationStore generations) {
         this.engine = Objects.requireNonNull(engine, "engine");
         this.dagSource = Objects.requireNonNull(dagSource, "dagSource");
         this.captureCoordinator = Objects.requireNonNull(captureCoordinator, "captureCoordinator");
@@ -92,6 +102,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         this.observationScopes = observationScopes;
         this.observationPublisher = observationPublisher;
         this.observations = observations;
+        this.generations = generations;
     }
 
     @Override
@@ -106,6 +117,13 @@ final class EngineLifecycleActuator implements LifecycleActuator {
 
     @Override
     public PreparedStart prepareStart(String pipelineId) {
+        return prepareStart(pipelineId, null, null, ignored -> { });
+    }
+
+    @Override
+    public PreparedStart prepareStart(String pipelineId, io.tapstate.core.lifecycle.DesiredState desired,
+            io.tapstate.core.lifecycle.CheckpointDoc checkpoint,
+            java.util.function.Consumer<io.tapstate.spi.store.PreExecutionFailure.Attempt> captured) {
         engine.refuseIfLost(pipelineId);
         // Submitting by name is idempotent, but preparing another execution before this check would
         // move its fence while the existing Jet job and capture still use the previous one.
@@ -117,11 +135,10 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         }
         // Validation precedes teardown, capture, and submission. An unmet source prerequisite leaves
         // no data-plane component running and no start-side state mutation behind.
-        DagSource.StartPreparation prepared = dagSource.prepareStart(
-                pipelineId, stateTeardown.defaultDatabase());
         String incarnation = incarnations == null ? null : incarnations.ensureCurrent(pipelineId)
                 .orElseThrow(() -> new IllegalStateException("validated pipeline lost its artifact before start"));
-        return startPrepared(pipelineId, prepared, incarnation);
+        DagSource.StartPreparation prepared = prepareInputs(pipelineId, incarnation, desired, checkpoint, captured);
+        return startPrepared(pipelineId, prepared, incarnation, null, null, null, captured);
     }
 
     private PreparedStart startPrepared(String pipelineId, DagSource.StartPreparation prepared,
@@ -132,6 +149,13 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     @Override
     public PreparedReplacement prepareReplacement(StopReservation reservation, ReplacementAdmission admission,
             Predicate<StopReservation> current) {
+        return prepareReplacement(reservation, admission, current, null, ignored -> { });
+    }
+
+    @Override
+    public PreparedReplacement prepareReplacement(StopReservation reservation, ReplacementAdmission admission,
+            Predicate<StopReservation> current, io.tapstate.core.lifecycle.CheckpointDoc checkpoint,
+            java.util.function.Consumer<io.tapstate.spi.store.PreExecutionFailure.Attempt> captured) {
         Objects.requireNonNull(reservation, "reservation");
         Objects.requireNonNull(admission, "admission");
         Objects.requireNonNull(current, "current");
@@ -140,17 +164,56 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         if (reservation.phase() != StopReservation.Phase.REPLACEMENT_PENDING || engine.hasLiveJob(pipelineId)) {
             throw new StartDeferred(StartDeferred.Reason.DEPENDENCY);
         }
-        DagSource.StartPreparation prepared = dagSource.prepareStart(pipelineId, stateTeardown.defaultDatabase());
         String incarnation = incarnations == null ? null : incarnations.current(pipelineId).orElse(null);
         if (incarnation == null) {
             throw new StartDeferred(StartDeferred.Reason.DEPENDENCY);
         }
-        return startPrepared(pipelineId, prepared, incarnation, reservation, admission, current);
+        DagSource.StartPreparation prepared = prepareInputs(pipelineId, incarnation, reservation.originalDesired(),
+                checkpoint, captured);
+        return startPrepared(pipelineId, prepared, incarnation, reservation, admission, current, captured);
+    }
+
+    private DagSource.StartPreparation prepareInputs(String id, String incarnation,
+            io.tapstate.core.lifecycle.DesiredState desired, io.tapstate.core.lifecycle.CheckpointDoc checkpoint,
+            java.util.function.Consumer<io.tapstate.spi.store.PreExecutionFailure.Attempt> captured) {
+        if (generations == null || incarnation == null || desired == null || checkpoint == null) {
+            return dagSource.prepareStart(id, stateTeardown.defaultDatabase());
+        }
+        PipelineActuationOwnership.Permit permit = actuation.permit(id);
+        if (!permit.granted()) { throw new StartDeferred(StartDeferred.Reason.DEPENDENCY); }
+        var frontier = generations.currentGeneration(actuation.clusterId(), id);
+        var writer = permit.claim() == null ? null : io.tapstate.spi.store.WorkloadClaimFence.from(permit.claim());
+        if (writer != null && writer.executionGeneration() != frontier.orElse(0L)) {
+            throw new StartDeferred(StartDeferred.Reason.DEPENDENCY);
+        }
+        return dagSource.prepareStart(id, stateTeardown.defaultDatabase(), snapshot -> {
+            if (snapshot.get(id).filter(resource -> "pipeline".equals(resource.kind())).isEmpty()
+                    || incarnations.current(id).filter(incarnation::equals).isEmpty()) {
+                throw new StartDeferred(StartDeferred.Reason.DEPENDENCY);
+            }
+            captured.accept(new io.tapstate.spi.store.PreExecutionFailure.Attempt(id, actuation.clusterId(), incarnation,
+                        checkpoint, desired, io.tapstate.control.core.ObservationArtifactLineage.hashes(id, snapshot.list()),
+                        frontier, writer));
+        });
+    }
+
+    @Override
+    public boolean stillPreExecution(io.tapstate.spi.store.PreExecutionFailure.Attempt attempt) {
+        return generations != null && !engine.hasLiveJob(attempt.pipelineId())
+                && incarnations.current(attempt.pipelineId()).filter(attempt.pipelineIncarnationId()::equals).isPresent()
+                && attempt.generationFrontier().equals(generations.currentGeneration(attempt.clusterId(), attempt.pipelineId()));
     }
 
     private PreparedReplacement startPrepared(String pipelineId, DagSource.StartPreparation prepared,
             String incarnation, StopReservation replacement, ReplacementAdmission admission,
             Predicate<StopReservation> currentAdmission) {
+        return startPrepared(pipelineId, prepared, incarnation, replacement, admission, currentAdmission, ignored -> { });
+    }
+
+    private PreparedReplacement startPrepared(String pipelineId, DagSource.StartPreparation prepared,
+            String incarnation, StopReservation replacement, ReplacementAdmission admission,
+            Predicate<StopReservation> currentAdmission,
+            java.util.function.Consumer<io.tapstate.spi.store.PreExecutionFailure.Attempt> captured) {
         if (captureCoordinator.hasActiveCapture(pipelineId)) {
             // A prior job can die while its source capture remains open. Close that run before opening
             // another so its reader cursor is not reused by a new job that resumes from an earlier sink ACK.
@@ -208,6 +271,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
                     + "execution generation", pipelineId);
             throw new StartDeferred(StartDeferred.Reason.DEPENDENCY);
         }
+        captured.accept(null);
         ObservationStore.Scope observationScope;
         try {
             if (observationScopes == null) {

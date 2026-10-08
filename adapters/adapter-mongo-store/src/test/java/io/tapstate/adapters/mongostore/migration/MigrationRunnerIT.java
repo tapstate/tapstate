@@ -348,7 +348,7 @@ class MigrationRunnerIT {
                         "V10SrsConsumerOffsetIndexes", "V11RateHistoryKeysetIndex",
                         "V12PipelineEventIndexes", "V13HistoryRollupIndexes",
                         "V14LatestObservationChunkIndexes", "V15StopReservationShape", "V16DurableRebuildHandoff",
-                        "V17ScopedRateHistoryIndex");
+                        "V17ScopedRateHistoryIndex", "V18PreExecutionFailureOwners");
 
         MigrationRunner.migrate(database);
 

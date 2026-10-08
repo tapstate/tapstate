@@ -160,8 +160,8 @@ final class ObservationJanitor implements AutoCloseable {
                 throw new IllegalStateException("observation manifest cleanup cursor did not advance");
             }
             scanned.incrementAndGet();
-            Optional<String> livePipeline = snapshot.scopes().stream()
-                    .map(scope -> artifacts.pipelineIdForIncarnation(scope.pipelineIncarnationId()))
+            Optional<String> livePipeline = snapshot.incarnations()
+                    .map(artifacts::pipelineIdForIncarnation)
                     .flatMap(Optional::stream).findFirst();
             boolean removed = manifestOrphan(snapshot) && (states != null && livePipeline.isPresent()
                     ? observations.deleteManifestIfUnchanged(snapshot, livePipeline.orElseThrow())
@@ -210,6 +210,11 @@ final class ObservationJanitor implements AutoCloseable {
     }
 
     private boolean manifestOrphan(ObservationStore.ManifestSnapshot snapshot) {
+        for (var owner : snapshot.refusals()) {
+            Optional<String> id = artifacts.pipelineIdForIncarnation(owner.pipelineIncarnationId());
+            if (id.isPresent() && (protectedContinuation(id.orElseThrow())
+                    || observations.isCurrentPreExecutionFailure(owner))) { return false; }
+        }
         if (snapshot.scopes().isEmpty()) {
             return true;
         }

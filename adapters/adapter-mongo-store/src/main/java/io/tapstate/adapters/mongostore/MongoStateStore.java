@@ -45,6 +45,14 @@ import java.util.Set;
  */
 public final class MongoStateStore implements StateStore {
 
+    @Override public boolean supportsPreExecutionFailures() { return stops != null; }
+
+    @Override public Optional<CheckpointDoc> failPreExecution(io.tapstate.spi.store.PreExecutionFailure.Attempt expected,
+            Instant touchTime) {
+        if (stops == null) { return StateStore.super.failPreExecution(expected, touchTime); }
+        return stops.failPreExecution(expected, touchTime);
+    }
+
     private static final FindOneAndUpdateOptions RETURN_AFTER =
             new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER);
 

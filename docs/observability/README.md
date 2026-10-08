@@ -44,6 +44,12 @@ latest observation and can still return retained samples for a stopped pipeline.
 require a current observation: an existing pipeline can have retained events while its current reads
 are pending.
 
+A start refused before a new execution is admitted can publish its actual `FAILED` state and coded
+reason to status and explain. That diagnostic has no job, records, bytes, positions, snapshot progress,
+or business failure counter. It remains current only while its original resource, intent, checkpoint,
+inputs, and execution frontier still match. A changed input or a new admission makes it pending until
+its own qualified observation arrives. These refusals do not create execution history or events.
+
 Check the deployed server's version and supported operation set before enabling these views. Earlier
 builds may provide history and explain without events or scoped logs. The examples and schemas in this
 guide do not establish what an older deployment exposes. Treat an unsupported operation as an

@@ -324,8 +324,12 @@ final class ConvergenceDriver {
         LOG.warn("Pipeline {} entered FAILED [{}]: its data-plane job died", pipelineId, failure.code(), cause);
     }
 
+    static void logPreExecutionFailure(String pipelineId, ObservationFailure failure, Throwable cause) {
+        LOG.warn("Pipeline {} start was refused [{}]", pipelineId, failure.code(), cause);
+    }
+
     private void offerEvents(String pipelineId, ConvergeResult result, ObservationFailure failure) {
-        if (telemetryWork == null || observationScopes == null || result == null) {
+        if (telemetryWork == null || observationScopes == null || result == null || result.preExecutionFailure().isPresent()) {
             return;
         }
         var scope = observationScopes.current(pipelineId).orElse(null);
@@ -460,6 +464,12 @@ final class ConvergenceDriver {
             TelemetryDispatcher.FailureLog diagnostic = observationScopes != null && failure != null
                     && result != null && result.status() == ConvergeStatus.FAILED
                     ? new TelemetryDispatcher.FailureLog(pipelineId, failure, result.failure().orElse(null)) : null;
+            if (result != null && failure != null && result.preExecutionFailure().isPresent()) {
+                var receipt = result.preExecutionFailure().orElseThrow();
+                telemetryWork.offerPreExecutionFailure(receipt, failure,
+                        () -> preExecutionQualification(pipelineId, receipt.owner()), diagnostic);
+                return Optional.empty();
+            }
             Optional<io.tapstate.spi.store.ObservationStore.Scope> scope = observationScopes == null
                     ? Optional.empty() : observationScopes.current(pipelineId);
             if (observationScopes != null && scope.isEmpty()) {
@@ -488,6 +498,17 @@ final class ConvergenceDriver {
         }
         return observationScopes.current(pipelineId)
                 .flatMap(scope -> publisher.publishScoped(pipelineId, failure, scope));
+    }
+
+    private TelemetryDispatcher.PublicationQualification preExecutionQualification(String pipelineId,
+            io.tapstate.spi.store.PreExecutionFailure.Owner owner) {
+        if (!businessEligible.getAsBoolean()) { return TelemetryDispatcher.PublicationQualification.STALE; }
+        PipelineActuationOwnership.Permit current = actuation.permit(pipelineId);
+        if (current.retry()) { return TelemetryDispatcher.PublicationQualification.RETRY; }
+        if (!current.granted()) { return TelemetryDispatcher.PublicationQualification.STALE; }
+        var writer = current.claim() == null ? null : io.tapstate.spi.store.WorkloadClaimFence.from(current.claim());
+        return java.util.Objects.equals(owner.writer(), writer) ? TelemetryDispatcher.PublicationQualification.CURRENT
+                : TelemetryDispatcher.PublicationQualification.STALE;
     }
 
     private TelemetryDispatcher.PublicationQualification admissionQualification(String pipelineId,

@@ -152,7 +152,9 @@ public final class PipelineConverger {
             if (!actuator.isCarryingAJob(pipelineId) && !rebuild) {
                 decisions.accept(new PendingDecision(intent.orElseThrow(), actualDoc, PendingAction.START));
                 ConvergeResult.ExecutionBoundary submission = null;
-                try (LifecycleActuator.PreparedStart prepared = actuator.prepareStart(pipelineId)) {
+                var receipt = new java.util.concurrent.atomic.AtomicReference<io.tapstate.spi.store.PreExecutionFailure.Attempt>();
+                try (LifecycleActuator.PreparedStart prepared = actuator.prepareStart(pipelineId, intent.orElseThrow(),
+                        actualDoc.orElseThrow(), receipt::set)) {
                     prepared.submit();
                     var source = prepared.submittedSource().orElse(null);
                     if (source != null && source.scope() != null && source.oldJob() != null) {
@@ -167,7 +169,7 @@ public final class PipelineConverger {
                     // answering healthy over a data plane that was never built, and the loop retries
                     // for the life of the process. A store that is unreachable when a process comes up
                     // is exactly the condition the coded refusal exists for.
-                    return failedWith(pipelineId, refused, actualDoc.orElseThrow(), intent.orElseThrow());
+                    return failedBeforeStart(pipelineId, refused, actualDoc.orElseThrow(), intent.orElseThrow(), receipt.get());
                 }
                 ConvergeResult restored = ConvergeResult.converged(actualDoc.orElseThrow());
                 return submission == null ? restored : restored.withExecutionBoundary(submission);
@@ -295,17 +297,18 @@ public final class PipelineConverger {
         for (int attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
             PipelineState from = StateJson.parse(current.stateJson());
             LifecycleActuator.PreparedStart prepared = null;
+            var receipt = new java.util.concurrent.atomic.AtomicReference<io.tapstate.spi.store.PreExecutionFailure.Attempt>();
             try {
                 // Admission that can refuse without a job must finish before RUNNING is made durable.
                 // A prepared run still submits only after the fenced checkpoint write succeeds.
                 if (target == PipelineState.RUNNING && from != PipelineState.PAUSED && !rebuild) {
                     try {
                         noteAction(decisions, stopIntent, current, PendingAction.START);
-                        prepared = actuator.prepareStart(pipelineId);
+                        prepared = actuator.prepareStart(pipelineId, stopIntent, current, receipt::set);
                     } catch (StartDeferred waiting) {
                         return ConvergeResult.startDeferred(current, waiting.reason());
                     } catch (TapstateException refused) {
-                        return failedWith(pipelineId, refused, current, stopIntent);
+                        return failedBeforeStart(pipelineId, refused, current, stopIntent, receipt.get());
                     }
                 }
                 CasOutcome outcome = state.compareAndSwap(pipelineId, current.epoch(), targetJson, clock.instant());
@@ -480,6 +483,7 @@ public final class PipelineConverger {
             java.util.function.BooleanSupplier current, Consumer<PendingDecision> decisions) {
         String id = marker.pipelineId();
         var admittedAttempt = new java.util.concurrent.atomic.AtomicReference<StopReservation>();
+        var receipt = new java.util.concurrent.atomic.AtomicReference<io.tapstate.spi.store.PreExecutionFailure.Attempt>();
         try (LifecycleActuator.PreparedReplacement prepared = actuator.prepareReplacement(marker,
                 (writer, incarnation, boot, executionMembers) -> {
                     if (!current.getAsBoolean() || !Objects.equals(marker.writerAuthority(), writer)) { return Optional.empty(); }
@@ -487,7 +491,7 @@ public final class PipelineConverger {
                     accepted.ifPresent(value -> admittedAttempt.set(value.reservation()));
                     return accepted;
                 },
-                admitted -> currentMarker(admitted, intent, admitted.writerAuthority()))) {
+                admitted -> currentMarker(admitted, intent, admitted.writerAuthority()), requireCheckpoint(id), receipt::set)) {
             StopReservation admitted = prepared.admitted();
             if (!currentMarker(admitted, intent, admitted.writerAuthority())) { return ConvergeResult.superseded(); }
             prepared.submit();
@@ -513,7 +517,7 @@ public final class PipelineConverger {
                     && state.read(id).filter(failed::equals).isPresent()
                     && Objects.equals(expected.writerAuthority(), actuator.stopAuthority(id).orElse(null));
             actuator.observeReplacementFailure(expected, failureCurrent);
-            return ConvergeResult.failed(failed, refused, Optional.of(PipelineState.STOPPED));
+            return withPreExecutionFailure(ConvergeResult.failed(failed, refused, Optional.of(PipelineState.STOPPED)), receipt.get());
         }
     }
 
@@ -689,5 +693,29 @@ public final class PipelineConverger {
     private CheckpointDoc requireCheckpoint(String pipelineId) {
         return state.read(pipelineId)
                 .orElseThrow(() -> new IllegalStateException("checkpoint vanished for pipeline " + pipelineId));
+    }
+
+    private ConvergeResult withPreExecutionFailure(ConvergeResult result,
+            io.tapstate.spi.store.PreExecutionFailure.Attempt attempt) {
+        return attempt != null && result.status() == ConvergeStatus.FAILED && actuator.stillPreExecution(attempt)
+                ? result.withPreExecutionFailure(attempt.failed(result.checkpoint().orElseThrow())) : result;
+    }
+
+    private ConvergeResult failedBeforeStart(String id, Throwable cause, CheckpointDoc before, DesiredState intent,
+            io.tapstate.spi.store.PreExecutionFailure.Attempt attempt) {
+        if (attempt == null) { return failedWith(id, cause, before, intent); }
+        if (!actuator.stillPreExecution(attempt) || Thread.currentThread().isInterrupted()) { return ConvergeResult.superseded(); }
+        if (!state.supportsPreExecutionFailures()) {
+            return withPreExecutionFailure(failedWith(id, cause, before, intent), attempt);
+        }
+        var failed = state.failPreExecution(attempt, clock.instant()).orElse(null);
+        if (failed == null) { return ConvergeResult.superseded(); }
+        rebuilds.recordFailure(id);
+        if (actuator.stillPreExecution(attempt)) {
+            try { actuator.stop(id, false); }
+            catch (TapstateException cleanup) { cause.addSuppressed(cleanup); }
+        }
+        return ConvergeResult.failed(failed, cause, Optional.of(StateJson.parse(before.stateJson())))
+                .withPreExecutionFailure(attempt.failed(failed));
     }
 }

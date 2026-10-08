@@ -76,6 +76,26 @@ import java.util.stream.Collectors;
  */
 public final class ObservationPublisher {
 
+    /** No execution exists for this refusal: publish only the actual coded state, without native collection or folding. */
+    public boolean publishPreExecutionFailure(io.tapstate.spi.store.PreExecutionFailure.Receipt receipt,
+            ObservationFailure failure, BooleanSupplier current) {
+        Objects.requireNonNull(receipt, "receipt"); Objects.requireNonNull(failure, "failure");
+        if (!current.getAsBoolean()) { return false; }
+        Observation diagnostic = new Observation(receipt.owner().pipelineId(), PipelineState.FAILED,
+                Map.of(), Map.of(), Map.of(), failure, clock.instant().truncatedTo(java.time.temporal.ChronoUnit.MILLIS), List.of());
+        return observations.savePreExecutionFailure(diagnostic, receipt);
+    }
+
+    /** This cold recovery retains the persisted original owner and cause; it cannot allocate an execution. */
+    public boolean refreshPreExecutionFailure(String pipelineId, BooleanSupplier current) {
+        return current.getAsBoolean() && observations.refreshPreExecutionFailure(pipelineId,
+                clock.instant().truncatedTo(java.time.temporal.ChronoUnit.MILLIS));
+    }
+
+    public boolean preExecutionFailureInputsCurrent(io.tapstate.spi.store.PreExecutionFailure.Owner owner) {
+        return observations.preExecutionFailureInputsCurrent(owner);
+    }
+
     /**
      * What a per-chain frontier reading is named in the metrics map, with the chain's own name appended.
      * The name is this layer's to choose: the metrics map is what a read face presents, and how a run

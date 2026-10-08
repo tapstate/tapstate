@@ -319,6 +319,6 @@ class DataPlaneActuationConfiguration {
                 pipelineCaptureCoordinator, nestStateTeardown,
                 pipelineActuationOwnership,
                 new io.tapstate.control.core.PipelineIncarnationService(storePort.artifacts()), observationScopes,
-                publisher, storePort.observations()), lifecycleWork);
+                publisher, storePort.observations(), storePort.workloadClaims()), lifecycleWork);
     }
 }

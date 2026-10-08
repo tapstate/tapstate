@@ -525,6 +525,167 @@ final class MongoStopReservationWrites {
     /** A conditional cold write uses this sentinel to abort, rather than commit partial guard writes. */
     static RuntimeException fencedHandoff() { return FENCED; }
 
+    /** A refusal commits only while its original actual, intent, artifacts and writer still qualify. */
+    <T> Optional<T> withPreExecutionFailure(io.tapstate.spi.store.PreExecutionFailure.Receipt receipt,
+            Function<ClientSession, T> coldWrites) {
+        Objects.requireNonNull(receipt, "receipt"); Objects.requireNonNull(coldWrites, "coldWrites");
+        return transact(receipt.owner().pipelineId(), session -> {
+            var owner = receipt.owner();
+            String id = owner.pipelineId();
+            Document actual = state(session, id);
+            if (actual == null || !MongoStateStore.toCheckpoint(actual).equals(receipt.checkpoint())) { throw FENCED; }
+            Document marker = requireMarkerOrAbsent(actual, id);
+            guardDesired(session, id, receipt.desired());
+            if (states.updateOne(session, new Document("_id", id).append("epoch", receipt.checkpoint().epoch())
+                    .append("stateJson", receipt.checkpoint().stateJson())
+                    .append(StopReservationDocument.FIELD, marker == null ? new Document("$exists", false) : marker),
+                    PROVE_DESIRED).getMatchedCount() != 1) { throw FENCED; }
+            if (artifacts == null) { throw new UnsupportedOperationException("refusal publication requires artifact fencing"); }
+            for (var artifact : receipt.artifactHashes().entrySet()) {
+                Document filter = new Document("_id", artifact.getKey()).append("contentHash", artifact.getValue());
+                if (artifact.getKey().equals(id)) {
+                    filter.append("kind", "pipeline").append("pipelineIncarnationId", owner.pipelineIncarnationId());
+                }
+                if (artifacts.updateOne(session, filter, PROVE_DESIRED).getMatchedCount() != 1) { throw FENCED; }
+            }
+            guardRefusalFrontier(session, owner);
+            return coldWrites.apply(session);
+        });
+    }
+
+    Optional<CheckpointDoc> failPreExecution(io.tapstate.spi.store.PreExecutionFailure.Attempt expected, Instant at) {
+        return transact(expected.pipelineId(), session -> {
+            String id = expected.pipelineId();
+            guardDesired(session, id, expected.desired());
+            if (artifacts == null) { throw new UnsupportedOperationException("refusal transitions require artifact fencing"); }
+            for (var artifact : expected.artifactHashes().entrySet()) {
+                Document filter = new Document("_id", artifact.getKey()).append("contentHash", artifact.getValue());
+                if (artifact.getKey().equals(id)) {
+                    filter.append("kind", "pipeline").append("pipelineIncarnationId", expected.pipelineIncarnationId());
+                }
+                if (artifacts.updateOne(session, filter, PROVE_DESIRED).getMatchedCount() != 1) { throw FENCED; }
+            }
+            guardRefusalFrontier(session, id, expected.clusterId(), expected.generationFrontier(), expected.writer());
+            Document failed = states.findOneAndUpdate(session, new Document("_id", id)
+                    .append("epoch", expected.originalCheckpoint().epoch()).append("stateJson", expected.originalCheckpoint().stateJson())
+                    .append(StopReservationDocument.FIELD, new Document("$exists", false)),
+                    new Document("$set", new Document("stateJson", StateJson.of(PipelineState.FAILED)).append("touchMillis", at.toEpochMilli()))
+                            .append("$inc", new Document("epoch", 1L)), RETURN_AFTER);
+            if (failed == null) { throw FENCED; }
+            return MongoStateStore.toCheckpoint(failed);
+        });
+    }
+
+    /** Payload is already verified; all cold ownership reads use the same Mongo snapshot. */
+    boolean currentPreExecutionFailure(io.tapstate.spi.store.PreExecutionFailure.Owner owner,
+            java.util.function.Predicate<ClientSession> sameCurrent) {
+        return preExecutionFailureReceipt(owner, sameCurrent).isPresent();
+    }
+
+    Optional<io.tapstate.spi.store.PreExecutionFailure.Receipt> preExecutionFailureReceipt(
+            io.tapstate.spi.store.PreExecutionFailure.Owner owner, java.util.function.Predicate<ClientSession> sameCurrent) {
+        Objects.requireNonNull(owner, "owner"); Objects.requireNonNull(sameCurrent, "sameCurrent");
+        return transact(owner.pipelineId(), session -> {
+            String id = owner.pipelineId();
+            Document actual = state(session, id);
+            Document wanted = desired.find(session, new Document("_id", id)).first();
+            if (actual == null || wanted == null || artifacts == null) { throw FENCED; }
+            var checkpoint = MongoStateStore.toCheckpoint(actual);
+            if (checkpoint.epoch() != owner.checkpointEpoch()
+                    || !owner.checkpointDigest().equals(io.tapstate.spi.store.PreExecutionFailure.checkpointDigest(checkpoint))
+                    || !owner.desiredDigest().equals(io.tapstate.spi.store.PreExecutionFailure.desiredDigest(
+                            readDesiredExact(wanted, id)))) { throw FENCED; }
+            Map<String, String> hashes = new java.util.TreeMap<>();
+            java.util.Set<String> visited = new java.util.HashSet<>();
+            var pending = new java.util.ArrayDeque<String>(); pending.add(id);
+            while (!pending.isEmpty()) {
+                String artifactId = pending.removeFirst();
+                if (!visited.add(artifactId)) { continue; }
+                Document stored = artifacts.find(session, new Document("_id", artifactId)).first();
+                if (stored == null) { continue; }
+                if (artifactId.equals(id) && (!"pipeline".equals(stored.get("kind"))
+                        || !owner.pipelineIncarnationId().equals(stored.get("pipelineIncarnationId")))) { throw FENCED; }
+                var resource = MongoArtifactStore.toResource(stored);
+                hashes.put(artifactId, io.tapstate.core.model.canonical.CanonicalHash.of(resource));
+                io.tapstate.core.dsl.ReferenceGraph.declaredReferences(resource).forEach(pending::addLast);
+            }
+            if (!hashes.containsKey(id) || !owner.artifactLineageDigest().equals(
+                    io.tapstate.spi.store.PreExecutionFailure.lineageDigest(hashes))
+                    || !refusalFrontierMatches(session, owner) || !sameCurrent.test(session)) { throw FENCED; }
+            return new io.tapstate.spi.store.PreExecutionFailure.Receipt(owner, checkpoint,
+                    readDesiredExact(wanted, id), hashes);
+        });
+    }
+
+    private boolean refusalFrontierMatches(ClientSession session, io.tapstate.spi.store.PreExecutionFailure.Owner owner) {
+        return refusalFrontierMatches(session, owner.pipelineId(), owner.clusterId(), owner.generationFrontier(), owner.writer());
+    }
+
+    private boolean refusalFrontierMatches(ClientSession session, String id, String clusterId,
+            java.util.OptionalLong frontier, WorkloadClaimFence writer) {
+        Document stored = claims.find(session, new Document("_id", claimId(clusterId, id))).first();
+        if (stored == null) { return writer == null && frontier.isEmpty(); }
+        validateClaim(stored, id, false);
+        long actual = stored.get("executionGeneration") instanceof Number number ? number.longValue() : 0L;
+        if (actual != frontier.orElse(0L)) { return false; }
+        if (writer == null) {
+            return claims.find(session, new Document("_id", claimId(clusterId, id))
+                    .append("$or", List.of(new Document("ownerNodeId", new Document("$exists", false)),
+                            new Document("$expr", new Document("$lte", List.of("$leaseUntil", "$$NOW")))))).first() != null;
+        }
+        var fence = writer;
+        Document filter = new Document("_id", claimId(clusterId, id))
+                .append("ownerNodeId", fence.owner().nodeId()).append("ownerBootId", fence.owner().bootId())
+                .append("claimGeneration", fence.claimGeneration()).append("executionGeneration", fence.executionGeneration())
+                .append("topologyRevision", fence.topologyRevision())
+                .append("$expr", new Document("$gt", List.of("$leaseUntil", "$$NOW")));
+        return claims.find(session, filter).first() != null;
+    }
+
+    private void guardRefusalFrontier(ClientSession session, io.tapstate.spi.store.PreExecutionFailure.Owner owner) {
+        guardRefusalFrontier(session, owner.pipelineId(), owner.clusterId(), owner.generationFrontier(), owner.writer());
+    }
+
+    private void guardRefusalFrontier(ClientSession session, String id, String clusterId,
+            java.util.OptionalLong frontier, WorkloadClaimFence writer) {
+        if (!refusalFrontierMatches(session, id, clusterId, frontier, writer)) { throw FENCED; }
+        if (writer != null) {
+            guardKnownAuthority(session, id, StopAuthority.claimed(writer));
+        } else if (frontier.isPresent()) {
+            guardKnownAuthority(session, id, StopAuthority.standalone(clusterId, frontier.getAsLong()));
+        } else {
+            Document key = claimId(clusterId, id);
+            Document stored = claims.find(session, new Document("_id", key)).first();
+            if (stored != null) {
+                Document filter = new Document("_id", key).append("executionGeneration", stored.get("executionGeneration"))
+                        .append("$or", List.of(new Document("ownerNodeId", new Document("$exists", false)),
+                                new Document("$expr", new Document("$lte", List.of("$leaseUntil", "$$NOW")))));
+                if (claims.updateOne(session, filter, PROVE_CLAIM).getMatchedCount() != 1) { throw FENCED; }
+            }
+            // There is no write or upsert for a missing generation document. Manifest role fencing and
+            // the post-payload authority snapshot make a concurrent first real admission invalidate it.
+        }
+    }
+
+    void requirePreExecutionContinuation(ClientSession session, io.tapstate.spi.store.PreExecutionFailure.Owner owner,
+            io.tapstate.spi.store.ObservationStore.ContinuationReceipt carried, Document header,
+            Document originalCurrent, boolean covered) {
+        Document actual = state(session, owner.pipelineId());
+        if (actual == null) { throw FENCED; }
+        Document raw = requireMarkerOrAbsent(actual, owner.pipelineId());
+        if (raw == null) { return; }
+        var marker = StopReservationDocument.read(owner.pipelineId(), MongoStateStore.toCheckpoint(actual).epoch(), raw);
+        if (marker.legacy()) { throw FENCED; }
+        if (marker.counterPolicy() != StopReservation.CounterPolicy.CONTINUE) { return; }
+        if (!covered || carried == null || header == null || !Objects.equals(originalCurrent, header.get("current"))
+                || !marker.token().equals(carried.token())
+                || !Objects.equals(marker.source().scope(), carried.sourceScope())
+                || !MongoObservationContinuation.expectedMatches(header, Optional.of(carried))) { throw FENCED; }
+        if (marker.successor() != null && carried.target().filter(target ->
+                target.scope().equals(marker.successor().scope())
+                        && target.realJob().equals(Optional.ofNullable(marker.successor().job()))).isEmpty()) { throw FENCED; }
+    }
+
     private <T> Optional<T> transact(String id, Function<ClientSession, T> action) {
         for (int attempt = 0; attempt < 8; attempt++) {
             try {
@@ -585,18 +746,7 @@ final class MongoStopReservationWrites {
     private void guardDesired(ClientSession session, String id, DesiredState expected) {
         Document stored = desired.find(session, new Document("_id", id)).first();
         if (stored == null) { throw FENCED; }
-        if (!(stored.get("_id") instanceof String)
-                || !(stored.get("targetState") instanceof String)
-                || !(stored.get("revision") instanceof String)
-                || stored.containsKey("purgeState") && !(stored.get("purgeState") instanceof Boolean)
-                || stored.containsKey("reassemble") && !(stored.get("reassemble") instanceof Boolean)
-                || stored.get("assemblyRevision") != null && !(stored.get("assemblyRevision") instanceof String)
-                || stored.get("rebuiltAtStateEpoch") != null
-                        && !(stored.get("rebuiltAtStateEpoch") instanceof Long
-                                || stored.get("rebuiltAtStateEpoch") instanceof Integer)) {
-            throw unreadable(id, "pipelineDesired");
-        }
-        if (!MongoDesiredStore.toDesired(stored).equals(expected)) { throw FENCED; }
+        if (!readDesiredExact(stored, id).equals(expected)) { throw FENCED; }
         Object guard = stored.get("stopGuardVersion");
         if (guard != null && !(guard instanceof Long || guard instanceof Integer)) {
             throw unreadable(id, "stopGuardVersion");
@@ -609,6 +759,22 @@ final class MongoStopReservationWrites {
                 .append("reassemble", stored.get("reassemble"))
                 .append("rebuiltAtStateEpoch", stored.get("rebuiltAtStateEpoch"));
         if (desired.updateOne(session, filter, PROVE_DESIRED).getMatchedCount() != 1) { throw FENCED; }
+    }
+
+    private static DesiredState readDesiredExact(Document stored, String id) {
+        if (!(stored.get("_id") instanceof String)
+                || !(stored.get("targetState") instanceof String)
+                || !(stored.get("revision") instanceof String)
+                || stored.containsKey("purgeState") && !(stored.get("purgeState") instanceof Boolean)
+                || stored.containsKey("reassemble") && !(stored.get("reassemble") instanceof Boolean)
+                || stored.get("assemblyRevision") != null && !(stored.get("assemblyRevision") instanceof String)
+                || stored.get("rebuiltAtStateEpoch") != null
+                        && !(stored.get("rebuiltAtStateEpoch") instanceof Long
+                                || stored.get("rebuiltAtStateEpoch") instanceof Integer)) {
+            throw unreadable(id, "pipelineDesired");
+        }
+        try { return MongoDesiredStore.toDesired(stored); }
+        catch (IllegalArgumentException | ClassCastException malformed) { throw unreadable(id, "pipelineDesired"); }
     }
 
     /** Current authority and this checkpoint transition write in one short Mongo transaction. */

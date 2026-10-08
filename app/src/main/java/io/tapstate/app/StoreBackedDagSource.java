@@ -158,7 +158,14 @@ final class StoreBackedDagSource implements DagSource {
 
     @Override
     public StartPreparation prepareStart(String pipelineId, String defaultDatabase) {
+        return prepareStart(pipelineId, defaultDatabase, ignored -> { });
+    }
+
+    @Override
+    public StartPreparation prepareStart(String pipelineId, String defaultDatabase,
+            java.util.function.Consumer<ArtifactStore> inputs) {
         ReadOnlyArtifactSnapshot snapshot = ReadOnlyArtifactSnapshot.capture(storePort.artifacts());
+        inputs.accept(snapshot);
         String cursorToken = java.util.UUID.randomUUID().toString();
         StoreBackedDagSource captured = new StoreBackedDagSource(
                 storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement,

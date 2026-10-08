@@ -92,6 +92,11 @@ public final class ReferenceGraph {
         return reverse.getOrDefault(id, List.of());
     }
 
+    /** Declared cross-resource names, including unresolved names; no store or validation side effect. */
+    public static Set<String> declaredReferences(Resource resource) {
+        return Set.copyOf(referencedIds(resource));
+    }
+
     /** The deduped set of top-level ids one resource names; intra-pipeline wiring is excluded. */
     private static Set<String> referencedIds(Resource r) {
         Set<String> ids = new LinkedHashSet<>();

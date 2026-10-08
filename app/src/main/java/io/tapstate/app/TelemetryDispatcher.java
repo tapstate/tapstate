@@ -85,6 +85,15 @@ final class TelemetryDispatcher implements AutoCloseable {
                 previous.restore();
             }
         }
+
+        void emitPreExecution(BooleanSupplier current) {
+            if (emitted.get() || !current.getAsBoolean() || !emitted.compareAndSet(false, true)) { return; }
+            PipelineLogContext previous = PipelineLogContext.capture();
+            MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, pipelineId);
+            PipelineLogContext.bindScope(null);
+            try { ConvergenceDriver.logPreExecutionFailure(pipelineId, failure, cause); }
+            finally { previous.restore(); }
+        }
     }
 
     private enum PreparationOutcome {
@@ -327,8 +336,13 @@ final class TelemetryDispatcher implements AutoCloseable {
         }
     }
 
-    private sealed interface Frame permits ObservationFrame, PreparationFrame, ReconcileFailureFrame, RecoveryFrame {
+    private sealed interface Frame permits ObservationFrame, PreparationFrame, ReconcileFailureFrame, RecoveryFrame, DiagnosticFrame {
         ObservationStore.Scope scope();
+    }
+
+    private record DiagnosticFrame(io.tapstate.spi.store.PreExecutionFailure.Receipt receipt,
+            ObservationFailure failure, Supplier<PublicationQualification> owner, FailureLog diagnostic) implements Frame {
+        @Override public ObservationStore.Scope scope() { return null; }
     }
 
     private record ObservationFrame(ObservationPublisher.Prepared prepared, ObservationStore.Scope scope)
@@ -762,6 +776,39 @@ final class TelemetryDispatcher implements AutoCloseable {
                 () -> owner.getAsBoolean() ? PublicationQualification.CURRENT : PublicationQualification.STALE);
     }
 
+    void offerPreExecutionFailure(io.tapstate.spi.store.PreExecutionFailure.Receipt receipt,
+            ObservationFailure failure, Supplier<PublicationQualification> owner, FailureLog diagnostic) {
+        Objects.requireNonNull(receipt, "receipt"); Objects.requireNonNull(failure, "failure"); Objects.requireNonNull(owner, "owner");
+        offerLatest(receipt.owner().pipelineId(), new DiagnosticFrame(receipt, failure, owner, diagnostic));
+    }
+
+    private PublicationQualification qualification(DiagnosticFrame frame) {
+        return abort.get() ? PublicationQualification.STALE : Objects.requireNonNull(frame.owner().get(), "qualification");
+    }
+
+    private PreparationOutcome publishDiagnostic(DiagnosticFrame frame) {
+        PublicationQualification qualification = qualification(frame);
+        if (qualification != PublicationQualification.CURRENT) {
+            return qualification == PublicationQualification.RETRY ? PreparationOutcome.RETRY : PreparationOutcome.SKIPPED;
+        }
+        BooleanSupplier current = () -> qualification(frame) == PublicationQualification.CURRENT;
+        if (continuations != null && !continuations.prepareHandoff(frame.receipt().owner().pipelineId(), null, current)) {
+            return current.getAsBoolean() ? PreparationOutcome.RETRY : PreparationOutcome.SKIPPED;
+        }
+        if (frame.diagnostic() != null) { frame.diagnostic().emitPreExecution(current); }
+        if (!publisher.publishPreExecutionFailure(frame.receipt(), frame.failure(), current)) {
+            return current.getAsBoolean() && publisher.preExecutionFailureInputsCurrent(frame.receipt().owner())
+                    ? PreparationOutcome.RETRY : PreparationOutcome.SKIPPED;
+        }
+        if (scopes != null) {
+            var owner = frame.receipt().owner();
+            scopes.current(owner.pipelineId()).filter(scope -> scope.pipelineIncarnationId().equals(owner.pipelineIncarnationId())
+                    && scope.executionGeneration() <= owner.generationFrontier().orElse(0L))
+                    .ifPresent(scope -> scopes.discard(owner.pipelineId(), scope));
+        }
+        return PreparationOutcome.PUBLISHED;
+    }
+
     void offerQualifiedPreparation(String pipelineId, ObservationFailure failure, ObservationStore.Scope scope,
             Supplier<PublicationQualification> owner) {
         offerQualifiedPreparation(pipelineId, failure, scope, owner, null);
@@ -950,8 +997,10 @@ final class TelemetryDispatcher implements AutoCloseable {
             pending = slot.pending;
         }
         // The external predicate stays outside the monitor. Cleanup matches this exact input snapshot.
-        if (!(pending instanceof PreparationFrame preparation)
-                || qualification(preparation) != PublicationQualification.STALE) {
+        boolean stale = pending instanceof PreparationFrame preparation
+                && qualification(preparation) == PublicationQualification.STALE
+                || pending instanceof DiagnosticFrame diagnostic && qualification(diagnostic) == PublicationQualification.STALE;
+        if (!stale) {
             return;
         }
         synchronized (slot) {
@@ -1127,6 +1176,10 @@ final class TelemetryDispatcher implements AutoCloseable {
         if (!scopes.awaiting(ticket) || !frame.owner().getAsBoolean()) {
             return false;
         }
+        if (publisher.refreshPreExecutionFailure(pipelineId, frame.owner())) {
+            scopes.cancelRestoration(pipelineId);
+            return true;
+        }
         if (continuations != null) {
             BooleanSupplier waiting = () -> scopes.awaiting(ticket) && frame.owner().getAsBoolean();
             var continued = continuations.resolveExisting(pipelineId, frame.owner());
@@ -1258,6 +1311,11 @@ final class TelemetryDispatcher implements AutoCloseable {
                         continue;
                     }
                     if (existing.pending != null) {
+                        if (existing.pending instanceof DiagnosticFrame diagnostic && !(frame instanceof DiagnosticFrame)
+                                && (frame.scope() == null || frame.scope().executionGeneration()
+                                        <= diagnostic.receipt().owner().generationFrontier().orElse(0L))) {
+                            frame = existing.pending;
+                        }
                         latestStats.coalesced.incrementAndGet();
                         if (frame instanceof PreparationFrame incoming
                                 && existing.pending instanceof PreparationFrame previous) {
@@ -1503,13 +1561,15 @@ final class TelemetryDispatcher implements AutoCloseable {
             latestCapacity.release();
         }
 
-        private void park(PreparationFrame request) {
+        private void park(Frame request) {
             synchronized (this) {
                 if (retired) {
                     return;
                 }
-                if (pending instanceof PreparationFrame incoming) {
-                    pending = incoming.replacing(request);
+                if (pending instanceof PreparationFrame incoming && request instanceof PreparationFrame prior) {
+                    pending = incoming.replacing(prior);
+                } else if (request instanceof DiagnosticFrame && (pending == null || pending instanceof RecoveryFrame)) {
+                    pending = request;
                 } else if (pending == null || Objects.equals(request.scope(), pending.scope())) {
                     pending = request;
                 }
@@ -1587,6 +1647,13 @@ final class TelemetryDispatcher implements AutoCloseable {
                         } else {
                             latestStats.skipped(operation);
                         }
+                    } else if (frame instanceof DiagnosticFrame diagnostic) {
+                        PreparationOutcome outcome = publishDiagnostic(diagnostic);
+                        if (outcome == PreparationOutcome.PUBLISHED) { successfulCompletion(latestStats, operation, Sink.LATEST); }
+                        else {
+                            latestStats.skipped(operation);
+                            if (outcome == PreparationOutcome.RETRY) { park(diagnostic); return; }
+                        }
                     }
                 } catch (RuntimeException failed) {
                     latestFailure(operation);
@@ -1598,6 +1665,8 @@ final class TelemetryDispatcher implements AutoCloseable {
                         park(preparation);
                         return;
                     }
+                    if (frame instanceof DiagnosticFrame diagnostic
+                            && qualification(diagnostic) != PublicationQualification.STALE) { park(diagnostic); return; }
                 } catch (Error defect) {
                     latestStats.completed(operation, false);
                     throw defect;

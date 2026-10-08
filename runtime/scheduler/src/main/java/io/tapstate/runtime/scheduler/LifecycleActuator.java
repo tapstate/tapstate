@@ -23,6 +23,22 @@ import io.tapstate.core.lifecycle.PipelineState;
  */
 public interface LifecycleActuator {
 
+    /** Captures original validation inputs; null retires that receipt after an actual execution admission. */
+    default PreparedStart prepareStart(String pipelineId, io.tapstate.core.lifecycle.DesiredState desired,
+            io.tapstate.core.lifecycle.CheckpointDoc checkpoint,
+            java.util.function.Consumer<io.tapstate.spi.store.PreExecutionFailure.Attempt> captured) {
+        return prepareStart(pipelineId);
+    }
+
+    default PreparedReplacement prepareReplacement(StopReservation reservation, ReplacementAdmission admission,
+            Predicate<StopReservation> current, io.tapstate.core.lifecycle.CheckpointDoc checkpoint,
+            java.util.function.Consumer<io.tapstate.spi.store.PreExecutionFailure.Attempt> captured) {
+        return prepareReplacement(reservation, admission, current);
+    }
+
+    /** A validation refusal cannot claim this variant once its actual new generation was allocated. */
+    default boolean stillPreExecution(io.tapstate.spi.store.PreExecutionFailure.Attempt attempt) { return false; }
+
     /** Holds admitted start work until the checkpoint transition has been recorded. */
     interface PreparedStart extends AutoCloseable {
         void submit();

@@ -19,7 +19,8 @@ import java.time.Instant;
 public record ConvergeResult(
         ConvergeStatus status, Optional<CheckpointDoc> checkpoint, Optional<Throwable> failure,
         Optional<PipelineState> transitionFrom,
-        Optional<ExecutionBoundary> executionBoundary) {
+        Optional<ExecutionBoundary> executionBoundary,
+        Optional<io.tapstate.spi.store.PreExecutionFailure.Receipt> preExecutionFailure) {
 
     /** One transient receipt of a real execution submission or winning successor binding. */
     public record ExecutionBoundary(ObservationStore.Scope scope, long checkpointEpoch,
@@ -38,6 +39,16 @@ public record ConvergeResult(
         Objects.requireNonNull(failure, "failure");
         Objects.requireNonNull(transitionFrom, "transitionFrom");
         Objects.requireNonNull(executionBoundary, "executionBoundary");
+        Objects.requireNonNull(preExecutionFailure, "preExecutionFailure");
+        if (preExecutionFailure.isPresent() && (status != ConvergeStatus.FAILED || failure.isEmpty()
+                || checkpoint.filter(preExecutionFailure.orElseThrow().checkpoint()::equals).isEmpty())) {
+            throw new IllegalArgumentException("an execution-free refusal belongs to its actual failed result");
+        }
+    }
+
+    public ConvergeResult(ConvergeStatus status, Optional<CheckpointDoc> checkpoint, Optional<Throwable> failure,
+            Optional<PipelineState> transitionFrom, Optional<ExecutionBoundary> executionBoundary) {
+        this(status, checkpoint, failure, transitionFrom, executionBoundary, Optional.empty());
     }
 
     public ConvergeResult(ConvergeStatus status, Optional<CheckpointDoc> checkpoint, Optional<Throwable> failure,
@@ -47,6 +58,10 @@ public record ConvergeResult(
 
     ConvergeResult withExecutionBoundary(ExecutionBoundary boundary) {
         return new ConvergeResult(status, checkpoint, failure, transitionFrom, Optional.of(boundary));
+    }
+
+    ConvergeResult withPreExecutionFailure(io.tapstate.spi.store.PreExecutionFailure.Receipt receipt) {
+        return new ConvergeResult(status, checkpoint, failure, transitionFrom, executionBoundary, Optional.of(receipt));
     }
 
     ConvergeResult recoveringExecution() {

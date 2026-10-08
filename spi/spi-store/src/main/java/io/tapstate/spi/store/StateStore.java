@@ -24,6 +24,13 @@ import java.util.Optional;
  */
 public interface StateStore extends StopReservationStore {
 
+    default boolean supportsPreExecutionFailures() { return false; }
+
+    /** Applies the original refusal only beneath its full captured resource, intent and writer qualification. */
+    default Optional<CheckpointDoc> failPreExecution(PreExecutionFailure.Attempt expected, Instant touchTime) {
+        throw new UnsupportedOperationException("qualified pre-execution failure transitions are unavailable");
+    }
+
     /** Returns the current checkpoint for a pipeline, or empty if none exists. */
     Optional<CheckpointDoc> read(String pipelineId);
 

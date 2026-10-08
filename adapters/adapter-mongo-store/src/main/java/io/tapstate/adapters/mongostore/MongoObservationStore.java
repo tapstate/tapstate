@@ -58,12 +58,14 @@ public final class MongoObservationStore implements ObservationStore {
     private final MongoLatestObservationStorage latest;
     private final MongoObservationContinuation continuation;
     private final MongoStopReservationWrites handoffWrites;
+    private final MongoPreExecutionFailureStorage refusals;
 
     public MongoObservationStore(MongoCollection<Document> collection) {
         this.collection = Objects.requireNonNull(collection, "collection");
         this.latest = null;
         this.continuation = null;
         this.handoffWrites = null;
+        this.refusals = null;
     }
 
     public MongoObservationStore(MongoClient client, MongoCollection<Document> collection,
@@ -78,6 +80,24 @@ public final class MongoObservationStore implements ObservationStore {
         this.latest = new MongoLatestObservationStorage(Objects.requireNonNull(client, "client"), collection,
                 Objects.requireNonNull(chunks, "chunks"));
         this.continuation = new MongoObservationContinuation(client, collection, chunks, latest, handoffWrites);
+        this.refusals = new MongoPreExecutionFailureStorage(collection, latest, handoffWrites, continuation);
+    }
+
+    @Override public boolean savePreExecutionFailure(Observation observation, io.tapstate.spi.store.PreExecutionFailure.Receipt receipt) {
+        if (refusals == null) { throw new UnsupportedOperationException("private refusal publication is unavailable"); }
+        return refusals.save(observation, receipt);
+    }
+
+    @Override public boolean isCurrentPreExecutionFailure(io.tapstate.spi.store.PreExecutionFailure.Owner owner) {
+        return refusals != null && refusals.current(owner);
+    }
+
+    @Override public boolean refreshPreExecutionFailure(String pipelineId, Instant observedAt) {
+        return refusals != null && refusals.refresh(pipelineId, observedAt);
+    }
+
+    @Override public boolean preExecutionFailureInputsCurrent(io.tapstate.spi.store.PreExecutionFailure.Owner owner) {
+        return handoffWrites != null && handoffWrites.currentPreExecutionFailure(owner, ignored -> true);
     }
 
     @Override
