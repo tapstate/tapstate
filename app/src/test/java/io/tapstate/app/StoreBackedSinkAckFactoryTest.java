@@ -8,6 +8,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -20,6 +21,8 @@ import io.tapstate.core.lifecycle.AwaitedLoad;
 import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.ConsumerProgressKind;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.SrsMetaStore;
 import java.lang.reflect.InvocationTargetException;
 import java.util.ArrayList;
@@ -49,6 +52,186 @@ class StoreBackedSinkAckFactoryTest {
 
     private static final String WRITER = "serve.s#0";
     private static final String OTHER_WRITER = "serve.t#0";
+
+    @Test
+    void anUnusedTableMappingDoesNotHoldASingleTableLegacyCheckpoint() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        store.create("mc-mail", null);
+        Map<String, List<String>> plan = Map.of(
+                "orders", List.of("view"), "mail", List.of("view"));
+        HazelcastInstance member = memberWith(store);
+        StoreBackedSinkAckFactory factory = startedRun(member,
+                Map.of("orders", "mc-orders", "items", "mc-orders", "mail", "mc-mail"), "pipe-1", plan);
+        SinkAck ack = factory.resolve(member).forWriter("view");
+
+        ack.advance("orders", at(7, "w7"));
+        ack.advance("mail", at(11, "mail-11"));
+
+        assertThat(store.read("mc-orders").orElseThrow().sourceReadOffset()).isEqualTo("w7");
+        assertThat(store.read("mc-mail").orElseThrow().sourceReadOffset()).isEqualTo("mail-11");
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1"))
+                .containsExactlyEntriesOf(Map.of("orders", 7L));
+    }
+
+    @Test
+    void separateWritersCannotRankTheLegacyTablesInTheirCompletePlan() {
+        InMemorySrsMetaStore backing = new InMemorySrsMetaStore();
+        backing.create("mc-orders", null);
+        SrsMetaStore store = mock(SrsMetaStore.class, AdditionalAnswers.delegatesTo(backing));
+        Map<String, List<String>> plan = Map.of(
+                "orders", List.of("orders-view"), "mail", List.of("mail-view"));
+        HazelcastInstance member = memberWith(store);
+        StoreBackedSinkAckFactory factory = startedRun(member,
+                Map.of("orders", "mc-orders", "mail", "mc-orders"), "pipe-1", plan);
+        SinkAck orders = factory.resolve(member).forWriter("orders-view");
+        SinkAck mail = factory.resolve(member).forWriter("mail-view");
+
+        orders.advance("orders", at(1, "low"));
+        backing.advanceConsumerReadSeq("mc-orders", "pipe-1", "orders", 2L);
+        mail.advance("mail", at(1_000, "mail-after-high"));
+
+        assertThat(backing.ringDoneThrough("mc-orders", "pipe-1"))
+                .containsExactlyInAnyOrderEntriesOf(Map.of("orders", 1L, "mail", 1_000L));
+        assertThat(backing.read("mc-orders").orElseThrow().sourceReadOffset()).isNull();
+        verify(store, never()).consumerOffsets(anyString());
+        verify(store, never()).advanceSourceReadOffset(anyString(), any());
+    }
+
+    @Test
+    void sharedCaptureKeepsEachSourceNodesConfirmedTablesSeparate() {
+        InMemorySrsMetaStore backing = new InMemorySrsMetaStore();
+        backing.create("crm", null);
+        backing.openEpoch("crm");
+        backing.publishCaptureTables("crm", 1L,
+                List.of("support_case", "casehistory__c", "emailmessage"));
+        backing.advanceCaptureCheckpoint("crm", at(30, "capture-30"));
+        SrsMetaStore store = mock(SrsMetaStore.class, AdditionalAnswers.delegatesTo(backing));
+        String cases = SrsConsumerId.of("pipe", "cases").value();
+        String mail = SrsConsumerId.of("pipe", "mail").value();
+        Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = Map.of(
+                "support_case", srsProgress("crm", cases),
+                "casehistory__c", srsProgress("crm", cases),
+                "emailmessage", srsProgress("crm", mail));
+        Map<String, List<String>> plan = Map.of(
+                "support_case", List.of("view"), "casehistory__c", List.of("view"),
+                "emailmessage", List.of("view"));
+        HazelcastInstance member = memberWith(store);
+        StoreBackedSinkAckFactory factory = new StoreBackedSinkAckFactory(progress, "pipe", "run-1");
+        factory.beginRun(member, plan);
+        SinkAck ack = factory.resolve(member).forWriter("view");
+
+        ack.advance("support_case", at(1, "low"));
+        backing.advanceConsumerReadSeq("crm", cases, "support_case", 2);
+        ack.advance("emailmessage", at(1_000, "mail-after-high"));
+        ack.advance("casehistory__c", at(4, "history-4"));
+
+        ConsumerOffset caseOffset = backing.read("crm").orElseThrow().consumerOffset(cases).orElseThrow();
+        ConsumerOffset mailOffset = backing.read("crm").orElseThrow().consumerOffset(mail).orElseThrow();
+        assertThat(caseOffset.sinkAckedByTable())
+                .containsExactlyInAnyOrderEntriesOf(Map.of("support_case", at(1, "low"),
+                        "casehistory__c", at(4, "history-4")));
+        assertThat(mailOffset.sinkAckedByTable()).containsExactlyEntriesOf(Map.of(
+                "emailmessage", at(1_000, "mail-after-high")));
+        assertThat(backing.ringDoneThrough("crm", cases)).containsEntry("support_case", 1L)
+                .doesNotContainKey("emailmessage");
+        assertThat(backing.read("crm").orElseThrow().sourceReadOffset()).isEqualTo("capture-30");
+        assertThat(backing.read("crm").orElseThrow().sourceReadDurable()).isTrue();
+        verify(store, atLeastOnce()).beginWriterRun("crm", cases, "run-1",
+                Map.of("support_case", List.of("view"), "casehistory__c", List.of("view")),
+                ConsumerProgressKind.SRS);
+        verify(store, atLeastOnce()).beginWriterRun("crm", mail, "run-1",
+                Map.of("emailmessage", List.of("view")), ConsumerProgressKind.SRS);
+        verify(store, never()).beginWriterRun("crm", cases, "run-1", plan, ConsumerProgressKind.SRS);
+        verify(store, never()).beginWriterRun("crm", mail, "run-1", plan, ConsumerProgressKind.SRS);
+        verify(store, never()).advanceSourceReadOffset(anyString(), any());
+        verify(store, never()).consumerOffsets(anyString());
+    }
+
+    @Test
+    void mailConfirmedAfterAnUnconfirmedHighCannotRaiseTheRootTablesReplayFloor() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("crm", null);
+        String consumer = SrsConsumerId.of("pipe", "crm_source").value();
+        Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = Map.of(
+                "support_case", srsProgress("crm", consumer),
+                "emailmessage", srsProgress("crm", consumer));
+        Map<String, List<String>> plan = Map.of(
+                "support_case", List.of("view"), "emailmessage", List.of("view"));
+        HazelcastInstance member = memberWith(store);
+        StoreBackedSinkAckFactory factory = new StoreBackedSinkAckFactory(progress, "pipe", "run-1");
+        factory.beginRun(member, plan);
+        SinkAck ack = factory.resolve(member).forWriter("view");
+        ack.advance("support_case", at(1, "low"));
+        store.advanceConsumerReadSeq("crm", consumer, "support_case", 2);
+
+        ack.advance("emailmessage", at(1_000, "mail-after-high"));
+
+        var floor = new StoreBackedReplayFloorFactory(progress).resolve(memberWith(store));
+        assertThat(floor.of("support_case")).contains(new SourceOrder(1, 1));
+        assertThat(floor.of("emailmessage")).contains(new SourceOrder(1, 1_000));
+        assertThat(store.ringDoneThrough("crm", consumer)).containsEntry("support_case", 1L);
+        assertThat(store.read("crm").orElseThrow().consumerOffset(consumer).orElseThrow().sinkAcked()).isNull();
+
+        ack.advance("support_case", at(2, "high"));
+        assertThat(floor.of("support_case")).contains(new SourceOrder(1, 2));
+    }
+
+    @Test
+    void independentDirectChannelsConfirmTheirOwnDatabaseOffsets() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("crm-channel-a", null);
+        store.create("crm-channel-b", null);
+        String first = SrsConsumerId.of("pipe", "cases").value();
+        String second = SrsConsumerId.of("pipe", "mail").value();
+        Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = Map.of(
+                "support_case", new StoreBackedSinkAckFactory.SourceProgress(
+                        "crm-channel-a", first, ConsumerProgressKind.DIRECT_SOURCE),
+                "emailmessage", new StoreBackedSinkAckFactory.SourceProgress(
+                        "crm-channel-b", second, ConsumerProgressKind.DIRECT_SOURCE));
+        Map<String, List<String>> plan = Map.of(
+                "support_case", List.of("view"), "emailmessage", List.of("view"));
+        HazelcastInstance member = memberWith(store);
+        StoreBackedSinkAckFactory factory = new StoreBackedSinkAckFactory(progress, "pipe", "run-1");
+        factory.beginRun(member, plan);
+        SinkAck ack = factory.resolve(member).forWriter("view");
+
+        ack.advance("support_case", at(1, "case-1"));
+        ack.advance("emailmessage", at(50, "mail-50"));
+
+        assertThat(store.read("crm-channel-a").orElseThrow().sourceReadOffset()).isEqualTo("case-1");
+        assertThat(store.read("crm-channel-b").orElseThrow().sourceReadOffset()).isEqualTo("mail-50");
+        assertThat(store.read("crm-channel-a").orElseThrow().consumerOffset(second)).isEmpty();
+        assertThat(store.read("crm-channel-b").orElseThrow().consumerOffset(first)).isEmpty();
+    }
+
+    @Test
+    void aDirectChannelWaitsForEveryTableInItsOwnSourceWideOrder() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("crm-channel", null);
+        String consumer = SrsConsumerId.of("pipe", "crm_source").value();
+        var source = new StoreBackedSinkAckFactory.SourceProgress(
+                "crm-channel", consumer, ConsumerProgressKind.DIRECT_SOURCE);
+        Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = Map.of(
+                "support_case", source, "emailmessage", source);
+        Map<String, List<String>> plan = Map.of(
+                "support_case", List.of("view"), "emailmessage", List.of("view"));
+        HazelcastInstance member = memberWith(store);
+        StoreBackedSinkAckFactory factory = new StoreBackedSinkAckFactory(progress, "pipe", "run-1");
+        factory.beginRun(member, plan);
+        SinkAck ack = factory.resolve(member).forWriter("view");
+        ack.advance("support_case", at(20, "low"));
+
+        ack.advance("emailmessage", at(22, "mail-after-high"));
+
+        assertThat(store.read("crm-channel").orElseThrow().sourceReadOffset()).isEqualTo("low");
+        ack.advance("support_case", at(21, "high"));
+        assertThat(store.read("crm-channel").orElseThrow().sourceReadOffset()).isEqualTo("high");
+    }
+
+    private static StoreBackedSinkAckFactory.SourceProgress srsProgress(String chain, String consumer) {
+        return new StoreBackedSinkAckFactory.SourceProgress(chain, consumer, ConsumerProgressKind.SRS);
+    }
 
     @Test
     void advancesTheDurableSinkAckedPositionForTheChainThatMapsToTheTable() {
@@ -217,7 +400,7 @@ class StoreBackedSinkAckFactoryTest {
         HazelcastInstance member = mock(HazelcastInstance.class);
         when(member.getUserContext()).thenReturn(new ConcurrentHashMap<>());
         StoreBackedSinkAckFactory factory =
-                new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1", "run-1");
+                legacyFactory(Map.of("orders", "mc-orders"), "pipe-1", "run-1");
 
         // A member the assembly layer has not made SRS-capable resolves to a no-op ack rather than failing,
         // mirroring the read-cursor publisher; a sink still runs before the store is bound. Starting the run
@@ -268,6 +451,28 @@ class StoreBackedSinkAckFactoryTest {
         assertThat(ackedChainPosition(store, "mc-orders", "pipe-1"))
                 .as("and nothing a read could resume from was recorded, because the change named nothing")
                 .isNull();
+    }
+
+    /**
+     * A table's confirmation is how far it has landed, and carries a token only where the change there named
+     * one. Paired with the token of an earlier change, the order would read back as a place the source had
+     * been read to, and a run resuming the table from it would start past changes it never read again.
+     */
+    @Test
+    void aTablesConfirmationPairsItsOrderOnlyWithTheTokenOfTheChangeThere() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        HazelcastInstance member = memberWith(store);
+        SinkAck ack = soleWriter(member, Map.of("orders", "mc-orders"), "pipe-1");
+
+        ack.advance("orders", at(5, "w5"));
+        ack.advance("orders", at(7, null));
+
+        assertThat(store.read("mc-orders").orElseThrow().consumerOffset("pipe-1").orElseThrow().sinkAckedByTable())
+                .containsExactly(Map.entry("orders", at(7, null)));
+        assertThat(ackedChainPosition(store, "mc-orders", "pipe-1"))
+                .as("while where a read resumes from stays at the last change that named a position")
+                .isEqualTo(at(5, "w5"));
     }
 
     @Test
@@ -459,8 +664,7 @@ class StoreBackedSinkAckFactoryTest {
             return invokeOn(backing, invocation);
         };
         SrsMetaStore store = mock(SrsMetaStore.class, AdditionalAnswers.delegatesTo(backing));
-        doAnswer(holdingTheNext).when(store).advanceSinkAcked(anyString(), anyString(), any());
-        doAnswer(holdingTheNext).when(store).advanceSinkAcked(anyString(), anyString(), anyString(), any());
+        doAnswer(holdingTheNext).when(store).raiseSinkAcked(anyString(), anyString(), any());
         HazelcastInstance member = memberWith(store);
         StoreBackedSinkAckFactory factory = startedRun(member, Map.of("orders", "mc-orders"), "pipe-1",
                 Map.of("orders", List.of(WRITER, OTHER_WRITER)));
@@ -570,7 +774,7 @@ class StoreBackedSinkAckFactoryTest {
         InMemorySrsMetaStore store = new InMemorySrsMetaStore();
         store.create("mc-orders", null);
         HazelcastInstance member = memberWith(store);
-        SinkAck ack = new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1", "run-1")
+        SinkAck ack = legacyFactory(Map.of("orders", "mc-orders"), "pipe-1", "run-1")
                 .resolve(member).forWriter(WRITER);
 
         assertThatThrownBy(() -> ack.advance("orders", at(7, "w7")))
@@ -682,7 +886,7 @@ class StoreBackedSinkAckFactoryTest {
         HazelcastInstance member = memberWith(store);
         Map<String, String> chains = Map.of("orders", "mc-orders");
         AwaitedLoad load = new AwaitedLoad("serve.s", "orders", List.of(WRITER));
-        StoreBackedSinkAckFactory notStarted = new StoreBackedSinkAckFactory(chains, "pipe-1", "run-1");
+        StoreBackedSinkAckFactory notStarted = legacyFactory(chains, "pipe-1", "run-1");
 
         assertThat(notStarted.loadLandings(member).stillLanding(List.of(load))).containsExactly(load);
 
@@ -704,7 +908,7 @@ class StoreBackedSinkAckFactoryTest {
         HazelcastInstance member = mock(HazelcastInstance.class);
         when(member.getUserContext()).thenReturn(new ConcurrentHashMap<>());
         StoreBackedSinkAckFactory factory =
-                new StoreBackedSinkAckFactory(Map.of("orders", "mc-orders"), "pipe-1", "run-1");
+                legacyFactory(Map.of("orders", "mc-orders"), "pipe-1", "run-1");
 
         assertThat(factory.loadLandings(member).stillLanding(
                 List.of(new AwaitedLoad("serve.s", "orders", List.of(WRITER))))).isEmpty();
@@ -745,9 +949,16 @@ class StoreBackedSinkAckFactoryTest {
     private static StoreBackedSinkAckFactory startedRun(HazelcastInstance member,
             Map<String, String> chainIdByTable, String pipelineId, Map<String, List<String>> writersByTable,
             String runId) {
-        StoreBackedSinkAckFactory factory = new StoreBackedSinkAckFactory(chainIdByTable, pipelineId, runId);
+        StoreBackedSinkAckFactory factory = legacyFactory(chainIdByTable, pipelineId, runId);
         factory.beginRun(member, writersByTable);
         return factory;
+    }
+
+    /** A factory for a pipeline read under its own name on each chain, its progress measured as it always was. */
+    private static StoreBackedSinkAckFactory legacyFactory(Map<String, String> chainIdByTable, String pipelineId,
+            String runId) {
+        return new StoreBackedSinkAckFactory(
+                StoreBackedSinkAckFactory.legacyProgress(chainIdByTable, pipelineId), pipelineId, runId);
     }
 
     private static HazelcastInstance memberWith(SrsMetaStore store) {

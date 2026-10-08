@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.testsupport.DockerGate;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -84,7 +85,7 @@ class ASlowerSinkHoldsTheResumePositionIT {
             });
             Await.until("the pipeline's initial shared resume position", TIMEOUT,
                     () -> hasAggregateRingDone(documents, chain),
-                    () -> String.valueOf(documents.consumerOffset(chain, PIPELINE)));
+                    () -> String.valueOf(documents.consumerOffset(chain, SrsConsumerId.of(PIPELINE, SOURCE).value())));
             Progress initial = progress(documents, chain);
 
             try {
@@ -153,7 +154,7 @@ class ASlowerSinkHoldsTheResumePositionIT {
     }
 
     private static boolean hasAggregateRingDone(StoreDocuments documents, String chain) {
-        Document consumer = documents.consumerOffset(chain, PIPELINE);
+        Document consumer = documents.consumerOffset(chain, SrsConsumerId.of(PIPELINE, SOURCE).value());
         return consumer != null
                 && consumer.get("perTableRingDone") instanceof Document rings
                 && rings.get(TABLE) instanceof Number;
@@ -164,7 +165,7 @@ class ASlowerSinkHoldsTheResumePositionIT {
      * consumer record. A writer that has reported nothing yet has no entry.
      */
     private static Progress progress(StoreDocuments documents, String chain) {
-        Document consumer = documents.consumerOffset(chain, PIPELINE);
+        Document consumer = documents.consumerOffset(chain, SrsConsumerId.of(PIPELINE, SOURCE).value());
         if (consumer == null) {
             return new Progress(-1L, Map.of());
         }

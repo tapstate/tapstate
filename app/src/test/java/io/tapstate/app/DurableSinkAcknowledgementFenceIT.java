@@ -95,7 +95,8 @@ class DurableSinkAcknowledgementFenceIT {
                         : Map.of(TABLE, List.of("writer-1"));
                 HazelcastInstance member = memberWith(meta, authorization);
                 SinkAckFactory durable = FencedSinkAckFactory.heldTo(new StoreBackedSinkAckFactory(
-                        Map.of(TABLE, CHAIN, "items", CHAIN), PIPELINE, "g" + run.executionGeneration()),
+                        StoreBackedSinkAckFactory.legacyProgress(Map.of(TABLE, CHAIN, "items", CHAIN), PIPELINE),
+                        PIPELINE, "g" + run.executionGeneration()),
                         execution);
                 durable.beginRun(member, plan);
                 SinkAck ack = durable.resolve(member).forWriter("writer-1");
@@ -181,7 +182,8 @@ class DurableSinkAcknowledgementFenceIT {
                 HazelcastInstance member = memberWith(staleMeta, authorization);
                 Map<String, List<String>> writerPlan = Map.of(TABLE, List.of("writer-1"));
                 SinkAckFactory durable = FencedSinkAckFactory.heldTo(new StoreBackedSinkAckFactory(
-                        Map.of(TABLE, CHAIN), PIPELINE, "g" + firstRun.executionGeneration()), staleFence);
+                        StoreBackedSinkAckFactory.legacyProgress(Map.of(TABLE, CHAIN), PIPELINE),
+                        PIPELINE, "g" + firstRun.executionGeneration()), staleFence);
                 durable.beginRun(member, writerPlan);
                 SinkAck staleAck = durable.resolve(member).forWriter("writer-1");
                 ChainPosition lastCurrentAck = position(1);

@@ -5,6 +5,7 @@ import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.testsupport.DockerGate;
 
@@ -108,7 +109,8 @@ class ArtifactDeleteLeavesNestStateStandingIT {
                     "both pipelines to hold a cursor on one shared mining chain",
                     () -> documents.miningChainIds().size() == 1
                             && documents.consumersOf(onlyChain(documents)).containsAll(
-                                    Set.of(departingId, survivingId)),
+                                    Set.of(SrsConsumerId.of(departingId, SOURCE_ID).value(),
+                                            SrsConsumerId.of(survivingId, SOURCE_ID).value())),
                     () -> "chains=" + documents.miningChainIds() + " consumers="
                             + documents.miningChainIds().stream().map(documents::consumersOf).toList());
 

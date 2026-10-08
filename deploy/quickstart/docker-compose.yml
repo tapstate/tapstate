@@ -1,7 +1,7 @@
 # Tapstate quickstart stack: the server and its state store, ready to run without a build.
 #
-# This is a single-node local demo, not a deployment topology. The server keeps pipeline position in
-# memory, so a restart replays rather than resumes.
+# This demo runs a single member. MongoDB persists control-plane state and recovery positions.
+# Restart recovery depends on the connector, read mode and retained source history; see the online quickstart.
 #
 # The store service is deliberately defined exactly as the development-only store stack defines it,
 # down to the advertised member address. The two differ only in how the *client* addresses the set

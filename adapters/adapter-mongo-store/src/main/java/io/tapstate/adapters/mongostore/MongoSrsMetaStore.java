@@ -3,6 +3,7 @@ package io.tapstate.adapters.mongostore;
 import com.mongodb.ErrorCategory;
 import com.mongodb.MongoException;
 import com.mongodb.MongoWriteException;
+import com.mongodb.ReadConcern;
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
@@ -17,6 +18,9 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.ConsumerProgressKind;
+import io.tapstate.spi.store.DurableSourceRead;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
@@ -35,6 +39,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Supplier;
 
 import org.bson.Document;
@@ -87,12 +92,19 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     static final String PER_TABLE_RING_DONE = "perTableRingDone";
 
     /**
-     * Per table, the last acked position written for it - its generation, its sequence in the table's ring and
-     * its token: what an ack of that table is compared with before it moves the chain's acked position. Dropped
-     * with the rest of the consumer when its record is rewritten, so a position written back is moved on from
-     * wherever it now stands.
+     * Per table, how far the consumer has durably landed it - the order, and the token of the change there where
+     * it carried one: what a run replacing this one resumes the table from, and what the next confirmation of
+     * the table is compared with. Kept in the shape of the acked position itself.
      */
     static final String SINK_ACKED_BY_TABLE = "sinkAckedByTable";
+
+    /** What the consumer's progress is measured against, which decides the positions a resume may rely on. */
+    private static final String PROGRESS_KIND = "progressKind";
+
+    private static final String POSITION = "position";
+    private static final String POSITION_ORDER = "position order";
+    private static final String TABLE = "table";
+    private static final String PIPELINE_ID = "pipelineId";
 
     /**
      * How much of a chain's schema history the record retains, in bytes of stored entries.
@@ -185,6 +197,22 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     @Override
+    public Optional<DurableSourceRead> durableSourceRead(String miningChainId) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Document root = StoreIo.call(() -> collection.withReadConcern(ReadConcern.MAJORITY)
+                .find(new Document("_id", miningChainId))
+                .projection(Projections.include(
+                        "sourceReadOffset", "sourceReadEpoch", "sourceReadSeq", "sourceReadDurable"))
+                .first());
+        if (root == null) {
+            return Optional.empty();
+        }
+        ChainPosition position = sourceReadFrom(root);
+        return position == null ? Optional.empty()
+                : Optional.of(new DurableSourceRead(position, sourceReadDurableFrom(root, miningChainId)));
+    }
+
+    @Override
     public Optional<SrsMeta> read(String miningChainId) {
         Objects.requireNonNull(miningChainId, "miningChainId");
         Document document = StoreIo.call(() -> collection.find(new Document("_id", miningChainId)).first());
@@ -199,7 +227,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                 chain.schemaHistory(),
                 chain.retention(),
                 chain.epoch(),
-                chain.sourceReadAt()));
+                chain.sourceReadAt(), chain.sourceReadDurable()));
     }
 
     /**
@@ -251,7 +279,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         // exists to stop. It matches nothing when the recorded position already ranks at or after this one.
         long matched = writeChainWithConsumerMigration(miningChainId, () -> collection.updateOne(
                 sourceReadAdvanceFilter(miningChainId, position.order()),
-                new Document("$set", sourceReadFields(position, Instant.now(clock)))).getMatchedCount());
+                new Document("$set", sourceReadFields(position, Instant.now(clock))
+                        .append("sourceReadDurable", false))).getMatchedCount());
         if (matched > 0) {
             return;
         }
@@ -259,6 +288,72 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         // mutators raise too -- or "this position does not move the chain forward", which is ordinary and
         // silent. Only a second look tells them apart, and it runs on the path that changed nothing.
         requireSeeded(miningChainId);
+    }
+
+    @Override
+    public void advanceCaptureCheckpoint(String miningChainId, ChainPosition position) {
+        throw new UnsupportedOperationException("a durable capture checkpoint requires its served table selection");
+    }
+
+    @Override
+    public void advanceCaptureCheckpoint(
+            String miningChainId, ChainPosition position, List<String> servedTables) {
+        Objects.requireNonNull(position, POSITION);
+        Objects.requireNonNull(position.order(), POSITION_ORDER);
+        List<String> selection = List.copyOf(Objects.requireNonNull(servedTables, "servedTables"));
+        Document fields = sourceReadFields(position, Instant.now(clock));
+        fields.append("sourceReadDurable", true);
+        Document filter = sourceReadAdvanceFilter(miningChainId, position.order());
+        filter.append("epoch", position.order().epoch())
+                .append("captureServingEpoch", position.order().epoch()).append("$expr",
+                new Document("$and", List.of(new Document("$setIsSubset", List.of(
+                        new Document("$ifNull", List.of("$captureTables", List.of())),
+                        new Document("$ifNull", List.of("$captureServingTables", List.of())))),
+                        new Document("$setIsSubset", List.of(
+                                new Document("$ifNull", List.of("$captureTables", List.of())),
+                                new Document("$literal", selection))))));
+        long matched = writeChainWithConsumerMigration(miningChainId, () -> collection.updateOne(
+                filter,
+                new Document("$set", fields)).getMatchedCount());
+        if (matched == 0) {
+            requireSeeded(miningChainId);
+        }
+    }
+
+    @Override
+    public void requestCaptureTables(String miningChainId, List<String> tables) {
+        applyToSeeded(miningChainId, () -> collection.updateOne(new Document("_id", miningChainId),
+                new Document("$addToSet", new Document("captureTables",
+                        new Document("$each", List.copyOf(tables))))));
+    }
+
+    @Override
+    public List<String> captureTables(String miningChainId) {
+        Document root = StoreIo.call(() -> collection.find(new Document("_id", miningChainId))
+                .projection(Projections.include("captureTables")).first());
+        return root == null || root.get("captureTables") == null ? List.of()
+                : List.copyOf(root.getList("captureTables", String.class));
+    }
+
+    @Override
+    public List<String> captureServingTables(String miningChainId) {
+        Document root = StoreIo.call(() -> collection.find(new Document("_id", miningChainId))
+                .projection(Projections.include("epoch", "captureServingEpoch", "captureServingTables")).first());
+        if (root == null || readEpoch(root, "epoch") != readEpoch(root, "captureServingEpoch")
+                || root.get("captureServingTables") == null) {
+            return List.of();
+        }
+        return List.copyOf(root.getList("captureServingTables", String.class));
+    }
+
+    @Override
+    public boolean publishCaptureTables(String miningChainId, long epoch, List<String> tables) {
+        Document filter = new Document("_id", miningChainId).append("epoch", epoch).append("$expr",
+                new Document("$setIsSubset", List.of(
+                        new Document("$ifNull", List.of("$captureTables", List.of())), List.copyOf(tables))));
+        return writeChainWithConsumerMigration(miningChainId, () -> collection.updateOne(filter,
+                new Document("$set", new Document("captureServingEpoch", epoch)
+                        .append("captureServingTables", List.copyOf(tables)))).getMatchedCount()) > 0;
     }
 
     @Override
@@ -274,7 +369,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                         new Document("$set", new Document("sourceReadOffset", token)
                                 .append("sourceReadAt", Instant.now(clock).toEpochMilli()))
                                 .append("$unset", new Document("sourceReadEpoch", "")
-                                        .append("sourceReadSeq", "")))
+                                        .append("sourceReadSeq", "").append("sourceReadDurable", "")))
                 .getMatchedCount());
         if (matched == 0) {
             // The filter names the chain and nothing else, so nothing matching can only mean no record.
@@ -435,33 +530,48 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     @Override
     public void beginWriterRun(String miningChainId, String pipelineId, String runId,
             Map<String, List<String>> expectedWritersByTable) {
+        beginWriterRun(miningChainId, pipelineId, runId, expectedWritersByTable, ConsumerProgressKind.LEGACY);
+    }
+
+    @Override
+    public void beginWriterRun(String miningChainId, String consumerId, String runId,
+            Map<String, List<String>> expectedWritersByTable, ConsumerProgressKind kind) {
         Objects.requireNonNull(runId, "runId");
-        Document expected = new Document();
-        expectedWritersByTable.forEach((table, writers) -> expected.append(table, List.copyOf(writers)));
-        updateConsumer(miningChainId, pipelineId, new Document("$set", new Document(WRITER_RUN,
-                new Document("id", runId).append("expected", expected).append("progress", new Document()))));
+        Objects.requireNonNull(kind, "kind");
+        migrateLegacyConsumers(miningChainId, true);
+        refuseLegacyProgress(miningChainId, consumerId, expectedWritersByTable);
+        updateConsumer(miningChainId, consumerId, new Document("$set", new Document(WRITER_RUN,
+                writerRunDocument(runId, expectedWritersByTable)).append(PROGRESS_KIND, kind.name())));
+    }
+
+    @Override
+    public boolean beginWriterRun(String miningChainId, String pipelineId, String runId,
+            Map<String, List<String>> expectedWritersByTable, WorkloadClaimFence fence) {
+        return beginWriterRun(miningChainId, pipelineId, runId, expectedWritersByTable,
+                ConsumerProgressKind.LEGACY, fence);
     }
 
     /**
-     * Starts the run's accounting as the unfenced start does, and binds the pipeline's later durable sink effects
+     * Starts the run's accounting as the unfenced start does, and binds the consumer's later durable sink effects
      * on the chain to {@code fence}'s run - in one transaction with the proof that {@code fence} is the live claim,
-     * and with the chain's lifecycle fence, because this is the write that may create the pipeline's cursor. Once
+     * and with the chain's lifecycle fence, because this is the write that may create the consumer's cursor. Once
      * a run a claim no longer names can prove nothing, it can neither start its accounting again nor take the
      * binding back from the run that holds it.
      */
     @Override
-    public boolean beginWriterRun(String miningChainId, String pipelineId, String runId,
-            Map<String, List<String>> expectedWritersByTable, WorkloadClaimFence fence) {
+    public boolean beginWriterRun(String miningChainId, String consumerId, String runId,
+            Map<String, List<String>> expectedWritersByTable, ConsumerProgressKind kind, WorkloadClaimFence fence) {
         Objects.requireNonNull(runId, "runId");
-        Document bound = sinkAckFenceDocument(pipelineId, fence);
-        Document expected = new Document();
-        expectedWritersByTable.forEach((table, writers) -> expected.append(table, List.copyOf(writers)));
+        Objects.requireNonNull(kind, "kind");
+        Document bound = sinkAckFenceDocument(consumerId, fence);
         Document update = new Document("$set", new Document(WRITER_RUN,
-                new Document("id", runId).append("expected", expected).append("progress", new Document()))
+                writerRunDocument(runId, expectedWritersByTable))
+                .append(PROGRESS_KIND, kind.name())
                 .append(SINK_ACK_FENCE, bound))
-                .append("$setOnInsert", consumerIdentity(miningChainId, pipelineId));
-        Document key = consumerKey(miningChainId, pipelineId);
+                .append("$setOnInsert", consumerIdentity(miningChainId, consumerId));
+        Document key = consumerKey(miningChainId, consumerId);
         migrateLegacyConsumers(miningChainId, true);
+        refuseLegacyProgress(miningChainId, consumerId, expectedWritersByTable);
         return StoreIo.call(miningChainId, () -> {
             try (ClientSession session = client.startSession()) {
                 return session.withTransaction(() -> {
@@ -478,6 +588,366 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                 });
             }
         });
+    }
+
+    /** A run's accounting as it starts: the writers each table is expected to reach, and no progress yet. */
+    private static Document writerRunDocument(String runId, Map<String, List<String>> expectedWritersByTable) {
+        Document expected = new Document();
+        expectedWritersByTable.forEach((table, writers) -> expected.append(table, List.copyOf(writers)));
+        return new Document("id", runId).append("expected", expected).append("progress", new Document());
+    }
+
+    /**
+     * Refuses to start accounting for a consumer named for its source node while its pipeline still holds sink
+     * progress recorded under the pipeline's own name on the chain - a confirmed position, a finished load, or a
+     * writer's progress. That record cannot say which source node it was made for: carried over it may stand for
+     * changes another node's sinks never wrote, and dropped it loses what a sink did write. Read cursors are not
+     * progress any sink made, and do not count. Where the run plans more than one writer the progress could not be
+     * split between them either, which is the code it answers with then.
+     */
+    private void refuseLegacyProgress(String miningChainId, String consumerId,
+            Map<String, List<String>> expectedWritersByTable) {
+        if (SrsConsumerId.sourceOf(consumerId).isEmpty()) {
+            return;
+        }
+        String pipeline = SrsConsumerId.pipelineOf(consumerId);
+        Document legacy = StoreIo.call(() -> consumers.find(consumerKey(miningChainId, pipeline)).first());
+        if (legacy == null) {
+            return;
+        }
+        boolean retained = sinkAckedFrom(legacy) != null || !snapshotCompletedFrom(legacy).isEmpty()
+                || !confirmedByTable(legacy, pipeline).isEmpty()
+                || writerRunOf(legacy).map(run -> run.progress().values().stream()
+                        .anyMatch(byWriter -> !byWriter.isEmpty())).orElse(false);
+        if (!retained) {
+            return;
+        }
+        long writers = expectedWritersByTable.values().stream().flatMap(List::stream).distinct().count();
+        throw new TapstateException(writers > 1 ? IoError.SINK_WRITER_PROGRESS_AMBIGUOUS
+                : IoError.SRS_PROGRESS_UNPROVEN, Map.of("pipeline", pipeline), null);
+    }
+
+    /**
+     * Raises the table's confirmed position where the one it holds is earlier, or where it holds none, and
+     * otherwise only its place in the ring - each in one write of its own, the comparison in the write's own
+     * filter, so no confirmation landing in between can split the two. It never creates the consumer's cursor:
+     * the run's start did, and a cursor that is gone has gone with its chain or its consumer, and must not come
+     * back.
+     */
+    @Override
+    public void advanceTableConfirmed(String miningChainId, String consumerId, String table,
+            ChainPosition confirmed) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(consumerId, "consumerId");
+        Objects.requireNonNull(table, TABLE);
+        Objects.requireNonNull(confirmed, POSITION);
+        Objects.requireNonNull(confirmed.order(), POSITION_ORDER);
+        migrateLegacyConsumers(miningChainId, true);
+        Document key = consumerKey(miningChainId, consumerId);
+        SourceOrder order = confirmed.order();
+        if (!updateExistingConsumer(miningChainId, tableAckedBefore(key, table, order),
+                tableConfirmedUpdate(table, confirmed)) && order.seq() >= 0) {
+            updateExistingConsumer(miningChainId, tableAckedAtOrAfter(key, table, order), ringRaise(table, order));
+        }
+    }
+
+    /** The fenced form of the table's confirmation: the same two conditional writes, while the fence holds. */
+    @Override
+    public boolean advanceTableConfirmed(String miningChainId, String consumerId, String table,
+            ChainPosition confirmed, WorkloadClaimFence fence) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(consumerId, "consumerId");
+        Objects.requireNonNull(table, TABLE);
+        Objects.requireNonNull(confirmed, POSITION);
+        Objects.requireNonNull(confirmed.order(), POSITION_ORDER);
+        migrateLegacyConsumers(miningChainId, true);
+        Document key = consumerKey(miningChainId, consumerId);
+        SourceOrder order = confirmed.order();
+        return fencedConsumerWrite(miningChainId, consumerId, fence, session -> {
+            if (consumers.updateOne(session, tableAckedBefore(key, table, order),
+                    tableConfirmedUpdate(table, confirmed)).getMatchedCount() == 0 && order.seq() >= 0) {
+                consumers.updateOne(session, tableAckedAtOrAfter(key, table, order), ringRaise(table, order));
+            }
+            return Boolean.TRUE;
+        }).isPresent();
+    }
+
+    /** One write raising the consumer's acked position, the comparison with the one it holds in its filter. */
+    @Override
+    public void raiseSinkAcked(String miningChainId, String consumerId, ChainPosition position) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(consumerId, "consumerId");
+        Objects.requireNonNull(position, POSITION);
+        Objects.requireNonNull(position.order(), POSITION_ORDER);
+        migrateLegacyConsumers(miningChainId, true);
+        updateExistingConsumer(miningChainId,
+                ackedBefore(consumerKey(miningChainId, consumerId), position.order()),
+                sinkAckedUpdate(consumerId, position));
+    }
+
+    /** The fenced form of the raise, while the fence holds. */
+    @Override
+    public boolean raiseSinkAcked(String miningChainId, String consumerId, ChainPosition position,
+            WorkloadClaimFence fence) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(consumerId, "consumerId");
+        Objects.requireNonNull(position, POSITION);
+        Objects.requireNonNull(position.order(), POSITION_ORDER);
+        migrateLegacyConsumers(miningChainId, true);
+        Document filter = ackedBefore(consumerKey(miningChainId, consumerId), position.order());
+        Document update = sinkAckedUpdate(consumerId, position);
+        return fencedConsumerWrite(miningChainId, consumerId, fence, session -> {
+            consumers.updateOne(session, filter, update);
+            return Boolean.TRUE;
+        }).isPresent();
+    }
+
+    /**
+     * Works the direct channel's progress out from what is stored, in one transaction with the chain's own record:
+     * the batches it completes, and the checkpoint they move, are read and written as one act, so two confirmations
+     * settling at once cannot both take the same batches off, nor one undo the other's checkpoint. A consumer that
+     * is not a direct channel's, or one whose chain has opened a generation its stream does not belong to, is
+     * left as it is.
+     */
+    @Override
+    public void settleDirectBatches(String miningChainId, String consumerId) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(consumerId, "consumerId");
+        migrateLegacyConsumers(miningChainId, true);
+        Document key = consumerKey(miningChainId, consumerId);
+        StoreIo.run(miningChainId, () -> {
+            try (ClientSession session = client.startSession()) {
+                session.withTransaction(() -> {
+                    Document consumer = consumers.find(session, key).first();
+                    if (consumer != null
+                            && progressKind(consumer, consumerId) == ConsumerProgressKind.DIRECT_SOURCE) {
+                        settleDirect(session, miningChainId, consumerId, key, consumer);
+                    }
+                    return null;
+                });
+            }
+        });
+    }
+
+    private void settleDirect(ClientSession session, String chain, String consumerId, Document key,
+            Document consumer) {
+        Map<String, ChainPosition> confirmed = confirmedByTable(consumer, consumerId);
+        if (!consumer.containsKey("directEpoch")) {
+            // No batch recorded: the tables' own positions are all there is, and their lowest is a prefix of the
+            // channel's one source order once every table of the run has one.
+            ChainPosition lowest = null;
+            for (String table : writerRunOf(consumer).map(run -> run.expected().keySet()).orElse(Set.of())) {
+                ChainPosition position = confirmed.get(table);
+                if (position == null) {
+                    return;
+                }
+                if (lowest == null || position.order().compareTo(lowest.order()) < 0) {
+                    lowest = position;
+                }
+            }
+            if (lowest != null) {
+                consumers.updateOne(session, ackedBefore(key, lowest.order()), sinkAckedUpdate(consumerId, lowest));
+            }
+            return;
+        }
+        long activeEpoch = readEpoch(consumer, "directEpoch");
+        Document root = collection.find(session, new Document("_id", chain))
+                .projection(Projections.include("epoch")).first();
+        if (root == null || readEpoch(root, "epoch") != activeEpoch) {
+            return;
+        }
+        List<Document> batches = directBatches(consumer, consumerId);
+        int completed = 0;
+        ChainPosition candidate = null;
+        for (Document batch : batches) {
+            long epoch = readEpoch(batch, "epoch");
+            Document targets = batch.get("targets", Document.class);
+            boolean settled = epoch == activeEpoch && targets != null;
+            if (settled) {
+                for (Map.Entry<String, Object> target : targets.entrySet()) {
+                    ChainPosition ack = confirmed.get(target.getKey());
+                    if (!(target.getValue() instanceof Number sequence) || ack == null
+                            || ack.order().epoch() != epoch || ack.order().seq() < sequence.longValue()) {
+                        settled = false;
+                        break;
+                    }
+                }
+            }
+            if (!settled) {
+                break;
+            }
+            candidate = new ChainPosition(new SourceOrder(epoch, readEpoch(batch, "seq")), batch.getString("token"));
+            completed++;
+        }
+        if (candidate == null) {
+            return;
+        }
+        Document update = sinkAckedUpdate(consumerId, candidate);
+        update.get("$set", Document.class).append("directBatches",
+                new ArrayList<>(batches.subList(completed, batches.size())));
+        consumers.updateOne(session, key, update);
+        advanceDirectCheckpoint(session, chain, candidate);
+    }
+
+    @Override
+    public void beginDirectCapture(String chain, String consumerId, long epoch, String anchor) {
+        mutateConsumerInSession(chain, consumerId, (session, consumer) -> {
+            requireDirectEpoch(session, chain, epoch);
+            if (consumer.containsKey("directEpoch")) {
+                long priorEpoch = readEpoch(consumer, "directEpoch");
+                if (priorEpoch > epoch) {
+                    throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+                }
+                if (priorEpoch == epoch) {
+                    // Capture first registers its stream, then reports its initial database boundary.
+                    // Repeating either call must never discard batches already awaiting their writers.
+                    if (anchor == null || consumer.containsKey("directAnchor")) {
+                        return false;
+                    }
+                    if (!directBatches(consumer, consumerId).isEmpty()) {
+                        throw new TapstateException(IoError.SRS_PROGRESS_UNPROVEN,
+                                Map.of("pipeline", SrsConsumerId.pipelineOf(consumerId)), null);
+                    }
+                } else {
+                    consumer.put("directBatches", new ArrayList<Document>());
+                    consumer.remove("directAnchor");
+                }
+            } else {
+                consumer.put("directBatches", new ArrayList<Document>());
+            }
+            consumer.put(PROGRESS_KIND, ConsumerProgressKind.DIRECT_SOURCE.name());
+            consumer.put("directEpoch", epoch);
+            if (anchor != null) {
+                ChainPosition initial = new ChainPosition(SourceOrder.snapshotRow(epoch), anchor);
+                writePosition(consumer, initial);
+                consumer.put("directAnchor", anchor);
+                advanceDirectCheckpoint(session, chain, initial);
+            }
+            return true;
+        });
+    }
+
+    @Override
+    public void recordDirectBatch(String chain, String consumerId, ChainPosition position,
+            Map<String, Long> targets) {
+        Objects.requireNonNull(position.order(), POSITION_ORDER);
+        if (position.token() == null) {
+            return;
+        }
+        mutateConsumerInSession(chain, consumerId, (session, consumer) -> {
+            requireDirectEpoch(session, chain, position.order().epoch());
+            if (readEpoch(consumer, "directEpoch") != position.order().epoch()) {
+                throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+            }
+            List<Document> pending = new ArrayList<>(directBatches(consumer, consumerId));
+            Document batch = new Document("epoch", position.order().epoch())
+                    .append("seq", position.order().seq()).append("token", position.token())
+                    .append("targets", new Document(targets));
+            pending.add(batch);
+            consumer.put("directBatches", pending);
+            return true;
+        });
+    }
+
+    /** Producer metadata is valid only for the generation currently owned by this capture chain. */
+    private void requireDirectEpoch(ClientSession session, String chain, long epoch) {
+        Document root = collection.find(session, new Document("_id", chain))
+                .projection(Projections.include("epoch")).first();
+        if (root == null || readEpoch(root, "epoch") != epoch) {
+            throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+        }
+    }
+
+    /**
+     * Mutates one complete consumer document - one the mutation may create - in a transaction with the chain's
+     * lifecycle fence. Only a direct channel's stream registrations take this path: they are a function of several
+     * of the document's values at once, and they happen once a generation or once a source batch, never once a
+     * confirmation.
+     */
+    private void mutateConsumerInSession(String miningChainId, String consumerId,
+            SessionConsumerDocumentMutation mutation) {
+        Objects.requireNonNull(miningChainId, "miningChainId");
+        Objects.requireNonNull(consumerId, "consumerId");
+        migrateLegacyConsumers(miningChainId, true);
+        writeConsumer(miningChainId, session -> {
+            Document key = consumerKey(miningChainId, consumerId);
+            Document consumer = consumers.find(session, key).first();
+            if (consumer == null) {
+                consumer = new Document(key);
+                consumer.putAll(consumerIdentity(miningChainId, consumerId));
+            }
+            if (mutation.apply(session, consumer)) {
+                consumers.replaceOne(session, key, consumer, new ReplaceOptions().upsert(true));
+                // A batch can be recorded after the changes it carried were confirmed, so it settles here as well.
+                if (progressKind(consumer, consumerId) == ConsumerProgressKind.DIRECT_SOURCE) {
+                    settleDirect(session, miningChainId, consumerId, key, consumer);
+                }
+            }
+        });
+    }
+
+    private void advanceDirectCheckpoint(ClientSession session, String chain, ChainPosition candidate) {
+        Document filter = sourceReadAdvanceFilter(chain, candidate.order());
+        filter.append("epoch", candidate.order().epoch());
+        collection.updateOne(session, filter, new Document("$set",
+                sourceReadFields(candidate, Instant.now(clock)).append("sourceReadDurable", false)));
+    }
+
+    private static List<Document> directBatches(Document consumer, String consumerId) {
+        Object raw = consumer.get("directBatches");
+        if (raw == null) {
+            return List.of();
+        }
+        if (!(raw instanceof List<?> entries)) {
+            throw unreadableConsumer(consumerId, "directBatches");
+        }
+        List<Document> batches = new ArrayList<>(entries.size());
+        for (Object entry : entries) {
+            if (!(entry instanceof Document document)
+                    || !(document.get("epoch") instanceof Number)
+                    || !(document.get("seq") instanceof Number)
+                    || !(document.get("token") instanceof String)
+                    || !(document.get("targets") instanceof Document targets)) {
+                throw unreadableConsumer(consumerId, "directBatches");
+            }
+            long boundary = readEpoch(document, "seq");
+            for (Object target : targets.values()) {
+                if (!(target instanceof Number sequence)
+                        || sequence.longValue() < 0 || sequence.longValue() > boundary) {
+                    throw unreadableConsumer(consumerId, "directBatches");
+                }
+            }
+            batches.add(document);
+        }
+        return batches;
+    }
+
+    /** The table's confirmed position, and its ring place raised to the position's sequence, in one update. */
+    private static Document tableConfirmedUpdate(String table, ChainPosition confirmed) {
+        Document update = new Document("$set",
+                new Document(SINK_ACKED_BY_TABLE + "." + table, positionDocument(confirmed)));
+        if (confirmed.order().seq() >= 0) {
+            update.putAll(ringRaise(table, confirmed.order()));
+        }
+        return update;
+    }
+
+    /** A raise of the table's ring place to {@code order}'s sequence. */
+    private static Document ringRaise(String table, SourceOrder order) {
+        return new Document("$max", new Document(PER_TABLE_RING_DONE + "." + table, order.seq()));
+    }
+
+    /**
+     * The consumer at {@code key}, where its acked position is earlier than {@code order}, or where it holds none
+     * that can be compared - ranked by generation first, as an order is.
+     */
+    static Document ackedBefore(Document key, SourceOrder order) {
+        return new Document(key).append("$or", List.of(
+                new Document("sinkAckedEpoch", new Document("$not", new Document("$type", "number"))),
+                new Document("sinkAckedSeq", new Document("$not", new Document("$type", "number"))),
+                new Document("sinkAckedEpoch", new Document("$lt", order.epoch())),
+                new Document("sinkAckedEpoch", order.epoch()).append("sinkAckedSeq",
+                        new Document("$lt", order.seq()))));
     }
 
     @Override
@@ -622,50 +1092,47 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                 .append("perTableSeq." + table, seq));
     }
 
-    /**
-     * A {@code $max}, as the raise that comes with an acked change is: writers of one run landing at once
-     * each write, and the record only ever moves forward. A snapshot row sits at a reserved sequence below
-     * every change and is no place in any ring, so it raises nothing.
-     */
-    @Override
-    public void advanceRingDone(String miningChainId, String pipelineId, String table, long seq) {
-        Objects.requireNonNull(table, "table");
-        if (seq < 0) {
-            return;
-        }
-        updateConsumer(miningChainId, pipelineId,
-                new Document("$max", new Document(PER_TABLE_RING_DONE + "." + table, seq)));
-    }
-
-    /** The fenced form of the ring raise, under the same condition as the fenced advance. */
-    @Override
-    public boolean advanceRingDone(String miningChainId, String pipelineId, String table, long seq,
-            WorkloadClaimFence fence) {
-        Objects.requireNonNull(table, "table");
-        if (seq < 0) {
-            return true;
-        }
-        migrateLegacyConsumers(miningChainId, true);
-        Document key = consumerKey(miningChainId, pipelineId);
-        return fencedConsumerWrite(miningChainId, pipelineId, fence, session -> consumers.updateOne(session, key,
-                new Document("$max", new Document(PER_TABLE_RING_DONE + "." + table, seq)))).isPresent();
-    }
-
     @Override
     public Map<String, Long> ringDoneThrough(String miningChainId, String pipelineId) {
         Objects.requireNonNull(miningChainId, "miningChainId");
         Objects.requireNonNull(pipelineId, "pipelineId");
         Document consumer = StoreIo.call(() -> consumers.find(consumerKey(miningChainId, pipelineId))
-                .projection(Projections.include(PER_TABLE_RING_DONE)).first());
-        Map<String, Long> seqs = new LinkedHashMap<>();
-        if (consumer != null && consumer.get(PER_TABLE_RING_DONE) instanceof Document perTable) {
-            for (Map.Entry<String, Object> entry : perTable.entrySet()) {
-                if (entry.getValue() instanceof Number seq) {
-                    seqs.put(entry.getKey(), seq.longValue());
+                .projection(Projections.include(PER_TABLE_RING_DONE, SINK_ACKED_BY_TABLE, PROGRESS_KIND)).first());
+        if (consumer == null) {
+            return Map.of();
+        }
+        Map<String, Long> seqs = ringDoneFromDocument(consumer, pipelineId);
+        if (progressKind(consumer, pipelineId) == ConsumerProgressKind.SRS) {
+            for (Map.Entry<String, ChainPosition> entry : confirmedByTable(consumer, pipelineId).entrySet()) {
+                SourceOrder order = entry.getValue().order();
+                if (order == null || order.epoch() < 1L) {
+                    throw unreadableConsumer(pipelineId, SINK_ACKED_BY_TABLE);
+                }
+                if (order.seq() >= 0L) {
+                    // This table's actual confirmation remains proof when its redundant marker is absent.
+                    seqs.merge(entry.getKey(), order.seq(), Math::max);
                 }
             }
         }
         return Map.copyOf(seqs);
+    }
+
+    private static Map<String, Long> ringDoneFromDocument(Document consumer, String pipelineId) {
+        Map<String, Long> seqs = new LinkedHashMap<>();
+        if (!consumer.containsKey(PER_TABLE_RING_DONE)) {
+            return seqs;
+        }
+        if (!(consumer.get(PER_TABLE_RING_DONE) instanceof Document perTable)) {
+            throw unreadableConsumer(pipelineId, PER_TABLE_RING_DONE);
+        }
+        for (Map.Entry<String, Object> entry : perTable.entrySet()) {
+            Object raw = entry.getValue();
+            if (!(raw instanceof Long || raw instanceof Integer) || ((Number) raw).longValue() < -1L) {
+                throw unreadableConsumer(pipelineId, PER_TABLE_RING_DONE);
+            }
+            seqs.put(entry.getKey(), ((Number) raw).longValue());
+        }
+        return seqs;
     }
 
     /**
@@ -725,15 +1192,28 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     static Document sinkAckedUpdate(String pipelineId, String table, ChainPosition position) {
         Objects.requireNonNull(table, "table");
         Document update = sinkAckedUpdate(pipelineId, position);
-        Document last = new Document("epoch", position.order().epoch()).append("ringSeq", position.order().seq());
-        if (position.token() != null) {
-            last.append("token", position.token());
-        }
-        update.get("$set", Document.class).append(SINK_ACKED_BY_TABLE + "." + table, last);
+        update.get("$set", Document.class).append(SINK_ACKED_BY_TABLE + "." + table, positionDocument(position));
         if (position.order().seq() >= 0) {
             update.append("$max", new Document(PER_TABLE_RING_DONE + "." + table, position.order().seq()));
         }
         return update;
+    }
+
+    /** A position in the shape the acked position itself is stored in: its order's two numbers, and its token. */
+    private static Document positionDocument(ChainPosition position) {
+        Document stored = new Document();
+        writePosition(stored, position);
+        return stored;
+    }
+
+    private static void writePosition(Document document, ChainPosition position) {
+        document.put("sinkAckedEpoch", position.order().epoch());
+        document.put("sinkAckedSeq", position.order().seq());
+        if (position.token() == null) {
+            document.remove("sinkAckedSrcpos");
+        } else {
+            document.put("sinkAckedSrcpos", position.token());
+        }
     }
 
     /**
@@ -742,8 +1222,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      * one: a generation and a ring sequence, both numbers. Ranked by generation first, as an order is.
      */
     static Document tableAckedBefore(Document key, String table, SourceOrder order) {
-        String epoch = SINK_ACKED_BY_TABLE + "." + table + ".epoch";
-        String seq = SINK_ACKED_BY_TABLE + "." + table + ".ringSeq";
+        String epoch = SINK_ACKED_BY_TABLE + "." + table + ".sinkAckedEpoch";
+        String seq = SINK_ACKED_BY_TABLE + "." + table + ".sinkAckedSeq";
         return new Document(key).append("$or", List.of(
                 new Document(epoch, new Document("$not", new Document("$type", "number"))),
                 new Document(seq, new Document("$not", new Document("$type", "number"))),
@@ -753,8 +1233,8 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
 
     /** The rest of the consumer at {@code key}: a last acked position for {@code table} at or after {@code order}. */
     static Document tableAckedAtOrAfter(Document key, String table, SourceOrder order) {
-        String epoch = SINK_ACKED_BY_TABLE + "." + table + ".epoch";
-        String seq = SINK_ACKED_BY_TABLE + "." + table + ".ringSeq";
+        String epoch = SINK_ACKED_BY_TABLE + "." + table + ".sinkAckedEpoch";
+        String seq = SINK_ACKED_BY_TABLE + "." + table + ".sinkAckedSeq";
         return new Document(key)
                 .append(seq, new Document("$type", "number"))
                 .append("$or", List.of(
@@ -766,11 +1246,24 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     private static SourceOrder tableAckedFrom(Document document, String table) {
         Document byTable = document.get(SINK_ACKED_BY_TABLE, Document.class);
         Document last = byTable == null ? null : byTable.get(table, Document.class);
-        if (last == null || !(last.get("epoch") instanceof Number epoch)
-                || !(last.get("ringSeq") instanceof Number seq)) {
-            return null;
+        ChainPosition position = last == null ? null : sinkAckedFrom(last);
+        return position == null ? null : position.order();
+    }
+
+    private static TapstateException unreadableConsumer(String consumerId, String field) {
+        return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", consumerId, "field", field), null);
+    }
+
+    /** Returns a nested document, or null where there is none, rejecting a malformed stored value. */
+    private static Document nestedDocument(Document parent, String field, String consumerId) {
+        Object raw = parent.get(field);
+        if (raw instanceof Document document) {
+            return document;
         }
-        return new SourceOrder(epoch.longValue(), seq.longValue());
+        if (raw != null) {
+            throw unreadableConsumer(consumerId, field);
+        }
+        return null;
     }
 
     @Override
@@ -940,19 +1433,35 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
 
     @Override
     public List<String> miningChainIdsWithConsumer(String pipelineId) {
-        Objects.requireNonNull(pipelineId, "pipelineId");
-        // Include both shapes during the lazy migration window. Only ids are read, so enumeration never
-        // reconstructs a cursor and a corrupt cursor cannot prevent a departing pipeline from detaching.
+        Objects.requireNonNull(pipelineId, PIPELINE_ID);
+        // Embedded records predate the owner field. Inspect their keys without reconstructing cursors,
+        // so an unreadable cursor cannot prevent a departing pipeline from detaching.
         LinkedHashSet<String> chains = new LinkedHashSet<>();
-        StoreIo.call(() -> collection.find(consumerPresenceFilter(pipelineId))
-                .projection(Projections.include("_id"))
-                .map(document -> document.getString("_id"))
-                .into(chains));
-        StoreIo.call(() -> consumers.find(new Document("pipelineId", pipelineId))
+        List<Document> embedded = StoreIo.call(() -> collection
+                .find(new Document("consumerOffsets", new Document("$type", "object")))
+                .projection(Projections.include("_id", "consumerOffsets"))
+                .into(new ArrayList<>()));
+        for (Document root : embedded) {
+            Document cursors = root.get("consumerOffsets", Document.class);
+            if (cursors.keySet().stream().anyMatch(id -> consumerBelongsTo(id, pipelineId))) {
+                chains.add(root.getString("_id"));
+            }
+        }
+        StoreIo.call(() -> consumers.find(new Document("$or", List.of(
+                        new Document(PIPELINE_ID, pipelineId), new Document("ownerPipelineId", pipelineId))))
                 .projection(Projections.include("miningChainId"))
                 .map(document -> document.getString("miningChainId"))
                 .into(chains));
         return List.copyOf(chains);
+    }
+
+    private static boolean consumerBelongsTo(String consumerId, String pipelineId) {
+        try {
+            return consumerId.equals(pipelineId) || SrsConsumerId.belongsTo(consumerId, pipelineId);
+        } catch (IllegalArgumentException malformedId) {
+            // A malformed unrelated key has no proven owner and cannot block cleanup of known records.
+            return false;
+        }
     }
 
     @Override
@@ -982,7 +1491,11 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         // Its transaction also serializes any older migration snapshot before the delete, so no durable
         // marker has to remain merely to keep a stale copier from recreating this cursor.
         migrateLegacyConsumers(miningChainId, false);
-        StoreIo.run(() -> consumers.deleteOne(consumerKey(miningChainId, pipelineId)));
+        Document deletion = SrsConsumerId.sourceOf(pipelineId).isPresent()
+                ? consumerKey(miningChainId, pipelineId)
+                : new Document("miningChainId", miningChainId).append("$or", List.of(
+                        new Document(PIPELINE_ID, pipelineId), new Document("ownerPipelineId", pipelineId)));
+        StoreIo.run(() -> consumers.deleteMany(deletion));
     }
 
     /**
@@ -1046,6 +1559,11 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
      */
     private boolean updateExistingConsumer(String miningChainId, Document filter, Document update) {
         return StoreIo.call(miningChainId, () -> consumers.updateOne(filter, update)).getMatchedCount() > 0;
+    }
+
+    @FunctionalInterface
+    private interface SessionConsumerDocumentMutation {
+        boolean apply(ClientSession session, Document consumer);
     }
 
     /**
@@ -1154,11 +1672,11 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
     }
 
     /** A sink fence is a submitted execution of this exact pipeline, never another workload type. */
-    private static void requirePipelineFence(String pipelineId, WorkloadClaimFence fence) {
-        Objects.requireNonNull(pipelineId, "pipelineId");
+    private static void requirePipelineFence(String consumerId, WorkloadClaimFence fence) {
+        Objects.requireNonNull(consumerId, "consumerId");
         Objects.requireNonNull(fence, "fence");
         if (fence.key().type() != WorkloadClaimType.PIPELINE_ACTUATION
-                || !pipelineId.equals(fence.key().resourceId())
+                || !SrsConsumerId.pipelineOf(consumerId).equals(fence.key().resourceId())
                 || fence.executionGeneration() < 1) {
             throw new IllegalArgumentException(
                     "a sink acknowledgement fence must name this pipeline's submitted execution");
@@ -1299,8 +1817,10 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
 
     /** Fields every split cursor carries so both lookup directions can use declared indexes. */
     private static Document consumerIdentity(String miningChainId, String pipelineId) {
-        return new Document("miningChainId", miningChainId)
-                .append("pipelineId", pipelineId);
+        Document identity = new Document("miningChainId", miningChainId).append(PIPELINE_ID, pipelineId);
+        SrsConsumerId.sourceOf(pipelineId).ifPresent(source -> identity
+                .append("ownerPipelineId", SrsConsumerId.pipelineOf(pipelineId)).append("sourceNodeId", source));
+        return identity;
     }
 
     /** One full split cursor document, used by replacement writes. */
@@ -1362,6 +1882,9 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         if (meta.sourceRead() != null) {
             document.putAll(sourceReadFields(meta.sourceRead(), meta.sourceReadAt()));
         }
+        if (meta.sourceReadDurable()) {
+            document.append("sourceReadDurable", true);
+        }
         if (meta.retention() != null) {
             document.append("retention", meta.retention());
         }
@@ -1417,11 +1940,24 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
         }
         return new SrsMeta(id, sourceReadFrom(document), consumers,
                 schemaHistory, document.getString("retention"), readEpoch(document, "epoch"),
-                sourceReadAtFrom(document));
+                sourceReadAtFrom(document), sourceReadDurableFrom(document, id));
+    }
+
+    private static boolean sourceReadDurableFrom(Document document, String id) {
+        Object raw = document.get("sourceReadDurable");
+        if (raw == null) {
+            return false;
+        }
+        if (!(raw instanceof Boolean durable)) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", id, "field", "sourceReadDurable"), null);
+        }
+        return durable;
     }
 
     /** Reconstructs one consumer cursor from its stored sub-document, keyed by the pipeline id. */
     private static ConsumerOffset consumerFromDocument(String pipelineId, Document document) {
+        ringDoneFromDocument(document, pipelineId);
         Map<String, Long> perTableSeq = new LinkedHashMap<>();
         Object perTableRaw = document.get("perTableSeq");
         if (perTableRaw instanceof Document perTableDoc) {
@@ -1442,7 +1978,41 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
                 sinkAckedFrom(document),
                 snapshotCompletedFrom(document),
                 document.getString("cdcStartPosition"),
-                readEpoch(document, "snapshotEpoch"));
+                readEpoch(document, "snapshotEpoch"), confirmedByTable(document, pipelineId),
+                progressKind(document, pipelineId));
+    }
+
+    private static Map<String, ChainPosition> confirmedByTable(Document document, String consumerId) {
+        Document tables = nestedDocument(document, SINK_ACKED_BY_TABLE, consumerId);
+        Map<String, ChainPosition> positions = new LinkedHashMap<>();
+        if (tables != null) {
+            for (Map.Entry<String, Object> entry : tables.entrySet()) {
+                if (!(entry.getValue() instanceof Document stored)) {
+                    throw unreadableConsumer(consumerId, SINK_ACKED_BY_TABLE);
+                }
+                ChainPosition position = sinkAckedFrom(stored);
+                if (position != null) {
+                    positions.put(entry.getKey(), position);
+                }
+            }
+        }
+        return positions;
+    }
+
+    private static ConsumerProgressKind progressKind(Document document, String consumerId) {
+        Object raw = document.get(PROGRESS_KIND);
+        if (raw == null) {
+            return ConsumerProgressKind.LEGACY;
+        }
+        if (!(raw instanceof String kind)) {
+            throw unreadableConsumer(consumerId, PROGRESS_KIND);
+        }
+        return switch (kind) {
+            case "LEGACY" -> ConsumerProgressKind.LEGACY;
+            case "SRS" -> ConsumerProgressKind.SRS;
+            case "DIRECT_SOURCE" -> ConsumerProgressKind.DIRECT_SOURCE;
+            default -> throw unreadableConsumer(consumerId, PROGRESS_KIND);
+        };
     }
 
     /**
@@ -1537,6 +2107,18 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
             perTable.append(entry.getKey(), entry.getValue());
         }
         Document document = new Document("perTableSeq", perTable);
+        if (offset.progressKind() != ConsumerProgressKind.LEGACY) {
+            document.append(PROGRESS_KIND, offset.progressKind().name());
+        }
+        if (!offset.sinkAckedByTable().isEmpty()) {
+            Document confirmed = new Document();
+            offset.sinkAckedByTable().forEach((table, position) -> {
+                Document stored = new Document();
+                writePosition(stored, position);
+                confirmed.put(table, stored);
+            });
+            document.append(SINK_ACKED_BY_TABLE, confirmed);
+        }
         if (!offset.snapshotCompletedTables().isEmpty()) {
             document.append("snapshotCompletedTables", List.copyOf(offset.snapshotCompletedTables()));
         }

@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.testsupport.DockerGate;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -62,14 +63,17 @@ class DisjointTableConsumersKeepSharedRingMovingIT {
             Await.until("both disjoint pipelines to consume one mining chain", Duration.ofMinutes(2),
                     () -> documents.miningChainIds().size() == 1
                             && documents.consumersOf(documents.miningChainIds().iterator().next())
-                                    .equals(Set.of(JOIN, NEST))
+                                    .equals(Set.of(SrsConsumerId.of(JOIN, SOURCE).value(),
+                                            SrsConsumerId.of(NEST, SOURCE).value()))
                             && files.count(joinAddress, JOIN_TABLE) == 1
                             && files.count(nestAddress, NEST_TABLE) == 1,
                     () -> "chains=" + documents.miningChainIds() + ", join=" + control.state(JOIN)
                             + ", nest=" + control.state(NEST) + ", logs=" + control.logs(NEST));
             String chain = documents.miningChainIds().iterator().next();
-            Document joinCursor = documents.consumerOffset(chain, JOIN).get("perTableSeq", Document.class);
-            Document nestCursor = documents.consumerOffset(chain, NEST).get("perTableSeq", Document.class);
+            Document joinCursor = documents.consumerOffset(chain, SrsConsumerId.of(JOIN, SOURCE).value())
+                    .get("perTableSeq", Document.class);
+            Document nestCursor = documents.consumerOffset(chain, SrsConsumerId.of(NEST, SOURCE).value())
+                    .get("perTableSeq", Document.class);
             assertThat(joinCursor.keySet()).containsExactly(JOIN_TABLE);
             assertThat(nestCursor.keySet()).containsExactly(NEST_TABLE);
 
@@ -80,7 +84,8 @@ class DisjointTableConsumersKeepSharedRingMovingIT {
                         () -> files.count(nestAddress, NEST_TABLE) == expected,
                         () -> "nest rows=" + files.count(nestAddress, NEST_TABLE)
                                 + ", expected=" + expected
-                                + ", cursor=" + documents.consumerReadSeq(chain, NEST, NEST_TABLE)
+                                + ", cursor=" + documents.consumerReadSeq(
+                                        chain, SrsConsumerId.of(NEST, SOURCE).value(), NEST_TABLE)
                                 + ", join=" + control.state(JOIN) + ", nest=" + control.state(NEST)
                                 + ", logs=" + control.logs(NEST));
             }

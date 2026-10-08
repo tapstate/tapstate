@@ -18,6 +18,7 @@ import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.Staged;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.BatchSpec;
+import io.tapstate.spi.store.SrsLogStore;
 import java.util.ArrayDeque;
 import java.util.List;
 import java.util.Map;
@@ -57,8 +58,9 @@ import java.util.function.LongConsumer;
  *
  * <p>Non-cooperative, exactly as Jet's own SourceBuilder-built source is: it runs on its own thread and backs
  * off between empty fills, so an idle input never spins a shared cooperative thread. It is not fault-tolerant -
- * it keeps no snapshot and a ring read position never enters Jet state; on an L1 restart the ring is re-mined
- * and replayed from the durable source offset. A configured ring and read-cursor sink are resolved on the
+ * it keeps no snapshot and a ring read position never enters Jet state. Durable shared capture instead
+ * replays the retained log after this source's separately confirmed position on restart. A configured ring,
+ * log and read-cursor sink are resolved on the
  * member the processor runs on, so nothing but serializable coordinates crosses the wire.
  */
 public final class SrsSourceProcessor extends AbstractProcessor implements Staged, HoldsChangesForLoads {
@@ -88,6 +90,8 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private final ArrayDeque<Envelope> pending = new ArrayDeque<>();
     private SnapshotBuffer buffered;
     private SrsRingbuffer ring;
+    private SrsLogStore log;
+    private ChainPosition confirmed;
     private LongConsumer cursor;
     private SrsRingReader reader;
     // When this run of refusals began, so the bound below measures the stretch the cluster has been
@@ -184,6 +188,10 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             Ringbuffer<SrsItem> rb = context.hazelcastInstance().getRingbuffer(ringName);
             ring = new SrsRingbuffer(rb);
             cursor = ringTail.publisherFactory().resolve(context.hazelcastInstance());
+            Object durable = context.hazelcastInstance().getUserContext()
+                    .get(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY);
+            log = durable instanceof SrsLogStore resolved ? resolved : null;
+            confirmed = ringTail.publisherFactory().confirmedPosition(context.hazelcastInstance()).orElse(null);
         }
     }
 
@@ -226,16 +234,15 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         int pendingBefore = pending.size();
         // Whatever the capture has handed over since the last pass, ahead of the ring as always.
         drainBuffered();
-        // The ring's sequence pairs with the generation this reader runs under to give each change its
-        // order. The sequence alone is not comparable across generations: a rebuilt ring numbers from zero
-        // again, so a change of the new ring would otherwise read as older than one of the ring before it.
+        // A durable record keeps the generation it was captured under. Replacing the member does not make
+        // a pending old change newer than a snapshot or a downstream effect already written by that run.
         // Not before a declared load is through: the ring may already hold changes to rows the load has
         // yet to hand over, and each of them has to follow its row, not precede it. Nor while changes are held
         // for the loads they could overtake: the ring keeps them, in order, until the gate opens.
         if (ringTail != null && !awaitingSnapshot && !holding && openReader()) {
             try {
                 reader.fill((item, seq) -> {
-                    SourceOrder order = orderOf(seq);
+                    SourceOrder order = orderOf(item, seq);
                     pending.add(SrsProjection.toEnvelope(item, src, order));
                     read = order;
                 }, readBatch);
@@ -280,9 +287,16 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             return true;
         }
         try {
-            reader = ringTail.resumeAfter() != null
-                    ? SrsRingReader.resumingAfter(ring, ringTail.resumeAfter(), cursor)
-                    : SrsRingReader.from(ring, ringTail.start(), cursor);
+            if (log == null) {
+                reader = ringTail.resumeAfter() != null
+                        ? SrsRingReader.resumingAfter(ring, ringTail.resumeAfter(), cursor)
+                        : SrsRingReader.from(ring, ringTail.start(), cursor);
+            } else {
+                reader = ringTail.resumeAfter() != null
+                        ? SrsRingReader.resumingAfter(
+                                ring, ringTail.resumeAfter(), confirmed, cursor, ringName, log)
+                        : SrsRingReader.from(ring, ringTail.start(), cursor, null, ringName, log);
+            }
             refused = false;
             return true;
         } catch (RingWriteRefusedException refusal) {
@@ -415,12 +429,13 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
      * is being filled for a chain nobody opened — a wiring error, and one that would otherwise put every
      * change of this job on a generation below every real one, so it crashes bare rather than ordering on it.
      */
-    private SourceOrder orderOf(long seq) {
-        if (epoch < 1) {
+    private SourceOrder orderOf(SrsItem item, long seq) {
+        long originalEpoch = item.epoch() > 0L ? item.epoch() : epoch;
+        if (originalEpoch < 1) {
             throw new IllegalStateException("ring '" + ringName + "' holds changes on stream '" + src
                     + "' but its mining chain has no ring generation open");
         }
-        return new SourceOrder(epoch, seq);
+        return new SourceOrder(originalEpoch, seq);
     }
 
     /**
@@ -495,10 +510,10 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
      * one reader runs where {@code placement} says, which has to be the member whose capture fills the hand-off
      * it drains -- see {@link SourcePlacement}.
      *
-     * <p>The generation is resolved when the job is assembled, not read per change: the ring is opened
-     * before the job is submitted and does not change generation while it runs, so carrying it here keeps
-     * the durable store off the per-change path entirely. Zero is reserved for a graph inspected before its
-     * capture was started, and a change found under it is rejected rather than ordered.
+     * <p>Each durable change keeps its original capture generation. The supplied generation anchors this
+     * source's snapshot bound and supports volatile legacy items; it never relabels a persisted change.
+     * Zero is reserved for a graph inspected before capture started, and an unlabelled volatile change
+     * found under it is rejected rather than ordered.
      */
     public static ProcessorMetaSupplier metaSupplier(String pipelineId, String ringName, String src,
             StartFrom start, long epoch, SrsReadCursorPublisherFactory publisherFactory,
@@ -575,6 +590,12 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         SupplierEx<Processor> supplier = () -> new SrsSourceProcessor(pipelineId, ringName, src, epoch, stamp, null,
                 BatchSpec.DEFAULT_MAX_RECORDS);
         return placement.place(ProcessorSupplier.of(supplier));
+    }
+
+    /** An unbounded direct source drains its private hand-off without opening an SRS recovery reader. */
+    public static ProcessorMetaSupplier directMetaSupplier(String pipelineId, String bufferName, String src,
+            long epoch, SourceBoundStamp stamp, SourcePlacement placement) {
+        return snapshotOnlyMetaSupplier(pipelineId, bufferName, src, epoch, stamp, placement);
     }
 
     /** Present only on the source shape that follows a shared ring and publishes its read cursor. */

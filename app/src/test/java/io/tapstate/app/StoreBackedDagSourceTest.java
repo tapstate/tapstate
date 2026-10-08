@@ -41,6 +41,9 @@ import io.tapstate.spi.store.ConnectionTester;
 import io.tapstate.spi.store.DerivedSchema;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.ConsumerProgressKind;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.PipelineLayoutStore;
 import io.tapstate.spi.store.SchemaStore;
@@ -66,6 +69,73 @@ import org.junit.jupiter.api.Test;
  * - the leaves (SRS source vertex, transform port, sink writer) are built but never opened here.
  */
 class StoreBackedDagSourceTest {
+
+    @Test
+    void aKeepStateRestartDoesNotAnnounceANewSnapshotBoundBeforeOlderPendingChanges() {
+        FakeStorePort store = new FakeStorePort();
+        String consumer = SrsConsumerId.of("p", "crm_source").value();
+        store.meta().create("crm", null);
+        store.meta().openEpoch("crm");
+        store.meta().upsertConsumerOffset("crm", new ConsumerOffset(consumer,
+                Map.of("support_case", 2L), null, List.of("support_case"), "before-batch", 1L,
+                Map.of("support_case", new ChainPosition(new SourceOrder(1, 1), "low")),
+                ConsumerProgressKind.SRS));
+        store.meta().openEpoch("crm");
+
+        assertThat(new StoreBackedDagSource(store).sourceContextEpoch("crm", consumer, "support_case"))
+                .isEqualTo(1L);
+        assertThat(store.meta().read("crm").orElseThrow().epoch()).isEqualTo(2L);
+    }
+
+    @Test
+    void cdcOnlyRestartUsesItsTablesConfirmedEpochWithoutBorrowingAnotherTable() {
+        FakeStorePort store = new FakeStorePort();
+        String consumer = SrsConsumerId.of("p", "crm_source").value();
+        store.meta().create("crm", null);
+        store.meta().openEpoch("crm");
+        store.meta().openEpoch("crm");
+        store.meta().upsertConsumerOffset("crm", new ConsumerOffset(consumer,
+                Map.of("support_case", 2L, "emailmessage", 1_000L), null, List.of(), null, 0L,
+                Map.of("support_case", new ChainPosition(new SourceOrder(1, 1), "low"),
+                        "emailmessage", new ChainPosition(new SourceOrder(2, 1_000), "mail")),
+                ConsumerProgressKind.SRS));
+
+        StoreBackedDagSource source = new StoreBackedDagSource(store);
+        assertThat(source.sourceContextEpoch("crm", consumer, "support_case")).isEqualTo(1L);
+        assertThat(source.sourceContextEpoch("crm", consumer, "emailmessage")).isEqualTo(2L);
+    }
+
+    @Test
+    void aFullReloadUsesItsNewSnapshotEpochOverRetainedOlderChanges() {
+        FakeStorePort store = new FakeStorePort();
+        String consumer = SrsConsumerId.of("p", "crm_source").value();
+        store.meta().create("crm", null);
+        store.meta().openEpoch("crm");
+        store.meta().openEpoch("crm");
+        store.meta().upsertConsumerOffset("crm", new ConsumerOffset(consumer,
+                Map.of("support_case", 2L), null, List.of(), "fresh-seam", 2L,
+                Map.of("support_case", new ChainPosition(new SourceOrder(1, 1), "low")),
+                ConsumerProgressKind.SRS));
+
+        assertThat(new StoreBackedDagSource(store).sourceContextEpoch("crm", consumer, "support_case"))
+                .isEqualTo(2L);
+    }
+
+    @Test
+    void aResumedTableUsesItsNewerConfirmedGenerationAfterTheSnapshot() {
+        FakeStorePort store = new FakeStorePort();
+        String consumer = SrsConsumerId.of("p", "crm_source").value();
+        store.meta().create("crm", null);
+        store.meta().openEpoch("crm");
+        store.meta().openEpoch("crm");
+        store.meta().upsertConsumerOffset("crm", new ConsumerOffset(consumer,
+                Map.of("support_case", 2L), null, List.of("support_case"), "old-seam", 1L,
+                Map.of("support_case", new ChainPosition(new SourceOrder(2, 1), "high")),
+                ConsumerProgressKind.SRS));
+
+        assertThat(new StoreBackedDagSource(store).sourceContextEpoch("crm", consumer, "support_case"))
+                .isEqualTo(2L);
+    }
 
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(strings = {"qualified", "source", "multiple", "regex"})
@@ -776,11 +846,49 @@ class StoreBackedDagSourceTest {
     }
 
     @Test
-    void a_single_sink_resumes_from_legacy_progress_it_alone_can_have_made() {
+    void a_single_sink_resumes_from_progress_it_alone_can_have_made() {
+        FakeStorePort store = new FakeStorePort();
+        String chain = servedBy(store, "only");
+        store.meta().advanceSinkAcked(
+                chain, SOURCE_NODE, "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
+
+        assertThat(vertexNames(new StoreBackedDagSource(store).dagFor("p"))).contains("orders_src");
+    }
+
+    @Test
+    void a_single_sink_is_refused_progress_kept_under_its_pipelines_own_name() {
         FakeStorePort store = new FakeStorePort();
         String chain = servedBy(store, "only");
         store.meta().advanceSinkAcked(
                 chain, "p", "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
+
+        // Kept before each source node had a record of its own on the chain, it cannot say which source node it
+        // was made for, however few sinks read it.
+        assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("p"))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(thrown -> assertThat(((TapstateException) thrown).code())
+                        .isEqualTo(IoError.SRS_PROGRESS_UNPROVEN));
+    }
+
+    @Test
+    void a_multi_sink_source_node_is_refused_a_position_kept_for_every_sink_at_once() {
+        FakeStorePort store = new FakeStorePort();
+        String chain = servedBy(store, "fast", "slow");
+        store.meta().advanceSinkAcked(
+                chain, SOURCE_NODE, "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
+
+        assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("p"))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(thrown -> assertThat(((TapstateException) thrown).code())
+                        .isEqualTo(IoError.SINK_WRITER_PROGRESS_AMBIGUOUS));
+    }
+
+    @Test
+    void a_position_at_the_loads_seam_is_no_progress_that_two_sinks_could_disagree_on() {
+        FakeStorePort store = new FakeStorePort();
+        String chain = servedBy(store, "fast", "slow");
+        // Where a direct channel's capture records the load's seam before any run of its sinks has begun.
+        store.meta().advanceSinkAcked(chain, SOURCE_NODE, new ChainPosition(SourceOrder.snapshotRow(1), "seam"));
 
         assertThat(vertexNames(new StoreBackedDagSource(store).dagFor("p"))).contains("orders_src");
     }
@@ -798,7 +906,7 @@ class StoreBackedDagSourceTest {
     void a_load_marked_finished_for_every_sink_at_once_is_refused_like_a_position() {
         FakeStorePort store = new FakeStorePort();
         String chain = servedBy(store, "fast", "slow");
-        store.meta().markSnapshotComplete(chain, "p", "orders");
+        store.meta().markSnapshotComplete(chain, SOURCE_NODE, "orders");
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("p"))
                 .isInstanceOf(TapstateException.class)
@@ -811,12 +919,15 @@ class StoreBackedDagSourceTest {
         FakeStorePort store = new FakeStorePort();
         String chain = servedBy(store, "fast", "slow");
         store.meta().advanceSinkAcked(
-                chain, "p", "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
+                chain, SOURCE_NODE, "orders", new ChainPosition(new SourceOrder(1, 100), "t100"));
         store.meta().beginWriterRun(
-                chain, "p", "g1", Map.of("orders", List.of("serve.fast#0", "serve.slow#0")));
+                chain, SOURCE_NODE, "g1", Map.of("orders", List.of("serve.fast#0", "serve.slow#0")));
 
         assertThat(vertexNames(new StoreBackedDagSource(store).dagFor("p"))).contains("orders_src");
     }
+
+    /** Where pipeline {@code p} keeps what it read from orders_src: under that source node's own name. */
+    private static final String SOURCE_NODE = SrsConsumerId.of("p", "orders_src").value();
 
     /** Pipeline {@code p} reading orders_src into one serve sink per name, its chain created; answers the chain. */
     private static String servedBy(FakeStorePort store, String... sinks) {

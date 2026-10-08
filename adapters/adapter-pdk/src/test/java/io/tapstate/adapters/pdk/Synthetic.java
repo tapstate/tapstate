@@ -538,6 +538,197 @@ final class Synthetic {
     }
 
     /**
+     * Streams one insert from a reader that wraps whatever its hand-over throws in an exception of its own,
+     * the way a binlog reader reports why it stopped.
+     */
+    static Path wrappingStreamSource(Path dir) {
+        String register = "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "  consumer.streamReadStarted();"
+                + row("a", 1)
+                + "  List<TapEvent> ins = new ArrayList<>();"
+                + "  ins.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(1L).after(a));"
+                + "  try { consumer.accept(ins, null); }"
+                + "  catch (Throwable t) { throw new RuntimeException(\"the reader stopped\", t); }"
+                + "  consumer.streamReadEnded();"
+                + "});";
+        return SyntheticJar.compileToJar(dir, "synthetic.WrappingStream", source("WrappingStream", "", register));
+    }
+
+    /**
+     * A source that reads on a thread of its own and delivers from it, the way a polling connector does, but
+     * only when it is told to; its flush function records every call it gets.
+     *
+     * <p>It takes its orders from, and reports through, the channel kept in the system properties under
+     * {@code channel}: the connector runs in a loader of its own, and those are one thing both sides of that
+     * boundary reach. An order of {@code rows} delivers one change closed by a fresh offset of the connector's
+     * own class; any other order delivers a heartbeat alone, naming no offset. It reports each offset it names
+     * under {@code named}, the thread of each delivery under {@code deliveredOn} as it begins and again under
+     * {@code handedOver} once its hand-over returns, and, for every flush call,
+     * the object it was handed, that object's loader, the connector's own loader and the calling thread under
+     * {@code flushes}.
+     *
+     * <p>Stopped, it makes one last heartbeat-only delivery on its way out, as a source may while it winds
+     * down, so a case can see what a delivery made after close does.
+     */
+    static Path acknowledgingSource(Path dir, String channel) {
+        return pollingSource(dir, "AcknowledgingSource", channel, flushFunction(""));
+    }
+
+    /** The same source, whose flush function records the call and then throws. */
+    static Path refusingAcknowledgementSource(Path dir, String channel) {
+        return pollingSource(dir, "RefusingAcknowledgementSource", channel,
+                flushFunction("throw new IllegalStateException(\"flush boom\");"));
+    }
+
+    /** The same source with no flush function at all. */
+    static Path unacknowledgingSource(Path dir, String channel) {
+        return pollingSource(dir, "UnacknowledgingSource", channel, "");
+    }
+
+    /**
+     * A source that, as the postgres connector does, creates a slot the first time a drive reads it and keeps
+     * the slot's name in its notes under {@code tapdata_pg_slot}; each read answers one row naming the slot it
+     * read through. Its release function reports the slot its notes name under {@code released} in the
+     * {@code channel} map. With {@code unreachable} in the map it then throws, as a source that cannot be
+     * reached does; with {@code hang} it waits until interrupted, and reports that under {@code interrupted} --
+     * having first, with {@code writeAfterInterrupt}, tried to write a note, reporting under {@code lateWrite}
+     * whether the write was taken.
+     */
+    static Path slotKeepingSource(Path dir, String channel) {
+        String register = ""
+                + "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
+                + "  Object slot = context.getStateMap().get(\"tapdata_pg_slot\");"
+                + "  if (slot == null) {"
+                + "    slot = \"slot-\" + java.util.UUID.randomUUID();"
+                + "    context.getStateMap().put(\"tapdata_pg_slot\", slot);"
+                + "  }"
+                + "  Map<String,Object> r = new LinkedHashMap<>();"
+                + "  r.put(\"id\", 1); r.put(\"slot\", String.valueOf(slot));"
+                + "  List<TapEvent> evs = new ArrayList<>();"
+                + "  evs.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(100L).after(r));"
+                + "  consumer.accept(evs, null);"
+                + "});"
+                + "functions.supportReleaseExternalFunction(context -> {"
+                + "  @SuppressWarnings(\"unchecked\") List<Object> released = (List<Object>) channel().get(\"released\");"
+                + "  released.add(String.valueOf(context.getStateMap().get(\"tapdata_pg_slot\")));"
+                + "  if (channel().containsKey(\"hang\")) {"
+                + "    try {"
+                + "      Thread.sleep(Long.MAX_VALUE);"
+                + "    } catch (InterruptedException e) {"
+                + "      channel().put(\"interrupted\", true);"
+                + "      if (channel().containsKey(\"writeAfterInterrupt\")) {"
+                + "        try {"
+                + "          context.getStateMap().put(\"late\", \"written after the release was given up on\");"
+                + "          channel().put(\"lateWrite\", \"written\");"
+                + "        } catch (RuntimeException refused) {"
+                + "          channel().put(\"lateWrite\", \"refused\");"
+                + "        }"
+                + "      }"
+                + "      throw e;"
+                + "    }"
+                + "  }"
+                + "  if (channel().containsKey(\"unreachable\")) {"
+                + "    throw new IllegalStateException(\"connection refused\");"
+                + "  }"
+                + "});";
+        String members = ""
+                + "@SuppressWarnings(\"unchecked\")"
+                + "private static Map<String,Object> channel() {"
+                + "  return (Map<String,Object>) System.getProperties().get(\"" + channel + "\");"
+                + "}";
+        return SyntheticJar.compileToJar(dir, "synthetic.SlotKeepingSource",
+                source("SlotKeepingSource", "", register, members));
+    }
+
+    /** A flush function that records each call under {@code flushes}, then runs {@code after}. */
+    private static String flushFunction(String after) {
+        return ""
+                + "functions.supportFlushOffsetFunction((context, offset) -> {"
+                + "  Map<String,Object> call = new java.util.HashMap<>();"
+                + "  call.put(\"offset\", offset);"
+                + "  call.put(\"offsetLoader\", offset == null ? null : offset.getClass().getClassLoader());"
+                + "  call.put(\"connectorLoader\", Offset.class.getClassLoader());"
+                + "  call.put(\"thread\", Thread.currentThread());"
+                + "  @SuppressWarnings(\"unchecked\") List<Object> flushes = (List<Object>) channel().get(\"flushes\");"
+                + "  flushes.add(call);"
+                + after
+                + "});";
+    }
+
+    private static Path pollingSource(Path dir, String simpleName, String channel, String flushFunction) {
+        String members = ""
+                + "public static class Offset implements java.io.Serializable {"
+                + "  public String mark;"
+                + "  public Offset() {}"
+                + "  public Offset(String mark) { this.mark = mark; }"
+                + "  public boolean equals(Object o) {"
+                + "    return o instanceof Offset && java.util.Objects.equals(mark, ((Offset) o).mark);"
+                + "  }"
+                + "  public int hashCode() { return java.util.Objects.hashCode(mark); }"
+                + "  public String toString() { return \"Offset(\" + mark + \")\"; }"
+                + "}"
+                + "private volatile boolean stopped;"
+                + "@SuppressWarnings(\"unchecked\")"
+                + "private static Map<String,Object> channel() {"
+                + "  return (Map<String,Object>) System.getProperties().get(\"" + channel + "\");"
+                + "}";
+        String register = ""
+                + "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "  @SuppressWarnings(\"unchecked\") java.util.concurrent.BlockingQueue<String> orders ="
+                + "      (java.util.concurrent.BlockingQueue<String>) channel().get(\"orders\");"
+                + "  @SuppressWarnings(\"unchecked\") List<Object> named = (List<Object>) channel().get(\"named\");"
+                + "  @SuppressWarnings(\"unchecked\") List<Object> deliveredOn ="
+                + "      (List<Object>) channel().get(\"deliveredOn\");"
+                + "  @SuppressWarnings(\"unchecked\") List<Object> handedOver ="
+                + "      (List<Object>) channel().get(\"handedOver\");"
+                + "  consumer.streamReadStarted();"
+                + "  Thread poll = new Thread(() -> {"
+                + "    int rows = 0;"
+                + "    while (!stopped) {"
+                + "      String order;"
+                + "      try {"
+                + "        order = orders.poll(10, java.util.concurrent.TimeUnit.MILLISECONDS);"
+                + "      } catch (InterruptedException e) {"
+                + "        return;"
+                + "      }"
+                + "      if (order == null) continue;"
+                + "      List<TapEvent> batch = new ArrayList<>();"
+                + "      Offset at = null;"
+                + "      if (order.equals(\"rows\")) {"
+                + "        rows++;"
+                + "        Map<String,Object> row = new LinkedHashMap<>(); row.put(\"id\", rows);"
+                + "        batch.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime((long) rows).after(row));"
+                + "        at = new Offset(\"batch-\" + rows);"
+                + "        named.add(at);"
+                + "      } else {"
+                + "        batch.add(new io.tapdata.entity.event.control.HeartbeatEvent().init());"
+                + "      }"
+                + "      deliveredOn.add(Thread.currentThread());"
+                + "      consumer.accept(batch, at);"
+                + "      handedOver.add(Thread.currentThread());"
+                + "    }"
+                + "    List<TapEvent> last = new ArrayList<>();"
+                + "    last.add(new io.tapdata.entity.event.control.HeartbeatEvent().init());"
+                + "    deliveredOn.add(Thread.currentThread());"
+                + "    consumer.accept(last, null);"
+                + "  }, \"synthetic-poll\");"
+                + "  poll.start();"
+                + "  while (poll.isAlive()) {"
+                + "    try { poll.join(); } catch (InterruptedException stopping) { }"
+                + "  }"
+                + "  consumer.streamReadEnded();"
+                + "});"
+                + flushFunction;
+        String discovery = "TapTable table = new TapTable(\"t1\");"
+                + "table.add(new TapField(\"id\", \"int\"));"
+                + "List<TapTable> tables = new ArrayList<>();"
+                + "tables.add(table);"
+                + "s.accept(tables);";
+        return SyntheticJar.compileToJar(dir, "synthetic." + simpleName,
+                source(simpleName, "", register, members, discovery, "stopped = true;"));
+    }
+
+    /**
      * Streams one insert whose row holds values no JSON writer knows, at three depths. A connector
      * hands on whatever its driver produced, and a document store's own key arrives as a driver object
      * rather than as a string or a number; {@code UUID} stands in for one here, because what matters is

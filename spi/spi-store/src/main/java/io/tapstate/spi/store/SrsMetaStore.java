@@ -25,6 +25,71 @@ import java.util.Optional;
  */
 public interface SrsMetaStore {
 
+    /** Records a requested table union for one physical capture without broadening any consumer. */
+    default void requestCaptureTables(String miningChainId, List<String> tables) {
+    }
+
+    /** The physical capture's durable requested table set, independent of source-node consumption. */
+    default List<String> captureTables(String miningChainId) {
+        return List.of();
+    }
+
+    /** Tables actually served by the current physical capture, not merely requested by a consumer. */
+    default List<String> captureServingTables(String miningChainId) {
+        return List.of();
+    }
+
+    /** Publishes a same-generation subscription only when it covers every current request. */
+    default boolean publishCaptureTables(String miningChainId, long epoch, List<String> tables) {
+        return true;
+    }
+
+    /**
+     * The chain's source read offset as it stands durably, with whether it is a write-through checkpoint;
+     * empty for a chain with no offset or no record.
+     *
+     * <p>Read so that only a write a majority of the store's members has taken is seen. This is the value a
+     * source may be told to release its change log up to, and a write the store could still roll back in a
+     * failover must never be told to one: the source would have let go of changes that the rolled-back record
+     * then asks it for again. Only the offset is read, never the whole record, which grows with every schema
+     * version. The default reads the record as {@link #read} does, which is durable for a store with no
+     * replicas to fail over to.
+     */
+    default Optional<DurableSourceRead> durableSourceRead(String miningChainId) {
+        return read(miningChainId).filter(record -> record.sourceRead() != null)
+                .map(record -> new DurableSourceRead(record.sourceRead(), record.sourceReadDurable()));
+    }
+
+    /**
+     * Checkpoints the physical capture after every change in its source batch was written to recoverable
+     * SRS. Consumer confirmations are independent; they never certify this source-database position.
+     */
+    default void advanceCaptureCheckpoint(String miningChainId, ChainPosition position) {
+        throw new UnsupportedOperationException("a durable capture checkpoint requires its served table selection");
+    }
+
+    /**
+     * Checkpoints only while this callback's immutable served selection covers every requested table.
+     * An older narrow callback cannot certify a position after a wider subscription is published.
+     * Backends must make the selection check atomic with the checkpoint write.
+     */
+    default void advanceCaptureCheckpoint(
+            String miningChainId, ChainPosition position, List<String> servedTables) {
+        throw new UnsupportedOperationException("durable capture checkpoints are not implemented by this store");
+    }
+
+    /** Starts one isolated direct stream without carrying pending batches into a new source generation. */
+    default void beginDirectCapture(String miningChainId, String consumerId, long epoch, String anchor) {
+    }
+
+    /**
+     * Records the source-stream batch boundary and the last event each selected table must confirm.
+     * Orders here belong to one direct channel; quiet tables with no event do not pin its checkpoint.
+     */
+    default void recordDirectBatch(String miningChainId, String consumerId, ChainPosition position,
+            Map<String, Long> targets) {
+    }
+
     /** Returns the meta record for a mining chain, or empty if the chain has not been seeded. */
     Optional<SrsMeta> read(String miningChainId);
 
@@ -185,6 +250,73 @@ public interface SrsMetaStore {
 
     /**
      * Starts {@code runId}'s writer accounting as {@link #beginWriterRun(String, String, String, Map)} does, and
+     * records with it what the consumer's progress is measured against: {@code kind}, which says which of the
+     * positions its record holds a run replacing this one may resume from.
+     *
+     * <p>A consumer named for its source node, whose pipeline still holds progress recorded under the
+     * pipeline's own name on the chain, is refused: that progress cannot say which source node it was made
+     * for, so neither carrying it over nor dropping it is safe, and the pipeline's state has to be cleared.
+     * Read cursors and a snapshot seam are not progress any sink made, and do not count.
+     */
+    default void beginWriterRun(String miningChainId, String consumerId, String runId,
+            Map<String, List<String>> expectedWritersByTable, ConsumerProgressKind kind) {
+        throw new UnsupportedOperationException("this store keeps no per-writer accounting");
+    }
+
+    /** The fenced form of {@link #beginWriterRun(String, String, String, Map, ConsumerProgressKind)}. */
+    default boolean beginWriterRun(String miningChainId, String consumerId, String runId,
+            Map<String, List<String>> expectedWritersByTable, ConsumerProgressKind kind, WorkloadClaimFence fence) {
+        throw new UnsupportedOperationException("this SRS meta store does not support fenced sink acknowledgements");
+    }
+
+    /**
+     * Records how far {@code consumerId} has durably landed {@code table}: the position every change of the
+     * table at or below which has landed - its order, and the token of the change there where it carried one -
+     * with the table's place in its own ring raised to the order's sequence. Only ever raised: a position no
+     * later than the one the table holds leaves it, as every writer reports on its own and an older answer can
+     * land after a newer one. The consumer's acked position is left as it is, since one table's progress says
+     * nothing about how far the source has been confirmed for the others.
+     */
+    default void advanceTableConfirmed(String miningChainId, String consumerId, String table,
+            ChainPosition confirmed) {
+        throw new UnsupportedOperationException("this store keeps no per-table confirmations");
+    }
+
+    /** The fenced form of {@link #advanceTableConfirmed}, under the same condition as the fenced advance. */
+    default boolean advanceTableConfirmed(String miningChainId, String consumerId, String table,
+            ChainPosition confirmed, WorkloadClaimFence fence) {
+        throw new UnsupportedOperationException("this SRS meta store does not support fenced sink acknowledgements");
+    }
+
+    /**
+     * Moves a direct channel's consumer on as far as its tables' confirmations now reach. Its tables share one
+     * source order, so the acked position - and the channel's checkpoint with it - moves as far as the source
+     * batches recorded for it ({@link #recordDirectBatch}) are complete: every table a batch carried a change of
+     * confirmed through that change, a table it carried none of holding nothing back. Where it has recorded no
+     * batch, the acked position moves to the lowest of its tables' confirmations, once every table of its run has
+     * one. Only ever raised. What it decides comes from what is stored alone, so settling twice, or late, settles
+     * the same.
+     */
+    default void settleDirectBatches(String miningChainId, String consumerId) {
+    }
+
+    /**
+     * Raises {@code consumerId}'s acked position to {@code position} where the one it holds is earlier, or where
+     * it holds none, and leaves it otherwise: every writer works the position out on its own, so an older
+     * answer can land after a newer one, and written as it came it would move the position back.
+     */
+    default void raiseSinkAcked(String miningChainId, String consumerId, ChainPosition position) {
+        throw new UnsupportedOperationException("this store keeps no per-writer accounting");
+    }
+
+    /** The fenced form of {@link #raiseSinkAcked}, under the same condition as the fenced advance. */
+    default boolean raiseSinkAcked(String miningChainId, String consumerId, ChainPosition position,
+            WorkloadClaimFence fence) {
+        throw new UnsupportedOperationException("this SRS meta store does not support fenced sink acknowledgements");
+    }
+
+    /**
+     * Starts {@code runId}'s writer accounting as {@link #beginWriterRun(String, String, String, Map)} does, and
      * binds every later durable sink effect of the pipeline on the chain to {@code fence}'s run. The binding and
      * the proof that {@code fence} is still the live claim are one store operation, so a superseded run can
      * neither start its accounting again nor take the binding back. False, with nothing written, where
@@ -252,26 +384,6 @@ public interface SrsMetaStore {
      * <p>The default records nothing, which leaves an arriving run starting where its read mode puts it.
      */
     default void startRingAfter(String miningChainId, String pipelineId, String table, long seq) {
-    }
-
-    /**
-     * Raises how far {@code pipelineId} has nothing left to receive from {@code table}'s change ring to
-     * {@code seq}, leaving the chain's acked position as it is.
-     *
-     * <p>For progress that names no place a read can resume from: every change of the table at or below
-     * {@code seq} is durable in the pipeline's target, but the change there carried no token, so the acked
-     * position - a token and the order it sat at - has nothing new to say. A run replacing this one carries on
-     * in the ring from just past {@code seq} all the same. Only ever raised, never lowered. The default records
-     * nothing, which leaves a replacing run carrying on from the last acked change instead: more replayed than
-     * needed, nothing missed.
-     */
-    default void advanceRingDone(String miningChainId, String pipelineId, String table, long seq) {
-    }
-
-    /** The store-fenced form of {@link #advanceRingDone}, under the same condition as the fenced advance. */
-    default boolean advanceRingDone(String miningChainId, String pipelineId, String table, long seq,
-            WorkloadClaimFence fence) {
-        throw new UnsupportedOperationException("this SRS meta store does not support fenced sink acknowledgements");
     }
 
     /**

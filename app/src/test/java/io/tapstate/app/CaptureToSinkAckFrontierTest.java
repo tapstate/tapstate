@@ -6,6 +6,7 @@ import static org.assertj.core.api.Assertions.entry;
 import com.hazelcast.config.Config;
 import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.RingbufferConfig;
+import com.hazelcast.config.RingbufferStoreConfig;
 import com.hazelcast.config.SerializerConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
@@ -18,6 +19,7 @@ import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Vertex;
 import com.hazelcast.jet.core.Watermark;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
+import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.FromClause;
@@ -38,11 +40,10 @@ import io.tapstate.runtime.engine.FrontierOrders;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.SnapshotBuffer;
-import io.tapstate.runtime.srs.SrsDurableFrontier;
-import io.tapstate.core.event.ChainPosition;
 import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.SrsItem;
 import io.tapstate.runtime.srs.SrsItemSerializer;
+import io.tapstate.runtime.srs.SrsLogRingbufferStoreFactory;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
@@ -55,6 +56,8 @@ import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.ConsumerProgressKind;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceModel;
@@ -65,7 +68,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Queue;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -107,6 +109,8 @@ class CaptureToSinkAckFrontierTest {
     /** The peer that reads the same source directly -- the one this file did not have. */
     private static final String DIRECT_PIPELINE = "p_direct";
     private static final String SOURCE_ID = "orders_src";
+    /** Where the pipeline keeps its progress on the chain: under its source node's name. */
+    private static final String CONSUMER = SrsConsumerId.of(PIPELINE, SOURCE_ID).value();
     private static final String DEST_ID = "orders_dest";
     private static final String TABLE = "orders";
     /** The second destination, and the sync element writing to it, in the case where one sink holds. */
@@ -114,9 +118,12 @@ class CaptureToSinkAckFrontierTest {
     private static final String HELD_SYNC = "sync_held";
 
     private HazelcastInstance member;
+    private InMemorySrsLogStore log;
+    private StoreBackedPipelineCaptureCoordinator coordinator;
 
     @BeforeEach
     void startMember() {
+        log = new InMemorySrsLogStore();
         Config config = new Config();
         config.setClusterName("capture-to-sink-ack-test-" + System.nanoTime());
         config.setProperty("hazelcast.phone.home.enabled", "false");
@@ -129,7 +136,9 @@ class CaptureToSinkAckFrontierTest {
                 .setCapacity(16)
                 .setInMemoryFormat(InMemoryFormat.OBJECT)
                 .setTimeToLiveSeconds(0)
-                .setBackupCount(0));
+                .setBackupCount(0)
+                .setRingbufferStoreConfig(new RingbufferStoreConfig().setEnabled(true)
+                        .setFactoryImplementation(new SrsLogRingbufferStoreFactory(log))));
         config.getSerializationConfig().addSerializerConfig(
                 new SerializerConfig().setImplementation(new SrsItemSerializer()).setTypeClass(SrsItem.class));
         member = Hazelcast.newHazelcastInstance(config);
@@ -139,6 +148,9 @@ class CaptureToSinkAckFrontierTest {
 
     @AfterEach
     void stopMember() {
+        if (coordinator != null) {
+            coordinator.close();
+        }
         if (member != null) {
             member.shutdown();
         }
@@ -195,6 +207,84 @@ class CaptureToSinkAckFrontierTest {
         }
 
         assertThat(gatedSource.cdcClosed).as("stop closes the capture subscription").isTrue();
+    }
+
+    @Test
+    void singleMemberRetiresSinkConfirmedChangesWithoutAnotherPipelineStarting() {
+        InMemoryStorePort store = seedStore();
+        GatedSource source = new GatedSource();
+        LifecycleActuator actuator = wireRuntime(store, source, UnaryOperator.identity());
+        SourceCaptureResolution resolution = SourceCaptureResolution.of(
+                StoredArtifacts.requireSource(store.artifacts(), SOURCE_ID));
+        String chainId = resolution.chainId().value();
+        String ring = resolution.ringName(TABLE);
+
+        actuator.start(PIPELINE);
+        try {
+            source.feed(change(0));
+            awaitSinkSize(1);
+            source.feed(change(1));
+            awaitSinkSize(2);
+            awaitSinkAck(store.meta(), chainId, "src-1");
+
+            awaitLogTrimmed(ring, 1L);
+            assertThat(log.load(ring, 0L)).isEmpty();
+            assertThat(log.load(ring, 1L)).isEmpty();
+            assertThat(log.largestSequence(ring)).isEqualTo(1L);
+
+            source.feed(change(2));
+            awaitSinkAck(store.meta(), chainId, "src-2");
+            awaitLogTrimmed(ring, 2L);
+            assertThat(log.load(ring, 2L)).isEmpty();
+            assertThat(log.largestSequence(ring)).isEqualTo(2L);
+            assertThat(source.starts).hasSize(1);
+            assertThat(source.activeSubscriptions()).isEqualTo(1L);
+        } finally {
+            actuator.stop(PIPELINE, true);
+        }
+    }
+
+    @Test
+    void singleMemberRetainsChangesUntilEveryConsumerConfirms() {
+        InMemoryStorePort store = seedStore();
+        GatedSource source = new GatedSource();
+        LifecycleActuator actuator = wireRuntime(store, source, UnaryOperator.identity());
+        SourceCaptureResolution resolution = SourceCaptureResolution.of(
+                StoredArtifacts.requireSource(store.artifacts(), SOURCE_ID));
+        String chainId = resolution.chainId().value();
+        String ring = resolution.ringName(TABLE);
+        String slowConsumer = SrsConsumerId.of("paused_peer", SOURCE_ID).value();
+
+        actuator.start(PIPELINE);
+        try {
+            store.meta().upsertConsumerOffset(chainId, new ConsumerOffset(slowConsumer,
+                    Map.of(TABLE, -1L), null, List.of(), null, 0L, Map.of(), ConsumerProgressKind.SRS));
+            store.meta().startRingAfter(chainId, slowConsumer, TABLE, -1L);
+            source.feed(change(0));
+            awaitSinkSize(1);
+            source.feed(change(1));
+            awaitSinkSize(2);
+            awaitSinkAck(store.meta(), chainId, "src-1");
+
+            // The peer's read cursor reaches the second change while its sink confirms only the first.
+            long epoch = store.meta().read(chainId).orElseThrow().epoch();
+            store.meta().advanceConsumerReadSeq(chainId, slowConsumer, TABLE, 1L);
+            store.meta().advanceSinkAcked(chainId, slowConsumer, TABLE,
+                    new ChainPosition(new SourceOrder(epoch, 0L), "src-0"));
+
+            awaitLogTrimmed(ring, 0L);
+            assertThat(log.load(ring, 0L)).isEmpty();
+            assertThat(log.load(ring, 1L)).isPresent();
+            assertThat(log.largestSequence(ring)).isEqualTo(1L);
+
+            store.meta().advanceSinkAcked(chainId, slowConsumer, TABLE,
+                    new ChainPosition(new SourceOrder(epoch, 1L), "src-1"));
+            awaitLogTrimmed(ring, 1L);
+            assertThat(log.load(ring, 1L)).isEmpty();
+            assertThat(source.starts).hasSize(1);
+        } finally {
+            actuator.stop(PIPELINE, true);
+        }
     }
 
     @Test
@@ -301,7 +391,7 @@ class CaptureToSinkAckFrontierTest {
     }
 
     /** The source, the sink connection and a passthrough-filter pipeline over one cdc-only table. */
-    private static InMemoryStorePort seedStore() {
+    private InMemoryStorePort seedStore() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource(SOURCE_ID, null, "fake", Map.of("host", "h"), SourceMode.CDC,
                 List.of(TableRef.literal(TABLE)), null, null));
@@ -315,7 +405,7 @@ class CaptureToSinkAckFrontierTest {
                 new ServeBlock.Inline(null, FromRef.literal("keep_all"),
                         List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.CDC_ONLY, "earliest"), null));
-        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        InMemoryStorePort store = new InMemoryStorePort(artifacts, log);
         store.schemas().save(new DiscoveredSourceModel(SOURCE_ID, "fake", 0L, new SourceModel(List.of(
                 new SourceTable(TABLE, List.of(new SourceField("id", "INT")), List.of("id"), List.of())))));
         return store;
@@ -338,6 +428,7 @@ class CaptureToSinkAckFrontierTest {
             UnaryOperator<DagSource> wrapDag, StoreBackedDagSource.SinkWriterBinder sinks) {
         SrsMetaStore meta = store.meta();
         member.getUserContext().put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY, meta);
+        member.getUserContext().put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY, store.srsLog());
         ConnectorProvisioner provisioner = connectorId -> {
             throw new UnsupportedOperationException("not resolved by this ack test");
         };
@@ -348,86 +439,63 @@ class CaptureToSinkAckFrontierTest {
 
         SrsCoordinator srsCoordinator = new SrsCoordinator(meta);
         CaptureRunUnit captureRunUnit = new CaptureRunUnit(gatedSource, srsCoordinator, meta, member);
-        PipelineCaptureCoordinator coordinator =
-                new StoreBackedPipelineCaptureCoordinator(store, captureRunUnit::start, srsCoordinator, snapshotBuffer);
+        coordinator = new StoreBackedPipelineCaptureCoordinator(
+                store, captureRunUnit::start, srsCoordinator, snapshotBuffer);
 
         DagSource dagSource = wrapDag.apply(new StoreBackedDagSource(store, sinks));
         return new EngineLifecycleActuator(
                 new Engine(member), dagSource, coordinator, new NestStateTeardown(member, store.keyedState(), store.nestDeadLetters()));
     }
 
-    /**
-     * A pipeline reading its source directly still counts when the chain works out what it may forget.
-     *
-     * <p>Turning the shared buffer off changes where a pipeline reads from. It must not change whether the
-     * chain knows it is there: the frontier is the slowest consumer's acked position, and a consumer the
-     * frontier cannot see is one it will pass -- taking the record past changes that pipeline has not
-     * landed, which is the loss that leaves nothing behind to find.
-     *
-     * <p>Two consumers, and that is not decoration. With one, a frontier that has lost sight of it takes a
-     * minimum over nothing and returns nothing at all -- the same answer as a frontier that is correctly
-     * held back, so the case would pass either way. It takes a second, faster consumer for "the slow one
-     * was ignored" and "the slow one held it" to be different values.
-     *
-     * <p>The faster one is moved ahead by hand rather than by racing it. What is under test is whether the
-     * direct pipeline is in the set the minimum is taken over, and a race that happened to leave them level
-     * would make the two readings equal again -- passing, and saying nothing.
-     *
-     * <p>No mutation stands behind this one, and the reason is worth more than a mutation would be: there
-     * is no branch to break. What puts a pipeline in that set is the acknowledgement wiring, and the wiring
-     * walks the pipeline's sources and resolves each one's chain without ever reading the buffering switch.
-     * A direct pipeline is not admitted by a special case; it is admitted because nothing asks. So this is
-     * a guard against that distinction being introduced rather than a witness of it being absent -- and it
-     * is not a vacuous one: it reddens the day anyone adds the branch, which is the day it would matter.
-     */
     @Test
-    @DisplayName("a directly-read pipeline is still one of the consumers the frontier waits for")
-    void aDirectlyReadPipelineStillCountsInTheChainsFrontier() {
+    @DisplayName("an independent direct channel resumes without sharing the buffered capture checkpoint")
+    void aDirectChannelKeepsItsOwnRecoveryPositionAgainstTheSameDatabase() {
         InMemoryStorePort store = seedStoreWithADirectPeer();
         GatedSource gatedSource = new GatedSource();
         LifecycleActuator actuator = wireRuntime(store, gatedSource, UnaryOperator.identity());
-
         SrsMetaStore meta = store.meta();
-        String chainId = SourceCaptureResolution
-                .of(StoredArtifacts.requireSource(store.artifacts(), SOURCE_ID)).chainId().value();
+        SourceCaptureResolution physical = SourceCaptureResolution.of(
+                StoredArtifacts.requireSource(store.artifacts(), SOURCE_ID));
+        String bufferedChain = physical.chainId().value();
+        String directChain = physical.scopedTo(DIRECT_PIPELINE, false).chainId().value();
+        String bufferedConsumer = SrsConsumerId.of(PIPELINE, SOURCE_ID).value();
+        String directConsumer = SrsConsumerId.of(DIRECT_PIPELINE, SOURCE_ID).value();
+        assertThat(directChain).isNotEqualTo(bufferedChain);
 
         actuator.start(PIPELINE);
         actuator.start(DIRECT_PIPELINE);
         try {
-            // Fed until the chain knows both of them, rather than until two changes have arrived
-            // somewhere. A start returns before the pipeline it started is reading, and the directly-read
-            // one reads the source live -- so a change made before it attached is not late for it, it is
-            // before its beginning and it never sees one. Nothing else says when that attach finished,
-            // which is why this keeps making changes rather than waiting for one.
-            awaitBothConsumersAcked(gatedSource, meta, chainId);
+            gatedSource.feed(change(0));
+            gatedSource.feed(change(1));
+            gatedSource.feed(change(2));
+            gatedSource.feed(change(3));
+            awaitConsumerAck(meta, bufferedChain, bufferedConsumer, "src-3");
+            awaitConsumerAck(meta, directChain, directConsumer, "src-3");
+            awaitSourceRead(meta, bufferedChain, "src-3");
+            awaitSourceRead(meta, directChain, "src-3");
+            assertThat(meta.consumerOffsets(bufferedChain)).extracting(ConsumerOffset::pipelineId)
+                    .containsExactly(bufferedConsumer);
+            assertThat(meta.consumerOffsets(directChain)).extracting(ConsumerOffset::pipelineId)
+                    .containsExactly(directConsumer);
+            assertThat(CapturingSinkWriter.collected()).containsExactlyInAnyOrder(
+                    "src-0", "src-0", "src-1", "src-1", "src-2", "src-2", "src-3", "src-3");
 
-            assertThat(meta.consumerOffsets(chainId))
-                    .as("the consumers the chain knows about: the switch decides where a pipeline reads "
-                            + "from, not whether the chain can see it")
-                    .extracting(ConsumerOffset::pipelineId)
-                    .containsExactlyInAnyOrder(PIPELINE, DIRECT_PIPELINE);
+            actuator.stop(DIRECT_PIPELINE, false);
+            gatedSource.feed(change(4));
+            awaitConsumerAck(meta, bufferedChain, bufferedConsumer, "src-4");
+            awaitSourceRead(meta, bufferedChain, "src-4");
+            assertThat(sourceRead(meta, directChain)).isEqualTo("src-3");
+            assertThat(gatedSource.activeSubscriptions()).isEqualTo(1);
 
-            ChainPosition acked = directAckedPosition(meta, chainId);
-            assertThat(acked).as("the direct pipeline's own acked position").isNotNull();
-
-            // The other one races ahead. By hand, because what is under test is membership of the set the
-            // minimum is taken over -- and a race that left them level would make both readings equal.
-            ChainPosition farAhead = new ChainPosition(
-                    new SourceOrder(acked.order().epoch(), acked.order().seq() + 1_000), "src-far");
-            meta.advanceSinkAcked(chainId, PIPELINE, farAhead);
-
-            // One reading of the record, so the set the minimum is taken over and the value it is
-            // compared against come from the same moment. The wait above ends as soon as the direct
-            // pipeline has acked once, which is while it may still be acking: taken from two readings,
-            // this would compare a minimum over the later one against a position read from the earlier,
-            // and differ for that reason alone.
-            List<ConsumerOffset> offsets = meta.consumerOffsets(chainId);
-            assertThat(SrsDurableFrontier.safeAdvance(farAhead, offsets))
-                    .as("what the chain may forget once one consumer has run far ahead: the direct one is "
-                            + "still in the minimum, so the answer is where it got to and not where the "
-                            + "fast one did. Left out of the set, this is the fast one's position and the "
-                            + "record moves past changes the direct pipeline has not landed")
-                    .contains(directAckedIn(offsets));
+            actuator.start(DIRECT_PIPELINE);
+            awaitConsumerAck(meta, directChain, directConsumer, "src-4");
+            awaitSourceRead(meta, directChain, "src-4");
+            assertThat(gatedSource.starts).contains(CaptureStart.resume(new SourcePosition("src-3")));
+            assertThat(meta.consumerOffsets(bufferedChain)).extracting(ConsumerOffset::pipelineId)
+                    .containsExactly(bufferedConsumer);
+            assertThat(meta.consumerOffsets(directChain)).extracting(ConsumerOffset::pipelineId)
+                    .containsExactly(directConsumer);
+            assertThat(CapturingSinkWriter.collected()).filteredOn("src-4"::equals).hasSize(2);
         } finally {
             actuator.stop(DIRECT_PIPELINE, true);
             actuator.stop(PIPELINE, true);
@@ -482,13 +550,13 @@ class CaptureToSinkAckFrontierTest {
                     .as("where the pipeline resumes from while one of its sinks has written nothing: a resume "
                             + "from where the other sink got to skips every change the held one holds")
                     .isNull();
-            assertThat(meta.ringDoneThrough(chainId, PIPELINE).getOrDefault(TABLE, -1L))
+            assertThat(meta.ringDoneThrough(chainId, CONSUMER).getOrDefault(TABLE, -1L))
                     .as("how far the pipeline has nothing left to receive from the table's ring")
                     .isNegative();
 
             HeldSinkWriter.release();
             awaitSinkAck(meta, chainId, "src-3");
-            assertThat(meta.ringDoneThrough(chainId, PIPELINE)).containsEntry(TABLE, 3L);
+            assertThat(meta.ringDoneThrough(chainId, CONSUMER)).containsEntry(TABLE, 3L);
         } finally {
             HeldSinkWriter.release();
             actuator.stop(PIPELINE, true);
@@ -497,7 +565,7 @@ class CaptureToSinkAckFrontierTest {
 
     /** Whether any writer of the pipeline's current run has landed {@code token} on the table. */
     private static boolean anyWriterLanded(SrsMetaStore meta, String chainId, String token) {
-        return meta.writerRun(chainId, PIPELINE)
+        return meta.writerRun(chainId, CONSUMER)
                 .map(run -> run.progressFor(TABLE).values().stream()
                         .anyMatch(progress -> progress.lastTokened() != null
                                 && token.equals(progress.lastTokened().token())))
@@ -505,7 +573,7 @@ class CaptureToSinkAckFrontierTest {
     }
 
     /** The seeded pipeline serving its stream to two destinations, one of which will hold its writes. */
-    private static InMemoryStorePort seedStoreWithTwoSinks() {
+    private InMemoryStorePort seedStoreWithTwoSinks() {
         InMemoryStorePort store = seedStore();
         store.artifacts().save(new SourceResource(HELD_DEST_ID, null, "fake", Map.of("host", "e"),
                 null, null, null, null));
@@ -520,60 +588,21 @@ class CaptureToSinkAckFrontierTest {
         return store;
     }
 
-    /** The direct pipeline's acked position, or null while it has acked nothing. */
-    private static ChainPosition directAckedPosition(SrsMetaStore meta, String chainId) {
-        return directAckedIn(meta.consumerOffsets(chainId));
-    }
-
-    /** The direct pipeline's acked position within one reading of the chain's consumers. */
-    private static ChainPosition directAckedIn(List<ConsumerOffset> offsets) {
-        return offsets.stream()
-                .filter(offset -> DIRECT_PIPELINE.equals(offset.pipelineId()))
-                .map(ConsumerOffset::sinkAcked)
-                .filter(java.util.Objects::nonNull)
-                .findFirst()
-                .orElse(null);
-    }
-
-    /**
-     * Feeds changes until the chain knows both pipelines and the directly-read one has acked.
-     *
-     * <p>What it waits on is per pipeline and read off the chain record, and that is the whole of it. It
-     * replaced a count of what had reached the sinks -- one static queue of bare positions with no
-     * pipeline on them -- in which "two changes arrived" and "both pipelines delivered one" were the same
-     * reading. Two deliveries to the buffered pipeline therefore ended the feeding while the directly-read
-     * one had never seen a change, and it then never could: feeding had stopped, and a live reader is only
-     * reachable by a change made after it attached. Measured on a developer machine before this changed,
-     * one repeat in twelve ended exactly there -- two positions collected, one consumer on the chain --
-     * which is the reading both of the runs that led here also produced.
-     */
-    private void awaitBothConsumersAcked(GatedSource source, SrsMetaStore meta, String chainId) {
+    private void awaitConsumerAck(SrsMetaStore meta, String chainId, String consumerId, String expected) {
         long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
-        int fed = 0;
-        while (meta.consumerOffsets(chainId).size() < 2 || directAckedPosition(meta, chainId) == null) {
+        while (!expected.equals(meta.read(chainId).flatMap(record -> record.consumerOffset(consumerId))
+                .map(ConsumerOffset::sinkAckedSrcpos).orElse(null))) {
             if (System.nanoTime() > deadline) {
-                // The chain's own rows, which name whichever pipeline is missing or has acked nothing,
-                // and a count rather than the sinks' contents: this feeds for as long as the deadline
-                // allows, so what they took runs to hundreds of positions and would bury the one line
-                // that says which reading this is.
-                throw new AssertionError("timed out waiting for both pipelines to join the chain after "
-                        + "feeding " + fed + " changes; the chain knew " + meta.consumerOffsets(chainId)
-                        + " and the sinks had taken " + CapturingSinkWriter.collected().size()
-                        + " changes");
+                throw new AssertionError("timed out waiting for " + consumerId + " to confirm " + expected
+                        + "; progress=" + meta.consumerOffsets(chainId)
+                        + "; sink positions=" + CapturingSinkWriter.collected());
             }
-            source.feed(change(fed++));
             park();
         }
     }
 
-    /**
-     * The seeded store with a second pipeline over the same source, reading it directly.
-     *
-     * <p>The same source declaration for both, which is what puts them on one chain: what a chain is keyed
-     * on is the connection, and the buffering switch sits on the pipeline's reference to the source rather
-     * than on the source.
-     */
-    private static InMemoryStorePort seedStoreWithADirectPeer() {
+    /** The same physical database with a second pipeline whose source disables SRS. */
+    private InMemoryStorePort seedStoreWithADirectPeer() {
         InMemoryStorePort store = seedStore();
         store.artifacts().save(new PipelineResource(DIRECT_PIPELINE, null,
                 List.of(SourceRef.spec(SOURCE_ID, false)),
@@ -613,6 +642,18 @@ class CaptureToSinkAckFrontierTest {
         }
     }
 
+    private void awaitLogTrimmed(String ring, long through) {
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        while (log.bounds(ring).trimmedThrough() < through) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("timed out waiting for durable log retirement through " + through
+                        + ", bounds=" + log.bounds(ring));
+            }
+            park();
+        }
+        assertThat(log.bounds(ring).trimmedThrough()).isEqualTo(through);
+    }
+
     /** Waits for the chain's own record of how far its source has been read to reach {@code expected}. */
     private void awaitSourceRead(SrsMetaStore meta, String chainId, String expected) {
         long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
@@ -633,7 +674,7 @@ class CaptureToSinkAckFrontierTest {
     /** The pipeline's acked position, or null while its record holds none - which a started run's record may. */
     private static String ackedPosition(SrsMetaStore meta, String chainId) {
         return meta.read(chainId).map(record -> record.consumerOffsets().stream()
-                .filter(offset -> offset.pipelineId().equals(PIPELINE))
+                .filter(offset -> offset.pipelineId().equals(SrsConsumerId.of(PIPELINE, SOURCE_ID).value()))
                 .map(ConsumerOffset::sinkAckedSrcpos)
                 .filter(java.util.Objects::nonNull)
                 .findFirst()
@@ -655,13 +696,19 @@ class CaptureToSinkAckFrontierTest {
      */
     private static final class GatedSource implements CapturePort {
 
-        private final LinkedBlockingQueue<Envelope> pending = new LinkedBlockingQueue<>();
-        private volatile boolean running;
+        private final List<Envelope> history = new java.util.ArrayList<>();
+        private final List<FakeSubscription> subscriptions = new java.util.ArrayList<>();
+        private final Queue<CaptureStart> starts = new ConcurrentLinkedQueue<>();
         private volatile boolean cdcClosed;
-        private Thread daemon;
 
-        void feed(Envelope change) {
-            pending.add(change);
+        synchronized void feed(Envelope change) {
+            history.add(change);
+            subscriptions.stream().filter(subscription -> subscription.running)
+                    .forEach(subscription -> subscription.pending.add(change));
+        }
+
+        synchronized long activeSubscriptions() {
+            return subscriptions.stream().filter(subscription -> subscription.running).count();
         }
 
         @Override
@@ -670,28 +717,18 @@ class CaptureToSinkAckFrontierTest {
         }
 
         @Override
-        public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
-            running = true;
-            daemon = new Thread(() -> {
-                while (running) {
-                    try {
-                        Envelope change = pending.poll(25, TimeUnit.MILLISECONDS);
-                        if (change != null) {
-                            listener.onBatch(java.util.List.of(change), java.util.Optional.of(new SourcePosition("src-" + change.ts())));
-                        }
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        return;
-                    }
-                }
-            }, "gated-source-cdc");
-            daemon.setDaemon(true);
-            daemon.start();
-            return () -> {
-                running = false;
-                cdcClosed = true;
-                daemon.interrupt();
-            };
+        public synchronized Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
+            starts.add(start);
+            FakeSubscription subscription = new FakeSubscription(listener);
+            long resumeAfter = start instanceof CaptureStart.Resume resume
+                    ? Long.parseLong(resume.position().token().substring("src-".length()))
+                    : start instanceof CaptureStart.Present && !history.isEmpty()
+                            ? history.getLast().ts() : -1L;
+            history.stream().filter(change -> change.ts() > resumeAfter)
+                    .forEach(subscription.pending::add);
+            subscriptions.add(subscription);
+            subscription.daemon.start();
+            return subscription;
         }
 
         @Override
@@ -702,6 +739,36 @@ class CaptureToSinkAckFrontierTest {
         @Override
         public DiscoveredSchema discoverSchema(CaptureConfig config) {
             throw new UnsupportedOperationException();
+        }
+
+        private final class FakeSubscription implements Subscription {
+            private final LinkedBlockingQueue<Envelope> pending = new LinkedBlockingQueue<>();
+            private volatile boolean running = true;
+            private final Thread daemon;
+
+            private FakeSubscription(CaptureListener listener) {
+                daemon = new Thread(() -> {
+                    while (running) {
+                        try {
+                            Envelope change = pending.poll(25, TimeUnit.MILLISECONDS);
+                            if (change != null) {
+                                listener.onBatch(List.of(change), Optional.of(new SourcePosition("src-" + change.ts())));
+                            }
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                    }
+                }, "gated-source-cdc");
+                daemon.setDaemon(true);
+            }
+
+            @Override
+            public void close() {
+                running = false;
+                cdcClosed = true;
+                daemon.interrupt();
+            }
         }
     }
 

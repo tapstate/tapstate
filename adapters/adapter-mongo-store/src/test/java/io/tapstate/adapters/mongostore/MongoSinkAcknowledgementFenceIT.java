@@ -55,8 +55,12 @@ class MongoSinkAcknowledgementFenceIT {
             assertThat(store.advanceSinkAcked(CHAIN, PIPELINE, TABLE, position(2), fence)).isTrue();
             assertThat(ackedBy(store)).isEqualTo(position(4));
             assertThat(store.ringDoneThrough(CHAIN, PIPELINE)).containsEntry(TABLE, 4L);
-            assertThat(store.advanceRingDone(CHAIN, PIPELINE, TABLE, 6, fence)).isTrue();
+            assertThat(store.advanceTableConfirmed(
+                    CHAIN, PIPELINE, TABLE, new ChainPosition(new SourceOrder(1, 6), null), fence)).isTrue();
             assertThat(store.ringDoneThrough(CHAIN, PIPELINE)).containsEntry(TABLE, 6L);
+            assertThat(store.raiseSinkAcked(CHAIN, PIPELINE, position(7), fence)).isTrue();
+            assertThat(store.raiseSinkAcked(CHAIN, PIPELINE, position(5), fence)).isTrue();
+            assertThat(ackedBy(store)).isEqualTo(position(7));
             assertThat(store.markSnapshotComplete(CHAIN, PIPELINE, TABLE, fence)).isTrue();
             assertThat(store.markSnapshotComplete(CHAIN, PIPELINE, TABLE, fence)).isTrue();
             assertThat(store.read(CHAIN).orElseThrow().snapshotCompletedTables(PIPELINE)).containsExactly(TABLE);
@@ -168,7 +172,8 @@ class MongoSinkAcknowledgementFenceIT {
         return List.of(
                 () -> store.advanceWriter(CHAIN, PIPELINE, fixture.runId(), WRITER, TABLE, progress(9), fence),
                 () -> store.advanceSinkAcked(CHAIN, PIPELINE, TABLE, position(9), fence),
-                () -> store.advanceRingDone(CHAIN, PIPELINE, TABLE, 9, fence),
+                () -> store.advanceTableConfirmed(CHAIN, PIPELINE, TABLE, position(9), fence),
+                () -> store.raiseSinkAcked(CHAIN, PIPELINE, position(9), fence),
                 () -> store.markSnapshotComplete(CHAIN, PIPELINE, TABLE, fence));
     }
 

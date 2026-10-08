@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import com.hazelcast.core.HazelcastInstance;
+import io.tapstate.adapters.pdk.ConnectorStateNamespace;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.FromClause;
@@ -497,6 +498,10 @@ class CaptureOwnershipTest {
         b.captures.startCapture("q");
         // What q's own run leaves on the record as it reads: its cursor, and its place on the chain with it.
         store.meta().upsertConsumerOffset(CHAIN, new ConsumerOffset("q", Map.of(), null));
+        String connectorNamespace = ConnectorStateNamespace.ofShared(CHAIN);
+        String migrationNamespace = "pdk.notes-migration." + connectorNamespace;
+        store.keyedState().save(connectorNamespace, "slot", new byte[]{11, 12});
+        store.keyedState().save(migrationNamespace, "removed:expired", new byte[]{1});
 
         a.captures.stopCapture("p", true);
 
@@ -504,12 +509,18 @@ class CaptureOwnershipTest {
                 .as("the chain is still there for the pipeline reading it on the other member")
                 .isPresent();
         assertThat(consumersOn(store)).containsExactly("q");
+        assertThat(store.keyedState().load(connectorNamespace, "slot"))
+                .hasValueSatisfying(value -> assertThat(value).containsExactly((byte) 11, (byte) 12));
+        assertThat(store.keyedState().load(migrationNamespace, "removed:expired"))
+                .hasValueSatisfying(value -> assertThat(value).containsExactly((byte) 1));
 
         b.captures.stopCapture("q", true);
 
         assertThat(store.meta().read(CHAIN))
                 .as("and it goes with the last pipeline on it, whichever member ran that one")
                 .isEmpty();
+        assertThat(store.keyedState().count(connectorNamespace)).isZero();
+        assertThat(store.keyedState().count(migrationNamespace)).isZero();
     }
 
     /**
@@ -737,6 +748,37 @@ class CaptureOwnershipTest {
         assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(10));
     }
 
+    @Test
+    void aTakenOverTailUsesTheRemainingPipelineAfterTheFirstJoinerStops() {
+        InMemoryStorePort store = new InMemoryStorePort(artifactsWith("p", "q", "r"));
+        MemoryClaims claims = new MemoryClaims();
+        List<String> starts = new ArrayList<>();
+        Member a = new Member("node-a", store, claims, TTL, starts);
+        Member b = new Member("node-b", store, claims, TTL, starts);
+        try {
+            a.captures.startCapture("p");
+            b.captures.startCapture("q");
+            b.captures.startCapture("r");
+            assertThat(starts).containsExactly(
+                    "node-a p opened the tail", "node-b q attached", "node-b r attached");
+
+            b.captures.stopCapture("q", false);
+            a.captures.stopCapture("p", false);
+            b.captures.tailWhatNobodyTails();
+
+            assertThat(starts)
+                    .as("the takeover tail belongs to r, the pipeline still running on this member")
+                    .containsExactly("node-a p opened the tail", "node-b q attached", "node-b r attached",
+                            "node-b r opened the tail");
+        } finally {
+            b.captures.stopCapture("r", false);
+            b.captures.stopCapture("q", false);
+            a.captures.stopCapture("p", false);
+            b.captures.close();
+            a.captures.close();
+        }
+    }
+
     /**
      * When the member holding a capture stops the last of its own pipelines on it, a member whose
      * pipelines still read that capture takes the tail over, so they go on receiving changes.
@@ -932,7 +974,9 @@ class CaptureOwnershipTest {
         if (store.meta().read(CHAIN).isEmpty()) {
             store.meta().create(CHAIN, null);
         }
-        store.meta().openEpoch(CHAIN);
+        store.meta().requestCaptureTables(CHAIN, SourceCaptureResolution.of(SOURCE).tables());
+        long epoch = store.meta().openEpoch(CHAIN);
+        store.meta().publishCaptureTables(CHAIN, epoch, store.meta().captureTables(CHAIN));
     }
 
     private static List<String> consumersOn(InMemoryStorePort store) {
@@ -956,6 +1000,7 @@ class CaptureOwnershipTest {
         private final String node;
         private final List<String> starts;
         private final SrsCoordinator chains;
+        private final InMemoryStorePort store;
         private final StoreBackedPipelineCaptureCoordinator captures;
         private final AtomicInteger tailsClosed = new AtomicInteger();
 
@@ -968,6 +1013,7 @@ class CaptureOwnershipTest {
                 List<String> starts) {
             this.node = node;
             this.starts = starts;
+            this.store = store;
             this.chains = new SrsCoordinator(store.meta());
             ClusterMembershipGate gate = eligibleGate();
             CaptureOwnership ownership = new CaptureOwnership(
@@ -987,13 +1033,14 @@ class CaptureOwnershipTest {
                 return new CaptureRun(Optional.empty(), false, 0, Optional.empty(), Optional.of(subscription),
                         new CaptureHealth());
             }
-            MiningChainId chain = MiningChainId.resolve(spec.config(), spec.srsKey());
+            MiningChainId chain = spec.miningChainId();
             if (startTail) {
-                chains.provisionSource(spec.sourceId(), chain, spec.config().streams(), spec.retention());
+                long epoch = chains.provisionSource(spec.sourceId(), chain, spec.config().streams(), spec.retention()).epoch();
+                store.meta().publishCaptureTables(chain.value(), epoch, store.meta().captureTables(chain.value()));
             } else {
                 chains.joinSource(spec.sourceId(), chain, spec.config().streams());
             }
-            chains.attachConsumer(chain, spec.pipelineId());
+            chains.attachConsumer(chain, spec.consumerId());
             return new CaptureRun(Optional.of(chain), !startTail, 0, Optional.empty(), Optional.of(subscription),
                     new CaptureHealth());
         }

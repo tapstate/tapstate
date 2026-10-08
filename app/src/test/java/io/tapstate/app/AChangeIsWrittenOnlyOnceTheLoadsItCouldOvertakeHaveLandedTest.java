@@ -137,7 +137,8 @@ class AChangeIsWrittenOnlyOnceTheLoadsItCouldOvertakeHaveLandedTest {
             }
             buffer.endSnapshot(PIPELINE, ringOf(table));
         }
-        StoreBackedSinkAckFactory acks = new StoreBackedSinkAckFactory(CHAINS, PIPELINE, "run-1");
+        StoreBackedSinkAckFactory acks = new StoreBackedSinkAckFactory(
+                StoreBackedSinkAckFactory.legacyProgress(CHAINS, PIPELINE), PIPELINE, "run-1");
         // Every source placed on this member, the way a server places a source on the member whose capture fills
         // its hand-off: the gate is wrapped around what that placement makes, and the job has to carry the two
         // together to every member.
