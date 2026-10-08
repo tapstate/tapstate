@@ -17,6 +17,28 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /** The same frozen workload definitions are consumed by both application jars. */
 class BenchmarkWorkloadDefinitionsTest {
+    @Test
+    void fixedPacingCalibrationChangesOnlyThePredeclaredMeasuredBatchSchedule() {
+        for (String id : List.of("copy", "stateless", "stateful")) {
+            var original = BenchmarkWorkloadDefinitions.steadyPilot(id);
+            var paced = BenchmarkWorkloadDefinitions.pacedCalibration(id);
+            assertThat(paced.rows()).isEqualTo(original.rows());
+            assertThat(paced.seed()).isEqualTo(original.seed());
+            assertThat(paced.setupSql()).isEqualTo(original.setupSql());
+            assertThat(paced.sourceChains()).isEqualTo(original.sourceChains());
+            assertThat(paced.phases()).hasSameSizeAs(original.phases());
+            for (int i = 0; i < paced.phases().size(); i++) {
+                var before = original.phases().get(i);
+                var after = paced.phases().get(i);
+                assertThat(after.sql()).isEqualTo(before.sql());
+                assertThat(after.expectedLogicalCoverage()).isEqualTo(before.expectedLogicalCoverage());
+                assertThat(after.targets()).isEqualTo(before.targets());
+                assertThat(after.statementsPerBatch()).isEqualTo(before.statementsPerBatch());
+                assertThat(after.batchInterval()).isEqualTo(before.measured()
+                        ? Duration.ofMillis(id.equals("stateful") ? 50 : 5) : before.batchInterval());
+            }
+        }
+    }
 
     private static final Map<String, Object> SOURCE = Map.of(
             "host", "127.0.0.1", "port", 3306, "database", "bench_fork",

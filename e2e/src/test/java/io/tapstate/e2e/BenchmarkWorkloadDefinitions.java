@@ -71,6 +71,17 @@ final class BenchmarkWorkloadDefinitions {
         };
     }
 
+    static Workload pacedCalibration(String id) {
+        Workload original = steadyPilot(id);
+        Duration interval = Duration.ofMillis(id.equals(STATEFUL) ? 50 : 5);
+        List<Phase> phases = original.phases().stream().map(phase -> phase.measured()
+                ? new Phase(phase.id(), phase.stage(), true, phase.expectedLogicalOutputChanges(),
+                        phase.sql(), phase.statementsPerBatch(), interval,
+                        phase.expectedLogicalCoverage(), phase.targets()) : phase).toList();
+        return new Workload(original.id(), original.seed(), original.rows(), original.database(),
+                original.pipelineIds(), original.sourceChains(), original.setupSql(), phases);
+    }
+
     enum Database {
         MYSQL,
         POSTGRES
