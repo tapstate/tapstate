@@ -6,8 +6,11 @@ import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 
@@ -20,6 +23,7 @@ class RealBenchmarkForkDriverIT {
     private static final String ARM_PROPERTY = "tapstate.e2e.benchmark-smoke.arm";
     private static final String FORK_PROPERTY = "tapstate.e2e.benchmark-smoke.fork";
     private static final String MODE_PROPERTY = "tapstate.e2e.benchmark-smoke.capture-mode";
+    private static final String OUTPUT_PROPERTY = "tapstate.e2e.benchmark-smoke.fork-output";
 
     @BeforeAll
     static void requireServices() {
@@ -47,6 +51,7 @@ class RealBenchmarkForkDriverIT {
     }
 
     private static void run(String workloadId) throws Exception {
+        Path forkOutput = forkOutput();
         PipelineBenchmarkComparison.Arm arm = PipelineBenchmarkComparison.Arm.valueOf(
                 System.getProperty(ARM_PROPERTY, "A"));
         var mode = BenchmarkCaptureCalibrationLiveRunIT.Mode.valueOf(System.getProperty(MODE_PROPERTY, "PLAIN"));
@@ -79,6 +84,7 @@ class RealBenchmarkForkDriverIT {
                     : pacedCalibration ? BenchmarkWorkloadDefinitions.pacedCalibration(workloadId)
                     : pilot ? BenchmarkWorkloadDefinitions.steadyPilot(workloadId)
                     : BenchmarkWorkloadDefinitions.byId(workloadId);
+            Instant startedAt = Instant.now();
             PipelineBenchmarkHarness.ForkResult result = driver.run(
                     workload, arm,
                     forkNumber, applicationJar);
@@ -160,6 +166,41 @@ class RealBenchmarkForkDriverIT {
                     }
                 });
             });
+            if (forkOutput != null) {
+                var evidence = driver.evidence().getFirst();
+                String profile = fullSettlingCalibration ? "FIXED_FULL_CDC_SETTLING_CALIBRATION"
+                        : settlingCalibration ? "FIXED_FIRST_QUARTER_CDC_SETTLING_CALIBRATION"
+                        : pacedCalibration ? "FIXED_PACING_CALIBRATION_5MS_50MS" : "ORIGINAL_BATCH_SCHEDULE";
+                String json = JsonWriter.write(Map.of(
+                        "formalPerformance", false,
+                        "performanceAcceptanceEligible", false,
+                        "acceptanceEvaluated", false,
+                        "captureMode", mode.name(),
+                        "jvmGapDiagnostics", jvmDiagnostics,
+                        "profile", profile,
+                        "measurement", PipelineBenchmarkLiveRunIT.fork(evidence, result, startedAt)));
+                Files.writeString(forkOutput, json + "\n", StandardCharsets.UTF_8,
+                        StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+                System.out.println("benchmark-real-fork-output=" + forkOutput);
+            }
         }
+    }
+
+    private static Path forkOutput() throws Exception {
+        String configured = System.getProperty(OUTPUT_PROPERTY);
+        if (configured == null) { return null; }
+        Path output = Path.of(configured);
+        if (!output.isAbsolute() || output.getFileName() == null) {
+            throw new IllegalArgumentException("diagnostic fork output must be an absolute file path");
+        }
+        output = output.normalize();
+        if (!Files.isDirectory(output.getParent())) {
+            throw new IllegalArgumentException("diagnostic fork output requires an existing parent directory");
+        }
+        if (Files.exists(output)) {
+            throw new IllegalArgumentException("diagnostic fork output already exists");
+        }
+        PipelineBenchmarkLiveRunIT.requireSafeOutput(output, PipelineBenchmarkLiveRunIT.harnessRoot());
+        return output;
     }
 }
