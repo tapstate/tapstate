@@ -285,7 +285,7 @@ final class BenchmarkJdiTelemetrySession implements AutoCloseable {
         add(new Spec(DISPATCHER, "<init>", "(Lio/tapstate/runtime/scheduler/ObservationPublisher;"
                 + "Lio/tapstate/runtime/scheduler/RateSampler;Lio/tapstate/spi/metrics/MetricsExport;"
                 + "Lio/tapstate/app/ObservationScopeRegistry;Lio/tapstate/spi/store/PipelineEventStore;"
-                + (artifact.artifactSet == BenchmarkJdiCostObserver.ArtifactSet.COMMON_SOURCE
+                + (artifact.artifactSet != BenchmarkJdiCostObserver.ArtifactSet.LEGACY
                         ? "Lio/tapstate/app/ObservationScopeRecovery;Lio/tapstate/app/ObservationContinuationRecovery;" : "")
                 + "IILjava/time/Duration;)V", Kind.CONSTRUCTOR, null, null, null));
         add(new Spec(DISPATCHER, "close", "()V", Kind.CLOSE, null, null, null));

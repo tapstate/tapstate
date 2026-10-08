@@ -69,6 +69,18 @@ class RuntimeConvergenceConfiguration {
     @Bean
     ObservationPublisher observationPublisher(
             StorePort storePort, Engine engine, PipelineCaptureCoordinator captureCoordinator) {
+        return observationPublisherFor(storePort, engine, captureCoordinator, id -> {
+            Engine.ObservationMetricsSession nativeSession = engine.openObservationMetrics(id);
+            return new ObservationPublisher.PreparationSession() {
+                @Override public boolean current() { return nativeSession.current(); }
+                @Override public void close() { nativeSession.close(); }
+            };
+        });
+    }
+
+    static ObservationPublisher observationPublisherFor(
+            StorePort storePort, Engine engine, PipelineCaptureCoordinator captureCoordinator,
+            ObservationPublisher.PreparationSessions sessions) {
         // The publisher's four run-statistic sources: recordCount and the per-chain frontier readings ride
         // from the engine's live Jet job, the per-table sink-acked positions from the store, and the
         // per-table initial load from the capture coordinator. All are ports, so the scheduler stays clear
@@ -114,13 +126,7 @@ class RuntimeConvergenceConfiguration {
                 engine::stateStoreCostReadings,
                 (ObservationPublisher.StageRuntimeFacts) engine::stageRuntimeReading,
                 captureCoordinator::runSnapshotProgress,
-                Clock.systemUTC(), id -> {
-                    Engine.ObservationMetricsSession nativeSession = engine.openObservationMetrics(id);
-                    return new ObservationPublisher.PreparationSession() {
-                        @Override public boolean current() { return nativeSession.current(); }
-                        @Override public void close() { nativeSession.close(); }
-                    };
-                });
+                Clock.systemUTC(), sessions);
     }
 
     /** Reads the sink's complete delivery tuple from one live job-metrics collection. */

@@ -136,9 +136,11 @@ public final class Engine {
 
         private ObservationMetricsSession(String pipelineId) {
             this.pipelineId = Objects.requireNonNull(pipelineId, "pipelineId");
-            this.originalJob = liveJob(pipelineId);
+            Job named = jobNamed(pipelineId);
+            JobStatus status = named == null ? null : named.getStatus();
+            this.originalJob = status == null || status.isTerminal() ? null : named;
             this.originalJobId = originalJob == null ? -1 : originalJob.getId();
-            this.originalStatus = originalJob == null ? null : originalJob.getStatus();
+            this.originalStatus = originalJob == null ? null : status;
             this.originalMembers = memberIds();
         }
 
@@ -150,10 +152,12 @@ public final class Engine {
 
         public boolean current() {
             requireOpen();
-            Job now = liveJob(pipelineId);
+            Job named = jobNamed(pipelineId);
+            JobStatus status = named == null ? null : named.getStatus();
+            Job now = status == null || status.isTerminal() ? null : named;
             if (!originalMembers.equals(memberIds())
                     || (originalJob == null ? now != null : now == null || now.getId() != originalJobId
-                            || now.getStatus() != originalStatus)) {
+                            || status != originalStatus)) {
                 invalid = true;
             }
             return !invalid;
@@ -164,19 +168,22 @@ public final class Engine {
             if (!pipelineId.equals(pipeline)) {
                 throw new IllegalStateException("observation native session was used by another pipeline");
             }
-            if (!current() || originalJob == null || job.getId() != originalJobId) {
+            if (invalid || originalJob == null || job.getId() != originalJobId) {
                 invalid = true;
                 return JobMetrics.of(Map.of());
             }
             if (!attempted) {
                 attempted = true;
                 sampled = job.getMetrics();
+                // The getter already checked its live job. Validate the collection here and the
+                // whole frame at preparation boundaries, without adding RPCs to cached projections.
+                if (!current()) { invalid = true; }
             }
             if (sampled == null) {
                 invalid = true;
                 return JobMetrics.of(Map.of());
             }
-            return current() ? sampled : JobMetrics.of(Map.of());
+            return invalid ? JobMetrics.of(Map.of()) : sampled;
         }
 
         @Override public void close() {

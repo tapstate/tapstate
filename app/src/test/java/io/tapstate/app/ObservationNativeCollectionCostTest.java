@@ -14,6 +14,7 @@ import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.runtime.engine.Engine;
+import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.StateStore;
@@ -50,6 +51,55 @@ class ObservationNativeCollectionCostTest {
     }
 
     @Test
+    void cachedProjectionsAddOnlyBoundedNativeIdentityLookups() {
+        Fixture fixture = new Fixture("orders");
+        int projections = 100;
+        try (Engine.ObservationMetricsSession session = fixture.engine.openObservationMetrics(fixture.pipeline)) {
+            for (int i = 0; i < projections; i++) {
+                assertThat(fixture.engine.recordCount(fixture.pipeline)).hasValue(0);
+            }
+            assertThat(session.current()).isTrue();
+        }
+        assertThat(fixture.collections.get()).isEqualTo(1);
+        assertThat(fixture.jobLookups.get())
+                .as("retain each getter's live lookup plus bounded session boundary checks")
+                .isLessThanOrEqualTo(projections + 4);
+    }
+
+    @Test
+    void assembledPreparationDoesNotIncreaseTotalNativeRequests() {
+        Fixture unshared = new Fixture("orders", false);
+        Fixture shared = new Fixture("orders");
+        assertThat(unshared.publisher.prepare(unshared.pipeline, null)).isPresent();
+        assertThat(shared.publisher.prepare(shared.pipeline, null)).isPresent();
+        assertThat(unshared.collections.get()).isEqualTo(12);
+        assertThat(shared.collections.get()).isEqualTo(1);
+        assertThat(shared.nativeRequests())
+                .as("native API calls: unshared %s, shared %s", unshared.requestCounts(), shared.requestCounts())
+                .isLessThanOrEqualTo(unshared.nativeRequests());
+        System.out.printf("observation-native-api-counts unshared=%s shared=%s%n",
+                unshared.requestCounts(), shared.requestCounts());
+    }
+
+    @Test
+    void identityChangesAfterTheSampleDiscardTheWholePreparedFrame() {
+        Fixture replacement = new Fixture("orders");
+        replacement.onSnapshot.set(() -> replacement.currentJob.set(replacement.job(2)));
+        assertThat(replacement.publisher.prepare(replacement.pipeline, null)).isEmpty();
+        assertThat(replacement.collections.get()).isEqualTo(1);
+
+        Fixture membership = new Fixture("orders");
+        membership.onSnapshot.set(() -> membership.members.set(Set.of()));
+        assertThat(membership.publisher.prepare(membership.pipeline, null)).isEmpty();
+        assertThat(membership.collections.get()).isEqualTo(1);
+
+        Fixture status = new Fixture("orders");
+        status.onSnapshot.set(() -> status.status.set(JobStatus.SUSPENDED));
+        assertThat(status.publisher.prepare(status.pipeline, null)).isEmpty();
+        assertThat(status.collections.get()).isEqualTo(1);
+    }
+
+    @Test
     void replacementJobAndChangedMembersDiscardTheWholePreparedFrame() {
         Fixture replacement = new Fixture("orders");
         replacement.onMetrics.set(() -> replacement.currentJob.set(replacement.job(2)));
@@ -80,6 +130,10 @@ class ObservationNativeCollectionCostTest {
         assertThat(fixture.publisher.prepare(fixture.pipeline, null)).isPresent();
         assertThat(fixture.collections.get()).isEqualTo(2);
         fixture.currentJob.set(null);
+        assertThat(fixture.publisher.prepare(fixture.pipeline, null)).isPresent();
+        assertThat(fixture.collections.get()).isEqualTo(2);
+        fixture.currentJob.set(fixture.job(3));
+        fixture.status.set(JobStatus.FAILED);
         assertThat(fixture.publisher.prepare(fixture.pipeline, null)).isPresent();
         assertThat(fixture.collections.get()).isEqualTo(2);
     }
@@ -137,8 +191,12 @@ class ObservationNativeCollectionCostTest {
     private static final class Fixture {
         private final String pipeline;
         private final AtomicInteger collections = new AtomicInteger();
+        private final AtomicInteger jobLookups = new AtomicInteger();
+        private final AtomicInteger statusReads = new AtomicInteger();
+        private final AtomicInteger configurationReads = new AtomicInteger();
         private final AtomicReference<Job> currentJob = new AtomicReference<>();
         private final AtomicReference<Runnable> onMetrics = new AtomicReference<>(() -> { });
+        private final AtomicReference<Runnable> onSnapshot = new AtomicReference<>(() -> { });
         private final AtomicBoolean rejectMetrics = new AtomicBoolean();
         private final AtomicReference<JobStatus> status = new AtomicReference<>(JobStatus.RUNNING);
         private final AtomicReference<Set<Member>> members = new AtomicReference<>();
@@ -147,10 +205,16 @@ class ObservationNativeCollectionCostTest {
 
         private Job job(long id) {
             return port(Job.class, (method, args) -> switch (method.getName()) {
-                case "getStatus" -> status.get();
+                case "getStatus" -> {
+                    statusReads.incrementAndGet();
+                    yield status.get();
+                }
                 case "getId" -> id;
                 case "getIdString" -> "0000-0000-0000-0001";
-                case "getConfig" -> new JobConfig();
+                case "getConfig" -> {
+                    configurationReads.incrementAndGet();
+                    yield new JobConfig();
+                }
                 case "getMetrics" -> {
                     collections.incrementAndGet();
                     if (rejectMetrics.get()) { throw new IllegalStateException("native collection refused"); }
@@ -162,6 +226,10 @@ class ObservationNativeCollectionCostTest {
         }
 
         private Fixture(String pipeline) {
+            this(pipeline, true);
+        }
+
+        private Fixture(String pipeline, boolean shared) {
             this.pipeline = pipeline;
             currentJob.set(job(1));
             Member local = port(Member.class, (method, args) -> {
@@ -176,7 +244,10 @@ class ObservationNativeCollectionCostTest {
                 throw new AssertionError("unexpected cluster call: " + method.getName());
             });
             JetService jet = port(JetService.class, (method, args) -> {
-                if (method.getName().equals("getJob") && pipeline.equals(args[0])) { return currentJob.get(); }
+                if (method.getName().equals("getJob") && pipeline.equals(args[0])) {
+                    jobLookups.incrementAndGet();
+                    return currentJob.get();
+                }
                 throw new AssertionError("unexpected job lookup: " + method.getName());
             });
             HazelcastInstance member = port(HazelcastInstance.class, (method, args) -> switch (method.getName()) {
@@ -205,12 +276,30 @@ class ObservationNativeCollectionCostTest {
                 default -> throw new AssertionError("unexpected store binding: " + method.getName());
             });
             PipelineCaptureCoordinator captures = port(PipelineCaptureCoordinator.class, (method, args) -> switch (method.getName()) {
-                case "snapshotProgress", "runSnapshotProgress" -> SnapshotReading.NONE;
+                case "snapshotProgress" -> {
+                    onSnapshot.get().run();
+                    yield SnapshotReading.NONE;
+                }
+                case "runSnapshotProgress" -> SnapshotReading.NONE;
                 case "capturedRows" -> CaptureReading.NONE;
                 default -> throw new AssertionError("unexpected capture call: " + method.getName());
             });
             engine = new Engine(member);
-            publisher = new RuntimeConvergenceConfiguration().observationPublisher(stores, engine, captures);
+            publisher = shared ? new RuntimeConvergenceConfiguration().observationPublisher(stores, engine, captures)
+                    : RuntimeConvergenceConfiguration.observationPublisherFor(stores, engine, captures,
+                            id -> new ObservationPublisher.PreparationSession() {
+                                @Override public boolean current() { return true; }
+                                @Override public void close() { }
+                            });
+        }
+
+        private int nativeRequests() {
+            return collections.get() + jobLookups.get() + statusReads.get() + configurationReads.get();
+        }
+
+        private Map<String, Integer> requestCounts() {
+            return Map.of("metrics", collections.get(), "jobLookups", jobLookups.get(), "status", statusReads.get(),
+                    "config", configurationReads.get());
         }
     }
 

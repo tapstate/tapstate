@@ -78,7 +78,9 @@ final class BenchmarkJdiCostObserver {
     enum ArtifactSet {
         LEGACY("0.5.0", Arm.REFERENCE.sha256, Arm.OBSERVABILITY.sha256),
         COMMON_SOURCE("0.6.0", "f7b371f38fd6af3dfdf3ba2aca00612ff313de617cff53b251deb6ae77714635",
-                "023f2cbf0b4ef3e72b4f992312f2d1761c270037babc63dd67e2ec76f197e9d3");
+                "023f2cbf0b4ef3e72b4f992312f2d1761c270037babc63dd67e2ec76f197e9d3"),
+        COMMON_SOURCE_NATIVE_SAMPLE("0.6.0", "f7b371f38fd6af3dfdf3ba2aca00612ff313de617cff53b251deb6ae77714635",
+                "b2b62efd51c0b5acd47495f4957d0e85e75a9d6ae0f2662eee981c8990864945");
 
         final String moduleVersion;
         final String referenceSha;
