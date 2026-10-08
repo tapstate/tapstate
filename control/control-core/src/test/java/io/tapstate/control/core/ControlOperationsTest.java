@@ -60,6 +60,7 @@ class ControlOperationsTest {
                         "pipeline.set-position",
                         "pipeline.derived-schema",
                         "pipeline.accept-derived-schema",
+                        "auth.current-user",
                         "user.create",
                         "user.passwd",
                         "user.list",
@@ -192,7 +193,7 @@ class ControlOperationsTest {
         // Every usable operation remains on CLI. The reveal reservation is the sole exception: its schema
         // and authorizer seam exist, but publishing it on a face would turn a future contract into a
         // callable plaintext feature before the dedicated authorizer exists.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(51);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(52);
         assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
         assertThat(registry.resolve("source.reveal-config").exposure()).isEmpty();

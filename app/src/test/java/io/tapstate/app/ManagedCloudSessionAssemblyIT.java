@@ -153,6 +153,7 @@ class ManagedCloudSessionAssemblyIT {
                 for (ControlledLogin login : ports.logins) {
                     String cookie = exchange(client, login);
                     cookies.put(login.jwtId(), cookie);
+                    assertCurrentUser(client, cookie, login.userId());
                     apply(client, origin(context), cookie, source(login), pipeline(login));
                     artifacts.put(login.sourceId(), attributed(context, client, stored, cookie,
                             login.sourceId(), login.userId()));
@@ -194,6 +195,8 @@ class ManagedCloudSessionAssemblyIT {
                 assertThat(loginRow(stored, ports.userA.jwtId()).getBoolean("revoked")).isTrue();
                 assertThat(status(client, cookieA, ports.userA.sourceId())).isEqualTo(401);
                 assertThat(status(client, cookieB, ports.userB.sourceId())).isEqualTo(200);
+                assertCurrentUserRefused(client, cookieA);
+                assertCurrentUser(client, cookieB, ports.userB.userId());
                 assertLoginRows(context, stored, ports, cookies);
                 ports.assertOnlyTwoLogins();
             }
@@ -204,6 +207,8 @@ class ManagedCloudSessionAssemblyIT {
                 String cookieB = cookies.get(ports.userB.jwtId());
                 assertThat(status(client, cookieA, ports.userA.sourceId())).isEqualTo(401);
                 assertThat(status(client, cookieB, ports.userB.sourceId())).isEqualTo(200);
+                assertCurrentUserRefused(client, cookieA);
+                assertCurrentUser(client, cookieB, ports.userB.userId());
                 for (ControlledLogin login : ports.logins) {
                     for (String id : List.of(login.sourceId(), login.pipelineId())) {
                         assertThat(attributed(restarted, client, stored, cookieB, id, login.userId()))
@@ -222,6 +227,7 @@ class ManagedCloudSessionAssemblyIT {
                         });
                 assertThat(status(client, cookieB, ports.userB.sourceId())).isEqualTo(401);
                 assertThat(status(client, cookieA, ports.userA.sourceId())).isEqualTo(401);
+                assertCurrentUserRefused(client, cookieB);
                 assertThat(loginRow(stored, ports.userB.jwtId()).getBoolean("revoked")).isTrue();
                 assertLoginRows(restarted, stored, ports, cookies);
                 ports.assertOnlyTwoLogins();
@@ -245,6 +251,29 @@ class ManagedCloudSessionAssemblyIT {
 
     private static String origin(ConfigurableApplicationContext context) {
         return "http://127.0.0.1:" + ((WebServerApplicationContext) context).getWebServer().getPort();
+    }
+
+    private static void assertCurrentUser(RestClient client, String cookie, String userId) {
+        Map<?, ?> body = client.get().uri("/api/auth/me").header(HttpHeaders.COOKIE, cookie)
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode().value()).isEqualTo(200);
+                    assertThat(response.getHeaders().getCacheControl()).isEqualTo("no-store");
+                    assertThat(response.getHeaders().get(HttpHeaders.SET_COOKIE)).isNull();
+                    return response.bodyTo(Map.class);
+                });
+        assertThat(body).isEqualTo(Map.of("mode", "cloud", "principal", userId,
+                "scopes", List.of("read", "write")));
+        assertThat(body.toString()).doesNotContain(cookie, TwoUserPorts.STATIC_TOKEN,
+                "jwt", "jti", "password", "email", "displayName");
+    }
+
+    private static void assertCurrentUserRefused(RestClient client, String cookie) {
+        String body = client.get().uri("/api/auth/me").header(HttpHeaders.COOKIE, cookie)
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode().value()).isEqualTo(401);
+                    return response.bodyTo(String.class);
+                });
+        assertThat(body).contains("control.unauthenticated").doesNotContain(cookie);
     }
 
     private static RestClient client(ConfigurableApplicationContext context) {

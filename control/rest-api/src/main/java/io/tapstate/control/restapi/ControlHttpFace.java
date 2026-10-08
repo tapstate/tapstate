@@ -2,6 +2,8 @@ package io.tapstate.control.restapi;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.tapstate.control.core.AuditGate;
+import io.tapstate.control.core.AuthenticationMode;
+import io.tapstate.control.core.CurrentUserQueryService;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.SourceDraft;
 import io.tapstate.control.core.SourceTableView;
@@ -10,6 +12,7 @@ import io.tapstate.control.core.TokenAdminService;
 import io.tapstate.control.core.TokenService;
 import org.springframework.boot.jackson.autoconfigure.JsonMapperBuilderCustomizer;
 import org.springframework.context.annotation.Bean;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Import;
 import tools.jackson.databind.DeserializationFeature;
@@ -41,7 +44,8 @@ import java.util.List;
         PipelineLogsController.class,
         PipelinePositionController.class,
         PipelineStreamConfiguration.class, ClusterController.class, HealthController.class,
-        VersionController.class, AuthController.class, CloudAuthController.class, IssuerDiscoveryController.class, TokenController.class,
+        VersionController.class, AuthController.class, CloudAuthController.class, CurrentUserController.class,
+        IssuerDiscoveryController.class, TokenController.class,
         SourceController.class,
         ConnectorIconController.class,
         PipelineViewController.class,
@@ -50,6 +54,11 @@ import java.util.List;
         DerivedSchemaController.class,
         ApiExceptionHandler.class})
 public class ControlHttpFace {
+
+    @Bean
+    CurrentUserQueryService currentUserQueryService(ObjectProvider<AuthenticationMode> modes) {
+        return new CurrentUserQueryService(modes.getIfAvailable(() -> AuthenticationMode.ON_PREM));
+    }
 
     @Bean
     TokenAdminService tokenAdminService(TokenService tokens, AuditGate auditGate) {

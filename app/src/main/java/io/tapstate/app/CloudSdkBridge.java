@@ -266,7 +266,12 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
                     .activePipelines(runtime.activePipelines())
                     .lastErrorAt(runtime.lastErrorAt() == null ? null : runtime.lastErrorAt().toString());
             try {
-                status.report(clusterId, request, "Bearer " + token);
+                var acknowledgment = status.report(clusterId, request, "Bearer " + token);
+                if (acknowledgment == null || !"ok".equals(acknowledgment.getCode())
+                        || acknowledgment.getData() == null
+                        || !"accepted".equals(acknowledgment.getData().getStatus())) {
+                    throw new ProviderFailure();
+                }
             } catch (ApiException failure) {
                 throw new ProviderFailure();
             }

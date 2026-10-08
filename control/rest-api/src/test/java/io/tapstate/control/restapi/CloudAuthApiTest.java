@@ -5,9 +5,11 @@ import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.CloudLoginIdentity;
 import io.tapstate.control.core.CloudSessionCallbackVerifier;
 import io.tapstate.control.core.CloudSessionService;
+import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.GeneratedSecret;
 import io.tapstate.control.core.Scope;
 import io.tapstate.control.core.TokenSecrets;
+import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.messages.MessageCatalog;
 import io.tapstate.spi.store.CloudSessionIdentity;
@@ -18,6 +20,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.NullAndEmptySource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.support.DefaultListableBeanFactory;
 import org.springframework.http.HttpHeaders;
 import org.springframework.mock.web.MockHttpServletRequest;
@@ -155,13 +159,21 @@ class CloudAuthApiTest {
         assertThat(store.records).isEmpty();
     }
 
-    @Test
-    void aMissingCodeWithAValidHostStillCannotBeExchanged() throws Exception {
+    @ParameterizedTest
+    @NullAndEmptySource
+    @ValueSource(strings = " \t ")
+    void aMissingOrBlankCodeWithAValidHostStillCannotBeExchanged(String code) throws Exception {
         MockMvc mvc = mvc(AuthenticationMode.CLOUD, true, false);
-        mvc.perform(get(CloudAuthController.EXCHANGE_PATH).header(HttpHeaders.HOST, AUDIENCE))
-                .andExpect(status().isBadRequest());
+        var request = get(CloudAuthController.EXCHANGE_PATH).header(HttpHeaders.HOST, AUDIENCE);
+        if (code != null) request.param("code", code);
+        var response = mvc.perform(request).andExpect(status().isBadRequest()).andReturn().getResponse();
+        Object body = JsonReader.parse(response.getContentAsString());
+        assertThat(body).isInstanceOf(Map.class);
+        assertThat(((Map<?, ?>) body).get("code")).isEqualTo(ControlError.MALFORMED_REQUEST.code());
         assertThat(exchanges.get()).isZero();
         assertThat(validations.get()).isZero();
+        assertThat(store.records).isEmpty();
+        assertThat(store.revoked).isEmpty();
     }
 
     @Test

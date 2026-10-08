@@ -275,7 +275,12 @@ public final class ControlOperations {
     public static final Operation PIPELINE_ACCEPT_DERIVED_SCHEMA = new Operation(
             "pipeline.accept-derived-schema", Scope.WRITE, true, null, CLI_ONLY);
 
-    // security domain: all admin-scoped. The mutating ones are audited; the list queries are not.
+    // The HTTP face projects the CLI-staged inventory; the current user read stays off MCP.
+    public static final Operation AUTH_CURRENT_USER = new Operation(
+            "auth.current-user", Scope.READ, false, null,
+            "Read the current verified user's identity and granted scopes without credentials or profile data.",
+            CLI_ONLY);
+    // Administration remains admin-scoped. The mutating operations are audited; list queries are not.
     public static final Operation USER_CREATE = new Operation("user.create", Scope.ADMIN, true, null, CLI_ONLY);
     public static final Operation USER_PASSWD = new Operation("user.passwd", Scope.ADMIN, true, null, CLI_ONLY);
     public static final Operation USER_LIST = new Operation("user.list", Scope.ADMIN, false, null, CLI_ONLY);
@@ -330,6 +335,7 @@ public final class ControlOperations {
             PIPELINE_SET_POSITION,
             PIPELINE_DERIVED_SCHEMA,
             PIPELINE_ACCEPT_DERIVED_SCHEMA,
+            AUTH_CURRENT_USER,
             USER_CREATE,
             USER_PASSWD,
             USER_LIST,

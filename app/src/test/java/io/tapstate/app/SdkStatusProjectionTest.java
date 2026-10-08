@@ -23,6 +23,7 @@ import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -149,6 +150,52 @@ class SdkStatusProjectionTest {
             assertThat(endpoint.requests.getLast().path("nonce").asText())
                     .isEqualTo("recovered-status-nonce");
             assertThat(endpoint.authorizations).allMatch(value -> value.equals("Bearer " + TOKEN));
+            verify(projectionStore, never()).artifacts();
+            verify(projectionStore, never()).catalog();
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"provider-code-sentinel, accepted", "ok, missing-data", "ok, provider-status-sentinel"})
+    void anUnacknowledgedSuccessfulHttpResponseIsSafeAndTheNextReportCanRecover(
+            String code, String acknowledgment) throws Exception {
+        StorePort projectionStore = projectionOnly(seededStorage());
+        try (StatusEndpoint endpoint = new StatusEndpoint()) {
+            Map<String, Object> body = new LinkedHashMap<>(Map.of(
+                    "opId", "status-unacknowledged", "code", code, "msg", "provider-password-sentinel"));
+            if (!acknowledgment.equals("missing-data")) {
+                body.put("data", Map.of("status", acknowledgment, "uri", "provider-uri-sentinel"));
+            }
+            endpoint.response.set(new Response(200, JSON.writeValueAsString(body)));
+            CloudStatusReporter reporter = reporter(projectionStore, Clock.fixed(NOW, ZoneOffset.UTC),
+                    endpoint, new ArrayDeque<>(List.of("unacknowledged-status-nonce", "recovered-status-nonce")));
+
+            assertThatThrownBy(reporter::report)
+                    .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                        assertThat(failure.code()).isEqualTo(BootError.CLOUD_STATUS_SDK_REQUIRED);
+                        assertThat(failure.args()).isEmpty();
+                    })
+                    .hasNoCause()
+                    .hasMessageNotContaining("provider-code-sentinel")
+                    .hasMessageNotContaining("provider-password-sentinel")
+                    .hasMessageNotContaining("provider-uri-sentinel")
+                    .hasMessageNotContaining("provider-status-sentinel")
+                    .hasMessageNotContaining(TOKEN);
+            assertThat(endpoint.requests).hasSize(1);
+            assertThat(endpoint.requests.getFirst().path("nonce").asText())
+                    .isEqualTo("unacknowledged-status-nonce");
+
+            endpoint.response.set(new Response(200, ACCEPTED));
+            reporter.report();
+
+            assertThat(endpoint.requests).hasSize(2);
+            assertThat(endpoint.requests.getLast().path("nonce").asText())
+                    .isEqualTo("recovered-status-nonce");
+            assertThat(endpoint.authorizations).containsExactly("Bearer " + TOKEN, "Bearer " + TOKEN);
+            assertThat(endpoint.methods).containsExactly("POST", "POST");
+            assertThat(endpoint.paths).containsExactly(
+                    "/v1/api/clusters/" + CLUSTER + "/status-report",
+                    "/v1/api/clusters/" + CLUSTER + "/status-report");
             verify(projectionStore, never()).artifacts();
             verify(projectionStore, never()).catalog();
         }

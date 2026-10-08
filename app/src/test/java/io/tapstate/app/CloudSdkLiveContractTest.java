@@ -8,10 +8,18 @@ import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import io.jsonwebtoken.Jwts;
+import io.tapstate.control.core.CloudAuthenticationService;
+import io.tapstate.control.core.CloudLoginIdentity;
 import io.tapstate.control.core.CloudRuntimeStatus;
+import io.tapstate.control.core.CloudSessionService;
+import io.tapstate.control.core.ControlError;
+import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CloudSessionIdentity;
+import io.tapstate.spi.store.CloudSessionStore;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.LoggerFactory;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
@@ -24,16 +32,20 @@ import java.security.KeyPairGenerator;
 import java.security.Signature;
 import java.security.interfaces.RSAPrivateKey;
 import java.security.interfaces.RSAPublicKey;
+import java.time.Clock;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verifyNoInteractions;
 
 /** Runs the real Cloud SDK against the current C1, JWKS, callback, and C2 wire shapes. */
 class CloudSdkLiveContractTest {
@@ -77,6 +89,85 @@ class CloudSdkLiveContractTest {
                             .contains(response.getHeader("X-Request-ID"))
                             .doesNotContain(rawJwt, TOKEN, "atlas.example"));
             assertThat(captured.list).allSatisfy(event -> assertThat(event.getThrowableProxy()).isNull());
+        } finally {
+            logger.detachAppender(captured);
+            captured.stop();
+            server.stop(0);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {401, 503})
+    void jwksHttpFailuresRefuseTrustedIdentityAndSessionsWithoutLeakingProviderPayloads(int status)
+            throws Exception {
+        KeyPair keyPair = rsaKeyPair();
+        AtomicInteger exchanges = new AtomicInteger();
+        AtomicInteger jwksRequests = new AtomicInteger();
+        AtomicReference<Optional<CloudLoginIdentity>> trustedLogin = new AtomicReference<>();
+        String code = "jwks-request-code-secret-sentinel";
+        String providerMessage = "jwks-provider-message-secret-sentinel\nforged-log";
+        String providerUri = "mongodb://provider-user:provider-password-sentinel@provider.example/metadata";
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        String baseUrl = "http://127.0.0.1:" + server.getAddress().getPort();
+        String rawJwt = jwt(keyPair, baseUrl);
+        server.createContext("/v1/api/auth/exchange", exchange -> {
+            exchanges.incrementAndGet();
+            respond(exchange, Map.of("opId", "jwks-failed-exchange", "code", "ok", "msg", "ok",
+                    "data", Map.of("jwt", rawJwt, "expiresAt", "2030-01-01T00:00:00Z", "jti", "jwt-one",
+                            "userEmail", "user@example.test", "orgId", "org-one", "clusterId", CLUSTER)));
+        });
+        server.createContext("/v1/api/jwks.json", exchange -> {
+            jwksRequests.incrementAndGet();
+            respond(exchange, status, Map.of("code", "jwks-provider-code-secret-sentinel",
+                    "msg", providerMessage, "data", Map.of("uri", providerUri, "jwt", rawJwt)));
+        });
+        server.start();
+        Logger logger = (Logger) LoggerFactory.getLogger(CloudSdkBridge.class);
+        ListAppender<ILoggingEvent> captured = new ListAppender<>();
+        captured.start();
+        logger.addAppender(captured);
+        try {
+            CloudProperties properties = new CloudProperties();
+            properties.setBaseUrl(baseUrl);
+            properties.setToken(TOKEN);
+            properties.setAtlasUri("mongodb://user:secret@atlas.example/cluster_meta");
+            properties.setClusterId(CLUSTER);
+            CloudSdkBridge bridge = new CloudSdkBridge(CloudRuntimeSettings.resolve(properties));
+            CloudSessionIdentity deployment = new CloudSessionIdentity(
+                    baseUrl, CloudSdkBridge.DEPLOYMENT_ORGANIZATION, CLUSTER);
+            CloudSessionStore store = mock(CloudSessionStore.class);
+            TokenSecrets secrets = mock(TokenSecrets.class);
+            CloudSessionService sessions = new CloudSessionService(store, deployment, secrets, Clock.systemUTC());
+            CloudAuthenticationService authentication = new CloudAuthenticationService(bridge,
+                    (jwt, identity, audience) -> {
+                        Optional<CloudLoginIdentity> verified = bridge.validate(jwt, identity, audience);
+                        trustedLogin.set(verified);
+                        return verified;
+                    }, sessions);
+
+            assertThatThrownBy(() -> authentication.exchangeCode(code, REQUEST_AUDIENCE))
+                    .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                        assertThat(failure.code()).isEqualTo(ControlError.UNAUTHENTICATED);
+                        assertThat(failure.args()).isEmpty();
+                        assertThat(failure.getSuppressed()).isEmpty();
+                    })
+                    .hasNoCause()
+                    .hasMessageNotContaining(rawJwt)
+                    .hasMessageNotContaining(code)
+                    .hasMessageNotContaining(TOKEN)
+                    .hasMessageNotContaining(providerMessage)
+                    .hasMessageNotContaining(providerUri);
+            assertThat(exchanges.get()).isEqualTo(1);
+            assertThat(jwksRequests.get()).isPositive();
+            assertThat(trustedLogin.get()).isNotNull().isEmpty();
+            verifyNoInteractions(store, secrets);
+            assertThat(captured.list).extracting(ILoggingEvent::getFormattedMessage)
+                    .anySatisfy(message -> assertThat(message).contains("stage=jwt-verification"));
+            assertThat(captured.list).allSatisfy(event -> {
+                assertThat(event.getFormattedMessage()).doesNotContain(rawJwt, code, TOKEN, providerMessage,
+                        providerUri, "provider-password-sentinel", "jwks-provider-code-secret-sentinel", "atlas.example");
+                assertThat(event.getThrowableProxy()).isNull();
+            });
         } finally {
             logger.detachAppender(captured);
             captured.stop();
