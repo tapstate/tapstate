@@ -6,12 +6,14 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import java.util.Map;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Db2 is supported as a source only: a running server installs a pipeline that reads a db2 connection,
- * and refuses, with a code naming the connector, a pipeline that would write into one.
+ * and refuses, with a code naming the connector, a pipeline that would write into one - and an edit that
+ * would move the connection an installed pipeline writes to onto db2.
  *
  * <p>The refusal is the part worth an end-to-end case. Db2's own connector implements writes, and an
  * on-prem deployment otherwise accepts a sync onto any connector the catalog marks sink-capable, so
@@ -74,6 +76,15 @@ class ADb2ConnectionIsReadFromButNeverWrittenToIT {
             config: { host: 10.30.0.9, port: 50000, database: SAMPLE, schema: APP }
             """;
 
+    /** The connection the installed pipeline writes to, re-applied on its own with Db2 underneath. */
+    private static final String MONGO_TARGET_MOVED_TO_DB2 = """
+            version: tapstate/v1
+            kind: source
+            id: tgt_mongo
+            connector: db2
+            config: { host: 10.30.0.9, port: 50000, database: SAMPLE, schema: APP }
+            """;
+
     private static final String WRITE_INTO_DB2 = """
             version: tapstate/v1
             kind: pipeline
@@ -91,7 +102,8 @@ class ADb2ConnectionIsReadFromButNeverWrittenToIT {
 
     @Test
     void aPipelineReadingDb2IsInstalledAndOneWritingIntoDb2IsRefused() {
-        try (ServerHandle server = InProcessServer.start(SharedMongo.replicaSetUrl("e2e_db2_source_only"))) {
+        String database = "e2e_db2_source_only_" + UUID.randomUUID().toString().replace("-", "");
+        try (ServerHandle server = InProcessServer.start(SharedMongo.replicaSetUrl(database))) {
             ControlPlane control = new ControlPlane(server.baseUrl());
             control.bootstrapAndLogin("e2e", "e2e-password");
 
@@ -119,6 +131,22 @@ class ADb2ConnectionIsReadFromButNeverWrittenToIT {
             assertThat(control.artifactIds())
                     .as("what the server holds after refusing the batch")
                     .doesNotContain("orders_into_db2", "tgt_db2", "src_orders");
+
+            String installedTarget = control.contentHash("tgt_mongo");
+            ControlPlane.Refusal moved = control.applyExpectingRefusal(Map.of(
+                    "tgt_mongo.tap.yml", MONGO_TARGET_MOVED_TO_DB2));
+
+            assertThat(moved.code())
+                    .as("the code refusing an edit that would leave an installed sync writing into db2")
+                    .isEqualTo(UNSUPPORTED_TARGET_CONNECTOR);
+            assertThat(moved.params())
+                    .as("the pipeline that would write into it is named, not only the connection")
+                    .containsEntry("connector", "db2")
+                    .containsEntry("source", "tgt_mongo")
+                    .containsEntry("resource", "orders_from_db2");
+            assertThat(control.contentHash("tgt_mongo"))
+                    .as("the connection the installed pipeline writes to, after the refused edit")
+                    .isEqualTo(installedTarget);
         }
     }
 }
