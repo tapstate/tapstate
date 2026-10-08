@@ -22,16 +22,16 @@ final class InMemoryStateStore implements StateStore {
     private final Map<String, CheckpointDoc> docs = new HashMap<>();
     private final Set<String> failing = new HashSet<>();
 
-    void failFor(String pipelineId) {
+    synchronized void failFor(String pipelineId) {
         failing.add(pipelineId);
     }
 
-    void recover(String pipelineId) {
+    synchronized void recover(String pipelineId) {
         failing.remove(pipelineId);
     }
 
     @Override
-    public Optional<CheckpointDoc> read(String pipelineId) {
+    public synchronized Optional<CheckpointDoc> read(String pipelineId) {
         if (failing.contains(pipelineId)) {
             throw new IllegalStateException("state read failed for " + pipelineId);
         }
@@ -39,17 +39,17 @@ final class InMemoryStateStore implements StateStore {
     }
 
     @Override
-    public void create(String pipelineId, String stateJson, Instant touchTime) {
+    public synchronized void create(String pipelineId, String stateJson, Instant touchTime) {
         docs.put(pipelineId, CheckpointDoc.initial(pipelineId, stateJson, touchTime));
     }
 
     @Override
-    public void delete(String pipelineId) {
+    public synchronized void delete(String pipelineId) {
         docs.remove(pipelineId);
     }
 
     @Override
-    public CasOutcome compareAndSwap(String pipelineId, long expectedEpoch, String nextStateJson, Instant touchTime) {
+    public synchronized CasOutcome compareAndSwap(String pipelineId, long expectedEpoch, String nextStateJson, Instant touchTime) {
         CasOutcome outcome = EpochCas.swap(docs.get(pipelineId), expectedEpoch, nextStateJson, touchTime);
         if (outcome instanceof CasOutcome.Applied applied) {
             docs.put(pipelineId, applied.next());
