@@ -25,9 +25,12 @@ Db2 is accepted as a source-only **unverified preview**, outside the certified t
 release lane reads a live Db2 database, and Db2 reads have not yet been verified against one.
 Db2 is supported as a source only. Its connector can write, but its catalog row is not
 sink-capable, so a `serve.sync` naming a `db2` connection is refused on-prem as well as in
-the cloud profile. Change capture uses the connector's raw log server mode, which needs a Db2
-log reader service reachable from the runtime and `DATA CAPTURE CHANGES` on each captured
-table; the published jar does not support the native log reader mode.
+the cloud profile. Change capture needs archive logging on the database and
+`DATA CAPTURE CHANGES` on each captured table. With `useNativeMiner: true` the connector reads
+the log in-process; that needs the server on Linux x86_64, running as root at least for the
+first Db2 connection, and the IBM Db2 runtime client prepared once on that host with
+`db2-native-runtime-setup.sh` from the same release. Otherwise it reads from a raw log server
+at `rawLogServerHost` and `rawLogServerPort`.
 
 Reads are verified on Oracle Free 23 and SQL Server 2022, and across MySQL, PostgreSQL and
 MongoDB, with snapshot and CDC inserts, updates and deletes.

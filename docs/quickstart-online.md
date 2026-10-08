@@ -59,11 +59,15 @@ release lane reads a live Db2 database, and Db2 reads have not yet been verified
 Db2 is supported as a source only. Its connector can write, but its catalog row is not
 sink-capable, so a `serve.sync` naming a `db2` connection is refused on-prem as well as in
 the cloud profile, and no authoring surface offers it as a target. Db2 LUW reads take a
-snapshot and then capture changes through the connector's raw log server mode: a Db2 log
-reader service reachable from the runtime at the configured `rawLogServerHost` and
-`rawLogServerPort`, with `DATA CAPTURE CHANGES` enabled on each captured table. The published
-jar does not carry the runtime the connector's native log reader mode needs, so that mode is
-not supported.
+snapshot and then capture changes; the database needs archive logging, and each captured
+table `DATA CAPTURE CHANGES`. Change capture has two modes. With `useNativeMiner: true` the
+connector reads the log in-process through IBM's db2ReadLog API. That needs the server on
+Linux x86_64, running as root at least for the first Db2 connection, and the IBM Db2 runtime
+client prepared once on that host with `db2-native-runtime-setup.sh` from the same release:
+the published jar carries the native bridge but not the runtime archive it loads. The
+published server image runs as a non-root user and is not prepared for this mode. Without
+`useNativeMiner`, the connector reads changes from a raw log server at the configured
+`rawLogServerHost` and `rawLogServerPort`.
 
 Reads are verified on Oracle Free 23 and SQL Server 2022, and across MySQL, PostgreSQL
 and MongoDB, with snapshot and CDC inserts, updates and deletes. Decimal validation includes a persisted MySQL DECIMAL(18,4) model, large values,
