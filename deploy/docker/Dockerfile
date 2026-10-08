@@ -114,7 +114,7 @@ ENV TAPSTATE_CONNECTORS_SEED_DIR=/opt/tapstate/connectors
 RUN set -eu; \
     cd /opt/tapstate/connectors; \
     sha256sum -c /opt/tapstate/release/connectors.sha256; \
-    test "$(find . -maxdepth 1 -type f -name '*-connector.jar' | wc -l | tr -d ' ')" = 7
+    test "$(find . -maxdepth 1 -type f -name '*-connector.jar' | wc -l | tr -d ' ')" = 8
 
 # Keep the standard image as the default target and preserve its on-prem connector lifecycle.
 FROM runtime-base AS server

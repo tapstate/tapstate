@@ -566,7 +566,7 @@ jobs:
           if-no-files-found: error
 
   cloud-image:
-    # The image is built and verified before approval, without pushing it. Its seven connector
+    # The image is built and verified before approval, without pushing it. Its locked connector
     # bytes and companion license texts must match the versioned lock in this release commit.
     needs: [version, cloud-server-jar, server-image]
     runs-on: ubuntu-latest

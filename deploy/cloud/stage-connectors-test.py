@@ -134,7 +134,7 @@ class StageConnectorsTest(unittest.TestCase):
             return SimpleNamespace(returncode=0)
         with patch.object(PREPARE.subprocess, "run", side_effect=response) as downloaded:
             PREPARE.prepare(self.lock, self.staged)
-        self.assertEqual(downloaded.call_count, 9)
+        self.assertEqual(downloaded.call_count, 10)
         self.assertEqual((self.staged / "release/connectors.lock.json").read_bytes(), self.lock.read_bytes())
 
     def test_tampered_public_test_input_fails_without_producing_output(self) -> None:
@@ -253,7 +253,7 @@ class StageConnectorsTest(unittest.TestCase):
         )
         self.assertEqual((self.staged / "release/connectors.lock.json").read_bytes(), self.lock.read_bytes())
         lines = (self.staged / "release/connectors.sha256").read_text(encoding="ascii").splitlines()
-        self.assertEqual(len(lines), 7)
+        self.assertEqual(len(lines), 8)
         for entry in self.entries:
             self.assertIn(f"{entry['sha256']}  {entry['id']}-connector.jar", lines)
         for entry in self.license_files:
@@ -306,6 +306,7 @@ class StageConnectorsTest(unittest.TestCase):
         self.make_jar("mongodb", spec_path="spec.json")
         self.make_jar("oracle", spec_path="spec_oracle.json")
         self.make_jar("postgres", spec_path="spec_postgres.json")
+        self.make_jar("db2", spec_path="spec_db2.json")
         self.write_lock()
         MODULE.stage(self.lock, self.jars, self.staged)
         self.assertTrue((self.staged / "connectors/oracle-connector.jar").is_file())

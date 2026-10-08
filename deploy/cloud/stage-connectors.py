@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify a seven-connector release lock and stage immutable Cloud image inputs.
+"""Verify the complete connector release lock and stage immutable Cloud image inputs.
 
 The lock is supplied by the release process after publication and license review.
 This script does not download, approve, or publish connector artifacts.
@@ -22,7 +22,7 @@ from typing import Any
 
 
 REQUIRED_IDS = (
-    "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql"
+    "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2"
 )
 REQUIRED_LICENSE_FILES = ("MICROSOFT-MIT-LICENSE.txt", "ORACLE-FREE-USE-TERMS.txt")
 ENTRY_KEYS = {"id", "bytes", "sha256", "upstreamRevision", "pdkApiVersion", "specPath"}
@@ -57,7 +57,7 @@ def read_lock(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         raise StageError("connector lock schemaVersion must be 2")
     entries = lock["connectors"]
     if not isinstance(entries, list) or len(entries) != len(REQUIRED_IDS):
-        raise StageError("connector lock must contain exactly seven entries")
+        raise StageError("connector lock must contain exactly eight entries")
     ids = []
     for entry in entries:
         if not isinstance(entry, dict) or set(entry) != ENTRY_KEYS:
@@ -238,7 +238,7 @@ def main() -> int:
     except StageError as exc:
         print(f"cloud connector staging refused: {exc}", file=sys.stderr)
         return 1
-    print(f"staged seven locked connectors in {args.stage_dir}")
+    print(f"staged eight locked connectors in {args.stage_dir}")
     return 0
 
 

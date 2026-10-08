@@ -128,7 +128,7 @@ def verify_platform(layout: Path, descriptor: dict[str, Any], platform: str,
     expected_jar_paths = {f"opt/tapstate/connectors/{entry['id']}-connector.jar" for entry in entries}
     actual_jar_paths = {path for path in files if path.startswith("opt/tapstate/connectors/")}
     if actual_jar_paths != expected_jar_paths:
-        raise ImageError(f"{platform} connector seed differs from the seven locked IDs")
+        raise ImageError(f"{platform} connector seed differs from the eight locked IDs")
     expected_release_paths = {
         "opt/tapstate/release/connectors.lock.json",
         "opt/tapstate/release/connectors.sha256",

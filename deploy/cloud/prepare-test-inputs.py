@@ -60,7 +60,7 @@ def main() -> int:
     except STAGE.StageError as failure:
         print(f"Cloud test inputs refused: {failure}", file=sys.stderr)
         return 1
-    print(f"Prepared seven verified public connectors in {args.output}")
+    print(f"Prepared eight verified public connector inputs in {args.output}")
     return 0
 
 

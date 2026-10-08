@@ -30,7 +30,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @RequiresDocker
 class CloudConnectorSeedReadinessIT {
     private static final Set<String> IDS = Set.of(
-            "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql");
+            "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2");
 
     @Container
     private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
@@ -38,7 +38,7 @@ class CloudConnectorSeedReadinessIT {
     @TempDir Path work;
 
     @Test
-    void allSevenRealArtifactsRegisterBeforeReadyAndRemainIdempotentAcrossRestart() {
+    void allLockedRealArtifactsRegisterBeforeReadyAndRemainIdempotentAcrossRestart() {
         Path seeds = CloudConnectorTestInputs.seedDirectory();
         String uri = database("complete");
         var ready = new AtomicInteger();
@@ -67,7 +67,7 @@ class CloudConnectorSeedReadinessIT {
     }
 
     @Test
-    void aCorruptCloudJarRefusesReadyWithoutWeakeningTheOtherSixInputs() throws Exception {
+    void aCorruptCloudJarRefusesReadyWithoutWeakeningTheOtherLockedInputs() throws Exception {
         Path seeds = copyRelease();
         Path atlas = seeds.resolve("mongodb-atlas-connector.jar");
         // Break only the owned hard link, then create the damaged file. Never modify the shared input.

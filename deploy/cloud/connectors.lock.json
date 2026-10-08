@@ -56,6 +56,14 @@
       "upstreamRevision": "cc13816bf624b4b8974bd4c3aa5a0ff34bce013d",
       "pdkApiVersion": "2.0.5-SNAPSHOT",
       "specPath": "aws-rds-mysql-spec.json"
+    },
+    {
+      "id": "db2",
+      "bytes": 32784188,
+      "sha256": "e00ec44e5c8711d90bea6419edf8107ef14ac873bf2838d699333f989ebbf181",
+      "upstreamRevision": "a73cd39e276d3209dec6b641e1a6d967952629f5",
+      "pdkApiVersion": "2.0.5-SNAPSHOT",
+      "specPath": "spec_db2.json"
     }
   ],
   "licenseFiles": [
