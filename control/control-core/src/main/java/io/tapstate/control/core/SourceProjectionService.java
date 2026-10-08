@@ -48,6 +48,7 @@ public final class SourceProjectionService {
     /** Maps structured input, plans the full artifact workspace, then creates the Source conditionally. */
     public SourceView create(String principal, SourceInput input) {
         Objects.requireNonNull(input, "input");
+        refuseStoreMarker(input.metadata());
         SourceResource source = representation.toModel(input, null);
         ArtifactWriteResult result = apply.create(principal, source, ControlOperations.SOURCE_CREATE);
         throwForWriteRefusal(source.id(), result.write());
@@ -59,8 +60,11 @@ public final class SourceProjectionService {
         Objects.requireNonNull(id, "id");
         Objects.requireNonNull(input, "input");
         requireMatchingId(id, input.id());
+        refuseStoreMarker(input.metadata());
         requirePrecondition(id, expectedContentHash);
-        SourceResource replacement = representation.toModel(input, source(requireSource(id).resource()));
+        SourceResource previous = source(requireSource(id).resource());
+        refuseStoreMarker(previous.metadata());
+        SourceResource replacement = representation.toModel(input, previous);
         ArtifactWriteResult result = apply.replace(
                 principal, replacement, expectedContentHash, ControlOperations.SOURCE_UPDATE);
         throwForWriteRefusal(id, result.write());
@@ -71,7 +75,7 @@ public final class SourceProjectionService {
     public void delete(String principal, String id, String expectedContentHash) {
         Objects.requireNonNull(id, "id");
         requirePrecondition(id, expectedContentHash);
-        requireSource(id);
+        refuseStoreMarker(source(requireSource(id).resource()).metadata());
         try {
             mutations.delete(principal, id, expectedContentHash);
         } catch (TapstateException error) {
@@ -143,5 +147,12 @@ public final class SourceProjectionService {
 
     private static TapstateException error(SourceError code, Map<String, Object> args) {
         return new TapstateException(code, args, null);
+    }
+
+    private static void refuseStoreMarker(io.tapstate.core.model.Metadata metadata) {
+        if (metadata != null && "true".equals(metadata.labels().get("store"))) {
+            throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                    Map.of("reason", "the state store must be configured through its dedicated setup API"), null);
+        }
     }
 }

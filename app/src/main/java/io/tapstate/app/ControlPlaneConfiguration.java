@@ -55,18 +55,23 @@ import io.tapstate.control.core.PipelinePositionService;
 import io.tapstate.control.core.PipelineProjectionService;
 import io.tapstate.control.core.PipelineRepresentation;
 import io.tapstate.control.core.PipelineViewService;
+import io.tapstate.control.core.ViewCatalogService;
+import io.tapstate.control.core.SampleSourceService;
+import io.tapstate.control.core.StateStoreSetupService;
 import io.tapstate.control.core.SchemaDiscoveryService;
 import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.ResourceAttributionPolicy;
 import io.tapstate.control.core.StateDatabasePolicy;
 import io.tapstate.control.core.DataBrowserFollows;
 import io.tapstate.control.core.DerivedSchemas;
+import io.tapstate.control.core.DeploymentProfile;
 import io.tapstate.control.core.SourceConnectionResolver;
 import io.tapstate.control.core.SchemaDerivation;
 import io.tapstate.control.core.SourceDraftService;
 import io.tapstate.control.core.SourceConfigRevealAuthorizer;
 import io.tapstate.control.core.SourceConfigRevealService;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Value;
 import io.tapstate.control.core.SourceRepresentation;
 import io.tapstate.control.core.SourceSchemaQueryService;
 import io.tapstate.control.core.SessionService;
@@ -537,7 +542,7 @@ class ControlPlaneConfiguration {
         // removes is a seam where a later change to that marking would silently not apply here.
         return new ViewStoreSeedRunner(
                 artifactStore, cloud.metadataUri(mongoProperties.getUri()), mongoProperties.getTlsCaFile(),
-                cloud.viewsDatabase(ViewTargetResolver.STATE_STORE_SOURCE_ID), cloud.cloud());
+                cloud.viewsDatabase(ViewTargetResolver.STATE_STORE_SOURCE_ID), cloud.cloud(), !cloud.cloud());
     }
 
     @Bean
@@ -774,6 +779,22 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
+    SampleSourceService sampleSourceService(SourceProjectionService sources, SchemaDiscoveryService discovery,
+            ConnectionTestService connections, ConnectorCatalogView connectors,
+            @Value("${tapstate.sample.host:113.98.206.139}") String host,
+            @Value("${tapstate.sample.password:}") String password) {
+        return new SampleSourceService(sources, discovery, connections, connectors, host, password);
+    }
+
+    @Bean
+    StateStoreSetupService stateStoreSetupService(ApplyService apply, ArtifactQueryService artifacts,
+            SourceRepresentation representation, ConnectionTestService connections,
+            @Value("${tapstate.deployment.profile:on-prem}") String deploymentProfile) {
+        return new StateStoreSetupService(apply, artifacts, representation,
+                DeploymentProfile.parse(deploymentProfile), connections);
+    }
+
+    @Bean
     PipelineRepresentation pipelineRepresentation() {
         return new PipelineRepresentation();
     }
@@ -784,6 +805,13 @@ class ControlPlaneConfiguration {
             PipelineRepresentation representation,
             PipelineObservationQueryService observations) {
         return new PipelineViewService(artifactQueryService, representation, observations);
+    }
+
+    @Bean
+    ViewCatalogService viewCatalogService(ArtifactQueryService artifacts,
+            PipelineObservationQueryService observations, DataBrowserService browser,
+            SourceSchemaQueryService schemas) {
+        return new ViewCatalogService(artifacts, observations, browser, schemas);
     }
 
     @Bean

@@ -13,6 +13,7 @@ import java.util.regex.Pattern;
 final class SourceReadProjection {
 
     static final String WITHHELD = "<redacted-source>";
+    static final String REDACTED = MongoUriUserInfo.REDACTED;
 
     private static final Pattern MONGO_URI =
             Pattern.compile("(?i)mongodb(?:\\+srv)?://[^\\s\\\"]+");
@@ -80,4 +81,14 @@ final class SourceReadProjection {
         }
         return false;
     }
+    public static String redactUserInfo(String uri) {
+        Objects.requireNonNull(uri, "uri");
+        return MongoUriUserInfo.redact(uri);
+    }
+
+    static boolean isRedactedUri(String uri) {
+        Objects.requireNonNull(uri, "uri");
+        return MongoUriUserInfo.isRedactedDisplay(uri);
+    }
+
 }

@@ -106,13 +106,11 @@ public final class SourceRepresentation {
         Map<String, ConfigField> secrets = secretFields(connector(source.connector()));
         Map<String, Object> redactedConfig = new LinkedHashMap<>(source.config());
         secrets.keySet().forEach(redactedConfig::remove);
-        if (isMongoConnector(source.connector())) {
-            Object uri = redactedConfig.get("uri");
-            if (uri instanceof String value) {
-                redactedConfig.put("uri", MongoUriUserInfo.redact(value));
-            } else if (uri != null) {
-                redactedConfig.put("uri", MongoUriUserInfo.REDACTED);
-            }
+        Object uri = redactedConfig.get("uri");
+        if (uri instanceof String value) {
+            redactedConfig.put("uri", MongoUriUserInfo.redact(value));
+        } else if (isMongoConnector(source.connector()) && uri != null) {
+            redactedConfig.put("uri", MongoUriUserInfo.REDACTED);
         }
         List<String> configuredSecrets = secrets.keySet().stream()
                 .filter(name -> source.config().containsKey(name)

@@ -308,7 +308,7 @@ public final class DataBrowserService {
      * here is therefore a decision somebody makes and a reviewer sees, which is the same shape the
      * synchronised-operation set takes and for the same reason.
      */
-    private static final Set<String> BROWSABLE_CONNECTORS = Set.of("mongodb");
+    private static final Set<String> BROWSABLE_CONNECTORS = Set.of("mongodb", "mongodb-atlas");
 
     /**
      * Refuses a row read against a connector this face cannot ask in, before anything is sent.

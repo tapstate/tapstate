@@ -1,5 +1,6 @@
 package io.tapstate.control.core;
 
+import io.tapstate.spi.store.CloudSessionContext;
 import io.tapstate.spi.store.CloudSessionIdentity;
 import io.tapstate.spi.store.CloudSessionRecord;
 import io.tapstate.spi.store.CloudSessionStore;
@@ -49,6 +50,10 @@ public final class CloudSessionService {
 
     /** Creates one cookie only from a verified, still-in-window proof for this exact deployment. */
     public Optional<CreatedCloudSession> create(CloudLoginIdentity login) {
+        return create(login, null);
+    }
+
+    public Optional<CreatedCloudSession> create(CloudLoginIdentity login, CloudSessionContext clusterContext) {
         Objects.requireNonNull(login, "login");
         var now = clock.instant();
         if (!identity.equals(login.deployment())) {
@@ -63,10 +68,15 @@ public final class CloudSessionService {
             observer.sessionRejected(CloudAuthenticationObserver.SessionRejection.ADMIN_SCOPE);
             return Optional.empty();
         }
+        if (clusterContext != null && (!Objects.equals(clusterContext.organizationId(), login.organizationId())
+                || !Objects.equals(clusterContext.clusterId(), login.clusterId())
+                || !identity.clusterId().equals(clusterContext.clusterId()))) {
+            return Optional.empty();
+        }
         GeneratedSecret secret = secrets.generate();
         var expires = now.plus(IDLE_TTL);
         CloudSessionRecord record = new CloudSessionRecord(identity, login.jwtId(), secret.secretHash(),
-                login.userId(), login.scope().name(), false, now, now, expires);
+                login.userId(), login.scope().name(), false, now, now, expires, clusterContext);
         if (!sessions.create(record)) {
             observer.sessionRejected(CloudAuthenticationObserver.SessionRejection.DUPLICATE_OR_REVOKED_JTI);
             return Optional.empty();
@@ -78,10 +88,18 @@ public final class CloudSessionService {
 
     /** Every successful local authentication refreshes idle expiry, without consulting Cloud or the JWT. */
     public Optional<VerifiedToken> authenticate(String cookie) {
+        return authenticatedRecord(cookie).map(record -> new VerifiedToken(record.userId(), scopeOf(record.scope())));
+    }
+
+    public Optional<CloudSessionContext> clusterContext(String cookie) {
+        return authenticatedRecord(cookie).map(CloudSessionRecord::clusterContext).filter(Objects::nonNull);
+    }
+
+    private Optional<CloudSessionRecord> authenticatedRecord(String cookie) {
         return parse(cookie).flatMap(parsed -> {
             var now = clock.instant();
             return sessions.authenticate(identity, parsed.jwtId(), secrets.hash(parsed.secret()),
-                    now, now.plus(IDLE_TTL)).map(record -> new VerifiedToken(record.userId(), scopeOf(record.scope())));
+                    now, now.plus(IDLE_TTL));
         });
     }
 

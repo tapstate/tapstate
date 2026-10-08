@@ -1,6 +1,7 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.CloudSessionContext;
 import io.tapstate.spi.store.CloudSessionIdentity;
 
 import java.util.Map;
@@ -38,19 +39,30 @@ public final class CloudAuthenticationService {
                     Map.of("reason", "a request audience is required"), null);
         }
         observer.entering(CloudAuthenticationObserver.Stage.CODE_EXCHANGE);
-        String jwt = exchanger.exchange(code, sessions.identity().clusterId());
+        CloudCodeExchangeResult exchanged = exchanger.exchangeWithContext(code, sessions.identity().clusterId());
+        String jwt = exchanged == null ? null : exchanged.jwt();
         if (jwt == null || jwt.isBlank()) {
             throw unavailable();
         }
         observer.entering(CloudAuthenticationObserver.Stage.JWT_VERIFICATION);
         CloudLoginIdentity login = validator.validate(jwt, sessions.identity(), expectedAudience)
                 .orElseThrow(CloudAuthenticationService::unauthenticated);
+        CloudSessionContext context = exchanged.context();
+        if (context != null && (!Objects.equals(context.organizationId(), login.organizationId())
+                || !Objects.equals(context.clusterId(), login.clusterId())
+                || !sessions.identity().clusterId().equals(context.clusterId()))) {
+            throw unauthenticated();
+        }
         observer.entering(CloudAuthenticationObserver.Stage.SESSION_CREATE);
-        return sessions.create(login).orElseThrow(CloudAuthenticationService::unauthenticated);
+        return sessions.create(login, context).orElseThrow(CloudAuthenticationService::unauthenticated);
     }
 
     public Optional<VerifiedToken> authenticate(String cookie) {
         return sessions.authenticate(cookie);
+    }
+
+    public Optional<CloudSessionContext> clusterContext(String cookie) {
+        return sessions.clusterContext(cookie);
     }
 
     public boolean logout(String cookie) {

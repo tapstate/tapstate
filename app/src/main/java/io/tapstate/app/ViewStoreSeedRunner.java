@@ -53,23 +53,35 @@ final class ViewStoreSeedRunner implements SmartInitializingSingleton {
     private final String tlsCaFile;
     private final String viewsDatabase;
     private final boolean cloud;
+    private final boolean enabled;
 
     ViewStoreSeedRunner(ArtifactStore artifacts, String serverStoreUri, String tlsCaFile) {
-        this(artifacts, serverStoreUri, tlsCaFile, ViewTargetResolver.STATE_STORE_SOURCE_ID);
+        this(artifacts, serverStoreUri, tlsCaFile, ViewTargetResolver.STATE_STORE_SOURCE_ID, false, true);
+    }
+
+    ViewStoreSeedRunner(ArtifactStore artifacts, String serverStoreUri, String tlsCaFile, boolean enabled) {
+        this(artifacts, serverStoreUri, tlsCaFile, ViewTargetResolver.STATE_STORE_SOURCE_ID, false, enabled);
     }
 
     ViewStoreSeedRunner(
             ArtifactStore artifacts, String serverStoreUri, String tlsCaFile, String viewsDatabase) {
-        this(artifacts, serverStoreUri, tlsCaFile, viewsDatabase, false);
+        this(artifacts, serverStoreUri, tlsCaFile, viewsDatabase, false, true);
     }
 
     ViewStoreSeedRunner(
             ArtifactStore artifacts, String serverStoreUri, String tlsCaFile, String viewsDatabase, boolean cloud) {
+        this(artifacts, serverStoreUri, tlsCaFile, viewsDatabase, cloud, true);
+    }
+
+    ViewStoreSeedRunner(
+            ArtifactStore artifacts, String serverStoreUri, String tlsCaFile,
+            String viewsDatabase, boolean cloud, boolean enabled) {
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.serverStoreUri = Objects.requireNonNull(serverStoreUri, "serverStoreUri");
         this.tlsCaFile = tlsCaFile;
         this.viewsDatabase = Objects.requireNonNull(viewsDatabase, "viewsDatabase");
         this.cloud = cloud;
+        this.enabled = enabled;
     }
 
     @Override
@@ -78,6 +90,7 @@ final class ViewStoreSeedRunner implements SmartInitializingSingleton {
     }
 
     void seed() {
+        if (!enabled) return;
         String id = ViewTargetResolver.STATE_STORE_SOURCE_ID;
         if (trustCannotTravelInTheUri()) {
             // Seeding anyway would register a connection that can never be made: the connector would
