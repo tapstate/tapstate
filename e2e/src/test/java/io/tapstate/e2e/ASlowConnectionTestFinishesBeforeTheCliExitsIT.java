@@ -11,12 +11,13 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
-import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -42,7 +43,9 @@ class ASlowConnectionTestFinishesBeforeTheCliExitsIT {
                 """;
         CountDownLatch completed = new CountDownLatch(1);
         AtomicInteger tests = new AtomicInteger();
+        AtomicLong completionNanos = new AtomicLong();
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        var connectorCompletion = Executors.newSingleThreadScheduledExecutor();
         server.setExecutor(command -> Thread.ofVirtual().start(command));
         server.createContext("/healthz", exchange -> reply(exchange, "{}"));
         server.createContext("/version", exchange -> reply(exchange, "{\"version\":null}"));
@@ -58,23 +61,21 @@ class ASlowConnectionTestFinishesBeforeTheCliExitsIT {
         server.createContext("/api/connections:test", exchange -> {
             exchange.getRequestBody().readAllBytes();
             tests.incrementAndGet();
-            try {
-                Thread.sleep(Duration.ofSeconds(32));
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-                exchange.close();
-                return;
-            }
-            completed.countDown();
-            try {
-                reply(exchange, """
-                        {"connectionId":"slow-db2","connectorId":"db2","outcome":"PASSED",
-                         "checks":[],"testedAt":1752000000000}
-                        """);
-            } catch (IOException clientGone) {
-                // A reverted client deadline can close the socket before the connector finishes.
-                exchange.close();
-            }
+            long started = System.nanoTime();
+            // Schedule an observable connector completion beyond the former client deadline.
+            connectorCompletion.schedule(() -> {
+                completionNanos.set(System.nanoTime() - started);
+                completed.countDown();
+                try {
+                    reply(exchange, """
+                            {"connectionId":"slow-db2","connectorId":"db2","outcome":"PASSED",
+                             "checks":[],"testedAt":1752000000000}
+                            """);
+                } catch (IOException clientGone) {
+                    // A reverted client deadline can close the socket before the connector finishes.
+                    exchange.close();
+                }
+            }, 32, TimeUnit.SECONDS);
         });
         server.start();
         try {
@@ -85,11 +86,14 @@ class ASlowConnectionTestFinishesBeforeTheCliExitsIT {
                     .as("the connector must have finished before assessing the CLI status; stdout:%n%s%nstderr:%n%s",
                             run.stdout(), run.stderr())
                     .isTrue();
+            assertThat(completionNanos.get()).as("the connector must finish after the old client deadline")
+                    .isGreaterThan(TimeUnit.SECONDS.toNanos(30));
             assertThat(tests.get()).as("the CLI must issue the operation exactly once").isEqualTo(1);
             assertThat(run.exitCode()).as("stdout:%n%s%nstderr:%n%s", run.stdout(), run.stderr()).isZero();
             assertThat(run.stdout()).contains("PASSED").contains("slow-db2");
             assertThat(run.stderr()).doesNotContain("cli.request-timed-out");
         } finally {
+            connectorCompletion.shutdownNow();
             server.stop(0);
         }
     }
