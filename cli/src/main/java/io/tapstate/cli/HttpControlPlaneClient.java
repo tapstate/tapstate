@@ -25,12 +25,9 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
@@ -39,7 +36,7 @@ import java.util.function.Supplier;
 /**
  * The production {@link ControlPlaneClient}, backed by the JDK HTTP client (no third-party
  * dependency, so rule R6 holds and the native image needs no extra metadata). Probes and calls are
- * given a short connect and request timeout so an unreachable seed fails fast, and every failure mode —
+ * given a short connect timeout so an unreachable seed fails fast, and every failure mode —
  * connection refused, timeout, unknown host, or a malformed / unsupported base URL — resolves to a
  * "not healthy" / "unreachable" result rather than throwing, so the caller can walk the seed list and
  * render outcomes without try/catch.
@@ -50,35 +47,40 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
      * The probe / connect budget: short enough that an unreachable seed does not stall the connect walk,
      * and the read budget for the light verbs, whose work is a lookup the server answers at once.
      */
-    static final Duration PROBE_TIMEOUT = Duration.ofSeconds(3);
+    static final Duration PROBE_TIMEOUT = HttpControlClient.DEFAULT_LIGHT_TIMEOUT;
 
     /**
-     * The read budget for the heavy verbs — {@code connections:test} and {@code discover-schema} drive a
-     * live round-trip to a remote database, and {@code connectors:register} uploads a multi-MB jar the
-     * server then class-loads. The flat probe budget starved them; register scales further with size (see
-     * {@link #registerTimeout(int)}). A slow answer within this window means "busy", not "unreachable".
+     * The read budget for bounded heavy requests. Connector uploads scale further with size (see
+     * {@link #registerTimeout(int)}); live database operations wait for the server to finish instead.
      */
-    static final Duration HEAVY_TIMEOUT = Duration.ofSeconds(30);
+    static final Duration HEAVY_TIMEOUT = HttpControlClient.DEFAULT_HEAVY_TIMEOUT;
 
     /** A conservative floor upload rate (~1 MB/s); below it even a healthy server is presumed too slow. */
     private static final long REGISTER_FLOOR_BYTES_PER_SECOND = 1_000_000;
 
     private final Duration probeTimeout;
     private final Duration heavyTimeout;
+    private final RequestBudget connectionBudget;
     private HttpClient httpClient;
     private final HttpControlClient sharedClient;
 
     HttpControlPlaneClient() {
-        this(PROBE_TIMEOUT, HEAVY_TIMEOUT);
+        this(PROBE_TIMEOUT, HEAVY_TIMEOUT, RequestBudget.CONNECTION);
     }
 
     /**
      * A seam for tests to shrink the budgets so a deliberately slow server trips the timeout path in
-     * milliseconds rather than the production tens of seconds. Production always uses the no-arg form.
+     * milliseconds. This explicitly bounds live connection requests too; production uses the no-arg
+     * form, which waits for the server's connection work to finish.
      */
     HttpControlPlaneClient(Duration probeTimeout, Duration heavyTimeout) {
+        this(probeTimeout, heavyTimeout, RequestBudget.HEAVY);
+    }
+
+    private HttpControlPlaneClient(Duration probeTimeout, Duration heavyTimeout, RequestBudget connectionBudget) {
         this.probeTimeout = probeTimeout;
         this.heavyTimeout = heavyTimeout;
+        this.connectionBudget = connectionBudget;
         this.sharedClient = new HttpControlClient(probeTimeout, heavyTimeout);
     }
 
@@ -479,6 +481,9 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     @Override
     public void close() {
         sharedClient.close();
+        if (httpClient != null) {
+            httpClient.shutdownNow();
+        }
     }
 
     @Override
@@ -603,7 +608,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     public ConnectionTestOutcome test(
             URI baseUrl, String credential, String id, String connectorId, Map<String, Object> settings) {
         try {
-            HttpRequest request = authed(baseUrl, "/api/connections:test", credential, heavyTimeout)
+            HttpRequest request = connectionRequest(baseUrl, "/api/connections:test", credential)
                     .header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(
                             connectionBody(id, connectorId, settings), StandardCharsets.UTF_8))
@@ -663,7 +668,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     public ConnectionDiscoverSchemaOutcome discoverSchema(
             URI baseUrl, String credential, String id, String connectorId, Map<String, Object> settings) {
         try {
-            HttpRequest request = authed(baseUrl, "/api/connections:discover-schema", credential, heavyTimeout)
+            HttpRequest request = connectionRequest(baseUrl, "/api/connections:discover-schema", credential)
                     .header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(
                             connectionBody(id, connectorId, settings), StandardCharsets.UTF_8))
@@ -1965,33 +1970,18 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                 .header("Authorization", "Bearer " + credential);
     }
 
-    /** Enforces the request budget outside the JDK client's transport state machine as well. */
+    private HttpRequest.Builder connectionRequest(URI baseUrl, String path, String credential) {
+        HttpRequest.Builder request = HttpRequest.newBuilder(endpoint(baseUrl, path))
+                .header("Authorization", "Bearer " + credential);
+        connectionBudget.timeout(probeTimeout, heavyTimeout).ifPresent(request::timeout);
+        return request;
+    }
+
+    /** Shares deadline enforcement and cancellation with the other control-plane frontends. */
     private <T> HttpResponse<T> send(
             HttpRequest request, HttpResponse.BodyHandler<T> handler)
             throws IOException, InterruptedException {
-        CompletableFuture<HttpResponse<T>> future = client().sendAsync(request, handler);
-        Duration timeout = request.timeout().orElse(probeTimeout);
-        try {
-            return future.get(Math.max(1, timeout.toMillis()), TimeUnit.MILLISECONDS);
-        } catch (InterruptedException error) {
-            future.cancel(true);
-            throw error;
-        } catch (TimeoutException error) {
-            future.cancel(true);
-            throw new HttpTimeoutException("HTTP request exceeded " + timeout);
-        } catch (ExecutionException error) {
-            Throwable cause = error.getCause();
-            if (cause instanceof IOException io) {
-                throw io;
-            }
-            if (cause instanceof RuntimeException runtime) {
-                throw runtime;
-            }
-            if (cause instanceof Error fatal) {
-                throw fatal;
-            }
-            throw new IOException("HTTP request failed", cause);
-        }
+        return sharedClient.send(request, handler);
     }
 
     /** The absolute request URI for {@code path} against a base, tolerating a trailing slash on the base. */
