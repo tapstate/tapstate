@@ -164,6 +164,9 @@ final class BenchmarkTableCaptureSet implements AutoCloseable {
             sample.put("consumer", source.binding().consumer()); sample.put("table", source.logical().table());
             sample.put("readStartedAtNanos", started); sample.put("readCompletedAtNanos", ended);
             sample.put("scope", "SEQUENTIAL_DURABLE_TAIL_AND_READ_CURSOR_POINT_READS");
+            // Interpret the same fetched document; the bracket places its read, not the sink effect.
+            sample.put("consumerFrontier", BenchmarkConsumerFrontierDiagnostics.read(
+                    source.binding(), source.epoch(), cursor));
             if (!integer(read) || !integer(tail) || ((Number) read).longValue() < -1
                     || ((Number) tail).longValue() < -1) { sample.put("state", "UNKNOWN"); }
             else {

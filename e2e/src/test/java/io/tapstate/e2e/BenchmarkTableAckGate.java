@@ -33,11 +33,7 @@ final class BenchmarkTableAckGate {
     }
 
     static boolean covers(Binding binding, BenchmarkTableTerminalObserver.Point point, Document cursor) {
-        identity(cursor, binding.physicalChain(), binding.pipeline(), binding.source(), binding.consumer());
-        if (!writers(cursor, binding.table()).equals(binding.writers())
-                || !Objects.equals(cursor.get("sinkAckFence"), binding.fence())) {
-            throw new AssertionError("benchmark source writer plan or execution fence changed");
-        }
+        requireBinding(binding, cursor);
         String expectedRing = io.tapstate.runtime.srs.SrsRingbuffer.ringName(binding.physicalChain(), binding.table());
         if (!expectedRing.equals(point.ring()) || point.epoch() < 1 || point.seq() < 0) {
             throw new AssertionError("terminal log point belongs to another table or an unknown generation");
@@ -52,6 +48,14 @@ final class BenchmarkTableAckGate {
         Document table = confirmed == null ? null : document(confirmed, binding.table());
         Document done = document(cursor, "perTableRingDone");
         return confirmed(table, point) && reached(done, binding.table(), point.seq());
+    }
+
+    static void requireBinding(Binding binding, Document cursor) {
+        identity(cursor, binding.physicalChain(), binding.pipeline(), binding.source(), binding.consumer());
+        if (!writers(cursor, binding.table()).equals(binding.writers())
+                || !Objects.equals(cursor.get("sinkAckFence"), binding.fence())) {
+            throw new AssertionError("benchmark source writer plan or execution fence changed");
+        }
     }
 
     private static boolean confirmed(Document document, BenchmarkTableTerminalObserver.Point point) {
