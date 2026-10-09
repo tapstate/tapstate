@@ -1,5 +1,7 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.model.BatchSpec;
+import io.tapstate.core.model.ExecutionSpec;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -144,6 +146,7 @@ public final class ControlApiSchema {
                 "schemaEvolution", enumString("track", "ignore"),
                 "queryable", Map.of("type", "boolean"),
                 "enabled", Map.of("type", "boolean")), false));
+        sourceProperties.put("execution", execution());
         sourceProperties.put("experimental", opaque);
         sourceProperties.put("clearSecrets", array(string("Config secret field to clear")));
         Map<String, Object> sourceRequest =
@@ -554,6 +557,23 @@ public final class ControlApiSchema {
             schema.put("required", List.copyOf(required));
         }
         return immutableMap(schema);
+    }
+
+    /**
+     * A node's execution block as a request carries it, held to what binding it accepts: the cluster-wide width,
+     * and the batch the node forms - its rows and its wait, spelled as a whole number and a unit.
+     */
+    private static Map<String, Object> execution() {
+        Map<String, Object> batch = object(List.of(), Map.of(
+                "maxRecords", integer(1, BatchSpec.MAX_RECORDS_LIMIT,
+                        "The most rows one batch holds. Defaults to " + BatchSpec.DEFAULT_MAX_RECORDS),
+                "maxWait", Map.of("type", "string", "pattern", BatchSpec.MAX_WAIT_PATTERN, "description",
+                        "How long a batch may wait for more rows after its first one, such as 0ms, 50ms or 2s; "
+                                + "at most 60s. Defaults to " + BatchSpec.DEFAULT_MAX_WAIT)), false);
+        return object(List.of(), Map.of(
+                "parallelism", integer(1, ExecutionSpec.MAX_PARALLELISM,
+                        "Target total number of processors for the node across the whole cluster"),
+                "batch", batch), false);
     }
 
     private static Map<String, Object> string(String description) {
