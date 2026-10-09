@@ -744,7 +744,8 @@ class AuthTest {
     @Import({ControlHttpFace.class, SourceDraftTestConfiguration.class, SourceProjectionServiceTestConfiguration.class,
             ClusterTopologyTestConfiguration.class,
             PipelinePositionTestConfiguration.class,
-            DerivedSchemaTestConfiguration.class, ObservabilityTestConfiguration.class})
+            DerivedSchemaTestConfiguration.class, ObservabilityTestConfiguration.class,
+            PipelinePreviewTestConfiguration.class})
     static class TestApp {
 
         @Bean

@@ -25,9 +25,12 @@ import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.runtime.engine.ChainAxes;
 import io.tapstate.runtime.engine.DagBindings;
+import io.tapstate.runtime.engine.DagTraceBinding;
 import io.tapstate.runtime.engine.FrontierBinding;
 import io.tapstate.runtime.engine.FrontierOrders;
 import io.tapstate.runtime.engine.PipelineDagBuilder;
+import io.tapstate.runtime.engine.FiniteEnvelopeSourceProcessor;
+import io.tapstate.runtime.engine.ReplayFloorFactory;
 import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.runtime.engine.ViewSinkWriters;
 import io.tapstate.runtime.engine.nest.DurableNestDeadLetter;
@@ -35,6 +38,8 @@ import io.tapstate.runtime.engine.join.JoinBinding;
 import io.tapstate.runtime.engine.join.JoinStoresBinding;
 import io.tapstate.runtime.engine.nest.NestBinding;
 import io.tapstate.runtime.engine.nest.NestClock;
+import io.tapstate.runtime.engine.nest.NestDeadLetter;
+import io.tapstate.runtime.engine.nest.NestStateLedger;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.engine.nest.NestTable;
 import io.tapstate.runtime.srs.CaptureRunUnit;
@@ -57,6 +62,8 @@ import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.StorePort;
+import io.tapstate.spi.capture.FieldSchema;
+import io.tapstate.spi.capture.TableSchema;
 import io.tapstate.spi.transform.TransformPort;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -70,6 +77,7 @@ import java.util.Set;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
+import io.tapstate.core.event.Envelope;
 
 /**
  * Builds the Jet topology a pipeline runs from its stored artifact. It loads the pipeline and the source and
@@ -246,6 +254,180 @@ final class StoreBackedDagSource implements DagSource {
         this.stepSchemaRecord = new StepSchemaRecord(this.storePort.derivedSchemas());
         this.sourcePlacement = Objects.requireNonNull(sourcePlacement, "sourcePlacement");
         this.requireMarkedStore = requireMarkedStore;
+    }
+
+    /** A read-only source compiled over candidate resources for one isolated preview. */
+    StoreBackedDagSource(StorePort storePort, NestSettings nestSettings, ArtifactStore candidateArtifacts) {
+        this(storePort, assembledSinkWriterBinder(), nestSettings, StoreReachability.assumingReachable(),
+                SourcePlacement.anyMember(), candidateArtifacts);
+    }
+
+    /** Resolves the candidate's selected source tables without opening a connector or changing a store. */
+    List<PreviewSourceTable> previewSourceTables(PipelineResource pipeline) {
+        List<PreviewSourceTable> selected = new ArrayList<>();
+        Map<String, SourceVertex> vertices = sourceVertices(pipeline);
+        for (Map.Entry<String, SourceVertex> entry : vertices.entrySet()) {
+            SourceVertex vertex = entry.getValue();
+            SourceResource source = StoredArtifacts.requireSource(artifacts(), vertex.sourceId());
+            SourceModel discovered = SourceDiscovery.model(storePort, source);
+            SourceTable table = discovered == null ? null : discovered.tables().stream()
+                    .filter(candidate -> candidate.name().equals(vertex.table())).findFirst().orElse(null);
+            if (table == null) {
+                throw new TapstateException(ActuationError.SOURCE_SCHEMA_NOT_DISCOVERED,
+                        Map.of("source", source.id()), null);
+            }
+            List<FieldSchema> fields = table.fields().stream()
+                    .map(field -> new FieldSchema(field.name(), field.dataType())).toList();
+            selected.add(new PreviewSourceTable(entry.getKey(), source.id(), source.connector(),
+                    source.config(), new TableSchema(table.name(), fields), table));
+        }
+        return List.copyOf(selected);
+    }
+
+    /** Source vertex keys that can reach the selected terminal, including every Nest/Join input. */
+    Set<String> previewInputSourceKeys(PipelineResource pipeline) {
+        Map<String, SourceVertex> vertices = sourceVertices(pipeline);
+        Map<String, String> sourceKeyByTable = sourceKeyByTable(vertices);
+        Map<String, List<String>> sourceKeysById = sourceKeysById(vertices);
+        Set<String> steps = stepIds(pipeline);
+        FromClause terminal = pipeline.view() instanceof ViewBlock.Inline view
+                ? FromClause.list(view.from())
+                : pipeline.serve() instanceof ServeBlock.Inline serve ? serve.from() : null;
+        if (terminal == null) {
+            throw previewRefused("the selected output has no executable view or sync terminal");
+        }
+        LinkedHashSet<String> inputs = new LinkedHashSet<>();
+        for (FromRef ref : refsOf(terminal)) {
+            collectPreviewSourceKeys(pipeline, ref, sourceKeyByTable, sourceKeysById,
+                    vertices, steps, inputs, new HashSet<>());
+        }
+        return Set.copyOf(inputs);
+    }
+
+    /** Join plans compiled from the candidate pipeline and its current discovered source schemas. */
+    Map<String, CompiledJoin> previewCompiledJoins(PipelineResource pipeline) {
+        return compiledJoins(pipeline, sourceIdByTable(sourceVertices(pipeline)));
+    }
+
+    /** Ephemeral operator maps created by the preview topology, for teardown after the job ends. */
+    Set<String> previewStateMapNames(PipelineResource pipeline) {
+        Set<String> namespaces = new LinkedHashSet<>(PipelineDagBuilder.joinStateNamespaces(pipeline));
+        Map<String, NestTable> tables = nestTablesByAlias(
+                pipeline, sourceIdByTable(sourceVertices(pipeline)));
+        namespaces.addAll(PipelineDagBuilder.nestStateNamespaces(pipeline, tables::get));
+        return Set.copyOf(namespaces);
+    }
+
+    /** Builds the official topology with finite sources and run-scoped, no-external-write sinks. */
+    DAG previewDag(PipelineResource pipeline, String sampleMap,
+            String materializerMap, DagTraceBinding trace, String previewExecutionId) {
+        Map<String, SourceVertex> vertices = sourceVertices(pipeline);
+        Map<String, String> sourceKeyByTable = sourceKeyByTable(vertices);
+        Map<String, List<String>> sourceKeysById = sourceKeysById(vertices);
+        Set<String> stepIds = stepIds(pipeline);
+        Map<String, String> sourceIdByTable = sourceIdByTable(vertices);
+        Map<String, CompiledJoin> compiled = compiledJoins(pipeline, sourceIdByTable);
+        Map<String, List<String>> outputKeys = previewTargetKeys(pipeline, vertices,
+                sourceKeyByTable, sourceKeysById, stepIds, compiled);
+        boolean viewOutput = pipeline.view() instanceof ViewBlock.Inline;
+        Map<String, List<String>> viewKeys = viewOutput ? outputKeys : Map.of();
+        Map<String, List<String>> sinkKeys = outputKeys;
+        DagBindings bindings = new DagBindings(
+                key -> FiniteEnvelopeSourceProcessor.metaSupplier(key, sampleMap, key),
+                step -> transformBinding(step, inlineStepsById(pipeline), vertices,
+                        sourceKeyByTable, sourceKeysById, stepIds, previewExecutionId),
+                element -> new PreviewMaterializerSinkWriterFactory(
+                        materializerMap, sinkKeys, previewWriteMode(element.writeMode())),
+                ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, vertices, stepIds),
+                sourceKeysById::get,
+                view -> new PreviewMaterializerSinkWriterFactory(
+                        materializerMap, viewKeys, io.tapstate.spi.sink.WriteMode.UPSERT),
+                previewNestBinding(pipeline, sourceIdByTable),
+                compiled.isEmpty() ? null : joinBinding(compiled));
+        return PipelineDagBuilder.build(pipeline, bindings, null, null, trace);
+    }
+
+    private NestBinding previewNestBinding(
+            PipelineResource pipeline, Map<String, String> sourceIdByTable) {
+        Map<String, NestTable> tables = nestTablesByAlias(pipeline, sourceIdByTable);
+        return new NestBinding(tables::get, NestBinding.onMap(),
+                (NestDeadLetter) (from, released) -> { },
+                PipelineDagBuilder.nestSettings(pipeline, tables::get, nestSettings), true);
+    }
+
+    private Map<String, List<String>> previewTargetKeys(
+            PipelineResource pipeline,
+            Map<String, SourceVertex> vertices,
+            Map<String, String> sourceKeyByTable,
+            Map<String, List<String>> sourceKeysById,
+            Set<String> stepIds,
+            Map<String, CompiledJoin> compiledJoins) {
+        if (pipeline.view() instanceof ViewBlock.Inline view) {
+            Set<String> streams = streamsReaching(pipeline, view.from(), sourceKeyByTable,
+                    sourceKeysById, vertices, stepIds);
+            Map<String, List<String>> keys = new LinkedHashMap<>();
+            streams.forEach(stream -> keys.put(stream, List.of(view.primaryKey())));
+            return Map.copyOf(keys);
+        }
+        if (!(pipeline.serve() instanceof ServeBlock.Inline serve)
+                || serve.sync() == null || serve.sync().isEmpty()) {
+            throw previewRefused("the selected output has no materialized rows");
+        }
+        Map<String, TargetTable> sourceTargets = targetModelResolver.resolveAll(pipeline);
+        Map<String, TargetTable> targets = new LinkedHashMap<>(sourceTargets);
+        targets.putAll(assembledTargets(pipeline, sourceTargets, vertices, compiledJoins));
+        Set<String> streams = streamsReaching(pipeline, serve.from(), sourceKeyByTable,
+                sourceKeysById, vertices, stepIds);
+        targets.putAll(publishedTargets(pipeline.id(), pipeline, serve.from(), streams,
+                sourceTargets, vertices, sourceKeyByTable, sourceKeysById, stepIds,
+                this::discoveredColumns));
+        SyncElement selected = serve.sync().getFirst();
+        Map<String, TargetTable> renamed = TargetModelResolver.renameAll(
+                targets, streams, selected.rename(), sourceIdByTable(vertices));
+        Map<String, List<String>> keys = new LinkedHashMap<>();
+        for (String stream : streams) {
+            TargetTable target = renamed.get(stream);
+            if (target == null) {
+                throw previewRefused("the selected output model for stream '" + stream + "' is unresolved");
+            }
+            keys.put(stream, target.fields().stream().filter(TargetField::primaryKey)
+                    .map(TargetField::name).toList());
+        }
+        return Map.copyOf(keys);
+    }
+
+    private static io.tapstate.spi.sink.WriteMode previewWriteMode(io.tapstate.core.model.WriteMode mode) {
+        return mode == io.tapstate.core.model.WriteMode.APPEND
+                ? io.tapstate.spi.sink.WriteMode.APPEND : io.tapstate.spi.sink.WriteMode.UPSERT;
+    }
+
+    private static TapstateException previewRefused(String reason) {
+        return new TapstateException(ActuationError.PREVIEW_REFUSED, Map.of("reason", reason), null);
+    }
+
+    private static void collectPreviewSourceKeys(
+            PipelineResource pipeline,
+            FromRef ref,
+            Map<String, String> sourceKeyByTable,
+            Map<String, List<String>> sourceKeysById,
+            Map<String, SourceVertex> vertices,
+            Set<String> steps,
+            Set<String> into,
+            Set<String> visiting) {
+        for (String key : upstreams(ref, sourceKeyByTable, sourceKeysById, vertices, steps)) {
+            if (vertices.containsKey(key)) {
+                into.add(key);
+                continue;
+            }
+            Step step = stepOf(pipeline, key);
+            if (step != null && visiting.add(key)) {
+                for (FromRef upstream : refsOf(step.from())) {
+                    collectPreviewSourceKeys(pipeline, upstream, sourceKeyByTable,
+                            sourceKeysById, vertices, steps, into, visiting);
+                }
+                visiting.remove(key);
+            }
+        }
     }
 
     @Override
@@ -683,6 +865,16 @@ final class StoreBackedDagSource implements DagSource {
             Map<String, TargetTable> bySourceTable, Map<String, SourceVertex> sourceVertices,
             Map<String, String> sourceKeyByTable, Map<String, List<String>> sourceKeysById,
             Set<String> stepIds) {
+        return publishedTargets(pipelineId, pipeline, from, streams, bySourceTable, sourceVertices,
+                sourceKeyByTable, sourceKeysById, stepIds,
+                vertex -> copiedColumns(pipelineId, vertex));
+    }
+
+    private Map<String, TargetTable> publishedTargets(
+            String pipelineId, PipelineResource pipeline, FromClause from, Set<String> streams,
+            Map<String, TargetTable> bySourceTable, Map<String, SourceVertex> sourceVertices,
+            Map<String, String> sourceKeyByTable, Map<String, List<String>> sourceKeysById,
+            Set<String> stepIds, Function<SourceVertex, NodeColumns> sourceColumns) {
         Map<String, TargetTable> published = new LinkedHashMap<>();
         for (String stream : streams) {
             TargetTable base = bySourceTable.get(stream);
@@ -692,7 +884,7 @@ final class StoreBackedDagSource implements DagSource {
             Map<String, NodeColumns> inputs = new LinkedHashMap<>();
             for (FromRef ref : refsOf(from)) {
                 NodeColumns columns = streamColumnsAt(pipelineId, pipeline, ref, stream, sourceVertices,
-                        sourceKeyByTable, sourceKeysById, stepIds, new HashSet<>(), base);
+                        sourceKeyByTable, sourceKeysById, stepIds, new HashSet<>(), base, sourceColumns);
                 if (columns != null) {
                     inputs.put(Integer.toString(inputs.size()), columns);
                 }
@@ -700,8 +892,8 @@ final class StoreBackedDagSource implements DagSource {
             NodeColumns produced = inputs.size() == 1 ? inputs.values().iterator().next()
                     : NodeColumns.of(new TransformBody.Union(), inputs, null);
             if (produced != null && produced.known()) {
-                published.put(stream, publishedAs(base, produced, atTheSource(pipelineId, stream,
-                        sourceVertices)));
+                published.put(stream, publishedAs(base, produced, atTheSource(
+                        pipelineId, stream, sourceVertices, sourceColumns)));
             } else if (produced != null) {
                 // Unknown lineage cannot preserve source attributes or secondary uniqueness. A decimal
                 // type token also declares bounds, so it cannot survive a script that may replace it.
@@ -733,11 +925,12 @@ final class StoreBackedDagSource implements DagSource {
     private NodeColumns streamColumnsAt(
             String pipelineId, PipelineResource pipeline, FromRef from, String stream,
             Map<String, SourceVertex> sourceVertices, Map<String, String> sourceKeyByTable,
-            Map<String, List<String>> sourceKeysById, Set<String> stepIds, Set<String> visiting, TargetTable base) {
+            Map<String, List<String>> sourceKeysById, Set<String> stepIds, Set<String> visiting, TargetTable base,
+            Function<SourceVertex, NodeColumns> sourceColumns) {
         ViewBlock.Inline view = inlineViewNamed(pipeline, from);
         if (view != null) {
             NodeColumns upstream = streamColumnsAt(pipelineId, pipeline, view.from(), stream,
-                    sourceVertices, sourceKeyByTable, sourceKeysById, stepIds, visiting, base);
+                    sourceVertices, sourceKeyByTable, sourceKeysById, stepIds, visiting, base, sourceColumns);
             return upstream == null ? null : NodeColumns.of(view, upstream);
         }
         List<NodeColumns> reached = new ArrayList<>();
@@ -745,7 +938,7 @@ final class StoreBackedDagSource implements DagSource {
             SourceVertex vertex = sourceVertices.get(key);
             if (vertex != null) {
                 if (vertex.table().equals(stream)) {
-                    NodeColumns copied = copiedColumns(pipelineId, vertex);
+                    NodeColumns copied = sourceColumns.apply(vertex);
                     if (copied != null) {
                         Map<String, io.tapstate.core.common.NumericType> numbers = new LinkedHashMap<>();
                         base.fields().stream().filter(field -> field.numericType() != null)
@@ -768,7 +961,8 @@ final class StoreBackedDagSource implements DagSource {
                 Map<String, NodeColumns> inputs = new LinkedHashMap<>();
                 for (FromRef upstreamRef : refsOf(inline.from())) {
                     NodeColumns upstream = streamColumnsAt(pipelineId, pipeline, upstreamRef, stream,
-                            sourceVertices, sourceKeyByTable, sourceKeysById, stepIds, visiting, base);
+                            sourceVertices, sourceKeyByTable, sourceKeysById, stepIds, visiting, base,
+                            sourceColumns);
                     if (upstream != null) {
                         inputs.put(Integer.toString(inputs.size()), upstream);
                     }
@@ -1121,10 +1315,11 @@ final class StoreBackedDagSource implements DagSource {
      * nothing has been copied yet. One vertex is one table, so the table name finds it.
      */
     private NodeColumns atTheSource(
-            String pipelineId, String table, Map<String, SourceVertex> sourceVertices) {
+            String pipelineId, String table, Map<String, SourceVertex> sourceVertices,
+            Function<SourceVertex, NodeColumns> sourceColumns) {
         for (SourceVertex vertex : sourceVertices.values()) {
             if (vertex.table().equals(table)) {
-                return copiedColumns(pipelineId, vertex);
+                return sourceColumns.apply(vertex);
             }
         }
         return null;
@@ -1368,12 +1563,19 @@ final class StoreBackedDagSource implements DagSource {
     private SupplierEx<? extends TransformPort> transformBinding(Step step,
             Map<String, Step.Inline> steps, Map<String, SourceVertex> vertices,
             Map<String, String> keysByTable, Map<String, List<String>> keysBySource, Set<String> stepIds) {
+        return transformBinding(step, steps, vertices, keysByTable, keysBySource, stepIds, null);
+    }
+
+    private SupplierEx<? extends TransformPort> transformBinding(Step step,
+            Map<String, Step.Inline> steps, Map<String, SourceVertex> vertices,
+            Map<String, String> keysByTable, Map<String, List<String>> keysBySource, Set<String> stepIds,
+            String previewExecutionId) {
         String guardedPath = step instanceof Step.Inline inline
                 && (inline.body() instanceof TransformBody.MapProjection || inline.body() instanceof TransformBody.Js)
                 ? downstreamUnwindPath(step.id(), steps, new HashSet<>()) : null;
         if (!(step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Unwind)
                 && guardedPath == null) {
-            return transformPort(step, List.of());
+            return transformPort(step, List.of(), previewExecutionId);
         }
         Function<FromRef, Map<String, List<String>>> sourceKeys = ref -> {
             Map<String, List<String>> byStream = new LinkedHashMap<>();
@@ -1392,7 +1594,7 @@ final class StoreBackedDagSource implements DagSource {
         Map<String, List<String>> keys = parentKeysReaching(step, steps, sourceKeys);
         Set<String> guardedStreams = guardedPath == null ? Set.of()
                 : unmodifiedStreamsReaching((Step.Inline) step, steps, sourceKeys);
-        return transformPortByStream(step, keys, guardedPath, guardedStreams);
+        return transformPortByStream(step, keys, guardedPath, guardedStreams, previewExecutionId);
     }
 
     /** Capture a serializable factory per logical stream; input tables need not share their key names. */
@@ -1403,8 +1605,15 @@ final class StoreBackedDagSource implements DagSource {
 
     private static SupplierEx<? extends TransformPort> transformPortByStream(Step step,
             Map<String, List<String>> parentKeys, String guardedPath, Set<String> guardedStreams) {
+        return transformPortByStream(step, parentKeys, guardedPath, guardedStreams, null);
+    }
+
+    private static SupplierEx<? extends TransformPort> transformPortByStream(Step step,
+            Map<String, List<String>> parentKeys, String guardedPath, Set<String> guardedStreams,
+            String previewExecutionId) {
         Map<String, SupplierEx<? extends TransformPort>> factories = new LinkedHashMap<>();
-        parentKeys.forEach((stream, key) -> factories.put(stream, transformPort(step, key)));
+        parentKeys.forEach((stream, key) -> factories.put(stream,
+                transformPort(step, key, previewExecutionId)));
         if (parentKeys.isEmpty()) {
             throw unresolvedParentKey(step.id(), "unknown", "no source identity reaches this step");
         }
@@ -1423,16 +1632,24 @@ final class StoreBackedDagSource implements DagSource {
                 }
                 ports.put(entry.getKey(), port);
             }
-            return event -> {
-                if (event.op() == io.tapstate.core.event.Op.DDL) {
-                    // A script sees DDL too; parent identity is irrelevant for this non-row event.
-                    return ports.values().iterator().next().transform(event);
+            return new TransformPort() {
+                @Override
+                public List<Envelope> transform(Envelope event) {
+                    if (event.op() == io.tapstate.core.event.Op.DDL) {
+                        // A script sees DDL too; parent identity is irrelevant for this non-row event.
+                        return ports.values().iterator().next().transform(event);
+                    }
+                    TransformPort port = ports.get(event.src());
+                    if (port == null) {
+                        throw new IllegalStateException("No parent-key binding for stream " + event.src());
+                    }
+                    return port.transform(event);
                 }
-                TransformPort port = ports.get(event.src());
-                if (port == null) {
-                    throw new IllegalStateException("No parent-key binding for stream " + event.src());
+
+                @Override
+                public void close() {
+                    ports.values().forEach(TransformPort::close);
                 }
-                return port.transform(event);
             };
         };
     }
@@ -2445,6 +2662,11 @@ final class StoreBackedDagSource implements DagSource {
      * other kind is a function of its own body alone.
      */
     static SupplierEx<? extends TransformPort> transformPort(Step step, List<String> parentKey) {
+        return transformPort(step, parentKey, null);
+    }
+
+    private static SupplierEx<? extends TransformPort> transformPort(
+            Step step, List<String> parentKey, String previewExecutionId) {
         if (!(step instanceof Step.Inline inline)) {
             throw new IllegalStateException("transform step '" + step.id() + "' is not inline");
         }
@@ -2464,7 +2686,9 @@ final class StoreBackedDagSource implements DagSource {
             }
             case TransformBody.Js js -> {
                 String script = js.script();
-                yield (SupplierEx<TransformPort>) () -> StatelessTransforms.js(script);
+                yield (SupplierEx<TransformPort>) () -> previewExecutionId == null
+                        ? StatelessTransforms.js(script)
+                        : StatelessTransforms.previewJs(script, previewExecutionId);
             }
             default -> throw new IllegalStateException("transform step '" + step.id()
                     + "' has a body the linear builder does not carry: " + body.type());

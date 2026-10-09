@@ -1,0 +1,180 @@
+package io.tapstate.control.restapi;
+
+import io.tapstate.control.core.ArtifactDraft;
+import io.tapstate.control.core.PipelinePreviewEvent;
+import io.tapstate.control.core.PipelinePreviewCommand;
+import io.tapstate.control.core.PipelinePreviewSession;
+import io.tapstate.control.core.PipelinePreviewService;
+import jakarta.servlet.http.HttpServletRequest;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.ObjectMapper;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+
+/** NDJSON presentation for bounded, no-write Pipeline preview runs. */
+@RestController
+class PipelinePreviewController {
+
+    private static final Set<String> REQUEST_FIELDS =
+            Set.of("pipelineId", "outputId", "rootLimit", "sampleId", "drafts");
+    private static final Set<String> DRAFT_FIELDS = Set.of("source", "content", "expectedContentHash");
+    static final int MAX_REQUEST_BYTES = 4 * 1024 * 1024;
+
+    private final PipelinePreviewService previews;
+    private final ObjectMapper json;
+
+    PipelinePreviewController(PipelinePreviewService previews, ObjectMapper json) {
+        this.previews = Objects.requireNonNull(previews, "previews");
+        this.json = Objects.requireNonNull(json, "json");
+    }
+
+    @Verb("pipeline.preview")
+    @PostMapping(value = "/artifacts:preview", consumes = "application/json", produces = "application/x-ndjson")
+    ResponseEntity<StreamingResponseBody> preview(HttpServletRequest request) throws IOException {
+        if (request.getContentLengthLong() > MAX_REQUEST_BYTES) {
+            throw MalformedRequest.rejecting("preview request exceeds the 4 MiB limit", null);
+        }
+        byte[] bytes = readBounded(request.getInputStream(), MAX_REQUEST_BYTES);
+        PipelinePreviewCommand command = parse(decodeRequest(bytes, json));
+        PipelinePreviewSession stream = previews.open(AuthenticatedCaller.subject(), command);
+        StreamingResponseBody response = output -> {
+            try (stream) {
+                writeEvents(json, output, stream);
+            }
+        };
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CACHE_CONTROL, "no-store")
+                .contentType(MediaType.parseMediaType("application/x-ndjson"))
+                .body(response);
+    }
+
+    static Map<?, ?> decodeRequest(byte[] bytes, ObjectMapper json) {
+        Object decoded;
+        try {
+            decoded = json.readValue(bytes, Object.class);
+        } catch (JacksonException malformedJson) {
+            throw MalformedRequest.rejecting("request body is not valid JSON", malformedJson);
+        }
+        Map<?, ?> body;
+        if (decoded instanceof Map<?, ?> object) {
+            body = object;
+        } else if (decoded == null) {
+            body = null;
+        } else {
+            throw MalformedRequest.rejecting("preview request body must be a JSON object", null);
+        }
+        return body;
+    }
+
+    static byte[] readBounded(InputStream input, int maxBytes) throws IOException {
+        byte[] bytes = input.readNBytes(maxBytes + 1);
+        if (bytes.length > maxBytes) {
+            throw MalformedRequest.rejecting("preview request exceeds the 4 MiB limit", null);
+        }
+        return bytes;
+    }
+
+    static PipelinePreviewCommand parse(Map<?, ?> body) {
+        if (body == null) {
+            throw MalformedRequest.rejecting("request body is required", null);
+        }
+        rejectUnknown(body, REQUEST_FIELDS, "preview request");
+        String pipelineId = text(body.get("pipelineId"), "pipelineId is required");
+        String outputId = optionalText(body.get("outputId"), "outputId must be a string");
+        Integer rootLimit = integer(body.get("rootLimit"), "rootLimit must be an integer");
+        String sampleId = optionalText(body.get("sampleId"), "sampleId must be a string");
+        Object rawDrafts = MalformedRequest.require(body.get("drafts"), "drafts must be an array");
+        if (!(rawDrafts instanceof java.util.List<?> list)) {
+            throw MalformedRequest.rejecting("drafts must be an array", null);
+        }
+        if (list.size() > PipelinePreviewService.MAX_DRAFTS) {
+            throw MalformedRequest.rejecting(
+                    "drafts exceed the " + PipelinePreviewService.MAX_DRAFTS + " resource limit", null);
+        }
+        ArrayList<ArtifactDraft> drafts = new ArrayList<>(list.size());
+        for (Object raw : list) {
+            if (!(raw instanceof Map<?, ?> draft)) {
+                throw MalformedRequest.rejecting("each draft must be an object", null);
+            }
+            rejectUnknown(draft, DRAFT_FIELDS, "draft");
+            String content = text(draft.get("content"), "each draft must carry non-blank content");
+            drafts.add(new ArtifactDraft(optionalText(draft.get("source"), "draft source must be a string"),
+                    content,
+                    optionalText(draft.get("expectedContentHash"), "expectedContentHash must be a string")));
+        }
+        return new PipelinePreviewCommand(pipelineId, outputId, rootLimit, sampleId, drafts);
+    }
+
+    private static void rejectUnknown(Map<?, ?> body, Set<String> allowed, String label) {
+        for (Object key : body.keySet()) {
+            if (!(key instanceof String name) || !allowed.contains(name)) {
+                throw MalformedRequest.rejecting(label + " contains an unknown field", null);
+            }
+        }
+    }
+
+    private static String text(Object value, String reason) {
+        if (!(value instanceof String text) || text.isBlank()) {
+            throw MalformedRequest.rejecting(reason, null);
+        }
+        return text;
+    }
+
+    private static String optionalText(Object value, String reason) {
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof String text) || text.isBlank()) {
+            throw MalformedRequest.rejecting(reason, null);
+        }
+        return text;
+    }
+
+    private static Integer integer(Object value, String reason) {
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof Number number)) {
+            throw MalformedRequest.rejecting(reason, null);
+        }
+        try {
+            return new BigDecimal(number.toString()).intValueExact();
+        } catch (ArithmeticException | NumberFormatException failure) {
+            throw MalformedRequest.rejecting(reason, failure);
+        }
+    }
+
+    static void writeEvents(ObjectMapper json, OutputStream output, PipelinePreviewSession stream) throws IOException {
+        try {
+            PipelinePreviewEvent event;
+            while ((event = stream.next()) != null) {
+                json.writeValue(output, event);
+                output.write('\n');
+                output.flush();
+                if ("run.completed".equals(event.kind()) || "run.failed".equals(event.kind())) {
+                    break;
+                }
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            stream.cancel();
+            throw new IOException("Pipeline preview stream was interrupted", interrupted);
+        } catch (IOException disconnected) {
+            stream.cancel();
+            throw disconnected;
+        }
+    }
+}

@@ -180,6 +180,29 @@ public final class ApplyService {
      * is not going anywhere.
      */
     public ApplyPlan plan(List<ArtifactDraft> drafts) {
+        return planCandidateWorkspace(drafts).plan();
+    }
+
+    /**
+     * Validates and canonicalizes the candidate workspace without writing it. The prepared artifacts in
+     * {@link CandidateWorkspacePlan#plan()} are the submitted resources; {@link CandidateWorkspacePlan#resources()}
+     * also retains the stored resources that completed their reference closure.
+     */
+    public CandidateWorkspacePlan planCandidateWorkspace(List<ArtifactDraft> drafts) {
+        return planCandidateWorkspace(drafts, ValidationScope.OFFLINE);
+    }
+
+    /**
+     * Validates a preview candidate against its persisted dependency closure without writing it. A
+     * Pipeline draft commonly references Sources already created through the typed Source API; those
+     * stored resources must participate in preview compilation even when the request carries only the
+     * unsaved Pipeline candidate.
+     */
+    public CandidateWorkspacePlan planPreviewWorkspace(List<ArtifactDraft> drafts) {
+        return planCandidateWorkspace(drafts, ValidationScope.ONLINE_SOURCE);
+    }
+
+    private CandidateWorkspacePlan planCandidateWorkspace(List<ArtifactDraft> drafts, ValidationScope scope) {
         Objects.requireNonNull(drafts, "drafts");
         List<Resource> resources = new ArrayList<>();
         List<Set<String>> declaredFields = new ArrayList<>();
@@ -211,7 +234,7 @@ public final class ApplyService {
                 }
             }
         }
-        return planResources(resources, preconditions, ValidationScope.OFFLINE);
+        return planResourcesAndWorkspace(resources, preconditions, scope);
     }
 
     private MergedSource mergeSource(SourceResource submitted, Set<String> fields) {
@@ -247,6 +270,11 @@ public final class ApplyService {
      * resource; they do not serialize it to YAML or recreate validation beside apply.
      */
     private ApplyPlan planResources(
+            List<Resource> submitted, Map<String, String> preconditions, ValidationScope validationScope) {
+        return planResourcesAndWorkspace(submitted, preconditions, validationScope).plan();
+    }
+
+    private CandidateWorkspacePlan planResourcesAndWorkspace(
             List<Resource> submitted, Map<String, String> preconditions, ValidationScope validationScope) {
         Objects.requireNonNull(submitted, "submitted");
         Objects.requireNonNull(preconditions, "preconditions");
@@ -328,7 +356,12 @@ public final class ApplyService {
             String canonicalForm = writer.write(recorded);
             prepared.add(new PreparedArtifact(recorded, canonicalForm, CanonicalHash.of(recorded)));
         }
-        return new ApplyPlan(prepared, advisories.review(validated, discovered), preconditions, workspacePreconditions);
+        Map<String, Resource> candidateById = new LinkedHashMap<>();
+        candidate.forEach(resource -> candidateById.put(resource.id(), resource));
+        prepared.forEach(artifact -> candidateById.put(artifact.id(), artifact.resource()));
+        ApplyPlan plan = new ApplyPlan(
+                prepared, advisories.review(validated, discovered), preconditions, workspacePreconditions);
+        return new CandidateWorkspacePlan(plan, List.copyOf(candidateById.values()));
     }
 
     /**
