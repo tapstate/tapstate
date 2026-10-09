@@ -39,7 +39,7 @@ final class BenchmarkDualGcDiagnostics {
         for (String variable : List.of("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS", "MAVEN_OPTS")) {
             String value = System.getenv(variable);
             if (value != null && !value.isBlank()) {
-                throw new AssertionError("owned dual GC diagnostics require absent inherited JVM and Maven options");
+                throw new AssertionError("owned dual GC diagnostics require an absent inherited option: " + variable);
             }
         }
         long driverPid = ProcessHandle.current().pid();
