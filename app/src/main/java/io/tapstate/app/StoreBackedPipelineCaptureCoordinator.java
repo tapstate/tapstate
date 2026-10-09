@@ -1,8 +1,10 @@
 package io.tapstate.app;
 
 import io.tapstate.adapters.pdk.ConnectorStateNamespace;
+import io.tapstate.adapters.pdk.PdkCapturePort;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.Settings;
@@ -21,6 +23,7 @@ import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.runtime.srs.StartFrom;
 import io.tapstate.spi.capture.CapturePlan;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.SourceModel;
@@ -204,7 +207,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 CaptureRun run;
                 if (!managedOwnership) {
                     run = captureStarter.start(spec, handoff);
-                    runs.add(PipelineRun.unmanaged(run, spec.consumerId()));
+                    runs.add(PipelineRun.unmanaged(run, spec));
                 } else {
                     OwnedCapture existing = ownedCaptures.get(captureId);
                     if (existing != null) {
@@ -227,7 +230,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                             Set<String> pipelines = new LinkedHashSet<>(List.of(pipelineId));
                             JoinedCapture joined = joinedCaptures.remove(captureId);
                             if (joined != null) {
-                                pipelines.addAll(joined.pipelines);
+                                pipelines.addAll(joined.pipelines.keySet());
                             }
                             own(captureId, run, permit, pipelines);
                         } else {
@@ -235,14 +238,14 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                             // that: its own load where its record says one is owed, then the changes the
                             // other member's tail writes into the shared ring.
                             run = captureAttacher.start(spec, handoff, false);
-                            joinedCaptures.computeIfAbsent(captureId, ignored -> new JoinedCapture(spec, handoff))
-                                    .pipelines.add(pipelineId);
+                            joinedCaptures.computeIfAbsent(captureId, ignored -> new JoinedCapture(spec))
+                                    .join(spec, handoff);
                             lookForCapturesNobodyTails();
                         }
                     }
                     runs.add(PipelineRun.managed(
                             captureId, run, spec.srsEnabled() && spec.readMode() != ReadMode.SNAPSHOT_ONLY,
-                            spec.consumerId()));
+                            spec));
                 }
                 if (run.loadOverWhenHandedBack()) {
                     // Handed back with its load already over -- read on this thread, or none owed. What the
@@ -381,6 +384,15 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         }
         tablesByChain.forEach((chain, tables) -> {
             if (storePort.meta().read(chain.value()).isEmpty()) {
+                // A chain with no record has no position, so connector notes still filed under its name are left
+                // over from an earlier one whose clearing stopped part way -- after the record and the release,
+                // before the notes (see purgeChain). Read as this chain's own they would name a slot that is
+                // gone, and a connector that knows a slot's name creates it again only when its stream starts:
+                // whatever is written to the source while the first load runs would never be read. They go
+                // before the record is created, while nothing can have opened a connector over them yet; another
+                // member seeding the same chain at the same moment is the one ordering this cannot give, as for
+                // the record itself.
+                dropChainNotes(chain.value());
                 try {
                     storePort.meta().create(chain.value(), retentionByChain.get(chain));
                 } catch (IllegalStateException alreadySeeded) {
@@ -454,15 +466,23 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         permits.clear();
     }
 
+    /**
+     * One source run of a pipeline, with the spec it was started from: a clearing lets go of what the run's
+     * source connector set up on the source through that spec's notes, as the run itself opened them.
+     */
     private record PipelineRun(
-            CaptureId captureId, CaptureRun run, boolean managed, boolean sharedTail, String consumerId) {
+            CaptureId captureId, CaptureRun run, boolean managed, boolean sharedTail, CaptureRunSpec spec) {
 
-        static PipelineRun unmanaged(CaptureRun run, String consumerId) {
-            return new PipelineRun(null, run, false, false, consumerId);
+        static PipelineRun unmanaged(CaptureRun run, CaptureRunSpec spec) {
+            return new PipelineRun(null, run, false, false, spec);
         }
 
-        static PipelineRun managed(CaptureId captureId, CaptureRun run, boolean sharedTail, String consumerId) {
-            return new PipelineRun(captureId, run, true, sharedTail, consumerId);
+        static PipelineRun managed(CaptureId captureId, CaptureRun run, boolean sharedTail, CaptureRunSpec spec) {
+            return new PipelineRun(captureId, run, true, sharedTail, spec);
+        }
+
+        String consumerId() {
+            return spec.consumerId();
         }
     }
 
@@ -487,20 +507,24 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      */
     private static final class JoinedCapture {
         private final boolean tails;
-        private final CaptureRunSpec tailSpec;
-        private final CaptureHandoff tailPassthrough;
-        private final Set<String> pipelines = new LinkedHashSet<>();
+        private final Map<String, JoinedPipeline> pipelines = new LinkedHashMap<>();
 
-        private JoinedCapture(CaptureRunSpec joinedWith, CaptureHandoff passthrough) {
+        private JoinedCapture(CaptureRunSpec joinedWith) {
             // A snapshot-only read has no tail for anybody to take over.
             this.tails = joinedWith.readMode() != ReadMode.SNAPSHOT_ONLY;
-            this.tailSpec = new CaptureRunSpec(
+        }
+
+        private void join(CaptureRunSpec joinedWith, CaptureHandoff passthrough) {
+            CaptureRunSpec tailSpec = new CaptureRunSpec(
                     joinedWith.config(), ReadMode.CDC_ONLY, joinedWith.srsKey(), joinedWith.srsEnabled(),
                     joinedWith.sourceId(), joinedWith.pipelineId(), joinedWith.startFrom(),
                     joinedWith.retention(), joinedWith.schemaVer(), joinedWith.snapshotEpoch())
                     .withConsumerId(joinedWith.consumerId());
-            this.tailPassthrough = passthrough;
+            pipelines.putIfAbsent(joinedWith.pipelineId(), new JoinedPipeline(tailSpec, passthrough));
         }
+    }
+
+    private record JoinedPipeline(CaptureRunSpec tailSpec, CaptureHandoff tailPassthrough) {
     }
 
     private void own(CaptureId captureId, CaptureRun run, CaptureOwnership.Permit permit, Set<String> pipelines) {
@@ -537,7 +561,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             // for a tail with no ring -- and a change ahead of a snapshot row of the same key is overwritten by
             // the older value. The tail resumes from where the durable record says the last one got to, so
             // asking again on a later pass costs a delay and nothing more.
-            if (stillLoading(capture.pipelines)) {
+            if (stillLoading(capture.pipelines.keySet())) {
                 continue;
             }
             CaptureOwnership.Permit permit = ownership.acquire(entry.getKey());
@@ -546,18 +570,19 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             }
             CaptureRun tail;
             try {
+                JoinedPipeline pipeline = capture.pipelines.values().iterator().next();
                 tail = captureAttacher.start(
-                        capture.tailSpec.withCaptureFence(permit.fence()), capture.tailPassthrough, true);
+                        pipeline.tailSpec.withCaptureFence(permit.fence()), pipeline.tailPassthrough, true);
             } catch (RuntimeException failure) {
                 ownership.release(permit.claim());
                 LOG.warn("Could not open the tail of capture {} for pipelines {} here; asking again later",
-                        entry.getKey().value(), capture.pipelines, failure);
+                        entry.getKey().value(), capture.pipelines.keySet(), failure);
                 continue;
             }
             joined.remove();
-            own(entry.getKey(), tail, permit, capture.pipelines);
+            own(entry.getKey(), tail, permit, capture.pipelines.keySet());
             LOG.info("Took over the tail of capture {} for pipelines {} here", entry.getKey().value(),
-                    capture.pipelines);
+                    capture.pipelines.keySet());
         }
     }
 
@@ -1024,6 +1049,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         Map<MiningChainId, Set<String>> consumersByChain = new LinkedHashMap<>();
         Set<String> progressIds = new LinkedHashSet<>();
         progressIds.add(pipelineId);
+        SourceReaders readers = new SourceReaders(pipelineId);
         for (PipelineRun pipelineRun : runs) {
             CaptureRun run = pipelineRun.run;
             try {
@@ -1038,9 +1064,10 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             }
             // Collected whether or not the close succeeded: a daemon that refused to stop does not make the
             // consumer membership this pipeline holds any less this pipeline's to give back.
-            progressIds.add(pipelineRun.consumerId);
+            progressIds.add(pipelineRun.consumerId());
             run.chainId().ifPresent(chain -> consumersByChain.computeIfAbsent(chain, ignored -> new LinkedHashSet<>())
-                    .add(pipelineRun.consumerId));
+                    .add(pipelineRun.consumerId()));
+            run.chainId().ifPresent(chain -> readers.ran(chain, pipelineRun.spec()));
         }
         // A live drain cannot detach an empty queue: capture may already hold that queue and append into it
         // after the drain returns. Lifecycle teardown has no such race once every capture close returned, so
@@ -1086,8 +1113,9 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 // Nobody is left on it, so the whole record goes: the read offset, the seam the tail
                 // resumes from, the schema history, and which tables finished their initial load. This
                 // is what makes the next run of this pipeline read its source from the beginning, which
-                // is what asking for the state to be cleared meant.
-                firstFailure = runCleanup(() -> purgeChain(chainId.value()), firstFailure);
+                // is what asking for the state to be cleared meant. What the chain's reader set up on the
+                // source goes with it, after the record: see purgeChain.
+                firstFailure = runCleanup(() -> purgeChain(chainId.value(), pipelineId, readers), firstFailure);
             } else {
                 // Others are still reading it, so only this pipeline's own cursor is its to give back.
                 // Run whether or not the release above succeeded, and safe to run twice: the detach
@@ -1117,7 +1145,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                         .map(offset -> offset.pipelineId())
                         .filter(consumer -> SrsConsumerId.belongsTo(consumer, pipelineId))
                         .forEach(progressIds::add);
-                firstFailure = purgeWhatTheRecordStillHolds(chainId, pipelineId, firstFailure);
+                firstFailure = purgeWhatTheRecordStillHolds(chainId, pipelineId, readers, firstFailure);
             }
             for (String progressId : progressIds) {
                 firstFailure = runCleanup(
@@ -1205,14 +1233,14 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
      * quietly -- so the two are read together and only their agreement licenses the drop.
      */
     private RuntimeException purgeWhatTheRecordStillHolds(
-            String chainId, String pipelineId, RuntimeException firstFailure) {
+            String chainId, String pipelineId, SourceReaders readers, RuntimeException firstFailure) {
         boolean lastOneOff = storePort.meta().consumerOffsets(chainId).stream()
                         .allMatch(offset -> SrsConsumerId.belongsTo(offset.pipelineId(), pipelineId))
                 && !srsCoordinator.isProvisioned(new MiningChainId(chainId));
         return runCleanup(
                 () -> {
                     if (lastOneOff) {
-                        purgeChain(chainId);
+                        purgeChain(chainId, pipelineId, readers);
                     } else {
                         storePort.meta().detachConsumer(chainId, pipelineId);
                     }
@@ -1220,13 +1248,134 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 firstFailure);
     }
 
-    private void purgeChain(String chainId) {
+    /**
+     * Lets go of everything a chain nobody reads any more accumulated: its record, then what its reader set up
+     * on the source to read it -- a replication slot -- and then the connector notes that named it.
+     *
+     * <p>In that order because of what each way of stopping part way leaves behind. Stopped after the record,
+     * a clearing leaves a slot nothing needs, or notes naming one that is gone, and the next run on the chain
+     * starts from a record with no position: it reads its source as a first run does, and the notes left over
+     * are dropped before that record is created (see requestSharedSelections). Dropped last, the record would
+     * outlive a slot that is gone, and the next run would resume from a position the source no longer keeps --
+     * quietly skipping whatever happened in between. The notes cannot go first either, because the release
+     * needs them to find what it lets go of.
+     *
+     * <p>A source that refuses is said and left as it is. The state is cleared either way: a clearing that
+     * failed over a source it cannot reach would leave a pipeline that can neither keep its state nor let go of
+     * it. What cannot be let go of on this side -- the record, the notes -- fails the step like any other.
+     */
+    private void purgeChain(String chainId, String pipelineId, SourceReaders readers) {
+        List<CaptureRunSpec> read = readers.of(new MiningChainId(chainId));
+        // Read while the record still says who was on the chain: where no source defined now reads it, what the
+        // notes name on the source is all there is to point at.
+        List<String> named = read.isEmpty() ? namedInTheNotesOf(chainId) : List.of();
+        storePort.meta().dropChain(chainId);
+        releaseOnTheSource(pipelineId, chainId, read, named);
+        dropChainNotes(chainId);
+    }
+
+    /** Drops the connector notes filed under a physical capture, and the markers their migration keeps. */
+    private void dropChainNotes(String chainId) {
         String connectorNamespace = ConnectorStateNamespace.ofShared(chainId);
-        // Keep the record until both namespaces are gone so a failed drop remains discoverable
-        // by a later purge, including after this process has lost its live capture handles.
         storePort.keyedState().dropNamespace(connectorNamespace);
         storePort.keyedState().dropNamespace(ConnectorStateNamespace.migrationOf(connectorNamespace));
-        storePort.meta().dropChain(chainId);
+    }
+
+    /** What the chain's notes, and the notes of each source recorded on it, name on the source. */
+    private List<String> namedInTheNotesOf(String chainId) {
+        List<String> namespaces = new ArrayList<>();
+        namespaces.add(ConnectorStateNamespace.ofShared(chainId));
+        for (ConsumerOffset consumer : storePort.meta().consumerOffsets(chainId)) {
+            SrsConsumerId.sourceOf(consumer.pipelineId()).ifPresent(source -> namespaces.add(ConnectorStateNamespace.of(
+                    new PipelineNode(SrsConsumerId.pipelineOf(consumer.pipelineId()), source))));
+        }
+        return PdkCapturePort.namedIn(storePort.keyedState(), namespaces);
+    }
+
+    /**
+     * Has the source connector of one of {@code read} -- the specs this pipeline read the chain through -- let
+     * go of what it set up on the source for the chain. Once per chain, never once per source: every source
+     * on a chain reads it through the same notes, and a chain read directly has one source.
+     */
+    private void releaseOnTheSource(String pipelineId, String chainId, List<CaptureRunSpec> read, List<String> named) {
+        Optional<CaptureRunSpec> reader = read.stream()
+                .filter(spec -> CapturePlan.forReadMode(spec.readMode()).cdc())
+                .findFirst();
+        if (reader.isEmpty()) {
+            LOG.warn("Cleared chain {} of pipeline {}, but no source the pipeline is defined to read reads it any "
+                    + "more, so what its connector set up on the source to read it is left there; remove it on "
+                    + "the source by hand: {}", chainId, pipelineId,
+                    named.isEmpty() ? "nothing its notes name" : String.join(", ", named));
+            return;
+        }
+        CaptureRunSpec spec = reader.get();
+        starter().release(spec).ifPresent(refused -> LOG.warn(
+                "Cleared pipeline {}, but source {} kept what its connector set up there to read changes; remove "
+                        + "it on the source by hand: {}", pipelineId, spec.sourceId(), refused.getMessage()));
+    }
+
+    /** Whichever seam starts runs here: the attacher where captures are owned, the starter where they are not. */
+    private CaptureStarter starter() {
+        return managedOwnership ? captureAttacher : captureStarter;
+    }
+
+    /**
+     * Which of a pipeline's sources read which chain, for a clearing to let go of what they set up there: the
+     * specs its runs here were started from, and for a chain it holds no run of here, the specs its stored
+     * definition gives now -- a clearing is as often asked of a pipeline whose runs are gone, after a start
+     * that threw part way or a process that was replaced.
+     *
+     * <p>The definition is read once, and only if a chain turns out to need it. One that cannot be read now
+     * releases nothing on the chains it would have answered for, and says so: the clearing goes on, and what
+     * was set up on the source stays until somebody removes it there.
+     */
+    private final class SourceReaders {
+
+        private final String pipelineId;
+        private final Map<MiningChainId, List<CaptureRunSpec>> ran = new LinkedHashMap<>();
+        private Map<MiningChainId, List<CaptureRunSpec>> defined;
+
+        SourceReaders(String pipelineId) {
+            this.pipelineId = pipelineId;
+        }
+
+        void ran(MiningChainId chainId, CaptureRunSpec spec) {
+            ran.computeIfAbsent(chainId, ignored -> new ArrayList<>()).add(spec);
+        }
+
+        List<CaptureRunSpec> of(MiningChainId chainId) {
+            List<CaptureRunSpec> held = ran.get(chainId);
+            if (held != null) {
+                return held;
+            }
+            if (defined == null) {
+                defined = definedReaders();
+            }
+            return defined.getOrDefault(chainId, List.of());
+        }
+
+        private Map<MiningChainId, List<CaptureRunSpec>> definedReaders() {
+            Map<MiningChainId, List<CaptureRunSpec>> byChain = new LinkedHashMap<>();
+            try {
+                ArtifactStore captured = artifacts();
+                PipelineResource pipeline = StoredArtifacts.requirePipeline(captured, pipelineId);
+                for (SourceRef ref : pipeline.sources()) {
+                    SourceResource source = StoredArtifacts.requireSource(captured, ref.id());
+                    Optional<SourceCaptureResolution> selected = SourceCaptureResolution.forPipeline(
+                            pipeline, source, SourceDiscovery.model(storePort, source));
+                    if (selected.isEmpty()) {
+                        continue;
+                    }
+                    CaptureRunSpec spec = deriveSpec(pipelineId, pipeline.settings(), source, selected.get(),
+                            srsSwitchOf(pipelineId, ref));
+                    byChain.computeIfAbsent(spec.miningChainId(), ignored -> new ArrayList<>()).add(spec);
+                }
+            } catch (RuntimeException unreadable) {
+                LOG.warn("Clearing pipeline {} could not read which sources it is defined to read, so nothing its "
+                        + "connectors set up on them to read changes is let go of there", pipelineId, unreadable);
+            }
+            return byChain;
+        }
     }
 
     /** Runs one release step, keeping the first failure and hanging any later one off it as suppressed. */

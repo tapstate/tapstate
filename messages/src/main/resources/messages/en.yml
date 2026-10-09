@@ -531,6 +531,12 @@ connector.position-unrenderable:
 connector.position-unreadable:
   message: "Connector '{connector}' could not read back the recorded stream position: {detail}."
   solution: "Read the source from the beginning again, or set an explicit start point, so a fresh position is recorded."
+connector.acknowledge-failed:
+  message: "Connector '{connector}' could not be told how far it may release its change log: {detail}."
+  solution: "The change stream keeps running and this is retried shortly; until it succeeds the source keeps change log it could already release. Check the source is reachable and the connection settings are correct."
+connector.release-failed:
+  message: "Connector '{connector}' could not let go of what it set up on its source to read changes ({resources}): {detail}."
+  solution: "The pipeline's state was cleared anyway. Remove what is named here on the source by hand; for a PostgreSQL replication slot, run pg_drop_replication_slot with its name once no session is using it. Until then the source keeps change log for it."
 connector.discover-failed:
   message: "Connector '{connector}' could not discover its schema: {detail}."
   solution: "The connector failed while discovering the source model; check the source is reachable and the connection settings are correct."

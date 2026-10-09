@@ -45,6 +45,22 @@ public interface SrsMetaStore {
     }
 
     /**
+     * The chain's source read offset as it stands durably, with whether it is a write-through checkpoint;
+     * empty for a chain with no offset or no record.
+     *
+     * <p>Read so that only a write a majority of the store's members has taken is seen. This is the value a
+     * source may be told to release its change log up to, and a write the store could still roll back in a
+     * failover must never be told to one: the source would have let go of changes that the rolled-back record
+     * then asks it for again. Only the offset is read, never the whole record, which grows with every schema
+     * version. The default reads the record as {@link #read} does, which is durable for a store with no
+     * replicas to fail over to.
+     */
+    default Optional<DurableSourceRead> durableSourceRead(String miningChainId) {
+        return read(miningChainId).filter(record -> record.sourceRead() != null)
+                .map(record -> new DurableSourceRead(record.sourceRead(), record.sourceReadDurable()));
+    }
+
+    /**
      * Checkpoints the physical capture after every change in its source batch was written to recoverable
      * SRS. Consumer confirmations are independent; they never certify this source-database position.
      */

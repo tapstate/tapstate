@@ -20,15 +20,27 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
 /**
- * Two pipeline nodes share a source position without sharing their connector identities. The second
- * starts from a tail position written by the first; after a process replacement both must resume.
- * Deletes made while the server is down distinguish resumed CDC from another snapshot.
+ * Two pipelines reading one MySQL database the same way share one capture: its position, and the identity its
+ * connector minted. The second starts cdc_only on the chain the first started, after the first has a tail
+ * position; after a process replacement both must resume. Deletes made while the server is down distinguish
+ * resumed CDC from another snapshot.
  *
- * <p>The declarative vocabulary cannot compare the connector-owned identity bytes across nodes and
- * process replacements or require a tail position to replace the snapshot seam before another start.
- * The real MySQL connector, its position object and its separate class loader are essential here.
+ * <p>The second pipeline does not start a reader of its own: the capture widens to its table and restarts from
+ * the chain's position, and the connector it restarts reads back the identity the first run filed rather than
+ * minting another. A fresh identity is what leaves a recorded position filed under a name nothing looks up.
+ *
+ * <p>The declarative vocabulary cannot compare the connector-owned identity bytes across a widening and a
+ * process replacement, or require a tail position to replace the snapshot seam before another start. The real
+ * MySQL connector, its position object and its separate class loader are essential here.
  */
 class RealMysqlToMongoSharedPositionIT {
+
+    /** The note the MySQL connector mints on a first run and looks for on every later one. */
+    private static final String SERVER_NAME = "SERVER_NAME";
+
+    /** Where a shared capture's connector notes are kept, before the chain the capture reads. */
+    private static final String CHAIN_NAMESPACE_PREFIX = "pdk.chain.";
+
     @BeforeAll
     static void requireConnectors() {
         DockerGate.require();
@@ -37,7 +49,7 @@ class RealMysqlToMongoSharedPositionIT {
 
     @ParameterizedTest
     @EnumSource(Tiers.class)
-    void anotherReaderAndARestartKeepThePositionButNotTheOtherReadersIdentity(Tiers tier) throws Exception {
+    void aSecondPipelineAndARestartKeepTheChainsPositionAndItsIdentity(Tiers tier) throws Exception {
         String suffix = tier.name().toLowerCase(Locale.ROOT);
         String first = "reader_first_" + suffix;
         String second = "reader_second_" + suffix;
@@ -49,11 +61,10 @@ class RealMysqlToMongoSharedPositionIT {
         String store = SharedMongo.replicaSetUrl("reader_position_store_" + suffix);
         String targetUri = SharedMongo.replicaSetUrl("reader_position_target_" + suffix);
         EndpointAddress target = EndpointAddress.uri(targetUri);
-        byte[] firstIdentity;
-        byte[] secondIdentity;
+        byte[] minted;
 
         try (MongoEndpoints mongo = new MongoEndpoints()) {
-            try (ServerHandle server = tier.launch(store)) {
+            try (ServerHandle server = tier.launch(store); StoreDocuments documents = StoreDocuments.at(store)) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
                 control.bootstrapAndLogin("e2e", "e2e-password");
                 control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
@@ -63,25 +74,29 @@ class RealMysqlToMongoSharedPositionIT {
                 sql(mysql, "UPDATE orders SET name='first-tail' WHERE id=1");
                 // The position face reports the durable source-read offset, not the snapshot seam.
                 // It is absent until CDC has delivered and acknowledged a real change.
-                Await.until("the first reader's tail position", () -> !control.resumePoint(first).isEmpty(),
+                Await.until("the first pipeline's tail position", () -> !control.resumePoint(first).isEmpty(),
                         () -> control.logs(first));
-                firstIdentity = identity(store, first, "first_source");
+                Await.until("the connector to have filed the identity it minted",
+                        () -> identity(store, documents) != null, () -> "chains=" + documents.miningChainIds());
+                minted = identity(store, documents);
 
-                // This is a new node with no state, taking a position issued by the first node. A new
-                // snapshot would hide that path by replacing the shared position with its own seam.
+                // The second pipeline reads the same database the same way, so it joins the chain the first
+                // started, and the capture widens to its table and restarts from that chain's position. A new
+                // snapshot would hide that path by replacing the chain's position with its own seam.
                 apply(control, mysql, targetUri, second, "second_source", "later_orders", "cdc_only");
                 sql(mysql, "INSERT INTO later_orders VALUES (2, 'second-tail')");
                 awaitIds(control, second, mongo, target, "later_orders", List.of(2L));
-                secondIdentity = identity(store, second, "second_source");
-                assertThat(secondIdentity).as("each live reader keeps a separate logical identity")
-                        .isNotEqualTo(firstIdentity);
-                assertThat(identity(store, first, "first_source")).isEqualTo(firstIdentity);
+                assertThat(documents.miningChainIds()).as("both pipelines read through one chain").hasSize(1);
+                assertThat(identity(store, documents))
+                        .as("the capture that widened to the second pipeline's table reads under the identity the "
+                                + "first run minted, rather than one minted for a reader it never starts")
+                        .isEqualTo(minted);
                 assertThat(control.state(first)).contains(PipelineState.RUNNING);
             }
 
             sql(mysql, "DELETE FROM orders WHERE id=1", "DELETE FROM later_orders WHERE id=2",
                     "INSERT INTO later_orders VALUES (3, 'during-downtime')");
-            try (ServerHandle server = tier.launch(store)) {
+            try (ServerHandle server = tier.launch(store); StoreDocuments documents = StoreDocuments.at(store)) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
                 control.login("e2e", "e2e-password");
                 sql(mysql, "INSERT INTO orders VALUES (99, 'after-restart')",
@@ -90,8 +105,9 @@ class RealMysqlToMongoSharedPositionIT {
                 // paths. RUNNING alone could have been an observation left by the previous process.
                 awaitIds(control, first, mongo, target, "orders", List.of(99L));
                 awaitIds(control, second, mongo, target, "later_orders", List.of(3L, 99L));
-                assertThat(identity(store, first, "first_source")).isEqualTo(firstIdentity);
-                assertThat(identity(store, second, "second_source")).isEqualTo(secondIdentity);
+                assertThat(identity(store, documents))
+                        .as("the run that came back reads under the identity the first run minted")
+                        .isEqualTo(minted);
                 assertThat(control.errorCount(first)).contains(0L);
                 assertThat(control.errorCount(second)).contains(0L);
             }
@@ -148,13 +164,18 @@ class RealMysqlToMongoSharedPositionIT {
                 .map(row -> ((Number) row.get("id")).longValue()).sorted().toList();
     }
 
-    private static byte[] identity(String store, String pipeline, String source) {
+    /**
+     * The identity the chain's connector filed under the one chain this tier's store holds, or null while it has
+     * filed none.
+     */
+    private static byte[] identity(String store, StoreDocuments documents) {
+        assertThat(documents.miningChainIds()).as("one chain in this tier's store").hasSize(1);
+        String namespace = CHAIN_NAMESPACE_PREFIX + documents.miningChainIds().iterator().next();
         try (MongoClient client = MongoClients.create(store)) {
-            Document id = new Document("ns", "pdk.state." + pipeline + "." + source).append("k", "SERVER_NAME");
+            Document id = new Document("ns", namespace).append("k", SERVER_NAME);
             Document record = client.getDatabase("tapstate_nest").getCollection("operator_state")
                     .find(new Document("_id", id)).first();
-            assertThat(record).as("the reader identity is durable for %s/%s", pipeline, source).isNotNull();
-            return record.get("state", Binary.class).getData();
+            return record == null ? null : record.get("state", Binary.class).getData();
         }
     }
 
