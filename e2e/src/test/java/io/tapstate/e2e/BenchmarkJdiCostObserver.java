@@ -84,7 +84,9 @@ final class BenchmarkJdiCostObserver {
         BOUNDED_NATIVE_SAMPLE("0.6.0", "f7b371f38fd6af3dfdf3ba2aca00612ff313de617cff53b251deb6ae77714635",
                 "ac6e406ac5a14fc93bf961f7898c58093e0ac84982e2340e548cfc6ea0ff1199"),
         PRE_EXECUTION_DIAGNOSTIC("0.6.0", "f7b371f38fd6af3dfdf3ba2aca00612ff313de617cff53b251deb6ae77714635",
-                "8d3805a29c469f7e505155a60acc62d8409e664876e637bb29303ac4488f69cc");
+                "8d3805a29c469f7e505155a60acc62d8409e664876e637bb29303ac4488f69cc"),
+        CURRENT_MAIN_OBSERVABILITY("0.6.0", "649a1e4cd64557aa6c9287f7705b379f875d998def0c12d2ca5687004f1cbf8b",
+                "8d66804d589a09c522a2d0b60d86a7ddeaa26768a2270707638592919435afb1");
 
         final String moduleVersion;
         final String referenceSha;
