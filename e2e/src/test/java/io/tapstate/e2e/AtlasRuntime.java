@@ -176,7 +176,9 @@ final class AtlasRuntime implements AutoCloseable {
         Instant expires = Instant.now().plusSeconds(900);
         respond(exchange, 200, Map.of("opId", "atlas-exchange", "code", "ok", "msg", "ok", "data", Map.of(
                 "jwt", jwt(audience, jti, expires), "expiresAt", expires.toString(), "jti", jti,
-                "userEmail", "atlas-user@example.test", "orgId", "atlas-data-org", "clusterId", CLUSTER)));
+                "userEmail", "atlas-user@example.test", "orgId", "atlas-data-org", "clusterId", CLUSTER,
+                "organizationName", "Atlas Test Organization", "clusterName", "Atlas Test Cluster",
+                "region", "test-region")));
     }
 
     private String jwt(String audience, String jti, Instant expires) {
