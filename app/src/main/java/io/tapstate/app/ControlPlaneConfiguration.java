@@ -801,9 +801,9 @@ class ControlPlaneConfiguration {
     @Bean
     StateStoreSetupService stateStoreSetupService(ApplyService apply, ArtifactQueryService artifacts,
             SourceRepresentation representation, ConnectionTestService connections,
-            @Value("${tapstate.deployment.profile:on-prem}") String deploymentProfile) {
+            CloudRuntimeSettings cloud) {
         return new StateStoreSetupService(apply, artifacts, representation,
-                DeploymentProfile.parse(deploymentProfile), connections);
+                cloud.cloud() ? DeploymentProfile.CLOUD : DeploymentProfile.ON_PREM, connections);
     }
 
     @Bean
