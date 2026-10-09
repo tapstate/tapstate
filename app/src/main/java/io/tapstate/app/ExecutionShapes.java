@@ -46,7 +46,8 @@ import java.util.function.Function;
  * <p>A nest or a join routes by the keys its own state is kept under, so it can always run wider than one
  * processor; what bounds it is what it costs. A nest's vertices each hold a thread of their own for the life of a
  * run, and every one of them runs as wide as the nest does, so they count against what a member may run of such
- * threads.
+ * threads. A nest with nothing to assemble keeps no state and draws no such vertex: it passes its root's rows on
+ * as they came, so like any step it runs wider than one processor only where those rows carry a key.
  *
  * <p>Every node is worked out here. A source always runs as one processor, and says so where its author asked
  * for more.
@@ -118,6 +119,21 @@ final class ExecutionShapes {
                 continue;
             }
             TransformBody body = inline.body();
+            if (body instanceof TransformBody.Nest nest && assemblesNothing(step.id(), graph)) {
+                emitted.put(step.id(), Map.of(step.id(), graph.assembledKeys().getOrDefault(step.id(), List.of())));
+                Map<String, List<String>> input = inputOf(rootOf(inline, nest), graph, emitted);
+                ExecutionSpec execution = step.execution();
+                boolean keyed = !input.isEmpty() && input.values().stream().noneMatch(List::isEmpty);
+                ParallelismRequest request = new ParallelismRequest(step.id(), ParallelismRequest.Kind.TRANSFORM,
+                        writtenIn(execution), keyed ? null : ParallelismRequest.Singleton.KEY_NOT_DERIVABLE, false,
+                        batchOf(execution).effectiveMaxRecords(), 0);
+                NodeParallelism parallelism = planned(pipelineId, ParallelismPlanner.plan(request, members, budget));
+                nodes.put(step.id(), parallelism);
+                if (parallelism.scope() == NodeParallelism.Scope.NATIVE) {
+                    inputKeys.put(step.id(), input);
+                }
+                continue;
+            }
             if (body instanceof TransformBody.Nest || body instanceof TransformBody.Join) {
                 emitted.put(step.id(), Map.of(step.id(), graph.assembledKeys().getOrDefault(step.id(), List.of())));
                 ExecutionSpec execution = step.execution();
@@ -174,6 +190,19 @@ final class ExecutionShapes {
         targets.values().forEach(target -> tables.add(target.table()));
         boolean anyKeyless = targets.values().stream().anyMatch(target -> !target.keyed());
         return tables.size() == 1 && anyKeyless ? ParallelismRequest.Singleton.SINGLE_TARGET_KEYLESS : null;
+    }
+
+    /** Whether a nest step draws no vertex holding a thread of its own: only one with nothing to assemble. */
+    private static boolean assemblesNothing(String stepId, Graph graph) {
+        return Integer.valueOf(0).equals(graph.blockingVertices().get(stepId));
+    }
+
+    /** The rows a nest's root reads, as a list to walk: none where its root names no alias of the step. */
+    private static FromClause rootOf(Step.Inline step, TransformBody.Nest nest) {
+        if (step.from() instanceof FromClause.Aliases aliases && aliases.aliases().get(nest.root().from()) != null) {
+            return FromClause.list(aliases.aliases().get(nest.root().from()));
+        }
+        return null;
     }
 
     private static Integer writtenIn(ExecutionSpec execution) {

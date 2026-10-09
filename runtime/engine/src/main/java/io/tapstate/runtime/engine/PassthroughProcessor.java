@@ -65,14 +65,8 @@ public final class PassthroughProcessor extends AbstractProcessor {
     public static ProcessorMetaSupplier metaSupplier(String vertexName, ChainAxes axes,
             Map<Integer, List<String>> chainsByOrdinal) {
         Objects.requireNonNull(vertexName, "vertexName");
-        SupplierEx<Processor> supplier = axes == null
-                ? PassthroughProcessor::new
-                // Holding nothing back is the whole of this vertex's own contribution: what it may promise
-                // is exactly the lowest of what its edges promised.
-                : () -> new PassthroughProcessor(
-                        new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING));
         // Its stand-ins on the other members pass its bounds on as it does; see TotalOne.
-        return TotalOne.passingBounds(ProcessorSupplier.of(supplier), vertexName, axes, chainsByOrdinal);
+        return TotalOne.passingBounds(processors(axes, chainsByOrdinal), vertexName, axes, chainsByOrdinal);
     }
 
     /**
@@ -84,11 +78,21 @@ public final class PassthroughProcessor extends AbstractProcessor {
     public static ProcessorMetaSupplier nativeMetaSupplier(String vertexName, ChainAxes axes,
             Map<Integer, List<String>> chainsByOrdinal, int plannedMembers) {
         Objects.requireNonNull(vertexName, "vertexName");
+        return PlannedMembersGuard.of(ProcessorMetaSupplier.of(processors(axes, chainsByOrdinal)), plannedMembers);
+    }
+
+    /**
+     * The processors of a passthrough vertex, however many of them it runs: each works out how far each chain
+     * has got from what arrived on each edge where {@code axes} is given, and propagates no frontier where not.
+     */
+    public static ProcessorSupplier processors(ChainAxes axes, Map<Integer, List<String>> chainsByOrdinal) {
         SupplierEx<Processor> supplier = axes == null
                 ? PassthroughProcessor::new
+                // Holding nothing back is the whole of this vertex's own contribution: what it may promise
+                // is exactly the lowest of what its edges promised.
                 : () -> new PassthroughProcessor(
                         new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING));
-        return PlannedMembersGuard.of(ProcessorMetaSupplier.of(ProcessorSupplier.of(supplier)), plannedMembers);
+        return ProcessorSupplier.of(supplier);
     }
 
     @Override

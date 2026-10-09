@@ -90,6 +90,36 @@ class ANestRunsAtTheWidthItsNodeWasWorkedOutForTest {
     }
 
     /**
+     * A nest with no embeds assembles nothing and passes its root's rows on as they came, through one vertex that
+     * keeps no state - and that vertex runs the width the node was worked out for, routing each row by the key it
+     * carries the way any step does, and takes its input in the batches its author asked for. Drawn as the
+     * single processor it used to be, the run would do something other than what its plan reports.
+     */
+    @Test
+    void aNestThatAssemblesNothingRunsItsWidthAndTakesItsInputInItsBatches() {
+        TransformBody.Nest rootOnly = new TransformBody.Nest(null, null,
+                new NestRoot("c", List.of("customer_id"), null, null, List.of()));
+        ExecutionShape wide = new ExecutionShape(1, Map.of("doc", new NodeParallelism("doc", 3,
+                NodeParallelism.Origin.EXPLICIT, NodeParallelism.Scope.NATIVE, 1, 3, 3, List.of())),
+                Map.of("doc", Map.of("customers", List.of("customer_id"))));
+
+        DAG dag = PipelineDagBuilder.build(pipeline(rootOnly, new ExecutionSpec(3, new BatchSpec(8, null))),
+                bindings(), null, null, wide);
+
+        Vertex vertex = dag.getVertex("doc");
+        assertThat(vertex.getLocalParallelism()).as("the node's width on each member").isEqualTo(3);
+        assertThat(InputBatches.takesInputInBatches(vertex.getMetaSupplier())).as("its author's batches").isTrue();
+        assertThat(dag.getInboundEdges("doc")).isNotEmpty().allSatisfy(edge ->
+                assertThat(edge.getPartitioner().getConstantPartitioningKey())
+                        .as("%s -> doc is routed by the key of each row", edge.getSourceName()).isNull());
+
+        DAG one = PipelineDagBuilder.build(pipeline(rootOnly, new ExecutionSpec(null, new BatchSpec(8, null))),
+                bindings());
+        assertThat(InputBatches.takesInputInBatches(one.getVertex("doc").getMetaSupplier()))
+                .as("as one processor too, it takes its input in its author's batches").isTrue();
+    }
+
+    /**
      * A wide nest is held to the member count its width was worked out for: a run that starts on any other count
      * is refused before a single processor runs, like any node run wide, rather than running a number of them
      * nobody worked out.
@@ -132,10 +162,14 @@ class ANestRunsAtTheWidthItsNodeWasWorkedOutForTest {
     }
 
     private static PipelineResource pipeline(ExecutionSpec execution) {
+        return pipeline(BODY, execution);
+    }
+
+    private static PipelineResource pipeline(TransformBody.Nest body, ExecutionSpec execution) {
         Map<String, FromRef> aliases = new LinkedHashMap<>();
         aliases.put("c", FromRef.literal("customers"));
         aliases.put("o", FromRef.literal("orders"));
-        Step step = Step.inline("doc", FromClause.aliases(aliases), BODY, execution, null);
+        Step step = Step.inline("doc", FromClause.aliases(aliases), body, execution, null);
         return new PipelineResource("p", null, List.of(SourceRef.bare("customers"), SourceRef.bare("orders")),
                 List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal("doc"),

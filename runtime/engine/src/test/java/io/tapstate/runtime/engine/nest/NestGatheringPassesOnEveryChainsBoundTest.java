@@ -91,7 +91,7 @@ class NestGatheringPassesOnEveryChainsBoundTest {
         Vertex gathered = NestDag.attach(dag, topology, "doc", "customer", "doc",
                 alias -> List.of(left, right), null, vertex -> 0,
                 new NestFrontier(AXES, alias -> List.of(List.of(LEFT), List.of(RIGHT))),
-                new NodeWidth("doc", 4, 1, null));
+                NodeWidth.totalOne("doc", null));
 
         Vertex collector = dag.newVertex("collector",
                 ProcessorSupplier.of((SupplierEx<Processor>) Collector::new)).localParallelism(1);

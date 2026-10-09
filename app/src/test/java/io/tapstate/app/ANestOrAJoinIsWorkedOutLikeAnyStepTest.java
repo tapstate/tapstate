@@ -68,6 +68,28 @@ class ANestOrAJoinIsWorkedOutLikeAnyStepTest {
                 .localOf("j")).isEqualTo(16);
     }
 
+    /**
+     * A nest with nothing to assemble keeps no state to route by and draws no vertex holding a thread: it passes
+     * its root's rows on as they came. So, like any step, it runs wide where those rows carry a key, routed by
+     * it, and is held to one processor where they carry none - refused where its author asked for more.
+     */
+    @Test
+    void aNestWithNothingToAssembleIsWorkedOutOverTheKeyOfItsRootsRows() {
+        ExecutionShape keyed = shape(3, nest(new ExecutionSpec(8, null)), join(null), Map.of("doc", 0),
+                Map.of("orders", List.of("id"), "customers", List.of("id")));
+
+        assertThat(keyed.localOf("doc")).isEqualTo(3);
+        assertThat(keyed.inputKeysOf("doc")).isEqualTo(Map.of("orders", List.of("id")));
+
+        assertThatThrownBy(() -> shape(3, nest(new ExecutionSpec(8, null)), join(null), Map.of("doc", 0),
+                Map.of("orders", List.of(), "customers", List.of("id"))))
+                .isInstanceOfSatisfying(TapstateException.class, refused -> {
+                    assertThat(refused.code()).isEqualTo(ActuationError.PARALLELISM_NEEDS_A_KEY);
+                    assertThat(refused.args()).containsEntry("node", "doc")
+                            .containsEntry("reason", "key-not-derivable");
+                });
+    }
+
     private static Step nest(ExecutionSpec execution) {
         TransformBody body = new TransformBody.Nest(null, null,
                 new NestRoot("o", List.of("id"), null, null, List.of()));
@@ -83,12 +105,17 @@ class ANestOrAJoinIsWorkedOutLikeAnyStepTest {
     }
 
     private static ExecutionShape shape(int members, Step nest, Step join, Map<String, Integer> blocking) {
+        return shape(members, nest, join, blocking, Map.of("orders", List.of("id"), "customers", List.of("id")));
+    }
+
+    private static ExecutionShape shape(int members, Step nest, Step join, Map<String, Integer> blocking,
+            Map<String, List<String>> tableKeys) {
         PipelineResource pipeline = new PipelineResource("p", null,
                 List.of(SourceRef.bare("orders"), SourceRef.bare("customers")), List.of(nest, join),
                 null, null, null, null);
         ExecutionShapes.Graph graph = new ExecutionShapes.Graph(ref -> List.of(((FromRef.Literal) ref).ref()),
                 Map.of("orders", "orders", "customers", "customers"),
-                Map.of("orders", List.of("id"), "customers", List.of("id")),
+                tableKeys,
                 Map.of("doc", List.of("id"), "j", List.of("id")),
                 blocking,
                 Map.of());

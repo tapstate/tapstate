@@ -407,7 +407,12 @@ public final class PipelineDagBuilder {
                             chains == null ? null : new NestFrontier(axes,
                                     alias -> chains.perProducer(
                                             aliasUpstream(inline.from(), alias, bindings))),
-                            shape.widthOf(step.id(), writtenBatch(step)).drawingInto(drawn)));
+                            shape.widthOf(step.id(), writtenBatch(step)).drawingInto(drawn),
+                            // A nest that assembles nothing keeps no state to route by, so where it runs on
+                            // every member its rows go by their own key, as they would into any step.
+                            topology.isPassthrough() && shape.isNative(step.id())
+                                    ? RoutingKeys.forNode(step.id(), shape.inputKeysOf(step.id()))
+                                    : null));
                     if (chains != null) {
                         chains.assembled(step.id(), nestUpstream(inline.from(), bindings));
                     }

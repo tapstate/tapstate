@@ -46,6 +46,14 @@ public final class NestDag {
     private NestDag() {
     }
 
+    /** As below, for a nest that cannot run as a passthrough wider than one processor. */
+    public static Vertex attach(DAG dag, NestTopology topology, String nodeId, String rootAlias,
+            String outputStream, Function<String, List<Vertex>> upstream, NestBinding binding,
+            ToIntFunction<Vertex> nextOutbound, NestFrontier frontier, NodeWidth width) {
+        return attach(dag, topology, nodeId, rootAlias, outputStream, upstream, binding, nextOutbound, frontier,
+                width, null);
+    }
+
     /**
      * Builds the node into {@code dag} and returns the vertex the rest of the pipeline reads from. A
      * passthrough nest builds one identity vertex fed by the root stream: it assembles nothing, so it
@@ -56,17 +64,29 @@ public final class NestDag {
      * the run like any other node's; nothing here takes the engine's own answer, which is the member's core
      * count, the budget for work that computes rather than for vertices that each hold a thread of their own
      * waiting on a state map.
+     *
+     * <p>A passthrough's one vertex runs as {@code width} says too, and takes its input in the node's batches:
+     * where it runs on every member, each row goes by {@code passthroughKey}, the key the rows reaching it carry,
+     * so one row's changes still meet on one processor in the order they were read.
      */
     public static Vertex attach(DAG dag, NestTopology topology, String nodeId, String rootAlias,
             String outputStream, Function<String, List<Vertex>> upstream, NestBinding binding,
-            ToIntFunction<Vertex> nextOutbound, NestFrontier frontier, NodeWidth width) {
+            ToIntFunction<Vertex> nextOutbound, NestFrontier frontier, NodeWidth width,
+            FunctionEx<Object, Object> passthroughKey) {
         if (topology.isPassthrough()) {
+            if (width.isNative() && passthroughKey == null) {
+                throw new IllegalStateException("passthrough nest '" + nodeId
+                        + "' runs on every member but was given no key to route its rows by");
+            }
             List<Vertex> sources = upstream.apply(rootAlias);
-            Vertex passthrough =
-                    dag.newVertex(nodeId, gathering(nodeId, frontier, rootAlias, sources.size()));
+            ChainAxes axes = frontier == null ? null : frontier.axes();
+            Map<Integer, List<String>> chains = frontier == null ? null
+                    : chainsByProducer(frontier, rootAlias, sources.size());
+            Vertex passthrough = width.sized(dag.newVertex(nodeId,
+                    width.metaSupplier(nodeId, PassthroughProcessor.processors(axes, chains), axes, chains)));
             int ordinal = 0;
             for (Vertex source : sources) {
-                gather(dag, source, passthrough, ordinal++, nextOutbound);
+                draw(dag, source, passthrough, ordinal++, passthroughKey, nextOutbound, width);
             }
             return passthrough;
         }
@@ -273,6 +293,12 @@ public final class NestDag {
         if (frontier == null) {
             return PassthroughProcessor.metaSupplier(vertexName);
         }
+        return PassthroughProcessor.metaSupplier(vertexName, frontier.axes(),
+                chainsByProducer(frontier, alias, producers));
+    }
+
+    /** The chains each of {@code alias}'s producers carries, by the ordinal its edge arrives on. */
+    private static Map<Integer, List<String>> chainsByProducer(NestFrontier frontier, String alias, int producers) {
         List<List<String>> chains = frontier.chainsOfAliasByProducer().apply(alias);
         if (chains.size() != producers) {
             throw new IllegalStateException("alias '" + alias + "' is wired from " + producers
@@ -282,7 +308,7 @@ public final class NestDag {
         for (int ordinal = 0; ordinal < chains.size(); ordinal++) {
             byOrdinal.put(ordinal, chains.get(ordinal));
         }
-        return PassthroughProcessor.metaSupplier(vertexName, frontier.axes(), byOrdinal);
+        return byOrdinal;
     }
 
     /**
