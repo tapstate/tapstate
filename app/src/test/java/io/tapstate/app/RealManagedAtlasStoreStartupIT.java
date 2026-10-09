@@ -45,8 +45,9 @@ class RealManagedAtlasStoreStartupIT {
     private static final String NAMESPACE = "managed-atlas-bootstrap";
     private static final String COLLECTION = "bootstrap_proof";
     private static final String ATLAS_CONNECTOR = "mongodb-atlas";
+    private static final String AUTHORED_SOURCE = "authored-proof";
     private static final List<String> CONNECTORS = List.of(
-            "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql");
+            "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2");
     private static final byte[] COLD_STATE = "stored-before-restart".getBytes(StandardCharsets.UTF_8);
 
     @Test
@@ -81,8 +82,13 @@ class RealManagedAtlasStoreStartupIT {
                         seedDirectory, "1h", firstReady)) {
                     StorePort store = readyStore(first, firstReady, operator);
                     store.keyedState().save(NAMESPACE, "key", COLD_STATE);
-                    SourceResource viewSource = viewSource(store);
-                    String viewUri = viewUri(viewSource, views);
+                    // Source ciphertext is proved with authored fixture config, never with the
+                    // deployment's actual Atlas connection. Views database access is observed separately.
+                    store.artifacts().create(new SourceResource(AUTHORED_SOURCE, null, "mongodb",
+                            Map.of("isUri", true, "uri", "mongodb://source-user:source-secret@user.example/owned"),
+                            null, null, null, null));
+                    SourceResource authored = authoredSource(store);
+                    String viewUri = ViewStoreSeedRunner.viewsUri(metadataUri, views);
                     try (MongoClient materialization = MongoClients.create(viewUri)) {
                         materialization.getDatabase(views).getCollection(COLLECTION)
                                 .insertOne(new Document("_id", "before-restart").append("value", 1));
@@ -93,7 +99,7 @@ class RealManagedAtlasStoreStartupIT {
                     store.rateHistory().append(sample);
                     assertHistory(observer.getDatabase(metadata), store, sample, Duration.ofHours(1));
                     assertSystemStorage(observer, databases, store, metadataUri);
-                    sourceHash = CanonicalHash.of(viewSource);
+                    sourceHash = CanonicalHash.of(authored);
                     registrations = assertConnectors(observer.getDatabase(metadata), store, seedDirectory);
                     collectionBefore = historyCollection(observer.getDatabase(metadata));
                 }
@@ -104,9 +110,9 @@ class RealManagedAtlasStoreStartupIT {
                     StorePort store = readyStore(restarted, restartedReady, operator);
                     assertThat(store.keyedState().load(NAMESPACE, "key"))
                             .hasValueSatisfying(bytes -> assertThat(bytes).isEqualTo(COLD_STATE));
-                    SourceResource viewSource = viewSource(store);
-                    assertThat(CanonicalHash.of(viewSource)).isEqualTo(sourceHash);
-                    try (MongoClient materialization = MongoClients.create(viewUri(viewSource, views))) {
+                    SourceResource authored = authoredSource(store);
+                    assertThat(CanonicalHash.of(authored)).isEqualTo(sourceHash);
+                    try (MongoClient materialization = MongoClients.create(ViewStoreSeedRunner.viewsUri(metadataUri, views))) {
                         assertThat(materialization.getDatabase(views).getCollection(COLLECTION)
                                 .countDocuments(new Document("_id", "before-restart").append("value", 1)))
                                 .isEqualTo(1);
@@ -149,21 +155,15 @@ class RealManagedAtlasStoreStartupIT {
         assertThat(context.getBean(CloudRuntimeSettings.class).cloud()).isTrue();
         StorePort store = context.getBean(StorePort.class);
         assertThat(store.operatorStateStores().defaultDatabase()).isEqualTo(operator);
+        assertThat(store.artifacts().get(ViewTargetResolver.STATE_STORE_SOURCE_ID)).isEmpty();
         return store;
     }
 
-    private static SourceResource viewSource(StorePort store) {
-        var resource = store.artifacts().get(ViewTargetResolver.STATE_STORE_SOURCE_ID)
-                .orElseThrow(() -> new AssertionError("the managed views Source is absent"));
-        assertThat(resource instanceof SourceResource).as("the managed views resource is a Source").isTrue();
+    private static SourceResource authoredSource(StorePort store) {
+        var resource = store.artifacts().get(AUTHORED_SOURCE)
+                .orElseThrow(() -> new AssertionError("the authored fixture Source is absent"));
+        assertThat(resource instanceof SourceResource).as("the authored resource is a Source").isTrue();
         return (SourceResource) resource;
-    }
-
-    private static String viewUri(SourceResource source, String views) {
-        assertThat(source.config().get("uri") instanceof String).as("the managed views connection supplies a URI").isTrue();
-        String uri = (String) source.config().get("uri");
-        assertThat(databaseName(uri).equals(views)).as("the saved connection targets only the assigned views database").isTrue();
-        return uri;
     }
 
     private static void assertSystemStorage(MongoClient observer, List<String> databases, StorePort store, String metadataUri) {
@@ -172,12 +172,15 @@ class RealManagedAtlasStoreStartupIT {
         assertThat(schema != null).as("migration persisted its schema version").isTrue();
         assertThat(schema.getInteger("installedVersion")).isEqualTo(MigrationRunner.SUPPORTED_VERSION);
         Document source = SystemCollections.ARTIFACTS.on(metadata)
-                .find(new Document("_id", ViewTargetResolver.STATE_STORE_SOURCE_ID)).first();
-        assertThat(source != null && source.get("body") instanceof Document).as("the managed Source is persisted").isTrue();
+                .find(new Document("_id", AUTHORED_SOURCE)).first();
+        assertThat(source != null && source.get("body") instanceof Document).as("the authored Source is persisted").isTrue();
+        assertThat(SystemCollections.ARTIFACTS.on(metadata)
+                .countDocuments(new Document("_id", ViewTargetResolver.STATE_STORE_SOURCE_ID))).isZero();
         Object config = source.get("body", Document.class).get("config");
         assertThat(config instanceof String).as("the whole saved config is a ciphertext string").isTrue();
         String envelope = (String) config;
         assertThat(envelope.startsWith("tscfg:1:")).as("the saved config has its authenticated envelope").isTrue();
+        assertThat(envelope).doesNotContain("source-user", "source-secret", "user.example");
         String authority = parsedUri(metadataUri).getRawAuthority();
         int at = authority == null ? -1 : authority.lastIndexOf('@');
         String rawPassword = at < 0 ? null : authority.substring(0, at);
@@ -188,7 +191,7 @@ class RealManagedAtlasStoreStartupIT {
                 assertThat(envelope.contains(decoded(rawPassword))).as("ciphertext contains no decoded password").isFalse();
             }
         }
-        assertThat(CanonicalHash.of(viewSource(store)).equals(source.getString("contentHash")))
+        assertThat(CanonicalHash.of(authoredSource(store)).equals(source.getString("contentHash")))
                 .as("the persisted Source retains its logical content hash").isTrue();
         assertThat(SystemCollections.OPERATOR_STATE.on(observer.getDatabase(databases.get(1)))
                 .countDocuments(new Document("_id.ns", NAMESPACE))).isEqualTo(1);

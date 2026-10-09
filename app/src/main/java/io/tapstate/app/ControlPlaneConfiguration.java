@@ -542,9 +542,10 @@ class ControlPlaneConfiguration {
         // built from the deployment's own store URI, which is the last one that should be the exception.
         // It changes nothing observable while the mongodb catalog marks `uri` non-secret; what it
         // removes is a seam where a later change to that marking would silently not apply here.
-        return new ViewStoreSeedRunner(
-                artifactStore, cloud.metadataUri(mongoProperties.getUri()), mongoProperties.getTlsCaFile(),
-                cloud.viewsDatabase(ViewTargetResolver.STATE_STORE_SOURCE_ID), cloud.cloud(), !cloud.cloud());
+        // Only on-prem deployments seed a views Source. Cloud never publishes its metadata
+        // connection as a Source and leaves any existing views resource untouched on restart.
+        if (cloud.cloud()) return new ViewStoreSeedRunner(artifactStore, null, null, false);
+        return new ViewStoreSeedRunner(artifactStore, mongoProperties.getUri(), mongoProperties.getTlsCaFile());
     }
 
     @Bean

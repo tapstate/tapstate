@@ -1,13 +1,8 @@
 package io.tapstate.app;
 
 import io.tapstate.core.model.SourceResource;
-import io.tapstate.core.common.TapstateException;
-import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.spi.store.ArtifactMutation;
 import io.tapstate.spi.store.ArtifactStore;
-import java.net.URI;
-import java.net.URISyntaxException;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.regex.Pattern;
@@ -16,8 +11,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.SmartInitializingSingleton;
 
 /**
- * Registers the managed state store views materialize into, once at startup, so a deployment has one
- * without anyone declaring it.
+ * Registers the managed state store views materialize into, once at on-prem startup, so a deployment
+ * has one without anyone declaring it. Cloud startup disables this runner.
  *
  * <p>It used to be a file the demo script wrote and the user applied, which made the store look like part
  * of the workspace an author owns. It is not: it is the deployment's, the same store the server already
@@ -30,10 +25,8 @@ import org.springframework.beans.factory.SmartInitializingSingleton;
  * and a second setting would be one more thing to get wrong for a deployment that has no second instance
  * to name.
  *
- * <p>On-prem seeding never overwrites an existing resource. In Cloud the deployment determines the view
- * database and credentials: a compatible legacy connection to that same target is refreshed by CAS.
- * This shape is a compatibility rule, not proof of authorship; recognizable authored or conflicting
- * resources are refused rather than overwritten. Every member must use coherent deployment settings.
+ * <p>Seeding never overwrites an existing resource. Cloud startup neither creates a views Source nor
+ * renews an existing connection from deployment credentials.
  */
 final class ViewStoreSeedRunner implements SmartInitializingSingleton {
 
@@ -51,36 +44,16 @@ final class ViewStoreSeedRunner implements SmartInitializingSingleton {
     private final ArtifactStore artifacts;
     private final String serverStoreUri;
     private final String tlsCaFile;
-    private final String viewsDatabase;
-    private final boolean cloud;
     private final boolean enabled;
 
     ViewStoreSeedRunner(ArtifactStore artifacts, String serverStoreUri, String tlsCaFile) {
-        this(artifacts, serverStoreUri, tlsCaFile, ViewTargetResolver.STATE_STORE_SOURCE_ID, false, true);
+        this(artifacts, serverStoreUri, tlsCaFile, true);
     }
 
     ViewStoreSeedRunner(ArtifactStore artifacts, String serverStoreUri, String tlsCaFile, boolean enabled) {
-        this(artifacts, serverStoreUri, tlsCaFile, ViewTargetResolver.STATE_STORE_SOURCE_ID, false, enabled);
-    }
-
-    ViewStoreSeedRunner(
-            ArtifactStore artifacts, String serverStoreUri, String tlsCaFile, String viewsDatabase) {
-        this(artifacts, serverStoreUri, tlsCaFile, viewsDatabase, false, true);
-    }
-
-    ViewStoreSeedRunner(
-            ArtifactStore artifacts, String serverStoreUri, String tlsCaFile, String viewsDatabase, boolean cloud) {
-        this(artifacts, serverStoreUri, tlsCaFile, viewsDatabase, cloud, true);
-    }
-
-    ViewStoreSeedRunner(
-            ArtifactStore artifacts, String serverStoreUri, String tlsCaFile,
-            String viewsDatabase, boolean cloud, boolean enabled) {
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
-        this.serverStoreUri = Objects.requireNonNull(serverStoreUri, "serverStoreUri");
-        this.tlsCaFile = tlsCaFile;
-        this.viewsDatabase = Objects.requireNonNull(viewsDatabase, "viewsDatabase");
-        this.cloud = cloud;
+        this.serverStoreUri = enabled ? Objects.requireNonNull(serverStoreUri, "serverStoreUri") : null;
+        this.tlsCaFile = enabled ? tlsCaFile : null;
         this.enabled = enabled;
     }
 
@@ -103,7 +76,7 @@ final class ViewStoreSeedRunner implements SmartInitializingSingleton {
         }
         SourceResource store = new SourceResource(
                 id, null, CONNECTOR,
-                Map.of("isUri", true, "uri", viewsUri(serverStoreUri, viewsDatabase)),
+                Map.of("isUri", true, "uri", viewsUri(serverStoreUri)),
                 // No mode and no tables: this is a connection supplier, not something to read from. The
                 // distinction is load-bearing -- a resource under this id that declares capture settings
                 // is refused as an authored source rather than written into.
@@ -111,68 +84,9 @@ final class ViewStoreSeedRunner implements SmartInitializingSingleton {
         ArtifactMutation outcome = artifacts.create(store);
         if (outcome == ArtifactMutation.CREATED) {
             LOG.info("Registered the managed state store '{}' for views to materialize into", id);
-        } else if (cloud) {
-            refreshCloudConnection(store);
         } else {
             LOG.info("The managed state store '{}' is already declared; leaving it as it is", id);
         }
-    }
-
-    private void refreshCloudConnection(SourceResource desired) {
-        var observed = artifacts.get(desired.id()).orElseThrow(ViewStoreSeedRunner::cloudConflict);
-        if (!(observed instanceof SourceResource current)
-                || current.metadata() != null || !CONNECTOR.equals(current.connector())
-                || current.mode() != null || current.tables() != null || current.srs() != null
-                || current.experimental() != null
-                || !current.config().keySet().equals(java.util.Set.of("isUri", "uri"))
-                || !Boolean.TRUE.equals(current.config().get("isUri"))
-                || !(current.config().get("uri") instanceof String currentUri)) {
-            throw cloudConflict();
-        }
-        String desiredUri = (String) desired.config().get("uri");
-        String currentTarget = connectionTarget(currentUri);
-        if (currentTarget == null || !currentTarget.equals(connectionTarget(desiredUri))) throw cloudConflict();
-        if (current.equals(desired)) {
-            registerAcceptedConnection(current);
-            return;
-        }
-        ArtifactMutation replaced = artifacts.replace(desired.id(), CanonicalHash.of(current), desired);
-        if (replaced != ArtifactMutation.REPLACED
-                && !(replaced == ArtifactMutation.VERSION_CONFLICT
-                        && artifacts.get(desired.id()).filter(desired::equals).isPresent())) {
-            // A conflicting writer is not a license to retry with its hash and overwrite it.
-            throw cloudConflict();
-        }
-        registerAcceptedConnection(desired);
-        LOG.info("Refreshed the managed state store '{}' from the Cloud deployment settings", desired.id());
-    }
-
-    private void registerAcceptedConnection(SourceResource accepted) {
-        // Another member can commit after this node took its initial redactor snapshot.
-        if (artifacts instanceof SecretTrackingArtifactStore tracked) tracked.trackLoaded(accepted);
-    }
-
-    /** Same scheme, hosts, database and options; only URI userinfo may change during renewal. */
-    private static String connectionTarget(String value) {
-        try {
-            URI parsed = new URI(value);
-            String scheme = parsed.getScheme();
-            String authority = parsed.getRawAuthority();
-            if (scheme == null || !(scheme.equalsIgnoreCase("mongodb") || scheme.equalsIgnoreCase("mongodb+srv"))
-                    || authority == null || parsed.getRawPath() == null || parsed.getRawFragment() != null) return null;
-            String hosts = authority.substring(authority.lastIndexOf('@') + 1);
-            if (hosts.isBlank()) return null;
-            return scheme.toLowerCase(Locale.ROOT) + "://" + hosts.toLowerCase(Locale.ROOT) + parsed.getRawPath()
-                    + (parsed.getRawQuery() == null ? "" : "?" + parsed.getRawQuery());
-        } catch (URISyntaxException invalid) {
-            // The parser quotes the input, including credentials; it must not travel into diagnostics.
-            return null;
-        }
-    }
-
-    private static TapstateException cloudConflict() {
-        return new TapstateException(BootError.CLOUD_VIEW_STORE_CONFLICT,
-                Map.of("store", ViewTargetResolver.STATE_STORE_SOURCE_ID), null);
     }
 
     /**
