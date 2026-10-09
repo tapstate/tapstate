@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.testsupport.DockerGate;
 import java.io.ByteArrayInputStream;
@@ -11,10 +12,13 @@ import java.io.ObjectInputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
+import java.util.function.Supplier;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.io.TempDir;
@@ -85,8 +89,54 @@ class AFilteredChangeStillAdvancesItsTableIT {
             assertThat(sequence(control.resumePoint(PIPELINE).get("token")))
                     .as("the resume point passes the dropped change without another passing order")
                     .isGreaterThanOrEqualTo(2);
-            assertThat(control.state(PIPELINE)).contains(PipelineState.RUNNING);
+            assertCurrentRunning(control, documents, tier);
         }
+    }
+
+    private static void assertCurrentRunning(ControlPlane control, StoreDocuments documents, Tiers tier) {
+        Document identityBefore = documents.benchmarkRunIdentity(PIPELINE);
+        Document artifact = identityBefore.get("artifact", Document.class);
+        var executions = identityBefore.getList("executionAuthority", Document.class);
+        assertThat(executions).hasSize(1);
+        var expectedScope = new ObservationStore.Scope(artifact.getString("pipelineIncarnationId"),
+                ((Number) executions.getFirst().get("executionGeneration")).longValue());
+        long firstReadStarted = System.nanoTime();
+        String firstReadStartedAt = Instant.now().toString();
+        var firstState = control.state(PIPELINE);
+        long firstReadCompleted = System.nanoTime();
+        Document witness = new Document("tier", tier.name()).append("identityBefore", identityBefore)
+                .append("firstReadStartedAt", firstReadStartedAt).append("firstReadStartedNanos", firstReadStarted)
+                .append("firstReadCompletedNanos", firstReadCompleted)
+                .append("firstState", firstState.map(Enum::name).orElse(null));
+        System.out.println("filtered-tail-status-first " + witness.toJson());
+
+        // Target acknowledgement and current observation are published independently.
+        PipelineState state = requireCurrentRunning(firstState, () -> control.state(PIPELINE));
+        long finalReadCompleted = System.nanoTime();
+        String finalReadCompletedAt = Instant.now().toString();
+        Document identityAfter = documents.benchmarkRunIdentity(PIPELINE);
+        assertThat(identityAfter).as("the same artifact and submitted execution remain current").isEqualTo(identityBefore);
+        var latest = documents.observationOf(PIPELINE).orElseThrow(
+                () -> new AssertionError("an HTTP current state needs a readable logical latest"));
+        assertThat(latest.scope()).contains(expectedScope);
+        assertThat(latest.observation().state()).isEqualTo(PipelineState.RUNNING);
+        witness.append("identityAfter", identityAfter).append("finalState", state.name())
+                .append("finalReadCompletedNanos", finalReadCompleted)
+                .append("finalReadCompletedAt", finalReadCompletedAt)
+                .append("statusObservedAt", control.statusObservedAt(PIPELINE).toString())
+                .append("latestScope", new Document("pipelineIncarnationId", expectedScope.pipelineIncarnationId())
+                        .append("executionGeneration", expectedScope.executionGeneration()))
+                .append("latestState", latest.observation().state().name())
+                .append("latestObservedAt", latest.observation().observedAt().toString());
+        System.out.println("filtered-tail-status-final " + witness.toJson());
+    }
+
+    static PipelineState requireCurrentRunning(Optional<PipelineState> firstState,
+            Supplier<Optional<PipelineState>> laterState) {
+        PipelineState state = firstState.orElseGet(() -> Await.answered("the current observation to be published",
+                TIMEOUT, laterState));
+        assertThat(state).isEqualTo(PipelineState.RUNNING);
+        return state;
     }
 
     private static long rowCount(Path directory, String table) {
