@@ -22,12 +22,18 @@ test('the controlled peer signs real RS256 claims and consumes a code once', asy
     { 'X-Cluster-Identity-Secret': TOKEN });
   const response = await exchange();
   assert.equal(response.status, 200);
-  const { jwt, jti } = (await response.json()).data;
+  const data = (await response.json()).data;
+  const { jwt, jti, orgId, clusterId, organizationName, clusterName, region } = data;
+  assert.deepEqual({ orgId, clusterId, organizationName, clusterName, region }, {
+    orgId: 'image-runtime-org', clusterId: CLUSTER,
+    organizationName: 'Image Smoke Organization', clusterName: 'Image Smoke Cluster', region: 'us-east-1',
+  });
   const [head, payload, signature] = jwt.split('.');
   const claims = JSON.parse(Buffer.from(payload, 'base64url'));
   assert.equal(claims.iss, 'http://gateway:3000');
   assert.equal(claims.aud, '127.0.0.1');
-  assert.equal(claims.cluster_id, CLUSTER);
+  assert.equal(claims.org_id, orgId);
+  assert.equal(claims.cluster_id, clusterId);
   assert.equal(claims.user_id, 'image-runtime-user');
   assert.equal(claims.jti, jti);
   assert.equal(claims.exp - claims.iat, 900);

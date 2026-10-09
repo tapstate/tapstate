@@ -56,7 +56,8 @@ export function createWireFixture({ issuer, version, audience = '127.0.0.1' }) {
         const jwt = `${signed}.${sign('RSA-SHA256', Buffer.from(signed), privateKey).toString('base64url')}`;
         return reply(res, 200, envelope({ jwt, expiresAt: new Date((now + 900) * 1000).toISOString(),
           jti: 'image-runtime-jti', userEmail: 'image-user@example.test',
-          orgId: 'image-runtime-org', clusterId: CLUSTER }));
+          orgId: 'image-runtime-org', clusterId: CLUSTER,
+          organizationName: 'Image Smoke Organization', clusterName: 'Image Smoke Cluster', region: 'us-east-1' }));
       }
       if (req.url === `/v1/api/clusters/${CLUSTER}/status-report` && req.method === 'POST') {
         assert.equal(req.headers.authorization, `Bearer ${TOKEN}`);

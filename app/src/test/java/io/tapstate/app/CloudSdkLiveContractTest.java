@@ -15,6 +15,7 @@ import io.tapstate.control.core.CloudSessionService;
 import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.CloudSessionContext;
 import io.tapstate.spi.store.CloudSessionIdentity;
 import io.tapstate.spi.store.CloudSessionStore;
 import org.junit.jupiter.api.Test;
@@ -114,7 +115,8 @@ class CloudSdkLiveContractTest {
             exchanges.incrementAndGet();
             respond(exchange, Map.of("opId", "jwks-failed-exchange", "code", "ok", "msg", "ok",
                     "data", Map.of("jwt", rawJwt, "expiresAt", "2030-01-01T00:00:00Z", "jti", "jwt-one",
-                            "userEmail", "user@example.test", "orgId", "org-one", "clusterId", CLUSTER)));
+                            "userEmail", "user@example.test", "orgId", "org-one", "clusterId", CLUSTER,
+                            "organizationName", "Organization One", "clusterName", "Cluster One", "region", "us-east-1")));
         });
         server.createContext("/v1/api/jwks.json", exchange -> {
             jwksRequests.incrementAndGet();
@@ -240,7 +242,10 @@ class CloudSdkLiveContractTest {
                             "jti", "jwt-one",
                             "userEmail", "user@example.test",
                             "orgId", "org-one",
-                            "clusterId", CLUSTER)));
+                            "clusterId", CLUSTER,
+                            "organizationName", "Organization One",
+                            "clusterName", "Cluster One",
+                            "region", "us-east-1")));
         });
         server.createContext("/v1/api/jwks.json", exchange -> respond(exchange, jwks(keyPair)));
         server.createContext("/v1/api/clusters/" + CLUSTER + "/status-report", exchange -> {
@@ -265,7 +270,10 @@ class CloudSdkLiveContractTest {
             for (String audience : List.of(REQUEST_AUDIENCE, "cluster.cloud.tapstate.com", "data.customer.example")) {
                 requestedAudience.set(audience);
                 String code = "one-time-code-" + ++expectedExchanges;
-                String exchanged = bridge.exchange(code, CLUSTER);
+                var result = bridge.exchangeWithContext(code, CLUSTER);
+                assertThat(result.context()).isEqualTo(new CloudSessionContext(
+                        "org-one", CLUSTER, "Organization One", "Cluster One", "us-east-1"));
+                String exchanged = result.jwt();
                 assertThat(bridge.validate(exchanged, deployment, audience)).hasValueSatisfying(login -> {
                     assertThat(login.userId()).isEqualTo("stable-user-one");
                     assertThat(login.jwtId()).isEqualTo("jwt-one");
