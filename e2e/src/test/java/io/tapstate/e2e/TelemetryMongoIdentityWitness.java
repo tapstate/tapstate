@@ -267,9 +267,13 @@ final class TelemetryMongoIdentityWitness {
                         .doesNotContain(Instant.parse(String.valueOf(point.get("intervalEnd"))));
             }
         }
-        assertThat(events.stream().map(row -> String.valueOf(row.get("id"))).toList())
+        requireNoFormerEventIds(events.stream().map(row -> String.valueOf(row.get("id"))).toList(), oldEvents);
+    }
+
+    static void requireNoFormerEventIds(List<String> currentEventIds, Set<String> formerEventIds) {
+        assertThat(currentEventIds)
                 .as("new-resource events exclude all retained former-resource event identities")
-                .doesNotContainAnyElementsOf(oldEvents);
+                .noneMatch(formerEventIds::contains);
     }
 
     /** Qualifies identity and retained public output without claiming quiet-stage counter or raw-pair evidence. */
