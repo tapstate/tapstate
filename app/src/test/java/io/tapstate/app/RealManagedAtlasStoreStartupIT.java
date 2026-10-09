@@ -71,6 +71,7 @@ class RealManagedAtlasStoreStartupIT {
                 assertThat(observer.getDatabase(database).listCollectionNames().first() == null)
                         .as("the allocated system database is empty before this witness owns it").isTrue();
             }
+            System.out.println("ATLAS_SYSTEM_STORAGE owned_databases=" + String.join(",", databases));
             try (AutoCloseable cleanup = () -> cleanup(observer, databases)) {
                 try {
                 String sourceHash;
@@ -81,6 +82,7 @@ class RealManagedAtlasStoreStartupIT {
                 try (ConfigurableApplicationContext first = start(metadataUri, metadata, plugins,
                         seedDirectory, "1h", firstReady)) {
                     StorePort store = readyStore(first, firstReady, operator);
+                    System.out.println("ATLAS_SYSTEM_STORAGE first_start_ready=true");
                     store.keyedState().save(NAMESPACE, "key", COLD_STATE);
                     // Source ciphertext is proved with authored fixture config, never with the
                     // deployment's actual Atlas connection. Views database access is observed separately.
@@ -88,11 +90,10 @@ class RealManagedAtlasStoreStartupIT {
                             Map.of("isUri", true, "uri", "mongodb://source-user:source-secret@user.example/owned"),
                             null, null, null, null));
                     SourceResource authored = authoredSource(store);
-                    String viewUri = ViewStoreSeedRunner.viewsUri(metadataUri, views);
-                    try (MongoClient materialization = MongoClients.create(viewUri)) {
-                        materialization.getDatabase(views).getCollection(COLLECTION)
-                                .insertOne(new Document("_id", "before-restart").append("value", 1));
-                    }
+                    // Reuse the authenticated system observer across the assigned databases. Rewriting
+                    // a URI here would replace the driver's SRV TXT authSource with a path default.
+                    observer.getDatabase(views).getCollection(COLLECTION)
+                            .insertOne(new Document("_id", "before-restart").append("value", 1));
                     Instant observedAt = Instant.now().minusSeconds(60).truncatedTo(ChronoUnit.MILLIS);
                     sample = new RateSample("bootstrap-proof", observedAt,
                             Map.of("records.out", 3L), Map.of(), observedAt.minusSeconds(60));
@@ -102,26 +103,27 @@ class RealManagedAtlasStoreStartupIT {
                     sourceHash = CanonicalHash.of(authored);
                     registrations = assertConnectors(observer.getDatabase(metadata), store, seedDirectory);
                     collectionBefore = historyCollection(observer.getDatabase(metadata));
+                    System.out.println("ATLAS_SYSTEM_STORAGE initial_storage_verified=true");
                 }
 
                 AtomicInteger restartedReady = new AtomicInteger();
                 try (ConfigurableApplicationContext restarted = start(metadataUri, metadata, plugins,
                         seedDirectory, "30m", restartedReady)) {
                     StorePort store = readyStore(restarted, restartedReady, operator);
+                    System.out.println("ATLAS_SYSTEM_STORAGE restart_ready=true");
                     assertThat(store.keyedState().load(NAMESPACE, "key"))
                             .hasValueSatisfying(bytes -> assertThat(bytes).isEqualTo(COLD_STATE));
                     SourceResource authored = authoredSource(store);
                     assertThat(CanonicalHash.of(authored)).isEqualTo(sourceHash);
-                    try (MongoClient materialization = MongoClients.create(ViewStoreSeedRunner.viewsUri(metadataUri, views))) {
-                        assertThat(materialization.getDatabase(views).getCollection(COLLECTION)
-                                .countDocuments(new Document("_id", "before-restart").append("value", 1)))
-                                .isEqualTo(1);
-                    }
+                    assertThat(observer.getDatabase(views).getCollection(COLLECTION)
+                            .countDocuments(new Document("_id", "before-restart").append("value", 1)))
+                            .isEqualTo(1);
                     assertHistory(observer.getDatabase(metadata), store, sample, Duration.ofMinutes(30));
                     assertThat(historyCollection(observer.getDatabase(metadata))).isEqualTo(collectionBefore);
                     assertSystemStorage(observer, databases, store, metadataUri);
                     assertThat(assertConnectors(observer.getDatabase(metadata), store, seedDirectory))
                             .containsExactlyInAnyOrderElementsOf(registrations);
+                    System.out.println("ATLAS_SYSTEM_STORAGE recovery_and_ttl_change_verified=true");
                 }
                 } catch (MongoException failure) {
                     // Sanitize before resource cleanup so its safe failures remain suppressed on this error.
@@ -250,19 +252,29 @@ class RealManagedAtlasStoreStartupIT {
     private static void cleanup(MongoClient observer, List<String> databases) {
         AssertionError failure = null;
         for (String database : databases) {
-            try { observer.getDatabase(database).drop(); }
+            try {
+                observer.getDatabase(database).drop();
+                assertThat(observer.getDatabase(database).listCollectionNames().first())
+                        .as("the owned system database is empty after cleanup").isNull();
+                System.out.println("ATLAS_SYSTEM_STORAGE cleaned_database=" + database);
+            }
             catch (MongoException rejected) {
                 AssertionError safe = new AssertionError("Could not clean the allocated database " + database
-                        + " with driver code " + rejected.getCode());
+                        + " with " + rejected.getClass().getSimpleName() + " and driver code " + rejected.getCode());
                 if (failure == null) failure = safe;
                 else failure.addSuppressed(safe);
+            }
+            catch (AssertionError notEmpty) {
+                if (failure == null) failure = notEmpty;
+                else failure.addSuppressed(notEmpty);
             }
         }
         if (failure != null) throw failure;
     }
 
     private static AssertionError observationFailure(MongoException failure) {
-        return new AssertionError("The real Atlas storage observation failed with driver code " + failure.getCode());
+        return new AssertionError("The real Atlas storage observation failed with "
+                + failure.getClass().getSimpleName() + " and driver code " + failure.getCode());
     }
 
     private static String inDatabase(String uri, String database) {
