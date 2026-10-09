@@ -231,6 +231,10 @@ class JoinPerformanceGateTest {
             }
         }
 
+        if (Boolean.getBoolean("joinperf.diagnostics")) {
+            printDiagnosticInputs();
+        }
+
         if (record) {
             writeGolden(golden);
             System.out.println("recorded " + golden.size() + " row(s) into " + GOLDEN);
@@ -318,8 +322,55 @@ class JoinPerformanceGateTest {
             }
         }
         JoinBenchComparison best = JoinBenchComparison.best(comparisons);
+        if (Boolean.getBoolean("joinperf.diagnostics")) {
+            for (int i = 0; i < comparisons.size(); i++) {
+                JoinBenchComparison each = comparisons.get(i);
+                JoinBenchRun.Result result = carriers.get(i);
+                System.out.printf("joinperf-sample scenario=%s tier=%s index=%d selected=%s"
+                                + " carrierNanos=%d carrierMidpoint=%d beforeNanos=%d beforeMidpoint=%d"
+                                + " beforeWindowNanos=%d afterNanos=%d afterMidpoint=%d afterWindowNanos=%d"
+                                + " ratio=%.9f workShape=%s rows=%d coldTrips=%d coldKeys=%d"
+                                + " resident=%d written=%d tripsWhere=%s%n",
+                        scenario, tier, i, each == best, each.carrier().nanos(), each.carrier().midpoint(),
+                        each.before().nanos(), each.before().midpoint(), each.before().windowNanos(),
+                        each.after().nanos(), each.after().midpoint(), each.after().windowNanos(),
+                        each.ratio(), result.workShape(), result.rows(), result.trips(), result.coldKeys(),
+                        result.resident(), result.written(), result.tripsWhere());
+            }
+        }
         return new Measured(carriers.get(comparisons.indexOf(best)), best.carrier().nanos(),
                 best.controlNanos(), best.controlWindowNanos());
+    }
+
+    /** Record diagnostic inputs after all timed work; class resources precede coverage transformation. */
+    private static void printDiagnosticInputs() throws IOException {
+        var runtime = java.lang.management.ManagementFactory.getRuntimeMXBean();
+        String arguments = String.join("\n", runtime.getInputArguments());
+        System.out.printf("joinperf-input pid=%d javaVersion=%s vmVersion=%s jvmArgumentsSha256=%s%n",
+                ProcessHandle.current().pid(), System.getProperty("java.version"),
+                System.getProperty("java.vm.version"), diagnosticHash(arguments.getBytes(StandardCharsets.UTF_8)));
+        runtime.getInputArguments().stream().filter(argument -> argument.startsWith("-javaagent:")
+                || argument.startsWith("-X") || argument.startsWith("--add-opens")
+                || argument.startsWith("--add-exports")).forEach(argument ->
+                System.out.println("joinperf-jvm-option=" + argument));
+        for (Class<?> type : List.of(BuiltinJoinExecutor.class, JoinDriver.class, ImapJoinStores.class,
+                JoinMaps.class, JoinStateMapStoreFactory.class, JoinFrontier.class,
+                com.hazelcast.core.Hazelcast.class)) {
+            String name = "/" + type.getName().replace('.', '/') + ".class";
+            try (var stream = type.getResourceAsStream(name)) {
+                if (stream == null) { throw new IllegalStateException("a measured class resource is absent: " + name); }
+                System.out.printf("joinperf-class name=%s resourceSha256=%s origin=%s%n", type.getName(),
+                        diagnosticHash(stream.readAllBytes()), type.getProtectionDomain().getCodeSource().getLocation());
+            }
+        }
+    }
+
+    private static String diagnosticHash(byte[] bytes) {
+        try {
+            return java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(bytes));
+        } catch (java.security.NoSuchAlgorithmException unavailable) {
+            throw new IllegalStateException("SHA-256 is unavailable", unavailable);
+        }
     }
 
     // ---------------------------------------------------------------- judging
