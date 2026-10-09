@@ -362,7 +362,9 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                         "claim", firstSubmission.claim(), "scope", firstReceipt.scope(), "job", firstSubmission.job().job()));
                 if (continuing) {
                     assertThat(hasKnownDelivery(first.observation().facts())).isTrue();
-                    historyEvents.capture("claimed-gen1-before-pause", first, cluster.first(),
+                    ControlPlane firstOwnerControl = firstClaim.owner().nodeId().equals(TwoMemberCluster.NODE_A)
+                            ? cluster.first() : cluster.second();
+                    historyEvents.capture("claimed-gen1-before-pause", first, firstOwnerControl,
                             sessions.get(firstClaim.owner().nodeId()).server().baseUrl(), true, setupDeadline);
                     captureContinueBoundaries(sessions, records, report, "claimed-gen1-history-events");
                     cluster.first().lifecycle(PIPELINE, LifecycleVerb.PAUSE);
@@ -387,7 +389,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                     assertFloorAtLeast(first.observation().facts(), paused.observation().facts());
                     priorStarts = counterStarts(paused.observation());
                     pausedFacts = paused.observation().facts();
-                    historyEvents.capture("claimed-gen1-paused", paused, cluster.first(),
+                    historyEvents.capture("claimed-gen1-paused", paused, firstOwnerControl,
                             sessions.get(firstClaim.owner().nodeId()).server().baseUrl(), false, setupDeadline);
                     captureContinueBoundaries(sessions, records, report, "claimed-paused-history-events");
                     nativeDeadline = System.nanoTime() + WAIT.toNanos();
@@ -664,6 +666,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
             assertThat(boundary.decodedAndAuthorityBound()).isTrue();
             if (replacement && !firstCurrentWindow) { assertReplacementBridge(observed, replacementProof); }
             else { assertBridge(observed, submission); }
+            ControlPlane emittingControl = emittingNode.equals(TwoMemberCluster.NODE_A) ? cluster.first() : cluster.second();
             if (continuing) {
                 var bindEvents = new java.util.concurrent.atomic.AtomicReference<List<Document>>(List.of());
                 Await.until("actual claimed replacement bind state and execution events are readable", remaining(deadline),
@@ -688,7 +691,7 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                                     && emitted.stream().anyMatch(event -> PipelineEvent.Kind.EXECUTION_RESTARTED.name().equals(event.getString("kind"))
                                             && PipelineState.RUNNING.name().equals(event.getString("afterState")));
                         }, () -> "captured bind event kinds=" + bindEvents.get().stream().map(event -> event.getString("kind")).toList());
-                historyEvents.capture("claimed-gen2-continued", current, cluster.first(), owner.server().baseUrl(), true, deadline);
+                historyEvents.capture("claimed-gen2-continued", current, emittingControl, owner.server().baseUrl(), true, deadline);
                 report.addFork(Map.of("action", "actual-claimed-gen2-bind-events", "scope", receipt.scope(),
                         "events", bindEvents.get().stream().map(Document::toJson).toList()));
                 captureContinueBoundaries(sessions, records, report, "claimed-gen2-history-events");
@@ -702,7 +705,6 @@ class NativeClaimedTelemetryPositiveCalibrationIT {
                 assertThat(afterBoots.get(node).owner()).isEqualTo(memberBoots.get(node).owner());
                 assertThat(afterBoots.get(node).claimGeneration()).isEqualTo(memberBoots.get(node).claimGeneration());
             }
-            ControlPlane emittingControl = emittingNode.equals(TwoMemberCluster.NODE_A) ? cluster.first() : cluster.second();
             ControlPlane logControl = logNode.equals(TwoMemberCluster.NODE_A) ? cluster.first() : cluster.second();
             Map<String, Object> logEvidence = new LinkedHashMap<>(NativeTelemetryPositiveCalibrationIT.assertScopedLogRead(
                     records.get(logNode), http, logControl, sessions.get(logNode).server().baseUrl(), receipt));
