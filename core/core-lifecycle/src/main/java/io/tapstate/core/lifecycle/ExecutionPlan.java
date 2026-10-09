@@ -190,17 +190,37 @@ public record ExecutionPlan(
                 return this;
             }
             List<String> causes = new ArrayList<>();
-            if (before.memberCount() != memberCount) {
+            boolean members = before.memberCount() != memberCount;
+            boolean target = before.requested() != requested;
+            if (members) {
                 causes.add(Change.MEMBERS_CHANGED);
             }
-            if (before.requested() != requested) {
+            if (target) {
                 causes.add(Change.TARGET_CHANGED);
             }
-            if (!before.reasons().equals(reasons)) {
+            // A rounding and a target of one are the working-out's account of the members and the target it was
+            // given, never a bound. A budget limit that rules out a candidate on one member count or target and
+            // not on another says nothing of the budget either, so it names a bound only where neither moved.
+            if (!bounds(before.reasons(), false).equals(bounds(reasons, false))
+                    || !members && !target && !bounds(before.reasons(), true).equals(bounds(reasons, true))) {
                 causes.add(Change.CAPABILITY_CHANGED);
             }
             return new Node(node, requested, origin, scope, memberCount, computedLocal, effective, reasons,
                     maxRecords, maxWaitMillis, vertices, resources, new Change(before.effective(), causes));
+        }
+
+        /**
+         * The reasons among {@code reasons} that name what bounds a node: the budget limits that ruled a candidate
+         * out where {@code budgets}, and otherwise what holds the node to one processor, such as rows that carry no
+         * key.
+         */
+        private static List<String> bounds(List<String> reasons, boolean budgets) {
+            return reasons.stream()
+                    .filter(reason -> !reason.equals(NodeParallelism.ROUNDED_UP)
+                            && !reason.equals(NodeParallelism.ROUNDED_DOWN)
+                            && !reason.equals(NodeParallelism.REQUESTED_ONE))
+                    .filter(reason -> reason.startsWith(NodeParallelism.BUDGET_PREFIX) == budgets)
+                    .toList();
         }
 
         /**

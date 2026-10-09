@@ -27,8 +27,40 @@ class AWidthThatMovedSaysWhatMovedItTest {
 
         assertThat(replacing.replaces()).isEqualTo(new ExecutionPlan.Replaced(6L, List.of("m1", "m2", "m3"), BEFORE));
         // The reasons moved too - nine was a rounding up, eight is exact - but only because the member count
-        // did: the reasons are the working-out's own account of the members it was given.
+        // did: a rounding is the working-out's account of the members it was given, not something bounding the
+        // node, and naming a bound here would send whoever reads it to a connector or a budget that never moved.
         assertThat(replacing.nodes().get(0).change()).isEqualTo(new ExecutionPlan.Change(9, List.of(
+                ExecutionPlan.Change.MEMBERS_CHANGED)));
+    }
+
+    @Test
+    void aBudgetThatRulesOutAWidthOnlyOnTheNewMemberCountIsTheMemberCountsDoing() {
+        // Eight on two members is four each, which a limit of three per member rules out; on three members the
+        // candidates were two and three, which it did not. The budget itself is the same.
+        ExecutionPlan before = plan(6L, List.of("m1", "m2", "m3"), node("sink", 8, 3, 3, 9, List.of("rounded-up")));
+        ExecutionPlan after = plan(7L, List.of("m1", "m2"),
+                node("sink", 8, 2, 3, 6, List.of("rounded-down", "budget:max-local-parallelism")));
+
+        assertThat(after.replacing(before).nodes().get(0).change())
+                .isEqualTo(new ExecutionPlan.Change(9, List.of(ExecutionPlan.Change.MEMBERS_CHANGED)));
+    }
+
+    @Test
+    void aBudgetThatMovedOnTheSameMembersAndTargetSaysTheCapabilityMovedTheWidth() {
+        ExecutionPlan before = plan(6L, List.of("m1", "m2"), node("sink", 8, 2, 4, 8, List.of()));
+        ExecutionPlan after = plan(7L, List.of("m1", "m2"),
+                node("sink", 8, 2, 3, 6, List.of("rounded-down", "budget:max-local-parallelism")));
+
+        assertThat(after.replacing(before).nodes().get(0).change())
+                .isEqualTo(new ExecutionPlan.Change(8, List.of(ExecutionPlan.Change.CAPABILITY_CHANGED)));
+    }
+
+    @Test
+    void aKeyLostAsAMemberLeftSaysBoth() {
+        ExecutionPlan before = plan(6L, List.of("m1", "m2", "m3"), node("sink", 8, 3, 3, 9, List.of("rounded-up")));
+        ExecutionPlan after = plan(7L, List.of("m1", "m2"), totalOne("sink", 8, 2, List.of("single-target-keyless")));
+
+        assertThat(after.replacing(before).nodes().get(0).change()).isEqualTo(new ExecutionPlan.Change(9, List.of(
                 ExecutionPlan.Change.MEMBERS_CHANGED, ExecutionPlan.Change.CAPABILITY_CHANGED)));
     }
 

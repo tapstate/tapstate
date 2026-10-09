@@ -180,8 +180,8 @@ class ARunWritesDownThePlanItIsSubmittedOnTest {
                     new ExecutionPlan.Replaced(6L, List.of("m1", "m2", "m3", "m4"), T0.minusSeconds(600)));
             assertThat(plan.nodes()).filteredOn(node -> node.node().equals("serve.s")).singleElement()
                     .extracting(ExecutionPlan.Node::change)
-                    .isEqualTo(new ExecutionPlan.Change(8, List.of(ExecutionPlan.Change.MEMBERS_CHANGED,
-                            ExecutionPlan.Change.CAPABILITY_CHANGED)));
+                    .as("eight on four members was exact and is nine on three, rounded up: only the members moved")
+                    .isEqualTo(new ExecutionPlan.Change(8, List.of(ExecutionPlan.Change.MEMBERS_CHANGED)));
         });
     }
 
