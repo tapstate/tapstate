@@ -30,15 +30,17 @@ public final class CatalogEntryReader {
     }
 
     public static ConnectorCatalogEntry fromTree(Map<String, Object> m) {
+        String connectorId = requireString(m, "id");
         return new ConnectorCatalogEntry(
-                requireString(m, "id"),
+                connectorId,
                 str(m.get("name")),
                 str(m.get("displayName")),
                 str(m.get("icon")),
                 groupOf(str(m.get("group"))),
                 modesOf(m.get("modes")),
                 discoveryOf(str(m.get("discovery"))),
-                sinkOf(asMap(m.get("sink"))),
+                // Stored capabilities cannot restore a role withdrawn by the running release.
+                SinkRules.applySupportPolicy(connectorId, sinkOf(asMap(m.get("sink")))),
                 bool(m, "pushOut"),
                 configOf(m.get("config")),
                 provenanceOf(asMap(m.get("provenance"))));
