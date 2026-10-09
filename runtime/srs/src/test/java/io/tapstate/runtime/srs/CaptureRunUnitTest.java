@@ -1977,6 +1977,35 @@ class CaptureRunUnitTest {
                 .isEqualTo(CaptureStart.resume(new SourcePosition("src-11")));
     }
 
+    @Test
+    void loadingANewTableWithALegacySeamKeepsADirectTailsExistingTableChanges() {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureConfig config = new CaptureConfig("mysql", Map.of("host", "h"), List.of("orders", "customers"));
+        CaptureRunSpec spec = new CaptureRunSpec(config, ReadMode.SNAPSHOT_AND_CDC, "chain-legacy-added-table",
+                false, "src-1", "pipe-1", StartFrom.earliest(), null, 0L);
+        String chain = spec.miningChainId().value();
+        String firstSeam = "seam-of-the-first-load";
+        ChainPosition landed = new ChainPosition(new SourceOrder(1L, 7L), "orders-landed-up-to-here");
+        // A v0.1.0 record has a seam but no snapshot generation; orders are already confirmed.
+        meta.seed(new SrsMeta(chain, landed,
+                List.of(new ConsumerOffset("pipe-1", Map.of("orders", 7L), landed,
+                        List.of("orders"), firstSeam, 0L)),
+                List.of(), null, 1L));
+        FakeSource source = new FakeSource(List.of(row(1),
+                Envelope.read(2, "customers", Map.of("id", 2), Map.of())),
+                List.of(), "seam-of-the-customers-load");
+        List<Envelope> delivered = new ArrayList<>();
+
+        try (CaptureRun run = runUnit(source, meta).start(spec, delivered::add)) {
+            assertThat(run.snapshotCount()).isEqualTo(1L);
+            assertThat(delivered).extracting(Envelope::src).containsExactly("customers");
+            assertThat(source.cdcStart)
+                    .as("loading only customers must not move the direct tail past the saved orders checkpoint")
+                    .isIn(CaptureStart.resume(new SourcePosition(landed.token())),
+                            CaptureStart.resume(new SourcePosition(firstSeam)));
+        }
+    }
+
     /**
      * A buffered tail's miner does not take {@code start_from}, because on that path the setting is this
      * one pipeline's cursor into the shared buffer and the miner is shared by all of them. The buffer is
