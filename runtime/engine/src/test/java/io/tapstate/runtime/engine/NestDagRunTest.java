@@ -36,6 +36,7 @@ import io.tapstate.runtime.engine.nest.ReleasedChild;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 import io.tapstate.spi.transform.TransformPort;
+import java.math.BigDecimal;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -130,6 +131,22 @@ class NestDagRunTest {
         assertThat(items(documents.get(1)).stream().map(item -> item.get("sku")).toList())
                 .containsExactlyInAnyOrder("s10", "s11", "s12");
         assertThat(items(documents.get(2)).get(0)).containsEntry("sku", "s20");
+    }
+
+    @Test
+    void anExactDecimalChildKeyJoinsTheSameWholeNumberRoot() {
+        DAG dag = ordersWithItems(
+                List.of(row("order_id", 1L, "code", "A"), row("order_id", 2L, "code", "B")),
+                List.of(row("item_id", 10L, "order_id", new BigDecimal("1.00"), "sku", "s10"),
+                        row("item_id", 20L, "order_id", new BigDecimal("2.01"), "sku", "s20")));
+
+        member.getJet().newJob(dag).join();
+
+        Map<Object, Map<String, Object>> documents = latestPerRoot();
+        assertThat(items(documents.get(1L))).extracting(item -> item.get("sku")).containsExactly("s10");
+        assertThat(items(documents.get(1L)).get(0).get("order_id"))
+                .isEqualTo(new BigDecimal("1.00"));
+        assertThat(items(documents.get(2L))).isEmpty();
     }
 
     /**
