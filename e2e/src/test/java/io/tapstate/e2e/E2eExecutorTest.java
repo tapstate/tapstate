@@ -722,6 +722,31 @@ class E2eExecutorTest {
         assertThat(paymentReads.get()).as("order 11's payment must be read after it arrives").isGreaterThanOrEqualTo(2);
     }
 
+    @Test
+    void heldStreamExampleWaitsForSecondOrdersInitialShipments() {
+        java.nio.file.Path workspace = Examples.ROOT.resolve("holding-one-stream-does-not-stop-the-other");
+        Envelope published = EnvelopeParser.parse(Examples.read(workspace.resolve("spec.e2e.yml")));
+        List<Step> snapshot = published.steps().stream()
+                .takeWhile(step -> !(step instanceof Step.StreamLifecycle)).toList();
+        TableAlias target = new TableAlias("views", "order_state");
+        binding.countsOverTime(target, 5L);
+        AtomicInteger secondOrderReads = new AtomicInteger();
+        binding.documentReader = (table, where) -> {
+            assertThat(table).isEqualTo(target);
+            int id = ((Number) where.get("id")).intValue();
+            assertThat(id).isIn(1, 2);
+            // Order 1's partition is complete while order 2's shipments arrive on its next read.
+            int children = id == 2 && secondOrderReads.incrementAndGet() == 1 ? 0 : 2;
+            return Optional.of(Map.of("id", id, "customer", id == 1 ? "alice" : "bob",
+                    "shipments", java.util.Collections.nCopies(children, Map.of("id", 1))));
+        };
+
+        // Run the published initial checks unchanged, stopping before the first stream hold.
+        new E2eExecutor(binding, new FilePipelineLoader(workspace), Duration.ofMillis(200), Duration.ofMillis(1))
+                .execute(new Envelope(published.name(), published.setup(), published.pipeline(), published.seed(), snapshot));
+        assertThat(secondOrderReads.get()).as("order 2 must be read after its shipments arrive").isGreaterThanOrEqualTo(2);
+    }
+
     private void execute(String yaml) {
         binding.calls.clear();
         new E2eExecutor(binding, path -> PIPELINE_ID, Duration.ofMillis(200), Duration.ofMillis(1))
