@@ -6,6 +6,7 @@ import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Watermark;
+import io.tapstate.core.event.Envelope;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -30,6 +31,8 @@ import java.util.Objects;
 public final class PassthroughProcessor extends AbstractProcessor {
 
     private final LevelBounds bounds;
+    // The stream every change leaves under, or null where each leaves under the one it arrived on.
+    private final String emitAs;
 
     public PassthroughProcessor() {
         this(null);
@@ -41,7 +44,16 @@ public final class PassthroughProcessor extends AbstractProcessor {
      * still rather than one that runs ahead.
      */
     public PassthroughProcessor(LevelBounds bounds) {
+        this(bounds, null);
+    }
+
+    /**
+     * As above, every change leaving under {@code emitAs} rather than the stream it arrived on, still covering the
+     * chains it covered - how a node that passes its input on as its own output names it.
+     */
+    public PassthroughProcessor(LevelBounds bounds, String emitAs) {
         this.bounds = bounds;
+        this.emitAs = emitAs;
     }
 
     /** A meta-supplier for a passthrough that propagates no frontier, for a job built without one. */
@@ -86,17 +98,27 @@ public final class PassthroughProcessor extends AbstractProcessor {
      * has got from what arrived on each edge where {@code axes} is given, and propagates no frontier where not.
      */
     public static ProcessorSupplier processors(ChainAxes axes, Map<Integer, List<String>> chainsByOrdinal) {
+        return processors(axes, chainsByOrdinal, null);
+    }
+
+    /** The same, every change leaving under {@code emitAs}, or under the stream it arrived on where that is null. */
+    public static ProcessorSupplier processors(ChainAxes axes, Map<Integer, List<String>> chainsByOrdinal,
+            String emitAs) {
         SupplierEx<Processor> supplier = axes == null
-                ? PassthroughProcessor::new
+                ? () -> new PassthroughProcessor(null, emitAs)
                 // Holding nothing back is the whole of this vertex's own contribution: what it may promise
                 // is exactly the lowest of what its edges promised.
                 : () -> new PassthroughProcessor(
-                        new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING));
+                        new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING), emitAs);
         return ProcessorSupplier.of(supplier);
     }
 
     @Override
     protected boolean tryProcess(int ordinal, Object item) {
+        if (emitAs != null && item instanceof Envelope event) {
+            return tryEmit(new Envelope(event.op(), event.ts(), emitAs, event.before(), event.after(), event.schema(),
+                    event.positions(), event.removed()));
+        }
         return tryEmit(item);
     }
 

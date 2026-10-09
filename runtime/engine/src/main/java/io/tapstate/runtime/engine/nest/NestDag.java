@@ -56,8 +56,9 @@ public final class NestDag {
 
     /**
      * Builds the node into {@code dag} and returns the vertex the rest of the pipeline reads from. A
-     * passthrough nest builds one identity vertex fed by the root stream: it assembles nothing, so it
-     * takes no state, no map and no thread of its own.
+     * passthrough nest builds one vertex fed by the root stream that passes each row on unchanged as one of the
+     * nest's documents, under {@code outputStream} like any other: it assembles nothing, so it takes no state, no
+     * map and no thread of its own.
      *
      * <p>Every vertex that keeps state runs as {@code width} says - one processor for the cluster, or the same
      * number on every member - and so does every edge into one of them. The width is the node's, worked out for
@@ -83,7 +84,8 @@ public final class NestDag {
             Map<Integer, List<String>> chains = frontier == null ? null
                     : chainsByProducer(frontier, rootAlias, sources.size());
             Vertex passthrough = width.sized(dag.newVertex(nodeId,
-                    width.metaSupplier(nodeId, PassthroughProcessor.processors(axes, chains), axes, chains)));
+                    width.metaSupplier(nodeId, PassthroughProcessor.processors(axes, chains, outputStream), axes,
+                            chains)));
             int ordinal = 0;
             for (Vertex source : sources) {
                 draw(dag, source, passthrough, ordinal++, passthroughKey, nextOutbound, width);
