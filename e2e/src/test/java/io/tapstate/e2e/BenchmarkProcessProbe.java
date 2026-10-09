@@ -8,14 +8,17 @@ import javax.management.remote.JMXConnector;
 import javax.management.remote.JMXConnectorFactory;
 import javax.management.remote.JMXServiceURL;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.lang.management.CompilationMXBean;
 import java.lang.management.GarbageCollectorMXBean;
 import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryMXBean;
 import java.lang.management.RuntimeMXBean;
+import java.lang.management.ThreadInfo;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
+import java.util.ArrayList;
 import java.util.Objects;
 import java.util.OptionalLong;
 import java.util.concurrent.TimeUnit;
@@ -169,6 +172,71 @@ final class BenchmarkProcessProbe implements AutoCloseable {
 
     private record CompilationAccess(CompilationMXBean compiler, String compilerName, Boolean monitoringSupported,
                                      CompilationUnknownReason unknownReason, String failureType) { }
+
+    /** Lazily reuses this exact child's connection; ordinary resource and compilation reads are unchanged. */
+    BenchmarkThreadPointDiagnostics.Reader threadPointReader() {
+        return new BenchmarkThreadPointDiagnostics.Reader() {
+            private RuntimeMXBean runtime;
+            private com.sun.management.ThreadMXBean threads;
+
+            @Override public long ownedPid() { return ownedPid; }
+
+            private void requireConnection() {
+                if (connection == null || child == null || !child.isAlive()) {
+                    throw new IllegalStateException("owned JVM thread readings are unavailable");
+                }
+            }
+
+            private com.sun.management.ThreadMXBean threads() {
+                requireConnection();
+                if (threads == null) {
+                    try {
+                        threads = ManagementFactory.newPlatformMXBeanProxy(connection,
+                                ManagementFactory.THREAD_MXBEAN_NAME, com.sun.management.ThreadMXBean.class);
+                    } catch (IOException failure) { throw new UncheckedIOException(failure); }
+                }
+                return threads;
+            }
+
+            @Override public BenchmarkThreadPointDiagnostics.Identity identity() {
+                requireConnection();
+                if (runtime == null) {
+                    try {
+                        runtime = ManagementFactory.newPlatformMXBeanProxy(connection,
+                                ManagementFactory.RUNTIME_MXBEAN_NAME, RuntimeMXBean.class);
+                    } catch (IOException failure) { throw new UncheckedIOException(failure); }
+                }
+                return new BenchmarkThreadPointDiagnostics.Identity(runtime.getPid(), runtime.getStartTime(), child.isAlive());
+            }
+
+            @Override public BenchmarkThreadPointDiagnostics.CpuCapability cpuCapability() {
+                boolean supported = threads().isThreadCpuTimeSupported();
+                return new BenchmarkThreadPointDiagnostics.CpuCapability(supported,
+                        supported ? threads().isThreadCpuTimeEnabled() : null);
+            }
+
+            @Override public long[] threadIds() { return threads().getAllThreadIds(); }
+
+            @Override public long[] cpuNanos(long[] ids) { return threads().getThreadCpuTime(ids); }
+
+            @Override public List<BenchmarkThreadPointDiagnostics.ThreadRow> threadInfo(long[] ids, int maxDepth) {
+                if (maxDepth < 0 || maxDepth > 64) { throw new IllegalArgumentException("thread point depth is outside its bound"); }
+                ThreadInfo[] actual = threads().getThreadInfo(ids, maxDepth);
+                var result = new ArrayList<BenchmarkThreadPointDiagnostics.ThreadRow>(actual.length);
+                for (ThreadInfo info : actual) {
+                    if (info == null) { result.add(null); continue; }
+                    var frames = new ArrayList<BenchmarkThreadPointDiagnostics.Frame>();
+                    for (StackTraceElement frame : info.getStackTrace()) {
+                        frames.add(new BenchmarkThreadPointDiagnostics.Frame(frame.getClassName(), frame.getMethodName(),
+                                frame.isNativeMethod(), frame.getLineNumber()));
+                    }
+                    result.add(new BenchmarkThreadPointDiagnostics.ThreadRow(info.getThreadId(), info.getThreadName(),
+                            info.getThreadState().name(), List.copyOf(frames)));
+                }
+                return java.util.Collections.unmodifiableList(result);
+            }
+        };
+    }
 
     record Snapshot(OptionalLong cpuNanos, OptionalLong heapUsedBytes, OptionalLong rssBytes,
                     OptionalLong gcCollectionMillis) {

@@ -37,6 +37,8 @@ final class BenchmarkResourceSampler implements AutoCloseable {
     private boolean finished;
     private BenchmarkCompilationDiagnostics compilationDiagnostics;
     private volatile Throwable compilationInvariantFailure;
+    private BenchmarkThreadPointDiagnostics threadPointDiagnostics;
+    private volatile Throwable threadPointInvariantFailure;
 
     private BenchmarkResourceSampler(BenchmarkProcessProbe probe,
                                      Supplier<BenchmarkProcessProbe.Snapshot> source, Duration interval,
@@ -94,6 +96,13 @@ final class BenchmarkResourceSampler implements AutoCloseable {
         return sampler;
     }
 
+    static BenchmarkResourceSampler fromWithThreadPoints(Supplier<BenchmarkProcessProbe.Snapshot> source,
+            Duration interval, LongSupplier nanoTime, BenchmarkThreadPointDiagnostics diagnostics) {
+        BenchmarkResourceSampler sampler = from(source, interval, nanoTime);
+        sampler.threadPointDiagnostics = Objects.requireNonNull(diagnostics, "thread point diagnostics");
+        return sampler;
+    }
+
     @FunctionalInterface
     interface TerminationWaiter {
         boolean await(ScheduledExecutorService worker, long timeout, TimeUnit unit) throws InterruptedException;
@@ -117,7 +126,7 @@ final class BenchmarkResourceSampler implements AutoCloseable {
 
     void enableCompilationDiagnostics() {
         synchronized (lifecycle) {
-            if (started || finished || compilationDiagnostics != null || probe == null) {
+            if (started || finished || compilationDiagnostics != null || threadPointDiagnostics != null || probe == null) {
                 throw new IllegalStateException("compilation diagnostics require a fresh owned process sampler");
             }
             compilationDiagnostics = BenchmarkCompilationDiagnostics.from(
@@ -128,6 +137,20 @@ final class BenchmarkResourceSampler implements AutoCloseable {
     Optional<Map<String, Object>> compilationEvidence() {
         return compilationDiagnostics == null ? Optional.empty()
                 : Optional.of(compilationDiagnostics.wireEvidence());
+    }
+
+    void enableThreadPointDiagnostics() {
+        synchronized (lifecycle) {
+            if (started || finished || threadPointDiagnostics != null || compilationDiagnostics != null || probe == null) {
+                throw new IllegalStateException("thread point diagnostics require a fresh owned process sampler");
+            }
+            threadPointDiagnostics = BenchmarkThreadPointDiagnostics.prepare(probe.threadPointReader(), nanoTime);
+        }
+    }
+
+    Optional<Map<String, Object>> threadPointEvidence() {
+        return threadPointDiagnostics == null ? Optional.empty()
+                : Optional.of(threadPointDiagnostics.wireEvidence());
     }
 
     Summary finish() {
@@ -141,6 +164,10 @@ final class BenchmarkResourceSampler implements AutoCloseable {
         if (compilationInvariantFailure != null) {
             stopWorker(compilationInvariantFailure);
             throwCompilationInvariant();
+        }
+        if (threadPointInvariantFailure != null) {
+            stopWorker(threadPointInvariantFailure);
+            throwThreadPointInvariant();
         }
         try {
             if (periodicSamples != null) {
@@ -162,16 +189,20 @@ final class BenchmarkResourceSampler implements AutoCloseable {
                 throw finishFailure(FailureStage.SHUTDOWN, FailureReason.SHUTDOWN_TIMEOUT, timeout);
             }
         } catch (SamplingFailure alreadyDiagnosed) {
+            throwThreadPointInvariant();
             throw alreadyDiagnosed;
         } catch (InterruptedException interrupted) {
             stopWorker(interrupted);
             Thread.currentThread().interrupt();
+            throwThreadPointInvariant();
             throw finishFailure(FailureStage.SHUTDOWN, FailureReason.SHUTDOWN_INTERRUPTED, interrupted);
         } catch (Throwable shutdownFailure) {
             stopWorker(shutdownFailure);
+            throwThreadPointInvariant();
             throw finishFailure(FailureStage.SHUTDOWN, FailureReason.SHUTDOWN_ERROR, shutdownFailure);
         }
         throwCompilationInvariant();
+        throwThreadPointInvariant();
         try {
             if (finalSampleFailure != null) {
                 throw finishFailure(FailureStage.FINAL_SAMPLE, FailureReason.FINAL_SAMPLE_ERROR, finalSampleFailure);
@@ -197,6 +228,12 @@ final class BenchmarkResourceSampler implements AutoCloseable {
     private void throwCompilationInvariant() {
         // These are programmer errors from the optional diagnostic, never resource-read failures.
         Throwable invariant = compilationInvariantFailure;
+        if (invariant instanceof Error error) { throw error; }
+        if (invariant instanceof RuntimeException failure) { throw failure; }
+    }
+
+    private void throwThreadPointInvariant() {
+        Throwable invariant = threadPointInvariantFailure;
         if (invariant instanceof Error error) { throw error; }
         if (invariant instanceof RuntimeException failure) { throw failure; }
     }
@@ -256,6 +293,14 @@ final class BenchmarkResourceSampler implements AutoCloseable {
                 compilationDiagnostics.record();
             } catch (RuntimeException | Error invariant) {
                 compilationInvariantFailure = invariant;
+                throw invariant;
+            }
+        }
+        if (threadPointDiagnostics != null && unavailable == null && threadPointInvariantFailure == null) {
+            try {
+                threadPointDiagnostics.recordAttempt(published.completed().attemptCount());
+            } catch (RuntimeException | Error invariant) {
+                threadPointInvariantFailure = invariant;
                 throw invariant;
             }
         }

@@ -56,6 +56,20 @@ class RealBenchmarkForkDriverIT {
                 System.getProperty(ARM_PROPERTY, "A"));
         var mode = BenchmarkCaptureCalibrationLiveRunIT.Mode.valueOf(System.getProperty(MODE_PROPERTY, "PLAIN"));
         Path applicationJar = Path.of(System.getProperty(BOOT_JAR_PROPERTY));
+        boolean threadPointDiagnostics = Boolean.getBoolean("tapstate.e2e.benchmark.thread-point-diagnostics");
+        if (threadPointDiagnostics && (!"copy".equals(workloadId)
+                || arm != PipelineBenchmarkComparison.Arm.B
+                || mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN || forkOutput == null
+                || !Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot")
+                || !Boolean.getBoolean("tapstate.e2e.benchmark.load-diagnostics")
+                || Boolean.getBoolean("tapstate.e2e.benchmark.compilation-diagnostics")
+                || Boolean.getBoolean("tapstate.e2e.benchmark-smoke.jvm-gap-diagnostics")
+                || Boolean.getBoolean(BenchmarkDualGcDiagnostics.ENABLED_PROPERTY)
+                || Boolean.getBoolean("tapstate.e2e.benchmark-smoke.paced-calibration")
+                || Boolean.getBoolean("tapstate.e2e.benchmark-smoke.cdc-settling-calibration")
+                || Boolean.getBoolean("tapstate.e2e.benchmark-smoke.full-cdc-settling-calibration"))) {
+            throw new AssertionError("thread point diagnostics require one unchanged plain original copy B fork with load points");
+        }
         BenchmarkJdiCostObserver.Artifact artifact = mode == BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN
                 ? null : BenchmarkJdiCostObserver.Artifact.open(
                 applicationJar, arm == PipelineBenchmarkComparison.Arm.A ? BenchmarkJdiCostObserver.Arm.REFERENCE
@@ -209,6 +223,9 @@ class RealBenchmarkForkDriverIT {
                         "measurement", PipelineBenchmarkLiveRunIT.fork(evidence, result, startedAt)));
                 if (compilationDiagnostics) {
                     output.put("compilationDiagnostics", true);
+                }
+                if (threadPointDiagnostics) {
+                    output.put("threadPointDiagnostics", true);
                 }
                 String json = JsonWriter.write(output);
                 Files.writeString(forkOutput, json + "\n", StandardCharsets.UTF_8,

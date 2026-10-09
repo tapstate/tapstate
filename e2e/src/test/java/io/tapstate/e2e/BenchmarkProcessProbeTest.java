@@ -8,6 +8,7 @@ import java.lang.ref.Reference;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -57,6 +58,26 @@ class BenchmarkProcessProbeTest {
                     assertThat(compilation.totalCompilationMillis()).isEmpty();
                 }
                 assertThat(probe.sample().complete()).as("optional compilation read leaves resource readings available").isTrue();
+                var threadReader = probe.threadPointReader();
+                assertThat(threadReader.ownedPid()).isEqualTo(child.pid());
+                var identity = threadReader.identity();
+                assertThat(identity.pid()).isEqualTo(child.pid());
+                assertThat(identity.startTimeMillis()).isPositive();
+                assertThat(identity.alive()).isTrue();
+                var capability = threadReader.cpuCapability();
+                if (capability.supported()) { assertThat(capability.enabled()).isNotNull(); }
+                else { assertThat(capability.enabled()).isNull(); }
+                if (Boolean.TRUE.equals(capability.enabled())) {
+                    long[] ids = threadReader.threadIds();
+                    var info = threadReader.threadInfo(ids, 0);
+                    assertThat(info).hasSize(ids.length);
+                    var present = info.stream().filter(Objects::nonNull).findFirst().orElseThrow();
+                    assertThat(present.frames()).isEmpty();
+                    long[] cpu = threadReader.cpuNanos(new long[] {present.id()});
+                    assertThat(cpu).hasSize(1);
+                    assertThat(cpu[0]).as("dead thread is absent rather than an invented zero").isGreaterThanOrEqualTo(-1L);
+                    assertThat(threadReader.threadInfo(new long[] {present.id()}, 1)).hasSize(1);
+                }
             }
 
             child.getOutputStream().close();
@@ -73,6 +94,10 @@ class BenchmarkProcessProbeTest {
                 assertThat(compilation.state()).isEqualTo(BenchmarkProcessProbe.CompilationState.UNKNOWN);
                 assertThat(compilation.unknownReason()).isEqualTo(BenchmarkProcessProbe.CompilationUnknownReason.CHILD_EXITED);
                 assertThat(compilation.totalCompilationMillis()).isEmpty();
+                var threadPoints = BenchmarkThreadPointDiagnostics.prepare(probe.threadPointReader(), System::nanoTime);
+                threadPoints.recordAttempt(1);
+                assertThat(((java.util.Map<?, ?>) threadPoints.evidence().get("preparation")).get("state"))
+                        .isEqualTo("UNKNOWN");
             }
         } finally {
             child.destroyForcibly();

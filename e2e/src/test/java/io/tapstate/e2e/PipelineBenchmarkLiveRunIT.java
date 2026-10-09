@@ -44,6 +44,9 @@ class PipelineBenchmarkLiveRunIT {
         if (Boolean.getBoolean("tapstate.e2e.benchmark.compilation-diagnostics")) {
             throw new AssertionError("compilation diagnostics cannot establish a live performance gate");
         }
+        if (Boolean.getBoolean("tapstate.e2e.benchmark.thread-point-diagnostics")) {
+            throw new AssertionError("thread point diagnostics cannot establish a live performance gate");
+        }
 
         Path output = Path.of(required(OUTPUT));
         Path harnessRoot = harnessRoot();

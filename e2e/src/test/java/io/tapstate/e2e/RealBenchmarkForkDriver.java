@@ -445,6 +445,11 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         if (compilationDiagnostics && !workload.pilotProfile()) {
             throw new AssertionError("compilation diagnostics require the declared steady pilot profile");
         }
+        boolean threadPointDiagnostics = Boolean.getBoolean("tapstate.e2e.benchmark.thread-point-diagnostics");
+        if (threadPointDiagnostics && (!workload.pilotProfile() || !"copy".equals(workload.id())
+                || compilationDiagnostics || !Boolean.getBoolean("tapstate.e2e.benchmark.load-diagnostics"))) {
+            throw new AssertionError("thread point diagnostics require the original copy pilot with load points");
+        }
         List<BenchmarkExpectedChanges.TargetPlan> plans = BenchmarkExpectedChanges.forPhase(workload, phase);
         long initialAcknowledged = recordsOut(workload, fork.control());
         BenchmarkForkEnvironment.PhaseIssue issued;
@@ -492,6 +497,9 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             if (compilationDiagnostics) {
                 resourceSampler.enableCompilationDiagnostics();
             }
+            if (threadPointDiagnostics) {
+                resourceSampler.enableThreadPointDiagnostics();
+            }
             Throwable samplingFailure = null;
             try {
                 resourceSampler.start();
@@ -530,6 +538,12 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                                 "intervalMillis", RESOURCE_INTERVAL.toMillis(), "evidence", reading,
                                 "scope", "CUMULATIVE_APPROXIMATE_COMPILATION_ELAPSED_COUNTER_READS",
                                 "performanceAcceptanceEligible", false))));
+                    resourceSampler.threadPointEvidence().ifPresent(reading ->
+                        System.out.println("benchmark-thread-point-timeline=" + JsonWriter.write(Map.of(
+                                "phase", phase.id(), "ownedPid", fork.server().pid(),
+                                "intervalMillis", RESOURCE_INTERVAL.toMillis(), "evidence", reading,
+                                "scope", "CONDITIONAL_PLATFORM_THREAD_CPU_AND_POSITIVE_STACK_POINT_READS",
+                                "captureRoleCoverage", "UNKNOWN", "performanceAcceptanceEligible", false))));
                 } catch (RuntimeException | Error diagnosticFailure) {
                     if (samplingFailure != null) {
                         samplingFailure.addSuppressed(diagnosticFailure);
