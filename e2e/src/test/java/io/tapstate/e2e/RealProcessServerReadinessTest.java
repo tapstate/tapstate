@@ -75,7 +75,7 @@ class RealProcessServerReadinessTest {
         }
     }
 
-    private static HttpServer healthyEndpoint(AtomicInteger requests) throws IOException {
+    static HttpServer healthyEndpoint(AtomicInteger requests) throws IOException {
         return healthyEndpoint(requests, () -> { });
     }
 
@@ -101,9 +101,12 @@ class RealProcessServerReadinessTest {
                 URI.create("http://127.0.0.1:" + endpoint.getAddress().getPort()), log, staging);
     }
 
-    private static final class ControlledProcess extends Process {
+    static final class ControlledProcess extends Process {
         private volatile boolean alive;
-        private ControlledProcess(boolean alive) { this.alive = alive; }
+        private final long pid;
+        ControlledProcess(boolean alive) { this(alive, 1L); }
+        ControlledProcess(boolean alive, long pid) { this.alive = alive; this.pid = pid; }
+        @Override public long pid() { return pid; }
         @Override public java.io.OutputStream getOutputStream() { return java.io.OutputStream.nullOutputStream(); }
         @Override public java.io.InputStream getInputStream() { return java.io.InputStream.nullInputStream(); }
         @Override public java.io.InputStream getErrorStream() { return java.io.InputStream.nullInputStream(); }

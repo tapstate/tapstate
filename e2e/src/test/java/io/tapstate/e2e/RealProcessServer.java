@@ -58,7 +58,7 @@ final class RealProcessServer implements ServerHandle {
         this(process, baseUrl, output, stagingDirectory, List.of());
     }
 
-    private RealProcessServer(Process process, URI baseUrl, Path output, Path stagingDirectory, List<String> launchCommand) {
+    RealProcessServer(Process process, URI baseUrl, Path output, Path stagingDirectory, List<String> launchCommand) {
         this.process = process;
         this.baseUrl = baseUrl;
         this.output = output;
@@ -244,7 +244,7 @@ final class RealProcessServer implements ServerHandle {
      * up after it. Whatever goes wrong doing that is attached to the failure rather than replacing it:
      * why the server did not come up is the thing a reader needs.
      */
-    private static RealProcessServer healthy(RealProcessServer server) {
+    static RealProcessServer healthy(RealProcessServer server) {
         try {
             awaitHealthy(server.process, server.baseUrl, server.output);
         } catch (RuntimeException | AssertionError e) {
@@ -480,7 +480,7 @@ final class RealProcessServer implements ServerHandle {
         }
     }
 
-    private static Path bootJar() {
+    static Path bootJar() {
         String configured = System.getProperty(BOOT_JAR_PROPERTY);
         if (configured == null || configured.isBlank()) {
             throw new AssertionError(

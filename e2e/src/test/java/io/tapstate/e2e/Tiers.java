@@ -26,4 +26,19 @@ enum Tiers {
     ServerHandle launch(String storeUri, String operatorStateDatabase) {
         return launcher.apply(storeUri, operatorStateDatabase);
     }
+    /** Explicitly starts an empty fixture; ordinary launch and recovery retain their existing behavior. */
+    ServerHandle launchFresh(String storeUri) {
+        return launchFresh(storeUri, SharedMongo.OPERATOR_STATE_DATABASE);
+    }
+
+    ServerHandle launchFresh(String storeUri, String operatorStateDatabase) {
+        return this == IN_PROCESS ? launch(storeUri, operatorStateDatabase)
+                : FreshNativeServer.startFresh(storeUri, operatorStateDatabase);
+    }
+
+    /** Per-call native boundaries for routing controls; no process-wide launcher override. */
+    ServerHandle launchFresh(String storeUri, String operatorStateDatabase, FreshNativeServer.Setup setup) {
+        return this == IN_PROCESS ? launch(storeUri, operatorStateDatabase)
+                : FreshNativeServer.startFresh(storeUri, operatorStateDatabase, setup);
+    }
 }

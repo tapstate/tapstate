@@ -97,7 +97,7 @@ class NestMigratesSubtreeOnAncestorReparentIT {
             String storeUri = SharedMongo.replicaSetUrl("subtree_store_" + suffix);
             String targetUri = SharedMongo.replicaSetUrl("subtree_target_" + suffix);
 
-            try (ServerHandle server = tier.launch(storeUri);
+            try (ServerHandle server = tier.launchFresh(storeUri);
                     MongoEndpoints mongo = new MongoEndpoints()) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
                 control.bootstrapAndLogin("e2e", "e2e-password");
