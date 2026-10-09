@@ -70,6 +70,12 @@ public enum ConnectorError implements TapstateErrorCode {
     CLASS_NOT_FOUND("connector.class-not-found", Set.of("connector", "class")),
 
     /**
+     * A connector artifact's archive or spec resource could not be read. {@code artifact} names the
+     * unreadable artifact, since introspection may fail before its connector id is known.
+     */
+    ARTIFACT_UNREADABLE("connector.artifact-unreadable", Set.of("artifact")),
+
+    /**
      * A registered artifact carries no connector entry class — no class it contains is annotated as a
      * connector. {@code artifact} names the artifact that was scanned. Self-scan raises this before a
      * connector id is known, so it is keyed by the artifact rather than by an id.

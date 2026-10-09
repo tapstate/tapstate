@@ -120,6 +120,7 @@ connector.ambiguous-connector-class
 connector.ambiguous-registration
 connector.api-level-incompatible
 connector.api-level-unknown
+connector.artifact-unreadable
 connector.capability-missing
 connector.capture-failed
 connector.class-not-found

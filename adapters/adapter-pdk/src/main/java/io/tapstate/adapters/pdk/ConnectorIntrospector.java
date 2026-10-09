@@ -6,7 +6,6 @@ import io.tapdata.pdk.apis.annotations.TapConnectorClass;
 import java.io.IOException;
 import java.lang.annotation.AnnotationFormatError;
 import java.io.InputStream;
-import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -29,8 +28,8 @@ import java.util.stream.Collectors;
  *
  * <p>PDK types stay inside this class. A malformed artifact — no connector class, more than one
  * unrelated connector class, or a spec the annotation names but the jar omits — is refused with a coded
- * connector-domain exception keyed by the artifact; a raw I/O failure reading a staged artifact is not
- * a connector defect and surfaces as an unchecked I/O exception.
+ * connector-domain exception keyed by the artifact, including I/O failures reading the archive or its
+ * spec resource.
  */
 public final class ConnectorIntrospector {
 
@@ -55,7 +54,8 @@ public final class ConnectorIntrospector {
             String pdkApiVersion = mainAttribute(jar, PDK_API_VERSION);
             return new IntrospectedConnector(entry.className(), pdkApiVersion, entry.specPath(), spec);
         } catch (IOException e) {
-            throw new UncheckedIOException("reading connector artifact " + entry.jar(), e);
+            throw new TapstateException(ConnectorError.ARTIFACT_UNREADABLE,
+                    Map.of("artifact", entry.jar().getFileName().toString()), e);
         }
     }
 
@@ -82,7 +82,8 @@ public final class ConnectorIntrospector {
                     }
                 }
             } catch (IOException e) {
-                throw new UncheckedIOException("reading connector artifact " + jarPath, e);
+                throw new TapstateException(ConnectorError.ARTIFACT_UNREADABLE,
+                        Map.of("artifact", jarPath.getFileName().toString()), e);
             }
         }
         return candidates;
