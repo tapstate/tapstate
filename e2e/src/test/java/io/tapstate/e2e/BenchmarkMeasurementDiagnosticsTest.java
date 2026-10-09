@@ -76,6 +76,55 @@ class BenchmarkMeasurementDiagnosticsTest {
     }
 
     @Test
+    void fullSourceIssueDurationDoesNotMoveWithTheLatencyCohort() {
+        var anchor = new BenchmarkForkEnvironment.ClockAnchor(Instant.EPOCH, 100, 140);
+        var batches = List.of(new BenchmarkForkEnvironment.BatchResult(0, 150, 180),
+                new BenchmarkForkEnvironment.BatchResult(1, 200, 260));
+        var resources = new BenchmarkResourceSampler.Summary(70, 3, 1_500, 2_500, 2);
+        var timing = Optional.of(new RealBenchmarkForkDriver.ConfirmationTiming(260, 280, 300, 220, 290));
+        var whole = new RealBenchmarkForkDriver.MeasuredPhase("cdc-update", 96_000, 150, 260, 300,
+                96_000, 96_000, 96_003, anchor, batches, resources, timing);
+        var cohort = new RealBenchmarkForkDriver.MeasuredPhase("cdc-update", 48_000, 200, 260, 300,
+                96_000, 96_000, 96_003, anchor, batches, resources, timing);
+
+        assertThat(PipelineBenchmarkLiveRunIT.phaseEvidence(whole))
+                .containsEntry("sourceIssueDurationNanos", 110L);
+        assertThat(PipelineBenchmarkLiveRunIT.phaseEvidence(cohort))
+                .as("full source counts keep the same full source issue interval")
+                .containsEntry("sourceIssueDurationNanos", 110L)
+                .containsEntry("sourceIssueWindowScope", "FULL_SOURCE_BATCH_LEDGER")
+                .containsEntry("fullSourceFirstIssuedAtNanos", 150L)
+                .containsEntry("firstIssuedAtNanos", 200L)
+                .containsEntry("durationNanos", 100L)
+                .containsEntry("deliveryWindowNanos", 90L);
+    }
+
+    @Test
+    void absentRawSourceBatchesLeaveTheSourceIssueClockUnavailable() {
+        var phase = new RealBenchmarkForkDriver.MeasuredPhase("cdc-update", 12_000, 150, 260, 300,
+                12_000, 12_000, 12_000, new BenchmarkForkEnvironment.ClockAnchor(Instant.EPOCH, 100, 140),
+                List.of(), new BenchmarkResourceSampler.Summary(70, 3, 1_500, 2_500, 2));
+
+        assertThat(phase.sourceIssueDurationNanos()).isEmpty();
+        assertThat(PipelineBenchmarkLiveRunIT.phaseEvidence(phase))
+                .containsEntry("sourceIssueDurationNanos", null)
+                .containsEntry("sourceIssueWindowScope", "UNAVAILABLE")
+                .containsEntry("fullSourceFirstIssuedAtNanos", null)
+                .containsEntry("durationNanos", 150L);
+    }
+
+    @Test
+    void aSourceCompletionBeforeItsActualBatchIssueCannotBecomeAReportedRate() {
+        var phase = new RealBenchmarkForkDriver.MeasuredPhase("cdc-update", 12_000, 150, 140, 300,
+                12_000, 12_000, 12_000, new BenchmarkForkEnvironment.ClockAnchor(Instant.EPOCH, 100, 140),
+                List.of(new BenchmarkForkEnvironment.BatchResult(0, 150, 180)),
+                new BenchmarkResourceSampler.Summary(70, 3, 1_500, 2_500, 2));
+
+        assertThatThrownBy(() -> PipelineBenchmarkLiveRunIT.phaseEvidence(phase))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("invalid full source issue window");
+    }
+
+    @Test
     void deliveryAndConfirmationIntervalsKeepTheirSeparateMeanings() {
         var anchor = new BenchmarkForkEnvironment.ClockAnchor(Instant.EPOCH, 100, 140);
         var resources = new BenchmarkResourceSampler.Summary(70, 3, 1_500, 2_500, 2);

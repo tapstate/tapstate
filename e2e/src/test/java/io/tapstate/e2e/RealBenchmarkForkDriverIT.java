@@ -134,7 +134,8 @@ class RealBenchmarkForkDriverIT {
                 long sourceChanges = evidence.phases().stream()
                         .mapToLong(RealBenchmarkForkDriver.MeasuredPhase::expectedSourceChanges).sum();
                 long sourceIssueNanos = evidence.phases().stream().mapToLong(phase ->
-                        phase.sourceCompletedAtNanos() - phase.firstIssuedAtNanos()).sum();
+                        phase.sourceIssueDurationNanos().orElseThrow(() ->
+                                new AssertionError("the actual source batch issue clock is unavailable"))).sum();
                 assertThat(sourceIssueNanos).as("source issue time must be measured independently of target ACK")
                         .isPositive();
                 System.out.printf("benchmark-real-fork acceptanceEvaluated=false id=%s jar=%s throughput=%s"

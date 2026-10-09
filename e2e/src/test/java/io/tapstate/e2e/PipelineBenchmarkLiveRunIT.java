@@ -451,11 +451,15 @@ class PipelineBenchmarkLiveRunIT {
     /** Delivery timing and proof-confirmation timing remain separately reported and versioned. */
     static Map<String, Object> phaseEvidence(RealBenchmarkForkDriver.MeasuredPhase phase) {
         BenchmarkForkEnvironment.ClockAnchor anchor = phase.clockAnchor();
+        var sourceIssueDuration = phase.sourceIssueDurationNanos();
         return object(
                 "id", phase.id(), "acknowledgedOutputs", phase.acknowledgedOutputs(),
                 "firstIssuedAtNanos", phase.firstIssuedAtNanos(),
                 "sourceCompletedAtNanos", phase.sourceCompletedAtNanos(),
-                "sourceIssueDurationNanos", phase.sourceCompletedAtNanos() - phase.firstIssuedAtNanos(),
+                "sourceIssueDurationNanos", sourceIssueDuration.isPresent() ? sourceIssueDuration.getAsLong() : null,
+                "sourceIssueWindowScope", sourceIssueDuration.isPresent() ? "FULL_SOURCE_BATCH_LEDGER" : "UNAVAILABLE",
+                "fullSourceFirstIssuedAtNanos", phase.sourceBatches().isEmpty()
+                        ? null : phase.sourceBatches().getFirst().issuedAtNanos(),
                 "expectedSourceChanges", phase.expectedSourceChanges(),
                 "completedAckAtNanos", phase.completedAckAtNanos(),
                 "durationNanos", phase.completedAckAtNanos() - phase.firstIssuedAtNanos(),

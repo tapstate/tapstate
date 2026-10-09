@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 
@@ -198,6 +199,13 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             long duration = completedAckAtNanos - firstIssuedAtNanos;
             if (duration <= 0 || acknowledgedOutputs <= 0) { throw new AssertionError("invalid confirmation window: " + id); }
             return acknowledgedOutputs * 1_000_000_000.0 / duration;
+        }
+
+        OptionalLong sourceIssueDurationNanos() {
+            if (sourceBatches.isEmpty()) { return OptionalLong.empty(); }
+            long duration = sourceCompletedAtNanos - sourceBatches.getFirst().issuedAtNanos();
+            if (duration <= 0) { throw new AssertionError("invalid full source issue window: " + id); }
+            return OptionalLong.of(duration);
         }
 
         boolean steadyOutputEstablished() {
