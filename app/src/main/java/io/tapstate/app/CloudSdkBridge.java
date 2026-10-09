@@ -24,7 +24,6 @@ import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 
 import java.time.Instant;
-import java.lang.reflect.InvocationTargetException;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -250,28 +249,17 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
         public ExchangeResult exchange(String code) {
             try {
                 var exchanged = sdk.exchangeForJwt(code);
-                String organizationName = optionalText(exchanged, "organizationName");
-                String clusterName = optionalText(exchanged, "clusterName");
-                String region = optionalText(exchanged, "region");
+                String organizationName = exchanged.organizationName();
+                String clusterName = exchanged.clusterName();
+                String region = exchanged.region();
                 if (!text(exchanged.orgId()) || !text(exchanged.clusterId())
                         || !text(organizationName) || !text(clusterName) || !text(region)) {
-                    return new ExchangeResult(exchanged.jwt());
+                    throw new ProviderFailure();
                 }
                 return new ExchangeResult(exchanged.jwt(), exchanged.orgId(), exchanged.clusterId(),
                         organizationName, clusterName, region);
             } catch (CloudControlPlaneException failure) {
                 logExchangeFailure(failure);
-                throw new ProviderFailure();
-            }
-        }
-
-        private static String optionalText(Object value, String accessor) {
-            try {
-                Object result = value.getClass().getMethod(accessor).invoke(value);
-                return result instanceof String text ? text : null;
-            } catch (NoSuchMethodException unavailableInPublishedSdk) {
-                return null;
-            } catch (IllegalAccessException | InvocationTargetException failure) {
                 throw new ProviderFailure();
             }
         }
