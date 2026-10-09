@@ -59,6 +59,20 @@ final class StoreDocuments implements AutoCloseable {
         return new StoreDocuments(client, client.getDatabase(name));
     }
 
+    /** Actual empty pipeline/work guards; source, target and managed-store declarations may already exist. */
+    FreshMemberStartup.Freshness freshMemberSetup() {
+        return new FreshMemberStartup.Freshness(
+                database.getCollection(MongoStorePort.ARTIFACTS).find(new Document("kind", "pipeline"))
+                        .projection(new Document("_id", 1)).limit(1).first() == null,
+                database.getCollection(MongoStorePort.PIPELINE_DESIRED).find()
+                        .projection(new Document("_id", 1)).limit(1).first() == null,
+                database.getCollection(MongoStorePort.PIPELINE_STATE).find()
+                        .projection(new Document("_id", 1)).limit(1).first() == null,
+                database.getCollection(MongoStorePort.WORKLOAD_CLAIMS)
+                        .find(new Document("resourceType", new Document("$ne", WorkloadClaimType.NODE_SESSION.name())))
+                        .projection(new Document("_id", 1)).limit(1).first() == null);
+    }
+
     /** Whether {@code collection} holds a document under {@code id}. */
     boolean holds(String collection, String id) {
         return database.getCollection(collection).find(new Document("_id", id)).first() != null;

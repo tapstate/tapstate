@@ -52,12 +52,18 @@ final class RealProcessServer implements ServerHandle {
     private final URI baseUrl;
     private final Path output;
     private final Path stagingDirectory;
+    private final List<String> launchCommand;
 
     RealProcessServer(Process process, URI baseUrl, Path output, Path stagingDirectory) {
+        this(process, baseUrl, output, stagingDirectory, List.of());
+    }
+
+    private RealProcessServer(Process process, URI baseUrl, Path output, Path stagingDirectory, List<String> launchCommand) {
         this.process = process;
         this.baseUrl = baseUrl;
         this.output = output;
         this.stagingDirectory = stagingDirectory;
+        this.launchCommand = List.copyOf(launchCommand);
     }
 
     /** Launches the deliverable and returns once its health probe answers. */
@@ -266,9 +272,9 @@ final class RealProcessServer implements ServerHandle {
         Path workingDirectory = workingDirectory();
         Path output = workingDirectory.resolve("server.out");
         Path stagingDirectory = ServerHandle.privateStagingDirectory();
-        Process process;
+        Launched launched;
         try {
-            process = launch(jar, jvmOptions, port, listenAddress, storeUri, operatorStateDatabase,
+            launched = launch(jar, jvmOptions, port, listenAddress, storeUri, operatorStateDatabase,
                     workingDirectory, output, stagingDirectory, extraArguments.apply(port));
         } catch (RuntimeException | Error failure) {
             // No child was returned; these pre-launch artifacts have no live process using them.
@@ -279,7 +285,7 @@ final class RealProcessServer implements ServerHandle {
             }
             throw failure;
         }
-        return new RealProcessServer(process, baseUrl, output, stagingDirectory);
+        return new RealProcessServer(launched.process(), baseUrl, output, stagingDirectory, launched.command());
     }
 
     /**
@@ -334,6 +340,28 @@ final class RealProcessServer implements ServerHandle {
         awaitHealthy(process, baseUrl, output);
     }
 
+    /** A fresh fixture keeps one startup deadline across its finite attempts. */
+    void awaitHealthy(Duration remaining, boolean requireOwnedHttpBinding) {
+        if (remaining.isNegative() || remaining.isZero() || remaining.compareTo(STARTUP_BUDGET) > 0) {
+            throw new IllegalArgumentException("a remaining startup budget is positive and at most the ordinary budget");
+        }
+        awaitHealthy(process, baseUrl, output, remaining, requireOwnedHttpBinding);
+    }
+
+    List<String> launchCommand() { return launchCommand; }
+
+    String startupLog() { return startupLog(output); }
+
+    private static String startupLog(Path output) {
+        try {
+            if (!Files.isRegularFile(output)) { return ""; }
+            if (Files.size(output) > 1_048_576L) {
+                throw new AssertionError("the owned startup log is too large to qualify a bind failure");
+            }
+            return Files.readString(output);
+        } catch (IOException unavailable) { throw new UncheckedIOException(unavailable); }
+    }
+
     /** The child JVM identity used by external benchmark resource sampling. */
     long pid() {
         return process.pid();
@@ -373,7 +401,9 @@ final class RealProcessServer implements ServerHandle {
         }
     }
 
-    private static Process launch(Path jar, List<String> jvmOptions, int port, String listenAddress,
+    private record Launched(Process process, List<String> command) { }
+
+    private static Launched launch(Path jar, List<String> jvmOptions, int port, String listenAddress,
             String storeUri, String operatorStateDatabase, Path workingDirectory, Path output,
             Path stagingDirectory, List<String> extraArguments) {
         List<String> command = new ArrayList<>();
@@ -404,11 +434,12 @@ final class RealProcessServer implements ServerHandle {
         command.addAll(extraArguments);
         try {
             releaseLaunchPorts(port, extraArguments);
-            return new ProcessBuilder(command)
+            Process child = new ProcessBuilder(command)
                     .directory(workingDirectory.toFile())
                     .redirectErrorStream(true)
                     .redirectOutput(output.toFile())
                     .start();
+            return new Launched(child, List.copyOf(command));
         } catch (IOException e) {
             throw new UncheckedIOException("could not launch " + jar, e);
         }
@@ -419,11 +450,18 @@ final class RealProcessServer implements ServerHandle {
      * too short on a loaded machine or waste its whole length on every green run.
      */
     private static void awaitHealthy(Process process, URI baseUrl, Path output) {
+        awaitHealthy(process, baseUrl, output, STARTUP_BUDGET, false);
+    }
+
+    private static void awaitHealthy(Process process, URI baseUrl, Path output, Duration budget,
+            boolean requireOwnedHttpBinding) {
         ControlPlane probe = new ControlPlane(baseUrl);
         long start = System.nanoTime();
-        long deadline = start + STARTUP_BUDGET.toNanos();
+        long deadline = start + budget.toNanos();
         while (true) {
-            if (probe.healthy()) {
+            boolean boundHere = !requireOwnedHttpBinding || process.isAlive() && startupLog(output).contains(
+                    "Tomcat started on port " + baseUrl.getPort() + " (http)");
+            if (boundHere && probe.healthy() && (!requireOwnedHttpBinding || process.isAlive())) {
                 return;
             }
             if (!process.isAlive()) {
@@ -435,7 +473,7 @@ final class RealProcessServer implements ServerHandle {
                 process.destroyForcibly();
                 throw new AssertionError(
                         "the server did not answer " + baseUrl + "/healthz after "
-                                + Duration.ofNanos(System.nanoTime() - start) + " (budget " + STARTUP_BUDGET
+                                + Duration.ofNanos(System.nanoTime() - start) + " (budget " + budget
                                 + "); its output was:\n" + tail(output));
             }
             sleep(POLL_INTERVAL);

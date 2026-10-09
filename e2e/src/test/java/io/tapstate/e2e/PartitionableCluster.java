@@ -137,7 +137,7 @@ final class PartitionableCluster implements AutoCloseable {
             }
             for (String nodeId : nodeIds) {
                 servers.put(nodeId,
-                        RealProcessServer.start(storeUri, "0.0.0.0", launchArguments.get(nodeId)));
+                        freshMember(storeUri, clusterId, nodeId, launchArguments.get(nodeId)));
             }
         } catch (RuntimeException | Error failure) {
             servers.values().forEach(RealProcessServer::close);
@@ -157,6 +157,55 @@ final class PartitionableCluster implements AutoCloseable {
             throw failure;
         }
         return cluster;
+    }
+
+    /** Re-selection is confined to a member's initial empty-work fixture bring-up. */
+    private static RealProcessServer freshMember(String storeUri, String clusterId, String nodeId,
+            IntFunction<List<String>> arguments) {
+        try (StoreDocuments documents = StoreDocuments.at(storeUri)) {
+            return FreshMemberStartup.start(documents::freshMemberSetup, () -> {
+                RealProcessServer server = RealProcessServer.launching(storeUri, "0.0.0.0", arguments);
+                return new FreshMemberStartup.Attempt<RealProcessServer>() {
+                    @Override public RealProcessServer await(Duration remaining) {
+                        server.awaitHealthy(remaining, true);
+                        return server;
+                    }
+                    @Override public FreshMemberStartup.Failure failure() {
+                        boolean ended = server.terminated();
+                        return new FreshMemberStartup.Failure(server.baseUrl().getPort(), ended,
+                                ended ? server.exitValue() : -1, server.startupLog());
+                    }
+                    @Override public void retain(int ordinal, FreshMemberStartup.Freshness fresh, Throwable cause) {
+                        Path directory = Path.of("target", "failure-scenes", "members", clusterId, "startup-attempts");
+                        Path raw = directory.resolve(nodeId + "-attempt-" + ordinal + ".raw.log");
+                        Path metadata = directory.resolve(nodeId + "-attempt-" + ordinal + ".json");
+                        Map<String, Object> receipt = new LinkedHashMap<>();
+                        receipt.put("nodeId", nodeId); receipt.put("attempt", ordinal); receipt.put("pid", server.pid());
+                        receipt.put("baseUri", server.baseUrl().toString()); receipt.put("argv", server.launchCommand());
+                        receipt.put("httpPort", server.baseUrl().getPort()); receipt.put("conflictingPortOwner", "UNKNOWN");
+                        receipt.put("sourceLog", server.output().toString()); receipt.put("capturedAt", Instant.now().toString());
+                        receipt.put("ended", server.terminated());
+                        receipt.put("exit", server.terminated() ? server.exitValue() : null);
+                        receipt.put("noPipeline", fresh.noPipeline()); receipt.put("noDesired", fresh.noDesired());
+                        receipt.put("noActual", fresh.noActual()); receipt.put("noWorkload", fresh.noWorkload());
+                        receipt.put("freshnessConsistency", "NON_ATOMIC_EMPTY_PIPELINE_WORK_GUARDS");
+                        receipt.put("failureType", cause == null ? null : cause.getClass().getName());
+                        receipt.put("rawLogState", server.terminated() ? "ENDED_CHILD_COMPLETE" : "LIVE_STARTUP_PREFIX");
+                        try {
+                            Files.createDirectories(directory);
+                            Files.copy(server.output(), raw);
+                            Files.writeString(metadata, JsonWriter.write(receipt));
+                        } catch (IOException unavailable) { throw new java.io.UncheckedIOException(unavailable); }
+                    }
+                    @Override public void close() {
+                        server.close();
+                        if (!server.terminated()) {
+                            throw new AssertionError("the failed fresh member did not confirm termination");
+                        }
+                    }
+                };
+            });
+        }
     }
 
     /** The control plane of one member. Every read face answers the same while the cluster is whole. */
