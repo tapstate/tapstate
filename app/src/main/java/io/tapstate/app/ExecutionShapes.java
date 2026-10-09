@@ -47,7 +47,8 @@ import java.util.function.Function;
  * processor; what bounds it is what it costs. A nest's vertices each hold a thread of their own for the life of a
  * run, and every one of them runs as wide as the nest does, so they count against what a member may run of such
  * threads. A nest with nothing to assemble keeps no state and draws no such vertex: it passes its root's rows on
- * as they came, so like any step it runs wider than one processor only where those rows carry a key.
+ * as they came, under their own streams, so like any step it runs wider than one processor only where those rows
+ * carry a key.
  *
  * <p>Every node is worked out here. A source always runs as one processor, and says so where its author asked
  * for more.
@@ -120,8 +121,9 @@ final class ExecutionShapes {
             }
             TransformBody body = inline.body();
             if (body instanceof TransformBody.Nest nest && assemblesNothing(step.id(), graph)) {
-                emitted.put(step.id(), Map.of(step.id(), graph.assembledKeys().getOrDefault(step.id(), List.of())));
+                // Its rows go on as they came, under their own streams and keyed as they arrived.
                 Map<String, List<String>> input = inputOf(rootOf(inline, nest), graph, emitted);
+                emitted.put(step.id(), input);
                 ExecutionSpec execution = step.execution();
                 boolean keyed = !input.isEmpty() && input.values().stream().noneMatch(List::isEmpty);
                 ParallelismRequest request = new ParallelismRequest(step.id(), ParallelismRequest.Kind.TRANSFORM,

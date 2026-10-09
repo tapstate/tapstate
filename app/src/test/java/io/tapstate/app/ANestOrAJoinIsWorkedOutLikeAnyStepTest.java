@@ -90,6 +90,26 @@ class ANestOrAJoinIsWorkedOutLikeAnyStepTest {
                 });
     }
 
+    /**
+     * The rows a nest with nothing to assemble passes on are its root's rows under their own stream, so a step
+     * reading the nest routes them by the key they carry there - not by a stream of the nest's own, which no row
+     * arriving at it is on.
+     */
+    @Test
+    void aStepAfterANestWithNothingToAssembleRoutesItsRowsUnderTheirOwnStream() {
+        Step wide = Step.inline("w", FromClause.list(FromRef.literal("doc")), new TransformBody.Js("row"),
+                new ExecutionSpec(4, null), null);
+        PipelineResource pipeline = new PipelineResource("p", null, List.of(SourceRef.bare("orders")),
+                List.of(nest(null), wide), null, null, null, null);
+        ExecutionShapes.Graph graph = new ExecutionShapes.Graph(ref -> List.of(((FromRef.Literal) ref).ref()),
+                Map.of("orders", "orders"), Map.of("orders", List.of("id")), Map.of("doc", List.of("id")),
+                Map.of("doc", 0), Map.of());
+
+        ExecutionShape shape = ExecutionShapes.of("p", pipeline, 2, ParallelismBudget.DEFAULTS, graph, List.of());
+
+        assertThat(shape.inputKeysOf("w")).isEqualTo(Map.of("orders", List.of("id")));
+    }
+
     private static Step nest(ExecutionSpec execution) {
         TransformBody body = new TransformBody.Nest(null, null,
                 new NestRoot("o", List.of("id"), null, null, List.of()));

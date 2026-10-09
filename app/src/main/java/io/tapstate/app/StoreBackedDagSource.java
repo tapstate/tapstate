@@ -66,7 +66,9 @@ import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.spi.transform.TransformPort;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -415,6 +417,13 @@ final class StoreBackedDagSource implements DagSource {
                     bySourceTable, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds));
         }
         requireFactKeyPublishedWhereAWriteMatchesOnIt(pipeline, compiledJoins, serveStreams);
+        // A nest with nothing to assemble passes its root's rows on under their own streams, not under the nest's,
+        // so each stream they arrive on is landed where the nest's documents land: in its target, matched on its
+        // root's key, and routed among a sink's writers by those.
+        Map<String, Set<String>> passedOn =
+                passedOnStreams(pipeline, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds);
+        Set<String> serveLanding = landing(serveStreams, targets, passedOn);
+        Set<String> viewLanding = landing(viewStreams, viewTargets, passedOn);
         FrontierBinding frontier = frontierBinding(sourceVertices);
         PipelineResource builtPipeline = new PipelineResource(
                 pipeline.id(), pipeline.metadata(),
@@ -430,13 +439,13 @@ final class StoreBackedDagSource implements DagSource {
                         PipelineDagBuilder.nestBlockingVertices(pipeline,
                                 nestTablesByAlias(pipeline, sourceIdByTable(sourceVertices))::get),
                         sourceExecutions(sourceVertices)),
-                sinksOf(pipeline, targets, serveStreams, viewStreams, sourceIdByTable(sourceVertices)));
+                sinksOf(pipeline, targets, serveLanding, viewLanding, sourceIdByTable(sourceVertices)));
         return fence -> {
             NodeVertices drawn = new NodeVertices();
             DAG dag = PipelineDagBuilder.build(
                     builtPipeline,
                     bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets, viewTargets,
-                            serveStreams, viewStreams, stepIds, frontier, compiledJoins, freshFullLoad, fence),
+                            serveLanding, viewLanding, stepIds, frontier, compiledJoins, freshFullLoad, fence),
                     FencedSinkAckFactory.heldTo(sinkAckFactory(pipeline, pipelineId, fence), fence), frontier,
                     shape, drawn);
             return new PlannedDag(dag, shape, planned, nodeBatches(pipeline, sourceVertices), drawn.byNode(),
@@ -2079,6 +2088,61 @@ final class StoreBackedDagSource implements DagSource {
                 }
             }
         }
+    }
+
+    /**
+     * Each nest step with nothing to assemble, with the streams its root's rows arrive on - which are the streams
+     * they leave it on, since such a nest passes each row on as it came.
+     */
+    private static Map<String, Set<String>> passedOnStreams(
+            PipelineResource pipeline,
+            Map<String, String> sourceKeyByTable,
+            Map<String, List<String>> sourceKeysById,
+            Map<String, SourceVertex> sourceVertices,
+            Set<String> stepIds) {
+        Map<String, Set<String>> passedOn = new LinkedHashMap<>();
+        for (Step step : pipeline.transforms() == null ? List.<Step>of() : pipeline.transforms()) {
+            if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest nest
+                    && (nest.root().embed() == null || nest.root().embed().isEmpty())
+                    && inline.from() instanceof FromClause.Aliases aliases
+                    && aliases.aliases().get(nest.root().from()) != null) {
+                passedOn.put(step.id(), streamsReaching(pipeline, aliases.aliases().get(nest.root().from()),
+                        sourceKeyByTable, sourceKeysById, sourceVertices, stepIds));
+            }
+        }
+        return passedOn;
+    }
+
+    /**
+     * The streams a sink's rows arrive on: {@code streams}, and for each nest among them that assembles nothing, the
+     * streams its rows are actually on - each landing in that nest's target in {@code targets}. A stream that also
+     * reaches the sink by another way keeps the target it lands in there, since the sink names one target per
+     * stream.
+     */
+    private static Set<String> landing(
+            Set<String> streams, Map<String, TargetTable> targets, Map<String, Set<String>> passedOn) {
+        Set<String> landing = new LinkedHashSet<>(streams);
+        for (String stream : streams) {
+            TargetTable target = targets.get(stream);
+            if (target == null || !passedOn.containsKey(stream)) {
+                continue;
+            }
+            Set<String> seen = new HashSet<>();
+            Deque<String> pending = new ArrayDeque<>(passedOn.get(stream));
+            while (!pending.isEmpty()) {
+                String arriving = pending.pop();
+                if (!seen.add(arriving)) {
+                    continue;
+                }
+                if (passedOn.containsKey(arriving)) {
+                    // One nest with nothing to assemble reading another: its rows are that one's rows.
+                    pending.addAll(passedOn.get(arriving));
+                } else if (!streams.contains(arriving) && landing.add(arriving)) {
+                    targets.put(arriving, target);
+                }
+            }
+        }
+        return landing;
     }
 
     /** The stream ids a terminal sink can receive: source tables, or a nest step's assembled stream id. */

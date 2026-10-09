@@ -16,6 +16,10 @@ import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.jet.config.JobConfig;
 import io.tapstate.core.event.Envelope;
+import com.hazelcast.jet.core.test.TestSupport;
+import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.Op;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.NodeParallelism;
 import io.tapstate.core.model.BatchSpec;
 import io.tapstate.core.model.Embed;
@@ -117,6 +121,33 @@ class ANestRunsAtTheWidthItsNodeWasWorkedOutForTest {
                 bindings());
         assertThat(InputBatches.takesInputInBatches(one.getVertex("doc").getMetaSupplier()))
                 .as("as one processor too, it takes its input in its author's batches").isTrue();
+    }
+
+    /**
+     * A nest with nothing to assemble passes each row on exactly as it came - under its own stream, sitting where
+     * it sat - so whatever reads the nest takes the rows as it would take them from the root: a stateful node
+     * after it orders each row by where the row sits on its own stream, which a row moved under another name no
+     * longer says.
+     */
+    @Test
+    void aNestThatAssemblesNothingPassesEachRowOnWhereItSits() {
+        TransformBody.Nest rootOnly = new TransformBody.Nest(null, null,
+                new NestRoot("c", List.of("customer_id"), null, null, List.of()));
+        ExecutionShape wide = new ExecutionShape(1, Map.of("doc", new NodeParallelism("doc", 3,
+                NodeParallelism.Origin.EXPLICIT, NodeParallelism.Scope.NATIVE, 1, 3, 3, List.of())),
+                Map.of("doc", Map.of("customers", List.of("customer_id"))));
+        DAG dag = PipelineDagBuilder.build(pipeline(rootOnly, new ExecutionSpec(3, null)), bindings(), null, null,
+                wide);
+        ChainPosition sat = new ChainPosition(new SourceOrder(1, 5), "t5");
+        Envelope row = new Envelope(Op.INSERT, 1L, "customers", null, Map.of("customer_id", 7, "name", "a"), null,
+                Map.of("customers", sat));
+
+        TestSupport.verifyProcessor(dag.getVertex("doc").getMetaSupplier())
+                .disableSnapshots()
+                .input(List.of(row))
+                .outputChecker((expected, actual) -> actual.equals(expected)
+                        && ((Envelope) actual.get(0)).position().equals(sat))
+                .expectOutput(List.of(row));
     }
 
     /**
