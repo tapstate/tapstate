@@ -248,6 +248,9 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         void requireSteadyStateWindow() {
             if (!workload.pilotProfile()) { throw new AssertionError("steady output requires the predeclared load profile"); }
             for (var phase : phases) {
+                if (Boolean.TRUE.equals(phase.targetClockEvidence().get("targetWitnessDeferred"))) {
+                    throw new AssertionError("deferred target witness cannot establish a live performance gate");
+                }
                 if (!"QUALIFIED".equals(phase.targetClockEvidence().get("state"))
                         || !(phase.targetClockEvidence().get("sampledInterior") instanceof Map<?, ?> interior)
                         || !"QUALIFIED_SAMPLED_INTERIOR".equals(interior.get("state"))) {
@@ -285,6 +288,11 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             throw new IllegalArgumentException("a positive fork number and application JAR are required");
         }
         String forkId = workload.id() + "-" + arm + "-" + armFork;
+        if (Boolean.getBoolean(BenchmarkWitnessReadGate.PROPERTY)
+                && (!"copy".equals(workload.id()) || !workload.pilotProfile()
+                || arm != PipelineBenchmarkComparison.Arm.B)) {
+            throw new AssertionError("deferred target witness requires the original copy B diagnostic profile");
+        }
         try (BenchmarkForkEnvironment fork = BenchmarkForkEnvironment.open(workload, applicationJar, forkId, launcher)) {
             BenchmarkSourceLineage.Witness lineage = workload.database()
                     == BenchmarkWorkloadDefinitions.Database.MYSQL
@@ -612,15 +620,19 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 : BenchmarkTargetClock.validate(targetClockBefore, targetClockAfter);
         var clockProof = new LinkedHashMap<String, Object>(outerClockEvidence);
         clockProof.put("sampledInterior", interiorClockEvidence);
-        Map<String, Object> targetClockEvidence = Map.copyOf(clockProof);
+        boolean deferredWitness = targets.readDeferred();
         if (workload.pilotProfile()) {
             System.out.println("benchmark-target-clock=" + JsonWriter.write(Map.of("workload", workload.id(),
-                    "phase", phase.id(), "calibration", targetClockEvidence,
+                    "phase", phase.id(), "calibration", Map.copyOf(clockProof),
                     "targetClockUriCount", targetClockUris.size(), "allBefore", targetClocksBefore.stream().map(BenchmarkTargetClock.Reading::evidence).toList(),
                     "allAfter", targetClocksAfter.stream().map(BenchmarkTargetClock.Reading::evidence).toList(),
                     "sampledInterior", interiorClockEvidence)));
         }
+        targets.releaseAfterOwnMeasuredAck(completedAckAt);
         var targetStreams = targets.checkpointStreams(phase);
+        clockProof.put("targetWitnessDeferred", deferredWitness);
+        clockProof.put("targetWitnessReadReceipts", targets.readSchedules());
+        Map<String, Object> targetClockEvidence = Map.copyOf(clockProof);
         List<BenchmarkMongoDeliveryObserver.Delivery> deliveries = targetStreams.values().stream().flatMap(List::stream).toList();
         if (deliveries.size() != phase.expectedLogicalOutputChanges()) {
             throw new AssertionError("observed " + deliveries.size() + " deliveries for " + phase.id()
@@ -842,6 +854,19 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             return byTarget.values().stream().map(BenchmarkMongoDeliveryObserver::diagnosticReadCosts).toList();
         }
 
+        List<Map<String, Object>> readSchedules() {
+            return byTarget.entrySet().stream().map(entry -> Map.<String, Object>of(
+                    "target", entry.getKey(), "readSchedule", entry.getValue().readScheduleEvidence())).toList();
+        }
+
+        boolean readDeferred() {
+            return byTarget.values().stream().anyMatch(BenchmarkMongoDeliveryObserver::readDeferred);
+        }
+
+        void releaseAfterOwnMeasuredAck(long acknowledgedAtNanos) {
+            byTarget.values().forEach(observer -> observer.releaseAfterOwnMeasuredAck(acknowledgedAtNanos));
+        }
+
         static TargetWatchSet open(BenchmarkWorkloadDefinitions.Workload workload,
                 BenchmarkWorkloadDefinitions.Phase firstMeasured, BenchmarkForkEnvironment fork) {
             Map<String, BenchmarkMongoDeliveryObserver> opened = new LinkedHashMap<>();
@@ -850,7 +875,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                         : BenchmarkExpectedChanges.forPhase(workload, firstMeasured)) {
                     String id = targetId(plan.target());
                     BenchmarkMongoDeliveryObserver observer = BenchmarkMongoDeliveryObserver.open(
-                            plan.target(), fork.externalTargetUri(), fork.managedViewsUri(), plan.keyOf());
+                            plan.target(), fork.externalTargetUri(), fork.managedViewsUri(), plan.keyOf(),
+                            Boolean.getBoolean(BenchmarkWitnessReadGate.PROPERTY));
                     if (opened.putIfAbsent(id, observer) != null) {
                         observer.close();
                         throw new AssertionError("duplicate benchmark target " + id);
@@ -937,6 +963,15 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     } else {
                         failure.addSuppressed(closeFailure);
                     }
+                }
+            }
+            if (readDeferred()) {
+                try {
+                    System.out.println("benchmark-target-witness-final=" + JsonWriter.write(Map.of(
+                            "readSchedules", readSchedules(), "performanceAcceptanceEligible", false)));
+                } catch (RuntimeException | Error diagnosticFailure) {
+                    if (failure == null) { failure = diagnosticFailure; }
+                    else { failure.addSuppressed(diagnosticFailure); }
                 }
             }
             if (failure instanceof Error error) {

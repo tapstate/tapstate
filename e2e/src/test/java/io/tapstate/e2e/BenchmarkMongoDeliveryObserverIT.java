@@ -25,6 +25,57 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class BenchmarkMongoDeliveryObserverIT {
 
     @Test
+    void deferredReadsRetainEveryChangeAndTerminalAfterTheActualWriteAck() {
+        String uri = SharedMongo.replicaSetUrl("benchmark_delivery_deferred");
+        String table = "benchmark_delivery_deferred_test";
+        MongoCollection<Document> target = freshCollection(uri, table);
+        try (var observer = BenchmarkMongoDeliveryObserver.open(
+                target(BenchmarkWorkloadDefinitions.TargetLocation.EXTERNAL_MONGO, table), uri,
+                SharedMongo.replicaSetUrl("views"), row -> String.valueOf(row.get("id")), true)) {
+            observer.expectBatch("cdc-update", System.nanoTime(), List.of(
+                    new BenchmarkMongoDeliveryObserver.ExpectedChange("1", BenchmarkMongoDeliveryObserver.Kind.INSERT),
+                    new BenchmarkMongoDeliveryObserver.ExpectedChange("2", BenchmarkMongoDeliveryObserver.Kind.INSERT)));
+            target.insertMany(List.of(new Document("id", 1L), new Document("id", 2L)));
+            long acknowledged = System.nanoTime();
+            assertThat(observer.diagnosticReadCosts()).containsEntry("readCalls", 0L);
+            assertThat(observer.readScheduleEvidence()).containsEntry("firstTryNextCallStartedAtNanos", null);
+            observer.releaseAfterOwnMeasuredAck(acknowledged);
+            assertThat(observer.checkpoint("cdc-update", BOUND)).hasSize(2);
+            var schedule = observer.readScheduleEvidence();
+            assertThat(schedule).containsEntry("ownAckAtNanos", acknowledged)
+                    .containsEntry("fullFirstPhaseDrainCompleted", true)
+                    .containsEntry("localDeliveryLatencyPerformanceEligible", false);
+            assertThat((Long) schedule.get("firstTryNextCallStartedAtNanos"))
+                    .isGreaterThanOrEqualTo((Long) schedule.get("releasedAtNanos"));
+            observer.expectUnmeasured("terminal", List.of(new BenchmarkMongoDeliveryObserver.ExpectedChange(
+                    "3", BenchmarkMongoDeliveryObserver.Kind.INSERT)));
+            target.insertOne(new Document("id", 3L));
+            assertThat(observer.checkpoint("terminal", BOUND)).isEmpty();
+            assertThat(observer.observedCoverage()).hasSize(3);
+            assertThat(observer.observedCoverage().values()).containsOnly(1L);
+        }
+    }
+
+    @Test
+    void deferringTheReaderStillRejectsMissingOrExtraChangesAfterRelease() {
+        for (boolean extra : List.of(false, true)) {
+            String table = "benchmark_delivery_deferred_negative_" + extra;
+            String uri = SharedMongo.replicaSetUrl(table);
+            MongoCollection<Document> target = freshCollection(uri, table);
+            try (var observer = BenchmarkMongoDeliveryObserver.open(
+                    target(BenchmarkWorkloadDefinitions.TargetLocation.EXTERNAL_MONGO, table), uri,
+                    SharedMongo.replicaSetUrl("views"), row -> String.valueOf(row.get("id")), true)) {
+                observer.expectBatch("cdc-update", System.nanoTime(), List.of(
+                        new BenchmarkMongoDeliveryObserver.ExpectedChange("1", BenchmarkMongoDeliveryObserver.Kind.INSERT)));
+                if (extra) { target.insertMany(List.of(new Document("id", 1L), new Document("id", 2L))); }
+                observer.releaseAfterOwnMeasuredAck(System.nanoTime());
+                assertThatThrownBy(() -> observer.checkpoint("cdc-update", BOUND)).isInstanceOf(AssertionError.class)
+                        .hasMessageContaining(extra ? "unmatched target change" : "missing deliveries");
+            }
+        }
+    }
+
+    @Test
     void optionalTerminalRefinementAllowsEitherArrivalOrderWithTheSameRequiredCoverage() {
         for (boolean childAfterRoot : List.of(false, true)) {
             String suffix = childAfterRoot ? "late" : "early";

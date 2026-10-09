@@ -37,6 +37,9 @@ class PipelineBenchmarkLiveRunIT {
 
     @Test
     void interleavedRealForksWriteEvidenceAndEnforceTheSelectedGate() throws Exception {
+        if (Boolean.getBoolean(BenchmarkWitnessReadGate.PROPERTY)) {
+            throw new AssertionError("deferred target witness cannot establish a live performance gate");
+        }
         boolean requested = List.of(BASELINE, CANDIDATE, OUTPUT, GATE, TARGET, PRIMARY).stream()
                 .anyMatch(property -> System.getProperty(property) != null);
         Assumptions.assumeTrue(requested,

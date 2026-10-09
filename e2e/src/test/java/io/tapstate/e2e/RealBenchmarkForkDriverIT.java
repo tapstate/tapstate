@@ -56,6 +56,20 @@ class RealBenchmarkForkDriverIT {
                 System.getProperty(ARM_PROPERTY, "A"));
         var mode = BenchmarkCaptureCalibrationLiveRunIT.Mode.valueOf(System.getProperty(MODE_PROPERTY, "PLAIN"));
         Path applicationJar = Path.of(System.getProperty(BOOT_JAR_PROPERTY));
+        if (Boolean.getBoolean(BenchmarkWitnessReadGate.PROPERTY) && (!"copy".equals(workloadId)
+                || arm != PipelineBenchmarkComparison.Arm.B
+                || mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN || forkOutput == null
+                || !Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot")
+                || Boolean.getBoolean("tapstate.e2e.benchmark.load-diagnostics")
+                || Boolean.getBoolean("tapstate.e2e.benchmark.compilation-diagnostics")
+                || Boolean.getBoolean("tapstate.e2e.benchmark.thread-point-diagnostics")
+                || Boolean.getBoolean("tapstate.e2e.benchmark-smoke.jvm-gap-diagnostics")
+                || Boolean.getBoolean(BenchmarkDualGcDiagnostics.ENABLED_PROPERTY)
+                || Boolean.getBoolean("tapstate.e2e.benchmark-smoke.paced-calibration")
+                || Boolean.getBoolean("tapstate.e2e.benchmark-smoke.cdc-settling-calibration")
+                || Boolean.getBoolean("tapstate.e2e.benchmark-smoke.full-cdc-settling-calibration"))) {
+            throw new AssertionError("deferred target witness requires one unchanged plain original copy B fork");
+        }
         boolean threadPointDiagnostics = Boolean.getBoolean("tapstate.e2e.benchmark.thread-point-diagnostics");
         if (threadPointDiagnostics && (!"copy".equals(workloadId)
                 || arm != PipelineBenchmarkComparison.Arm.B
@@ -226,6 +240,11 @@ class RealBenchmarkForkDriverIT {
                 }
                 if (threadPointDiagnostics) {
                     output.put("threadPointDiagnostics", true);
+                }
+                if (evidence.phases().stream().anyMatch(phase ->
+                        Boolean.TRUE.equals(phase.targetClockEvidence().get("targetWitnessDeferred")))) {
+                    output.put("targetWitnessDeferred", true);
+                    output.put("localDeliveryLatencyPerformanceEligible", false);
                 }
                 String json = JsonWriter.write(output);
                 Files.writeString(forkOutput, json + "\n", StandardCharsets.UTF_8,

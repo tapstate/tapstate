@@ -97,6 +97,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
     private long previousIterationEnded;
     private final OperationOrder operationOrder = new OperationOrder();
     private final BenchmarkTargetClock.WallSamples operationWalls = new BenchmarkTargetClock.WallSamples();
+    private final BenchmarkWitnessReadGate readGate;
 
     static final class OperationOrder {
         private org.bson.BsonTimestamp previous;
@@ -122,7 +123,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
     private AssertionError failure;
 
     private BenchmarkMongoDeliveryObserver(String uri, String targetId, String targetCollection,
-                                           Function<Document, String> keyOf) {
+                                           Function<Document, String> keyOf, boolean deferred) {
         ConnectionString address = new ConnectionString(uri);
         this.databaseName = Objects.requireNonNull(address.getDatabase(), "target URI has no database");
         this.targetId = Objects.requireNonNull(targetId, "target identity");
@@ -138,6 +139,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
             client.close();
             throw e;
         }
+        this.readGate = new BenchmarkWitnessReadGate(deferred);
         this.reader = Thread.ofVirtual().name("benchmark-target-change-stream").start(this::readChanges);
     }
 
@@ -146,11 +148,26 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
             String externalTargetUri,
             String managedViewsUri,
             Function<Document, String> keyOf) {
+        return open(target, externalTargetUri, managedViewsUri, keyOf, false);
+    }
+
+    static BenchmarkMongoDeliveryObserver open(
+            BenchmarkWorkloadDefinitions.TargetExpectation target,
+            String externalTargetUri,
+            String managedViewsUri,
+            Function<Document, String> keyOf, boolean deferred) {
         String uri = target.location() == BenchmarkWorkloadDefinitions.TargetLocation.MANAGED_VIEW
                 ? managedViewsUri : externalTargetUri;
         return new BenchmarkMongoDeliveryObserver(uri, target.pipelineId() + "/" + target.table(),
-                target.table(), keyOf);
+                target.table(), keyOf, deferred);
     }
+
+    void releaseAfterOwnMeasuredAck(long acknowledgedAtNanos) {
+        readGate.releaseAfterOwnAck(acknowledgedAtNanos);
+    }
+
+    Map<String, Object> readScheduleEvidence() { return readGate.evidence(); }
+    boolean readDeferred() { return readGate.deferred(); }
 
     /** Register before the corresponding source SQL begins, using its captured monotonic start time. */
     void expectBatch(long issuedAtNanos, List<ExpectedChange> expected) {
@@ -275,6 +292,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                         + (phaseExpected - phaseObserved) + " missing deliveries in " + phaseId);
             }
             phaseDeliveries = List.copyOf(deliveries.subList(returnedDeliveries, deliveries.size()));
+            readGate.completedPhase(phaseId, phaseExpected, phaseObserved);
             returnedDeliveries = deliveries.size();
             activePhase = null;
             phaseExpected = 0;
@@ -317,6 +335,8 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
 
     private void readChanges() {
         try {
+            if (!readGate.awaitFirstRead()) { return; }
+            boolean firstRead = true;
             while (true) {
                 synchronized (lock) {
                     if (closed || failure != null) {
@@ -324,6 +344,10 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                     }
                 }
                 long started = System.nanoTime();
+                if (firstRead) {
+                    if (!readGate.beforeFirstTryNext(started)) { return; }
+                    firstRead = false;
+                }
                 long schedulingGap = previousIterationEnded == 0 ? 0 : started - previousIterationEnded;
                 ChangeStreamDocument<Document> change = cursor.tryNext();
                 long completed = System.nanoTime();
@@ -345,7 +369,12 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                     }
                 }
             }
-        } catch (RuntimeException e) {
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            synchronized (lock) {
+                if (!closed) { fail("target change-stream read gate interrupted", e); }
+            }
+        } catch (RuntimeException | AssertionError e) {
             synchronized (lock) {
                 if (!closed) {
                     fail("target change-stream reader failed", e);
@@ -504,6 +533,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
             closed = true;
             lock.notifyAll();
         }
+        readGate.close();
         try {
             cursor.close();
         } finally {
