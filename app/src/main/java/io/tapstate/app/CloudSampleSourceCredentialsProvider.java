@@ -1,7 +1,7 @@
 package io.tapstate.app;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.json.JsonMapper;
 import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.SampleSourceCredentialsProvider;
 import io.tapstate.core.common.TapstateException;
@@ -22,9 +22,9 @@ final class CloudSampleSourceCredentialsProvider implements SampleSourceCredenti
 
     private final CloudRuntimeSettings settings;
     private final HttpClient http;
-    private final ObjectMapper objectMapper;
+    private final JsonMapper objectMapper;
 
-    CloudSampleSourceCredentialsProvider(CloudRuntimeSettings settings, ObjectMapper objectMapper) {
+    CloudSampleSourceCredentialsProvider(CloudRuntimeSettings settings, JsonMapper objectMapper) {
         this.settings = Objects.requireNonNull(settings, "settings");
         this.objectMapper = Objects.requireNonNull(objectMapper, "objectMapper");
         this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build();

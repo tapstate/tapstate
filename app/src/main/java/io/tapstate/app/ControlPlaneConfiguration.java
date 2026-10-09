@@ -73,7 +73,7 @@ import io.tapstate.control.core.SourceConfigRevealAuthorizer;
 import io.tapstate.control.core.SourceConfigRevealService;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import tools.jackson.databind.json.JsonMapper;
 import io.tapstate.control.core.SourceRepresentation;
 import io.tapstate.control.core.SourceSchemaQueryService;
 import io.tapstate.control.core.SessionService;
@@ -782,7 +782,7 @@ class ControlPlaneConfiguration {
 
     @Bean
     SampleSourceCredentialsProvider sampleSourceCredentialsProvider(
-            CloudRuntimeSettings cloudSettings, ObjectMapper objectMapper,
+            CloudRuntimeSettings cloudSettings, JsonMapper objectMapper,
             @Value("${tapstate.sample.host:113.98.206.139}") String host,
             @Value("${tapstate.sample.password:}") String password) {
         if (cloudSettings.cloud()) {
