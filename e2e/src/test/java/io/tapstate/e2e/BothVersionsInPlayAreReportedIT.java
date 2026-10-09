@@ -1,11 +1,13 @@
 package io.tapstate.e2e;
 
 import io.tapstate.testsupport.DockerGate;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -89,6 +91,25 @@ class BothVersionsInPlayAreReportedIT {
             // written to warn unconditionally still passes every mismatch test it has, and fails only
             // here.
             assertThat(run.stderr()).doesNotContain("cli.version-mismatch");
+        }
+    }
+
+    @Test
+    void aConnectedStopRefusalNamesTheServersVersion(@TempDir Path home) {
+        try (ServerHandle server = Tiers.IN_PROCESS.launch(
+                SharedMongo.replicaSetUrl("e2e_cli_diagnostic_version"))) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            control.bootstrapAndLogin(USER, PASSWORD);
+            String reportedByTheServer = control.version();
+            assertThat(reportedByTheServer).isNotBlank();
+
+            CliOnce.Run run = CliOnce.runWithPassword(PASSWORD,
+                    List.of("-Duser.home=" + home), "-c", server.baseUrl().toString(), "-u", USER,
+                    "stop", "ship_clear");
+
+            assertThat(run.exitCode()).isEqualTo(1);
+            assertThat(run.stderr()).contains("error: cli.confirmation-needs-a-terminal")
+                    .endsWith(", server " + reportedByTheServer + ")" + System.lineSeparator());
         }
     }
 }
