@@ -244,6 +244,60 @@ class SnapshotPhaseTest {
     }
 
     @Test
+    void aLegacyPartialLoadKeepsItsRecordedSeamWithoutACheckpoint() {
+        SrsMeta legacy = new SrsMeta("chain", null,
+                List.of(new ConsumerOffset(PIPE, Map.of(), null, List.of("orders"), "first-seam", 0L)),
+                List.of(), null, 2L);
+        RecordingMeta meta = new RecordingMeta(new ArrayList<>(), legacy);
+        FakePort port = new FakePort(Map.of("customers", new FakeBatch(List.of(row("customers", 1)), "new-seam")));
+        List<Envelope> sink = new ArrayList<>();
+
+        SnapshotPhase.Outcome outcome = SnapshotPhase.run(
+                port, multiTableConfig(), "chain", PIPE, List.of("orders", "customers"), 2L, meta, sink::add);
+
+        assertThat(port.asked).containsExactly(List.of("customers"));
+        assertThat(outcome.tailSeam()).isEqualTo("first-seam");
+        assertThat(meta.cdcStart).isEqualTo("first-seam");
+        assertThat(meta.pinnedEpoch).isEqualTo(2L);
+        assertThat(sink).extracting(event -> event.position().order()).containsOnly(SourceOrder.snapshotRow(2L));
+    }
+
+    @Test
+    void aLegacyLoadOfEverySelectedTableSamplesANewSeam() {
+        ChainPosition checkpoint = new ChainPosition(new SourceOrder(1L, 7L), "prior-checkpoint");
+        SrsMeta legacy = new SrsMeta("chain", checkpoint,
+                List.of(new ConsumerOffset(PIPE, Map.of(), checkpoint, List.of("customers"), "first-seam", 0L)),
+                List.of(), null, 2L);
+        RecordingMeta meta = new RecordingMeta(new ArrayList<>(), legacy);
+
+        SnapshotPhase.Outcome outcome = SnapshotPhase.run(
+                new FakePort(new FakeBatch(List.of(row(1)), "new-seam")), config(), "chain", PIPE,
+                List.of("orders"), 2L, meta, event -> { });
+
+        assertThat(outcome.rows()).isEqualTo(1L);
+        assertThat(outcome.tailSeam()).isEqualTo("new-seam");
+        assertThat(meta.cdcStart).isEqualTo("new-seam");
+        assertThat(meta.pinnedEpoch).isEqualTo(2L);
+    }
+
+    @Test
+    void aPartialLoadWithARecordedGenerationKeepsItsEarlierSeam() {
+        ChainPosition checkpoint = new ChainPosition(new SourceOrder(1L, 7L), "later-checkpoint");
+        SrsMeta retained = new SrsMeta("chain", checkpoint,
+                List.of(new ConsumerOffset(PIPE, Map.of(), checkpoint, List.of("orders"), "first-seam", 1L)),
+                List.of(), null, 2L);
+        RecordingMeta meta = new RecordingMeta(new ArrayList<>(), retained);
+
+        SnapshotPhase.Outcome outcome = SnapshotPhase.run(
+                new FakePort(new FakeBatch(List.of(row("customers", 1)), "new-seam")), multiTableConfig(),
+                "chain", PIPE, List.of("orders", "customers"), 2L, meta, event -> { });
+
+        assertThat(outcome.tailSeam()).isEqualTo("first-seam");
+        assertThat(meta.cdcStart).isEqualTo("first-seam");
+        assertThat(meta.pinnedEpoch).isEqualTo(1L);
+    }
+
+    @Test
     void aPipelineNewToTheChainRecordsItsOwnSeamWithoutMovingAnotherPipelines() {
         // pipe-a recorded this seam under generation 1 and finished its load. The source has moved on
         // since: the batch pipe-b opens samples a much later seam. pipe-b has no record of its own on the
