@@ -124,6 +124,22 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
     @Override
     public void recordFailure(String pipelineId) {
         actuation.recordFailure(pipelineId, MAX_ATTEMPTS * backoffNanos, detectionWindowNanos);
+        Attempts spent = attempts.get(pipelineId);
+        if (spent != null) {
+            observeFailure(spent, actuation.heldExecutionGeneration(pipelineId), nanoTime.getAsLong());
+        }
+    }
+
+    /**
+     * Takes the moment {@code failedRun} was first seen failed: where its failure is recorded, which is as the
+     * pipeline is marked failed, or otherwise the first time admission is asked about it - only a failed run is
+     * asked about, on every pass. The moment is kept for that run however often either is asked again.
+     */
+    private static void observeFailure(Attempts spent, long failedRun, long now) {
+        if (failedRun != spent.failedExecution) {
+            spent.failedExecution = failedRun;
+            spent.failureSeenAtNanos = now;
+        }
     }
 
     @Override
@@ -161,12 +177,7 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
         Attempts spent = attempts.computeIfAbsent(pipelineId, id -> new Attempts());
         long now = nanoTime.getAsLong();
         long failedRun = actuation.heldExecutionGeneration(pipelineId);
-        if (failedRun != spent.failedExecution) {
-            // Only a failed run is asked about, on every pass, so the first time it is asked about is within a
-            // pass of when it failed.
-            spent.failedExecution = failedRun;
-            spent.failureSeenAtNanos = now;
-        }
+        observeFailure(spent, failedRun, now);
         if (spent.started && failedRun > spent.replacedExecution
                 && spent.failureSeenAtNanos - spent.admittedAtNanos >= MAX_ATTEMPTS * backoffNanos) {
             // The run the last rebuild put in place went on running for longer than the whole stretch a

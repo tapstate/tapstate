@@ -782,6 +782,34 @@ class ClusterRebuildAdmissionTest {
                 .isFalse();
     }
 
+    /**
+     * The same, where the run's failure is recorded as the pipeline is marked failed and admission is first asked
+     * only well after - a pass held up by another pipeline's start. The replacement failed when that was recorded,
+     * not when admission next looked; time it then spent failed is no time it ran.
+     */
+    @Test
+    void aSpentBudgetIsNotGivenBackByAnAdmissionAskedLongAfterTheFailureWasRecorded() {
+        committed(7, "node-a", "node-b", "node-c");
+        submitRunUnder(7);
+        long revision = 7;
+        for (int loss = 1; loss <= ClusterRebuildAdmission.MAX_ATTEMPTS; loss++) {
+            String staying = loss % 2 == 1 ? "node-b" : "node-c";
+            committed(++revision, "node-a", staying);
+            assertThat(admission.admits("orders")).as("attempt %s", loss).isTrue();
+            assertThat(ownership.beginExecution("orders").allowed()).as("replacement %s", loss).isTrue();
+            nanos.addAndGet(BACKOFF.toNanos());
+        }
+        // The last replacement is planned over node-a and node-b; node-b goes, and the run is recorded failed.
+        committed(++revision, "node-a", "node-c");
+        admission.recordFailure("orders");
+
+        nanos.addAndGet(BACKOFF.multipliedBy(2L * ClusterRebuildAdmission.MAX_ATTEMPTS).toNanos());
+
+        assertThat(admission.admits("orders"))
+                .as("the replacement failed a backoff after it was admitted, when its failure was recorded")
+                .isFalse();
+    }
+
     @Test
     void onceTheSettlingIsOverADeathIsThePipelinesOwnAgain() {
         committed(7, "node-a", "node-b");
