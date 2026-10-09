@@ -8,12 +8,15 @@ import javax.management.remote.JMXConnector;
 import javax.management.remote.JMXConnectorFactory;
 import javax.management.remote.JMXServiceURL;
 import java.io.IOException;
+import java.lang.management.CompilationMXBean;
 import java.lang.management.GarbageCollectorMXBean;
 import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryMXBean;
+import java.lang.management.RuntimeMXBean;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
+import java.util.Objects;
 import java.util.OptionalLong;
 import java.util.concurrent.TimeUnit;
 
@@ -23,11 +26,15 @@ final class BenchmarkProcessProbe implements AutoCloseable {
     private static final Duration PS_TIMEOUT = Duration.ofSeconds(2);
     private static final long BYTES_PER_KIB = 1_024;
 
+    private final long ownedPid;
     private final ProcessHandle child;
     private final JMXConnector jmx;
     private final MBeanServerConnection connection;
+    private CompilationAccess compilationAccess;
 
-    private BenchmarkProcessProbe(ProcessHandle child, JMXConnector jmx, MBeanServerConnection connection) {
+    private BenchmarkProcessProbe(long ownedPid, ProcessHandle child, JMXConnector jmx,
+                                  MBeanServerConnection connection) {
+        this.ownedPid = ownedPid;
         this.child = child;
         this.jmx = jmx;
         this.connection = connection;
@@ -39,7 +46,7 @@ final class BenchmarkProcessProbe implements AutoCloseable {
         }
         ProcessHandle child = ProcessHandle.of(pid).orElse(null);
         if (child == null || !child.isAlive()) {
-            return new BenchmarkProcessProbe(null, null, null);
+            return new BenchmarkProcessProbe(pid, null, null, null);
         }
 
         VirtualMachine attached = null;
@@ -67,8 +74,101 @@ final class BenchmarkProcessProbe implements AutoCloseable {
                 }
             }
         }
-        return new BenchmarkProcessProbe(child, jmx, connection);
+        return new BenchmarkProcessProbe(pid, child, jmx, connection);
     }
+
+    enum CompilationState { SUCCESS, UNKNOWN }
+
+    enum CompilationUnknownReason {
+        NONE, CHILD_EXITED, JMX_UNAVAILABLE, OWNED_PID_MISMATCH, INVALID_COMPILER_NAME,
+        MONITORING_UNSUPPORTED, INVALID_COUNTER, READ_FAILED
+    }
+
+    /** An actual cumulative elapsed compilation reading; this value is not compiler CPU time. */
+    record CompilationReading(long ownedPid, String compilerName, Boolean monitoringSupported,
+                              OptionalLong totalCompilationMillis, CompilationState state,
+                              CompilationUnknownReason unknownReason, String failureType) {
+        CompilationReading {
+            if (ownedPid <= 0) { throw new IllegalArgumentException("compilation reading needs an owned PID"); }
+            Objects.requireNonNull(totalCompilationMillis, "compilation counter availability");
+            Objects.requireNonNull(state, "compilation reading state");
+            Objects.requireNonNull(unknownReason, "compilation unknown reason");
+            if (state == CompilationState.SUCCESS) {
+                if (compilerName == null || compilerName.isBlank() || !Boolean.TRUE.equals(monitoringSupported)
+                        || totalCompilationMillis.isEmpty() || totalCompilationMillis.getAsLong() < 0
+                        || unknownReason != CompilationUnknownReason.NONE || failureType != null) {
+                    throw new IllegalArgumentException("successful compilation reading lacks actual supported metadata");
+                }
+            } else if (totalCompilationMillis.isPresent() || unknownReason == CompilationUnknownReason.NONE) {
+                throw new IllegalArgumentException("unknown compilation reading must not invent a counter");
+            }
+        }
+    }
+
+    /** Uses the already owned connection, without changing the ordinary four-resource sample. */
+    CompilationReading compilationRead() {
+        if (child == null || !child.isAlive()) {
+            return unknownCompilation(null, null, CompilationUnknownReason.CHILD_EXITED, null);
+        }
+        if (connection == null) {
+            return unknownCompilation(null, null, CompilationUnknownReason.JMX_UNAVAILABLE, null);
+        }
+        CompilationAccess access = compilationAccess();
+        if (access.unknownReason() != CompilationUnknownReason.NONE) {
+            return unknownCompilation(access.compilerName(), access.monitoringSupported(),
+                    access.unknownReason(), access.failureType());
+        }
+        try {
+            long millis = access.compiler().getTotalCompilationTime();
+            if (!child.isAlive()) {
+                return unknownCompilation(access.compilerName(), true, CompilationUnknownReason.CHILD_EXITED, null);
+            }
+            if (millis < 0) {
+                return unknownCompilation(access.compilerName(), true, CompilationUnknownReason.INVALID_COUNTER, null);
+            }
+            return new CompilationReading(ownedPid, access.compilerName(), true, OptionalLong.of(millis),
+                    CompilationState.SUCCESS, CompilationUnknownReason.NONE, null);
+        } catch (RuntimeException failure) {
+            return unknownCompilation(access.compilerName(), true, CompilationUnknownReason.READ_FAILED,
+                    failure.getClass().getName());
+        }
+    }
+
+    private synchronized CompilationAccess compilationAccess() {
+        if (compilationAccess != null) { return compilationAccess; }
+        String name = null;
+        Boolean supported = null;
+        try {
+            RuntimeMXBean runtime = ManagementFactory.newPlatformMXBeanProxy(
+                    connection, ManagementFactory.RUNTIME_MXBEAN_NAME, RuntimeMXBean.class);
+            if (runtime.getPid() != ownedPid) {
+                compilationAccess = new CompilationAccess(null, null, null,
+                        CompilationUnknownReason.OWNED_PID_MISMATCH, null);
+            } else {
+                CompilationMXBean compiler = ManagementFactory.newPlatformMXBeanProxy(
+                        connection, ManagementFactory.COMPILATION_MXBEAN_NAME, CompilationMXBean.class);
+                name = compiler.getName();
+                supported = compiler.isCompilationTimeMonitoringSupported();
+                CompilationUnknownReason reason = name == null || name.isBlank()
+                        ? CompilationUnknownReason.INVALID_COMPILER_NAME
+                        : supported ? CompilationUnknownReason.NONE : CompilationUnknownReason.MONITORING_UNSUPPORTED;
+                compilationAccess = new CompilationAccess(compiler, name, supported, reason, null);
+            }
+        } catch (IOException | RuntimeException failure) {
+            compilationAccess = new CompilationAccess(null, name, supported,
+                    CompilationUnknownReason.READ_FAILED, failure.getClass().getName());
+        }
+        return compilationAccess;
+    }
+
+    private CompilationReading unknownCompilation(String name, Boolean supported,
+                                                  CompilationUnknownReason reason, String failureType) {
+        return new CompilationReading(ownedPid, name, supported, OptionalLong.empty(), CompilationState.UNKNOWN,
+                reason, failureType);
+    }
+
+    private record CompilationAccess(CompilationMXBean compiler, String compilerName, Boolean monitoringSupported,
+                                     CompilationUnknownReason unknownReason, String failureType) { }
 
     record Snapshot(OptionalLong cpuNanos, OptionalLong heapUsedBytes, OptionalLong rssBytes,
                     OptionalLong gcCollectionMillis) {

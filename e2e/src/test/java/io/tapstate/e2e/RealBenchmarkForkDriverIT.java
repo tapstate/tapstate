@@ -66,6 +66,17 @@ class RealBenchmarkForkDriverIT {
                 throw new AssertionError("JVM gap diagnostics require an independent plain artifact run");
             }
             boolean dualGcDiagnostics = Boolean.getBoolean(BenchmarkDualGcDiagnostics.ENABLED_PROPERTY);
+            boolean compilationDiagnostics = Boolean.getBoolean("tapstate.e2e.benchmark.compilation-diagnostics");
+            if (compilationDiagnostics && (!"copy".equals(workloadId)
+                    || arm != PipelineBenchmarkComparison.Arm.B
+                    || mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN || jvmDiagnostics || dualGcDiagnostics
+                    || !Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot") || forkOutput == null
+                    || Boolean.getBoolean("tapstate.e2e.benchmark-smoke.paced-calibration")
+                    || Boolean.getBoolean("tapstate.e2e.benchmark-smoke.cdc-settling-calibration")
+                    || Boolean.getBoolean("tapstate.e2e.benchmark-smoke.full-cdc-settling-calibration")
+                    || Boolean.getBoolean("tapstate.e2e.benchmark.load-diagnostics"))) {
+                throw new AssertionError("compilation diagnostics require one unchanged plain original copy B fork");
+            }
             if (dualGcDiagnostics && (!"copy".equals(workloadId)
                     || arm != PipelineBenchmarkComparison.Arm.B
                     || mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN || jvmDiagnostics)) {
@@ -185,7 +196,7 @@ class RealBenchmarkForkDriverIT {
                 String profile = fullSettlingCalibration ? "FIXED_FULL_CDC_SETTLING_CALIBRATION"
                         : settlingCalibration ? "FIXED_FIRST_QUARTER_CDC_SETTLING_CALIBRATION"
                         : pacedCalibration ? "FIXED_PACING_CALIBRATION_5MS_50MS" : "ORIGINAL_BATCH_SCHEDULE";
-                String json = JsonWriter.write(Map.of(
+                var output = new java.util.LinkedHashMap<String, Object>(Map.of(
                         "forkOutputSchemaVersion", 2,
                         "dualGcDiagnostics", dualGc == null
                                 ? Map.of("schemaVersion", 1, "enabled", false) : dualGc.evidence(),
@@ -196,6 +207,10 @@ class RealBenchmarkForkDriverIT {
                         "jvmGapDiagnostics", jvmDiagnostics,
                         "profile", profile,
                         "measurement", PipelineBenchmarkLiveRunIT.fork(evidence, result, startedAt)));
+                if (compilationDiagnostics) {
+                    output.put("compilationDiagnostics", true);
+                }
+                String json = JsonWriter.write(output);
                 Files.writeString(forkOutput, json + "\n", StandardCharsets.UTF_8,
                         StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
                 System.out.println("benchmark-real-fork-output=" + forkOutput);

@@ -40,6 +40,23 @@ class BenchmarkProcessProbeTest {
                 assertThat(sample.heapUsedBytes().orElseThrow()).isGreaterThan(16L * 1_024 * 1_024);
                 assertThat(sample.rssBytes().orElseThrow()).isGreaterThan(sample.heapUsedBytes().orElseThrow());
                 assertThat(sample.gcCollectionMillis().orElseThrow()).isNotNegative();
+                var compilation = probe.compilationRead();
+                assertThat(compilation.ownedPid()).isEqualTo(child.pid());
+                if (compilation.state() == BenchmarkProcessProbe.CompilationState.SUCCESS) {
+                    assertThat(compilation.compilerName()).isNotBlank();
+                    assertThat(compilation.monitoringSupported()).isTrue();
+                    assertThat(compilation.totalCompilationMillis().orElseThrow()).isNotNegative();
+                    var laterCompilation = probe.compilationRead();
+                    assertThat(laterCompilation.state()).isEqualTo(BenchmarkProcessProbe.CompilationState.SUCCESS);
+                    assertThat(laterCompilation.totalCompilationMillis().orElseThrow())
+                            .isGreaterThanOrEqualTo(compilation.totalCompilationMillis().orElseThrow());
+                } else {
+                    assertThat(compilation.unknownReason())
+                            .isEqualTo(BenchmarkProcessProbe.CompilationUnknownReason.MONITORING_UNSUPPORTED);
+                    assertThat(compilation.monitoringSupported()).isFalse();
+                    assertThat(compilation.totalCompilationMillis()).isEmpty();
+                }
+                assertThat(probe.sample().complete()).as("optional compilation read leaves resource readings available").isTrue();
             }
 
             child.getOutputStream().close();
@@ -51,6 +68,11 @@ class BenchmarkProcessProbeTest {
                 assertThat(unavailable.heapUsedBytes()).isEmpty();
                 assertThat(unavailable.rssBytes()).isEmpty();
                 assertThat(unavailable.gcCollectionMillis()).isEmpty();
+                var compilation = probe.compilationRead();
+                assertThat(compilation.ownedPid()).isEqualTo(child.pid());
+                assertThat(compilation.state()).isEqualTo(BenchmarkProcessProbe.CompilationState.UNKNOWN);
+                assertThat(compilation.unknownReason()).isEqualTo(BenchmarkProcessProbe.CompilationUnknownReason.CHILD_EXITED);
+                assertThat(compilation.totalCompilationMillis()).isEmpty();
             }
         } finally {
             child.destroyForcibly();

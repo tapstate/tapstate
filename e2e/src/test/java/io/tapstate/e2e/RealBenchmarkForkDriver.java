@@ -441,6 +441,10 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             BenchmarkForkEnvironment fork, BenchmarkWorkloadDefinitions.Phase phase,
             CaptureSet captures, BenchmarkConnectorPositionCoverage positionCoverage,
             TargetWatchSet targets, BenchmarkTableCaptureSet tables) throws Exception {
+        boolean compilationDiagnostics = Boolean.getBoolean("tapstate.e2e.benchmark.compilation-diagnostics");
+        if (compilationDiagnostics && !workload.pilotProfile()) {
+            throw new AssertionError("compilation diagnostics require the declared steady pilot profile");
+        }
         List<BenchmarkExpectedChanges.TargetPlan> plans = BenchmarkExpectedChanges.forPhase(workload, phase);
         long initialAcknowledged = recordsOut(workload, fork.control());
         BenchmarkForkEnvironment.PhaseIssue issued;
@@ -485,30 +489,54 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
              BenchmarkMongoCommandSampler commandSampler = BenchmarkMongoCommandSampler.open(fork.storeUri());
              BenchmarkTargetClockSampler clockSampler = targetClockBefore == null ? null
                      : BenchmarkTargetClockSampler.open(targetClockUris.getFirst())) {
-            resourceSampler.start();
-            commandSampler.start();
-            issued = fork.issuePhase(phase, true, (current, batchIndex, issuedAt, sql) -> {
-                for (BenchmarkExpectedChanges.TargetPlan plan : plans) {
-                    List<BenchmarkMongoDeliveryObserver.ExpectedChange> changes = plan.forBatch(batchIndex);
-                    if (!changes.isEmpty()) {
-                        targets.expectBatch(plan.target(), phase.id(), issuedAt, changes);
+            if (compilationDiagnostics) {
+                resourceSampler.enableCompilationDiagnostics();
+            }
+            Throwable samplingFailure = null;
+            try {
+                resourceSampler.start();
+                commandSampler.start();
+                issued = fork.issuePhase(phase, true, (current, batchIndex, issuedAt, sql) -> {
+                    for (BenchmarkExpectedChanges.TargetPlan plan : plans) {
+                        List<BenchmarkMongoDeliveryObserver.ExpectedChange> changes = plan.forBatch(batchIndex);
+                        if (!changes.isEmpty()) {
+                            targets.expectBatch(plan.target(), phase.id(), issuedAt, changes);
+                        }
+                    }
+                });
+                if (issued.batches().isEmpty()) {
+                    throw new AssertionError("measured phase has no source batches: " + phase.id());
+                }
+                sourceMarkerWaitStartedAt = System.nanoTime();
+                captures.awaitMeasuredSourceMarkers(workload, phase);
+                sourceMarkerWaitCompletedAt = System.nanoTime();
+                completedAckAt = tables.awaitMeasured(workload, phase.id());
+                resources = resourceSampler.finish();
+                commands = commandSampler.finish();
+                if (clockSampler != null) {
+                    clockSampler.close();
+                    interiorClockEvidence = clockSampler.evidence();
+                    interiorClockReadings = clockSampler.readings();
+                    BenchmarkTargetClock.validate(targetClockBefore, interiorClockReadings.getFirst());
+                }
+            } catch (Exception | Error failure) {
+                samplingFailure = failure;
+                throw failure;
+            } finally {
+                try {
+                    resourceSampler.compilationEvidence().ifPresent(reading ->
+                        System.out.println("benchmark-compilation-timeline=" + JsonWriter.write(Map.of(
+                                "phase", phase.id(), "ownedPid", fork.server().pid(),
+                                "intervalMillis", RESOURCE_INTERVAL.toMillis(), "evidence", reading,
+                                "scope", "CUMULATIVE_APPROXIMATE_COMPILATION_ELAPSED_COUNTER_READS",
+                                "performanceAcceptanceEligible", false))));
+                } catch (RuntimeException | Error diagnosticFailure) {
+                    if (samplingFailure != null) {
+                        samplingFailure.addSuppressed(diagnosticFailure);
+                    } else {
+                        throw diagnosticFailure;
                     }
                 }
-            });
-            if (issued.batches().isEmpty()) {
-                throw new AssertionError("measured phase has no source batches: " + phase.id());
-            }
-            sourceMarkerWaitStartedAt = System.nanoTime();
-            captures.awaitMeasuredSourceMarkers(workload, phase);
-            sourceMarkerWaitCompletedAt = System.nanoTime();
-            completedAckAt = tables.awaitMeasured(workload, phase.id());
-            resources = resourceSampler.finish();
-            commands = commandSampler.finish();
-            if (clockSampler != null) {
-                clockSampler.close();
-                interiorClockEvidence = clockSampler.evidence();
-                interiorClockReadings = clockSampler.readings();
-                BenchmarkTargetClock.validate(targetClockBefore, interiorClockReadings.getFirst());
             }
         } catch (BenchmarkResourceSampler.SamplingFailure failure) {
             phaseFailure = failure.inPhase(phase.id());

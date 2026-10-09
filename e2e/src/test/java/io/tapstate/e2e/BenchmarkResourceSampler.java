@@ -4,6 +4,7 @@ import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.Executors;
@@ -34,6 +35,8 @@ final class BenchmarkResourceSampler implements AutoCloseable {
     private ScheduledFuture<?> periodicSamples;
     private boolean started;
     private boolean finished;
+    private BenchmarkCompilationDiagnostics compilationDiagnostics;
+    private volatile Throwable compilationInvariantFailure;
 
     private BenchmarkResourceSampler(BenchmarkProcessProbe probe,
                                      Supplier<BenchmarkProcessProbe.Snapshot> source, Duration interval,
@@ -84,6 +87,13 @@ final class BenchmarkResourceSampler implements AutoCloseable {
         return new BenchmarkResourceSampler(null, source, interval, nanoTime, terminationWaiter);
     }
 
+    static BenchmarkResourceSampler fromWithCompilation(Supplier<BenchmarkProcessProbe.Snapshot> source,
+            Duration interval, LongSupplier nanoTime, BenchmarkCompilationDiagnostics diagnostics) {
+        BenchmarkResourceSampler sampler = from(source, interval, nanoTime);
+        sampler.compilationDiagnostics = Objects.requireNonNull(diagnostics, "compilation diagnostics");
+        return sampler;
+    }
+
     @FunctionalInterface
     interface TerminationWaiter {
         boolean await(ScheduledExecutorService worker, long timeout, TimeUnit unit) throws InterruptedException;
@@ -105,6 +115,21 @@ final class BenchmarkResourceSampler implements AutoCloseable {
         }
     }
 
+    void enableCompilationDiagnostics() {
+        synchronized (lifecycle) {
+            if (started || finished || compilationDiagnostics != null || probe == null) {
+                throw new IllegalStateException("compilation diagnostics require a fresh owned process sampler");
+            }
+            compilationDiagnostics = BenchmarkCompilationDiagnostics.from(
+                    probe::compilationRead, nanoTime, attempts.retention);
+        }
+    }
+
+    Optional<Map<String, Object>> compilationEvidence() {
+        return compilationDiagnostics == null ? Optional.empty()
+                : Optional.of(compilationDiagnostics.wireEvidence());
+    }
+
     Summary finish() {
         synchronized (lifecycle) {
             if (!started || finished) {
@@ -112,6 +137,10 @@ final class BenchmarkResourceSampler implements AutoCloseable {
                         new IllegalStateException("resource sampler has no open measured window"));
             }
             finished = true;
+        }
+        if (compilationInvariantFailure != null) {
+            stopWorker(compilationInvariantFailure);
+            throwCompilationInvariant();
         }
         try {
             if (periodicSamples != null) {
@@ -142,6 +171,7 @@ final class BenchmarkResourceSampler implements AutoCloseable {
             stopWorker(shutdownFailure);
             throw finishFailure(FailureStage.SHUTDOWN, FailureReason.SHUTDOWN_ERROR, shutdownFailure);
         }
+        throwCompilationInvariant();
         try {
             if (finalSampleFailure != null) {
                 throw finishFailure(FailureStage.FINAL_SAMPLE, FailureReason.FINAL_SAMPLE_ERROR, finalSampleFailure);
@@ -162,6 +192,13 @@ final class BenchmarkResourceSampler implements AutoCloseable {
         } catch (Throwable invalidSummary) {
             throw finishFailure(FailureStage.SUMMARY, FailureReason.INVALID_SUMMARY, invalidSummary);
         }
+    }
+
+    private void throwCompilationInvariant() {
+        // These are programmer errors from the optional diagnostic, never resource-read failures.
+        Throwable invariant = compilationInvariantFailure;
+        if (invariant instanceof Error error) { throw error; }
+        if (invariant instanceof RuntimeException failure) { throw failure; }
     }
 
     private SamplingFailure finishFailure(FailureStage stage, FailureReason reason, Throwable cause) {
@@ -213,6 +250,14 @@ final class BenchmarkResourceSampler implements AutoCloseable {
             failure = unavailable;
         } else {
             resources.add(sample);
+        }
+        if (compilationDiagnostics != null && unavailable == null && compilationInvariantFailure == null) {
+            try {
+                compilationDiagnostics.record();
+            } catch (RuntimeException | Error invariant) {
+                compilationInvariantFailure = invariant;
+                throw invariant;
+            }
         }
     }
 

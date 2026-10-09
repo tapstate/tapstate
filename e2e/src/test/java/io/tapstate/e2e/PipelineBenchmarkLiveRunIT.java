@@ -41,6 +41,9 @@ class PipelineBenchmarkLiveRunIT {
                 .anyMatch(property -> System.getProperty(property) != null);
         Assumptions.assumeTrue(requested,
                 "no live benchmark properties supplied; this full-size run is opt-in");
+        if (Boolean.getBoolean("tapstate.e2e.benchmark.compilation-diagnostics")) {
+            throw new AssertionError("compilation diagnostics cannot establish a live performance gate");
+        }
 
         Path output = Path.of(required(OUTPUT));
         Path harnessRoot = harnessRoot();
