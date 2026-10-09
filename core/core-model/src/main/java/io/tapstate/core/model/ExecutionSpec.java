@@ -12,9 +12,9 @@ package io.tapstate.core.model;
  */
 @Doc("How one pipeline node runs: its target total parallelism across the cluster and the batch it works in.")
 public record ExecutionSpec(
-        @Doc("Target total number of processors for this node across the whole cluster, from 1 to 1024. "
+        @Doc(value = "Target total number of processors for this node across the whole cluster, from 1 to 1024. "
                 + "Omitted means the node type's default: 1 for sources and transforms, 4 for view and "
-                + "serve.sync sinks.")
+                + "serve.sync sinks.", min = 1, max = ExecutionSpec.MAX_PARALLELISM)
         Integer parallelism,
         @Doc("The batch this node forms before handing its rows on or writing them out.")
         BatchSpec batch) {

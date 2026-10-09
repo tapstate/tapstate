@@ -17,10 +17,12 @@ import java.util.regex.Pattern;
  */
 @Doc("The batch a node forms: at most max_records rows, closed early once max_wait has passed since its first row.")
 public record BatchSpec(
-        @Doc(value = "The most rows one batch holds, from 1 to 65536.", def = "1024")
+        @Doc(value = "The most rows one batch holds, from 1 to 65536.", def = "1024",
+                min = 1, max = BatchSpec.MAX_RECORDS_LIMIT)
         Integer maxRecords,
         @Doc(value = "How long a batch may wait for more rows after its first one: a whole number followed "
-                + "by ms, s or m, at most 60s. 0ms means no waiting.", def = "0ms")
+                + "by ms, s or m, at most 60s. 0ms means no waiting.", def = "0ms",
+                pattern = BatchSpec.MAX_WAIT_PATTERN)
         String maxWait) {
 
     /** The row limit when none is written. */
@@ -34,6 +36,14 @@ public record BatchSpec(
 
     /** The longest wait an author may ask for, in milliseconds. */
     public static final long MAX_WAIT_LIMIT_MILLIS = 60_000L;
+
+    /**
+     * Every wait an author may write, as a regular expression a schema can state: a whole number with no leading
+     * zero followed by ms, s or m, from 0ms to 60s - exactly what {@link #durationMillis} reads within
+     * {@link #MAX_WAIT_LIMIT_MILLIS}.
+     */
+    public static final String MAX_WAIT_PATTERN =
+            "^(?:(?:[0-9]|[1-9][0-9]{1,3}|[1-5][0-9]{4}|60000)ms|(?:[0-9]|[1-5][0-9]|60)s|[01]m)$";
 
     /** A batch that states nothing, so both limits read as their defaults. */
     public static final BatchSpec DEFAULTS = new BatchSpec(null, null);
