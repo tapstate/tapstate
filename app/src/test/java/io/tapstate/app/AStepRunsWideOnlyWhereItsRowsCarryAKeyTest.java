@@ -85,6 +85,33 @@ class AStepRunsWideOnlyWhereItsRowsCarryAKeyTest {
     }
 
     @Test
+    void branchesOfOneStreamThatKeyItDifferentlyLeaveNothingToRouteBy() {
+        Map<String, FieldRule> rename = new LinkedHashMap<>();
+        rename.put("order_id", FieldRule.rename("id"));
+        Step moved = plain("moved", "orders", new TransformBody.MapProjection(rename));
+        Step kept = plain("kept", "orders", new TransformBody.Js("row"));
+
+        assertRefused(shape -> shape(Map.of("orders", List.of("id")), moved, kept, union("kept", "moved")));
+        assertRefused(shape -> shape(Map.of("orders", List.of("id")), moved, kept, union("moved", "kept")));
+    }
+
+    @Test
+    void branchesOfOneStreamThatKeepItsKeyStillRunWide() {
+        Step filtered = plain("filtered", "orders", new TransformBody.Js("row"));
+        Step kept = plain("kept", "orders", new TransformBody.Js("row"));
+
+        ExecutionShape shape = shape(Map.of("orders", List.of("id")), filtered, kept, union("kept", "filtered"));
+
+        assertThat(shape.isNative("w")).isTrue();
+        assertThat(shape.inputKeysOf("w")).isEqualTo(Map.of("orders", List.of("id")));
+    }
+
+    private static Step union(String first, String second) {
+        return Step.inline("w", FromClause.list(FromRef.literal(first), FromRef.literal(second)),
+                new TransformBody.Js("row"), new ExecutionSpec(4, null), null);
+    }
+
+    @Test
     void aKeyTakenAwayByAProjectionLeavesNothingToRouteBy() {
         assertRefused(shape -> shape(Map.of("orders", List.of("id")),
                 plain("dropped", "orders", new TransformBody.MapProjection(Map.of("id", FieldRule.drop()))),

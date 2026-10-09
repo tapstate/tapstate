@@ -184,7 +184,11 @@ final class ExecutionShapes {
         return execution == null ? BatchSpec.DEFAULTS : execution.batchOrDefaults();
     }
 
-    /** Every stream reaching a step from its {@code from:} list, with the key each carries there. */
+    /**
+     * Every stream reaching a step from its {@code from:} list, with the key each carries there. Branches of one
+     * stream that key it differently - one of them having renamed the key - reach the step as one stream whose
+     * rows carry no one key, so nothing could route every row of it.
+     */
     private static Map<String, List<String>> inputOf(
             FromClause from, Graph graph, Map<String, Map<String, List<String>>> emitted) {
         Map<String, List<String>> input = new LinkedHashMap<>();
@@ -198,7 +202,8 @@ final class ExecutionShapes {
                         throw new IllegalStateException("reference " + ref + " names '" + producer
                                 + "', which nothing before it produces");
                     }
-                    streams.forEach(input::putIfAbsent);
+                    streams.forEach((stream, key) -> input.merge(stream, key,
+                            (seen, other) -> seen.equals(other) ? seen : List.of()));
                 }
             }
         }
