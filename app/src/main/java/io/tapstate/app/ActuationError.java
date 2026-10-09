@@ -204,6 +204,15 @@ enum ActuationError implements TapstateErrorCode {
             Set.of("pipeline", "node", "requested", "reason")),
 
     /**
+     * Rows of one stream would reach one sink two ways that land them differently: {@code stream} reaches it as
+     * the documents of {@code nest} - a nest with nothing to assemble, whose rows keep their own stream - and as
+     * {@code other}, the stream itself or another such nest, and the two land it in different tables or match it
+     * on different keys. A sink names one target per stream, so the rows of one way would be routed and matched
+     * on a key they were not given.
+     */
+    STREAM_LANDS_TWO_WAYS("actuation.stream-lands-two-ways", Set.of("pipeline", "stream", "nest", "other")),
+
+    /**
      * A member a run would take part on cannot load a connector the pipeline's sinks open: {@code pipeline} is
      * the pipeline, {@code member} the member by stable id, {@code connector} the connector id and {@code reason}
      * what the member answered - its own coded refusal, the failure it hit, or that it did not answer in time.

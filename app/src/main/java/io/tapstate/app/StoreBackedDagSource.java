@@ -422,8 +422,8 @@ final class StoreBackedDagSource implements DagSource {
         // root's key, and routed among a sink's writers by those.
         Map<String, Set<String>> passedOn =
                 passedOnStreams(pipeline, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds);
-        Set<String> serveLanding = landing(serveStreams, targets, passedOn);
-        Set<String> viewLanding = landing(viewStreams, viewTargets, passedOn);
+        Set<String> serveLanding = landing(pipelineId, serveStreams, targets, passedOn);
+        Set<String> viewLanding = landing(pipelineId, viewStreams, viewTargets, passedOn);
         FrontierBinding frontier = frontierBinding(sourceVertices);
         PipelineResource builtPipeline = new PipelineResource(
                 pipeline.id(), pipeline.metadata(),
@@ -2115,13 +2115,17 @@ final class StoreBackedDagSource implements DagSource {
 
     /**
      * The streams a sink's rows arrive on: {@code streams}, and for each nest among them that assembles nothing, the
-     * streams its rows are actually on - each landing in that nest's target in {@code targets}. A stream that also
-     * reaches the sink by another way keeps the target it lands in there, since the sink names one target per
-     * stream.
+     * streams its rows are actually on - each landing in that nest's target in {@code targets}.
+     *
+     * <p>A sink names one target per stream. So a stream that reaches it both as such a nest's documents and another
+     * way - as itself, or as another such nest's documents - lands one way only, and only where the two land it in
+     * the same table on the same key; otherwise the rows of one way would be routed and matched on a key they were
+     * not given, and the start is refused here, before anything opens.
      */
-    private static Set<String> landing(
-            Set<String> streams, Map<String, TargetTable> targets, Map<String, Set<String>> passedOn) {
+    private static Set<String> landing(String pipelineId, Set<String> streams, Map<String, TargetTable> targets,
+            Map<String, Set<String>> passedOn) {
         Set<String> landing = new LinkedHashSet<>(streams);
+        Map<String, String> landedBy = new LinkedHashMap<>();
         for (String stream : streams) {
             TargetTable target = targets.get(stream);
             if (target == null || !passedOn.containsKey(stream)) {
@@ -2137,12 +2141,26 @@ final class StoreBackedDagSource implements DagSource {
                 if (passedOn.containsKey(arriving)) {
                     // One nest with nothing to assemble reading another: its rows are that one's rows.
                     pending.addAll(passedOn.get(arriving));
-                } else if (!streams.contains(arriving) && landing.add(arriving)) {
+                    continue;
+                }
+                String other = streams.contains(arriving) ? arriving : landedBy.get(arriving);
+                if (other == null) {
+                    landing.add(arriving);
+                    landedBy.put(arriving, stream);
                     targets.put(arriving, target);
+                } else if (!landsAlike(targets.get(arriving), target)) {
+                    throw new TapstateException(ActuationError.STREAM_LANDS_TWO_WAYS, Map.of(
+                            "pipeline", pipelineId, "stream", arriving, "nest", stream, "other", other), null);
                 }
             }
         }
         return landing;
+    }
+
+    /** Whether two targets land a row alike: in the same table, matched on the same key. */
+    private static boolean landsAlike(TargetTable one, TargetTable other) {
+        return one != null && other != null && one.name().equals(other.name())
+                && keyColumnsOf(one).equals(keyColumnsOf(other));
     }
 
     /** The stream ids a terminal sink can receive: source tables, or a nest step's assembled stream id. */

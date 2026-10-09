@@ -47,6 +47,9 @@ actuation.no-safe-parallelism:
 actuation.parallelism-needs-a-key:
   message: "Pipeline {pipeline} cannot start: node {node} asks for {requested} processors but can only run as one ({reason})."
   solution: "Set execution.parallelism to 1 on {node}, or leave it out; the node then runs as one processor and keeps every change in order."
+actuation.stream-lands-two-ways:
+  message: "Pipeline {pipeline} cannot start: rows of {stream} reach one sink both through nest {nest} and through {other}, and the two land them in different tables or on different keys."
+  solution: "Send {stream} to that sink one way only, or give nest {nest} the same root key the other way lands {stream} on."
 actuation.connector-unavailable-on-member:
   message: "Pipeline {pipeline} was not started: member {member} cannot load connector {connector} ({reason})."
   solution: "Every member loads the connectors a pipeline writes through from the shared connector registry into its own plugins directory. Check that member's access to the store and that its plugins directory is writable, then start the pipeline again."

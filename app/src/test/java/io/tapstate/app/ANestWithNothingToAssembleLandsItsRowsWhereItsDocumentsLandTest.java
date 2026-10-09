@@ -1,8 +1,11 @@
 package io.tapstate.app;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.hazelcast.function.SupplierEx;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.NestRoot;
@@ -74,6 +77,41 @@ class ANestWithNothingToAssembleLandsItsRowsWhereItsDocumentsLandTest {
                 .containsEntry(TABLE, new SinkTarget(TABLE, List.of("cust_no")));
     }
 
+    /**
+     * One sink names one target per stream, so a stream reaching it both as a nest's documents and another way -
+     * as itself, through a step that took the key away, or as another such nest's documents - can land only one
+     * way. Where the two ways land on different tables or keys, the rows of one of them would be routed and
+     * matched on a key they were not given, so the start is refused before anything opens.
+     */
+    @Test
+    void aStreamReachingOneSinkToLandTwoWaysIsRefusedBeforeAnythingStarts() {
+        Step clip = Step.inline("clip", FromClause.list(FromRef.literal(STEP)),
+                new TransformBody.MapProjection(Map.of("id", FieldRule.drop())), null);
+        assertRefused(seedStore(List.of(rootOnly(STEP, "cust_no"), clip),
+                FromClause.list(FromRef.literal(TABLE), FromRef.literal("clip"))), STEP, TABLE);
+        assertRefused(seedStore(List.of(rootOnly(STEP, "cust_no"), rootOnly("by_name", "name")),
+                FromClause.list(FromRef.literal(STEP), FromRef.literal("by_name"))), "by_name", STEP);
+    }
+
+    @Test
+    void aStreamReachingOneSinkTwoWaysThatLandTheSameWayIsPlanned() {
+        DagSource.PlannedDag planned = new StoreBackedDagSource(
+                seedStore(List.of(rootOnly(STEP, "id")), FromClause.list(FromRef.literal(TABLE), FromRef.literal(STEP))),
+                capturing(new AtomicReference<>())).plannedDagFor(PIPELINE, null);
+
+        assertThat(planned.shape().sinkTargetsOf(SINK)).containsEntry(TABLE, new SinkTarget(TABLE, List.of("id")));
+    }
+
+    private static void assertRefused(InMemoryStorePort store, String nest, String other) {
+        assertThatThrownBy(() -> new StoreBackedDagSource(store, capturing(new AtomicReference<>()))
+                .plannedDagFor(PIPELINE, null))
+                .isInstanceOfSatisfying(TapstateException.class, refused -> {
+                    assertThat(refused.code()).isEqualTo(ActuationError.STREAM_LANDS_TWO_WAYS);
+                    assertThat(refused.args()).containsEntry("pipeline", PIPELINE).containsEntry("stream", TABLE)
+                            .containsEntry("nest", nest).containsEntry("other", other);
+                });
+    }
+
     /** Records the map handed to the sink binder without building a writer. */
     private static StoreBackedDagSource.SinkWriterBinder capturing(
             AtomicReference<Map<String, TargetTable>> bound) {
@@ -96,16 +134,23 @@ class ANestWithNothingToAssembleLandsItsRowsWhereItsDocumentsLandTest {
 
     /** One source table whose primary key is not the nest's root key, and a root-only nest served to one sink. */
     private static InMemoryStorePort seedStore() {
+        return seedStore(List.of(rootOnly(STEP, "cust_no")), FromClause.list(FromRef.literal(STEP)));
+    }
+
+    /** A nest over the table with nothing to assemble, keyed on {@code key}. */
+    private static Step rootOnly(String id, String key) {
+        return Step.inline(id, FromClause.aliases(Map.of("c", FromRef.literal(TABLE))),
+                new TransformBody.Nest(null, null, new NestRoot("c", List.of(key), null, null, List.of())), null);
+    }
+
+    private static InMemoryStorePort seedStore(List<Step> steps, FromClause served) {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource(SOURCE, null, "fake", Map.of("host", "h"), SourceMode.CDC,
                 List.of(TableRef.literal(TABLE)), null, null));
         artifacts.save(new SourceResource(DEST_ID, null, "fake", Map.of("host", "d"), null, null, null, null));
-        TransformBody.Nest body = new TransformBody.Nest(null, null,
-                new NestRoot("c", List.of("cust_no"), null, null, List.of()));
-        Step step = Step.inline(STEP, FromClause.aliases(Map.of("c", FromRef.literal(TABLE))), body, null);
-        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(SOURCE, true)), List.of(step),
+        artifacts.save(new PipelineResource(PIPELINE, null, List.of(SourceRef.spec(SOURCE, true)), steps,
                 null,
-                new ServeBlock.Inline(null, FromRef.literal(STEP),
+                new ServeBlock.Inline(null, served,
                         List.of(new SyncElement("sync_1", DEST_ID, null, null, null)), null, null),
                 new Settings(null, null, null, null, ReadMode.SNAPSHOT_AND_CDC, "earliest"), null));
 
