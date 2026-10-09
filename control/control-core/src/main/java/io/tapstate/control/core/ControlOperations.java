@@ -104,7 +104,7 @@ public final class ControlOperations {
             "sample-source.install", Scope.WRITE, true, null,
             "Install configured sample databases as Sources for the current workspace.", CLI_AND_REST);
     public static final Operation STATE_STORE_CONNECT = new Operation(
-            "state-store.connect", Scope.ADMIN, true, null,
+            "state-store.connect", Scope.WRITE, true, null,
             "Configure the one Cloud MongoDB Atlas destination for materialized views.", CLI_AND_REST);
 
     // connection domain: each probing verb runs an external probe and persists its result for later query
