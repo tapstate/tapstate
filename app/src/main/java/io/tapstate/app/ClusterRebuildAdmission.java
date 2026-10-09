@@ -76,6 +76,9 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
         private long admittedAtNanos;
         /** The execution generation of the run the last rebuild replaced. */
         private long replacedExecution;
+        /** The failed run this was last asked about, and when it was first asked about it. */
+        private long failedExecution;
+        private long failureSeenAtNanos;
     }
 
     ClusterRebuildAdmission(PipelineActuationOwnership actuation, Duration backoff, Duration detectionWindow) {
@@ -158,12 +161,20 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
         Attempts spent = attempts.computeIfAbsent(pipelineId, id -> new Attempts());
         long now = nanoTime.getAsLong();
         long failedRun = actuation.heldExecutionGeneration(pipelineId);
+        if (failedRun != spent.failedExecution) {
+            // Only a failed run is asked about, on every pass, so the first time it is asked about is within a
+            // pass of when it failed.
+            spent.failedExecution = failedRun;
+            spent.failureSeenAtNanos = now;
+        }
         if (spent.started && failedRun > spent.replacedExecution
-                && now - spent.admittedAtNanos >= MAX_ATTEMPTS * backoffNanos) {
+                && spent.failureSeenAtNanos - spent.admittedAtNanos >= MAX_ATTEMPTS * backoffNanos) {
             // The run the last rebuild put in place went on running for longer than the whole stretch a
             // departure answers for, and only then failed. The departure that budget was spent on is over;
             // this is another one, with a budget of its own. Counted over the pipeline's life instead, a
             // cluster that has lost members three times would leave every pipeline failed at the fourth.
+            // Measured to when the run failed rather than to now: a replacement that died at once and then
+            // stayed failed has not outlived anything, however long it is waited beside.
             spent.made = 0;
             spent.started = false;
         }

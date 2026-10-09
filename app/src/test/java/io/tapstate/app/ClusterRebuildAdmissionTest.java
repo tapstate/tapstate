@@ -752,6 +752,36 @@ class ClusterRebuildAdmissionTest {
                 .isFalse();
     }
 
+    /**
+     * A spent budget stays spent for the run it was spent on, however long that run then stays failed. What
+     * gives a departure a budget of its own is the run a rebuild put in place running past the stretch before
+     * it fails; a replacement that died at once has not done that, and waiting long enough beside it is not
+     * the same thing - nothing would then stop the cycle of rebuilds starting again, every stretch, for ever.
+     */
+    @Test
+    void aSpentBudgetIsNotGivenBackByWaitingBesideTheRunItWasSpentOn() {
+        committed(7, "node-a", "node-b", "node-c");
+        submitRunUnder(7);
+        long revision = 7;
+        for (int loss = 1; loss <= ClusterRebuildAdmission.MAX_ATTEMPTS; loss++) {
+            String staying = loss % 2 == 1 ? "node-b" : "node-c";
+            committed(++revision, "node-a", staying);
+            assertThat(admission.admits("orders")).as("attempt %s", loss).isTrue();
+            assertThat(ownership.beginExecution("orders").allowed()).as("replacement %s", loss).isTrue();
+            nanos.addAndGet(BACKOFF.toNanos());
+        }
+        // The last replacement is planned over node-a and node-b; node-b goes too, and stays gone.
+        committed(++revision, "node-a", "node-c");
+        assertThat(admission.admits("orders")).as("the budget is spent").isFalse();
+
+        nanos.addAndGet(BACKOFF.multipliedBy(2L * ClusterRebuildAdmission.MAX_ATTEMPTS).toNanos());
+
+        assertThat(admission.admits("orders"))
+                .as("the same failed run, long after: nothing was started and nothing moved since the budget "
+                        + "ran out")
+                .isFalse();
+    }
+
     @Test
     void onceTheSettlingIsOverADeathIsThePipelinesOwnAgain() {
         committed(7, "node-a", "node-b");
