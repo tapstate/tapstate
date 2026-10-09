@@ -1,8 +1,10 @@
 package io.tapstate.tools.catalog.assembler;
 
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeSet;
 import java.util.regex.Pattern;
 
@@ -51,10 +53,15 @@ final class SpecDrift {
     }
 
     static Report compare(List<ConnectorCatalogEntry> snapshot, Map<String, String> fetchedByPath) {
+        return compareRepositories(snapshot, Map.of(SpecRepository.OSS, fetchedByPath));
+    }
+
+    static Report compareRepositories(List<ConnectorCatalogEntry> snapshot,
+                                     Map<SpecRepository, Map<String, String>> fetchedByRepository) {
         List<String> changed = new ArrayList<>();
         List<String> vanished = new ArrayList<>();
         TreeSet<String> catalogued = new TreeSet<>();
-        TreeSet<String> claimedPaths = new TreeSet<>();
+        Map<SpecRepository, Set<String>> claimedPaths = new EnumMap<>(SpecRepository.class);
 
         for (ConnectorCatalogEntry row : snapshot) {
             catalogued.add(row.id());
@@ -62,8 +69,22 @@ final class SpecDrift {
             if (path == null || path.isBlank()) {
                 continue; // registered at runtime; no upstream file stands behind it
             }
-            claimedPaths.add(path);
-            String content = fetchedByPath.get(path);
+            SpecRepository repository = SpecRepository.of(row);
+            Map<String, String> fetched = fetchedByRepository.get(repository);
+            if (fetched == null) {
+                continue; // an unvisited repository has no deletion authority
+            }
+            // Newly catalogued enterprise rows can be found in the scanned checkout without adding
+            // repository fields to the catalog. Absence from both scanned repositories is drift.
+            Map<String, String> enterprise = fetchedByRepository.get(SpecRepository.ENTERPRISE);
+            if (repository == SpecRepository.OSS && !fetched.containsKey(path)
+                    && enterprise != null && enterprise.containsKey(path)
+                    && row.id().equals(connectorId(enterprise.get(path)))) {
+                repository = SpecRepository.ENTERPRISE;
+                fetched = enterprise;
+            }
+            claimedPaths.computeIfAbsent(repository, ignored -> new TreeSet<>()).add(path);
+            String content = fetched.get(path);
             if (content == null) {
                 vanished.add(row.id());
             } else if (!SpecHash.of(content).equals(row.provenance().specContentHash())) {
@@ -71,20 +92,29 @@ final class SpecDrift {
             }
         }
 
+        return new Report(List.copyOf(changed), List.copyOf(vanished),
+                newConnectors(fetchedByRepository, claimedPaths, catalogued));
+    }
+
+    private static List<String> newConnectors(Map<SpecRepository, Map<String, String>> fetchedByRepository,
+                                              Map<SpecRepository, Set<String>> claimedPaths,
+                                              Set<String> catalogued) {
         TreeSet<String> discovered = new TreeSet<>();
-        for (Map.Entry<String, String> fetched : fetchedByPath.entrySet()) {
-            if (claimedPaths.contains(fetched.getKey())) {
-                continue;
-            }
-            // What makes a file a connector specification is the id inside it. The scan fetches on
-            // shape and decides here, so a resource that merely sits where a specification would is
-            // passed over rather than announced as a connector nobody catalogued.
-            String id = connectorId(fetched.getValue());
-            if (id != null && !catalogued.contains(id)) {
-                discovered.add(id);
+        for (var repository : fetchedByRepository.entrySet()) {
+            for (Map.Entry<String, String> fetched : repository.getValue().entrySet()) {
+                if (claimedPaths.getOrDefault(repository.getKey(), Set.of()).contains(fetched.getKey())) {
+                    continue;
+                }
+                // What makes a file a connector specification is the id inside it. The scan fetches on
+                // shape and decides here, so a resource that merely sits where a specification would is
+                // passed over rather than announced as a connector nobody catalogued.
+                String id = connectorId(fetched.getValue());
+                if (id != null && !catalogued.contains(id)) {
+                    discovered.add(id);
+                }
             }
         }
-        return new Report(List.copyOf(changed), List.copyOf(vanished), List.copyOf(discovered));
+        return List.copyOf(discovered);
     }
 
     private static String connectorId(String specContent) {
