@@ -284,6 +284,9 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
         // Per table: what this writer last wrote into the source node's record, so an answer that has not moved
         // since is not written again.
         private final transient Map<String, Landed> landed = new HashMap<>();
+        // The tables whose recorded progress has not all landed: the store turned a fenced write of the source
+        // node's record away, so the next report lands it again, at the same position as much as at a later one.
+        private final transient Set<String> owed = new HashSet<>();
         // Per mining chain: the source position last recorded as read, for the same reason.
         private final Map<String, ChainPosition> recordedRead = new HashMap<>();
         // Per source node: the acked position last raised, for the same reason.
@@ -321,7 +324,7 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                 tokened = resumable;
             }
             WriterProgress next = new WriterProgress(durable, tokened);
-            if (!next.equals(was)) {
+            if (!next.equals(was) || owed.contains(chain)) {
                 report(chain, source, next, fence);
             }
         }
@@ -335,6 +338,9 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
         public void bounded(String chain, SourceOrder through, WorkloadClaimFence fence) {
             WriterProgress was = progress.get(chain);
             if (was != null && through.compareTo(was.durableThrough()) <= 0) {
+                if (owed.contains(chain)) {
+                    report(chain, sourceOf(progressByTable, chain), was, fence);
+                }
                 return;
             }
             report(chain, sourceOf(progressByTable, chain),
@@ -379,7 +385,11 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                 return;
             }
             progress.put(chain, next);
-            land(chain, source, run.get(), fence);
+            if (land(chain, source, run.get(), fence)) {
+                owed.remove(chain);
+            } else {
+                owed.add(chain);
+            }
         }
 
         /**
@@ -416,15 +426,17 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
          *
          * <p>A writer reporting a table the run does not route to it crashes bare: its progress would be left
          * out of the lowest one, so a resume could pass changes it still holds.
+         *
+         * @return false where the store turned a fenced write away, leaving the rest of the landing owed
          */
-        private void land(String chain, SourceProgress source, WriterRun run, WorkloadClaimFence fence) {
+        private boolean land(String chain, SourceProgress source, WriterRun run, WorkloadClaimFence fence) {
             if (!run.expectedFor(chain).contains(writerId)) {
                 throw new IllegalStateException("writer '" + writerId + "' landed changes of '" + chain
                         + "' that run '" + runId + "' of pipeline '" + pipelineId + "' does not route to it");
             }
             Optional<Landed> answer = SrsWriterFrontier.landed(run, chain);
             if (answer.isEmpty()) {
-                return;
+                return true;
             }
             Landed now = answer.get();
             Landed before = landed.get(chain);
@@ -432,7 +444,7 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
             // store, comparing the two, leaves standing.
             if (before == null || now.durableThrough().compareTo(before.durableThrough()) > 0) {
                 if (!advanceTableConfirmed(source, chain, confirmedAt(now), fence)) {
-                    return;
+                    return false;
                 }
                 if (source.kind() == ConsumerProgressKind.DIRECT_SOURCE) {
                     meta.settleDirectBatches(source.miningChainId(), source.consumerId());
@@ -444,7 +456,7 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                 ChainPosition acked = ackedCandidate(source, run, resumable);
                 if (acked != null && !acked.equals(raised.get(source))) {
                     if (!raiseSinkAcked(source, acked, fence)) {
-                        return;
+                        return false;
                     }
                     raised.put(source, acked);
                 }
@@ -454,11 +466,12 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
             }
             if (!loaded.contains(chain) && SrsWriterFrontier.passedLoad(now, run.snapshotEpoch())) {
                 if (!markSnapshotComplete(source, chain, fence)) {
-                    return;
+                    return false;
                 }
                 loaded.add(chain);
             }
             landed.put(chain, now);
+            return true;
         }
 
         /**

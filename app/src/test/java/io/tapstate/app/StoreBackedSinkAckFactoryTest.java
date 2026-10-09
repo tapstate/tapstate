@@ -24,6 +24,10 @@ import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.ConsumerProgressKind;
 import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.spi.store.SrsMetaStore;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
+import io.tapstate.spi.store.WorkloadOwner;
 import java.lang.reflect.InvocationTargetException;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -737,6 +741,46 @@ class StoreBackedSinkAckFactoryTest {
 
         assertThat(store.read("mc-orders").orElseThrow().snapshotCompletedTables("pipe-1"))
                 .containsExactly("orders");
+    }
+
+    /**
+     * A fenced write of the table's confirmation that the store turns away - the claim re-taken between the
+     * writer's report and that write - leaves the landing owed, and the writer's next report at the same
+     * position lands it, an ack and a bound alike. A quiet table sends nothing higher, so a landing owed until
+     * something did would hold the table's position back for as long as it stayed quiet.
+     */
+    @Test
+    void aLandingTheStoreTurnedAwayIsLandedByTheNextReportAtTheSamePosition() {
+        WorkloadClaimFence fence = new WorkloadClaimFence(
+                new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, "pipe-1"),
+                new WorkloadOwner("node-a", "boot-a"), 1, 1, 0);
+        for (boolean byBound : List.of(false, true)) {
+            InMemorySrsMetaStore backing = new InMemorySrsMetaStore();
+            backing.create("mc-orders", null);
+            AtomicBoolean refuseTheNext = new AtomicBoolean(true);
+            SrsMetaStore store = mock(SrsMetaStore.class, AdditionalAnswers.delegatesTo(backing));
+            doAnswer(invocation -> !refuseTheNext.getAndSet(false) && (boolean) invokeOn(backing, invocation))
+                    .when(store).advanceTableConfirmed(anyString(), anyString(), anyString(),
+                            any(ChainPosition.class), any(WorkloadClaimFence.class));
+            HazelcastInstance member = memberWith(store);
+            SinkAck ack = soleWriter(member, Map.of("orders", "mc-orders"), "pipe-1");
+
+            ack.advance("orders", at(7, "w7"), fence);
+            assertThat(backing.writerRun("mc-orders", "pipe-1").orElseThrow().progressFor("orders"))
+                    .as("the writer's own progress is recorded").containsKey(WRITER);
+            assertThat(ackedPosition(backing, "mc-orders", "pipe-1")).as("nothing landed yet").isNull();
+
+            if (byBound) {
+                ack.bounded("orders", new SourceOrder(1, 7), fence);
+            } else {
+                ack.advance("orders", at(7, "w7"), fence);
+            }
+
+            assertThat(backing.read("mc-orders").orElseThrow().consumerOffset("pipe-1").orElseThrow()
+                    .sinkAckedByTable()).as(byBound ? "landed by a bound" : "landed by an ack")
+                    .containsEntry("orders", at(7, "w7"));
+            assertThat(ackedPosition(backing, "mc-orders", "pipe-1")).isEqualTo("w7");
+        }
     }
 
     /**
