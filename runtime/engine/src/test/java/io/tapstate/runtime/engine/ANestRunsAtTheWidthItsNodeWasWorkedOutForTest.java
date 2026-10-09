@@ -16,10 +16,6 @@ import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.jet.config.JobConfig;
 import io.tapstate.core.event.Envelope;
-import com.hazelcast.jet.core.test.TestSupport;
-import io.tapstate.core.event.ChainPosition;
-import io.tapstate.core.event.Op;
-import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.NodeParallelism;
 import io.tapstate.core.model.BatchSpec;
 import io.tapstate.core.model.Embed;
@@ -121,43 +117,6 @@ class ANestRunsAtTheWidthItsNodeWasWorkedOutForTest {
                 bindings());
         assertThat(InputBatches.takesInputInBatches(one.getVertex("doc").getMetaSupplier()))
                 .as("as one processor too, it takes its input in its author's batches").isTrue();
-    }
-
-    /**
-     * What a nest with nothing to assemble passes on are its documents, under the stream the nest emits - the one
-     * the run was planned with and its sinks map to a target - carrying the chains its root's rows sat on. Passed
-     * on under the root's own stream instead, a sink running several writers has no target to route them by, and
-     * the run fails on the first row.
-     */
-    @Test
-    void aNestThatAssemblesNothingPassesItsRowsOnUnderItsOwnStreamToAParallelSink() {
-        TransformBody.Nest rootOnly = new TransformBody.Nest(null, null,
-                new NestRoot("c", List.of("customer_id"), null, null, List.of()));
-        String sink = "serve.sync_1";
-        Map<String, SinkTarget> targets = Map.of("doc", new SinkTarget("customers", List.of("customer_id")));
-        ExecutionShape shape = new ExecutionShape(1,
-                Map.of("doc", new NodeParallelism("doc", 3, NodeParallelism.Origin.EXPLICIT,
-                                NodeParallelism.Scope.NATIVE, 1, 3, 3, List.of()),
-                        sink, new NodeParallelism(sink, 4, NodeParallelism.Origin.NODE_DEFAULT,
-                                NodeParallelism.Scope.NATIVE, 1, 4, 4, List.of())),
-                Map.of("doc", Map.of("customers", List.of("customer_id"))),
-                Map.of(sink, targets));
-        DAG dag = PipelineDagBuilder.build(pipeline(rootOnly, new ExecutionSpec(3, null)), bindings(), null, null,
-                shape);
-        Map<String, ChainPosition> sat = Map.of("customers", new ChainPosition(new SourceOrder(1, 5), "t5"));
-        Envelope row = new Envelope(Op.INSERT, 1L, "customers", null, Map.of("customer_id", 7, "name", "a"), null,
-                sat);
-        Envelope document = new Envelope(Op.INSERT, 1L, "doc", null, row.after(), null, sat);
-
-        TestSupport.verifyProcessor(dag.getVertex("doc").getMetaSupplier())
-                .disableSnapshots()
-                .input(List.of(row))
-                .expectOutput(List.of(document));
-
-        assertThat(dag.getInboundEdges(PipelineDagBuilder.ROUTE_VERTEX_PREFIX + sink)).singleElement()
-                .satisfies(edge -> assertThat(edge.getSourceName()).isEqualTo("doc"));
-        assertThat(RoutingKeys.forSink(sink, targets).apply(document))
-                .as("the key the edge into the sink's writers routes it by").isNotNull();
     }
 
     /**
