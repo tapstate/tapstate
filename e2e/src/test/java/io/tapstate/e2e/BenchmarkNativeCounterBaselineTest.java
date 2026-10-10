@@ -96,6 +96,16 @@ class BenchmarkNativeCounterBaselineTest {
                 .isInstanceOf(AssertionError.class).hasMessageContaining("lost a settled counter");
     }
 
+    @Test void admitted_baseline_evidence_is_serializable_by_the_actual_diagnostic_json_writer() {
+        var guard = new BenchmarkNativeCounterBaseline(0, Duration.ofSeconds(3));
+        guard.observe(snapshot(5000, 10, 100), 100, 20);
+        guard.observe(snapshot(10000, 5_000_000_000L, 100), 100, 5_000_000_010L);
+        assertThat(guard.observe(snapshot(15000, 10_000_000_000L, 100), 100, 10_000_000_010L)).isTrue();
+        String json = io.tapstate.core.common.JsonWriter.write(guard.evidence());
+        assertThat(json).contains("RECORDED_FRESH_NATIVE_BASELINE", "member/serve.sink/0", "recordsOut.UPDATE.orders");
+        assertThat(io.tapstate.core.common.JsonReader.parse(json)).isInstanceOf(Map.class);
+    }
+
     private static BenchmarkNativeCounterBaseline.Snapshot snapshot(long publication, long read, long count) {
         return new BenchmarkNativeCounterBaseline.Snapshot("pipeline", "job", "member", "execution", publication,
                 read, read + 1, Set.of("member/serve.sink/0"), Map.of("recordsOut.UPDATE.orders|member/serve.sink/0", count));

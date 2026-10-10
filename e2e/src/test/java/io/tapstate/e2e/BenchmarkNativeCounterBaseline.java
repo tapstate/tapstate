@@ -162,7 +162,8 @@ final class BenchmarkNativeCounterBaseline {
         return Map.of("pipeline", snapshot.pipeline(), "jobId", snapshot.jobId(), "memberUuid", snapshot.memberUuid(),
                 "executionId", snapshot.executionId(), "publicationStamp", snapshot.publicationStamp(),
                 "readStartedAtNanos", snapshot.readStartedAtNanos(), "readCompletedAtNanos", snapshot.readCompletedAtNanos(),
-                "expectedSinkIdentities", snapshot.expectedSinkIdentities(), "counters", snapshot.counters());
+                "expectedSinkIdentities", snapshot.expectedSinkIdentities().stream().sorted().toList(),
+                "counters", snapshot.counters());
     }
 
     private static int size(String value) { return value.getBytes(StandardCharsets.UTF_8).length; }
