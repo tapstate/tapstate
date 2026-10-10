@@ -75,6 +75,11 @@ final class BenchmarkResourceSampler implements AutoCloseable {
         }
     }
 
+    BenchmarkWriteReturnReader writeReturnReader() {
+        if (probe == null) { throw new AssertionError("return capture requires the actual owned resource connection"); }
+        return probe.writeReturnReader();
+    }
+
     static BenchmarkResourceSampler openForPhaseBudget(long childPid, Duration interval, Duration budget) {
         int retained = Math.toIntExact(budget.toNanos() / interval.toNanos() + 4);
         if (retained < 2 || retained > 4096) { throw new AssertionError("phase resource retention exceeds its declared finite budget"); }

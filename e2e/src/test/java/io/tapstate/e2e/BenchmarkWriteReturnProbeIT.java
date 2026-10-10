@@ -39,6 +39,15 @@ import static org.assertj.core.api.Assertions.assertThat;
 class BenchmarkWriteReturnProbeIT {
     @Test
     void coldScopeAndClockPointsComeFromTheActualOwnedWriter(@TempDir Path temporary) throws Exception {
+        runCold(temporary, false);
+    }
+
+    @Test
+    void collectedWindowUsesActualOwnedGetterAndTerminalPages(@TempDir Path temporary) throws Exception {
+        runCold(temporary, true);
+    }
+
+    private static void runCold(Path temporary, boolean collected) throws Exception {
         DockerGate.require(); RealConnectorGate.require("mongodb");
         Path jar = ConnectorJars.pathFor("mongodb");
         String database = "write_return_" + UUID.randomUUID().toString().replace("-", "");
@@ -67,95 +76,109 @@ class BenchmarkWriteReturnProbeIT {
                 assertThat(runtime.get("status")).isEqualTo("COMPLETE");
                 assertThat(child.isAlive()).as("the original owned child remains alive after attach").isTrue();
                 var probe = resources.writeReturnReader();
-                assertThat(probe.start("cold-scope-control")).isTrue();
-                List<BenchmarkCausalClock.Sample> samples = new ArrayList<>();
-                samples.add(probe.clockSample(0));
-                for (int step = 1; step <= 3; step++) {
-                    child.getOutputStream().write(("WRITE " + step + "\n").getBytes(StandardCharsets.US_ASCII));
-                    child.getOutputStream().flush();
-                    output.awaitLine(child, "WRITE_RETURN_DONE " + step);
-                    samples.add(probe.clockSample(step));
-                }
-                assertThat(probe.stop()).isTrue();
-                byte[] raw = probe.page(0);
-                var page = BenchmarkWriteReturnLedger.decode(raw);
-                assertThat(page.window()).isEqualTo("cold-scope-control");
-                assertThat(page.state()).isEqualTo("RECORDED_SCOPE_UNQUALIFIED");
-                assertThat(page.cursor()).isZero(); assertThat(page.nextCursor()).isEqualTo(3);
-                assertThat(page.totalFrames()).isEqualTo(3);
-                assertThat(page.calls()).extracting(BenchmarkWriteReturnLedger.Call::sequence)
-                        .containsExactly(1L, 2L, 3L);
-                assertThat(page.calls()).allSatisfy(call -> {
-                    assertThat(call.returnedNormally()).isTrue(); assertThat(call.errors()).isZero();
-                    assertThat(call.callbackCount()).isPositive(); assertThat(call.writer()).isEqualTo(1);
-                    assertThat(call.target()).isEqualTo("orders"); assertThat(call.keyFields()).containsExactly("id");
-                    assertThat(call.scope()).startsWith("state=ORDINARY_ACKNOWLEDGED;reason=PINNED_RUNTIME_SCOPE;")
-                            .contains("concern=w:1,");
-                });
-                assertThat(page.calls().stream().mapToLong(call ->
-                        call.inserted() + call.modified() + call.removed()).sum()).isEqualTo(6);
-                assertThat(page.calls().stream().flatMap(call -> call.rows().stream())
-                        .map(BenchmarkWriteReturnLedger.Row::keys).toList())
-                        .containsExactly(List.of(1), List.of(2), List.of(3), List.of(1), List.of(2), List.of(3));
-                assertThat(page.calls().stream().flatMap(call -> call.rows().stream())
-                        .map(BenchmarkWriteReturnLedger.Row::kind).toList()).containsExactly(1, 1, 1, 2, 2, 3);
-                var clock = new BenchmarkCausalClock(samples.getFirst().identity(), samples);
-                List<Map<String, Object>> bounds = new ArrayList<>();
-                for (var call : page.calls()) {
-                    var point = clock.map(samples.getFirst().identity(), call.observedNanos());
-                    var began = clock.map(samples.getFirst().identity(), call.beganNanos());
-                    assertThat(point.widthNanos()).isPositive();
-                    bounds.add(Map.of("sequence", call.sequence(), "capturedPointBounds", List.of(point.lowerNanos(), point.upperNanos()),
-                            "literalReturnBounds", List.of(began.lowerNanos(), point.upperNanos()),
-                            "scope", call.scope()));
-                }
-                Map<Object, Long> insertedKeys = new java.util.HashMap<>();
-                List<String> coverage = new ArrayList<>();
-                String barrier = UUID.randomUUID().toString();
-                mongo.getDatabase(database).getCollection("orders")
-                        .insertOne(new Document("_write_return_barrier", barrier));
-                long oracleDeadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
-                org.bson.BsonTimestamp previous = null;
-                boolean barrierSeen = false;
-                while (!barrierSeen && System.nanoTime() < oracleDeadline) {
-                    var change = changes.tryNext();
-                    if (change == null) { continue; }
-                    assertThat(change.getClusterTime()).isNotNull();
-                    if (previous != null) { assertThat(change.getClusterTime().compareTo(previous)).isNotNegative(); }
-                    previous = change.getClusterTime();
-                    var operation = change.getOperationType();
-                    if (operation == com.mongodb.client.model.changestream.OperationType.INSERT
-                            && barrier.equals(change.getFullDocument().getString("_write_return_barrier"))) {
-                        barrierSeen = true; continue;
+                BenchmarkWriteReturnCapture capture = collected
+                        ? BenchmarkWriteReturnCapture.open(probe, "cold-scope-control") : null;
+                try {
+                    if (capture == null) { assertThat(probe.start("cold-scope-control")).isTrue(); }
+                    List<BenchmarkCausalClock.Sample> samples = new ArrayList<>();
+                    if (capture == null) { samples.add(probe.clockSample(0)); }
+                    for (int step = 1; step <= 3; step++) {
+                        child.getOutputStream().write(("WRITE " + step + "\n").getBytes(StandardCharsets.US_ASCII));
+                        child.getOutputStream().flush();
+                        output.awaitLine(child, "WRITE_RETURN_DONE " + step);
+                        if (capture == null) { samples.add(probe.clockSample(step)); }
                     }
-                    if (coverage.size() >= 32) { throw new AssertionError("cold target event roster exceeded its bound"); }
-                    if (operation == com.mongodb.client.model.changestream.OperationType.INSERT) {
-                        long key = ((Number) change.getFullDocument().get("id")).longValue();
-                        insertedKeys.put(change.getDocumentKey().get("_id"), key); coverage.add("1:" + key);
-                    } else if (operation == com.mongodb.client.model.changestream.OperationType.UPDATE
-                            || operation == com.mongodb.client.model.changestream.OperationType.REPLACE) {
-                        coverage.add("2:" + ((Number) change.getFullDocument().get("id")).longValue());
-                    } else if (operation == com.mongodb.client.model.changestream.OperationType.DELETE) {
-                        coverage.add("3:" + insertedKeys.get(change.getDocumentKey().get("_id")));
-                    } else { throw new AssertionError("unexpected cold target event: " + operation); }
-                }
-                assertThat(barrierSeen).as("owned post-write target barrier").isTrue();
-                assertThat(coverage).containsExactlyInAnyOrder("1:1", "1:2", "1:3", "2:1", "2:2", "3:3");
-                mongo.getDatabase(database).getCollection("orders")
-                        .deleteOne(new Document("_write_return_barrier", barrier));
-                List<Document> rows = mongo.getDatabase(database).getCollection("orders")
-                        .find().projection(new Document("_id", 0)).sort(new Document("id", 1)).into(new ArrayList<>());
-                assertThat(rows).containsExactly(new Document("id", 1L).append("seq", 21L),
-                        new Document("id", 2L).append("seq", 22L));
-                System.out.println("benchmark-write-return-cold-evidence=" + JsonWriter.write(Map.of(
-                        "purpose", "COLD_ACK_SCOPE_AND_CAUSAL_CLOCK_CONTROL", "runtime", runtime,
-                        "samples", samples.stream().map(sample -> Map.of("sequence", sample.sequence(),
-                                "pid", sample.identity().pid(), "jvmStartTimeMillis", sample.identity().jvmStartTimeMillis(),
-                                "driverBeforeNanos", sample.driverBeforeNanos(), "driverAfterNanos", sample.driverAfterNanos(),
-                                "ownedNanos", sample.ownedNanos())).toList(),
-                        "bounds", bounds, "receiptBase64", Base64.getEncoder().encodeToString(raw),
-                        "targetRows", rows, "targetEventCoverage", coverage, "performanceAcceptanceEligible", false,
-                        "returnCaptureDelayQualified", false, "samplingCostQualified", false)));
+                    if (capture == null) { assertThat(probe.stop()).isTrue(); }
+                    else {
+                        var result = capture.finish();
+                        assertThat(result.calls()).hasSize(3);
+                        assertThat(result.summary().completedCalls()).isEqualTo(3);
+                        assertThat(result.summary().reportedRecords()).isEqualTo(6);
+                        assertThat(result.summary().openCalls()).isZero();
+                        assertThat(result.summary().failedCalls()).isZero();
+                        assertThat(result.samples().size()).isBetween(2, 512);
+                        samples.addAll(result.samples());
+                    }
+                    byte[] raw = probe.page(0);
+                    var page = BenchmarkWriteReturnLedger.decode(raw);
+                    assertThat(page.window()).isEqualTo("cold-scope-control");
+                    assertThat(page.state()).isEqualTo("RECORDED_SCOPE_UNQUALIFIED");
+                    assertThat(page.cursor()).isZero(); assertThat(page.nextCursor()).isEqualTo(3);
+                    assertThat(page.totalFrames()).isEqualTo(3);
+                    assertThat(page.calls()).extracting(BenchmarkWriteReturnLedger.Call::sequence)
+                            .containsExactly(1L, 2L, 3L);
+                    assertThat(page.calls()).allSatisfy(call -> {
+                        assertThat(call.returnedNormally()).isTrue(); assertThat(call.errors()).isZero();
+                        assertThat(call.callbackCount()).isPositive(); assertThat(call.writer()).isEqualTo(1);
+                        assertThat(call.target()).isEqualTo("orders"); assertThat(call.keyFields()).containsExactly("id");
+                        assertThat(call.scope()).startsWith("state=ORDINARY_ACKNOWLEDGED;reason=PINNED_RUNTIME_SCOPE;")
+                                .contains("concern=w:1,");
+                    });
+                    assertThat(page.calls().stream().mapToLong(call ->
+                            call.inserted() + call.modified() + call.removed()).sum()).isEqualTo(6);
+                    assertThat(page.calls().stream().flatMap(call -> call.rows().stream())
+                            .map(BenchmarkWriteReturnLedger.Row::keys).toList())
+                            .containsExactly(List.of(1), List.of(2), List.of(3), List.of(1), List.of(2), List.of(3));
+                    assertThat(page.calls().stream().flatMap(call -> call.rows().stream())
+                            .map(BenchmarkWriteReturnLedger.Row::kind).toList()).containsExactly(1, 1, 1, 2, 2, 3);
+                    var clock = new BenchmarkCausalClock(samples.getFirst().identity(), samples);
+                    List<Map<String, Object>> bounds = new ArrayList<>();
+                    for (var call : page.calls()) {
+                        var point = clock.map(samples.getFirst().identity(), call.observedNanos());
+                        var began = clock.map(samples.getFirst().identity(), call.beganNanos());
+                        assertThat(point.widthNanos()).isPositive();
+                        bounds.add(Map.of("sequence", call.sequence(), "capturedPointBounds", List.of(point.lowerNanos(), point.upperNanos()),
+                                "literalReturnBounds", List.of(began.lowerNanos(), point.upperNanos()),
+                                "scope", call.scope()));
+                    }
+                    Map<Object, Long> insertedKeys = new java.util.HashMap<>();
+                    List<String> coverage = new ArrayList<>();
+                    String barrier = UUID.randomUUID().toString();
+                    mongo.getDatabase(database).getCollection("orders")
+                            .insertOne(new Document("_write_return_barrier", barrier));
+                    long oracleDeadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+                    org.bson.BsonTimestamp previous = null;
+                    boolean barrierSeen = false;
+                    while (!barrierSeen && System.nanoTime() < oracleDeadline) {
+                        var change = changes.tryNext();
+                        if (change == null) { continue; }
+                        assertThat(change.getClusterTime()).isNotNull();
+                        if (previous != null) { assertThat(change.getClusterTime().compareTo(previous)).isNotNegative(); }
+                        previous = change.getClusterTime();
+                        var operation = change.getOperationType();
+                        if (operation == com.mongodb.client.model.changestream.OperationType.INSERT
+                                && barrier.equals(change.getFullDocument().getString("_write_return_barrier"))) {
+                            barrierSeen = true; continue;
+                        }
+                        if (coverage.size() >= 32) { throw new AssertionError("cold target event roster exceeded its bound"); }
+                        if (operation == com.mongodb.client.model.changestream.OperationType.INSERT) {
+                            long key = ((Number) change.getFullDocument().get("id")).longValue();
+                            insertedKeys.put(change.getDocumentKey().get("_id"), key); coverage.add("1:" + key);
+                        } else if (operation == com.mongodb.client.model.changestream.OperationType.UPDATE
+                                || operation == com.mongodb.client.model.changestream.OperationType.REPLACE) {
+                            coverage.add("2:" + ((Number) change.getFullDocument().get("id")).longValue());
+                        } else if (operation == com.mongodb.client.model.changestream.OperationType.DELETE) {
+                            coverage.add("3:" + insertedKeys.get(change.getDocumentKey().get("_id")));
+                        } else { throw new AssertionError("unexpected cold target event: " + operation); }
+                    }
+                    assertThat(barrierSeen).as("owned post-write target barrier").isTrue();
+                    assertThat(coverage).containsExactlyInAnyOrder("1:1", "1:2", "1:3", "2:1", "2:2", "3:3");
+                    mongo.getDatabase(database).getCollection("orders")
+                            .deleteOne(new Document("_write_return_barrier", barrier));
+                    List<Document> rows = mongo.getDatabase(database).getCollection("orders")
+                            .find().projection(new Document("_id", 0)).sort(new Document("id", 1)).into(new ArrayList<>());
+                    assertThat(rows).containsExactly(new Document("id", 1L).append("seq", 21L),
+                            new Document("id", 2L).append("seq", 22L));
+                    System.out.println("benchmark-write-return-cold-evidence=" + JsonWriter.write(Map.of(
+                            "purpose", collected ? "COLD_CAPTURE_SAMPLER_ASSEMBLY_CONTROL" : "COLD_ACK_SCOPE_AND_CAUSAL_CLOCK_CONTROL", "runtime", runtime,
+                            "samples", samples.stream().map(sample -> Map.of("sequence", sample.sequence(),
+                                    "pid", sample.identity().pid(), "jvmStartTimeMillis", sample.identity().jvmStartTimeMillis(),
+                                    "driverBeforeNanos", sample.driverBeforeNanos(), "driverAfterNanos", sample.driverAfterNanos(),
+                                    "ownedNanos", sample.ownedNanos())).toList(),
+                            "bounds", bounds, "receiptBase64", Base64.getEncoder().encodeToString(raw),
+                            "targetRows", rows, "targetEventCoverage", coverage, "performanceAcceptanceEligible", false,
+                            "returnCaptureDelayQualified", false, "samplingCostQualified", false)));
+                } finally { if (capture != null) { capture.close(); } }
             }
             child.getOutputStream().write("EXIT\n".getBytes(StandardCharsets.US_ASCII));
             child.getOutputStream().flush();

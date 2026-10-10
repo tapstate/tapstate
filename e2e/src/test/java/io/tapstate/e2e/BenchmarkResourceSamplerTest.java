@@ -14,6 +14,14 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class BenchmarkResourceSamplerTest {
 
     @Test
+    void supplied_resource_samples_cannot_supply_an_owned_return_connection() {
+        try (var sampler = BenchmarkResourceSampler.from(() -> reading(1, 1, 1, 1), Duration.ofHours(1))) {
+            assertThatThrownBy(sampler::writeReturnReader).isInstanceOf(AssertionError.class)
+                    .hasMessageContaining("actual owned resource connection");
+        }
+    }
+
+    @Test
     void computesCounterDeltasAndPeakMemoryAcrossTheWholeWindow() {
         BenchmarkResourceSampler.Summary summary = BenchmarkResourceSampler.summarize(List.of(
                 reading(100, 20, 1_000, 2_000),
