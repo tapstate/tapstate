@@ -28,8 +28,9 @@ cleanup() {
     fi
   done
   for resource in "${VOLUMES[@]}"; do
-    [[ "$(docker volume inspect -f "{{index .Labels \"$label\"}}" "$resource" 2>/dev/null || true)" = "$OWNER" ]] \
-      && docker volume rm "$resource" >/dev/null 2>&1 || true
+    if [[ "$(docker volume inspect -f "{{index .Labels \"$label\"}}" "$resource" 2>/dev/null || true)" = "$OWNER" ]]; then
+      docker volume rm "$resource" >/dev/null 2>&1 || true
+    fi
   done
   if [[ "$(docker network inspect -f "{{index .Labels \"$label\"}}" "$NETWORK" 2>/dev/null || true)" = "$OWNER" ]]; then
     docker network rm "$NETWORK" >/dev/null 2>&1 || true
