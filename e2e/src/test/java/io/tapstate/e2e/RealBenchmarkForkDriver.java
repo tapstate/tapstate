@@ -28,6 +28,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
     private static final Duration PRE_WINDOW_QUIET = Duration.ofSeconds(3);
     static final String WRITE_RETURN_DIAGNOSTICS_PROPERTY = "tapstate.e2e.benchmark.write-return-diagnostics";
     static final String WRITE_RETURN_CLOCK_CONTROL_PROPERTY = "tapstate.e2e.benchmark.write-return-clock-control";
+    static final String WRITE_RETURN_METHOD_CONTROL_PROPERTY = "tapstate.e2e.benchmark.write-return-method-control";
 
     /** Local observation intervals distinguish data arrival from subsequent proof reads. */
     record ConfirmationTiming(long sourceMarkerWaitStartedAtNanos, long sourceMarkerWaitCompletedAtNanos,
@@ -321,13 +322,51 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         return BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL;
     }
 
+    static boolean writeReturnMethodControl(String value, boolean diagnostics, boolean pilot,
+            BenchmarkReturnClockSampler.Mode clockMode, boolean conflictingDiagnostics) {
+        if (value == null || "false".equals(value)) { return false; }
+        if (!"true".equals(value)) { throw new AssertionError("return method control must be true or false"); }
+        if (!diagnostics || !pilot || clockMode != BenchmarkReturnClockSampler.Mode.PERIODIC || conflictingDiagnostics) {
+            throw new AssertionError("return method cost control requires one original plain diagnostic pilot without other controls");
+        }
+        return true;
+    }
+
+    static boolean collectWriteReturns(boolean diagnostics, boolean methodControl) {
+        return diagnostics && !methodControl;
+    }
+
+    static boolean admitWriteReturnMethodProtocol(String value, boolean diagnostics, boolean pilot,
+            BenchmarkReturnClockSampler.Mode clockMode, boolean conflictingDiagnostics) {
+        if (value == null) { return false; }
+        writeReturnMethodControl(value, diagnostics, pilot, clockMode, conflictingDiagnostics);
+        if (!diagnostics || !pilot || clockMode != BenchmarkReturnClockSampler.Mode.PERIODIC || conflictingDiagnostics) {
+            throw new AssertionError("return method cost protocol requires one original plain diagnostic pilot without other controls");
+        }
+        return "true".equals(value);
+    }
+
     @Override
     public PipelineBenchmarkHarness.ForkResult run(BenchmarkWorkloadDefinitions.Workload workload,
             PipelineBenchmarkComparison.Arm arm, int armFork, Path applicationJar) throws Exception {
         Objects.requireNonNull(workload, "workload");
         Objects.requireNonNull(arm, "arm");
-        writeReturnClockMode(System.getProperty(WRITE_RETURN_CLOCK_CONTROL_PROPERTY),
+        var clockMode = writeReturnClockMode(System.getProperty(WRITE_RETURN_CLOCK_CONTROL_PROPERTY),
                 Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY), workload.pilotProfile());
+        admitWriteReturnMethodProtocol(System.getProperty(WRITE_RETURN_METHOD_CONTROL_PROPERTY),
+                Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY), workload.pilotProfile(), clockMode,
+                !"stateless".equals(workload.id()) || arm != PipelineBenchmarkComparison.Arm.B
+                        || Boolean.getBoolean("tapstate.e2e.benchmark-smoke.jvm-gap-diagnostics")
+                        || Boolean.getBoolean("tapstate.e2e.benchmark.compilation-diagnostics")
+                        || Boolean.getBoolean("tapstate.e2e.benchmark.thread-point-diagnostics")
+                        || Boolean.getBoolean("tapstate.e2e.benchmark.load-diagnostics")
+                        || Boolean.getBoolean(BenchmarkDualGcDiagnostics.ENABLED_PROPERTY)
+                        || Boolean.getBoolean(BenchmarkWitnessReadGate.PROPERTY)
+                        || Boolean.getBoolean(BenchmarkMongoDeliveryObserver.CLOCK_REJECTION_EVIDENCE_PROPERTY)
+                        || Boolean.getBoolean(BenchmarkMongoDeliveryObserver.NATIVE_OPERATION_WALL_EVIDENCE_PROPERTY)
+                        || Boolean.getBoolean("tapstate.e2e.benchmark-smoke.paced-calibration")
+                        || Boolean.getBoolean("tapstate.e2e.benchmark-smoke.cdc-settling-calibration")
+                        || Boolean.getBoolean("tapstate.e2e.benchmark-smoke.full-cdc-settling-calibration"));
         if (armFork < 1 || applicationJar == null) {
             throw new IllegalArgumentException("a positive fork number and application JAR are required");
         }
@@ -539,6 +578,14 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         BenchmarkResourceSampler.Summary resources;
         BenchmarkMongoCommandSampler.Summary commands;
         BenchmarkWriteReturnCapture.Result writeReturns = null;
+        boolean methodControl = writeReturnMethodControl(System.getProperty(WRITE_RETURN_METHOD_CONTROL_PROPERTY),
+                Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY), workload.pilotProfile(),
+                writeReturnClockMode(System.getProperty(WRITE_RETURN_CLOCK_CONTROL_PROPERTY),
+                        Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY), workload.pilotProfile()), false);
+        boolean methodCostProtocol = Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY)
+                && System.getProperty(WRITE_RETURN_METHOD_CONTROL_PROPERTY) != null;
+        Map<String, Object> returnRegistrationBefore = Map.of();
+        Map<String, Object> returnRegistrationAfter = Map.of();
         Map<String, Object> retainedReturnEvidence = Map.of();
         Map<String, Object> retainedSourceIssue = Map.of("state", "UNAVAILABLE", "completeSourceRoster", false);
         List<String> targetClockUris = phase.targets().stream().map(target ->
@@ -578,6 +625,9 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
              BenchmarkTargetClockSampler clockSampler = targetClockBefore == null ? null
                      : BenchmarkTargetClockSampler.open(targetClockUris.getFirst())) {
             fork.ownedProcessReceipt().recordJvmRuntime(resourceSampler.runtimeEvidence());
+            if (methodCostProtocol) {
+                returnRegistrationBefore = resourceSampler.writeReturnReader().registrationEvidence(!methodControl);
+            }
             if (compilationDiagnostics) {
                 resourceSampler.enableCompilationDiagnostics();
             }
@@ -588,7 +638,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             try {
                 resourceSampler.start();
                 commandSampler.start();
-                try (BenchmarkWriteReturnCapture returnCapture = Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY)
+                try (BenchmarkWriteReturnCapture returnCapture = collectWriteReturns(
+                        Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY), methodControl)
                         ? BenchmarkWriteReturnCapture.open(resourceSampler.writeReturnReader(),
                                 workload.id() + "/" + phase.id(), writeReturnClockMode(
                                         System.getProperty(WRITE_RETURN_CLOCK_CONTROL_PROPERTY), true, workload.pilotProfile())) : null) {
@@ -601,7 +652,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                                 }
                             }
                         });
-                        if (returnCapture != null) { retainedSourceIssue = sourceIssueEvidence(issued); }
+                        if (Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY)) { retainedSourceIssue = sourceIssueEvidence(issued); }
                         if (issued.batches().isEmpty()) {
                             throw new AssertionError("measured phase has no source batches: " + phase.id());
                         }
@@ -619,12 +670,21 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                                     Map.of("state", "UNKNOWN", "capture", returnCapture.retainedEvidence(),
                                             "sourceIssue", retainedSourceIssue, "resourceSummaryAvailable", false,
                                             "performanceAcceptanceEligible", false)));
+                        } else if (methodCostProtocol) {
+                            System.out.println("benchmark-return-method-control-refusal=" + JsonWriter.write(Map.of(
+                                    "state", "UNKNOWN", "sourceIssue", retainedSourceIssue,
+                                    "registrationBefore", returnRegistrationBefore,
+                                    "rawReturnReceipt", "UNAVAILABLE_DISABLED_PRODUCER",
+                                    "performanceAcceptanceEligible", false, "samplingCostQualified", false)));
                         }
                         throw failure;
                     }
                 }
                 resources = resourceSampler.finish();
                 commands = commandSampler.finish();
+                if (methodCostProtocol) {
+                    returnRegistrationAfter = resourceSampler.writeReturnReader().registrationEvidence(!methodControl);
+                }
                 if (clockSampler != null) {
                     clockSampler.close();
                     interiorClockEvidence = clockSampler.evidence();
@@ -707,7 +767,10 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     "queryIntervalMillis", 200, "samples", nativeQueues.samples(), "performanceAcceptanceEligible", false,
                     "samplingScope", "READ_ONLY_NATIVE_JOB_METRICS_WITH_DECLARED_COLLECTION_CADENCE")));
         }
-        Map<String, Object> capturedForClockFailure = retainedReturnEvidence;
+        Map<String, Object> capturedForClockFailure = methodControl
+                ? Map.of("state", "UNAVAILABLE", "reason", "RETURN_METHOD_COST_CONTROL_DISABLED_PRODUCER",
+                        "registrationBefore", returnRegistrationBefore, "registrationAfter", returnRegistrationAfter)
+                : retainedReturnEvidence;
         Map<String, Object> sourceForClockFailure = retainedSourceIssue;
         List<BenchmarkTargetClock.Reading> interiorForClockCheck = interiorClockReadings;
         ValidatedTargetClocks checkedClocks = BenchmarkReturnFailureRetention.run(() -> {
@@ -737,6 +800,37 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         Map<String, Object> outerClockEvidence = checkedClocks.outer();
         var clockProof = new LinkedHashMap<String, Object>(outerClockEvidence);
         if (counterBefore != null) { clockProof.put("nativeCounterBaselineBefore", counterBefore.evidence()); }
+        if (methodCostProtocol) {
+            clockProof.put("returnProbeRegistrationBefore", returnRegistrationBefore);
+            clockProof.put("returnProbeRegistrationAfter", returnRegistrationAfter);
+            long fullFirstIssued = issued.batches().getFirst().issuedAtNanos();
+            var costDiagnostic = new LinkedHashMap<String, Object>(Map.of(
+                    "state", "RECORDED_DIAGNOSTIC", "actualProducerEnabled", !methodControl,
+                    "actualPeriodicClockEnabled", !methodControl && !Boolean.getBoolean(WRITE_RETURN_CLOCK_CONTROL_PROPERTY),
+                    "sourceIssue", retainedSourceIssue,
+                    "driverPhaseDrain", Map.of("firstSourceIssuedAtNanos", fullFirstIssued,
+                            "tableAckObservedAtNanos", completedAckAt,
+                            "durationNanos", Math.subtractExact(completedAckAt, fullFirstIssued),
+                            "scope", "FULL_SOURCE_FIRST_ISSUE_TO_OWN_TABLE_ACK_OBSERVATION"),
+                    "endpointRole", "DIAGNOSTIC_PROXY_ONLY_NOT_ACKNOWLEDGED_WRITE_RETURN",
+                    "performanceAcceptanceEligible", false, "samplingCostQualified", false));
+            costDiagnostic.put("resourceReceiptScope", methodControl ? "FULL_PHASE_THROUGH_RESOURCE_FINISH_NO_RETURN_CAPTURE"
+                    : "FULL_PHASE_INCLUDES_POST_ACK_RETURN_CAPTURE_CLOSE_AND_PAGE_READS");
+            clockProof.put("returnMethodCostDiagnostic", Map.copyOf(costDiagnostic));
+        }
+        if (methodControl) {
+            var unavailable = Map.of("state", "UNAVAILABLE", "reason", "RETURN_METHOD_COST_CONTROL_DISABLED_PRODUCER");
+            var disabled = new LinkedHashMap<String, Object>(Map.of("state", "RETURN_METHOD_COST_CONTROL",
+                    "actualProducerEnabled", false, "actualPeriodicClockEnabled", false,
+                    "returnScope", unavailable, "rawReturnReceipt", unavailable,
+                    "p99LatencyNanos", unavailable, "completionSpanNanos", unavailable,
+                    "throughput", unavailable, "commonWindowCertificate", unavailable,
+                    "performanceAcceptanceEligible", false));
+            disabled.put("samplingCostQualified", false);
+            disabled.put("resourceBounds", unavailable);
+            disabled.put("cohortReturnProof", unavailable);
+            clockProof.put("writeReturnDiagnostics", Map.copyOf(disabled));
+        }
         if (writeReturns != null) {
             try {
                 Map<String, Object> returnEvidence = new LinkedHashMap<>(BenchmarkWriteReturnPhaseEvidence.record(

@@ -37,6 +37,9 @@ class PipelineBenchmarkLiveRunIT {
 
     @Test
     void interleavedRealForksWriteEvidenceAndEnforceTheSelectedGate() throws Exception {
+        if (Boolean.getBoolean(RealBenchmarkForkDriver.WRITE_RETURN_METHOD_CONTROL_PROPERTY)) {
+            throw new AssertionError("return method cost control cannot establish a live performance gate");
+        }
         if (Boolean.getBoolean("tapstate.e2e.benchmark-smoke.jvm-gap-diagnostics")) {
             throw new AssertionError("owned JVM diagnostics cannot establish a live performance gate");
         }

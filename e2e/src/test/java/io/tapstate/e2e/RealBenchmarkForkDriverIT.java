@@ -79,6 +79,12 @@ class RealBenchmarkForkDriverIT {
                 BenchmarkMongoDeliveryObserver.CLOCK_REJECTION_EVIDENCE_PROPERTY, BenchmarkMongoDeliveryObserver.NATIVE_OPERATION_WALL_EVIDENCE_PROPERTY,
                 "tapstate.e2e.benchmark-smoke.paced-calibration", "tapstate.e2e.benchmark-smoke.cdc-settling-calibration",
                 "tapstate.e2e.benchmark-smoke.full-cdc-settling-calibration").stream().anyMatch(Boolean::getBoolean);
+        boolean methodControl = RealBenchmarkForkDriver.admitWriteReturnMethodProtocol(
+                System.getProperty(RealBenchmarkForkDriver.WRITE_RETURN_METHOD_CONTROL_PROPERTY), writeReturnDiagnostics,
+                Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot"), returnClockMode,
+                conflictingReturnDiagnostics || jvmDiagnostics || !"stateless".equals(workloadId)
+                        || arm != PipelineBenchmarkComparison.Arm.B || mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN
+                        || forkOutput == null);
         if (writeReturnDiagnostics && (mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN || forkOutput == null
                 || !Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot")
                 || conflictingReturnDiagnostics)) {
@@ -163,7 +169,7 @@ class RealBenchmarkForkDriverIT {
                     : writeReturnDiagnostics
                     ? new RealBenchmarkForkDriver((store, operator, jar) -> new BenchmarkForkEnvironment.OwnedBoot(
                             RealProcessServer.start(store, operator, jar, "127.0.0.1",
-                                    port -> List.of(), List.of("-Dtapstate.benchmark.write-return=true")), null))
+                                    port -> List.of(), List.of("-Dtapstate.benchmark.write-return=" + !methodControl)), null))
                     : dualGc != null
                     ? new RealBenchmarkForkDriver(dualGc::start)
                     : jvmDiagnostics ? new RealBenchmarkForkDriver(BenchmarkJvmDiagnostics::start)
@@ -228,9 +234,18 @@ class RealBenchmarkForkDriverIT {
                         Map<String, Object> capture = (Map<String, Object>) phase.targetClockEvidence()
                                 .get("writeReturnDiagnostics");
                         assertThat(capture).containsEntry("performanceAcceptanceEligible", false)
-                                .containsEntry("samplingCostQualified", false)
-                                .containsEntry("clockSamplingMode", returnClockMode.name());
-                        if (returnClockMode == BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL) {
+                                .containsEntry("samplingCostQualified", false);
+                        if (methodControl) {
+                            assertThat(capture).containsEntry("state", "RETURN_METHOD_COST_CONTROL")
+                                    .containsEntry("actualProducerEnabled", false)
+                                    .containsEntry("actualPeriodicClockEnabled", false);
+                            assertThat(capture).doesNotContainKeys("clockSamples", "pagesBase64", "fullRows", "fixedCohortRows");
+                            assertThat((Map<?, ?>) capture.get("p99LatencyNanos")).isEqualTo(Map.of(
+                                    "state", "UNAVAILABLE", "reason", "RETURN_METHOD_COST_CONTROL_DISABLED_PRODUCER"));
+                        } else {
+                            assertThat(capture).containsEntry("clockSamplingMode", returnClockMode.name());
+                        }
+                        if (!methodControl && returnClockMode == BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL) {
                             assertThat((List<?>) capture.get("clockSamples")).hasSize(2);
                             assertThat((Map<?, ?>) capture.get("p99LatencyNanos")).isEqualTo(Map.of(
                                     "state", "UNAVAILABLE", "reason", "FIRST_FINAL_CLOCK_COST_CONTROL"));
@@ -307,6 +322,7 @@ class RealBenchmarkForkDriverIT {
                 }
                 if (writeReturnDiagnostics) {
                     output.put("writeReturnDiagnostics", true);
+                    output.put("writeReturnMethodControl", methodControl);
                     output.put("writeReturnClockSamplingMode", returnClockMode.name());
                     output.put("writeReturnPerformanceAcceptanceEligible", false);
                     output.put("retainedLegacyMeasurementEndpoint", "OPERATION_DATE_AND_OBSERVER_DIAGNOSTICS");

@@ -4,6 +4,7 @@ import javax.management.Attribute;
 import javax.management.MBeanServerConnection;
 import javax.management.ObjectName;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.function.BooleanSupplier;
 import java.util.function.LongSupplier;
@@ -12,11 +13,16 @@ import java.util.function.LongSupplier;
 final class BenchmarkWriteReturnReader {
     private static final String NAME = "io.tapstate.benchmark:type=WriteReturn";
     private static final int MAX_PAGE_BYTES = 64 * 1024;
+    private static final String ENABLED_PROPERTY = "-Dtapstate.benchmark.write-return";
+    private static final int MAX_RUNTIME_ARGUMENTS = 128;
+    private static final int MAX_RUNTIME_ARGUMENT_LENGTH = 16_384;
+    private static final long MAX_RUNTIME_ARGUMENT_BYTES = 2L * 1024 * 1024 - 4096;
     private final BenchmarkCausalClock.Identity identity;
     private final MBeanServerConnection connection;
     private final BooleanSupplier alive;
     private final LongSupplier clock;
     private final ObjectName name;
+    private final ObjectName runtimeName;
 
     BenchmarkWriteReturnReader(BenchmarkCausalClock.Identity identity, MBeanServerConnection connection,
                               BooleanSupplier alive, LongSupplier clock) {
@@ -24,8 +30,95 @@ final class BenchmarkWriteReturnReader {
         this.connection = java.util.Objects.requireNonNull(connection);
         this.alive = java.util.Objects.requireNonNull(alive);
         this.clock = java.util.Objects.requireNonNull(clock);
-        try { name = new ObjectName(NAME); }
+        try {
+            name = new ObjectName(NAME);
+            runtimeName = new ObjectName(java.lang.management.ManagementFactory.RUNTIME_MXBEAN_NAME);
+        }
         catch (javax.management.MalformedObjectNameException impossible) { throw new AssertionError(impossible); }
+    }
+
+    /** A cold registration check uses the existing connection and never reads or controls the probe. */
+    Map<String, Object> registrationEvidence(boolean expectedEnabled) {
+        try {
+            RuntimeRead before = runtimeRead(expectedEnabled);
+            requireAlive();
+            boolean registered = connection.isRegistered(name);
+            requireAlive();
+            RuntimeRead after = runtimeRead(expectedEnabled);
+            if (!before.arguments().equals(after.arguments())) {
+                throw new AssertionError("return registration runtime arguments changed");
+            }
+            if (Math.subtractExact(after.startedAtNanos(), before.completedAtNanos()) < 0) {
+                throw new AssertionError("return registration root reads are not serial");
+            }
+            if (registered != expectedEnabled) {
+                throw new AssertionError("return registration does not match the explicit runtime flag");
+            }
+            var result = new java.util.LinkedHashMap<String, Object>();
+            result.put("state", expectedEnabled ? "RECORDED_ENABLED" : "RECORDED_DISABLED");
+            result.put("reason", "EXACT_OWNED_RUNTIME_FLAG_AND_REGISTRATION_MATCH");
+            result.put("scope", "EXISTING_OWNED_RESOURCE_JMX_OUTSIDE_MEASUREMENT_WINDOW");
+            result.put("pid", identity.pid()); result.put("jvmStartTimeMillis", identity.jvmStartTimeMillis());
+            result.put("expectedEnabled", expectedEnabled); result.put("actualRegistered", registered);
+            result.put("matchedRuntimeFlag", ENABLED_PROPERTY + "=" + expectedEnabled);
+            result.put("argumentCount", before.arguments().size());
+            result.put("beforeRuntimeRead", bracket(before.startedAtNanos(), before.completedAtNanos()));
+            // These root points enclose the registration call and liveness checks, not its service cost.
+            result.put("registrationRead", bracket(before.completedAtNanos(), after.startedAtNanos()));
+            result.put("afterRuntimeRead", bracket(after.startedAtNanos(), after.completedAtNanos()));
+            result.put("performanceAcceptanceEligible", false); result.put("formalPerformance", false);
+            result.put("costAcceptanceEligible", false); result.put("samplingCostQualified", false);
+            result.put("returnCaptureDelayQualified", false); result.put("phaseAttributionQualified", false);
+            return Map.copyOf(result);
+        } catch (java.io.IOException | javax.management.JMException unavailable) {
+            throw new AssertionError("owned return registration is unavailable", unavailable);
+        }
+    }
+
+    private record RuntimeRead(List<String> arguments, long startedAtNanos, long completedAtNanos) { }
+
+    private RuntimeRead runtimeRead(boolean expectedEnabled) throws java.io.IOException, javax.management.JMException {
+        requireAlive();
+        long before = clock.getAsLong();
+        var attributes = connection.getAttributes(runtimeName, new String[]{"Pid", "StartTime", "InputArguments"});
+        long after = clock.getAsLong();
+        requireAlive();
+        if (Math.subtractExact(after, before) < 0) { throw new AssertionError("return registration root bracket moved backward"); }
+        Map<String, Object> values = new HashMap<>();
+        for (Object entry : attributes) {
+            if (!(entry instanceof Attribute attribute) || values.containsKey(attribute.getName())) {
+                throw new AssertionError("return registration runtime attributes are malformed or duplicate");
+            }
+            values.put(attribute.getName(), attribute.getValue());
+        }
+        if (!values.keySet().equals(java.util.Set.of("Pid", "StartTime", "InputArguments"))) {
+            throw new AssertionError("return registration runtime attributes are incomplete");
+        }
+        var actual = new BenchmarkCausalClock.Identity(number(values, "Pid"), number(values, "StartTime"));
+        if (!identity.equals(actual)) { throw new AssertionError("return registration has another owned runtime identity"); }
+        if (!(values.get("InputArguments") instanceof String[] arguments) || arguments.length > MAX_RUNTIME_ARGUMENTS) {
+            throw new AssertionError("return registration runtime argument roster exceeds its bound");
+        }
+        long bytes = 0;
+        int flags = 0;
+        String expected = ENABLED_PROPERTY + "=" + expectedEnabled;
+        for (String argument : arguments) {
+            if (argument == null || argument.length() > MAX_RUNTIME_ARGUMENT_LENGTH) {
+                throw new AssertionError("return registration runtime argument exceeds its length bound");
+            }
+            bytes = Math.addExact(bytes, 4L * argument.length() + 16);
+            if (bytes > MAX_RUNTIME_ARGUMENT_BYTES) { throw new AssertionError("return registration runtime argument bytes exceed their bound"); }
+            if (argument.equals(ENABLED_PROPERTY) || argument.startsWith(ENABLED_PROPERTY + "=")) {
+                flags++;
+                if (!argument.equals(expected)) { throw new AssertionError("return registration runtime flag contradicts the declared mode"); }
+            }
+        }
+        if (flags != 1) { throw new AssertionError("return registration requires exactly one explicit runtime flag"); }
+        return new RuntimeRead(List.copyOf(java.util.Arrays.asList(arguments.clone())), before, after);
+    }
+
+    private static Map<String, Long> bracket(long before, long after) {
+        return Map.of("startedAtNanos", before, "completedAtNanos", after);
     }
 
     BenchmarkCausalClock.Sample clockSample(long sequence) {

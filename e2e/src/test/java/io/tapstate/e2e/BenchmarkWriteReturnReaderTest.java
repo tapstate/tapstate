@@ -5,7 +5,9 @@ import javax.management.Attribute;
 import javax.management.AttributeList;
 import javax.management.MBeanServerConnection;
 import java.lang.reflect.Proxy;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
 
@@ -14,6 +16,99 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class BenchmarkWriteReturnReaderTest {
     private static final BenchmarkCausalClock.Identity OWNER = new BenchmarkCausalClock.Identity(17, 1_000);
+    private static final String RETURN_FLAG = "-Dtapstate.benchmark.write-return=";
+
+    @Test void registration_proofs_use_only_owned_runtime_attributes_and_actual_bean_presence() {
+        for (boolean enabled : new boolean[]{true, false}) {
+            var fixture = new RegistrationFixture(enabled);
+            var evidence = fixture.reader().registrationEvidence(enabled);
+            assertThat(evidence).containsEntry("state", enabled ? "RECORDED_ENABLED" : "RECORDED_DISABLED")
+                    .containsEntry("pid", 17L).containsEntry("jvmStartTimeMillis", 1_000L)
+                    .containsEntry("expectedEnabled", enabled).containsEntry("actualRegistered", enabled)
+                    .containsEntry("matchedRuntimeFlag", RETURN_FLAG + enabled).containsEntry("argumentCount", 2)
+                    .containsEntry("performanceAcceptanceEligible", false).containsEntry("formalPerformance", false)
+                    .containsEntry("costAcceptanceEligible", false).containsEntry("samplingCostQualified", false)
+                    .containsEntry("returnCaptureDelayQualified", false).containsEntry("phaseAttributionQualified", false);
+            assertThat(evidence.get("beforeRuntimeRead")).isEqualTo(Map.of("startedAtNanos", 101L, "completedAtNanos", 102L));
+            assertThat(evidence.get("registrationRead")).isEqualTo(Map.of("startedAtNanos", 102L, "completedAtNanos", 103L));
+            assertThat(evidence.get("afterRuntimeRead")).isEqualTo(Map.of("startedAtNanos", 103L, "completedAtNanos", 104L));
+            assertThat(fixture.operations).containsExactly("runtime", "registered", "runtime");
+            assertThat(io.tapstate.core.common.JsonWriter.write(evidence)).doesNotContain("controlled_runtime_secret", "InputArguments");
+            assertThatThrownBy(() -> evidence.put("state", "changed")).isInstanceOf(UnsupportedOperationException.class);
+        }
+    }
+
+    @Test void registration_checks_refuse_pid_reuse_missing_attributes_and_changed_argument_rosters() {
+        for (var attributes : List.of(runtimeAttributes(18L, 1_000L, new String[]{RETURN_FLAG + "true"}),
+                runtimeAttributes(17L, 1_001L, new String[]{RETURN_FLAG + "true"}), new AttributeList())) {
+            var fixture = new RegistrationFixture(true); fixture.after = attributes;
+            assertThatThrownBy(() -> fixture.reader().registrationEvidence(true)).isInstanceOf(AssertionError.class);
+        }
+        var duplicate = runtimeAttributes(17L, 1_000L, new String[]{RETURN_FLAG + "true"});
+        duplicate.add(new Attribute("Pid", 17L));
+        var malformed = new RegistrationFixture(true); malformed.before = duplicate;
+        assertThatThrownBy(() -> malformed.reader().registrationEvidence(true))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("duplicate");
+        var changed = new RegistrationFixture(true);
+        changed.after = runtimeAttributes(17L, 1_000L, new String[]{RETURN_FLAG + "true", "-Xmx64m"});
+        assertThatThrownBy(() -> changed.reader().registrationEvidence(true))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("runtime arguments changed");
+    }
+
+    @Test void missing_duplicate_conflicting_or_implicit_runtime_flags_cannot_prove_registration() {
+        for (boolean enabled : new boolean[]{true, false}) {
+            String expected = RETURN_FLAG + enabled;
+            for (String[] arguments : List.of(new String[0], new String[]{expected, expected},
+                    new String[]{expected, RETURN_FLAG + !enabled}, new String[]{RETURN_FLAG + !enabled},
+                    new String[]{"-Dtapstate.benchmark.write-return"}, new String[]{RETURN_FLAG + "TRUE"})) {
+                var fixture = new RegistrationFixture(enabled);
+                fixture.before = runtimeAttributes(17L, 1_000L, arguments);
+                assertThatThrownBy(() -> fixture.reader().registrationEvidence(enabled))
+                        .isInstanceOf(AssertionError.class).hasMessageContaining("runtime flag");
+                assertThat(fixture.operations).containsExactly("runtime");
+            }
+        }
+    }
+
+    @Test void runtime_argument_shape_and_cold_profile_bounds_are_enforced_before_registration_reads() {
+        String[] tooMany = new String[129]; java.util.Arrays.fill(tooMany, "-Xmx64m"); tooMany[0] = RETURN_FLAG + "true";
+        String[] tooLarge = new String[33]; java.util.Arrays.fill(tooLarge, "x".repeat(16_384)); tooLarge[0] = RETURN_FLAG + "true";
+        for (Object arguments : List.of(tooMany, tooLarge, new String[]{RETURN_FLAG + "true", "x".repeat(16_385)},
+                new String[]{RETURN_FLAG + "true", null}, List.of(RETURN_FLAG + "true"))) {
+            var fixture = new RegistrationFixture(true); fixture.before = runtimeAttributes(17L, 1_000L, arguments);
+            assertThatThrownBy(() -> fixture.reader().registrationEvidence(true))
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("argument");
+            assertThat(fixture.operations).containsExactly("runtime");
+        }
+    }
+
+    @Test void wrong_actual_bean_presence_is_refused_for_both_explicit_modes() {
+        for (boolean enabled : new boolean[]{true, false}) {
+            var fixture = new RegistrationFixture(enabled); fixture.registered = !enabled;
+            assertThatThrownBy(() -> fixture.reader().registrationEvidence(enabled))
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("registration does not match");
+            assertThat(fixture.operations).containsExactly("runtime", "registered", "runtime");
+        }
+    }
+
+    @Test void unavailable_runtime_or_registration_reads_never_become_disabled_evidence() {
+        for (String operation : List.of("runtime", "registered")) {
+            var fixture = new RegistrationFixture(false); fixture.failingOperation = operation;
+            assertThatThrownBy(() -> fixture.reader().registrationEvidence(false))
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("registration is unavailable")
+                    .hasCause(fixture.readFailure);
+        }
+        var dead = new RegistrationFixture(false); dead.alive = () -> false;
+        assertThatThrownBy(() -> dead.reader().registrationEvidence(false))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("exited");
+        assertThat(dead.operations).isEmpty();
+        for (long lastAliveCheck : List.of(3L, 5L)) {
+            var exits = new RegistrationFixture(false); var checks = new AtomicLong();
+            exits.alive = () -> checks.incrementAndGet() <= lastAliveCheck;
+            assertThatThrownBy(() -> exits.reader().registrationEvidence(false))
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("exited");
+        }
+    }
 
     @Test void the_getter_point_is_read_during_its_actual_root_request() {
         AtomicLong root = new AtomicLong(100);
@@ -108,6 +203,49 @@ class BenchmarkWriteReturnReaderTest {
         var attributes = new AttributeList();
         attributes.add(new Attribute("Pid", pid)); attributes.add(new Attribute("JvmStartTimeMillis", start));
         attributes.add(new Attribute("NanoTime", point)); return attributes;
+    }
+
+    private static AttributeList runtimeAttributes(Object pid, Object start, Object arguments) {
+        var attributes = new AttributeList();
+        attributes.add(new Attribute("Pid", pid)); attributes.add(new Attribute("StartTime", start));
+        attributes.add(new Attribute("InputArguments", arguments)); return attributes;
+    }
+
+    private static final class RegistrationFixture {
+        AttributeList before, after;
+        boolean registered;
+        BooleanSupplier alive = () -> true;
+        final List<String> operations = new ArrayList<>();
+        final java.io.IOException readFailure = new java.io.IOException("controlled registration read failure");
+        String failingOperation;
+        RegistrationFixture(boolean enabled) {
+            before = runtimeAttributes(17L, 1_000L, new String[]{RETURN_FLAG + enabled, "-Dpassword=controlled_runtime_secret"});
+            after = before; registered = enabled;
+        }
+        BenchmarkWriteReturnReader reader() {
+            var reads = new AtomicLong();
+            var connection = (MBeanServerConnection) Proxy.newProxyInstance(
+                    BenchmarkWriteReturnReaderTest.class.getClassLoader(), new Class<?>[]{MBeanServerConnection.class},
+                    (proxy, method, arguments) -> {
+                        if (method.getName().equals("getAttributes")) {
+                            assertThat(arguments[0].toString()).isEqualTo("java.lang:type=Runtime");
+                            assertThat((String[]) arguments[1]).containsExactly("Pid", "StartTime", "InputArguments");
+                            operations.add("runtime");
+                            if ("runtime".equals(failingOperation)) { throw readFailure; }
+                            long ordinal = reads.incrementAndGet();
+                            assertThat(ordinal).isBetween(1L, 2L);
+                            return ordinal == 1 ? before : after;
+                        }
+                        if (method.getName().equals("isRegistered")) {
+                            assertThat(arguments[0].toString()).isEqualTo("io.tapstate.benchmark:type=WriteReturn");
+                            operations.add("registered");
+                            if ("registered".equals(failingOperation)) { throw readFailure; }
+                            return registered;
+                        }
+                        throw new AssertionError("registration proof called a probe getter or control");
+                    });
+            return new BenchmarkWriteReturnReader(OWNER, connection, alive, new AtomicLong(100)::incrementAndGet);
+        }
     }
     private static BenchmarkWriteReturnReader reader(AttributeList attributes, Object result,
                                                      BooleanSupplier alive, AtomicLong root) {
