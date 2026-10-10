@@ -194,7 +194,8 @@ class JoinAdvancesTheDurableFrontierTest {
                 vertex -> outbound.merge(vertex, 1, Integer::sum) - 1,
                 JoinStoresBinding.onTheCluster(), DimensionRowDisplacedAlert.NONE,
                 new JoinFrontier(AXES, alias -> List.of(List.of(
-                        alias.equals("o") ? ORDERS : CUSTOMERS))));
+                        alias.equals("o") ? ORDERS : CUSTOMERS))),
+                new NodeWidth("joined", 4, 1, null));
         if (orders.size() > 1) {
             @SuppressWarnings("unchecked")
             com.hazelcast.jet.core.Partitioner<Object> partitioner =
