@@ -17,13 +17,20 @@ import java.util.Map;
  */
 record RemoteProcessor(Integer index, Integer localIndex, String memberUuid, String nodeId, Long backlog,
         Map<String, Long> frontierGaps, Map<String, Long> frontierStalledMillis, Map<String, Long> queuedByStream,
-        Map<String, Long> inFlightByTable) {
+        Map<String, Long> inFlightByTable, RemoteProcessorContext context) {
 
     RemoteProcessor {
         frontierGaps = frontierGaps == null ? Map.of() : Map.copyOf(frontierGaps);
         frontierStalledMillis = frontierStalledMillis == null ? Map.of() : Map.copyOf(frontierStalledMillis);
         queuedByStream = queuedByStream == null ? Map.of() : Map.copyOf(queuedByStream);
         inFlightByTable = inFlightByTable == null ? Map.of() : Map.copyOf(inFlightByTable);
+    }
+
+    RemoteProcessor(Integer index, Integer localIndex, String memberUuid, String nodeId, Long backlog,
+            Map<String, Long> frontierGaps, Map<String, Long> frontierStalledMillis, Map<String, Long> queuedByStream,
+            Map<String, Long> inFlightByTable) {
+        this(index, localIndex, memberUuid, nodeId, backlog, frontierGaps, frontierStalledMillis, queuedByStream,
+                inFlightByTable, null);
     }
 
     /** A processor the server said nothing about by stream or table. */

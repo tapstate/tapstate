@@ -1570,6 +1570,26 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     }
 
     @Test
+    void aNewExecutionCannotInheritAnOlderLocalCaptureFailure() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipeline("p", "orders_src"));
+        CaptureHealth health = new CaptureHealth();
+        CaptureStarter starter = (spec, handoff) -> new CaptureRun(
+                Optional.empty(), false, 0L, Optional.empty(), Optional.empty(), health);
+        var coordinator = new StoreBackedPipelineCaptureCoordinator(artifactsOnly(artifacts), starter,
+                new SrsCoordinator(new InMemorySrsMetaStore()), new SnapshotBuffer());
+        coordinator.startCapture("p");
+        RuntimeException oldFailure = new RuntimeException("old reader failed");
+        health.fail(oldFailure);
+        assertThat(coordinator.captureFailure("p")).containsSame(oldFailure);
+        var newExecution = new io.tapstate.spi.store.WorkloadClaimFence(
+                new io.tapstate.spi.store.WorkloadClaimKey("east", io.tapstate.spi.store.WorkloadClaimType.PIPELINE_ACTUATION, "p"),
+                new io.tapstate.spi.store.WorkloadOwner("node", "boot"), 2, 3, 1, 1);
+        assertThat(coordinator.captureFailure("p", newExecution)).isEmpty();
+    }
+
+    @Test
     void captureFailureSurfacesAFailedRunPastAHealthyEarlierRun() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(cdcSource("src_a", "orders", null));
@@ -1839,6 +1859,28 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         coordinator.stopCapture("p", false);
 
         assertThat(coordinator.loadDelivered("p")).isTrue();
+    }
+
+    @Test
+    void aLegacyUnprofiledFenceDoesNotAcquireSourceProofStartupPrerequisites() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipeline("p", "orders_src"));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        java.util.concurrent.atomic.AtomicReference<CaptureRunSpec> started = new java.util.concurrent.atomic.AtomicReference<>();
+        CaptureStarter starter = (spec, handoff) -> {
+            started.set(spec);
+            return new CaptureRun(Optional.empty(), false, 0L, Optional.empty(), Optional.empty(), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(store, starter,
+                new SrsCoordinator(store.meta()), new SnapshotBuffer());
+        var legacy = new io.tapstate.spi.store.WorkloadClaimFence(new io.tapstate.spi.store.WorkloadClaimKey("east",
+                io.tapstate.spi.store.WorkloadClaimType.PIPELINE_ACTUATION, "p"),
+                new io.tapstate.spi.store.WorkloadOwner("node", "boot"), 1, 1, 1);
+        coordinator.startCapture("p", artifacts, legacy);
+        assertThat(started.get().resumeWitness()).isNull();
+        assertThat(coordinator.isCapturing("p")).isTrue();
+        coordinator.stopCapture("p", false);
     }
 
     // ---- fixtures --------------------------------------------------------------------------------

@@ -47,6 +47,10 @@ final class ExecutionProfileFactory {
     }
 
     ExecutionProfile create() {
+        return create(null, io.tapstate.runtime.srs.SnapshotBuffer.DEFAULT_CAPACITY);
+    }
+
+    ExecutionProfile create(com.hazelcast.config.Config actual, Integer snapshotCapacity) {
         long heap = maxHeap.getAsLong();
         if (properties.getHeapTier() == null || properties.getHeapTier().isBlank()
                 || properties.getMinimumHeapBytes() < 1 || heap < properties.getMinimumHeapBytes()) {
@@ -64,11 +68,19 @@ final class ExecutionProfileFactory {
         inputs.put("minimumHeapBytes", String.valueOf(properties.getMinimumHeapBytes()));
         inputs.put("maxHeapBytes", String.valueOf(heap));
         Integer configuredThreads = hazelcast.getJet().getCooperativeThreadCount();
-        int threads = configuredThreads == null ? new JetConfig().getCooperativeThreadCount() : configuredThreads;
+        int threads = actual == null
+                ? configuredThreads == null ? new JetConfig().getCooperativeThreadCount() : configuredThreads
+                : actual.getJetConfig().getCooperativeThreadCount();
         if (threads < 1) {
             throw invalid("cooperative thread count must be positive", null);
         }
         inputs.put("cooperativeThreads", String.valueOf(threads));
+        inputs.put("defaultEdgeQueueCapacity", String.valueOf(actual == null
+                ? new JetConfig().getDefaultEdgeConfig().getQueueSize()
+                : actual.getJetConfig().getDefaultEdgeConfig().getQueueSize()));
+        inputs.put("changeRingCapacity", String.valueOf(actual == null ? HazelcastConfiguration.SRS_RING_CAPACITY
+                : actual.findRingbufferConfig("srs.profile-snapshot").getCapacity()));
+        inputs.put("snapshotHandoffCapacity", snapshotCapacity == null ? "absent" : snapshotCapacity.toString());
         inputs.put("haProfile", cluster.getProfile().name());
         inputs.put("bootstrapMinMembers", String.valueOf(cluster.getBootstrapMinMembers()));
         inputs.put("maxLocalParallelism", String.valueOf(budget.maxLocalParallelism()));

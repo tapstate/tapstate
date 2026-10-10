@@ -12,7 +12,8 @@ import java.util.Set;
 public final class PinnedStandIns {
 
     private static final Set<String> TYPES =
-            Set.of("ExpectNothingP", "NoopP", TotalOne.BoundsStandIn.class.getSimpleName());
+            Set.of("ExpectNothingP", "NoopP", TotalOne.BoundsStandIn.class.getSimpleName(),
+                    NativeExecutionStartup.STAND_IN_PROCESSOR_TYPE);
 
     private PinnedStandIns() {
     }

@@ -77,6 +77,7 @@ public final class JoinDag {
         Vertex vertex = width.sized(dag.newVertex(nodeId, width.metaSupplier(nodeId, new JoinVertexSupplier(
                 plan, pipelineId, nodeId, factKeyColumns, dimensionRowKeyColumns,
                 Map.copyOf(sourceByOrdinal), stores, displaced, false))));
+        width.buffered(vertex, JoinBufferBounds.updates(sourceByOrdinal.size() - 1));
         sourceByOrdinal.forEach((edge, source) -> {
             List<Vertex> producers = sourceUpstream.apply(source);
             if (producers == null || producers.isEmpty()) {
@@ -91,6 +92,7 @@ public final class JoinDag {
         Vertex projection = width.sized(dag.newVertex(projecting, width.metaSupplier(projecting,
                 new JoinVertexSupplier(plan, pipelineId, nodeId, factKeyColumns, Map.of(), Map.of(), stores,
                         displaced, true))));
+        width.buffered(projection, JoinBufferBounds.projection(sourceByOrdinal.size() - 1));
         dag.edge(width.into(Edge.from(vertex, nextOutbound.applyAsInt(vertex)).to(projection), projecting,
                 (FunctionEx<Object, Object>) item -> ((JoinUpdate) item).factKey()));
         return projection;

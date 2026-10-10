@@ -803,11 +803,13 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         Long revision = null;
         Long profileGeneration = null;
         String profileHash = null;
+        RemoteRecovery.Cluster recovery = null;
         if (JsonReader.parse(body) instanceof Map<?, ?> map) {
             clusterId = stringOrNull(map.get("clusterId"));
             revision = map.get("topologyRevision") instanceof Number n ? n.longValue() : null;
             profileGeneration = map.get("profileGeneration") instanceof Number n ? n.longValue() : null;
             profileHash = stringOrNull(map.get("profileHash"));
+            recovery = RecoveryWire.cluster(map.get("recovery"));
             if (map.get("members") instanceof List<?> list) {
                 for (Object o : list) {
                     if (o instanceof Map<?, ?> m) {
@@ -835,7 +837,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             pipelines.addAll(pipelines(map));
         }
         return new ClusterMembersOutcome.Listed(
-                clusterId, revision, members, pipelines, profileGeneration, profileHash);
+                clusterId, revision, members, pipelines, profileGeneration, profileHash, recovery);
     }
 
     /** The pipeline half of a topology body; a field the server did not send stays null. */
@@ -883,7 +885,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                     stringOrNull(m.get("measuredAt")),
                     measuredFrom,
                     awaiting,
-                    vertices));
+                    vertices,
+                    RecoveryWire.pipeline(m.get("recovery"))));
         }
         return pipelines;
     }
@@ -895,7 +898,15 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                 stringOrNull(claim.get("ownerBootId")),
                 claim.get("claimGeneration") instanceof Number n ? n.longValue() : null,
                 claim.get("executionGeneration") instanceof Number n ? n.longValue() : null,
-                claim.get("leased") instanceof Boolean b ? b : null);
+                RecoveryWire.number(claim, "topologyRevision"),
+                claim.get("leased") instanceof Boolean b ? b : null,
+                RecoveryWire.text(claim, "leaseUntil"), RecoveryWire.number(claim, "leaseRemainingMillis"),
+                RecoveryWire.number(claim, "profileGeneration"), RecoveryWire.number(claim, "contextExecutionGeneration"),
+                RecoveryWire.number(claim, "executionClaimGeneration"), RecoveryWire.text(claim, "executionIncarnation"),
+                RecoveryWire.text(claim, "executionRevision"), RecoveryWire.number(claim, "executionTopologyRevision"),
+                RecoveryWire.number(claim, "executionProfileGeneration"), RecoveryWire.text(claim, "executionProfileHash"),
+                RecoveryWire.members(claim.get("executionMembers")), RecoveryWire.number(claim, "failureClaimGeneration"),
+                RecoveryWire.bool(claim, "failureAfterMemberLoss"), RecoveryWire.bool(claim, "executionContextCurrent"));
     }
 
     /** A map of names to whole numbers as the server sent it, keeping only the entries that are both. */
@@ -925,7 +936,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                             longsByName(p.get("frontierGaps")),
                             longsByName(p.get("frontierStalledMillis")),
                             longsByName(p.get("queuedByStream")),
-                            longsByName(p.get("inFlightByTable"))));
+                            longsByName(p.get("inFlightByTable")), RecoveryWire.processorContext(p.get("context"))));
                 }
             }
         }
@@ -1388,9 +1399,15 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         if (map.get("plan") != null && plan == null || awaitingRebalance == null) {
             return null;
         }
+        RemoteRecovery.Pipeline recovery;
+        try {
+            recovery = RecoveryWire.pipeline(map.get("recovery"));
+        } catch (IllegalArgumentException | ArithmeticException malformed) {
+            return null;
+        }
         return new ExplainOutcome.Found(pipelineId, state, kind, message, (String) rawObservedAt,
                 rawAge == null ? null : ((Number) rawAge).longValue(), freshness,
-                evidence, cannotSay, next, pending, plan, awaitingRebalance);
+                evidence, cannotSay, next, pending, plan, awaitingRebalance, recovery);
     }
 
     private static ExplainOutcome.Plan explanationPlan(Object raw) {
@@ -1635,9 +1652,14 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             // it and on an observation stored before the time was recorded; both read back null, which
             // means "nobody can say" and is never replaced by a subtraction against this machine's clock.
             Long ageMillis = m.get("observedAgeMillis") instanceof Number age ? age.longValue() : null;
+            RemoteRecovery.Pipeline recovery = RecoveryWire.pipeline(m.get("recovery"));
+            ExplainOutcome.Plan plan = explanationPlan(m.get("plan"));
+            List<String> awaiting = m.get("awaitingRebalance") == null ? List.of() : strings(m.get("awaitingRebalance"));
+            if (m.get("plan") != null && plan == null || awaiting == null) { return null; }
+            String observedAt = stringOrNull(m.get("observedAt"));
             Object rawFailure = m.get("failure");
             if (rawFailure == null) {
-                return new StatusOutcome.Found(id, state, null, null, ageMillis);
+                return new StatusOutcome.Found(id, state, null, null, ageMillis, recovery, observedAt, Map.of(), plan, awaiting);
             }
             if (!(rawFailure instanceof Map<?, ?> failure) || !(failure.get("code") instanceof String code)) {
                 return null;
@@ -1645,7 +1667,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             // The message is the server's rendering of that code; when it is absent the code still names
             // the diagnosis, so it stands in rather than the whole read degrading to unreachable.
             String message = failure.get("message") instanceof String rendered ? rendered : code;
-            return new StatusOutcome.Found(id, state, code, message, ageMillis);
+            Map<String, Object> params = failure.get("params") == null ? Map.of() : RecoveryWire.objectMap(failure.get("params"));
+            return new StatusOutcome.Found(id, state, code, message, ageMillis, recovery, observedAt, params, plan, awaiting);
         }
         return null;
     }

@@ -17,6 +17,7 @@ import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
+import io.tapstate.spi.store.ClusterExecutionMember;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.core.common.TapstateException;
 import org.bson.Document;
@@ -202,6 +203,7 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
                 .append("contextExecutionGeneration", nextGeneration)
                 .append("executionClaimGeneration", "$claimGeneration")
                 .append("executionNodeIds", new Document("$literal", executionNodeIds.stream().sorted().toList()))
+                .append("executionMembers", new Document("$literal", List.of()))
                 .append("executionIncarnation", null).append("executionRevision", null)
                 .append("failureClaimGeneration", 0L)
                 .append("failureAfterMemberLoss", false)
@@ -388,7 +390,26 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
                 numberOrZero(document, "profileGeneration"),
                 MongoClusterProfileStore.executionProfile(document.get("executionProfile", Document.class)),
                 document.get("executionTopologyRevision") instanceof Number revision ? revision.longValue() : null,
-                document.getString("executionIncarnation"), document.getString("executionRevision"));
+                document.getString("executionIncarnation"), document.getString("executionRevision"), executionMembers(document));
+    }
+
+    private static Map<String, ClusterExecutionMember> executionMembers(Document document) {
+        try {
+            Map<String, ClusterExecutionMember> members = new LinkedHashMap<>();
+            for (Document member : document.getList("executionMembers", Document.class, List.of())) {
+                ClusterExecutionMember identity = new ClusterExecutionMember(member.getString("nodeId"), member.getString("bootId"), member.getString("memberUuid"));
+                if (members.put(identity.nodeId(), identity) != null) {
+                    throw new IllegalArgumentException("duplicate original execution member");
+                }
+            }
+            if (!members.isEmpty() && !members.keySet().equals(Set.copyOf(document.getList("executionNodeIds", String.class, List.of())))) {
+                throw new IllegalArgumentException("original execution member cohort is incomplete");
+            }
+            return Map.copyOf(members);
+        } catch (RuntimeException invalid) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", String.valueOf(document.get("_id")), "field", "executionMembers"), invalid);
+        }
     }
 
     private static WorkloadClaim read(Document document) {

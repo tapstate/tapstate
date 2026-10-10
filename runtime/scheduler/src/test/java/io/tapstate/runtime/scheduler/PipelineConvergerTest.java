@@ -453,6 +453,20 @@ class PipelineConvergerTest {
                 .containsExactly("start:p1");
     }
 
+    @Test
+    void aSuccessfullyCompletedNativeRunIsRecordedAndNeverAutomaticallyReplayed() {
+        converge(RUNNING);
+        actuator.reset();
+        actuator.completedSuccessfully();
+
+        converger.converge("p1");
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(COMPLETED));
+        assertThat(actuator.calls()).containsExactly("stop:p1:keep");
+        actuator.reset();
+        converger.converge("p1");
+        assertThat(actuator.calls()).isEmpty();
+    }
+
     /**
      * The restart road reaches the same refusal as the CAS road, and it used to escape here. A store
      * that is unreachable when a process comes up is exactly the condition this refusal exists for --

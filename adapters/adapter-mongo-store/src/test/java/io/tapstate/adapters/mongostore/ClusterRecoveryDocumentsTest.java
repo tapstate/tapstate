@@ -5,18 +5,25 @@ import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.ClusterCapacityDemand;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.DesiredStateFingerprint;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.spi.store.ClusterCapacityReservation;
 import io.tapstate.spi.store.ClusterExecutionProfile;
 import io.tapstate.spi.store.ClusterRecoveryCause;
 import io.tapstate.spi.store.ClusterRecoveryDiagnostic;
 import io.tapstate.spi.store.ClusterRecoveryEvent;
-import io.tapstate.spi.store.ClusterRecoveryIntentFingerprint;
+import io.tapstate.spi.store.CaptureResumeWitness;
+import io.tapstate.spi.store.ConsumerProgressKind;
+import io.tapstate.spi.store.SrsConsumerId;
+import io.tapstate.core.model.ReadMode;
 import io.tapstate.spi.store.ClusterRecoveryItem;
 import io.tapstate.spi.store.ClusterRecoveryKey;
 import io.tapstate.spi.store.ClusterRecoveryPermit;
 import io.tapstate.spi.store.ClusterRecoveryPosition;
 import io.tapstate.spi.store.ClusterRecoveryStartupReceipt;
+import io.tapstate.spi.store.ClusterRecoveryMutation;
+import io.tapstate.spi.store.ClusterRecoveryFailureNote;
+import io.tapstate.spi.store.ClusterRecoveryStore;
 import io.tapstate.spi.store.ClusterRecoverySuccessor;
 import io.tapstate.spi.store.ExecutionProfile;
 import io.tapstate.spi.store.IoError;
@@ -30,6 +37,7 @@ import org.junit.jupiter.api.Test;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
+import java.util.List;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -54,10 +62,10 @@ class ClusterRecoveryDocumentsTest {
         ClusterRecoveryItem permitted = queued.permitted(new ClusterRecoveryPermit("permit-a", RECOVERY, NOW,
                 NOW.plusSeconds(30), DEMAND, 0), NOW);
         ClusterRecoveryItem advanced = permitted.advanced(new ClusterRecoverySuccessor(PIPELINE, PROFILE,
-                Set.of("node.alpha"), NOW, null, null, null), NOW);
+                Set.of("node.alpha"), Set.of("crm"), NOW, null, null, Map.of(), null), NOW);
         ClusterRecoveryItem submitted = advanced.submitted("job-42", NOW);
         ClusterRecoveryItem initialized = submitted.initialized(new ClusterRecoveryStartupReceipt(PIPELINE,
-                "job-42", NOW, POSITIONS, NOW, false), NOW);
+                "job-42", NOW, Map.of("crm", witness()), POSITIONS, POSITIONS, NOW, false), NOW);
         for (ClusterRecoveryItem item : new ClusterRecoveryItem[] {queued, permitted, advanced, submitted,
                 initialized, initialized.recovered(NOW)}) {
             Document bson = Document.parse(ClusterRecoveryDocuments.item(item).toJson());
@@ -124,8 +132,80 @@ class ClusterRecoveryDocumentsTest {
         Document legacyFilter = MongoClusterCapacityStore.intentFilter(legacy);
         assertThat(legacyFilter.get("reassemble")).isEqualTo(new Document("$exists", false));
         assertThat(legacyFilter.get("purgeState")).isEqualTo(new Document("$exists", false));
-        assertThat(ClusterRecoveryIntentFingerprint.of("inc-a", MongoDesiredStore.toDesired(legacy)))
-                .isEqualTo(ClusterRecoveryIntentFingerprint.of("inc-a", new DesiredState("orders", PipelineState.RUNNING, "r")));
+        assertThat(DesiredStateFingerprint.of(MongoDesiredStore.toDesired(legacy)))
+                .isEqualTo(DesiredStateFingerprint.of(new DesiredState("orders", PipelineState.RUNNING, "r")));
+    }
+
+    @Test
+    void runtimeAndActualStoreUseOneCompleteIntentFingerprint() {
+        DesiredState desired = new DesiredState("orders", PipelineState.RUNNING, "revision", true, "assembly", true, 8L);
+        assertThat(MongoClusterCapacityStore.intentFingerprint(KEY, MongoDesiredStore.toDocument(desired)))
+                .isEqualTo(DesiredStateFingerprint.of(desired));
+    }
+
+    @Test
+    void legacyExecutionMustHaveItsRealMigratedIncarnationAndCannotBorrowTheTargetRevision() {
+        ClusterRecoveryEvent legacy = new ClusterRecoveryEvent(KEY, ClusterRecoveryCause.FULL_CLUSTER_RESTART,
+                41, null, null, null, true, PROFILE, 2, "intent", POSITIONS);
+        Document source = new Document("executionGeneration", 41L);
+        assertThat(MongoClusterRecoveryStore.originalExecutionCheck(legacy, source)).isEqualTo(ClusterRecoveryMutation.STALE_EXECUTION);
+        source.append("executionIncarnation", "inc-a");
+        assertThat(MongoClusterRecoveryStore.originalExecutionCheck(legacy, source)).isEqualTo(ClusterRecoveryMutation.APPLIED);
+        source.append("executionIncarnation", "recreated");
+        assertThat(MongoClusterRecoveryStore.originalExecutionCheck(legacy, source)).isEqualTo(ClusterRecoveryMutation.STALE_EXECUTION);
+        source.append("executionIncarnation", "inc-a").append("executionRevision", "current-target-revision");
+        assertThat(MongoClusterRecoveryStore.originalExecutionCheck(legacy, source)).isEqualTo(ClusterRecoveryMutation.STALE_EXECUTION);
+    }
+
+    @Test
+    void historicalStartupCannotCompleteAnExecutionWithACurrentFailureVerdict() {
+        ClusterRecoverySuccessor successor = new ClusterRecoverySuccessor(PIPELINE, PROFILE, Set.of("node.alpha"),
+                Set.of("crm"), NOW, "job-42", NOW, POSITIONS, null);
+        ClusterRecoveryStartupReceipt receipt = new ClusterRecoveryStartupReceipt(PIPELINE, "job-42", NOW,
+                Map.of("crm", witness()), POSITIONS, POSITIONS, NOW, false);
+        Document source = new Document("executionGeneration", 42L).append("contextExecutionGeneration", 42L);
+        Document actual = new Document("stateJson", "RUNNING");
+        assertThat(MongoClusterRecoveryStore.startupExecutionCheck(successor, source, actual, receipt))
+                .isEqualTo(ClusterRecoveryMutation.APPLIED);
+        source.append("failureClaimGeneration", 8L);
+        assertThat(MongoClusterRecoveryStore.startupExecutionCheck(successor, source, actual, receipt))
+                .isEqualTo(ClusterRecoveryMutation.STALE_EXECUTION);
+        source.append("failureClaimGeneration", 0L);
+        actual.append("stateJson", "FAILED");
+        assertThat(MongoClusterRecoveryStore.startupExecutionCheck(successor, source, actual, receipt))
+                .isEqualTo(ClusterRecoveryMutation.STALE_EXECUTION);
+        actual.append("stateJson", "COMPLETED");
+        assertThat(MongoClusterRecoveryStore.startupExecutionCheck(successor, source, actual, receipt))
+                .isEqualTo(ClusterRecoveryMutation.MISSING_STARTUP_RECEIPT);
+    }
+
+    @Test
+    void missingRecordedSourceRequirementsCannotBecomeAKnownZeroSourcePlan() {
+        ClusterRecoveryItem allocated = queued(POSITIONS)
+                .permitted(new ClusterRecoveryPermit("permit-a", RECOVERY, NOW, NOW.plusSeconds(30), DEMAND, 0), NOW)
+                .advanced(new ClusterRecoverySuccessor(PIPELINE, PROFILE, Set.of("node.alpha"), Set.of("crm"),
+                        NOW, null, null, Map.of(), null), NOW);
+        Document missing = ClusterRecoveryDocuments.item(allocated);
+        missing.get("successor", Document.class).remove("requiredSourceIds");
+        assertUnreadable(missing);
+    }
+
+    @Test
+    void aPendingFirstFailureRoundTripsWithoutReleasingItsPermitOrLosingOriginalArguments() {
+        ClusterRecoveryItem allocated = queued(POSITIONS)
+                .permitted(new ClusterRecoveryPermit("permit-a", RECOVERY, NOW, NOW.plusSeconds(30), DEMAND, 0), NOW)
+                .advanced(new ClusterRecoverySuccessor(PIPELINE, PROFILE, Set.of("node.alpha"), Set.of("crm"),
+                        NOW, null, null, Map.of(), null), NOW);
+        var diagnostic = new ClusterRecoveryDiagnostic(ClusterRecoveryDiagnostic.Reason.SOURCE_POSITION_REJECTED,
+                "connector.mongo.position-expired", Map.of("capture", "capture-a", "position", "resume:73"), POSITIONS,
+                "Restore the retained source position before starting explicitly");
+        ClusterRecoveryItem pending = allocated.failureNoted(new ClusterRecoveryFailureNote(PIPELINE,
+                ClusterRecoveryStore.FailureStage.SOURCE_POSITION_REJECTION, diagnostic, NOW), NOW);
+        ClusterRecoveryItem restored = ClusterRecoveryDocuments.item(Document.parse(ClusterRecoveryDocuments.item(pending).toJson()));
+        assertThat(restored).isEqualTo(pending);
+        assertThat(restored.permit()).isEqualTo(allocated.permit());
+        assertThat(restored.successor().failureNote().diagnostic().params()).containsEntry("position", "resume:73");
+        assertThat(restored.attempt()).isEqualTo(1);
     }
 
     private static void assertUnreadable(Document document) {
@@ -136,6 +216,13 @@ class ClusterRecoveryDocumentsTest {
     private static ClusterRecoveryItem queued(Map<String, ClusterRecoveryPosition> positions) {
         return ClusterRecoveryItem.enqueued(new ClusterRecoveryEvent(KEY, ClusterRecoveryCause.MEMBER_LOSS, 41,
                 "artifact-revision", 1L, PROFILE, PROFILE, 2, "intent", positions), 1, NOW, 3);
+    }
+
+    private static CaptureResumeWitness witness() {
+        ChainPosition floor = POSITIONS.get("crm").position();
+        return new CaptureResumeWitness("crm", "mongo", "capture-a", SrsConsumerId.of("orders", "crm").value(),
+                ReadMode.CDC_ONLY, true, List.of("orders"), true, 9, floor, true, true, List.of(), null, 0,
+                ConsumerProgressKind.SRS, floor, Map.of("orders", floor));
     }
 
     private static WorkloadClaimFence fence(WorkloadClaimType type, String resource, long execution, long topology) {

@@ -9,6 +9,7 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.model.TransformBody;
 import java.util.ArrayList;
+import java.util.AbstractList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -27,6 +28,40 @@ import org.junit.jupiter.api.Test;
  * whenever a parent's key changes; both run green over any data that never exercises them.
  */
 class UnwindPortTest {
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"insert", "update"})
+    void fanOutDoesNotReadElementsBeyondTheConsumedPrefix(String operation) {
+        CountingElements before = new CountingElements(10_000);
+        CountingElements after = new CountingElements(operation.equals("update") ? 9_999 : 10_000);
+        Envelope input = operation.equals("update") ? update(row(before), row(after)) : insert(row(after));
+
+        List<Envelope> output = port(unwind("item_no", false, null)).transform(input);
+
+        assertThat(output).hasSize(10_000);
+        assertThat(before.reads + after.reads).as("backpressure has consumed no output yet").isZero();
+        Envelope first = output.getFirst();
+        assertThat(before.reads + after.reads).as("only the first output has been requested").isLessThanOrEqualTo(2);
+        assertThat(first.op()).isEqualTo(operation.equals("update") ? Op.DELETE : Op.INSERT);
+        assertThat((first.after() == null ? first.before() : first.after()).get("item_no"))
+                .isEqualTo(operation.equals("update") ? 9_999L : 0L);
+        assertThat(itemsOf(output)).hasSize(10_000).endsWith(operation.equals("update") ? 9_998L : 9_999L);
+    }
+
+    private static final class CountingElements extends AbstractList<Object> {
+        private final int count;
+        private int reads;
+
+        private CountingElements(int count) { this.count = count; }
+
+        @Override public int size() { return count; }
+
+        @Override public Object get(int index) {
+            java.util.Objects.checkIndex(index, count);
+            reads++;
+            return (long) index;
+        }
+    }
 
     /** The rows arriving here are keyed on the parent's own key; the expansion adds to it. */
     private static final List<String> PARENT_KEY = List.of("o_id");

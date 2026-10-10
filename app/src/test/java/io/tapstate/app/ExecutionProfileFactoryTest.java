@@ -60,6 +60,24 @@ class ExecutionProfileFactoryTest {
         assertThat(profile.attributes().values()).allSatisfy(value -> assertThat(value).doesNotContain("${"));
     }
 
+    @Test
+    void actualRuntimeBuffersParticipateInCompatibilityAndMissingHandoffIsExplicit() {
+        var configuration = new com.hazelcast.config.Config();
+        configuration.getJetConfig().setCooperativeThreadCount(3);
+        configuration.getJetConfig().getDefaultEdgeConfig().setQueueSize(256);
+        configuration.addRingBufferConfig(new com.hazelcast.config.RingbufferConfig("srs.*").setCapacity(2048));
+        var factory = factory(new HazelcastProperties(), 1_073_741_824L, ABI);
+        var first = factory.create(configuration, 1000);
+        assertThat(first.attributes()).containsEntry("cooperativeThreads", "3")
+                .containsEntry("defaultEdgeQueueCapacity", "256").containsEntry("changeRingCapacity", "2048")
+                .containsEntry("snapshotHandoffCapacity", "1000");
+        configuration.getJetConfig().getDefaultEdgeConfig().setQueueSize(512);
+        assertThat(factory.create(configuration, 1000).hash()).isNotEqualTo(first.hash());
+        configuration.getJetConfig().getDefaultEdgeConfig().setQueueSize(256);
+        assertThat(factory.create(configuration, 2000).hash()).isNotEqualTo(first.hash());
+        assertThat(factory.create(configuration, null).attributes()).containsEntry("snapshotHandoffCapacity", "absent");
+    }
+
     private static ExecutionProfileFactory factory(HazelcastProperties hz, long heap, String abi) {
         return new ExecutionProfileFactory(hz, new ClusterProperties(), new ExecutionProfileProperties(),
                 ParallelismBudget.DEFAULTS, new ClusterCapacityProperties().limits(), () -> heap,

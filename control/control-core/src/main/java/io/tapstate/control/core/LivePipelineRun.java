@@ -1,5 +1,7 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.lifecycle.ProcessorRuntimeContext;
+
 import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
@@ -28,11 +30,22 @@ public record LivePipelineRun(
         String executionId,
         Instant measuredAt,
         Set<String> measuredFrom,
-        List<LivePipelineVertex> vertices) {
+        List<LivePipelineVertex> vertices,
+        List<ProcessorRuntimeContext> processorContexts) {
 
     public LivePipelineRun {
         pipelineId = Objects.requireNonNull(pipelineId, "pipelineId");
         measuredFrom = Set.copyOf(Objects.requireNonNull(measuredFrom, "measuredFrom"));
         vertices = List.copyOf(Objects.requireNonNull(vertices, "vertices"));
+        processorContexts = List.copyOf(Objects.requireNonNull(processorContexts, "processorContexts"));
+    }
+
+    public LivePipelineRun(String pipelineId, String executionId, Instant measuredAt, Set<String> measuredFrom,
+            List<LivePipelineVertex> vertices) {
+        this(pipelineId, executionId, measuredAt, measuredFrom, vertices, List.of());
+    }
+
+    public LivePipelineRun withProcessorContexts(List<ProcessorRuntimeContext> contexts) {
+        return new LivePipelineRun(pipelineId, executionId, measuredAt, measuredFrom, vertices, contexts);
     }
 }

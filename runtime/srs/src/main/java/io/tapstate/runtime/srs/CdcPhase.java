@@ -4,6 +4,7 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CapturePort;
+import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.CaptureStartedListener;
 import io.tapstate.core.event.ChainPosition;
@@ -11,6 +12,10 @@ import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.CaptureReadAttempt;
+import io.tapstate.spi.store.CaptureResumeWitness;
+import io.tapstate.spi.store.SrsMetaStore;
+import io.tapstate.spi.store.WorkloadClaimFence;
 
 import java.time.Duration;
 import java.util.Collection;
@@ -190,11 +195,19 @@ public final class CdcPhase {
      */
     public static Subscription runDurable(CapturePort port, CaptureConfig config, CaptureStart start,
             Map<String, TableRoute> routes, CaptureHealth health, AtomicLong batchOrder) {
+        return runDurable(port, config, start, routes, health, batchOrder, null);
+    }
+
+    static Subscription runDurable(CapturePort port, CaptureConfig config, CaptureStart start,
+            Map<String, TableRoute> routes, CaptureHealth health, AtomicLong batchOrder, CaptureRunSpec prepared) {
         Map<String, TableRoute> selected = Map.copyOf(routes);
-        List<String> servedTables = List.copyOf(selected.keySet());
+        List<String> servedTables = List.copyOf(config.streams());
+        if (!java.util.Set.copyOf(servedTables).equals(selected.keySet())) {
+            throw new IllegalArgumentException("durable reader routes must match its physical table selection");
+        }
         CdcChain physical = selected.values().iterator().next().chain();
         AtomicReference<ChainPosition> lastWritten = new AtomicReference<>();
-        return port.cdc(config, start, health.recording(new CaptureStartedListener() {
+        CaptureListener callback = new CaptureStartedListener() {
             @Override
             public void onStart(SourcePosition position) {
                 if (physical.meta().read(physical.miningChainId()).orElseThrow().sourceRead() == null) {
@@ -212,7 +225,67 @@ public final class CdcPhase {
                                 new SourceOrder(physical.epoch(), batchOrder.incrementAndGet()), token.token()),
                         servedTables));
             }
-        }));
+        };
+        return openReader(port, config, start, health.recording(qualifiedReader(callback, physical.meta(),
+                physical.miningChainId(), physical.epoch(), servedTables, start, physical.captureFence(),
+                prepared == null ? null : prepared.pipelineFence(), prepared == null ? null : prepared.resumeWitness())));
+    }
+
+    /** A coded synchronous refusal belongs to the same qualified attempt as an asynchronous callback. */
+    static Subscription openReader(CapturePort port, CaptureConfig config, CaptureStart start, CaptureListener listener) {
+        try { return port.cdc(config, start, listener); }
+        catch (TapstateException refusal) {
+            listener.onError(refusal);
+            throw refusal;
+        }
+    }
+
+    /** Allocates the physical version before SDK open; only successful callbacks certify acceptance. */
+    static CaptureListener qualifiedReader(CaptureListener delegate, SrsMetaStore meta, String chain, long epoch,
+            List<String> tables, CaptureStart start, WorkloadClaimFence capture, WorkloadClaimFence pipeline,
+            CaptureResumeWitness witness) {
+        if (capture == null || capture.profileGeneration() == 0) { return delegate; }
+        CaptureReadAttempt.Kind kind = start instanceof CaptureStart.Resume ? CaptureReadAttempt.Kind.RESUME
+                : start instanceof CaptureStart.At ? CaptureReadAttempt.Kind.AT
+                : start instanceof CaptureStart.Earliest ? CaptureReadAttempt.Kind.EARLIEST : CaptureReadAttempt.Kind.PRESENT;
+        String token = start instanceof CaptureStart.Resume resume ? resume.position().token() : null;
+        var instant = start instanceof CaptureStart.At at ? at.instant() : null;
+        CaptureReadAttempt attempt = meta.beginCaptureReadAttempt(chain, epoch, tables, kind, token, instant, capture)
+                .orElseThrow(() -> new TapstateException(CaptureError.CLAIM_LOST, Map.of("captureId", capture.key().resourceId()), null));
+        if (pipeline != null && witness != null && !meta.bindCaptureReadAttempt(pipeline, witness, attempt, false)) {
+            throw new TapstateException(CaptureError.CLAIM_LOST, Map.of("captureId", capture.key().resourceId()), null);
+        }
+        return new CaptureStartedListener() {
+            @Override
+            public void onStart(SourcePosition anchor) {
+                if (!meta.recordCaptureAnchor(attempt, anchor.token())) { throw lost(); }
+                if (delegate instanceof CaptureStartedListener started) { started.onStart(anchor); }
+            }
+            @Override
+            public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                delegate.onBatch(events, position);
+                if (!meta.recordCaptureFirstDelivery(attempt)) { throw lost(); }
+            }
+            @Override
+            public void onError(Throwable error) {
+                try {
+                    if (error instanceof TapstateException coded) {
+                        meta.recordCaptureReadFailure(attempt, coded.code().code(), coded.args(),
+                                coded.code() == CaptureError.START_FROM_OUTSIDE_WINDOW
+                                        ? "stop-and-clear-source-state" : "retry-source-start");
+                    } else { meta.recordCaptureReadFailure(attempt, null); }
+                }
+                catch (TapstateException markerFailure) { error.addSuppressed(markerFailure); }
+                delegate.onError(error);
+            }
+            @Override
+            public void onAcknowledged(SourcePosition position) { delegate.onAcknowledged(position); }
+            @Override
+            public void onAcknowledgeFailed(Throwable error) { delegate.onAcknowledgeFailed(error); }
+            private TapstateException lost() {
+                return new TapstateException(CaptureError.CLAIM_LOST, Map.of("captureId", capture.key().resourceId()), null);
+            }
+        };
     }
 
     /**

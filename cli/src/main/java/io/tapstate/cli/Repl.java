@@ -838,8 +838,7 @@ final class Repl {
         if (words.get(0).equals("apply")) {
             return applyOnline(words);
         }
-        // The two streaming sugars ride the read verbs over the websocket channel: `status --watch` and
-        // `logs --follow`. They are the only dash-options a connected verb accepts, and only on their verb.
+        // Streaming forms ride the existing websocket channel and keep their text-only option parsing.
         if (words.get(0).equals("status") && words.contains("--watch")) {
             return statusWatch(words);
         }
@@ -875,6 +874,10 @@ final class Repl {
         // success.
         if (words.get(0).equals("status")) {
             return statusOnline(words);
+        }
+        // Explanation reads share the existing output formats and parse them beside their pipeline id.
+        if (words.get(0).equals("explain")) {
+            return explainOnline(words);
         }
         // Current metrics is positional, while the history form carries a bounded range and selectors.
         // Parse both here so the generic connected-verb guard does not reject the history options.
@@ -2895,6 +2898,7 @@ final class Repl {
                 appendFact(profile, "profile", listed.profileGeneration());
                 appendFact(profile, "hash", listed.profileHash());
                 printFacts(out, profile);
+                RecoveryText.cluster(out, listed.recovery());
                 if (listed.members().isEmpty()) {
                     out.println("no members");
                 } else {
@@ -2906,9 +2910,12 @@ final class Repl {
                 for (RemotePipeline pipeline : listed.pipelines()) {
                     out.println();
                     out.println(pipelineHeadline(pipeline, participatingLiveMembers(pipeline, listed.members())));
+                    renderClaimFacts(out, pipeline.controllerClaim());
                     for (RemoteVertex vertex : pipeline.vertices()) {
                         out.println("  " + cell(vertex.name()) + "  " + where(vertex) + backlogOf(vertex));
+                        for (RemoteProcessor processor : vertex.processors()) { renderProcessorContext(out, processor); }
                     }
+                    RecoveryText.pipeline(out, pipeline.recovery());
                 }
             }
             case JSON -> out.println(JsonOut.write(clusterMap(listed)));
@@ -3022,6 +3029,7 @@ final class Repl {
         }
         map.put("members", rows);
         map.put("pipelines", pipelines);
+        putIfPresent(map, "recovery", RecoveryWire.tree(listed.recovery()));
         return map;
     }
 
@@ -3124,6 +3132,7 @@ final class Repl {
                 putIfPresent(one, "localIndex", processor.localIndex());
                 putIfPresent(one, "memberUuid", processor.memberUuid());
                 putIfPresent(one, "nodeId", processor.nodeId());
+                putIfPresent(one, "context", RecoveryWire.tree(processor.context()));
                 putIfPresent(one, "backlog", processor.backlog());
                 if (!processor.frontierGaps().isEmpty()) {
                     one.put("frontierGaps", new java.util.TreeMap<>(processor.frontierGaps()));
@@ -3143,6 +3152,7 @@ final class Repl {
             vertices.add(entry);
         }
         row.put("vertices", vertices);
+        putIfPresent(row, "recovery", RecoveryWire.tree(pipeline.recovery()));
         return row;
     }
 
@@ -3153,8 +3163,69 @@ final class Repl {
         putIfPresent(row, "ownerBootId", claim.ownerBootId());
         putIfPresent(row, "claimGeneration", claim.claimGeneration());
         putIfPresent(row, "executionGeneration", claim.executionGeneration());
+        putIfPresent(row, "topologyRevision", claim.topologyRevision());
         putIfPresent(row, "leased", claim.leased());
+        putIfPresent(row, "leaseUntil", claim.leaseUntil());
+        putIfPresent(row, "leaseRemainingMillis", claim.leaseRemainingMillis());
+        putIfPresent(row, "profileGeneration", claim.profileGeneration());
+        putIfPresent(row, "contextExecutionGeneration", claim.contextExecutionGeneration());
+        putIfPresent(row, "executionClaimGeneration", claim.executionClaimGeneration());
+        putIfPresent(row, "executionIncarnation", claim.executionIncarnation());
+        putIfPresent(row, "executionRevision", claim.executionRevision());
+        putIfPresent(row, "executionTopologyRevision", claim.executionTopologyRevision());
+        putIfPresent(row, "executionProfileGeneration", claim.executionProfileGeneration());
+        putIfPresent(row, "executionProfileHash", claim.executionProfileHash());
+        putIfPresent(row, "executionMembers", RecoveryWire.tree(claim.executionMembers()));
+        putIfPresent(row, "failureClaimGeneration", claim.failureClaimGeneration());
+        putIfPresent(row, "failureAfterMemberLoss", claim.failureAfterMemberLoss());
+        putIfPresent(row, "executionContextCurrent", claim.executionContextCurrent());
         return row;
+    }
+
+    private static void renderClaimFacts(PrintWriter out, RemoteClaim claim) {
+        if (claim == null) { return; }
+        StringBuilder lease = new StringBuilder();
+        appendFact(lease, "topology", claim.topologyRevision());
+        appendFact(lease, "profile", claim.profileGeneration());
+        appendFact(lease, "leased", claim.leased());
+        appendFact(lease, "remaining ms", claim.leaseRemainingMillis());
+        appendFact(lease, "until", claim.leaseUntil());
+        printFacts(out, lease);
+        StringBuilder context = new StringBuilder();
+        appendFact(context, "context execution", claim.contextExecutionGeneration());
+        appendFact(context, "execution claim", claim.executionClaimGeneration());
+        appendFact(context, "execution incarnation", claim.executionIncarnation());
+        appendFact(context, "execution revision", claim.executionRevision());
+        appendFact(context, "execution topology", claim.executionTopologyRevision());
+        appendFact(context, "execution profile", claim.executionProfileGeneration());
+        appendFact(context, "execution profile hash", claim.executionProfileHash());
+        appendFact(context, "execution context current", claim.executionContextCurrent());
+        printFacts(out, context);
+        StringBuilder cohort = new StringBuilder();
+        appendFact(cohort, "execution members", RecoveryWire.tree(claim.executionMembers()));
+        appendFact(cohort, "failure claim", claim.failureClaimGeneration());
+        appendFact(cohort, "failure after member loss", claim.failureAfterMemberLoss());
+        printFacts(out, cohort);
+    }
+
+    private static void renderProcessorContext(PrintWriter out, RemoteProcessor processor) {
+        if (processor.context() == null) { return; }
+        RemoteProcessorContext context = processor.context();
+        StringBuilder line = new StringBuilder();
+        appendFact(line, "processor", processor.index());
+        appendFact(line, "local", processor.localIndex());
+        appendFact(line, "job", context.jobId());
+        appendFact(line, "runtime execution", context.runtimeExecutionId());
+        appendFact(line, "claim", context.claimGeneration());
+        appendFact(line, "execution", context.executionGeneration());
+        appendFact(line, "profile", context.profileGeneration());
+        appendFact(line, "node", context.nodeId());
+        appendFact(line, "boot", context.bootId());
+        appendFact(line, "member", context.memberUuid());
+        appendFact(line, "native global", context.globalProcessorIndex());
+        appendFact(line, "native local", context.localProcessorIndex());
+        appendFact(line, "initialized", context.initializedAt());
+        printFacts(out, line);
     }
 
     /**
@@ -3624,11 +3695,28 @@ final class Repl {
      * working.
      */
     private int statusOnline(List<String> words) {
-        String id = streamTargetId(words, "--rate");
-        if (id == null) {
+        IdAndFormat target = parseIdAndFormat(words.stream().filter(word -> !word.equals("--rate")).toList());
+        if (target == null) {
             return Cli.EXIT_USAGE;
         }
+        String id = target.id();
         boolean waitForRate = words.contains("--rate");
+        if (target.format() != OutputFormat.TEXT) {
+            if (waitForRate) {
+                commandLine.getErr().println("status: --rate requires text output");
+                commandLine.getErr().flush();
+                return Cli.EXIT_USAGE;
+            }
+            StatusOutcome status = readStatus(id);
+            return switch (status) {
+                case StatusOutcome.Found found -> {
+                    renderReadDocument(ReadViewDocuments.status(found), target.format());
+                    yield Cli.EXIT_OK;
+                }
+                case StatusOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+                case StatusOutcome.Unreachable ignored -> reportRequestFailed();
+            };
+        }
         ExplainOutcome outcome = readExplanation(id);
         PrintWriter out = commandLine.getOut();
         return switch (outcome) {
@@ -3870,22 +3958,33 @@ final class Repl {
     }
 
     private int explainOnline(List<String> words) {
-        String id = readTargetId(words);
-        if (id == null) {
+        IdAndFormat target = parseIdAndFormat(words);
+        if (target == null) {
             return Cli.EXIT_USAGE;
         }
+        String id = target.id();
         ExplainOutcome outcome = readExplanation(id);
         PrintWriter out = commandLine.getOut();
         return switch (outcome) {
             case ExplainOutcome.Found found -> {
-                out.println(found.pipelineId() + "  " + found.state().toLowerCase(Locale.ROOT));
-                renderExplanation(out, found);
+                if (target.format() == OutputFormat.TEXT) {
+                    out.println(found.pipelineId() + "  " + found.state().toLowerCase(Locale.ROOT));
+                    renderExplanation(out, found);
+                } else {
+                    renderReadDocument(ReadViewDocuments.explanation(found), target.format());
+                }
                 out.flush();
                 yield Cli.EXIT_OK;
             }
             case ExplainOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
             case ExplainOutcome.Unreachable ignored -> reportRequestFailed();
         };
+    }
+
+    private void renderReadDocument(Map<String, Object> document, OutputFormat format) {
+        PrintWriter out = commandLine.getOut();
+        out.println(format == OutputFormat.JSON ? JsonOut.write(document) : YamlOut.write(document));
+        out.flush();
     }
 
     /**
@@ -5255,6 +5354,7 @@ final class Repl {
             out.println("  awaiting   " + String.join(", ", answer.awaitingRebalance())
                     + " -- joined after this run was planned; given no part of it until a rebalance");
         }
+        RecoveryText.pipeline(out, answer.recovery());
     }
 
     /**

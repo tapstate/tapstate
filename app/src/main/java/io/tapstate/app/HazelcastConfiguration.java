@@ -91,7 +91,7 @@ class HazelcastConfiguration {
      * primary guard against overwriting an unread change, so this is a coarse single-node default rather
      * than a tuned figure.
      */
-    private static final int SRS_RING_CAPACITY = 1024;
+    static final int SRS_RING_CAPACITY = 1024;
 
     @Bean(destroyMethod = "shutdown")
     HazelcastInstance hazelcastMember(HazelcastProperties properties, ClusterProperties clusterProperties,
@@ -108,14 +108,15 @@ class HazelcastConfiguration {
                 ClusterMemberPreflight.validate(properties, clusterProperties, controlProperties);
         warnAboutClusterProfile(clusterProperties);
         WorkloadClaimStore claimStore = workloadClaims.getIfAvailable();
+        Config config = memberConfig(properties, nestStateStore, nestSettings, srsLogStore);
         long sessionAskedAt = System.nanoTime();
-        io.tapstate.spi.store.ExecutionProfile proposed = identity == null ? null : profileFactory.create();
+        io.tapstate.spi.store.ExecutionProfile proposed = identity == null ? null
+                : profileFactory.create(config, snapshotBuffer == null ? null : snapshotBuffer.capacity());
         if (identity != null) {
             identity = ClusterMemberPreflight.reserve(identity, clusterProperties,
                     clusterIdentities.getIfAvailable(), clusterProfiles.getIfAvailable(), proposed, bootId.value());
             membershipGate.bindProfile(identity.nodeSession().profileGeneration(), proposed.hash());
         }
-        Config config = memberConfig(properties, nestStateStore, nestSettings, srsLogStore);
         if (identity != null) {
             identify(config, identity);
             config.getMemberAttributeConfig()

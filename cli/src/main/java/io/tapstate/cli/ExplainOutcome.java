@@ -18,12 +18,19 @@ sealed interface ExplainOutcome {
             Next next,
             Pending pending,
             Plan plan,
-            List<String> awaitingRebalance) implements ExplainOutcome {
+            List<String> awaitingRebalance, RemoteRecovery.Pipeline recovery) implements ExplainOutcome {
 
         public Found {
             evidence = List.copyOf(evidence);
             cannotSay = List.copyOf(cannotSay);
             awaitingRebalance = awaitingRebalance == null ? List.of() : List.copyOf(awaitingRebalance);
+        }
+
+        Found(String pipelineId, String state, String kind, String message, String observedAt,
+                Long observedAgeMillis, String freshness, List<Evidence> evidence, List<String> cannotSay, Next next,
+                Pending pending, Plan plan, List<String> awaitingRebalance) {
+            this(pipelineId, state, kind, message, observedAt, observedAgeMillis, freshness, evidence, cannotSay,
+                    next, pending, plan, awaitingRebalance, null);
         }
 
         /** An explanation beside {@code plan}, which every member of the cluster was planned for. */

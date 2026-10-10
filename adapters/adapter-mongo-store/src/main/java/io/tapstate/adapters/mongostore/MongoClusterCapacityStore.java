@@ -16,7 +16,8 @@ import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.spi.store.ClusterCapacityReservation;
 import io.tapstate.spi.store.ClusterCapacityStore;
 import io.tapstate.spi.store.ClusterExecutionProfile;
-import io.tapstate.spi.store.ClusterRecoveryIntentFingerprint;
+import io.tapstate.spi.store.ClusterExecutionMember;
+import io.tapstate.core.lifecycle.DesiredStateFingerprint;
 import io.tapstate.spi.store.ClusterRecoveryKey;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimFence;
@@ -120,12 +121,12 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
         if (occupied.unknown) {
             return result(Outcome.UNKNOWN_DEMAND, null, null, List.of());
         }
-        List<ClusterCapacityLimits.Violation> violations = new ArrayList<>();
         for (Map.Entry<String, ClusterCapacityDemand> entry : new TreeMap<>(demand).entrySet()) {
-            violations.addAll(limits.violations(occupied.demand.getOrDefault(entry.getKey(), ClusterCapacityDemand.ZERO), entry.getValue()));
-        }
-        if (!violations.isEmpty()) {
-            return result(Outcome.CAPACITY_REFUSED, null, null, violations);
+            List<ClusterCapacityLimits.Violation> violations = limits.violations(
+                    occupied.demand.getOrDefault(entry.getKey(), ClusterCapacityDemand.ZERO), entry.getValue());
+            if (!violations.isEmpty()) {
+                return new Result(Outcome.CAPACITY_REFUSED, null, null, violations, entry.getKey());
+            }
         }
         Instant deadline = context.now.plus(ttl);
         Document authority = claims.find(session, WorkloadClaimDocuments.live(pipelineClaim)).first();
@@ -170,6 +171,10 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
                 || !expected.deadline().isAfter(context.now)) {
             return result(Outcome.STALE_EXECUTION, expected, null, List.of());
         }
+        Map<String, ClusterExecutionMember> executionMembers = liveExecutionMembers(session, expected.profile(), executionNodes);
+        if (!executionMembers.keySet().equals(executionNodes)) {
+            return result(Outcome.WAITING_QUORUM, expected, null, List.of());
+        }
         OptionalAdvance allocated = allocate(session, pipelineClaim, context.topologyRevision, executionNodes);
         if (allocated.claim == null) {
             return result(Outcome.STALE_CLAIM, expected, null, List.of());
@@ -180,7 +185,8 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
                 allocated.claim.executionGeneration(), null);
         if (claims.updateOne(session, WorkloadClaimDocuments.live(WorkloadClaimFence.from(allocated.claim)),
                 new Document("$set", new Document("executionIncarnation", context.key.incarnation())
-                        .append("executionRevision", context.intent.getString("revision")))).getMatchedCount() != 1) {
+                        .append("executionRevision", context.intent.getString("revision"))
+                        .append("executionMembers", executionMemberDocuments(executionMembers)))).getMatchedCount() != 1) {
             throw new IllegalStateException("the allocated execution changed before its artifact receipt");
         }
         WorkloadClaim recorded = MongoWorkloadClaimStore.readDocument(claims.find(session,
@@ -247,28 +253,40 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
 
     @Override
     public Map<String, ClusterCapacityDemand> occupied(String clusterId) {
+        return readOccupied(clusterId).map(Snapshot::occupiedByNode).orElseThrow(() ->
+                new TapstateException(io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null));
+    }
+
+    @Override
+    public java.util.Optional<Snapshot> readOccupied(String clusterId) {
         return profileStore.transaction(session -> {
-            Document profile = profiles.find(session, new Document("_id", clusterId)).first();
-            if (profile == null || !profileStore.profileGuard(session, clusterId, ClusterRecoveryDocuments.number(profile, "generation"))) {
-                throw new TapstateException(io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+            Document profile = profiles.aggregate(session, List.of(new Document("$match", new Document("_id", clusterId)),
+                    new Document("$set", new Document("capacityReadTime", "$$NOW")))).first();
+            if (profile == null) {
+                return java.util.Optional.empty();
             }
-            Occupied occupied = occupied(session, clusterId, clock(session, clusterId));
+            Instant now = profile.getDate("capacityReadTime").toInstant();
+            Occupied occupied = occupied(session, clusterId, now, false);
             if (occupied.unknown) {
                 throw capacityError("unknown", "unknown-demand", "unknown", "unknown", "unknown");
             }
-            return Map.copyOf(occupied.demand);
+            return java.util.Optional.of(new Snapshot(MongoClusterProfileStore.profile(profile), occupied.demand));
         });
     }
 
     Occupied occupied(ClientSession session, String clusterId, Instant now) {
+        return occupied(session, clusterId, now, true);
+    }
+
+    private Occupied occupied(ClientSession session, String clusterId, Instant now, boolean cleanup) {
         Map<String, ClusterCapacityDemand> total = new LinkedHashMap<>();
         List<Document> records = occupancy.find(session, new Document("clusterId", clusterId)).into(new ArrayList<>());
         Set<String> recordedExecutions = new java.util.HashSet<>();
         for (Document record : records) {
             ClusterCapacityReservation reservation = reservation(record);
-            if (fenced(session, record, now) && !reservation.deadline().isAfter(now)) {
+            if ((cleanup ? fenced(session, record, now) : fencedAt(session, record, now)) && !reservation.deadline().isAfter(now)) {
                 // An unsubmitted recovery retains its authority evidence until its queue step releases it.
-                if (!record.getBoolean("recovery", false) || reservation.nativeJobId() != null) {
+                if (cleanup && (!record.getBoolean("recovery", false) || reservation.nativeJobId() != null)) {
                     occupancy.deleteOne(session, new Document("_id", record.get("_id")).append("revision", record.get("revision")));
                 }
                 continue;
@@ -282,8 +300,11 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
                 return new Occupied(Map.of(), true);
             }
         }
-        for (Document claim : claims.find(session, MongoClusterProfileStore.liveClaims(clusterId,
-                WorkloadClaimType.PIPELINE_ACTUATION)).into(new ArrayList<>())) {
+        Document live = MongoClusterProfileStore.liveClaims(clusterId, WorkloadClaimType.PIPELINE_ACTUATION);
+        if (!cleanup) {
+            live.put("$expr", new Document("$gt", List.of("$leaseUntil", Date.from(now))));
+        }
+        for (Document claim : claims.find(session, live).into(new ArrayList<>())) {
             long execution = ClusterRecoveryDocuments.number(claim, "executionGeneration");
             if (execution == 0 || recordedExecutions.contains(claim.getString("resourceId") + ":" + execution)) {
                 continue;
@@ -303,7 +324,42 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
         return new Occupied(Map.copyOf(total), false);
     }
 
+    private boolean fencedAt(ClientSession session, Document record, Instant now) {
+        ClusterCapacityReservation reservation = reservation(record);
+        Document profile = profiles.find(session, new Document("_id", reservation.clusterId())).first();
+        if (profile == null) {
+            return false;
+        }
+        if (ClusterRecoveryDocuments.number(profile, "generation") > reservation.profile().generation()) {
+            return true;
+        }
+        Document current = claims.find(session, new Document("_id", claimId(reservation.clusterId(), reservation.pipelineId()))).first();
+        Document live = WorkloadClaimDocuments.live(reservation.pipelineClaim());
+        live.put("$expr", new Document("$gt", List.of("$leaseUntil", Date.from(now))));
+        if (current == null || claims.find(session, live).first() != null) {
+            return false;
+        }
+        Date authority = record.getDate("authorityUntil");
+        if (authority == null || authority.toInstant().isAfter(now)) {
+            return false;
+        }
+        Document retired = new Document("_id", claimId(reservation.clusterId(), reservation.pipelineId()))
+                .append("$nor", List.of(live)).append("$expr", new Document("$lte", List.of(
+                        new Document("$ifNull", List.of("$retiredAuthorizationUntil", new Date(Long.MAX_VALUE))), Date.from(now))));
+        return claims.find(session, retired).first() != null;
+    }
+
     Context guard(ClientSession session, ClusterRecoveryKey key, ClusterExecutionProfile profile, String fingerprint, boolean runningIntent) {
+        return guard(session, key, profile, fingerprint, runningIntent, true);
+    }
+
+    /** Reporting an already-authorized execution's failure is independent of new data admission. */
+    Context guardFailureFact(ClientSession session, ClusterRecoveryKey key, ClusterExecutionProfile profile, String fingerprint) {
+        return guard(session, key, profile, fingerprint, true, false);
+    }
+
+    private Context guard(ClientSession session, ClusterRecoveryKey key, ClusterExecutionProfile profile,
+            String fingerprint, boolean runningIntent, boolean requireDataQuorum) {
         Document currentProfile = profiles.findOneAndUpdate(session, new Document("_id", key.clusterId())
                 .append("generation", profile.generation()).append("hash", profile.profile().hash()),
                 List.of(new Document("$set", new Document("recoveryStoreTime", "$$NOW")
@@ -312,26 +368,30 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
             return Context.refused(Outcome.STALE_PROFILE);
         }
         Instant now = currentProfile.getDate("recoveryStoreTime").toInstant();
-        Document committed = membership.find(session, new Document("_id", key.clusterId())
-                .append("profileGeneration", profile.generation())).first();
-        if (committed == null) {
-            return Context.refused(Outcome.WAITING_QUORUM);
-        }
-        Set<String> committedNodes = Set.copyOf(committed.getList("activeNodeIds", String.class));
         Set<String> live = new java.util.HashSet<>();
-        for (Document node : claims.find(session, MongoClusterProfileStore.liveClaims(key.clusterId(), WorkloadClaimType.NODE_SESSION)
-                .append("profileGeneration", profile.generation())).into(new ArrayList<>())) {
-            Document registry = nodes.find(session, new Document("clusterId", key.clusterId()).append("nodeId", node.getString("ownerNodeId"))
-                    .append("bootId", node.getString("ownerBootId")).append("profileGeneration", profile.generation()).append("joined", true)).first();
-            if (registry != null && committedNodes.contains(node.getString("ownerNodeId"))) {
-                live.add(node.getString("ownerNodeId"));
+        Long committedRevision = null;
+        if (requireDataQuorum) {
+            Document committed = membership.find(session, new Document("_id", key.clusterId())
+                    .append("profileGeneration", profile.generation())).first();
+            if (committed == null) {
+                return Context.refused(Outcome.WAITING_QUORUM);
             }
+            Set<String> committedNodes = Set.copyOf(committed.getList("activeNodeIds", String.class));
+            for (Document node : claims.find(session, MongoClusterProfileStore.liveClaims(key.clusterId(), WorkloadClaimType.NODE_SESSION)
+                    .append("profileGeneration", profile.generation())).into(new ArrayList<>())) {
+                Document registry = nodes.find(session, new Document("clusterId", key.clusterId()).append("nodeId", node.getString("ownerNodeId"))
+                        .append("bootId", node.getString("ownerBootId")).append("profileGeneration", profile.generation()).append("joined", true)).first();
+                if (registry != null && committedNodes.contains(node.getString("ownerNodeId"))) {
+                    live.add(node.getString("ownerNodeId"));
+                }
+            }
+            if (committedNodes.isEmpty() || live.size() < committedNodes.size() / 2 + 1) {
+                return Context.refused(Outcome.WAITING_QUORUM);
+            }
+            committedRevision = ClusterRecoveryDocuments.number(committed, "revision");
+            membership.updateOne(session, new Document("_id", key.clusterId()).append("profileGeneration", profile.generation())
+                    .append("revision", committed.get("revision")), new Document("$inc", new Document("recoveryFenceSerial", 1L)));
         }
-        if (committedNodes.isEmpty() || live.size() < committedNodes.size() / 2 + 1) {
-            return Context.refused(Outcome.WAITING_QUORUM);
-        }
-        membership.updateOne(session, new Document("_id", key.clusterId()).append("profileGeneration", profile.generation())
-                .append("revision", committed.get("revision")), new Document("$inc", new Document("recoveryFenceSerial", 1L)));
         Document artifact = artifacts.find(session, new Document("_id", key.pipelineId())).first();
         Document intent = desired.find(session, new Document("_id", key.pipelineId())).first();
         if (artifact == null || !"pipeline".equals(artifact.getString("kind"))
@@ -339,7 +399,7 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
                 || (runningIntent && !PipelineState.RUNNING.name().equals(intent.getString("targetState")))) {
             return Context.refused(Outcome.STALE_INTENT);
         }
-        String currentFingerprint = ClusterRecoveryIntentFingerprint.of(key.incarnation(), MongoDesiredStore.toDesired(intent));
+        String currentFingerprint = intentFingerprint(key, intent);
         if (!io.tapstate.core.model.canonical.CanonicalHash.of(MongoArtifactStore.toResource(artifact)).equals(artifact.getString("contentHash"))) {
             throw ClusterRecoveryDocuments.unreadable(artifact, "contentHash", null);
         }
@@ -359,7 +419,37 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
             return Context.refused(Outcome.STALE_INTENT);
         }
         return new Context(Outcome.APPLIED, key, profile, fingerprint, now, Set.copyOf(live),
-                ClusterRecoveryDocuments.number(committed, "revision"), artifact, intent, actual, pipeline);
+                committedRevision == null ? ClusterRecoveryDocuments.number(pipeline, "topologyRevision") : committedRevision,
+                artifact, intent, actual, pipeline);
+    }
+
+    Map<String, ClusterExecutionMember> liveExecutionMembers(ClientSession session, ClusterExecutionProfile profile,
+            Set<String> nodeIds) {
+        Map<String, ClusterExecutionMember> identities = new LinkedHashMap<>();
+        for (String nodeId : nodeIds.stream().sorted().toList()) {
+            Document node = claims.find(session, MongoClusterProfileStore.liveClaims(profile.clusterId(), WorkloadClaimType.NODE_SESSION)
+                    .append("profileGeneration", profile.generation()).append("resourceId", nodeId)).first();
+            if (node == null) {
+                continue;
+            }
+            Document registration = nodes.find(session, new Document("clusterId", profile.clusterId()).append("nodeId", nodeId)
+                    .append("profileGeneration", profile.generation()).append("bootId", node.getString("ownerBootId"))
+                    .append("joined", true)).first();
+            if (registration == null) {
+                continue;
+            }
+            try {
+                identities.put(nodeId, new ClusterExecutionMember(nodeId, registration.getString("bootId"), registration.getString("memberUuid")));
+            } catch (RuntimeException invalid) {
+                throw ClusterRecoveryDocuments.unreadable(registration, "executionMember", invalid);
+            }
+        }
+        return Map.copyOf(identities);
+    }
+
+    static List<Document> executionMemberDocuments(Map<String, ClusterExecutionMember> identities) {
+        return new TreeMap<>(identities).values().stream().map(member -> new Document("nodeId", member.nodeId())
+                .append("bootId", member.bootId()).append("memberUuid", member.memberUuid())).toList();
     }
 
     static Document intentFilter(Document intent) {
@@ -368,6 +458,10 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
             filter.append(field, intent.containsKey(field) ? intent.get(field) : new Document("$exists", false));
         }
         return filter;
+    }
+
+    static String intentFingerprint(ClusterRecoveryKey key, Document intent) {
+        return DesiredStateFingerprint.of(MongoDesiredStore.toDesired(intent));
     }
 
     Instant clock(ClientSession session, String clusterId) {

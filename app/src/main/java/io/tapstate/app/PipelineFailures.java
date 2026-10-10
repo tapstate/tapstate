@@ -4,9 +4,14 @@ import io.tapstate.adapters.pdk.ConnectorError;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.runtime.engine.EngineError;
+import io.tapstate.runtime.engine.Engine;
+import io.tapstate.runtime.srs.CaptureStartupException;
+import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimFence;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * Maps the Throwable that killed a pipeline's run to the coded failure its observation carries, so a dead
@@ -47,6 +52,11 @@ final class PipelineFailures {
      */
     static ObservationFailure of(String pipelineId, Throwable failure) {
         TapstateException coded = codedCause(failure);
+        if (coded instanceof CaptureStartupException remote) {
+            Map<String, String> params = new LinkedHashMap<>();
+            remote.failure().params().forEach((name, value) -> params.put(name, bound(String.valueOf(value))));
+            return new ObservationFailure(remote.failure().code(), params);
+        }
         if (coded != null) {
             Map<String, String> params = new LinkedHashMap<>();
             coded.args().forEach((name, value) -> params.put(name, bound(String.valueOf(value))));
@@ -54,6 +64,21 @@ final class PipelineFailures {
         }
         return new ObservationFailure(EngineError.JOB_FAILED.code(),
                 Map.of("pipeline", pipelineId, "cause", describe(failure)));
+    }
+
+    /** A retained older native result or local capture frame cannot classify the next allocated run. */
+    static Optional<Throwable> current(String pipelineId, WorkloadClaim claim, boolean fenced,
+            Engine engine, PipelineCaptureCoordinator captures) {
+        if (claim == null && fenced) { return Optional.empty(); }
+        if (claim == null || claim.profileGeneration() == 0) {
+            return engine.failureOf(pipelineId).or(() -> captures.captureFailure(pipelineId));
+        }
+        return captures.captureFailure(pipelineId, WorkloadClaimFence.from(claim)).or(() ->
+                engine.nativeRun(pipelineId)
+                        .filter(run -> run.claimGeneration() == claim.claimGeneration()
+                                && run.executionGeneration() == claim.executionGeneration()
+                                && run.profileGeneration() == claim.profileGeneration())
+                        .flatMap(run -> engine.failureOf(pipelineId)));
     }
 
     /** Recognizes the coded sink failure before Jet can reduce it to a generic wrapper. */

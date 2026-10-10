@@ -44,6 +44,37 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class CaptureHealth {
 
     private final AtomicReference<Throwable> failure = new AtomicReference<>();
+    private final AtomicLong listenerVersion = new AtomicLong();
+    private final AtomicReference<ReaderEvidence> reader = new AtomicReference<>(new ReaderEvidence(0, null, null));
+    private final AtomicReference<Instant> snapshotOpenedAt = new AtomicReference<>();
+    private final AtomicReference<Instant> firstSnapshotDeliveredAt = new AtomicReference<>();
+    private final AtomicReference<Instant> snapshotCompletedAt = new AtomicReference<>();
+
+    private record ReaderEvidence(long version, SourcePosition anchor, Instant firstDeliveredAt) {}
+
+    public Optional<SourcePosition> resolvedStartingAnchor() { return Optional.ofNullable(reader.get().anchor()); }
+    public Optional<Instant> firstDeliveredAt() { return Optional.ofNullable(reader.get().firstDeliveredAt()); }
+    public boolean readerAccepted() {
+        ReaderEvidence actual = reader.get();
+        return actual.anchor() != null && actual.firstDeliveredAt() != null && failure.get() == null;
+    }
+    public boolean snapshotAccepted() {
+        return snapshotOpenedAt.get() != null && (firstSnapshotDeliveredAt.get() != null || snapshotCompletedAt.get() != null)
+                && failure.get() == null;
+    }
+    public Optional<Instant> snapshotAcceptedAt() {
+        return Optional.ofNullable(firstSnapshotDeliveredAt.get() != null ? firstSnapshotDeliveredAt.get() : snapshotCompletedAt.get());
+    }
+    private Runnable snapshotWitness = () -> { };
+    void snapshotWitness(Runnable witness) { snapshotWitness = java.util.Objects.requireNonNull(witness, "witness"); }
+    void snapshotDelivered() {
+        if (firstSnapshotDeliveredAt.compareAndSet(null, Instant.now())) { snapshotWitness.run(); }
+    }
+    void snapshotOpened() { snapshotOpenedAt.compareAndSet(null, Instant.now()); }
+    void snapshotCompleted() {
+        if (snapshotCompletedAt.compareAndSet(null, Instant.now()) && firstSnapshotDeliveredAt.get() == null
+                && snapshotOpenedAt.get() != null) { snapshotWitness.run(); }
+    }
 
     /**
      * Rows received, by source table and then by the op's wire symbol. Concurrent on both levels because it
@@ -193,16 +224,27 @@ public final class CaptureHealth {
      * only late.
      */
     public CaptureListener recording(CaptureListener onBatch) {
+        long version = listenerVersion.incrementAndGet();
+        reader.set(new ReaderEvidence(version, null, null));
         CaptureListener recorded = new CaptureListener() {
             @Override
             public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
                 events.forEach(CaptureHealth.this::received);
                 onBatch.onBatch(events, position);
+                reader.updateAndGet(current -> current.version() == version && current.firstDeliveredAt() == null
+                        ? new ReaderEvidence(version, current.anchor(), Instant.now()) : current);
             }
 
             @Override
             public void onError(Throwable error) {
-                fail(error);
+                if (reader.get().version() == version) {
+                    fail(error);
+                }
+                try {
+                    onBatch.onError(error);
+                } catch (TapstateException markerFailure) {
+                    error.addSuppressed(markerFailure);
+                }
             }
 
             @Override
@@ -217,13 +259,14 @@ public final class CaptureHealth {
                 onBatch.onAcknowledgeFailed(acknowledgeFailure);
             }
         };
-        if (!(onBatch instanceof CaptureStartedListener started)) {
-            return recorded;
-        }
         return new CaptureStartedListener() {
             @Override
             public void onStart(SourcePosition position) {
-                started.onStart(position);
+                reader.updateAndGet(current -> current.version() == version && current.anchor() == null
+                        ? new ReaderEvidence(version, position, current.firstDeliveredAt()) : current);
+                if (onBatch instanceof CaptureStartedListener started) {
+                    started.onStart(position);
+                }
             }
 
             @Override

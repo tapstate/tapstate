@@ -24,6 +24,7 @@ import io.tapstate.control.core.PipelineCaptures;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.model.BatchSpec;
 import io.tapstate.runtime.engine.ChainAxes;
+import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.engine.NodeWidth;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.WorkloadClaim;
@@ -122,6 +123,38 @@ class EveryMemberCanSayWhereAPipelinesWorkIsRunningTest {
             if (second != null) {
                 second.shutdown();
             }
+            first.shutdown();
+        }
+    }
+
+    @Test
+    void nativeStartupInstrumentationKeepsPinnedPlaceholdersOutOfTheWorkingCount() throws Exception {
+        int[] ports = twoFreePorts();
+        HazelcastInstance first = start(ports[0], ports[0], "node-a", "boot-a1");
+        HazelcastInstance second = null;
+        try {
+            second = start(ports[1], ports[0], "node-b", "boot-b1");
+            awaitMembers(first, 2);
+            awaitMembers(second, 2);
+            new Engine(first).submitFenced(PIPELINE, pinnedAndSpreadDag(), Map.of(),
+                    io.tapstate.runtime.engine.nest.NestSettings.defaults(), 1, 1, 1);
+
+            LivePipelineRun run = awaitMeasuredFromBothMembers(first);
+
+            assertThat(workers(run, "pinned")).as("native initialization also instruments real stand-ins without making them workers")
+                    .hasSize(1);
+            assertThat(vertex(run, "pinned").processors()).hasSize(2);
+            assertThat(workers(run, "spread").stream().map(LivePipelineProcessor::memberUuid).collect(Collectors.toSet()))
+                    .hasSize(2);
+            assertThat(run.processorContexts()).filteredOn(context -> context.vertex().equals("pinned")).hasSize(2);
+            assertThat(run.processorContexts()).allSatisfy(context -> {
+                assertThat(context.executionGeneration()).isEqualTo(1);
+                assertThat(context.profileGeneration()).isEqualTo(1);
+                assertThat(context.jobId()).isNotBlank();
+                assertThat(context.runtimeExecutionId()).isNotBlank();
+            });
+        } finally {
+            if (second != null) { second.shutdown(); }
             first.shutdown();
         }
     }

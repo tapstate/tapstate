@@ -112,6 +112,11 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
      */
     private final NestStore<ParkedSubtree> parking;
 
+    private final long parkingLimit;
+
+    /** Parked copies whose mapping is stored, but whose outgoing children have not all been accepted. */
+    private final Map<List<Object>, ParkedSubtree.At> takeoversReadyToFree = new LinkedHashMap<>();
+
     /**
      * Where what killed this vertex is written down before Jet is told, so a nest's own code reaches the
      * read faces rather than the generic engine failure. Resolved on the member in {@code init}; a vertex
@@ -227,6 +232,7 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
         this.parking = parking;
         this.pendingLimit =
                 Objects.requireNonNull(settings, "settings").pendingAllowedIn(vertex.mapName());
+        this.parkingLimit = settings.parkingAllowedIn(vertex.mapName());
         this.migrationProtection = settings.migrationProtectionIn(vertex.mapName());
         this.vertex = Objects.requireNonNull(vertex, "vertex");
         this.store = Objects.requireNonNull(store, "store");
@@ -552,6 +558,11 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
         // ordinary way to meet one - and sending it on regardless puts the element back into the document
         // that reparent took it out of, with the entry here still right and nothing counting the document.
         if (!state.accepts(order)) {
+            // The mapping can have landed before a crash left its handover parked. The replay must
+            // collect through that stored mapping even though the policy itself is already applied.
+            if (tookOverFrom(edge, event, row)) {
+                collectVacated(key, state, event.ts());
+            }
             return;
         }
         Map<String, Object> was = NestKeys.replacedRow(edge, event);
@@ -649,6 +660,7 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
         }
         ParkedSubtree.At at = new ParkedSubtree.At(vertex.pathId(), joining);
         ParkedSubtree held = parking.load(at);
+        refuseParked(at, Math.addExact((long) waiting.size(), held == null ? 0L : held.changes().size()));
         ParkedSubtree now = new ParkedSubtree(waiting);
         parking.save(at, held == null ? now : held.and(now), held == null);
         // Emptied only now that the rows are somewhere both instances can reach. Emptying first and then
@@ -769,22 +781,37 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
         if (parking == null) {
             return false;
         }
+        if (takeoversReadyToFree.containsKey(key)) {
+            return true;
+        }
         ParkedSubtree.At at = new ParkedSubtree.At(vertex.pathId(), key);
         ParkedSubtree waiting = parking.load(at);
         if (waiting == null) {
             return false;
         }
+        refuseParked(at, waiting.changes().size());
+        refuseToLetOneKeyHoldMoreThanItMay(key, state.pending());
         for (NestElement child : waiting.changes()) {
             switch (state.resolve(child, clock.millis())) {
                 case RESOLVED -> emit(new KeyedElement(state.parentKey(), child, ts));
-                case HELD -> { }
+                case HELD -> refuseToLetOneKeyHoldMoreThanItMay(key, state.pending());
                 case PARENT_ABSENT ->
                         deadLetter.unassemblable(vertex, new ReleasedChild(child, Duration.ZERO));
             }
         }
-        parking.remove(at);
-        tookOver.remove(key);
+        // The parked copy remains durable until both the mapping write and every outgoing child
+        // have landed. A save failure or a blocked outbox therefore leaves a restart something to read.
+        store.save(key, state, heldNothing.contains(key));
+        heldNothing.remove(key);
+        takeoversReadyToFree.put(key, at);
         return true;
+    }
+
+    private void refuseParked(ParkedSubtree.At at, long changes) {
+        if (changes > parkingLimit) {
+            throw new TapstateException(NestError.MIGRATION_PARKING_LIMIT_EXCEEDED,
+                    Map.of("address", NestStateKeys.nameOf(at), "changes", changes, "limit", parkingLimit), null);
+        }
     }
 
     /** Whether this row says the value its children point at has changed. */
@@ -800,7 +827,7 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
      * being left somewhere produces no event of its own, so it has to travel on somebody else's.
      */
     private void collectWhatWasTakenOver() {
-        if (parking == null || tookOver.isEmpty()) {
+        if (parking == null || tookOver.isEmpty() || !flush()) {
             return;
         }
         long now = clock.millis();
@@ -821,7 +848,9 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
             // here was parked before this level ever saw it, so its own time is no longer anywhere - and
             // this is the change that puts it in a document, which is the time a document is stamped by.
             if (collectVacated(waited.getKey(), state, waited.getValue().ts())) {
-                store.save(waited.getKey(), state);
+                if (!flush()) {
+                    return;
+                }
             }
         }
     }
@@ -855,9 +884,8 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
         ResolverState state = stateFor(key, touched);
         switch (state.resolve(element, clock.millis())) {
             case RESOLVED -> emit(new KeyedElement(state.parentKey(), element, ts));
-            // Held: it is in the state now, and the drain writes that through before this level promises
-            // anything, so there is nothing further to do here and nothing to record about it.
-            case HELD -> { }
+            // Checked as it grows, so one drain cannot temporarily release a bucket beyond its limit.
+            case HELD -> refuseToLetOneKeyHoldMoreThanItMay(key, state.pending());
             // Zero: this change arrived after the parent was already gone, so it waited no time at all.
             case PARENT_ABSENT -> deadLetter.unassemblable(vertex, new ReleasedChild(element, Duration.ZERO));
         }
@@ -899,6 +927,7 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
                 heldNothing.add(k);
                 return new ResolverState();
             }
+            refuseToLetOneKeyHoldMoreThanItMay(k, kept.pending());
             return kept;
         });
     }
@@ -914,6 +943,13 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
                 return false;
             }
             outgoing.poll();
+        }
+        Iterator<Map.Entry<List<Object>, ParkedSubtree.At>> accepted = takeoversReadyToFree.entrySet().iterator();
+        while (accepted.hasNext()) {
+            Map.Entry<List<Object>, ParkedSubtree.At> entry = accepted.next();
+            parking.remove(entry.getValue());
+            tookOver.remove(entry.getKey());
+            accepted.remove();
         }
         return true;
     }

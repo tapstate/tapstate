@@ -46,7 +46,10 @@ public enum LifecycleError implements TapstateErrorCode {
 
     /** Aggregate execution and reserved demand would exceed a member's configured ceiling. */
     CLUSTER_CAPACITY_REFUSED("lifecycle.cluster-capacity-refused",
-            Set.of("node", "resource", "occupied", "requested", "limit"));
+            Set.of("node", "resource", "occupied", "requested", "limit")),
+
+    /** An enforced owned resource has no computable upper bound before submission. */
+    CLUSTER_CAPACITY_UNPROVEN("lifecycle.cluster-capacity-unproven", Set.of("pipeline", "reason"));
 
     private final String code;
     private final Set<String> placeholders;

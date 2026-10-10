@@ -4,6 +4,8 @@ import com.mongodb.ErrorCategory;
 import com.mongodb.MongoException;
 import com.mongodb.MongoWriteException;
 import com.mongodb.ReadConcern;
+import com.mongodb.TransactionOptions;
+import com.mongodb.WriteConcern;
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
@@ -29,9 +31,17 @@ import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WriterProgress;
 import io.tapstate.spi.store.WriterRun;
+import io.tapstate.spi.store.CaptureResumeWitness;
+import io.tapstate.spi.store.CaptureResumePreparation;
+import io.tapstate.spi.store.CaptureReadAttempt;
+import io.tapstate.spi.store.CaptureReadState;
+import io.tapstate.spi.store.CaptureStartupProof;
+import io.tapstate.spi.store.CaptureStartupFailure;
+import io.tapstate.spi.store.ClusterRecoveryPosition;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.util.Date;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -76,6 +86,546 @@ import org.bson.Document;
  * its model is coded {@code io.document-unreadable}.
  */
 public final class MongoSrsMetaStore implements SrsMetaStore {
+
+    private static final TransactionOptions SOURCE_PROOF = TransactionOptions.builder()
+            .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
+    private static final String PREPARED_SOURCE = "preparedSourceStart";
+    private static final String READ_ATTEMPT = "captureReadAttempt";
+
+    private <T> T sourceProof(java.util.function.Function<ClientSession, T> action) {
+        return StoreIo.call(() -> {
+            try (ClientSession session = client.startSession()) {
+                return session.withTransaction(() -> action.apply(session), SOURCE_PROOF);
+            }
+        });
+    }
+
+    @Override
+    public CaptureResumeWitness resumeWitness(String sourceId, String connectorId, String chain,
+            String consumerId, io.tapstate.core.model.ReadMode mode, boolean shared, List<String> tables) {
+        return sourceProof(session -> {
+            Document root = collection.find(session, new Document("_id", chain)).projection(new Document("epoch", 1)
+                    .append("sourceReadOffset", 1).append("sourceReadEpoch", 1).append("sourceReadSeq", 1)
+                    .append("sourceReadDurable", 1).append("consumerOffsets", 1).append(READ_ATTEMPT, 1)).first();
+            Document consumer = consumers.find(session, consumerKey(chain, consumerId)).first();
+            if (consumer == null && root != null && root.get("consumerOffsets") instanceof Document legacy) {
+                Object found = legacy.get(consumerId);
+                consumer = found instanceof Document value ? value : null;
+            }
+            ConsumerOffset offset = consumer == null ? null : consumerFromDocument(consumerId, consumer);
+            return new CaptureResumeWitness(sourceId, connectorId, chain, consumerId, mode, shared, tables,
+                    root != null, root == null ? 0 : readEpoch(root, "epoch"), root == null ? null : sourceReadFrom(root),
+                    root != null && sourceReadDurableFrom(root, chain), offset != null,
+                    offset == null ? List.of() : offset.snapshotCompletedTables(), offset == null ? null : offset.cdcStartPosition(),
+                    offset == null ? 0 : offset.snapshotEpoch(), offset == null ? null : offset.progressKind(),
+                    offset == null ? null : offset.sinkAcked(), offset == null ? Map.of() : offset.sinkAckedByTable(),
+                    root == null ? null : CaptureStartupDocuments.reader(root.get(READ_ATTEMPT, Document.class)));
+        });
+    }
+
+    @Override
+    public boolean prepareCaptureResume(WorkloadClaimFence pipeline, CaptureResumeWitness witness,
+            ClusterRecoveryPosition requested) {
+        return prepareCaptureResume(pipeline, witness, requested, Set.of(witness.sourceId()));
+    }
+
+    @Override
+    public boolean prepareCaptureResume(WorkloadClaimFence pipeline, CaptureResumeWitness witness,
+            ClusterRecoveryPosition requested, Set<String> requiredSources) {
+        return prepareCaptureResume(pipeline, witness, requested, requiredSources, null);
+    }
+
+    @Override
+    public boolean prepareCaptureResume(WorkloadClaimFence pipeline, CaptureResumeWitness witness,
+            ClusterRecoveryPosition requested, Set<String> requiredSources, String retention) {
+        requirePipelineFence(witness.consumerId(), pipeline);
+        if (!requiredSources.contains(witness.sourceId())) {
+            throw new IllegalArgumentException("the actual source must belong to the required startup selection");
+        }
+        List<String> required = requiredSources.stream().sorted().toList();
+        return sourceProof(session -> {
+            if (!provesClaim(session, pipeline)) { return false; }
+            Document key = consumerKey(witness.miningChainId(), witness.consumerId());
+            Document existing = consumers.find(session, key).first();
+            Document prior = CaptureStartupDocuments.prepared(existing);
+            if (prior != null && sameProofRun(prior.get("pipelineClaim", Document.class), pipeline)) {
+                return witness.equals(CaptureStartupDocuments.witness(prior.get("witness", Document.class)))
+                        && Objects.equals(CaptureStartupDocuments.requested(requested), prior.get("requestedPosition"))
+                        && required.equals(prior.get("requiredSourceIds"));
+            }
+            if (!guardResumeWitness(session, witness, retention)) { return false; }
+            Document prepared = new Document("schemaVersion", 1)
+                    .append("pipelineClaim", new Document("$literal", WorkloadClaimDocuments.stored(pipeline)))
+                    .append("witness", new Document("$literal", CaptureStartupDocuments.witness(witness)))
+                    .append("requestedPosition", new Document("$literal", CaptureStartupDocuments.requested(requested)))
+                    .append("requiredSourceIds", new Document("$literal", required))
+                    .append("preparedAt", "$$NOW").append("snapshotAcceptedAt", null);
+            Document fields = consumerIdentity(witness.miningChainId(), witness.consumerId());
+            fields.replaceAll((name, value) -> new Document("$literal", value));
+            fields.append(PREPARED_SOURCE, prepared).append("perTableSeq", new Document("$ifNull", List.of("$perTableSeq", new Document())));
+            consumers.updateOne(session, key, List.of(new Document("$set", fields)), new UpdateOptions().upsert(true));
+            return true;
+        });
+    }
+
+    /** True root and exact-consumer writes serialize a preparation with every subsequent truth change. */
+    boolean guardResumeWitness(ClientSession session, CaptureResumeWitness witness) {
+        return guardResumeWitness(session, witness, null);
+    }
+
+    private boolean guardResumeWitness(ClientSession session, CaptureResumeWitness witness, String retention) {
+        String chain = witness.miningChainId();
+        Document root = collection.find(session, new Document("_id", chain)).first();
+        if ((root != null) != witness.chainPresent()) { return false; }
+        if (root == null) {
+            collection.insertOne(session, toDocument(new SrsMeta(chain, null, List.of(), List.of(), retention)));
+        } else {
+            List<Document> conditions = new ArrayList<>();
+            conditions.add(eqDefault("epoch", witness.chainEpoch(), 0L));
+            conditions.add(eqDefault("sourceReadDurable", witness.sourceReadDurable(), false));
+            if (!Objects.equals(CaptureStartupDocuments.reader(root.get(READ_ATTEMPT, Document.class)), witness.priorReader())) {
+                return false;
+            }
+            ChainPosition read = witness.sourceRead();
+            conditions.add(eqDefault("sourceReadOffset", read == null ? null : read.token(), null));
+            conditions.add(eqDefault("sourceReadEpoch", read == null || read.order() == null ? null : read.order().epoch(), null));
+            conditions.add(eqDefault("sourceReadSeq", read == null || read.order() == null ? null : read.order().seq(), null));
+            Document filter = new Document("_id", chain).append("$expr", new Document("$and", conditions));
+            if (collection.updateOne(session, filter, new Document("$inc", new Document("sourceResumeProofRevision", 1L)))
+                    .getMatchedCount() != 1) { return false; }
+        }
+        Document key = consumerKey(chain, witness.consumerId());
+        Document consumer = consumers.find(session, key).first();
+        if (consumer == null && root != null && root.get("consumerOffsets") instanceof Document legacy) {
+            Object prior = legacy.get(witness.consumerId());
+            if (prior instanceof Document original) {
+                consumer = new Document(original);
+                consumer.putAll(key);
+                consumer.putAll(consumerIdentity(chain, witness.consumerId()));
+                consumers.insertOne(session, consumer);
+                collection.updateOne(session, new Document("_id", chain),
+                        new Document("$unset", new Document("consumerOffsets." + witness.consumerId(), "")));
+            }
+        }
+        if ((consumer != null) != witness.consumerPresent()) { return false; }
+        if (consumer != null) {
+            ConsumerOffset actual = consumerFromDocument(witness.consumerId(), consumer);
+            if (!actual.snapshotCompletedTables().equals(witness.snapshotCompletedTables())
+                    || !Objects.equals(actual.cdcStartPosition(), witness.cdcStartPosition())
+                    || actual.snapshotEpoch() != witness.snapshotEpoch() || actual.progressKind() != witness.progressKind()
+                    || !Objects.equals(actual.sinkAcked(), witness.sinkAcked())
+                    || !actual.sinkAckedByTable().equals(witness.sinkAckedByTable())) { return false; }
+            return consumers.updateOne(session, key, new Document("$inc", new Document("sourceResumeProofRevision", 1L)))
+                    .getMatchedCount() == 1;
+        }
+        return true;
+    }
+
+    @Override
+    public Optional<CaptureResumePreparation> captureResumePreparation(WorkloadClaimFence pipeline, String chain, String consumerId) {
+        return StoreIo.call(() -> {
+            Document row = consumers.withReadConcern(ReadConcern.MAJORITY).find(consumerKey(chain, consumerId))
+                    .projection(new Document(PREPARED_SOURCE, 1)).first();
+            Document prepared = CaptureStartupDocuments.prepared(row);
+            return prepared == null || !sameProofRun(prepared.get("pipelineClaim", Document.class), pipeline) ? Optional.empty()
+                    : Optional.of(new CaptureResumePreparation(pipeline, CaptureStartupDocuments.witness(prepared.get("witness", Document.class)),
+                            CaptureStartupDocuments.requested(prepared.get("requestedPosition", Document.class)),
+                            CaptureStartupDocuments.instant(prepared, "preparedAt"), CaptureStartupDocuments.requiredSources(prepared)));
+        });
+    }
+
+    @Override
+    public List<CaptureResumePreparation> captureResumePreparations(WorkloadClaimFence pipeline) {
+        return StoreIo.call(() -> {
+            Document filter = new Document();
+            WorkloadClaimDocuments.stored(pipeline).forEach((field, value) -> {
+                if (!field.equals("topologyRevision")) { filter.put(PREPARED_SOURCE + ".pipelineClaim." + field, value); }
+            });
+            List<CaptureResumePreparation> found = new ArrayList<>();
+            for (Document row : consumers.withReadConcern(ReadConcern.MAJORITY).find(filter)
+                    .projection(new Document(PREPARED_SOURCE, 1))) {
+                Document prepared = CaptureStartupDocuments.prepared(row);
+                found.add(new CaptureResumePreparation(pipeline, CaptureStartupDocuments.witness(prepared.get("witness", Document.class)),
+                        CaptureStartupDocuments.requested(prepared.get("requestedPosition", Document.class)),
+                        CaptureStartupDocuments.instant(prepared, "preparedAt"), CaptureStartupDocuments.requiredSources(prepared)));
+            }
+            return List.copyOf(found);
+        });
+    }
+
+    @Override
+    public Optional<CaptureReadAttempt> beginCaptureReadAttempt(String chain, long epoch, List<String> tables,
+            CaptureReadAttempt.Kind kind, String token, Instant instant, WorkloadClaimFence capture) {
+        if (capture.key().type() != WorkloadClaimType.CAPTURE || capture.profileGeneration() < 1) {
+            throw new IllegalArgumentException("a durable reader attempt requires a profile-aware capture claim");
+        }
+        return sourceProof(session -> {
+            if (!provesClaim(session, capture)) { return Optional.empty(); }
+            Document version = new Document("$add", List.of(new Document("$ifNull", List.of("$captureReadVersion", 0L)), 1L));
+            Document attempt = new Document("schemaVersion", 1).append("miningChainId", new Document("$literal", chain))
+                    .append("chainEpoch", epoch).append("version", version)
+                    .append("captureClaim", new Document("$literal", WorkloadClaimDocuments.stored(capture)))
+                    .append("tables", new Document("$literal", List.copyOf(tables)))
+                    .append("requestedKind", kind.name()).append("requestedToken", new Document("$literal", token))
+                    .append("requestedInstant", instant == null ? null : Date.from(instant)).append("allocatedAt", "$$NOW")
+                    .append("resolvedAnchor", null).append("anchorResolvedAt", null).append("firstDeliveredAt", null)
+                    .append("failed", false).append("failureCode", null)
+                    .append("failureParams", new Document("$literal", new Document())).append("disposition", null)
+                    .append("failedAt", null).append("eventRevision", 0L).append("failureRevision", 0L)
+                    .append("failureClaimProven", false);
+            Document updated = collection.findOneAndUpdate(session, new Document("_id", chain).append("epoch", epoch),
+                    List.of(new Document("$set", new Document("captureReadVersion", version).append(READ_ATTEMPT, attempt))),
+                    new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER));
+            return Optional.ofNullable(updated).map(row -> CaptureStartupDocuments.reader(row.get(READ_ATTEMPT, Document.class)).attempt());
+        });
+    }
+
+    @Override
+    public boolean bindCaptureReadAttempt(WorkloadClaimFence pipeline, CaptureResumeWitness witness,
+            CaptureReadAttempt attempt, boolean attachment) {
+        return sourceProof(session -> {
+            if (!provesClaim(session, pipeline) || !provesClaim(session, attempt.captureClaim())
+                    || pipeline.profileGeneration() != attempt.captureClaim().profileGeneration()
+                    || !pipeline.key().clusterId().equals(attempt.captureClaim().key().clusterId())
+                    || !attempt.miningChainId().equals(witness.miningChainId())
+                    || !attempt.tables().containsAll(witness.tables()) || (attachment && !witness.srsEnabled())) { return false; }
+            Document root = collection.find(session, readerFilter(attempt)).first();
+            if (root == null || (witness.srsEnabled() && (!attempt.tables().equals(root.get("captureServingTables"))
+                    || readEpoch(root, "captureServingEpoch") != attempt.chainEpoch()))) { return false; }
+            Document key = consumerKey(witness.miningChainId(), witness.consumerId());
+            Document row = consumers.find(session, key).first();
+            Document prepared = CaptureStartupDocuments.prepared(row);
+            if (prepared == null || !sameProofRun(prepared.get("pipelineClaim", Document.class), pipeline)
+                    || !witness.equals(CaptureStartupDocuments.witness(prepared.get("witness", Document.class)))) { return false; }
+            ClusterRecoveryPosition requested = CaptureStartupDocuments.requested(prepared.get("requestedPosition", Document.class));
+            if (!attachment) {
+                if (requested != null && requested.position() != null && requested.position().token() != null
+                        && (attempt.requestedKind() != CaptureReadAttempt.Kind.RESUME
+                            || !requested.position().token().equals(attempt.requestedToken()))) { return false; }
+                if (requested != null && requested.kind() == ClusterRecoveryPosition.Kind.SNAPSHOT_REQUIRED
+                        && witness.readMode() == io.tapstate.core.model.ReadMode.SNAPSHOT_AND_CDC) {
+                    ConsumerOffset actual = consumerFromDocument(witness.consumerId(), row);
+                    if (attempt.requestedKind() != CaptureReadAttempt.Kind.RESUME || actual.snapshotEpoch() < 1
+                            || !Objects.equals(actual.cdcStartPosition(), attempt.requestedToken())) { return false; }
+                    requested = new ClusterRecoveryPosition(witness.sourceId(), witness.connectorId(), requested.captureId(),
+                            ClusterRecoveryPosition.Kind.DURABLE_POSITION,
+                            new ChainPosition(SourceOrder.snapshotRow(actual.snapshotEpoch()), attempt.requestedToken()),
+                            "mongo-snapshot-seam", witness.miningChainId() + ":" + witness.consumerId());
+                }
+            }
+            if (collection.updateOne(session, readerFilter(attempt), new Document("$inc",
+                    new Document("sourceStartupProofRevision", 1L))).getMatchedCount() != 1) { return false; }
+            boolean sameReader = readEpoch(prepared, "readerVersion") == attempt.version()
+                    && Objects.equals(prepared.get("readerClaim"), WorkloadClaimDocuments.stored(attempt.captureClaim()));
+            long observedRevision = sameReader ? readEpoch(prepared, "readerObservedRevision")
+                    : readEpoch(root.get(READ_ATTEMPT, Document.class), "eventRevision");
+            Document fields = new Document(PREPARED_SOURCE + ".readerObservedRevision", observedRevision)
+                    .append(PREPARED_SOURCE + ".readerVersion", attempt.version())
+                    .append(PREPARED_SOURCE + ".readerEpoch", attempt.chainEpoch())
+                    .append(PREPARED_SOURCE + ".readerClaim", new Document("$literal", WorkloadClaimDocuments.stored(attempt.captureClaim())))
+                    .append(PREPARED_SOURCE + ".readerTables", new Document("$literal", attempt.tables()))
+                    .append(PREPARED_SOURCE + ".sharedAttachment", attachment)
+                    .append(PREPARED_SOURCE + ".requestedPosition", new Document("$literal", CaptureStartupDocuments.requested(requested)));
+            return consumers.updateOne(session, key, List.of(new Document("$set", fields))).getMatchedCount() == 1;
+        });
+    }
+
+    @Override
+    public boolean recordCaptureAnchor(CaptureReadAttempt attempt, String anchor) {
+        Objects.requireNonNull(anchor, "anchor");
+        return updateReader(attempt, new Document("$set", new Document(READ_ATTEMPT + ".resolvedAnchor", new Document("$literal", anchor))
+                .append(READ_ATTEMPT + ".anchorResolvedAt", "$$NOW")), true);
+    }
+
+    @Override
+    public boolean recordCaptureFirstDelivery(CaptureReadAttempt attempt) {
+        return updateReader(attempt, new Document("$set", new Document(READ_ATTEMPT + ".firstDeliveredAt",
+                new Document("$ifNull", List.of("$" + READ_ATTEMPT + ".firstDeliveredAt", "$$NOW")))), false);
+    }
+
+    @Override
+    public boolean recordCaptureReadFailure(CaptureReadAttempt attempt, String code) {
+        return recordCaptureReadFailure(attempt, code, Map.of(), "retry-source-start");
+    }
+
+    @Override
+    public boolean recordCaptureReadFailure(CaptureReadAttempt attempt, String code,
+            Map<String, Object> params, String disposition) {
+        return sourceProof(session -> {
+            if (!provesClaim(session, attempt.captureClaim())) { return false; }
+            Document next = new Document("$add", List.of(new Document("$ifNull",
+                    List.of("$" + READ_ATTEMPT + ".eventRevision", 0L)), 1L));
+            Document fields = new Document(READ_ATTEMPT + ".failed", true)
+                    .append(READ_ATTEMPT + ".failureCode", new Document("$literal", code))
+                    .append(READ_ATTEMPT + ".failureParams", new Document("$literal", CaptureStartupDocuments.namedParams(params)))
+                    .append(READ_ATTEMPT + ".disposition", new Document("$literal", disposition))
+                    .append(READ_ATTEMPT + ".failedAt", "$$NOW")
+                    .append(READ_ATTEMPT + ".failureClaimProven", true)
+                    .append(READ_ATTEMPT + ".failureRevision", next).append(READ_ATTEMPT + ".eventRevision", next);
+            return collection.updateOne(session, readerFilter(attempt).append(READ_ATTEMPT + ".failed", false),
+                    List.of(new Document("$set", fields))).getMatchedCount() == 1;
+        });
+    }
+
+    private boolean updateReader(CaptureReadAttempt attempt, Document update, boolean withoutAnchor) {
+        return sourceProof(session -> {
+            if (!provesClaim(session, attempt.captureClaim())) { return false; }
+            Document filter = readerFilter(attempt);
+            if (!withoutAnchor) { filter.append(READ_ATTEMPT + ".resolvedAnchor", new Document("$type", "string")); }
+            if (!update.get("$set", Document.class).containsKey(READ_ATTEMPT + ".failed")) {
+                filter.append(READ_ATTEMPT + ".failed", false);
+            }
+            if (update.get("$set", Document.class).containsKey(READ_ATTEMPT + ".resolvedAnchor")) {
+                Object literal = update.get("$set", Document.class).get(READ_ATTEMPT + ".resolvedAnchor", Document.class).get("$literal");
+                filter.append("$or", List.of(new Document(READ_ATTEMPT + ".resolvedAnchor", null),
+                        new Document(READ_ATTEMPT + ".resolvedAnchor", literal)));
+            }
+            return collection.updateOne(session, filter, List.of(update)).getMatchedCount() == 1;
+        });
+    }
+
+    @Override
+    public Optional<CaptureReadState> captureReadState(String chain) {
+        return StoreIo.call(() -> {
+            Document root = collection.withReadConcern(ReadConcern.MAJORITY).find(new Document("_id", chain))
+                    .projection(new Document(READ_ATTEMPT, 1)).first();
+            return root == null ? Optional.empty() : Optional.ofNullable(CaptureStartupDocuments.reader(root.get(READ_ATTEMPT, Document.class)));
+        });
+    }
+
+    @Override
+    public boolean recordCaptureAttachment(WorkloadClaimFence pipeline, CaptureResumeWitness witness, long epoch) {
+        return sourceProof(session -> {
+            if (!provesClaim(session, pipeline)) { return false; }
+            Document root = collection.find(session, new Document("_id", witness.miningChainId()).append("epoch", epoch)).first();
+            Document row = consumers.find(session, consumerKey(witness.miningChainId(), witness.consumerId())).first();
+            Document prepared = CaptureStartupDocuments.prepared(row);
+            if (root == null || prepared == null || !sameProofRun(prepared.get("pipelineClaim", Document.class), pipeline)
+                    || !witness.equals(CaptureStartupDocuments.witness(prepared.get("witness", Document.class)))) { return false; }
+            if (witness.srsEnabled() && (!row.containsKey("perTableSeq")
+                    || !row.get("perTableSeq", Document.class).keySet().containsAll(witness.tables()))) { return false; }
+            if (collection.updateOne(session, new Document("_id", witness.miningChainId()).append("epoch", epoch),
+                    new Document("$inc", new Document("sourceStartupProofRevision", 1L))).getMatchedCount() != 1) { return false; }
+            Document fields = new Document(PREPARED_SOURCE + ".attachedEpoch", epoch)
+                    .append(PREPARED_SOURCE + ".attachedAt", new Document("$ifNull",
+                            List.of("$" + PREPARED_SOURCE + ".attachedAt", "$$NOW")));
+            CaptureReadState reader = CaptureStartupDocuments.reader(root.get(READ_ATTEMPT, Document.class));
+            if (reader != null && reader.attempt().chainEpoch() == epoch
+                    && reader.attempt().tables().containsAll(witness.tables())
+                    && reader.attempt().captureClaim().profileGeneration() == pipeline.profileGeneration()
+                    && reader.attempt().captureClaim().key().clusterId().equals(pipeline.key().clusterId())
+                    && provesClaim(session, reader.attempt().captureClaim())) {
+                boolean sameReader = readEpoch(prepared, "readerVersion") == reader.attempt().version()
+                        && Objects.equals(prepared.get("readerClaim"), WorkloadClaimDocuments.stored(reader.attempt().captureClaim()))
+                        && CaptureStartupDocuments.instant(prepared, "attachedAt") != null;
+                fields.append(PREPARED_SOURCE + ".readerVersion", reader.attempt().version())
+                        .append(PREPARED_SOURCE + ".readerEpoch", epoch)
+                        .append(PREPARED_SOURCE + ".readerClaim", new Document("$literal", WorkloadClaimDocuments.stored(reader.attempt().captureClaim())))
+                        .append(PREPARED_SOURCE + ".readerTables", new Document("$literal", reader.attempt().tables()))
+                        .append(PREPARED_SOURCE + ".readerObservedRevision", sameReader
+                                ? readEpoch(prepared, "readerObservedRevision")
+                                : readEpoch(root.get(READ_ATTEMPT, Document.class), "eventRevision"));
+                if (witness.srsEnabled()) { fields.append(PREPARED_SOURCE + ".sharedAttachment", true); }
+            }
+            return consumers.updateOne(session, consumerKey(witness.miningChainId(), witness.consumerId()),
+                    List.of(new Document("$set", fields))).getMatchedCount() == 1;
+        });
+    }
+
+    @Override
+    public boolean recordSnapshotStartup(WorkloadClaimFence pipeline, CaptureResumeWitness witness) {
+        if (!witness.snapshotOwed()) { return false; }
+        return sourceProof(session -> {
+            if (!provesClaim(session, pipeline)) { return false; }
+            Document key = consumerKey(witness.miningChainId(), witness.consumerId());
+            Document row = consumers.find(session, key).first();
+            Document prepared = CaptureStartupDocuments.prepared(row);
+            if (prepared == null || !sameProofRun(prepared.get("pipelineClaim", Document.class), pipeline)
+                    || !witness.equals(CaptureStartupDocuments.witness(prepared.get("witness", Document.class)))) { return false; }
+            Document fields = new Document(PREPARED_SOURCE + ".snapshotAcceptedAt", new Document("$ifNull",
+                    List.of("$" + PREPARED_SOURCE + ".snapshotAcceptedAt", "$$NOW")));
+            ClusterRecoveryPosition requested = CaptureStartupDocuments.requested(prepared.get("requestedPosition", Document.class));
+            if (witness.readMode() != io.tapstate.core.model.ReadMode.SNAPSHOT_ONLY && requested != null
+                    && requested.kind() == ClusterRecoveryPosition.Kind.SNAPSHOT_REQUIRED) {
+                ConsumerOffset actual = consumerFromDocument(witness.consumerId(), row);
+                if (actual.cdcStartPosition() == null || actual.snapshotEpoch() < 1) { return false; }
+                ClusterRecoveryPosition actualSeam = new ClusterRecoveryPosition(witness.sourceId(), witness.connectorId(),
+                        requested.captureId(), ClusterRecoveryPosition.Kind.DURABLE_POSITION,
+                        new ChainPosition(SourceOrder.snapshotRow(actual.snapshotEpoch()), actual.cdcStartPosition()),
+                        "mongo-snapshot-seam", witness.miningChainId() + "/" + witness.consumerId());
+                fields.append(PREPARED_SOURCE + ".requestedPosition", new Document("$literal", CaptureStartupDocuments.requested(actualSeam)));
+            }
+            return consumers.updateOne(session, key, List.of(new Document("$set", fields))).getMatchedCount() == 1;
+        });
+    }
+
+    @Override
+    public Optional<CaptureStartupProof> captureStartupProof(WorkloadClaimFence pipeline, CaptureResumeWitness witness) {
+        return sourceProof(session -> startupProof(session, pipeline, witness, false));
+    }
+
+    @Override
+    public Optional<CaptureStartupFailure> captureStartupFailure(WorkloadClaimFence pipeline, CaptureResumeWitness witness) {
+        return sourceProof(session -> startupFailure(session, pipeline, witness));
+    }
+
+    boolean guardStartupFailure(ClientSession session, CaptureStartupFailure fact, WorkloadClaimFence pipeline) {
+        return fact.pipelineClaim().equals(pipeline)
+                && startupFailure(session, pipeline, fact.witness()).filter(fact::equals).isPresent();
+    }
+
+    boolean guardStartupFailure(ClientSession session, CaptureStartupFailure fact, WorkloadClaimFence pipeline,
+            Set<String> requiredSources) {
+        Document row = consumers.find(session, consumerKey(fact.witness().miningChainId(), fact.witness().consumerId())).first();
+        Document prepared = CaptureStartupDocuments.prepared(row);
+        return prepared != null && CaptureStartupDocuments.requiredSources(prepared).equals(requiredSources)
+                && guardStartupFailure(session, fact, pipeline);
+    }
+
+    private Optional<CaptureStartupFailure> startupFailure(ClientSession session,
+            WorkloadClaimFence pipeline, CaptureResumeWitness witness) {
+        if (!provesClaim(session, pipeline)) { return Optional.empty(); }
+        Document row = consumers.find(session, consumerKey(witness.miningChainId(), witness.consumerId())).first();
+        Document prepared = CaptureStartupDocuments.prepared(row);
+        Document root = collection.find(session, new Document("_id", witness.miningChainId())).first();
+        CaptureReadState reader = root == null ? null : CaptureStartupDocuments.reader(root.get(READ_ATTEMPT, Document.class));
+        if (prepared == null || !sameProofRun(prepared.get("pipelineClaim", Document.class), pipeline)
+                || !witness.equals(CaptureStartupDocuments.witness(prepared.get("witness", Document.class)))
+                || reader == null || !reader.failed() || reader.failureCode() == null || reader.failedAt() == null
+                || !pipeline.key().clusterId().equals(reader.attempt().captureClaim().key().clusterId())
+                || pipeline.profileGeneration() != reader.attempt().captureClaim().profileGeneration()
+                || reader.disposition() == null || CaptureStartupDocuments.instant(prepared, "attachedAt") == null
+                || readEpoch(prepared, "attachedEpoch") != reader.attempt().chainEpoch()
+                || readEpoch(root, "epoch") != reader.attempt().chainEpoch()
+                || readEpoch(prepared, "readerVersion") != reader.attempt().version()
+                || !Objects.equals(prepared.get("readerClaim"), WorkloadClaimDocuments.stored(reader.attempt().captureClaim()))
+                || !Objects.equals(prepared.get("readerTables"), reader.attempt().tables())
+                || !reader.attempt().tables().containsAll(witness.tables())
+                || readEpoch(root.get(READ_ATTEMPT, Document.class), "failureRevision")
+                    <= readEpoch(prepared, "readerObservedRevision")
+                || (witness.srsEnabled() && (!reader.attempt().tables().equals(root.get("captureServingTables"))
+                    || readEpoch(root, "captureServingEpoch") != reader.attempt().chainEpoch()))
+                || !provesRecordedFailure(session, reader, root.get(READ_ATTEMPT, Document.class))) { return Optional.empty(); }
+        if (collection.updateOne(session, readerFilter(reader.attempt()).append(READ_ATTEMPT + ".failed", true),
+                new Document("$inc", new Document("sourceStartupProofRevision", 1L))).getMatchedCount() != 1
+                || consumers.updateOne(session, new Document("_id", row.get("_id")).append(PREPARED_SOURCE, prepared),
+                new Document("$inc", new Document("sourceStartupProofRevision", 1L))).getMatchedCount() != 1) {
+            return Optional.empty();
+        }
+        return Optional.of(new CaptureStartupFailure(pipeline, witness,
+                CaptureStartupDocuments.requested(prepared.get("requestedPosition", Document.class)),
+                CaptureStartupDocuments.instant(prepared, "preparedAt"), reader));
+    }
+
+    private boolean provesRecordedFailure(ClientSession session, CaptureReadState reader, Document marker) {
+        Object proven = marker.get("failureClaimProven");
+        if (proven != null && !(proven instanceof Boolean)) {
+            throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", reader.attempt().miningChainId(), "field", "captureReadAttempt.failureClaimProven"), null);
+        }
+        // A committed first failure was guarded while its exact capture claim was live. Cleanup may
+        // retire that claim; the immutable cause remains qualified by the current pipeline and reader.
+        // Older records without this proof still require a fresh live capture-claim condition-write.
+        return Boolean.TRUE.equals(proven) || provesClaim(session, reader.attempt().captureClaim());
+    }
+
+    /** Consumes the stored pre-open and accepted facts, never a later mutable checkpoint observation. */
+    boolean guardPreparedStartup(ClientSession session, WorkloadClaimFence pipeline, CaptureResumeWitness witness,
+            ClusterRecoveryPosition requested) {
+        Optional<CaptureStartupProof> proof = startupProof(session, pipeline, witness, true);
+        return proof.isPresent() && Objects.equals(proof.get().requestedPosition(), requested);
+    }
+
+    boolean guardPreparedStartup(ClientSession session, WorkloadClaimFence pipeline, CaptureResumeWitness witness,
+            ClusterRecoveryPosition requested, Set<String> requiredSources) {
+        Document row = consumers.find(session, consumerKey(witness.miningChainId(), witness.consumerId())).first();
+        Document prepared = CaptureStartupDocuments.prepared(row);
+        return prepared != null && CaptureStartupDocuments.requiredSources(prepared).equals(requiredSources)
+                && guardPreparedStartup(session, pipeline, witness, requested);
+    }
+
+    private Optional<CaptureStartupProof> startupProof(ClientSession session, WorkloadClaimFence pipeline,
+            CaptureResumeWitness witness, boolean touch) {
+        if (!provesClaim(session, pipeline)) { return Optional.empty(); }
+        Document row = consumers.find(session, consumerKey(witness.miningChainId(), witness.consumerId())).first();
+        Document prepared = CaptureStartupDocuments.prepared(row);
+        if (prepared == null || !sameProofRun(prepared.get("pipelineClaim", Document.class), pipeline)
+                || !witness.equals(CaptureStartupDocuments.witness(prepared.get("witness", Document.class)))) { return Optional.empty(); }
+        CaptureReadState reader = null;
+        Instant accepted;
+        if (witness.readMode() == io.tapstate.core.model.ReadMode.SNAPSHOT_ONLY) {
+            accepted = CaptureStartupDocuments.instant(prepared, "snapshotAcceptedAt");
+            if (accepted == null) { return Optional.empty(); }
+        } else {
+            Document root = collection.find(session, new Document("_id", witness.miningChainId())).first();
+            reader = root == null ? null : CaptureStartupDocuments.reader(root.get(READ_ATTEMPT, Document.class));
+            if (reader == null || !reader.accepted() || !reader.attempt().tables().containsAll(witness.tables())
+                    || !pipeline.key().clusterId().equals(reader.attempt().captureClaim().key().clusterId())
+                    || pipeline.profileGeneration() != reader.attempt().captureClaim().profileGeneration()
+                    || CaptureStartupDocuments.instant(prepared, "attachedAt") == null
+                    || readEpoch(prepared, "attachedEpoch") != reader.attempt().chainEpoch()
+                    || (witness.snapshotOwed() && CaptureStartupDocuments.instant(prepared, "snapshotAcceptedAt") == null)
+                    || readEpoch(prepared, "readerVersion") != reader.attempt().version()
+                    || readEpoch(prepared, "readerEpoch") != reader.attempt().chainEpoch()
+                    || !Objects.equals(prepared.get("readerClaim"), WorkloadClaimDocuments.stored(reader.attempt().captureClaim()))
+                    || !Objects.equals(prepared.get("readerTables"), reader.attempt().tables())
+                    || (witness.srsEnabled() && (!reader.attempt().tables().equals(root.get("captureServingTables"))
+                        || readEpoch(root, "captureServingEpoch") != reader.attempt().chainEpoch()))
+                    || readEpoch(root, "epoch") != reader.attempt().chainEpoch()
+                    || !provesClaim(session, reader.attempt().captureClaim())) { return Optional.empty(); }
+            if (touch && collection.updateOne(session, readerFilter(reader.attempt())
+                            .append(READ_ATTEMPT + ".failed", false)
+                            .append(READ_ATTEMPT + ".firstDeliveredAt", Date.from(reader.firstDeliveredAt())),
+                    new Document("$inc", new Document("sourceStartupProofRevision", 1L))).getMatchedCount() != 1) {
+                return Optional.empty();
+            }
+            accepted = reader.firstDeliveredAt();
+            Instant attached = CaptureStartupDocuments.instant(prepared, "attachedAt");
+            if (attached.isAfter(accepted)) { accepted = attached; }
+            Instant snapshot = CaptureStartupDocuments.instant(prepared, "snapshotAcceptedAt");
+            if (snapshot != null && snapshot.isAfter(accepted)) { accepted = snapshot; }
+        }
+        ClusterRecoveryPosition requested = CaptureStartupDocuments.requested(prepared.get("requestedPosition", Document.class));
+        if (reader != null && !Boolean.TRUE.equals(prepared.getBoolean("sharedAttachment"))
+                && reader.attempt().requestedKind() == CaptureReadAttempt.Kind.RESUME
+                && !Objects.equals(reader.attempt().requestedToken(), reader.resolvedAnchor())) { return Optional.empty(); }
+        if (requested == null && reader != null) {
+            requested = new ClusterRecoveryPosition(witness.sourceId(), witness.connectorId(), reader.attempt().captureClaim().key().resourceId(),
+                    ClusterRecoveryPosition.Kind.DURABLE_POSITION,
+                    new ChainPosition(SourceOrder.snapshotRow(reader.attempt().chainEpoch()), reader.resolvedAnchor()),
+                    "source-resolved-" + reader.attempt().requestedKind().name().toLowerCase(java.util.Locale.ROOT),
+                    witness.miningChainId() + "/" + witness.consumerId());
+            Document boundary = CaptureStartupDocuments.requested(requested);
+            if (consumers.updateOne(session, new Document("_id", row.get("_id")).append(PREPARED_SOURCE, prepared),
+                    new Document("$set", new Document(PREPARED_SOURCE + ".requestedPosition", boundary))).getMatchedCount() != 1) {
+                return Optional.empty();
+            }
+            prepared.put("requestedPosition", boundary);
+        }
+        if (touch && consumers.updateOne(session, new Document("_id", row.get("_id"))
+                        .append(PREPARED_SOURCE, prepared), new Document("$inc", new Document("sourceStartupProofRevision", 1L)))
+                .getMatchedCount() != 1) { return Optional.empty(); }
+        return Optional.of(new CaptureStartupProof(pipeline, witness,
+                requested, CaptureStartupDocuments.instant(prepared, "preparedAt"), accepted, reader));
+    }
+
+    private static Document readerFilter(CaptureReadAttempt attempt) {
+        return new Document("_id", attempt.miningChainId()).append("epoch", attempt.chainEpoch())
+                .append(READ_ATTEMPT + ".version", attempt.version()).append(READ_ATTEMPT + ".tables", attempt.tables())
+                .append(READ_ATTEMPT + ".captureClaim", WorkloadClaimDocuments.stored(attempt.captureClaim()));
+    }
+
+    private static boolean sameProofRun(Document stored, WorkloadClaimFence current) {
+        if (stored == null) { return false; }
+        Document prior = new Document(stored); prior.remove("topologyRevision");
+        Document actual = WorkloadClaimDocuments.stored(current); actual.remove("topologyRevision");
+        return prior.equals(actual);
+    }
+
+    private static Document eqDefault(String field, Object expected, Object fallback) {
+        return new Document("$eq", java.util.Arrays.asList(new Document("$ifNull", java.util.Arrays.asList("$" + field, fallback)),
+                new Document("$literal", expected)));
+    }
 
     /**
      * A root-local fence advanced by every split-cursor write that may create the cursor. It has no model

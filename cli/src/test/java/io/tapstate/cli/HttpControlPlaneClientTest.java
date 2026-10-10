@@ -167,6 +167,72 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void recoveryClaimsAndNativeContextKeepTheirSeparateDurableIdentities() throws Exception {
+        for (String path : List.of("/api/cluster/members", "/api/cluster/status")) {
+            HttpServer server = serverReplying(path, 200, JsonOut.compact(RecoveryFixtures.topology()));
+            try {
+                HttpControlPlaneClient client = new HttpControlPlaneClient();
+                ClusterMembersOutcome outcome = path.endsWith("status")
+                        ? client.clusterStatus(baseOf(server), "token") : client.clusterMembers(baseOf(server), "token");
+                assertThat(outcome).isInstanceOf(ClusterMembersOutcome.Listed.class);
+                var found = (ClusterMembersOutcome.Listed) outcome;
+                assertThat(JsonReader.parse(JsonOut.compact(RecoveryWire.tree(found.recovery())))).isEqualTo(RecoveryFixtures.clusterRecovery());
+                assertThat(found.recovery().quorumReady()).isNull();
+                assertThat(found.recovery().capacity().occupiedByNode()).isNull();
+                var pipeline = found.pipelines().getFirst();
+                assertThat(JsonReader.parse(JsonOut.compact(RecoveryWire.tree(pipeline.recovery())))).isEqualTo(RecoveryFixtures.pipelineRecovery());
+                assertThat(pipeline.controllerClaim().executionContextCurrent()).isFalse();
+                assertThat(pipeline.controllerClaim().executionGeneration()).isEqualTo(22);
+                assertThat(pipeline.controllerClaim().contextExecutionGeneration()).isEqualTo(21);
+                assertThat(pipeline.controllerClaim().executionMembers()).containsExactly(new RemoteClaim.Member("node-b", "boot-b1", "uuid-b1"));
+                var processors = pipeline.vertices().getFirst().processors();
+                assertThat(processors.getFirst().localIndex()).isNull();
+                assertThat(processors.getFirst().context()).isNull();
+                assertThat(JsonReader.parse(JsonOut.compact(RecoveryWire.tree(processors.getLast().context()))))
+                        .isEqualTo(RecoveryFixtures.processorContext());
+                assertThat(found.recovery().items().getFirst().successor().failureNote().diagnostic().params())
+                        .containsEntry("requested", "resume-12");
+                assertThat(found.recovery().items().getFirst().originalPositions().get("crm").token()).isEqualTo("resume-7");
+            } finally {
+                server.stop(0);
+            }
+        }
+    }
+
+    @Test
+    void statusAndExplanationCarryTheSameAttemptFactsAndOriginalCodedArguments() throws Exception {
+        HttpServer statusServer = serverReplying("/api/pipelines/orders/status", 200, JsonOut.compact(RecoveryFixtures.status()));
+        HttpServer explainServer = serverReplying("/api/pipelines/orders/explain", 200, JsonOut.compact(RecoveryFixtures.explanation()));
+        try {
+            var client = new HttpControlPlaneClient();
+            StatusOutcome status = client.status(baseOf(statusServer), "token", "orders");
+            ExplainOutcome explanation = client.explain(baseOf(explainServer), "token", "orders");
+            assertThat(status).isInstanceOf(StatusOutcome.Found.class);
+            assertThat(explanation).isInstanceOf(ExplainOutcome.Found.class);
+            assertThat(JsonReader.parse(JsonOut.compact(ReadViewDocuments.status((StatusOutcome.Found) status))))
+                    .isEqualTo(RecoveryFixtures.status());
+            assertThat(JsonReader.parse(JsonOut.compact(ReadViewDocuments.explanation((ExplainOutcome.Found) explanation))))
+                    .isEqualTo(RecoveryFixtures.explanation());
+        } finally {
+            statusServer.stop(0);
+            explainServer.stop(0);
+        }
+    }
+
+    @Test
+    void malformedRecoveryDoesNotDecodeAsAHealthyEmptyQueue() throws Exception {
+        Map<String, Object> malformed = new java.util.LinkedHashMap<>(RecoveryFixtures.explanation());
+        malformed.put("recovery", Map.of("recoveryState", "RECOVERED", "causes", List.of(), "items", "wrong-type"));
+        HttpServer server = serverReplying("/api/pipelines/orders/explain", 200, JsonOut.compact(malformed));
+        try {
+            assertThat(new HttpControlPlaneClient().explain(baseOf(server), "token", "orders"))
+                    .isInstanceOf(ExplainOutcome.Unreachable.class);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void healthyWhenHealthzReturns200() throws Exception {
         HttpServer server = serverReplying(200, "ok");
         try {

@@ -4,6 +4,7 @@ import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.CaptureResumeWitness;
 
 import java.util.Objects;
 
@@ -27,12 +28,9 @@ import java.util.Objects;
  *       to the pipeline id. The pipeline id still names the job and snapshot handoff.</li>
  * </ul>
  *
- * <p>No connector position is carried here. Both a run's seam and its per-change positions are the
- * source's own and are learned from it as the read happens — the seam from the snapshot batch, each
- * change's from the change itself. {@code snapshotEpoch} is an engine order, not a resumable source
- * coordinate: it exists precisely where no tail and therefore no connector position exists. A source
- * position supplied alongside the run instead would be a stand-in for a connector, and a stand-in is what
- * makes a restart's positions start over while its generation rises.
+ * <p>A profile-aware run carries an immutable pre-open witness from the source coordination store.
+ * Snapshot seams still come from the actual bounded read; an existing resume uses only the frozen
+ * confirmed frontier, so a later checkpoint movement cannot silently change this attempt's request.
  */
 public record CaptureRunSpec(
         CaptureConfig config,
@@ -46,7 +44,16 @@ public record CaptureRunSpec(
         long schemaVer,
         long snapshotEpoch,
         WorkloadClaimFence captureFence,
-        String consumerId) {
+        String consumerId,
+        CaptureResumeWitness resumeWitness,
+        WorkloadClaimFence pipelineFence) {
+
+    public CaptureRunSpec(CaptureConfig config, ReadMode readMode, String srsKey, boolean srsEnabled,
+            String sourceId, String pipelineId, StartFrom startFrom, String retention, long schemaVer,
+            long snapshotEpoch, WorkloadClaimFence captureFence, String consumerId) {
+        this(config, readMode, srsKey, srsEnabled, sourceId, pipelineId, startFrom, retention, schemaVer,
+                snapshotEpoch, captureFence, consumerId, null, null);
+    }
 
     /** Compatibility construction for a caller whose pipeline has one consumption record. */
     public CaptureRunSpec(
@@ -107,13 +114,25 @@ public record CaptureRunSpec(
     public CaptureRunSpec withCaptureFence(WorkloadClaimFence fence) {
         return new CaptureRunSpec(
                 config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
-                startFrom, retention, schemaVer, snapshotEpoch, fence, consumerId);
+                startFrom, retention, schemaVer, snapshotEpoch, fence, consumerId, resumeWitness, pipelineFence);
     }
 
     /** The same run using {@code id} as this source node's independent progress record. */
     public CaptureRunSpec withConsumerId(String id) {
         return new CaptureRunSpec(config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
-                startFrom, retention, schemaVer, snapshotEpoch, captureFence, id);
+                startFrom, retention, schemaVer, snapshotEpoch, captureFence, id, resumeWitness, pipelineFence);
+    }
+
+    /** Freeze the exact pre-open source truth and successor authority for this run. */
+    public CaptureRunSpec withResumeWitness(CaptureResumeWitness witness, WorkloadClaimFence pipeline) {
+        if (!witness.sourceId().equals(sourceId) || !witness.consumerId().equals(consumerId)
+                || !witness.miningChainId().equals(miningChainId().value())
+                || !witness.tables().equals(config.streams()) || witness.readMode() != readMode
+                || witness.srsEnabled() != srsEnabled) {
+            throw new IllegalArgumentException("a frozen witness must name the actual source run");
+        }
+        return new CaptureRunSpec(config, readMode, srsKey, srsEnabled, sourceId, pipelineId,
+                startFrom, retention, schemaVer, snapshotEpoch, captureFence, consumerId, witness, pipeline);
     }
 
     /** Shared capture state follows the physical source; direct recovery state follows its own channel. */

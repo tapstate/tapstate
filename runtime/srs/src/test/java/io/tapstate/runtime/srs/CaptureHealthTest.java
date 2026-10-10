@@ -72,7 +72,7 @@ class CaptureHealthTest {
         CaptureHealth health = new CaptureHealth();
         Envelope[] delivered = new Envelope[1];
         CaptureListener listener = health.recording((events, pos) -> delivered[0] = events.get(0));
-        assertThat(listener).isNotInstanceOf(CaptureStartedListener.class);
+        assertThat(listener).isInstanceOf(CaptureStartedListener.class);
         Envelope event = Envelope.insert(1L, "orders", Map.of("id", 1), Map.of());
 
         listener.onBatch(List.of(event), Optional.empty());

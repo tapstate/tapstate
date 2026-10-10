@@ -84,6 +84,7 @@ public final class NestDag {
                     : chainsByProducer(frontier, rootAlias, sources.size());
             Vertex passthrough = width.sized(dag.newVertex(nodeId,
                     width.metaSupplier(nodeId, PassthroughProcessor.processors(axes, chains), axes, chains)));
+            width.buffered(passthrough, io.tapstate.runtime.engine.ProcessorBufferBounds.oneOutput());
             int ordinal = 0;
             for (Vertex source : sources) {
                 draw(dag, source, passthrough, ordinal++, passthroughKey, nextOutbound, width);
@@ -99,6 +100,9 @@ public final class NestDag {
             Vertex vertex = width.sized(dag.newVertex(spec.name(), width.metaSupplier(spec.name(),
                     processorsFor(spec, topology, binding, outputStream, frontier, chains),
                     frontier == null ? null : frontier.axes(), chains)));
+            width.buffered(vertex, spec.isAssembler()
+                    ? NestBufferBounds.assembler(spec, topology.slots(), binding.settings())
+                    : NestBufferBounds.resolver(spec, binding.settings()));
             built.put(spec.pathId(), vertex);
             for (NestInbound edge : spec.inbound()) {
                 connect(dag, vertex, edge, built, upstream, nextOutbound, frontier, width);
@@ -147,6 +151,7 @@ public final class NestDag {
                         binding.settings().referrersAllowedIn(lookup.mapName()),
                         frontier == null ? null : frontier.axes(), chains),
                 frontier == null ? null : frontier.axes(), chains)));
+        width.buffered(vertex, NestBufferBounds.lookup(lookup, binding.settings()));
         Vertex source = sources.size() == 1
                 ? sources.get(0)
                 : gatheredInto(dag, vertex, lookup.alias(), sources, nextOutbound, frontier);

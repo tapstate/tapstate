@@ -68,12 +68,12 @@ class ClusterPipelineTopologyServiceTest {
         ClusterPipelineView pipeline = topology.pipelines(MEMBERS).get(0);
 
         assertThat(pipeline.controllerClaim())
-                .isEqualTo(new ClusterClaimView("orders", "node-b", "boot-b1", 3, 7, 4, true));
+                .isEqualTo(legacyClaim("orders", "node-b", "boot-b1", 3, 7, true));
         assertThat(pipeline.captureClaims())
                 .as("a capture's generations fence one reader of a source from the next, which is not "
                         + "the same question as which actuation of the pipeline is current -- one pair "
                         + "hung off the pipeline would have to mean the controller's")
-                .containsExactly(new ClusterClaimView("capture-1", "node-a", "boot-a1", 1, 4, 4, true));
+                .containsExactly(legacyClaim("capture-1", "node-a", "boot-a1", 1, 4, true));
     }
 
     @Test
@@ -100,15 +100,14 @@ class ClusterPipelineTopologyServiceTest {
                 .as("the record outlives its holder, and who held it last is exactly what a reader "
                         + "chasing a dead owner needs -- dropping it would leave the pipeline ownerless "
                         + "just when the owner is the question")
-                .isEqualTo(new ClusterClaimView("orders", "node-b", "boot-b1", 3, 7, 4, false));
+                .isEqualTo(legacyClaim("orders", "node-b", "boot-b1", 3, 7, false));
     }
 
     @Test
     void eachProcessorSaysItsPlaceOnItsMemberAndWhatItWasLastReadToBeCarrying() {
-        // Six processors, three on each of two members, reported out of order: the engine numbers each
-        // member's processors of a vertex in one run, so a processor's place on its member is its rank there.
+        // Metrics arrive out of order; native contexts supply the actual local index independently.
         ClusterPipelineTopologyService topology = new ClusterPipelineTopologyService(
-                runs(new LivePipelineVertex("serve.s", List.of(
+                () -> List.of(new LivePipelineRun("orders", "exec-1", MEASURED, Set.of(UUID_A, UUID_B), List.of(new LivePipelineVertex("serve.s", List.of(
                         new LivePipelineProcessor(4, UUID_B, true, 7L, Map.of("shop", 12L), Map.of("shop", 900L),
                                 Map.of("shop.orders", 30L), Map.of("orders", 512L)),
                         new LivePipelineProcessor(0, UUID_A, true, 0L, Map.of(), Map.of()),
@@ -116,6 +115,7 @@ class ClusterPipelineTopologyServiceTest {
                         new LivePipelineProcessor(2, UUID_A, true),
                         new LivePipelineProcessor(5, UUID_B, true),
                         new LivePipelineProcessor(1, UUID_A, true)))),
+                        java.util.stream.IntStream.range(0, 6).mapToObj(index -> nativeContext("serve.s", index)).toList())),
                 PipelineCaptures.none(), claims, desired("orders"), CLUSTER);
 
         ClusterVertexView vertex = topology.pipelines(MEMBERS).get(0).vertices().get(0);
@@ -133,6 +133,17 @@ class ClusterPipelineTopologyServiceTest {
     }
 
     @Test
+    void aSparseMetricsReadingCannotInventANativeLocalProcessorIndex() {
+        var topology = new ClusterPipelineTopologyService(
+                runs(new LivePipelineVertex("serve", List.of(new LivePipelineProcessor(4, UUID_B, true)))),
+                PipelineCaptures.none(), claims, desired("orders"), CLUSTER);
+
+        assertThat(topology.pipelines(MEMBERS).get(0).vertices().get(0).processors().get(0).localIndex())
+                .as("the metrics carry a global index, while the missing earlier workers have not reported yet")
+                .isNull();
+    }
+
+    @Test
     void aVertexPinnedToOneMemberReportsOneProcessorRatherThanOnePerMember() {
         ClusterPipelineTopologyService topology = new ClusterPipelineTopologyService(
                 runs(new LivePipelineVertex("source", List.of(
@@ -145,7 +156,7 @@ class ClusterPipelineTopologyServiceTest {
         assertThat(vertex.processors())
                 .as("the engine puts an instance that does nothing on every member a pinned vertex is "
                         + "not running on; counting those reports a pinned vertex as running everywhere")
-                .containsExactly(new ClusterProcessorView(0, 0, UUID_B, "node-b", null, Map.of(), Map.of()));
+                .containsExactly(new ClusterProcessorView(0, null, UUID_B, "node-b", null, Map.of(), Map.of()));
         assertThat(vertex.effective()).isEqualTo(1);
         assertThat(vertex.requested())
                 .as("what ran is not what was asked for: a run with no plan recorded asked for nothing, and "
@@ -192,6 +203,45 @@ class ClusterPipelineTopologyServiceTest {
     /** One working processor of {@code name}, on the second member. */
     private static LivePipelineVertex working(String name) {
         return new LivePipelineVertex(name, List.of(new LivePipelineProcessor(0, UUID_B, true)));
+    }
+
+    private static io.tapstate.core.lifecycle.ProcessorRuntimeContext nativeContext(String vertex, int index) {
+        boolean first = index < 3;
+        return new io.tapstate.core.lifecycle.ProcessorRuntimeContext("orders", vertex, "42", "43", 3, 7, 2,
+                first ? "node-a" : "node-b", first ? "boot-a1" : "boot-b1", first ? UUID_A : UUID_B,
+                first ? "node-a:5701" : "node-b:5701", first ? 0 : 1, index % 3, index, 3, 6, 2, MEASURED);
+    }
+
+    private static ClusterClaimView legacyClaim(String id, String node, String boot, long claim, long execution, boolean leased) {
+        return new ClusterClaimView(id, node, boot, claim, execution, 4, leased, MEASURED, leased ? 21_000L : -3_000L,
+                null, null, null, null, null, null, null, null, List.of(), null, null, null);
+    }
+
+    @Test
+    void aClaimCarriesStoreClockDeadlineAndItsOriginalExecutionProfileAndCohort() {
+        var key = new WorkloadClaimKey(CLUSTER, WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+        var profile = new io.tapstate.spi.store.ClusterExecutionProfile(CLUSTER, 2,
+                new io.tapstate.spi.store.ExecutionProfile(1, Map.of("runtime", "actual")));
+        var original = new WorkloadClaim(key, new WorkloadOwner("node-b", "boot-b1"), 4, 7, 9, MEASURED.plusSeconds(8),
+                7, 3, Set.of("node-a", "node-b"), 3, true, 2, profile, 8L, "inc", "rev",
+                Map.of("node-a", new io.tapstate.spi.store.ClusterExecutionMember("node-a", "boot-a1", UUID_A),
+                        "node-b", new io.tapstate.spi.store.ClusterExecutionMember("node-b", "boot-b1", UUID_B)));
+        claims.byKey.put(key, new WorkloadClaimReading(original, Duration.ofMillis(-500)));
+        var topology = new ClusterPipelineTopologyService(LivePipelineRuns.none(), PipelineCaptures.none(), claims, desired("orders"), CLUSTER);
+
+        var view = topology.pipelines(MEMBERS).get(0).controllerClaim();
+
+        assertThat(view.leaseUntil()).isEqualTo(MEASURED.plusSeconds(8));
+        assertThat(view.leaseRemainingMillis()).isEqualTo(-500);
+        assertThat(view.leased()).isFalse();
+        assertThat(view.profileGeneration()).isEqualTo(2);
+        assertThat(view.executionProfileHash()).isEqualTo(profile.profile().hash());
+        assertThat(view.executionTopologyRevision()).isEqualTo(8);
+        assertThat(view.executionClaimGeneration()).isEqualTo(3);
+        assertThat(view.executionContextCurrent()).isTrue();
+        assertThat(view.failureAfterMemberLoss()).isTrue();
+        assertThat(view.executionMembers()).containsExactly(new ClusterClaimView.Member("node-a", "boot-a1", UUID_A),
+                new ClusterClaimView.Member("node-b", "boot-b1", UUID_B));
     }
 
     /** The plan of an execution of {@code orders} with the given generation: its sink eight wide, three a member. */

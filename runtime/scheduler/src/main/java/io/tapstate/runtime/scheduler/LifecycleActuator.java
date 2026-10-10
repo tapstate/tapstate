@@ -65,4 +65,7 @@ public interface LifecycleActuator {
      * without this query there is nothing left to notice that no job is carrying it.
      */
     boolean isCarryingAJob(String pipelineId);
+
+    /** Real successful finite completion, after any required startup evidence has been consumed. */
+    default boolean hasCompleted(String pipelineId) { return false; }
 }

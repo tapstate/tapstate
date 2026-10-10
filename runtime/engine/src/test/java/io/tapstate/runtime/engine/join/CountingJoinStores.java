@@ -29,6 +29,7 @@ final class CountingJoinStores implements JoinStores {
     /** How many times a page of fact keys was asked for, and how many keys those asks carried. */
     int batchReads;
     int keysRead;
+    int largestBatchRead;
 
     /** How many times a single fact key was asked for on its own. */
     int singleReads;
@@ -89,6 +90,7 @@ final class CountingJoinStores implements JoinStores {
     void forgetCounts() {
         batchReads = 0;
         keysRead = 0;
+        largestBatchRead = 0;
         singleReads = 0;
         pageCountReads = 0;
         pageReads = 0;
@@ -107,6 +109,7 @@ final class CountingJoinStores implements JoinStores {
     public Map<String, Map<String, Object>> factsUnder(Collection<String> factKeys) {
         batchReads++;
         keysRead += factKeys.size();
+        largestBatchRead = Math.max(largestBatchRead, factKeys.size());
         return held.factsUnder(factKeys);
     }
 

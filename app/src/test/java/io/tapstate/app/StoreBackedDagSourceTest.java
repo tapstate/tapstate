@@ -71,6 +71,36 @@ import org.junit.jupiter.api.Test;
 class StoreBackedDagSourceTest {
 
     @Test
+    void admissionPlanningRecordsNothingAndActivationUsesTheFrozenSourceModel() {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("src", "orders"));
+        store.artifacts().save(connectionSupplier("dest"));
+        store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.spec("src", true)),
+                List.of(Step.inline("keep", FromClause.list(FromRef.literal("orders")),
+                        new TransformBody.Filter("true"), null)), null,
+                serve(FromRef.literal("keep"), sync("sync_1", "dest")), null, null));
+        store.schemas.save(new DiscoveredSourceModel("src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders", List.of(
+                        new SourceField("id", "bigint", TapstateType.INT64)), List.of("id"), List.of())))));
+
+        DagSource.PlannedStart planned = new StoreBackedDagSource(store).prepareStart("p", "tapstate").plan();
+
+        assertThat(store.derivedSchemas.latest("p", "src.orders")).isEmpty();
+        assertThat(store.derivedSchemas.latest("p", "keep")).isEmpty();
+        assertThat(store.derivedSchemas.pinned("p", "src.orders")).isEmpty();
+        store.schemas.save(new DiscoveredSourceModel("src", "mysql", 2L,
+                new SourceModel(List.of(new SourceTable("orders", List.of(
+                        new SourceField("changed", "varchar", TapstateType.STRING)), List.of(), List.of())))));
+
+        planned.build(null);
+
+        assertThat(store.derivedSchemas.pinned("p", "src.orders").orElseThrow().schema())
+                .containsOnlyKeys("id");
+        assertThat(store.derivedSchemas.pinned("p", "keep").orElseThrow().schema())
+                .containsOnlyKeys("id");
+    }
+
+    @Test
     void aKeepStateRestartDoesNotAnnounceANewSnapshotBoundBeforeOlderPendingChanges() {
         FakeStorePort store = new FakeStorePort();
         String consumer = SrsConsumerId.of("p", "crm_source").value();

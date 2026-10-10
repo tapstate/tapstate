@@ -31,6 +31,8 @@ import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.control.core.ClusterIdentityService;
 import io.tapstate.control.core.ClusterPipelineTopologyService;
 import io.tapstate.control.core.ClusterTopologyService;
+import io.tapstate.control.core.ClusterRecoveryQueries;
+import io.tapstate.control.core.ClusterRecoveryProjection;
 import io.tapstate.control.core.LiveClusterMembers;
 import io.tapstate.control.core.LivePipelineRuns;
 import io.tapstate.spi.store.ClusterMembershipStore;
@@ -205,13 +207,36 @@ class ControlPlaneConfiguration {
             ObjectProvider<HazelcastInstance> member,
             ObjectProvider<ClusterMembershipStore> membership,
             ClusterPipelineTopologyService pipelines,
-            ClusterProperties clusterProperties) {
+            ClusterProperties clusterProperties,
+            ObjectProvider<io.tapstate.spi.store.ClusterProfileStore> profiles,
+            ClusterRecoveryQueries recovery) {
         HazelcastInstance engine = member.getIfAvailable();
         return new ClusterTopologyService(
                 engine == null ? LiveClusterMembers.none() : new HazelcastLiveClusterMembers(engine),
                 membership.getIfAvailable(),
                 pipelines,
-                clusterProperties.getId());
+                clusterProperties.getId(),
+                clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE ? null : profiles.getIfAvailable(), recovery);
+    }
+
+    @Bean
+    ClusterRecoveryQueries clusterRecoveryQueries(StorePort stores, ClusterProperties properties,
+            ObjectProvider<HazelcastInstance> members, ObjectProvider<ClusterMembershipGate> gates) {
+        if (properties.getProfile() == ClusterProperties.Profile.SINGLE) { return ClusterRecoveryQueries.NONE; }
+        ClusterRecoveryProjection projection = new ClusterRecoveryProjection(stores.artifacts(), stores.clusterRecovery(),
+                stores.clusterProfiles(), stores.clusterCapacity(), stores.workloadClaims());
+        return new ClusterRecoveryQueries() {
+            private Boolean quorum() {
+                ClusterMembershipGate gate = gates.getIfAvailable();
+                return members.getIfAvailable() == null || gate == null ? null : gate.businessEligible();
+            }
+            @Override public io.tapstate.control.core.ClusterRecoveryView cluster() {
+                return projection.cluster(properties.getId(), quorum());
+            }
+            @Override public io.tapstate.control.core.ClusterPipelineRecoveryView pipeline(String pipelineId) {
+                return projection.pipeline(properties.getId(), pipelineId, quorum());
+            }
+        };
     }
 
     /**
@@ -632,10 +657,11 @@ class ControlPlaneConfiguration {
 
     @Bean
     PipelineObservationQueryService pipelineObservationQueryService(
-            ArtifactQueryService artifactQueryService, StorePort storePort, ObjectProvider<HazelcastInstance> member) {
+            ArtifactQueryService artifactQueryService, StorePort storePort, ObjectProvider<HazelcastInstance> member,
+            ClusterRecoveryQueries recovery) {
         HazelcastInstance engine = member.getIfAvailable();
         return new PipelineObservationQueryService(artifactQueryService, storePort.observations(),
-                executionPlans(engine), dataMembers(engine));
+                executionPlans(engine), dataMembers(engine), recovery);
     }
 
     @Bean
@@ -652,12 +678,12 @@ class ControlPlaneConfiguration {
     @Bean
     PipelineExplainService pipelineExplainService(
             ArtifactQueryService artifactQueryService, StorePort storePort, Clock clock,
-            ObjectProvider<HazelcastInstance> member) {
+            ObjectProvider<HazelcastInstance> member, ClusterRecoveryQueries recovery) {
         ExplanationCatalog messages = ExplanationCatalog.bundled();
         HazelcastInstance engine = member.getIfAvailable();
         return new PipelineExplainService(
                 artifactQueryService, storePort.observations(), clock, messages::render,
-                executionPlans(engine), dataMembers(engine));
+                executionPlans(engine), dataMembers(engine), recovery);
     }
 
     /**

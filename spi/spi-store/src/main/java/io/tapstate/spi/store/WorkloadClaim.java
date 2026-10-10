@@ -3,6 +3,8 @@ package io.tapstate.spi.store;
 import java.time.Instant;
 import java.util.Objects;
 import java.util.Set;
+import java.util.Map;
+import java.util.Optional;
 
 /**
  * Durable owner lease, monotonic generations, and the last execution's failure context.
@@ -28,13 +30,15 @@ public record WorkloadClaim(
         ClusterExecutionProfile executionProfile,
         Long executionTopologyRevision,
         String executionIncarnation,
-        String executionRevision) {
+        String executionRevision,
+        Map<String, ClusterExecutionMember> executionMembers) {
 
     public WorkloadClaim {
         key = Objects.requireNonNull(key, "key");
         owner = Objects.requireNonNull(owner, "owner");
         leaseUntil = Objects.requireNonNull(leaseUntil, "leaseUntil");
         executionNodeIds = Set.copyOf(Objects.requireNonNull(executionNodeIds, "executionNodeIds"));
+        executionMembers = Map.copyOf(Objects.requireNonNull(executionMembers, "executionMembers"));
         if (claimGeneration < 1 || executionGeneration < 0 || topologyRevision < 0
                 || contextExecutionGeneration < 0 || executionClaimGeneration < 0
                 || failureClaimGeneration < 0 || profileGeneration < 0) {
@@ -46,6 +50,28 @@ public record WorkloadClaim(
         if (executionTopologyRevision != null && executionTopologyRevision < 1) {
             throw new IllegalArgumentException("execution topology revision must be positive when known");
         }
+        if (!executionMembers.isEmpty() && (!executionMembers.keySet().equals(executionNodeIds)
+                || executionMembers.entrySet().stream().anyMatch(entry -> !entry.getKey().equals(entry.getValue().nodeId())))) {
+            throw new IllegalArgumentException("execution member facts must cover the exact original stable member set");
+        }
+    }
+
+    public WorkloadClaim(WorkloadClaimKey key, WorkloadOwner owner, long claimGeneration,
+            long executionGeneration, long topologyRevision, Instant leaseUntil,
+            long contextExecutionGeneration, long executionClaimGeneration, Set<String> executionNodeIds,
+            long failureClaimGeneration, boolean failureAfterMemberLoss, long profileGeneration,
+            ClusterExecutionProfile executionProfile, Long executionTopologyRevision,
+            String executionIncarnation, String executionRevision) {
+        this(key, owner, claimGeneration, executionGeneration, topologyRevision, leaseUntil, contextExecutionGeneration,
+                executionClaimGeneration, executionNodeIds, failureClaimGeneration, failureAfterMemberLoss,
+                profileGeneration, executionProfile, executionTopologyRevision, executionIncarnation, executionRevision, Map.of());
+    }
+
+    /** Absence is unknown, never a guessed membership verdict from stable ids alone. */
+    public Optional<Boolean> originalMembersPresent(Map<String, ClusterExecutionMember> liveMembers) {
+        Objects.requireNonNull(liveMembers, "liveMembers");
+        return executionMembers.isEmpty() || contextExecutionGeneration != executionGeneration ? Optional.empty()
+                : Optional.of(executionMembers.entrySet().stream().allMatch(entry -> entry.getValue().equals(liveMembers.get(entry.getKey()))));
     }
 
     public WorkloadClaim(WorkloadClaimKey key, WorkloadOwner owner, long claimGeneration,

@@ -159,6 +159,9 @@ capture.start-from-outside-window:
 capture.event-table-not-selected:
   message: "The capture stream emitted table `{table}`, which this pipeline did not select."
   solution: "Update the source table selection or verify the connector emits the configured table names."
+capture.reader-startup-failed:
+  message: "Source '{source}' failed during reader startup for pipeline '{pipeline}' ({code})."
+  solution: "Inspect the recorded source failure and its requested position before retrying."
 capture.recovery-log-gap:
   message: "Change log `{ring}` cannot recover sequence {sequence}: {reason}."
   solution: "Restore the retained SRS log or stop with state purge and perform a full reload. Do not resume from a newer cursor; a CDC-only baseline requires explicit acceptance of the missing interval."
@@ -429,6 +432,9 @@ dsl.malformed-interpolation:
 lifecycle.cluster-capacity-refused:
   message: "Node {node} cannot reserve {requested} {resource}: {occupied} already occupied, ceiling {limit}."
   solution: "Wait for a pending rebuild or execution to release its resources, reduce the pipeline's computed demand, or configure a verified larger capacity ceiling."
+lifecycle.cluster-capacity-unproven:
+  message: "Pipeline {pipeline} cannot start because its resource upper bound is unproven: {reason}."
+  solution: "Resolve the unavailable compiled resource facts before starting; unknown resource demand cannot be counted as zero."
 lifecycle.illegal-transition:
   message: "Cannot {verb} a pipeline in state {from}."
   solution: "Only certain actions are valid from each state; check the pipeline's current state first."
@@ -879,6 +885,9 @@ nest.root-fanout-limit-exceeded:
 nest.migration-parking-limit-exceeded:
   message: "Rows on their way to {address} have parked {changes} changes, past the limit of {limit}."
   solution: "These rows are in no document while they sit there and the durable position is held below the change that moved them, so this is worth looking at rather than only raising. Reaching it usually means the half of the move that collects them is not being worked - check that side before raising the limit."
+nest.migration-handover-unavailable:
+  message: "Parked handover {address} does not supply its promised piece {piece}."
+  solution: "The handover was refused without freeing its identifying entry. Retry the fenced execution after concurrent collection or storage availability settles; investigate the retained operator state if the piece remains unavailable."
 nest.reference-fanout-limit-exceeded:
   message: "Row {identity} behind embed {refPath} is referenced by {referrers} rows, past the per-row limit of {limit}."
   solution: "One change to that row rewrites that many documents, which is what this bounds - it is not a limit on storage, so widening how the references are held does not lift it. Raise the limit if the data really is this wide, or embed the row from the other side so the change travels with one document instead of all of them."

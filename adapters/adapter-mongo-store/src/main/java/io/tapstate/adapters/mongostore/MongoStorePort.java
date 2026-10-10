@@ -203,6 +203,10 @@ public final class MongoStorePort implements StorePort {
         MongoWorkloadClaimStore leases = new MongoWorkloadClaimStore(SystemCollections.WORKLOAD_CLAIMS.on(database),
                 clusteredClaims ? profiles : null);
         this.workloadClaims = leases;
+        MongoSrsMetaStore sourceMeta = new MongoSrsMetaStore(connection.client(),
+                SystemCollections.SRS_META.on(database), SystemCollections.SRS_CONSUMER_OFFSETS.on(database),
+                SystemCollections.WORKLOAD_CLAIMS.on(database));
+        this.meta = sourceMeta;
         MongoClusterCapacityStore capacity = new MongoClusterCapacityStore(profiles, leases,
                 SystemCollections.CLUSTER_CAPACITY_OCCUPANCY.on(database),
                 SystemCollections.WORKLOAD_CLAIMS.on(database), SystemCollections.CLUSTER_EXECUTION_PROFILES.on(database),
@@ -210,12 +214,10 @@ public final class MongoStorePort implements StorePort {
                 SystemCollections.PIPELINE_DESIRED.on(database), SystemCollections.PIPELINE_STATE.on(database),
                 SystemCollections.ARTIFACTS.on(database));
         this.clusterCapacity = capacity;
-        this.clusterRecovery = new MongoClusterRecoveryStore(SystemCollections.CLUSTER_RECOVERY_QUEUE.on(database), capacity);
+        this.clusterRecovery = new MongoClusterRecoveryStore(SystemCollections.CLUSTER_RECOVERY_QUEUE.on(database), capacity, sourceMeta);
         this.clusterMembership =
                 new MongoClusterMembershipStore(SystemCollections.CLUSTER_MEMBERSHIP.on(database),
                         clusteredClaims ? profiles : null);
-        this.meta = new MongoSrsMetaStore(connection.client(),
-                SystemCollections.SRS_META.on(database), SystemCollections.SRS_CONSUMER_OFFSETS.on(database));
         this.srsLog = new MongoSrsLogStore(
                 connection.client(), SystemCollections.SRS_LOG.on(database),
                 SystemCollections.WORKLOAD_CLAIMS.on(database));

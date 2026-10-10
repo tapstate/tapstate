@@ -5,6 +5,8 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.LinkedHashSet;
 
 /**
  * Which vertices of a drawn graph run at each pipeline node's width, by node, as the graph is drawn.
@@ -19,6 +21,8 @@ public final class NodeVertices {
 
     private final Map<String, List<String>> byNode = new LinkedHashMap<>();
     private final Map<String, List<String>> feeding = new LinkedHashMap<>();
+    private final Set<String> writers = new LinkedHashSet<>();
+    private final Map<String, ProcessorBufferBounds> buffers = new LinkedHashMap<>();
 
     /** Notes that {@code vertex} runs at {@code node}'s width. */
     void add(String node, String vertex) {
@@ -28,6 +32,28 @@ public final class NodeVertices {
     /** Notes that {@code vertex}, drawn for another node or for none, sends its rows into {@code node}. */
     void feeds(String node, String vertex) {
         feeding.computeIfAbsent(node, ignored -> new ArrayList<>()).add(vertex);
+    }
+
+    /** Notes a vertex that opens sink writers, rather than a router belonging to the same sink node. */
+    void writer(String vertex) {
+        writers.add(vertex);
+    }
+
+    /** Sink writer vertices identified by the compiler, without inferring their role from a name. */
+    public Set<String> writers() {
+        return Set.copyOf(writers);
+    }
+
+    /** Registers the concrete processor's transient buffering as that processor is drawn. */
+    void buffers(String vertex, ProcessorBufferBounds bounds) {
+        if (buffers.put(vertex, bounds) != null) {
+            throw new IllegalStateException("a vertex has more than one buffer descriptor");
+        }
+    }
+
+    /** Descriptors for actual vertex roles; a missing descriptor supplies no resource assertion. */
+    public Map<String, ProcessorBufferBounds> bufferBounds() {
+        return Map.copyOf(buffers);
     }
 
     /** Every node's vertices that run at its width, in the order they were drawn. */

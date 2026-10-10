@@ -216,9 +216,9 @@ class EngineLifecycleActuatorTest {
                 .isEqualTo(PipelineActuationOwnership.Departure.START_REFUSED);
     }
 
-    /** A start refused once it took a run is that run's failure, judged like any other death of a run. */
+    /** A rejected resource plan must not spend an execution generation or open a source. */
     @Test
-    void aStartRefusedOnceItTookARunIsJudgedByThatRun() {
+    void aStartRefusedWhilePlanningTakesNoExecutionGeneration() {
         RecordingDagSource dagSource = new RecordingDagSource(new CopyOnWriteArrayList<>());
         dagSource.planning = () -> {
             throw new TapstateException(ActuationError.NO_SAFE_PARALLELISM, Map.of(
@@ -232,9 +232,10 @@ class EngineLifecycleActuatorTest {
 
         assertThatThrownBy(() -> actuator.start(PIPE)).isInstanceOf(TapstateException.class);
 
-        assertThat(ownership.heldExecutionGeneration(PIPE)).as("the start took a run first").isEqualTo(1);
-        assertThat(ownership.departure(PIPE, Duration.ofSeconds(90).toNanos()))
-                .isNotEqualTo(PipelineActuationOwnership.Departure.START_REFUSED);
+        assertThat(ownership.heldExecutionGeneration(PIPE))
+                .as("capacity and shape refusal happen before the execution allocator")
+                .isZero();
+        assertThat(member.getJet().getJob(PIPE)).isNull();
     }
 
     /** A start that plans its run does so before it opens the capture its topology is then built over. */
@@ -310,7 +311,12 @@ class EngineLifecycleActuatorTest {
         List<String> events = new CopyOnWriteArrayList<>();
         RecordingCaptureCoordinator coordinator = new RecordingCaptureCoordinator(events);
         RecordingDagSource dagSource = new RecordingDagSource(events);
-        ArtifactStore snapshot = ReadOnlyArtifactSnapshot.capture(new InMemoryArtifactStore());
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("orders")), null, null));
+        artifacts.save(new PipelineResource(PIPE, null, List.of(SourceRef.spec("orders_src", true)), null, null,
+                new ServeBlock.Inline(null, FromRef.literal("orders_src"), List.of(), null, null), null, null));
+        ArtifactStore snapshot = ReadOnlyArtifactSnapshot.capture(artifacts);
         dagSource.artifactSnapshot = snapshot;
         LifecycleActuator actuator = new EngineLifecycleActuator(
                 new Engine(member), dagSource, coordinator, teardown());

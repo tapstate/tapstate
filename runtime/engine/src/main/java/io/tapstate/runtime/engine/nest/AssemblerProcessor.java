@@ -184,6 +184,9 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
      */
     private final Map<Object, Window> windows = new LinkedHashMap<>();
 
+    /** A window emission whose frontier can be released only after the outbox accepted it. */
+    private boolean windowEmissionsNeedRelease;
+
     // The highest position per chain that needs no further document here, waiting until this level holds
     // nothing lower on that chain. These come from rows no document names and from a first filing already
     // present in the document that crossed ahead of its wake. In memory, like the windows beside it: a
@@ -456,11 +459,9 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
                 waiting.changes().forEach(change ->
                         deadLetter.unassemblable(vertex, new ReleasedChild(change, heldFor)));
                 for (int piece = 1; piece <= waiting.batches(); piece++) {
-                    ParkedSubtree more = parking.load(entry.getKey().piece(piece));
-                    if (more != null) {
-                        more.changes().forEach(change ->
-                                deadLetter.unassemblable(vertex, new ReleasedChild(change, heldFor)));
-                    }
+                    ParkedSubtree more = NestMigrationWriter.readPiece(parking, entry.getKey(), piece);
+                    more.changes().forEach(change ->
+                            deadLetter.unassemblable(vertex, new ReleasedChild(change, heldFor)));
                 }
                 letGoOf(entry.getKey(), waiting.batches());
             }
@@ -832,7 +833,8 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         }
         Touched document = touched(leaving, touched);
         document.ts = event.ts();
-        hand(ParkedSubtree.At.ofRoot(arriving), document.assembly.detachEverything(), event.positions());
+        hand(ParkedSubtree.At.ofRoot(arriving), document.assembly.everythingForHandover(), event.positions());
+        document.assembly.forgetEverything();
         document.assembly.deleteRoot(order, event.positions());
         document.rootDeleted = true;
     }
@@ -857,8 +859,8 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             // document without rows that reached nowhere else, and the replay that would move them again
             // resumes above the change that moved them - so nothing looks for them ever again. A failure
             // here costs a retry that parks the same rows twice, which their identities make harmless.
-            hand(ParkedSubtree.At.of(change), assembly.subtreeAt(change.movedFrom()), change.positions());
-            assembly.detachSubtree(change.movedFrom());
+            hand(ParkedSubtree.At.of(change), assembly.subtreeForHandover(change.movedFrom()), change.positions());
+            assembly.forgetSubtree(change.movedFrom());
             return;
         }
         assembly.take(change);
@@ -885,42 +887,17 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
      * move, nothing collects what is parked, and the subtree is gone from both documents with the pipeline
      * running and no error anywhere.
      */
-    private void hand(ParkedSubtree.At at, List<NestElement> subtree, Map<String, ChainPosition> since) {
-        if (subtree.isEmpty()) {
-            return;
-        }
-        ParkedSubtree held = parking.load(at);
+    private void hand(ParkedSubtree.At at, Iterable<NestElement> subtree, Map<String, ChainPosition> since) {
         Held outstanding = handedOver.get(at);
-        long parked = (outstanding == null ? 0L : outstanding.changes()) + subtree.size();
-        if (parked > parkingLimit) {
-            throw new TapstateException(NestError.MIGRATION_PARKING_LIMIT_EXCEEDED,
-                    Map.of("address", NestStateKeys.nameOf(at), "changes", parked, "limit", parkingLimit),
-                    null);
-        }
-        int size = (int) Math.min(Integer.MAX_VALUE, migrationBatch);
-        List<NestElement> first = held == null ? null : held.changes();
-        int cursor = 0;
-        if (first == null) {
-            first = List.copyOf(subtree.subList(0, Math.min(size, subtree.size())));
-            cursor = first.size();
-        }
-        int pieces = held == null ? 0 : held.batches();
-        while (cursor < subtree.size()) {
-            int take = Math.min(size, subtree.size() - cursor);
-            parking.save(at.piece(++pieces), new ParkedSubtree(subtree.subList(cursor, cursor + take)));
-            cursor += take;
-        }
-        // The entry naming the rest is written last, and it is the only one anyone looks for. A failure part
-        // way through therefore leaves pieces nobody reads rather than an address promising pieces that are
-        // not there - and the change that started the move is replayed, because the frontier is held below
-        // it until it lands, so they are written again.
-        parking.save(at, new ParkedSubtree(first, pieces), held == null);
+        NestMigrationWriter.Written written = NestMigrationWriter.publish(at, subtree, parking,
+                migrationBatch, parkingLimit).orElse(null);
+        if (written == null) return;
         // Kept from the first hand-over onto this address rather than reset by a later one: what the frontier
         // must stay below is the earliest change still in flight, and how long this has been outstanding is
         // measured from when it started rather than from the last thing added to it.
         handedOver.put(at, outstanding == null
-                ? new Held(since, clock.millis(), pieces, parked)
-                : new Held(outstanding.since(), outstanding.parkedAt(), pieces, parked));
+                ? new Held(since, clock.millis(), written.pieces(), written.changes())
+                : new Held(outstanding.since(), outstanding.parkedAt(), written.pieces(), written.changes()));
     }
 
     /**
@@ -947,12 +924,14 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
 
     /** Applies a hand-over, whichever pieces it was written in, in the order they were written. */
     private void takeIn(RootAssembly assembly, ParkedSubtree.At at, ParkedSubtree waiting) {
+        long changes = waiting.changes().size();
+        NestMigrationWriter.refuse(at, changes, parkingLimit);
         waiting.changes().forEach(assembly::take);
         for (int piece = 1; piece <= waiting.batches(); piece++) {
-            ParkedSubtree more = parking.load(at.piece(piece));
-            if (more != null) {
-                more.changes().forEach(assembly::take);
-            }
+            ParkedSubtree more = NestMigrationWriter.readPiece(parking, at, piece);
+            changes = Math.addExact(changes, more.changes().size());
+            NestMigrationWriter.refuse(at, changes, parkingLimit);
+            more.changes().forEach(assembly::take);
         }
     }
 
@@ -980,7 +959,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
      * still drains, and one fed nothing but bounds still gets those.
      */
     private void collectWhatIsOwed() {
-        if (parking == null || owed.isEmpty()) {
+        if (parking == null || owed.isEmpty() || !flush()) {
             return;
         }
         Map<Object, Touched> landed = new LinkedHashMap<>();
@@ -1004,6 +983,9 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
                     }
                     pending.remove();
                 }
+                if (landed.size() >= DrainFolding.MAX_KEYS_HELD && !settleLanded(landed, taken)) {
+                    return;
+                }
                 continue;
             }
             // One document may be owed several hand-overs at once, and a store answers a second read with
@@ -1023,18 +1005,28 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             taken.put(entry.getKey(), waiting.batches());
             handedOver.remove(entry.getKey());
             pending.remove();
+            if ((landed.size() >= DrainFolding.MAX_KEYS_HELD || taken.size() >= DrainFolding.MAX_KEYS_HELD)
+                    && !settleLanded(landed, taken)) {
+                return;
+            }
         }
         // Sent, not merely stored. A document that gained rows this way changed after it had already gone
         // out, and nothing else is due for that key - so without a send of its own the sink keeps the
         // version without them for good, with the state correct, every reading healthy and no error counted.
         // The hold on the frontier is let go of in the same breath, so a restart resumes above the change
         // and nothing replays it either.
-        if (!landed.isEmpty()) {
-            settle(landed);
-        }
+        settleLanded(landed, taken);
+    }
+
+    /** Persists one bounded landing group before freeing its parked rows or reading another group. */
+    private boolean settleLanded(Map<Object, Touched> landed, Map<ParkedSubtree.At, Integer> taken) {
+        if (!landed.isEmpty()) settle(landed);
         // Only once the documents holding those rows have been stored, for the reason collect gives: between
         // the two writes the rows exist in one place, and it must not be the one being emptied.
         taken.forEach(this::letGoOf);
+        landed.clear();
+        taken.clear();
+        return flush();
     }
 
     /**
@@ -1104,6 +1096,9 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
      * is what is still owed rather than what has just been paid.
      */
     private void settle(Map<Object, Touched> touched) {
+        // A drain or imported handover may have grown a document since its last write. Refuse before
+        // materializing reference rows or rendered output beyond the limits that admission reserved.
+        touched.forEach((key, document) -> verifyDocumentForRead(key, document.assembly));
         Map<String, Map<Object, Map<String, Object>>> resolved = resolveReferences(touched);
         touched.forEach((key, document) -> {
             document.assembly.render(slots, resolved).ifPresentOrElse(
@@ -1264,11 +1259,13 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
     }
 
     private boolean sendFolded(boolean onlyWhatHasRunOut) {
+        if (!flush() || !releaseEmittedWindows()) {
+            return false;
+        }
         if (windows.isEmpty()) {
-            return flush();
+            return true;
         }
         long now = clock.millis();
-        boolean letGo = false;
         Iterator<Map.Entry<Object, Window>> open = windows.entrySet().iterator();
         while (open.hasNext()) {
             Map.Entry<Object, Window> entry = open.next();
@@ -1298,6 +1295,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
                 continue;
             }
             RootAssembly assembly = store.load(entry.getKey());
+            if (assembly != null) verifyDocumentForRead(entry.getKey(), assembly);
             Map<String, Map<Object, Map<String, Object>>> references = assembly == null
                     ? Map.of()
                     : referencesFor(assembly);
@@ -1327,17 +1325,32 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             assembly.documentSent();
             store.save(entry.getKey(), assembly);
             window.reopen(now);
-            letGo = true;
-        }
-        if (!flush()) {
-            return false;
+            windowEmissionsNeedRelease = true;
+            if (!flush()) {
+                return false;
+            }
         }
         // Only after they have actually left: a bound offered ahead of the documents queued behind it
         // would say they had gone. And it has to be offered at all, because what this level may promise
         // depends on what it is holding as well as on what its edges said - an upstream that has finished
         // speaking sends nothing more to prompt the recount, and the chain would stay pinned at whatever
         // the fold held it to.
-        return !letGo || bounds == null || bounds.release(this::tryEmit);
+        return releaseEmittedWindows();
+    }
+
+    private boolean releaseEmittedWindows() {
+        if (windowEmissionsNeedRelease && bounds != null && !bounds.release(this::tryEmit)) {
+            return false;
+        }
+        windowEmissionsNeedRelease = false;
+        return true;
+    }
+
+    private void verifyDocumentForRead(Object key, RootAssembly assembly) {
+        refuseToLetOneDocumentGrowPastItsWidth(key, assembly);
+        long pending = assembly.pending();
+        store.holding(pending);
+        NestLimits.refuse(vertex, key, pending, pendingLimit);
     }
 
     /**

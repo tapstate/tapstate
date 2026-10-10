@@ -5625,6 +5625,107 @@ class ReplTest {
     }
 
     @ParameterizedTest
+    @ValueSource(strings = {"text", "json", "yaml"})
+    void clusterRecoveryFormatsPreserveUnknownDemandAndTheAttemptSourceRejection(String format) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.clusterOutcome = new ClusterMembersOutcome.Listed("cluster-a", 9L, List.of(), List.of(),
+                2L, "profile-current", RecoveryWire.cluster(RecoveryFixtures.clusterRecovery()));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("cluster status -o " + format);
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("FULL_CLUSTER_RESTART", "SOURCE_POSITION_REJECTION", "capture.start-from-outside-window", "resume-7", "resume-12");
+        if (format.equals("text")) {
+            assertThat(out).contains("quorum unknown", "occupied   unknown", "attempt 2/3", "original position", "requested position", "failure note")
+                    .doesNotContain("occupied   0", "profile 0");
+        } else if (format.equals("json")) {
+            Map<?, ?> body = (Map<?, ?>) io.tapstate.core.common.JsonReader.parse(out);
+            assertThat(body.get("recovery")).isEqualTo(RecoveryFixtures.clusterRecovery());
+        } else {
+            assertThat(out).contains("occupiedByNode: null", "quorumReady: null", "failureNote:");
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"status,json", "status,yaml", "explain,json", "explain,yaml"})
+    void machinePipelineReadsUseTheirExistingTypedEndpointOnceWithoutMetricPolling(String command, String format) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = RecoveryFixtures.statusFound();
+        client.explainOutcome = RecoveryFixtures.explanationFound();
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch(command + " orders -o " + format);
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(client.metricsCalls).isEmpty();
+        if (command.equals("status")) {
+            assertThat(client.statusCalls).containsExactly("jwt-tok@http://node1:7900/orders");
+            assertThat(client.explainCalls).isEmpty();
+        } else {
+            assertThat(client.explainCalls).containsExactly("jwt-tok@http://node1:7900/orders");
+            assertThat(client.statusCalls).isEmpty();
+        }
+        String out = h.sink().toString().substring(mark);
+        assertThat(out).contains("capture.start-from-outside-window", "resume-12", "occupiedByNode");
+        if (format.equals("json")) {
+            assertThat(io.tapstate.core.common.JsonReader.parse(out))
+                    .isEqualTo(command.equals("status") ? RecoveryFixtures.status() : RecoveryFixtures.explanation());
+        } else {
+            assertThat(out).contains("occupiedByNode: null", "requested: resume-12", "failureNote:");
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"status", "explain"})
+    void textPipelineReadsKeepTheirExplanationAndExposeTheDurableRecoveryCause(String command) {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.statusOutcome = RecoveryFixtures.statusFound();
+        client.explainOutcome = RecoveryFixtures.explanationFound();
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch(command + " orders");
+
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(h.sink().toString().substring(mark)).contains("orders  failed", "why:", "recovery   REBUILDING",
+                "FULL_CLUSTER_RESTART", "attempt 2/3", "capture.start-from-outside-window", "resume-7", "resume-12")
+                .doesNotContain("occupied   0");
+        assertThat(client.statusCalls).isEmpty();
+        assertThat(client.explainCalls).hasSize(1);
+        assertThat(client.metricsCalls).isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"status", "explain"})
+    void machineRecoveryReadsReuseIssuerBoundFailoverWithoutSendingBearerToForeignSeeds(String command) {
+        URI original = URI.create("http://localhost:7900");
+        URI foreign = URI.create("http://localhost:7901");
+        URI replacement = URI.create("http://localhost:7902");
+        FakeControlPlane client = new FakeControlPlane(original);
+        client.statusOutcome = RecoveryFixtures.statusFound();
+        client.explainOutcome = RecoveryFixtures.explanationFound();
+        Harness h = authenticatedFailoverHarness(client, List.of(original, foreign, replacement), false);
+        client.statusCalls.clear();
+        client.explainCalls.clear();
+        client.discoveryOutcomes.put(foreign, new DiscoveryOutcome.Discovered(
+                "urn:tapstate:cluster:another-cluster", "another-cluster", "tapstate/v1", List.of("password", "machine_token")));
+        client.setHealthy(foreign, replacement);
+
+        h.repl().dispatch(command + " orders -o json");
+
+        assertThat(command.equals("status") ? client.statusCalls : client.explainCalls)
+                .containsExactly("cluster-bearer@" + original + "/orders", "cluster-bearer@" + replacement + "/orders");
+        assertThat(h.repl().session().credential()).isEqualTo("cluster-bearer");
+        assertThat(h.repl().session().landingNode()).isEqualTo(replacement);
+        assertThat(h.repl().lastExitCode()).isZero();
+        assertThat(client.metricsCalls).isEmpty();
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = {"rebalance", "drain", "cordon", "uncordon", "restart", "rejoin"})
     void clusterMutationWordsAreRejectedBeforeAnyRemoteRead(String action) {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));

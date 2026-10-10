@@ -25,11 +25,17 @@ public record ClusterTopologyView(
         List<ClusterMemberView> members,
         List<ClusterPipelineView> pipelines,
         Long profileGeneration,
-        String profileHash) {
+        String profileHash,
+        ClusterRecoveryView recovery) {
 
     public ClusterTopologyView {
         members = List.copyOf(Objects.requireNonNull(members, "members"));
         pipelines = List.copyOf(Objects.requireNonNull(pipelines, "pipelines"));
+    }
+
+    public ClusterTopologyView(String clusterId, Long topologyRevision, List<ClusterMemberView> members,
+            List<ClusterPipelineView> pipelines, Long profileGeneration, String profileHash) {
+        this(clusterId, topologyRevision, members, pipelines, profileGeneration, profileHash, null);
     }
 
     /** A topology whose execution profile has not been read. */

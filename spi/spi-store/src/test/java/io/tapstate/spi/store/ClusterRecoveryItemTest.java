@@ -5,11 +5,14 @@ import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.ClusterCapacityDemand;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.DesiredStateFingerprint;
 import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.model.ReadMode;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
+import java.util.List;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
 
@@ -124,7 +127,7 @@ class ClusterRecoveryItemTest {
     }
 
     @Test
-    void startupEvidenceMustMatchTheExactSuccessorAndOriginalResumePosition() {
+    void startupEvidenceMustMatchTheExactSuccessorAndItsPreparedRequest() {
         ClusterRecoveryItem submitted = allocated().submitted("job-42", NOW);
         ClusterRecoveryStartupReceipt wrongExecution = new ClusterRecoveryStartupReceipt(
                 pipelineClaim(43), "job-42", NOW, POSITIONS, NOW, false);
@@ -133,7 +136,9 @@ class ClusterRecoveryItemTest {
                 new ChainPosition(new SourceOrder(7, 94), "resume-94"), "capture-majority-read", "srs/crm/7"));
 
         assertThat(submitted.startupReceiptCheck(wrongExecution)).isEqualTo(ClusterRecoveryMutation.STALE_EXECUTION);
-        assertThat(submitted.startupReceiptCheck(receipt(submitted, changed)))
+        ClusterRecoveryStartupReceipt incorrect = new ClusterRecoveryStartupReceipt(submitted.successor().pipelineClaim(),
+                "job-42", NOW, Map.of("crm", witness()), POSITIONS, changed, NOW, false);
+        assertThat(submitted.startupReceiptCheck(incorrect))
                 .isEqualTo(ClusterRecoveryMutation.MISSING_STARTUP_RECEIPT);
         assertThat(submitted.startupReceiptCheck(receipt(submitted, Map.of())))
                 .isEqualTo(ClusterRecoveryMutation.MISSING_STARTUP_RECEIPT);
@@ -222,7 +227,7 @@ class ClusterRecoveryItemTest {
     }
 
     @Test
-    void snapshotResumeHasExplicitAbsenceAndMustBeAcceptedAsThatSameOriginalMode() {
+    void snapshotResumeHasExplicitAbsenceAndMustBeAcceptedAsTheActualPreparedMode() {
         ClusterRecoveryPosition snapshot = new ClusterRecoveryPosition("crm", "mongo", "capture-orders",
                 ClusterRecoveryPosition.Kind.SNAPSHOT_REQUIRED, null, "capture-snapshot-incomplete", null);
         Map<String, ClusterRecoveryPosition> snapshotPositions = Map.of("crm", snapshot);
@@ -230,7 +235,9 @@ class ClusterRecoveryItemTest {
                 PROFILE, 2, INTENT, snapshotPositions), 1, NOW, 3)
                 .permitted(permit("snapshot", recoveryClaim(1)), NOW).advanced(successor(42), NOW)
                 .submitted("job-42", NOW);
-        assertThat(item.startupReceiptCheck(receipt(item, POSITIONS)))
+        ClusterRecoveryStartupReceipt incorrect = new ClusterRecoveryStartupReceipt(item.successor().pipelineClaim(),
+                "job-42", NOW, Map.of("crm", witness()), snapshotPositions, POSITIONS, NOW, false);
+        assertThat(item.startupReceiptCheck(incorrect))
                 .isEqualTo(ClusterRecoveryMutation.MISSING_STARTUP_RECEIPT);
         assertThat(item.initialized(receipt(item, snapshotPositions), NOW).recovered(NOW).status())
                 .isEqualTo(ClusterRecoveryStatus.RECOVERED);
@@ -243,19 +250,18 @@ class ClusterRecoveryItemTest {
     }
 
     @Test
-    void fingerprintIncludesIncarnationAndEveryLifecycleInstruction() {
+    void fingerprintIncludesEveryLifecycleInstructionWhileIncarnationIsIndependentlyFenced() {
         DesiredState intent = new DesiredState("orders", PipelineState.RUNNING, "revision-a", false,
                 "assembly-a", false, null);
-        String expected = ClusterRecoveryIntentFingerprint.of("a", intent);
-        assertThat(ClusterRecoveryIntentFingerprint.of("a", intent)).isEqualTo(expected);
-        assertThat(ClusterRecoveryIntentFingerprint.of("b", intent)).isNotEqualTo(expected);
-        assertThat(ClusterRecoveryIntentFingerprint.of("a", new DesiredState("orders", PipelineState.RUNNING,
+        String expected = DesiredStateFingerprint.of(intent);
+        assertThat(DesiredStateFingerprint.of(intent)).isEqualTo(expected);
+        assertThat(DesiredStateFingerprint.of(new DesiredState("orders", PipelineState.RUNNING,
                 "revision-a", true, "assembly-a", false, null))).isNotEqualTo(expected);
-        assertThat(ClusterRecoveryIntentFingerprint.of("a", new DesiredState("orders", PipelineState.RUNNING,
+        assertThat(DesiredStateFingerprint.of(new DesiredState("orders", PipelineState.RUNNING,
                 "revision-a", false, "assembly-a", true, null))).isNotEqualTo(expected);
-        assertThat(ClusterRecoveryIntentFingerprint.of("a", new DesiredState("orders", PipelineState.RUNNING,
+        assertThat(DesiredStateFingerprint.of(new DesiredState("orders", PipelineState.RUNNING,
                 "revision-a", false, "assembly-a", false, 7L))).isNotEqualTo(expected);
-        assertThat(ClusterRecoveryIntentFingerprint.of("a", new DesiredState("orders", PipelineState.PAUSED,
+        assertThat(DesiredStateFingerprint.of(new DesiredState("orders", PipelineState.PAUSED,
                 "revision-a", false, "assembly-a", false, null))).isNotEqualTo(expected);
     }
 
@@ -300,14 +306,21 @@ class ClusterRecoveryItemTest {
     }
 
     private static ClusterRecoverySuccessor successor(long executionGeneration) {
-        return new ClusterRecoverySuccessor(pipelineClaim(executionGeneration), PROFILE, Set.of("node-a"), NOW,
-                null, null, null);
+        return new ClusterRecoverySuccessor(pipelineClaim(executionGeneration), PROFILE, Set.of("node-a"), Set.of("crm"), NOW,
+                null, null, Map.of(), null);
     }
 
     private static ClusterRecoveryStartupReceipt receipt(ClusterRecoveryItem item,
             Map<String, ClusterRecoveryPosition> positions) {
         return new ClusterRecoveryStartupReceipt(item.successor().pipelineClaim(), item.successor().nativeJobId(),
-                NOW, positions, NOW, false);
+                NOW, Map.of("crm", witness()), positions, positions, NOW, false);
+    }
+
+    private static CaptureResumeWitness witness() {
+        ChainPosition floor = POSITIONS.get("crm").position();
+        return new CaptureResumeWitness("crm", "mongo", "capture-orders", SrsConsumerId.of("orders", "crm").value(),
+                ReadMode.CDC_ONLY, true, List.of("orders"), true, 7, floor, true, true, List.of(), null, 0,
+                ConsumerProgressKind.SRS, floor, Map.of("orders", floor));
     }
 
     private static ClusterRecoveryDiagnostic diagnostic(ClusterRecoveryDiagnostic.Reason reason) {
@@ -316,6 +329,6 @@ class ClusterRecoveryItemTest {
     }
 
     private static String fingerprint(PipelineState state) {
-        return ClusterRecoveryIntentFingerprint.of(KEY.incarnation(), new DesiredState(KEY.pipelineId(), state, "revision-a"));
+        return DesiredStateFingerprint.of(new DesiredState(KEY.pipelineId(), state, "revision-a"));
     }
 }

@@ -1,5 +1,8 @@
 package io.tapstate.control.core;
 
+import java.time.Instant;
+import java.util.List;
+
 /**
  * One workload claim, as a control-plane reader sees it.
  *
@@ -29,5 +32,28 @@ public record ClusterClaimView(
         long claimGeneration,
         long executionGeneration,
         long topologyRevision,
-        boolean leased) {
+        boolean leased,
+        Instant leaseUntil,
+        Long leaseRemainingMillis,
+        Long profileGeneration,
+        Long contextExecutionGeneration,
+        Long executionClaimGeneration,
+        String executionIncarnation,
+        String executionRevision,
+        Long executionTopologyRevision,
+        Long executionProfileGeneration,
+        String executionProfileHash,
+        List<Member> executionMembers,
+        Long failureClaimGeneration,
+        Boolean failureAfterMemberLoss,
+        Boolean executionContextCurrent) {
+    public ClusterClaimView { executionMembers = List.copyOf(executionMembers); }
+
+    public ClusterClaimView(String resourceId, String ownerNodeId, String ownerBootId, long claimGeneration,
+            long executionGeneration, long topologyRevision, boolean leased) {
+        this(resourceId, ownerNodeId, ownerBootId, claimGeneration, executionGeneration, topologyRevision, leased,
+                null, null, null, null, null, null, null, null, null, null, List.of(), null, null, null);
+    }
+
+    public record Member(String nodeId, String bootId, String memberUuid) { }
 }

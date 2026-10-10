@@ -51,7 +51,7 @@ public record ClusterRecoveryItem(
                 && (successor == null || permit.transferredExecutionGeneration() != successor.executionGeneration()))) {
             throw new IllegalArgumentException("transferred reservation must match the successor");
         }
-        if (status == ClusterRecoveryStatus.RECOVERED && (!hasMatchingStartup(event, successor)
+        if (status == ClusterRecoveryStatus.RECOVERED && (!hasMatchingStartup(successor)
                 || !targetProfile.equals(successor.profile())
                 || targetTopologyRevision != successor.pipelineClaim().topologyRevision())) {
             throw new IllegalArgumentException("recovered item requires matching initialization and source acceptance");
@@ -74,6 +74,23 @@ public record ClusterRecoveryItem(
 
     public long executionFrontier() {
         return executionAliases.stream().mapToLong(Long::longValue).max().orElseThrow();
+    }
+
+    /** Structural replacement eligibility; stores must still prove the candidate's current cause. */
+    public ClusterRecoveryMutation terminalEventCheck(ClusterRecoveryEvent candidate) {
+        if (!status.terminal()) {
+            throw new IllegalStateException("terminal event eligibility requires a terminal item");
+        }
+        if (!event.key().equals(candidate.key())) {
+            return ClusterRecoveryMutation.STALE_ITEM;
+        }
+        if (event.uniqueKey().equals(candidate.uniqueKey()) || candidate.originalExecutionGeneration() < executionFrontier()
+                || (status != ClusterRecoveryStatus.RECOVERED
+                        && event.intentFingerprint().equals(candidate.intentFingerprint())
+                        && candidate.originalExecutionGeneration() == executionFrontier())) {
+            return ClusterRecoveryMutation.TERMINAL;
+        }
+        return ClusterRecoveryMutation.APPLIED;
     }
 
     /** Pure optimistic checks; stores additionally condition-write the live claims and profile guard. */
@@ -103,6 +120,18 @@ public record ClusterRecoveryItem(
         return (status == ClusterRecoveryStatus.WAITING_PERMIT || status == ClusterRecoveryStatus.RETRY_BACKOFF)
                 && permit == null
                 && (nextEligibleAt == null || !storeTime.isBefore(nextEligibleAt));
+    }
+
+    /** A non-runnable original authority does not spend retry budget or block later eligible work. */
+    public ClusterRecoveryItem deferredUntil(Instant eligible, Instant storeTime) {
+        requireActive();
+        Objects.requireNonNull(eligible, "eligible");
+        if (permit != null || !eligible.isAfter(storeTime)) {
+            throw new IllegalArgumentException("authority deferral requires an unpermitted item and future eligibility");
+        }
+        Instant next = nextEligibleAt != null && nextEligibleAt.isAfter(eligible) ? nextEligibleAt : eligible;
+        return copy(targetProfile, targetTopologyRevision, status, attempt, next, executionAliases,
+                null, successor, diagnostic, storeTime);
     }
 
     /** Retargeting never discards an in-flight successor or its already consumed attempt. */
@@ -135,6 +164,7 @@ public record ClusterRecoveryItem(
         requireActive();
         if (permit == null || permit.transferredExecutionGeneration() != 0 || attempt >= maxAttempts
                 || nextSuccessor.executionGeneration() != Math.addExact(executionFrontier(), 1)
+                || nextSuccessor.failureNote() != null
                 || !targetProfile.equals(nextSuccessor.profile())
                 || !permit.demandByNode().keySet().equals(nextSuccessor.executionNodeIds())) {
             throw new IllegalArgumentException("execution advance must consume the exact untransferred permit");
@@ -148,12 +178,13 @@ public record ClusterRecoveryItem(
     /** Submission proof transfers reservation occupancy without opening another recovery slot. */
     public ClusterRecoveryItem submitted(String nativeJobId, Instant storeTime) {
         requireActive();
-        if (permit == null || successor == null || successor.submittedAt() != null) {
+        if (permit == null || successor == null || successor.submittedAt() != null || successor.failureNote() != null) {
             throw new IllegalStateException("submission requires an unsubmitted allocated successor");
         }
         ClusterRecoverySuccessor submitted = new ClusterRecoverySuccessor(successor.pipelineClaim(),
-                successor.profile(), successor.executionNodeIds(), successor.allocatedAt(),
-                nativeJobId, storeTime, null);
+                successor.profile(), successor.executionNodeIds(), successor.requiredSourceIds(),
+                successor.sourceRequirementsRecorded(), successor.allocatedAt(),
+                nativeJobId, storeTime, successor.requestedPositions(), null);
         return copy(targetProfile, targetTopologyRevision, status, attempt, null, executionAliases,
                 permit.transferred(successor.executionGeneration()), submitted, diagnostic, storeTime);
     }
@@ -163,7 +194,7 @@ public record ClusterRecoveryItem(
                 || !Objects.equals(successor.nativeJobId(), receipt.nativeJobId())) {
             return ClusterRecoveryMutation.STALE_EXECUTION;
         }
-        return event.resumePositions().equals(receipt.acceptedPositions())
+        return successor.matchesStartup(receipt)
                 ? ClusterRecoveryMutation.APPLIED : ClusterRecoveryMutation.MISSING_STARTUP_RECEIPT;
     }
 
@@ -171,13 +202,31 @@ public record ClusterRecoveryItem(
         requireActive();
         if (startupReceiptCheck(receipt) != ClusterRecoveryMutation.APPLIED || permit == null
                 || permit.transferredExecutionGeneration() != successor.executionGeneration()) {
-            throw new IllegalArgumentException("startup receipt must match the transferred successor and original positions");
+            throw new IllegalArgumentException("startup receipt must match the transferred successor and prepared source requirements");
         }
         ClusterRecoverySuccessor initialized = new ClusterRecoverySuccessor(successor.pipelineClaim(),
-                successor.profile(), successor.executionNodeIds(), successor.allocatedAt(),
-                successor.nativeJobId(), successor.submittedAt(), receipt);
+                successor.profile(), successor.executionNodeIds(), successor.requiredSourceIds(),
+                successor.sourceRequirementsRecorded(), successor.allocatedAt(),
+                successor.nativeJobId(), successor.submittedAt(), receipt.requestedPositions(), receipt);
         return copy(targetProfile, targetTopologyRevision, status, attempt, null, executionAliases,
                 permit, initialized, diagnostic, storeTime);
+    }
+
+    /** Reporting the first failure preserves all occupancy until the exact authority is retired. */
+    public ClusterRecoveryItem failureNoted(ClusterRecoveryFailureNote note, Instant storeTime) {
+        requireActive();
+        if (permit == null || successor == null || !successor.pipelineClaim().equals(note.pipelineClaim())) {
+            throw new IllegalArgumentException("failure fact must match an allocated permitted successor");
+        }
+        if (successor.failureNote() != null) {
+            return this;
+        }
+        ClusterRecoverySuccessor failed = new ClusterRecoverySuccessor(successor.pipelineClaim(), successor.profile(),
+                successor.executionNodeIds(), successor.requiredSourceIds(), successor.sourceRequirementsRecorded(),
+                successor.allocatedAt(), successor.nativeJobId(), successor.submittedAt(), successor.requestedPositions(),
+                successor.startupReceipt(), note);
+        return copy(targetProfile, targetTopologyRevision, status, attempt, nextEligibleAt, executionAliases,
+                permit, failed, note.diagnostic(), storeTime);
     }
 
     public ClusterRecoveryMutation completionCheck() {
@@ -185,7 +234,8 @@ public record ClusterRecoveryItem(
             return ClusterRecoveryMutation.TERMINAL;
         }
         return status == ClusterRecoveryStatus.REBUILDING && permit != null
-                && hasMatchingStartup(event, successor) && targetProfile.equals(successor.profile())
+                && hasMatchingStartup(successor) && targetProfile.equals(successor.profile())
+                && permit.transferredExecutionGeneration() == successor.executionGeneration()
                 && targetTopologyRevision == successor.pipelineClaim().topologyRevision()
                 ? ClusterRecoveryMutation.APPLIED : ClusterRecoveryMutation.MISSING_STARTUP_RECEIPT;
     }
@@ -220,7 +270,7 @@ public record ClusterRecoveryItem(
         if (successor == null) {
             throw new IllegalStateException("execution failure requires an allocated successor");
         }
-        return failed(cause, attempt, backoff, storeTime);
+        return failed(successor.failureNote() == null ? cause : successor.failureNote().diagnostic(), attempt, backoff, storeTime);
     }
 
     private ClusterRecoveryItem failed(ClusterRecoveryDiagnostic cause, int usedAttempts,
@@ -253,8 +303,8 @@ public record ClusterRecoveryItem(
         }
     }
 
-    private static boolean hasMatchingStartup(ClusterRecoveryEvent event, ClusterRecoverySuccessor successor) {
-        return successor != null && successor.startupReceipt() != null
-                && event.resumePositions().equals(successor.startupReceipt().acceptedPositions());
+    private static boolean hasMatchingStartup(ClusterRecoverySuccessor successor) {
+        return successor != null && successor.matchesStartup(successor.startupReceipt())
+                && successor.requestedPositions().equals(successor.startupReceipt().requestedPositions());
     }
 }

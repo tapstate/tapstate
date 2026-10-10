@@ -108,6 +108,19 @@ public final class PipelineDagBuilder {
         return namespaces;
     }
 
+    /** Frozen state paths from the same tree compiler used by the executing DAG, without reading a ledger. */
+    public static Map<String, Set<String>> nestStatePaths(PipelineResource pipeline,
+            Function<String, NestTable> tables) {
+        Map<String, Set<String>> paths = new LinkedHashMap<>();
+        for (Step step : pipeline.transforms() == null ? List.<Step>of() : pipeline.transforms()) {
+            TransformBody.Nest nest = nestOf(step);
+            if (nest != null) {
+                paths.put(step.id(), NestTopology.compile(pipeline.id(), step.id(), nest, tables).statePaths());
+            }
+        }
+        return Map.copyOf(paths);
+    }
+
     /**
      * Every map namespace of every nest, paired with the database that nest resolves to. An absent
      * per-nest state block inherits {@code defaultDatabase}; the artifact remains absent rather than being
@@ -446,6 +459,9 @@ public final class PipelineDagBuilder {
                         chains == null ? null : chains.perOrdinal(upstream), shape);
                 byKey.put(step.id(), vertex);
                 drawn.add(step.id(), vertex.getName());
+                if (step instanceof Step.Inline inline && !(inline.body() instanceof TransformBody.Js)) {
+                    drawn.buffers(vertex.getName(), ProcessorBufferBounds.oneOutput());
+                }
                 if (chains != null) {
                     chains.derived(step.id(), upstream);
                 }
@@ -460,6 +476,7 @@ public final class PipelineDagBuilder {
         Map<String, List<String>> writersByChain = chains == null ? null : writersByChain(sinks, chains, shape);
         boolean startsTheRun = sinkAck != null && writersByChain != null;
         for (SinkNode sink : sinks) {
+            drawn.writer(sink.name());
             verticesOf(sink.upstream(), byKey).forEach(upstream -> drawn.feeds(sink.name(), upstream.getName()));
             if (shape.isNative(sink.name())) {
                 drawNativeSink(dag, sink, sinkAck, axes, chains, shape, byKey, outboundOrdinal, inboundOrdinal,

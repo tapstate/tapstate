@@ -10,6 +10,7 @@ import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.SnapshotOnlyCapture;
 import io.tapstate.spi.capture.SnapshotSession;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.CaptureResumeWitness;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
 
@@ -118,6 +119,11 @@ public final class SnapshotPhase {
             List<String> tables,
             long ringEpoch,
             SrsMetaStore meta) {
+        return open(port, config, miningChainId, pipelineId, tables, ringEpoch, meta, null);
+    }
+
+    public static Load open(CapturePort port, CaptureConfig config, String miningChainId, String pipelineId,
+            List<String> tables, long ringEpoch, SrsMetaStore meta, CaptureResumeWitness frozen) {
         Objects.requireNonNull(port, "port");
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(miningChainId, "miningChainId");
@@ -128,18 +134,30 @@ public final class SnapshotPhase {
             throw new IllegalArgumentException("a snapshot over a chain must name the tables it reads");
         }
 
-        Optional<SrsMeta> record = meta.read(miningChainId);
-        List<String> owed = stillOwed(record, pipelineId, tables);
-        Optional<ConsumerOffset> resumed = resumedSnapshot(record, pipelineId, owed);
-        long epoch = resumed.map(ConsumerOffset::snapshotEpoch).orElse(ringEpoch);
+        Optional<SrsMeta> record = frozen == null ? meta.read(miningChainId) : Optional.empty();
+        List<String> owed = frozen == null ? stillOwed(record, pipelineId, tables)
+                : tables.stream().filter(table -> !frozen.snapshotCompletedTables().contains(table)).toList();
+        Optional<ConsumerOffset> resumed = frozen == null ? resumedSnapshot(record, pipelineId, owed) : Optional.empty();
+        boolean frozenResume = frozen != null && !owed.isEmpty() && frozen.cdcStartPosition() != null
+                && frozen.snapshotEpoch() > 0;
+        long epoch = frozenResume ? frozen.snapshotEpoch() : resumed.map(ConsumerOffset::snapshotEpoch).orElse(ringEpoch);
         SourceOrder order = SourceOrder.snapshotRow(epoch);
         if (owed.isEmpty()) {
             return new Load(null, miningChainId, tables, owed, order, null, null, false);
         }
         // A known generation keeps its recorded seam. A legacy partial load must also replay changes
         // for confirmed tables it leaves unread, so retain their start before recording a new epoch.
-        String resumedStart = resumed.map(ConsumerOffset::cdcStartPosition)
-                .orElseGet(() -> owed.size() < tables.size() ? recordedTailStart(record, pipelineId) : null);
+        String resumedStart;
+        if (frozen == null) {
+            resumedStart = resumed.map(ConsumerOffset::cdcStartPosition)
+                    .orElseGet(() -> owed.size() < tables.size() ? recordedTailStart(record, pipelineId) : null);
+        } else if (frozenResume) {
+            resumedStart = frozen.cdcStartPosition();
+        } else {
+            resumedStart = owed.size() < tables.size() ? frozen.requestedPosition(miningChainId)
+                    .map(io.tapstate.spi.store.ClusterRecoveryPosition::position)
+                    .map(io.tapstate.core.event.ChainPosition::token).orElse(null) : null;
+        }
         SnapshotSession session = SnapshotSession.open(port, readOf(config, owed));
         CaptureBatch first = null;
         try {

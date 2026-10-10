@@ -63,8 +63,8 @@ class AHighFanOutDimensionChangeReachesEveryRowTest {
         JoinPlan plan = SqlFrontEnd.derive(
                 "SELECT o.o_id AS order_id, c.c_name AS customer_name "
                         + "FROM orders o JOIN customers c ON o.o_cust_id = c.c_id", TABLES);
-        JoinDriver driver = new JoinDriver(plan, List.of("o_id"), "order_state",
-                new CountingJoinStores(ReverseIndex.DEFAULT_PAGE_SIZE));
+        CountingJoinStores stores = new CountingJoinStores(ReverseIndex.DEFAULT_PAGE_SIZE);
+        JoinDriver driver = new JoinDriver(plan, List.of("o_id"), "order_state", stores);
         BoundedSink sink = new BoundedSink();
 
         feed(driver, sink, new SourceChange("c", Envelope.insert(1L, "src",
@@ -97,6 +97,9 @@ class AHighFanOutDimensionChangeReachesEveryRowTest {
         assertThat(sink.ordersCarrying("Ada"))
                 .as("and none is left holding the old one")
                 .isEmpty();
+        assertThat(stores.largestBatchRead)
+                .as("a hundred-thousand-row fanout cannot widen one mirror read beyond its compiled descriptor")
+                .isLessThanOrEqualTo(JoinBufferBounds.updates(1).fixedRecords().get("recompute-mirror-read").intValue());
     }
 
     /**

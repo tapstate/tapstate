@@ -12,6 +12,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import com.hazelcast.jet.core.test.TestInbox;
 import com.hazelcast.jet.core.test.TestOutbox;
 import com.hazelcast.jet.core.test.TestProcessorContext;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.TransformBody;
@@ -50,6 +51,85 @@ class AFailedHandoffLeavesWhatItWasCarryingTest {
 
     private final HeapNestStore<ResolverState> mappings = new HeapNestStore<>();
     private final TestOutbox outbox = new TestOutbox(256);
+
+    @Test
+    void aResolverCannotMergeMoreParkedChangesThanItsConfiguredLimit() throws Exception {
+        HeapNestStore<ParkedSubtree> parking = new HeapNestStore<>();
+        ResolverProcessor losing = new ResolverProcessor(POLICIES, mappings, (from, released) -> { },
+                null, null, ReplayFloor.NONE, NestClock.SYSTEM,
+                NestSettings.defaults().withPendingLimit(POLICIES.mapName(), 2)
+                        .withParkingLimit(POLICIES.mapName(), 2), parking);
+        losing.init(outbox, new TestProcessorContext());
+        feed(losing, CLAIMS, claim(1, "K1", "P1"));
+        feed(losing, CLAIMS, claim(2, "K2", "P1"));
+        feed(losing, TWIN, policyRenamed(RENAMED_AT, "P1", "P3", "C1"));
+        ParkedSubtree.At address = new ParkedSubtree.At(POLICIES.pathId(), List.of("P3"));
+        assertThat(parking.load(address).changes()).as("the exact limit remains admissible").hasSize(2);
+        feed(losing, CLAIMS, claim(3, "K3", "P2"));
+
+        assertThatThrownBy(() -> feed(losing, TWIN, policyRenamed(RENAMED_AT + 1, "P2", "P3", "C1")))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(NestError.MIGRATION_PARKING_LIMIT_EXCEEDED);
+                    assertThat(failure.args()).containsEntry("changes", 3L).containsEntry("limit", 2L);
+                });
+
+        assertThat(parking.load(address).changes()).hasSize(2);
+        assertThat(mappings.load(List.of("P2")).waiting()).singleElement().satisfies(child ->
+                assertThat(child.fields()).containsEntry("claim_id", "K3"));
+    }
+
+    @Test
+    void aFailedTakeoverWriteLeavesTheParkedChildrenAvailableToAReplay() throws Exception {
+        HeapNestStore<ParkedSubtree> parking = new HeapNestStore<>();
+        ResolverProcessor losing = resolver(parking);
+        RefusesOneMappingWrite writes = new RefusesOneMappingWrite(mappings);
+        ResolverProcessor gaining = new ResolverProcessor(POLICIES, writes, (from, released) -> { },
+                null, null, ReplayFloor.NONE, NestClock.SYSTEM, NestSettings.defaults(), parking);
+        gaining.init(outbox, new TestProcessorContext());
+        feed(losing, CLAIMS, claim(1, "K1", "P1"));
+        Envelope move = policyRenamed(RENAMED_AT, "P1", "P2", "C1");
+        // The mapping lands before its children, so the idle collector is the only thing that finds them.
+        feed(gaining, OWN_ROWS, move);
+        feed(losing, TWIN, move);
+        ParkedSubtree.At address = new ParkedSubtree.At(POLICIES.pathId(), List.of("P2"));
+        assertThat(parking.load(address).changes()).hasSize(1);
+        writes.refuseNext = true;
+
+        assertThatThrownBy(gaining::tryProcess).isInstanceOf(IllegalStateException.class);
+
+        assertThat(parking.load(address))
+                .as("the collector cannot free the only durable child before its own write succeeds")
+                .isNotNull();
+        assertThat(parking.load(address).changes()).singleElement().satisfies(child ->
+                assertThat(child.fields()).containsEntry("claim_id", "K1"));
+        // A restarted processor has no idle bookkeeping. The already-stored mapping must still let the
+        // replayed move collect its handover without publishing the policy twice.
+        ResolverProcessor restarted = resolver(parking);
+        TestInbox replay = new TestInbox();
+        replay.add(move);
+        restarted.process(OWN_ROWS, replay);
+        List<KeyedElement> recovered = new ArrayList<>();
+        outbox.drainQueueAndReset(0, recovered, false);
+        assertThat(recovered).singleElement().satisfies(child ->
+                assertThat(child.element().fields()).containsEntry("claim_id", "K1"));
+        assertThat(parking.load(address)).isNull();
+    }
+
+    private static final class RefusesOneMappingWrite implements NestStore<ResolverState> {
+        private final NestStore<ResolverState> delegate;
+        private boolean refuseNext;
+        private RefusesOneMappingWrite(NestStore<ResolverState> delegate) { this.delegate = delegate; }
+        @Override public ResolverState load(Object key) { return delegate.load(key); }
+        @Override public void save(Object key, ResolverState state) {
+            if (refuseNext) {
+                refuseNext = false;
+                throw new IllegalStateException("mapping write refused");
+            }
+            delegate.save(key, state);
+        }
+        @Override public void remove(Object key) { delegate.remove(key); }
+        @Override public long count() { return delegate.count(); }
+    }
 
     @Test
     void aFailedParkingWriteLeavesTheChildrenInTheEntryTheyWaitedIn() throws Exception {

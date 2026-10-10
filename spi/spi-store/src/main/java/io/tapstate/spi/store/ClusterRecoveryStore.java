@@ -10,9 +10,10 @@ import java.util.Optional;
 import java.util.Set;
 
 /**
- * Majority-durable recovery queue and capacity reservations. Every write is one atomic conditional
- * operation over the item revision, current intent/incarnation/execution frontier, exact live recovery
- * claim and current profile. The claim/profile documents participate in actual conditional writes;
+ * Majority-durable recovery queue and capacity reservations. Every recovery transition is one atomic
+ * conditional operation over the item revision, current intent/incarnation/execution frontier, exact
+ * live recovery claim and current profile. A factual failure report instead uses the exact live
+ * pipeline claim and preserves the step. The claim/profile documents participate in conditional writes;
  * reading a matching lease followed by an unconditional item write does not implement this contract.
  * All eligibility, backoff, permit and authority deadlines are evaluated on the store clock.
  *
@@ -71,6 +72,12 @@ public interface ClusterRecoveryStore {
     Result advanceExecution(ClusterRecoveryFence expected, WorkloadClaim expectedPipelineClaim,
             Set<String> executionNodeIds);
 
+    /** Records the actual frozen compiler selection, including an explicitly known zero-source plan. */
+    default Result advanceExecution(ClusterRecoveryFence expected, WorkloadClaim expectedPipelineClaim,
+            Set<String> executionNodeIds, Set<String> requiredSourceIds) {
+        return new Result(ClusterRecoveryMutation.MISSING_STARTUP_RECEIPT, read(expected.key()).orElse(null), null);
+    }
+
     /**
      * Records real submission proof for the matching successor and exact live pipeline claim, moving
      * reservation demand atomically to live execution occupancy keyed by incarnation and generation.
@@ -79,8 +86,9 @@ public interface ClusterRecoveryStore {
     Result recordSubmission(ClusterRecoveryFence expected, WorkloadClaimFence pipelineClaim, String nativeJobId);
 
     /**
-     * Records native initialization and original durable-position acceptance for the matching
-     * successor under its exact pipeline claim/profile fence. A RUNNING checkpoint alone is not proof.
+     * Records native initialization and this successor's actual prepared/accepted source facts under
+     * its exact pipeline claim/profile fence. The allocated required source set must be complete;
+     * original event positions remain diagnostic. A RUNNING checkpoint alone is not proof.
      */
     Result recordStartup(ClusterRecoveryFence expected, WorkloadClaimFence pipelineClaim,
             ClusterRecoveryStartupReceipt receipt);
@@ -91,6 +99,18 @@ public interface ClusterRecoveryStore {
      * execution demand remains counted while the execution can still authorize work.
      */
     Result complete(ClusterRecoveryFence expected);
+
+    /**
+     * Reports a qualified first failure under the allocated successor's exact live pipeline authority.
+     * This fact report needs no live recovery holder, preserves permit/demand/attempt, and cannot
+     * allocate, release, retry or complete a step. Source facts are consumed in the same transaction;
+     * a generic native report requires that execution's durable workload failure verdict. Reporting
+     * needs no new data admission quorum and refuses a current completed or user-terminal state.
+     */
+    default Result recordFailureNote(ClusterRecoveryPipelineFence expected, ClusterRecoveryDiagnostic diagnostic,
+            FailureStage stage, CaptureStartupFailure sourceFailure) {
+        return new Result(ClusterRecoveryMutation.STALE_PIPELINE_CLAIM, read(expected.key()).orElse(null), null);
+    }
 
     /**
      * Records a bounded failed attempt and releases its reservation only after the exact recorded

@@ -39,6 +39,55 @@ import org.junit.jupiter.api.Test;
  */
 class ADocumentGoesOutAtOnceAndThenOnceAWindowTest {
 
+    @Test
+    void expiredWindowsStopReadingDocumentsWhenTheOutboxRefuses() throws Exception {
+        int documents = DrainFolding.MAX_KEYS_HELD * 2 + 3;
+        CountingStore counted = new CountingStore();
+        TestOutbox limited = new TestOutbox(1);
+        AssemblerProcessor processor = new AssemblerProcessor(TOPOLOGY.assembler(), TOPOLOGY.slots(), counted,
+                "doc", null, null, io.tapstate.runtime.engine.ReplayFloor.NONE, NestSettings.defaults(),
+                clock, NestSendPolicy.within(WINDOW));
+        processor.init(limited, new TestProcessorContext());
+        for (int index = 0; index < documents; index++) {
+            TestInbox first = new TestInbox();
+            first.add(customer(index + 1L, "C" + index, "before"));
+            processor.process(ROOT_ROWS, first);
+            limited.drainQueueAndReset(0, new ArrayList<>(), false);
+            TestInbox change = new TestInbox();
+            change.add(customer(documents + index + 1L, "C" + index, "after"));
+            processor.process(ROOT_ROWS, change);
+        }
+        clock.advance(WINDOW + 1);
+        counted.loads = 0;
+        limited.block();
+
+        processor.tryProcess();
+
+        assertThat(counted.loads).as("only one expired document may be staged before backpressure is observed")
+                .isLessThanOrEqualTo(1);
+        limited.unblock();
+        limited.reset();
+        List<Envelope> emitted = new ArrayList<>();
+        for (int turns = 0; turns <= documents && emitted.size() < documents; turns++) {
+            processor.tryProcess();
+            limited.drainQueueAndReset(0, emitted, false);
+        }
+        assertThat(emitted).hasSize(documents).allSatisfy(document ->
+                assertThat(document.after()).containsEntry("name", "after"));
+        assertThat(emitted).extracting(document -> document.after().get("customer_id"))
+                .containsExactlyElementsOf(java.util.stream.IntStream.range(0, documents)
+                        .mapToObj(index -> "C" + index).toList());
+    }
+
+    private static final class CountingStore implements NestStore<RootAssembly> {
+        private final HeapNestStore<RootAssembly> delegate = new HeapNestStore<>();
+        private int loads;
+        @Override public RootAssembly load(Object key) { loads++; return delegate.load(key); }
+        @Override public void save(Object key, RootAssembly state) { delegate.save(key, state); }
+        @Override public void remove(Object key) { delegate.remove(key); }
+        @Override public long count() { return delegate.count(); }
+    }
+
     private static final long WINDOW = 50L;
 
     /** Policies have claims beneath them, so the policies edge is a cascade rather than a leaf's own rows. */

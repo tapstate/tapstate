@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Function;
 
 /**
  * Resolves a sink's write-side target model from the source model discovery persisted for a connection. The
@@ -35,16 +36,22 @@ import java.util.Optional;
  */
 final class TargetModelResolver {
 
-    private final StorePort storePort;
     private final ArtifactStore artifacts;
+    private final Function<SourceResource, SourceModel> models;
 
     TargetModelResolver(StorePort storePort) {
         this(storePort, Objects.requireNonNull(storePort, "storePort").artifacts());
     }
 
     TargetModelResolver(StorePort storePort, ArtifactStore artifacts) {
-        this.storePort = Objects.requireNonNull(storePort, "storePort");
+        this(storePort, artifacts, source -> SourceDiscovery.model(storePort, source));
+    }
+
+    TargetModelResolver(StorePort storePort, ArtifactStore artifacts,
+            Function<SourceResource, SourceModel> models) {
+        Objects.requireNonNull(storePort, "storePort");
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
+        this.models = Objects.requireNonNull(models, "models");
     }
 
     /**
@@ -55,7 +62,7 @@ final class TargetModelResolver {
     void requireAllDiscovered(Iterable<String> sourceIds) {
         for (String sourceId : sourceIds) {
             SourceResource source = StoredArtifacts.requireSource(artifacts, sourceId);
-            SourceModel discovered = SourceDiscovery.model(storePort, source);
+            SourceModel discovered = models.apply(source);
             if (discovered == null) {
                 throw new TapstateException(
                         ActuationError.SOURCE_SCHEMA_NOT_DISCOVERED, Map.of("source", source.id()), null);
@@ -76,7 +83,7 @@ final class TargetModelResolver {
         Map<String, TargetTable> targets = new LinkedHashMap<>();
         for (String sourceId : pipeline.sourceIds()) {
             SourceResource source = StoredArtifacts.requireSource(artifacts, sourceId);
-            SourceModel discovered = SourceDiscovery.model(storePort, source);
+            SourceModel discovered = models.apply(source);
             resolveAll(PipelineTableSelection.resolve(pipeline, source, discovered), discovered)
                     .forEach(targets::putIfAbsent);
         }
@@ -86,13 +93,13 @@ final class TargetModelResolver {
     /** Resolves one target model per selected table of the source that feeds a sink. */
     Map<String, TargetTable> resolveAll(String sourceId) {
         SourceResource source = StoredArtifacts.requireSource(artifacts, sourceId);
-        return resolveAll(source, SourceDiscovery.model(storePort, source));
+        return resolveAll(source, models.apply(source));
     }
 
     /** Resolves the first selected table for callers that still require a single target. */
     ResolvedTarget resolve(String sourceId) {
         SourceResource source = StoredArtifacts.requireSource(artifacts, sourceId);
-        SourceModel discovered = SourceDiscovery.model(storePort, source);
+        SourceModel discovered = models.apply(source);
         String table = SourceCaptureResolution.of(source, discovered).table();
         return new ResolvedTarget(table, resolveAll(source, discovered).get(table));
     }

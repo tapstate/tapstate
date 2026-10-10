@@ -771,12 +771,10 @@ class ControlApiTest {
         assertThat(pipeline.controllerClaim())
                 .as("who actuates it, and under which generations -- the pair is what tells one run of "
                         + "a pipeline from the next")
-                .isEqualTo(new ClusterClaimView(
-                        ClusterTopologyTestConfiguration.PIPELINE, "node-b", "boot-b1", 3, 7, 4, true));
+                .isEqualTo(fixtureClaim(ClusterTopologyTestConfiguration.PIPELINE, "node-b", "boot-b1", 3, 7, 21_000L));
         assertThat(pipeline.captureClaims())
                 .as("and who reads its sources, which is a separate ownership with its own generations")
-                .containsExactly(new ClusterClaimView(
-                        ClusterTopologyTestConfiguration.CAPTURE, "node-a", "boot-a1", 1, 1, 4, true));
+                .containsExactly(fixtureClaim(ClusterTopologyTestConfiguration.CAPTURE, "node-a", "boot-a1", 1, 1, 28_000L));
         assertThat(pipeline.measuredFrom())
                 .as("which members this picture was assembled from; against the member list it says "
                         + "whether the picture is complete")
@@ -795,7 +793,7 @@ class ControlApiTest {
         assertThat(pipeline.vertices().get(0).processors())
                 .as("and the processor names the stable node as well as the engine's identity for this "
                         + "run of it, because a claim names the stable one")
-                .containsExactly(new ClusterProcessorView(0, 0,
+                .containsExactly(new ClusterProcessorView(0, null,
                         ClusterTopologyTestConfiguration.SECOND.memberUuid(), "node-b", null, Map.of(), Map.of()));
         assertThat(pipeline.awaitingRebalance())
                 .as("both members were planned into this run -- one doing the pinned vertex's work and "
@@ -806,6 +804,12 @@ class ControlApiTest {
                 .as("a run with no plan recorded asked for nothing, and absent is not the same as the one "
                         + "processor that happened to run")
                 .isNull();
+    }
+
+    private static ClusterClaimView fixtureClaim(String id, String node, String boot, long claim, long execution, long remaining) {
+        return new ClusterClaimView(id, node, boot, claim, execution, 4, true,
+                ClusterTopologyTestConfiguration.MEASURED_AT.plusSeconds(30), remaining,
+                null, null, null, null, null, null, null, null, List.of(), null, null, null);
     }
 
     @Test

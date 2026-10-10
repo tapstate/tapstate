@@ -12,6 +12,7 @@ import com.hazelcast.jet.core.test.TestProcessorContext;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.EmbedAs;
+import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.TransformBody;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -34,6 +35,63 @@ import org.junit.jupiter.api.Test;
  * been held to the end, which is asserted alongside.
  */
 class DrainFoldingCapTest {
+
+    @Test
+    void handOversLandingTogetherAreStoredBeforeTheNextBoundedGroupIsRead() throws Exception {
+        TransformBody.Nest tree = nest(new NestRoot("customer", List.of("customer_id"), null, true,
+                List.of(embed("policy", "customer_id", "customer_id", EmbedAs.ARRAY, "policies",
+                        List.of("policy_no")))));
+        NestTopology topology = NestTopology.compile("p", "doc", tree, tables());
+        RecordingStore<RootAssembly> documents = new RecordingStore<>();
+        HeapNestStore<ParkedSubtree> parking = new HeapNestStore<>();
+        TestOutbox out = new TestOutbox(KEYS * 4);
+        AssemblerProcessor gaining = moving(topology, documents, parking, out);
+        AssemblerProcessor losing = moving(topology, documents, parking, out);
+        List<Envelope> moves = new ArrayList<>();
+        for (int index = 0; index < KEYS; index++) {
+            feed(gaining, out, 0, Envelope.insert(index + 1L, "customer",
+                    row("customer_id", "old" + index, "name", "before"), null)
+                    .withOrder(new SourceOrder(1L, index + 1L)));
+            feed(gaining, out, 1, Envelope.insert(KEYS + index + 1L, "policy",
+                    row("customer_id", "old" + index, "policy_id", "p" + index, "policy_no", "n" + index), null)
+                    .withOrder(new SourceOrder(1L, KEYS + index + 1L)));
+            moves.add(Envelope.update(KEYS * 2L + index + 1L, "customer",
+                    row("customer_id", "old" + index, "name", "before"),
+                    row("customer_id", "new" + index, "name", "after"), null)
+                    .withOrder(new SourceOrder(1L, KEYS * 2L + index + 1L)));
+        }
+        // The arriving halves all precede the parked halves, so one idle turn finds a wide landed set.
+        for (Envelope move : moves) feed(gaining, out, 0, move);
+        for (Envelope move : moves) feed(losing, out, 2, move);
+        documents.calls.clear();
+
+        gaining.tryProcess();
+
+        assertThat(documents.longestRunOfLoads())
+                .as("landed documents cannot accumulate past the same folding bound as a normal drain")
+                .isLessThanOrEqualTo(DrainFolding.MAX_KEYS_HELD);
+        List<Envelope> sent = new ArrayList<>();
+        out.drainQueueAndReset(0, sent, false);
+        assertThat(sent).hasSize(KEYS).allSatisfy(document ->
+                assertThat((List<?>) document.after().get("policies")).hasSize(1));
+        assertThat(parking.count()).as("parked rows are released after every landed document is stored").isZero();
+    }
+
+    private static AssemblerProcessor moving(NestTopology topology, NestStore<RootAssembly> documents,
+            NestStore<ParkedSubtree> parking, TestOutbox out) throws Exception {
+        AssemblerProcessor processor = new AssemblerProcessor(topology.assembler(), topology.slots(), documents,
+                "doc", null, null, io.tapstate.runtime.engine.ReplayFloor.NONE, NestSettings.defaults(),
+                NestClock.SYSTEM, NestSendPolicy.within(0), parking);
+        processor.init(out, new TestProcessorContext());
+        return processor;
+    }
+
+    private static void feed(AssemblerProcessor processor, TestOutbox out, int ordinal, Envelope event) {
+        TestInbox inbox = new TestInbox();
+        inbox.add(event);
+        processor.process(ordinal, inbox);
+        out.drainQueueAndReset(0, new ArrayList<>(), false);
+    }
 
     private static final TransformBody.Nest TREE = nest("customer", List.of("customer_id"),
             embed("policy", "customer_id", "customer_id", EmbedAs.ARRAY, "policies", List.of("policy_no"),

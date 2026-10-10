@@ -1,5 +1,10 @@
 package io.tapstate.cli;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
 /**
  * The outcome of a remote pipeline status read ({@code GET /api/pipelines/{id}/status}). Either the read
  * found the pipeline's latest published lifecycle state, or it was refused with a coded reason (a pipeline
@@ -27,7 +32,23 @@ sealed interface StatusOutcome {
      *                          its own
      */
     record Found(String pipelineId, String state, String failureCode, String failureMessage,
-            Long observedAgeMillis) implements StatusOutcome {
+            Long observedAgeMillis, RemoteRecovery.Pipeline recovery, String observedAt,
+            Map<String, Object> failureParams, ExplainOutcome.Plan plan, List<String> awaitingRebalance)
+            implements StatusOutcome {
+
+        public Found {
+            failureParams = failureParams == null ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(failureParams));
+            awaitingRebalance = awaitingRebalance == null ? List.of() : List.copyOf(awaitingRebalance);
+        }
+
+        Found(String pipelineId, String state, String failureCode, String failureMessage,
+                Long observedAgeMillis, RemoteRecovery.Pipeline recovery) {
+            this(pipelineId, state, failureCode, failureMessage, observedAgeMillis, recovery, null, Map.of(), null, List.of());
+        }
+
+        Found(String pipelineId, String state, String failureCode, String failureMessage, Long observedAgeMillis) {
+            this(pipelineId, state, failureCode, failureMessage, observedAgeMillis, null);
+        }
 
         /** A reading from a server that did not say how old it is — the shape before the time was carried. */
         Found(String pipelineId, String state, String failureCode, String failureMessage) {

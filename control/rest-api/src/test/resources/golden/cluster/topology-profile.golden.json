@@ -89,7 +89,21 @@
         "claimGeneration": 3,
         "executionGeneration": 7,
         "topologyRevision": 4,
-        "leased": true
+        "leased": true,
+        "leaseUntil": "2026-09-19T08:30:30Z",
+        "leaseRemainingMillis": 21000,
+        "profileGeneration": null,
+        "contextExecutionGeneration": null,
+        "executionClaimGeneration": null,
+        "executionIncarnation": null,
+        "executionRevision": null,
+        "executionTopologyRevision": null,
+        "executionProfileGeneration": null,
+        "executionProfileHash": null,
+        "executionMembers": [],
+        "failureClaimGeneration": null,
+        "failureAfterMemberLoss": null,
+        "executionContextCurrent": null
       },
       "captureClaims": [
         {
@@ -99,7 +113,21 @@
           "claimGeneration": 1,
           "executionGeneration": 1,
           "topologyRevision": 4,
-          "leased": true
+          "leased": true,
+          "leaseUntil": "2026-09-19T08:30:30Z",
+          "leaseRemainingMillis": 28000,
+          "profileGeneration": null,
+          "contextExecutionGeneration": null,
+          "executionClaimGeneration": null,
+          "executionIncarnation": null,
+          "executionRevision": null,
+          "executionTopologyRevision": null,
+          "executionProfileGeneration": null,
+          "executionProfileHash": null,
+          "executionMembers": [],
+          "failureClaimGeneration": null,
+          "failureAfterMemberLoss": null,
+          "executionContextCurrent": null
         }
       ],
       "measuredAt": "2026-09-19T08:30:00Z",
@@ -118,14 +146,15 @@
           "processors": [
             {
               "index": 0,
-              "localIndex": 0,
+              "localIndex": null,
               "memberUuid": "8b0a1e6e-0000-4000-8000-00000000000b",
               "nodeId": "node-b",
               "backlog": null,
               "frontierGaps": {},
               "frontierStalledMillis": {},
               "queuedByStream": {},
-              "inFlightByTable": {}
+              "inFlightByTable": {},
+              "context": null
             }
           ]
         },
@@ -138,25 +167,27 @@
           "processors": [
             {
               "index": 0,
-              "localIndex": 0,
+              "localIndex": null,
               "memberUuid": "8b0a1e6e-0000-4000-8000-00000000000b",
               "nodeId": "node-b",
               "backlog": null,
               "frontierGaps": {},
               "frontierStalledMillis": {},
               "queuedByStream": {},
-              "inFlightByTable": {}
+              "inFlightByTable": {},
+              "context": null
             },
             {
               "index": 1,
-              "localIndex": 0,
+              "localIndex": null,
               "memberUuid": "8b0a1e6e-0000-4000-8000-00000000000a",
               "nodeId": "node-a",
               "backlog": null,
               "frontierGaps": {},
               "frontierStalledMillis": {},
               "queuedByStream": {},
-              "inFlightByTable": {}
+              "inFlightByTable": {},
+              "context": null
             }
           ]
         }
@@ -164,5 +195,6 @@
     }
   ],
   "profileGeneration": 2,
-  "profileHash": "7cfff7ba047061b5cdffe86fa6d643c0c803ac007a190419d922cf98afa8303e"
+  "profileHash": "7cfff7ba047061b5cdffe86fa6d643c0c803ac007a190419d922cf98afa8303e",
+  "recovery": null
 }

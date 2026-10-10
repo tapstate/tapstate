@@ -28,6 +28,7 @@ public final class NativeExecutionStartup {
     public static final String CLAIM_ARGUMENT = "tapstate.claim-generation";
     public static final String EXECUTION_ARGUMENT = "tapstate.execution-generation";
     public static final String PROFILE_ARGUMENT = "tapstate.profile-generation";
+    static final String STAND_IN_PROCESSOR_TYPE = InitializedStandIn.class.getSimpleName();
 
     private NativeExecutionStartup() { }
 
@@ -169,11 +170,13 @@ public final class NativeExecutionStartup {
         @Override public void close(Throwable error) throws Exception { delegate.close(error); }
         @Override public Collection<? extends Processor> get(int count) {
             return delegate.get(count).stream()
-                    .map(processor -> new Initialized(processor, pipeline, claim, execution, profile)).toList();
+                    .map(processor -> PinnedStandIns.isStandIn(processor)
+                            ? new InitializedStandIn(processor, pipeline, claim, execution, profile)
+                            : new Initialized(processor, pipeline, claim, execution, profile)).toList();
         }
     }
 
-    private static final class Initialized implements Processor {
+    private static class Initialized implements Processor {
         private final Processor delegate;
         private final String pipeline;
         private final long claim;
@@ -216,5 +219,11 @@ public final class NativeExecutionStartup {
         @Override public boolean finishSnapshotRestore() { return delegate.finishSnapshotRestore(); }
         @Override public void close() throws Exception { delegate.close(); }
         @Override public boolean closeIsCooperative() { return delegate.closeIsCooperative(); }
+    }
+
+    private static final class InitializedStandIn extends Initialized {
+        InitializedStandIn(Processor delegate, String pipeline, long claim, long execution, long profile) {
+            super(delegate, pipeline, claim, execution, profile);
+        }
     }
 }

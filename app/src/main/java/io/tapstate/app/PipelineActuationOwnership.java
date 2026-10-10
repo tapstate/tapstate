@@ -136,6 +136,8 @@ final class PipelineActuationOwnership {
         return new PipelineActuationOwnership();
     }
 
+    boolean isFenced() { return fenced; }
+
     PipelineActuationOwnership(
             String clusterId,
             WorkloadOwner owner,
@@ -469,6 +471,26 @@ final class PipelineActuationOwnership {
         return current == null ? Optional.empty() : Optional.ofNullable(current.claim);
     }
 
+    /** Validates the current owning claim before pre-allocation validation or pending teardown. */
+    synchronized boolean mayStart(String pipelineId) {
+        if (closing) {
+            return false;
+        }
+        if (!fenced) {
+            return true;
+        }
+        WorkloadClaim expected = currentClaim(pipelineId).orElse(null);
+        if (expected == null) {
+            return false;
+        }
+        return claims.read(expected.key()).filter(WorkloadClaimReading::leased)
+                .map(WorkloadClaimReading::claim)
+                .filter(actual -> actual.owner().equals(expected.owner())
+                        && actual.claimGeneration() == expected.claimGeneration()
+                        && actual.executionGeneration() == expected.executionGeneration()
+                        && actual.profileGeneration() == expected.profileGeneration()).isPresent();
+    }
+
     /** Retires only the stopped execution captured before cleanup, never a subsequently admitted run. */
     synchronized boolean retireStoppedExecution(WorkloadClaim expected) {
         if (!fenced || expected == null) {
@@ -549,6 +571,16 @@ final class PipelineActuationOwnership {
             return;
         }
         state.claim = recorded.get();
+    }
+
+    /** A specifically diagnosed failure keeps its classification before unrelated membership movement. */
+    synchronized void recordClassifiedFailure(String pipelineId, boolean topologyFailure) {
+        if (!fenced || closing) { return; }
+        Held state = held.get(pipelineId);
+        if (state == null || state.claim == null || state.claim.executionGeneration() < 1
+                || state.claim.contextExecutionGeneration() != state.claim.executionGeneration()
+                || state.claim.failureClaimGeneration() != 0) { return; }
+        state.claim = claims.recordExecutionFailure(state.claim, topologyFailure).orElse(null);
     }
 
     /** A shutting-down member must leave its dying run unclassified for the next holder to recover. */

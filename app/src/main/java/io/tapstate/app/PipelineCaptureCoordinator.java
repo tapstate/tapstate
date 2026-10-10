@@ -3,6 +3,14 @@ package io.tapstate.app;
 import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.CaptureResumeWitness;
+import io.tapstate.spi.store.CaptureStartupProof;
+import io.tapstate.spi.store.CaptureStartupFailure;
+import io.tapstate.spi.store.CaptureResumePreparation;
+import io.tapstate.spi.store.SourceModel;
+import java.util.Map;
+import java.util.Set;
 
 import java.util.Optional;
 
@@ -35,6 +43,38 @@ interface PipelineCaptureCoordinator {
         startCapture(pipelineId);
     }
 
+    /** Starts actual sources under this execution, after durably freezing their pre-open truth. */
+    default void startCapture(String pipelineId, ArtifactStore artifactSnapshot, WorkloadClaimFence pipelineClaim) {
+        startCapture(pipelineId, artifactSnapshot);
+    }
+
+    /** Opens exactly the source models captured by the native plan and capacity reservation. */
+    default void startCapture(String pipelineId, ArtifactStore artifactSnapshot,
+            Map<String, SourceModel> sourceModels, WorkloadClaimFence pipelineClaim) {
+        startCapture(pipelineId, artifactSnapshot, pipelineClaim);
+    }
+
+    /** Pure diagnostic projection of every actual selected source before startup. */
+    default Map<String, CaptureResumeWitness> resumeWitnesses(String pipelineId, ArtifactStore artifactSnapshot) {
+        return Map.of();
+    }
+
+    /** Per-attempt requests remain available for failure diagnostics before acceptance. */
+    default Map<String, CaptureResumePreparation> preparedSources(String pipelineId, WorkloadClaimFence pipelineClaim) {
+        return Map.of();
+    }
+
+    default Set<String> requiredSources(String pipelineId, WorkloadClaimFence pipelineClaim) { return Set.of(); }
+
+    /** Complete only after every required source has accepted its qualified reader or bounded load. */
+    default Map<String, CaptureStartupProof> startupProofs(String pipelineId, WorkloadClaimFence pipelineClaim) {
+        return Map.of();
+    }
+
+    default Map<String, CaptureStartupFailure> startupFailures(String pipelineId, WorkloadClaimFence pipelineClaim) {
+        return Map.of();
+    }
+
     /**
      * Stops the cdc capture started for the pipeline, tearing down each source run and giving back its hold
      * on each chain it read. {@code purgeState} additionally lets go of what the pipeline left in the
@@ -64,6 +104,10 @@ interface PipelineCaptureCoordinator {
      */
     default Optional<Throwable> captureFailure(String pipelineId) {
         return Optional.empty();
+    }
+
+    default Optional<Throwable> captureFailure(String pipelineId, WorkloadClaimFence pipelineClaim) {
+        return captureFailure(pipelineId);
     }
 
     /**

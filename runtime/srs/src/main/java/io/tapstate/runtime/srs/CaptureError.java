@@ -23,6 +23,9 @@ public enum CaptureError implements TapstateErrorCode {
     /** A live capture could no longer renew the cluster ownership generation that fences its writes. */
     CLAIM_LOST("capture.claim-lost", Set.of("captureId")),
 
+    /** A qualified remote reader failed after this pipeline attached to its exact attempt. */
+    READER_STARTUP_FAILED("capture.reader-startup-failed", Set.of("pipeline", "source", "code")),
+
     /** A confirmed SRS cursor cannot be served without skipping missing or unverified history. */
     RECOVERY_LOG_GAP("capture.recovery-log-gap", Set.of("ring", "sequence", "reason")),
 

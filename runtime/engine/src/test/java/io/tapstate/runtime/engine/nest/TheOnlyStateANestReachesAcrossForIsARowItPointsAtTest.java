@@ -5,11 +5,13 @@ import static io.tapstate.runtime.engine.nest.NestTreeFixtures.embed;
 import static io.tapstate.runtime.engine.nest.NestTreeFixtures.nest;
 import static io.tapstate.runtime.engine.nest.NestTreeFixtures.tables;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.hazelcast.jet.core.test.TestInbox;
 import com.hazelcast.jet.core.test.TestOutbox;
 import com.hazelcast.jet.core.test.TestProcessorContext;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.TransformBody;
@@ -45,6 +47,39 @@ import org.junit.jupiter.api.Test;
  * below shows it is not touched there.
  */
 class TheOnlyStateANestReachesAcrossForIsARowItPointsAtTest {
+
+    @Test
+    void anOverLimitDocumentIsRefusedBeforeItsReferenceRowsAreMaterialized() throws Exception {
+        NestTopology limited = NestTopology.compile("p", "doc", nest("customer", List.of("customer_id"),
+                embed("policy", "customer_id", "customer_id", EmbedAs.ARRAY, "policies", List.of("policy_no"),
+                        embed("profile", "customer_id", "insured_ref", EmbedAs.OBJECT, "profile", null))),
+                tables());
+        RootAssembly document = new RootAssembly();
+        document.applyRoot(row("customer_id", "C1"), new SourceOrder(1, 1));
+        for (int index = 0; index < 2; index++) {
+            document.applyElement(new ElementRef(List.of("policies"), null, List.of("PN-" + index), null),
+                    row("policy_no", "PN-" + index, "insured_ref", "R" + index),
+                    new SourceOrder(1, index + 2), Map.of());
+        }
+        Recording<RootAssembly> own = new Recording<>();
+        own.save(List.of("C1"), document);
+        Recording<Map<String, Object>> referenced = new Recording<>();
+        AssemblerProcessor processor = new AssemblerProcessor(limited.assembler(), limited.slots(), own,
+                "doc", null, null, ReplayFloor.NONE,
+                NestSettings.defaults().withElementLimit(limited.assembler().mapName(), 1), NestClock.SYSTEM,
+                NestSendPolicy.everyChange(), null, (from, child) -> { },
+                Map.of(limited.lookups().getFirst().mapName(), referenced));
+        processor.init(new TestOutbox(16), new TestProcessorContext());
+        TestInbox inbox = new TestInbox();
+        inbox.add(Envelope.insert(4, "customer", row("customer_id", "C1"), null)
+                .withOrder(new SourceOrder(1, 4)));
+
+        assertThatThrownBy(() -> processor.process(0, inbox)).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(NestError.ROOT_FANOUT_LIMIT_EXCEEDED));
+
+        assertThat(referenced.reads).as("admission's reference-row bound is checked before the bulk read")
+                .isEmpty();
+    }
 
     /** Orders that point at a customer: the root holds a row it does not carry. */
     private static final TransformBody.Nest TREE = nest("order", List.of("order_id"),

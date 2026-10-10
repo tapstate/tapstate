@@ -7,6 +7,8 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import io.tapstate.spi.transform.TransformPort;
 import java.util.ArrayList;
+import java.util.AbstractList;
+import java.util.Objects;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -70,91 +72,121 @@ final class UnwindPort implements TransformPort {
 
     /** Every element of one row's list, as events of {@code op} carrying the row on the right side. */
     private List<Envelope> expandOneSide(Envelope event, Map<String, Object> row, Op op) {
-        List<Envelope> out = new ArrayList<>();
-        Set<Object> seen = new LinkedHashSet<>();
-        for (Map<String, Object> expanded : expand(row)) {
-            noteIfKeyIsShared(seen, expanded);
-            out.add(op == Op.DELETE ? asDelete(event, expanded) : asRow(event, op, expanded));
+        Expansion expansion = expand(row);
+        // Ordinals cannot collide inside one input row. Element-key collisions are reported before the
+        // lazy outputs leave, retaining the same alert order without retaining expanded row copies.
+        if (spec.elementKey() != null) {
+            Set<Object> seen = new LinkedHashSet<>();
+            for (int index = 0; index < expansion.size(); index++) {
+                Object key = expansion.keyAt(index);
+                if (!seen.add(key)) {
+                    alert.rowsShareAKey(TransformErrors.unwindRowsShareAKey(spec.path(), key));
+                }
+            }
         }
-        return out;
+        return new AbstractList<>() {
+            @Override public int size() { return expansion.size(); }
+
+            @Override public Envelope get(int index) {
+                Map<String, Object> expanded = expansion.rowAt(index);
+                return op == Op.DELETE ? asDelete(event, expanded) : asRow(event, op, expanded);
+            }
+        };
     }
 
-    /**
-     * The rows an update becomes: one delete for each key the earlier row had and the new one does
-     * not, an update for each key both carry, and an insert for each key only the new one has.
-     *
-     * <p>Splitting the last two rather than sending everything as an update keeps each event the
-     * shape its op promises - an update carries both rows, an insert only the new one - and a target
-     * matching rows to keys treats the two identically anyway.
-     */
+    /** Deletes for vanished keys precede the new rows; duplicate new rows retain their original order. */
     private List<Envelope> pairUpdate(Envelope event) {
-        Map<Object, Map<String, Object>> was = keyed(expand(event.before()));
-        List<Map<String, Object>> rows = expand(event.after());
-        Map<Object, Map<String, Object>> now = keyed(rows);
-        List<Envelope> out = new ArrayList<>();
-        was.forEach((key, row) -> {
+        Expansion before = expand(event.before());
+        Expansion after = expand(event.after());
+        Map<Object, Integer> was = keyed(before);
+        Map<Object, Integer> now = keyed(after);
+        List<Integer> removed = new ArrayList<>();
+        was.forEach((key, ordinal) -> {
             if (!now.containsKey(key)) {
-                out.add(asDelete(event, row));
+                removed.add(ordinal);
             }
         });
-        // The key index decides membership, not cardinality. Duplicate elements still travel to
-        // the sink in order, just as they do for inserts, after the collision has been reported.
-        rows.forEach(row -> {
-            Map<String, Object> earlier = was.get(keyOf(row));
-            out.add(earlier == null
-                    ? asRow(event, Op.INSERT, row)
-                    : new Envelope(Op.UPDATE, event.ts(), event.src(), earlier, row, event.schema())
-                            .withRemoved(event.removed()));
-        });
-        return out;
+        int size = Math.addExact(removed.size(), after.size());
+        return new AbstractList<>() {
+            @Override public int size() { return size; }
+
+            @Override public Envelope get(int index) {
+                Objects.checkIndex(index, size);
+                if (index < removed.size()) {
+                    return asDelete(event, before.rowAt(removed.get(index)));
+                }
+                int ordinal = index - removed.size();
+                Map<String, Object> row = after.rowAt(ordinal);
+                Integer earlier = was.get(after.keyAt(ordinal));
+                return earlier == null ? asRow(event, Op.INSERT, row)
+                        : new Envelope(Op.UPDATE, event.ts(), event.src(), before.rowAt(earlier), row, event.schema())
+                                .withRemoved(event.removed());
+            }
+        };
     }
 
-    /** The expanded rows of one side by their key, warning where two of them share one. */
-    private Map<Object, Map<String, Object>> keyed(List<Map<String, Object>> rows) {
-        Map<Object, Map<String, Object>> byKey = new LinkedHashMap<>();
-        for (Map<String, Object> row : rows) {
-            Object key = keyOf(row);
-            if (byKey.put(key, row) != null) {
+    /** Only keys and input ordinals are indexed; expanded rows are created when their output is consumed. */
+    private Map<Object, Integer> keyed(Expansion expansion) {
+        Map<Object, Integer> byKey = new LinkedHashMap<>();
+        for (int index = 0; index < expansion.size(); index++) {
+            Object key = expansion.keyAt(index);
+            if (byKey.put(key, index) != null) {
                 alert.rowsShareAKey(TransformErrors.unwindRowsShareAKey(spec.path(), key));
             }
         }
         return byKey;
     }
 
-    private void noteIfKeyIsShared(Set<Object> seen, Map<String, Object> row) {
-        Object key = keyOf(row);
-        if (!seen.add(key)) {
-            alert.rowsShareAKey(TransformErrors.unwindRowsShareAKey(spec.path(), key));
-        }
-    }
-
-    /**
-     * One row's list as the rows it becomes: the parent's columns with the list's field holding a
-     * single element, plus the ordinal where one was asked for.
-     *
-     * <p>Three shapes arrive as nothing to expand - the field absent, holding null, or holding an
-     * empty list - and they are one case because they mean one thing to whoever wrote the row. A
-     * value that is not a list at all is the opposite: it is one element, since whether a column
-     * holds a list is a fact about the row rather than the declaration, and stopping a pipeline over
-     * one dirty row is a worse answer than expanding it as the single thing it is.
-     */
-    private List<Map<String, Object>> expand(Map<String, Object> row) {
+    private Expansion expand(Map<String, Object> row) {
         if (row == null) {
-            return List.of();
+            return new Expansion(null, List.of(), false);
         }
         UnwindRules.refuseColumnCollisions(spec.path(), spec.includeArrayIndex(),
                 spec.elementKey(), row.keySet());
         Object original = row.get(spec.path());
         Object value = containerValue(original);
         if (value == null || value instanceof List<?> list && list.isEmpty()) {
-            return spec.preserveNullAndEmptyArrays() ? List.of(rowWith(row, null, null)) : List.of();
+            return new Expansion(row, List.of(), spec.preserveNullAndEmptyArrays());
         }
-        List<?> elements = value instanceof List<?> list ? list : List.of(original);
-        List<Map<String, Object>> out = new ArrayList<>(elements.size());
-        for (int i = 0; i < elements.size(); i++) {
-            out.add(rowWith(row, elements.get(i), (long) i));
+        return new Expansion(row, value instanceof List<?> list ? list : List.of(original), false);
+    }
+
+    private final class Expansion {
+        private final Map<String, Object> row;
+        private final List<?> elements;
+        private final boolean preservedEmpty;
+        private final int size;
+        private final List<Object> parent;
+
+        private Expansion(Map<String, Object> row, List<?> elements, boolean preservedEmpty) {
+            this.row = row;
+            this.elements = elements;
+            this.preservedEmpty = preservedEmpty;
+            this.size = preservedEmpty ? 1 : elements.size();
+            this.parent = new ArrayList<>(spec.parentKey().size());
+            if (row != null) {
+                spec.parentKey().forEach(column -> parent.add(ConvertedValue.unwrap(row.get(column))));
+            }
         }
-        return out;
+
+        private int size() { return size; }
+
+        private Map<String, Object> rowAt(int index) {
+            Objects.checkIndex(index, size);
+            return rowWith(row, preservedEmpty ? null : elements.get(index), preservedEmpty ? null : (long) index);
+        }
+
+        private Object keyAt(int index) {
+            Objects.checkIndex(index, size);
+            List<Object> key = new ArrayList<>(parent);
+            if (spec.elementKey() == null) {
+                key.add(preservedEmpty ? null : (long) index);
+            } else {
+                Object value = preservedEmpty ? null : containerValue(elements.get(index));
+                key.add(ConvertedValue.unwrap(value instanceof Map<?, ?> map ? map.get(spec.elementKey()) : null));
+            }
+            return key;
+        }
     }
 
     /**
@@ -197,26 +229,6 @@ final class UnwindPort implements TransformPort {
             value = carrier.value();
         }
         return value;
-    }
-
-    /**
-     * What tells this row from the others the same parent produced: what its rows were already keyed
-     * on, plus the one thing that varies per element.
-     *
-     * <p>Both parts are read off the row as columns, because by the time a row is paired the
-     * expansion has already written its locator as one - so what is compared here is the same
-     * thing the target is keyed on rather than a second reading of it. Every part is unwrapped,
-     * since this is a comparison and a carrier never equals the value inside it.
-     */
-    private Object keyOf(Map<String, Object> row) {
-        List<Object> key = new ArrayList<>(spec.parentKey().size() + 1);
-        for (String column : spec.parentKey()) {
-            key.add(ConvertedValue.unwrap(row.get(column)));
-        }
-        // Nothing else can identify an element, and the offline check refuses a declaration naming
-        // neither - so a null locator here is a wiring fault, not a row anyone wrote.
-        key.add(ConvertedValue.unwrap(row.get(spec.locator())));
-        return key;
     }
 
     // What an event covers is stamped onto every output by the runtime that drives this port, so

@@ -48,6 +48,7 @@ public final class PipelineExplainService {
     private final ExplanationMessages messages;
     private final ExecutionPlans plans;
     private final Supplier<List<String>> members;
+    private final ClusterRecoveryQueries recovery;
 
     public PipelineExplainService(ArtifactQueryService artifacts, ObservationStore observations,
             Clock clock, ExplanationMessages messages) {
@@ -66,12 +67,19 @@ public final class PipelineExplainService {
      */
     public PipelineExplainService(ArtifactQueryService artifacts, ObservationStore observations,
             Clock clock, ExplanationMessages messages, ExecutionPlans plans, Supplier<List<String>> members) {
+        this(artifacts, observations, clock, messages, plans, members, ClusterRecoveryQueries.NONE);
+    }
+
+    public PipelineExplainService(ArtifactQueryService artifacts, ObservationStore observations,
+            Clock clock, ExplanationMessages messages, ExecutionPlans plans, Supplier<List<String>> members,
+            ClusterRecoveryQueries recovery) {
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.observations = Objects.requireNonNull(observations, "observations");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.messages = Objects.requireNonNull(messages, "messages");
         this.plans = Objects.requireNonNull(plans, "plans");
         this.members = Objects.requireNonNull(members, "members");
+        this.recovery = Objects.requireNonNull(recovery, "recovery");
     }
 
     /**
@@ -83,7 +91,8 @@ public final class PipelineExplainService {
         Observation observation = observations.read(pipelineId).orElseThrow(() -> unobserved(pipelineId));
         ExecutionPlan plan = plans.current(List.of(pipelineId)).get(pipelineId);
         return diagnose(pipelineId, observation)
-                .withPlan(plan, plan == null ? List.of() : plan.notPlannedFor(members.get()));
+                .withPlan(plan, plan == null ? List.of() : plan.notPlannedFor(members.get()))
+                .withRecovery(recovery.pipeline(pipelineId));
     }
 
     private PipelineExplanation diagnose(String pipelineId, Observation observation) {

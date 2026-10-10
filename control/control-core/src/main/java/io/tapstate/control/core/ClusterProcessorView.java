@@ -1,5 +1,7 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.lifecycle.ProcessorRuntimeContext;
+
 import java.util.Collections;
 import java.util.Map;
 import java.util.Objects;
@@ -17,7 +19,7 @@ import java.util.TreeMap;
  * these say which writer is behind rather than only that the sink is.
  *
  * @param index                 the processor's index within this execution of its vertex, across the cluster
- * @param localIndex            its index among the vertex's processors on its member
+ * @param localIndex            its actual native local index, or null when no matching context was read
  * @param memberUuid            the engine identity of the member running it
  * @param nodeId                that member's stable id, or null when it carries no Tapstate identity
  * @param backlog               the rows waiting in the queues into it at the last reading, or null when
@@ -31,9 +33,9 @@ import java.util.TreeMap;
  * @param inFlightByTable       the rows a sink's writer is writing and has not had settled, by the table they
  *                              go to; empty where none are in flight
  */
-public record ClusterProcessorView(int index, int localIndex, String memberUuid, String nodeId, Long backlog,
+public record ClusterProcessorView(int index, Integer localIndex, String memberUuid, String nodeId, Long backlog,
         Map<String, Long> frontierGaps, Map<String, Long> frontierStalledMillis, Map<String, Long> queuedByStream,
-        Map<String, Long> inFlightByTable) {
+        Map<String, Long> inFlightByTable, ProcessorRuntimeContext context) {
 
     public ClusterProcessorView {
         frontierGaps = sorted(frontierGaps, "frontierGaps");
@@ -43,7 +45,14 @@ public record ClusterProcessorView(int index, int localIndex, String memberUuid,
     }
 
     /** A processor with nothing read about what is waiting in it by stream or table. */
-    public ClusterProcessorView(int index, int localIndex, String memberUuid, String nodeId, Long backlog,
+    public ClusterProcessorView(int index, Integer localIndex, String memberUuid, String nodeId, Long backlog,
+            Map<String, Long> frontierGaps, Map<String, Long> frontierStalledMillis, Map<String, Long> queuedByStream,
+            Map<String, Long> inFlightByTable) {
+        this(index, localIndex, memberUuid, nodeId, backlog, frontierGaps, frontierStalledMillis, queuedByStream,
+                inFlightByTable, null);
+    }
+
+    public ClusterProcessorView(int index, Integer localIndex, String memberUuid, String nodeId, Long backlog,
             Map<String, Long> frontierGaps, Map<String, Long> frontierStalledMillis) {
         this(index, localIndex, memberUuid, nodeId, backlog, frontierGaps, frontierStalledMillis, Map.of(), Map.of());
     }

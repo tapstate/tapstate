@@ -15,7 +15,17 @@ public record CaptureResumeWitness(
         boolean chainPresent, long chainEpoch, ChainPosition sourceRead, boolean sourceReadDurable,
         boolean consumerPresent, List<String> snapshotCompletedTables, String cdcStartPosition,
         long snapshotEpoch, ConsumerProgressKind progressKind,
-        ChainPosition sinkAcked, Map<String, ChainPosition> sinkAckedByTable) {
+        ChainPosition sinkAcked, Map<String, ChainPosition> sinkAckedByTable, CaptureReadState priorReader) {
+    public CaptureResumeWitness(String sourceId, String connectorId, String miningChainId, String consumerId,
+            ReadMode readMode, boolean srsEnabled, List<String> tables, boolean chainPresent, long chainEpoch,
+            ChainPosition sourceRead, boolean sourceReadDurable, boolean consumerPresent,
+            List<String> snapshotCompletedTables, String cdcStartPosition, long snapshotEpoch,
+            ConsumerProgressKind progressKind, ChainPosition sinkAcked, Map<String, ChainPosition> sinkAckedByTable) {
+        this(sourceId, connectorId, miningChainId, consumerId, readMode, srsEnabled, tables, chainPresent, chainEpoch,
+                sourceRead, sourceReadDurable, consumerPresent, snapshotCompletedTables, cdcStartPosition, snapshotEpoch,
+                progressKind, sinkAcked, sinkAckedByTable, null);
+    }
+
     public CaptureResumeWitness {
         Objects.requireNonNull(sourceId, "sourceId");
         Objects.requireNonNull(connectorId, "connectorId");
@@ -25,6 +35,9 @@ public record CaptureResumeWitness(
         tables = List.copyOf(tables);
         snapshotCompletedTables = List.copyOf(snapshotCompletedTables);
         sinkAckedByTable = Map.copyOf(sinkAckedByTable);
+        if (priorReader != null && !priorReader.attempt().miningChainId().equals(miningChainId)) {
+            throw new IllegalArgumentException("retained reader must name this exact physical source chain");
+        }
         if (sourceId.isBlank() || connectorId.isBlank() || miningChainId.isBlank() || consumerId.isBlank()
                 || tables.isEmpty() || chainEpoch < 0 || snapshotEpoch < 0
                 || (consumerPresent && progressKind == null)
@@ -65,9 +78,16 @@ public record CaptureResumeWitness(
                     new ChainPosition(SourceOrder.snapshotRow(snapshotEpoch), cdcStartPosition),
                     "mongo-consumer-snapshot-seam", reference));
         }
-        if (sourceRead != null && sourceRead.token() != null) {
+        if (snapshotOwed() && tables.stream().noneMatch(snapshotCompletedTables::contains)) {
+            // Its first source batch has not sampled this new full snapshot's own seam yet.
             return Optional.of(new ClusterRecoveryPosition(sourceId, connectorId, captureId,
-                    ClusterRecoveryPosition.Kind.DURABLE_POSITION, sourceRead, "mongo-source-checkpoint", reference));
+                    ClusterRecoveryPosition.Kind.SNAPSHOT_REQUIRED, null, "mongo-new-snapshot", reference));
+        }
+        ChainPosition checkpoint = srsEnabled ? (sourceReadDurable ? sourceRead : null) : confirmedDirectPosition();
+        if (checkpoint != null && checkpoint.token() != null) {
+            return Optional.of(new ClusterRecoveryPosition(sourceId, connectorId, captureId,
+                    ClusterRecoveryPosition.Kind.DURABLE_POSITION, checkpoint,
+                    srsEnabled ? "mongo-source-checkpoint" : "mongo-consumer-confirmed-prefix", reference));
         }
         if (cdcStartPosition != null) {
             return Optional.of(new ClusterRecoveryPosition(sourceId, connectorId, captureId,
@@ -75,8 +95,45 @@ public record CaptureResumeWitness(
                     new ChainPosition(snapshotEpoch > 0 ? SourceOrder.snapshotRow(snapshotEpoch) : null, cdcStartPosition),
                     "mongo-consumer-seam", reference));
         }
+        if (priorReader != null) {
+            String retained = priorReader.attempt().requestedKind() == CaptureReadAttempt.Kind.RESUME
+                    ? priorReader.attempt().requestedToken() : priorReader.resolvedAnchor();
+            if (retained != null) {
+                return Optional.of(new ClusterRecoveryPosition(sourceId, connectorId, captureId,
+                        ClusterRecoveryPosition.Kind.DURABLE_POSITION,
+                        new ChainPosition(SourceOrder.snapshotRow(priorReader.attempt().chainEpoch()), retained),
+                        "mongo-retained-reader-request", reference));
+            }
+        }
         return snapshotOwed() ? Optional.of(new ClusterRecoveryPosition(sourceId, connectorId, captureId,
                 ClusterRecoveryPosition.Kind.SNAPSHOT_REQUIRED, null, "mongo-snapshot-required", reference))
                 : Optional.empty();
+    }
+
+    /** Only the isolated channel's confirmed common prefix can resume its database reader. */
+    public ChainPosition confirmedDirectPosition() {
+        if (progressKind != ConsumerProgressKind.DIRECT_SOURCE) {
+            return null;
+        }
+        ChainPosition floor = sinkAcked;
+        if (floor == null && tables.stream().allMatch(sinkAckedByTable::containsKey)) {
+            for (String table : tables) {
+                ChainPosition confirmed = sinkAckedByTable.get(table);
+                if (confirmed.order() == null) {
+                    return null;
+                }
+                if (floor == null || confirmed.order().compareTo(floor.order()) < 0) {
+                    floor = confirmed;
+                }
+            }
+        }
+        if (floor == null) {
+            return null;
+        }
+        if (sourceRead != null && sourceRead.order() != null && floor.order() != null
+                && sourceRead.order().compareTo(floor.order()) <= 0 && sourceRead.token() != null) {
+            return sourceRead;
+        }
+        return floor.token() == null ? null : floor;
     }
 }

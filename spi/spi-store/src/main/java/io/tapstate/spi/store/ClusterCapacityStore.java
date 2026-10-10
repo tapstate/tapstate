@@ -6,6 +6,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 
 /** Shared atomic occupancy for ordinary starts and recovery; every write validates real authority. */
@@ -34,8 +35,20 @@ public interface ClusterCapacityStore {
      */
     Result release(ClusterCapacityReservation expected);
 
-    /** Every known occupied resource on each node; an unreadable or unknown execution fails this read. */
+    /** Every known occupied resource on each node, without cleanup or authority mutations. */
     Map<String, ClusterCapacityDemand> occupied(String clusterId);
+
+    /** The profile and demand from one read-only snapshot; unknown demand remains a coded refusal. */
+    default Optional<Snapshot> readOccupied(String clusterId) {
+        return Optional.empty();
+    }
+
+    record Snapshot(ClusterExecutionProfile profile, Map<String, ClusterCapacityDemand> occupiedByNode) {
+        public Snapshot {
+            profile = Objects.requireNonNull(profile, "profile");
+            occupiedByNode = Map.copyOf(Objects.requireNonNull(occupiedByNode, "occupiedByNode"));
+        }
+    }
 
     enum Outcome {
         APPLIED, ALREADY_RESERVED, CAPACITY_REFUSED, UNKNOWN_DEMAND,
@@ -43,7 +56,7 @@ public interface ClusterCapacityStore {
     }
 
     record Result(Outcome outcome, ClusterCapacityReservation reservation,
-            WorkloadClaim advancedPipelineClaim, List<ClusterCapacityLimits.Violation> violations) {
+            WorkloadClaim advancedPipelineClaim, List<ClusterCapacityLimits.Violation> violations, String refusedNode) {
         public Result {
             Objects.requireNonNull(outcome, "outcome");
             violations = List.copyOf(Objects.requireNonNull(violations, "violations"));
@@ -51,6 +64,11 @@ public interface ClusterCapacityStore {
                     || reservation.executionGeneration() != advancedPipelineClaim.executionGeneration())) {
                 throw new IllegalArgumentException("advanced generation must match its capacity receipt");
             }
+        }
+
+        public Result(Outcome outcome, ClusterCapacityReservation reservation,
+                WorkloadClaim advancedPipelineClaim, List<ClusterCapacityLimits.Violation> violations) {
+            this(outcome, reservation, advancedPipelineClaim, violations, null);
         }
     }
 }

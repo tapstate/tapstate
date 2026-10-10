@@ -2,6 +2,7 @@ package io.tapstate.control.core;
 
 import io.tapstate.core.lifecycle.ExecutionPlans;
 import io.tapstate.core.lifecycle.ExecutionPlan;
+import io.tapstate.core.lifecycle.ProcessorRuntimeContext;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimKey;
@@ -117,7 +118,7 @@ public final class ClusterPipelineTopologyService {
                     run == null ? List.of() : List.copyOf(new TreeSet<>(run.measuredFrom())),
                     run == null ? List.of() : awaitingRebalance(run, members),
                     run == null ? List.of()
-                            : vertices(run, nodeIdByMemberUuid, plannedNodes(planById.get(pipelineId), controller))));
+                            : vertices(run, nodeIdByMemberUuid, plannedNodes(planById.get(pipelineId), controller, run.processorContexts()))));
         }
         return views;
     }
@@ -127,11 +128,15 @@ public final class ClusterPipelineTopologyService {
      * plan. One written for an earlier execution than the claim now names says nothing about the run executing:
      * its widths were worked out for another run, and reporting them would put an old answer beside a new run.
      */
-    private static Map<String, ExecutionPlan.Node> plannedNodes(ExecutionPlan plan, ClusterClaimView controller) {
+    private static Map<String, ExecutionPlan.Node> plannedNodes(ExecutionPlan plan, ClusterClaimView controller,
+            List<ProcessorRuntimeContext> contexts) {
         if (plan == null) {
             return Map.of();
         }
         if (controller != null && !Objects.equals(plan.executionGeneration(), controller.executionGeneration())) {
+            return Map.of();
+        }
+        if (contexts.stream().anyMatch(context -> !Objects.equals(plan.executionGeneration(), context.executionGeneration()))) {
             return Map.of();
         }
         Map<String, ExecutionPlan.Node> byVertex = new HashMap<>();
@@ -253,7 +258,18 @@ public final class ClusterPipelineTopologyService {
                 claim.claimGeneration(),
                 claim.executionGeneration(),
                 claim.topologyRevision(),
-                reading.leased());
+                reading.leased(), claim.leaseUntil(), reading.leaseRemaining().toMillis(),
+                claim.profileGeneration() == 0 ? null : claim.profileGeneration(),
+                claim.contextExecutionGeneration() == 0 ? null : claim.contextExecutionGeneration(),
+                claim.executionClaimGeneration() == 0 ? null : claim.executionClaimGeneration(),
+                claim.executionIncarnation(), claim.executionRevision(), claim.executionTopologyRevision(),
+                claim.executionProfile() == null ? null : claim.executionProfile().generation(),
+                claim.executionProfile() == null ? null : claim.executionProfile().profile().hash(),
+                claim.executionMembers().values().stream().sorted(java.util.Comparator.comparing(io.tapstate.spi.store.ClusterExecutionMember::nodeId))
+                        .map(value -> new ClusterClaimView.Member(value.nodeId(), value.bootId(), value.memberUuid())).toList(),
+                claim.failureClaimGeneration() == 0 ? null : claim.failureClaimGeneration(),
+                claim.failureClaimGeneration() == 0 ? null : claim.failureAfterMemberLoss(),
+                claim.contextExecutionGeneration() == 0 ? null : claim.contextExecutionGeneration() == claim.executionGeneration());
     }
 
     private static List<ClusterVertexView> vertices(
@@ -264,21 +280,22 @@ public final class ClusterPipelineTopologyService {
                     .filter(LivePipelineProcessor::working)
                     .sorted((left, right) -> Integer.compare(left.index(), right.index()))
                     .toList();
-            // A processor's index on its member is its place among the vertex's processors there, in the
-            // cluster-wide order: the engine numbers each member's processors of a vertex in one run.
-            Map<String, Integer> nextOnMember = new HashMap<>();
             List<ClusterProcessorView> processors = new ArrayList<>();
             for (LivePipelineProcessor processor : working) {
+                ProcessorRuntimeContext context = run.processorContexts().stream()
+                        .filter(value -> value.vertex().equals(vertex.name())
+                                && value.globalProcessorIndex() == processor.index()
+                                && value.memberUuid().equals(processor.memberUuid())).findFirst().orElse(null);
                 processors.add(new ClusterProcessorView(
                         processor.index(),
-                        nextOnMember.merge(String.valueOf(processor.memberUuid()), 1, Integer::sum) - 1,
+                        context == null ? null : context.localProcessorIndex(),
                         processor.memberUuid(),
                         nodeIdByMemberUuid.get(processor.memberUuid()),
                         processor.backlog(),
                         processor.frontierGaps(),
                         processor.frontierStalledMillis(),
                         processor.queuedByStream(),
-                        processor.inFlightByTable()));
+                        processor.inFlightByTable(), context));
             }
             // What the plan says of the vertex's node, where the vertex runs at its node's width: a vertex the plan
             // does not name - one gathering several producers into one, or any vertex of a run with no plan

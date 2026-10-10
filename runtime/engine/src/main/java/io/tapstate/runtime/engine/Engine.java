@@ -176,6 +176,13 @@ public final class Engine {
                 job.getStatus(), NativeExecutionStartup.read(member, pipelineId)));
     }
 
+    /** Successful completion comes from the native job result, not from absence of a live job. */
+    public boolean hasCompleted(String pipelineId) {
+        if (isLost()) { return false; }
+        Job job = jobNamed(pipelineId);
+        return job != null && job.getStatus() == JobStatus.COMPLETED && !job.isUserCancelled();
+    }
+
     private static boolean matchesExecution(Job job, long claim, long execution, long profile) {
         return Objects.equals(job.getConfig().getArgument(NativeExecutionStartup.CLAIM_ARGUMENT), claim)
                 && Objects.equals(job.getConfig().getArgument(NativeExecutionStartup.EXECUTION_ARGUMENT), execution)

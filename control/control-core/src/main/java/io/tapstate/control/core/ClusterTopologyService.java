@@ -42,6 +42,7 @@ public final class ClusterTopologyService {
     private final ClusterPipelineTopologyService pipelines;
     private final String clusterId;
     private final ClusterProfileStore profiles;
+    private final ClusterRecoveryQueries recovery;
 
     /**
      * @param committed the committed-membership store, or null on a build that keeps no membership --
@@ -58,11 +59,18 @@ public final class ClusterTopologyService {
     /** Reads admitted profiles and node sessions alongside live membership. */
     public ClusterTopologyService(LiveClusterMembers live, ClusterMembershipStore committed,
             ClusterPipelineTopologyService pipelines, String clusterId, ClusterProfileStore profiles) {
+        this(live, committed, pipelines, clusterId, profiles, ClusterRecoveryQueries.NONE);
+    }
+
+    public ClusterTopologyService(LiveClusterMembers live, ClusterMembershipStore committed,
+            ClusterPipelineTopologyService pipelines, String clusterId, ClusterProfileStore profiles,
+            ClusterRecoveryQueries recovery) {
         this.live = Objects.requireNonNull(live, "live");
         this.committed = committed;
         this.pipelines = Objects.requireNonNull(pipelines, "pipelines");
         this.clusterId = clusterId;
         this.profiles = profiles;
+        this.recovery = Objects.requireNonNull(recovery, "recovery");
     }
 
     /** The cluster as the answering node can see it right now. */
@@ -101,7 +109,7 @@ public final class ClusterTopologyService {
                 // which members a run is carrying no part of is a question about both.
                 pipelines.pipelines(members),
                 profile == null ? null : profile.generation(),
-                profile == null ? null : profile.profile().hash());
+                profile == null ? null : profile.profile().hash(), recovery.cluster());
     }
 
     private ClusterMemberView member(LiveClusterMember member, ClusterNodeReading reading,

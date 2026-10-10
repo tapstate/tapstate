@@ -5,8 +5,11 @@ import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.ClusterCapacityDemand;
 import io.tapstate.spi.store.ClusterExecutionProfile;
+import io.tapstate.spi.store.CaptureResumeWitness;
 import io.tapstate.spi.store.ClusterRecoveryCause;
 import io.tapstate.spi.store.ClusterRecoveryDiagnostic;
+import io.tapstate.spi.store.ClusterRecoveryFailureNote;
+import io.tapstate.spi.store.ClusterRecoveryStore;
 import io.tapstate.spi.store.ClusterRecoveryEvent;
 import io.tapstate.spi.store.ClusterRecoveryItem;
 import io.tapstate.spi.store.ClusterRecoveryKey;
@@ -139,29 +142,79 @@ final class ClusterRecoveryDocuments {
     private static Document successor(ClusterRecoverySuccessor successor) {
         return new Document("pipelineClaim", WorkloadClaimDocuments.stored(successor.pipelineClaim()))
                 .append("profile", profile(successor.profile())).append("executionNodeIds", successor.executionNodeIds().stream().sorted().toList())
+                .append("requiredSourceIds", successor.requiredSourceIds().stream().sorted().toList())
+                .append("sourceRequirementsRecorded", successor.sourceRequirementsRecorded())
                 .append("allocatedAt", date(successor.allocatedAt())).append("nativeJobId", successor.nativeJobId())
                 .append("submittedAt", date(successor.submittedAt()))
+                .append("requestedPositions", positions(successor.requestedPositions()))
+                .append("failureNote", successor.failureNote() == null ? null : failureNote(successor.failureNote()))
                 .append("startupReceipt", successor.startupReceipt() == null ? null : receipt(successor.startupReceipt()));
     }
 
     private static ClusterRecoverySuccessor successor(Document document) {
         return new ClusterRecoverySuccessor(fence(required(document, "pipelineClaim")), profile(required(document, "profile")),
-                Set.copyOf(document.getList("executionNodeIds", String.class)), instant(document, "allocatedAt"),
+                Set.copyOf(document.getList("executionNodeIds", String.class)),
+                requiredSources(document),
+                Boolean.TRUE.equals(document.getBoolean("sourceRequirementsRecorded")), instant(document, "allocatedAt"),
                 document.getString("nativeJobId"), instantOrNull(document, "submittedAt"),
-                document.get("startupReceipt") == null ? null : receipt(required(document, "startupReceipt")));
+                positions(document.getList("requestedPositions", Document.class, List.of())),
+                document.get("startupReceipt") == null ? null : receipt(required(document, "startupReceipt")),
+                document.get("failureNote") == null ? null : failureNote(required(document, "failureNote")));
+    }
+
+    private static Document failureNote(ClusterRecoveryFailureNote note) {
+        return new Document("pipelineClaim", WorkloadClaimDocuments.stored(note.pipelineClaim()))
+                .append("stage", note.stage().name()).append("diagnostic", diagnostic(note.diagnostic()))
+                .append("recordedAt", date(note.recordedAt()));
+    }
+
+    private static ClusterRecoveryFailureNote failureNote(Document document) {
+        return new ClusterRecoveryFailureNote(fence(required(document, "pipelineClaim")),
+                ClusterRecoveryStore.FailureStage.valueOf(document.getString("stage")),
+                diagnostic(required(document, "diagnostic")), instant(document, "recordedAt"));
+    }
+
+    private static Set<String> requiredSources(Document document) {
+        List<String> ids = document.getList("requiredSourceIds", String.class);
+        if (ids == null) {
+            if (Boolean.TRUE.equals(document.getBoolean("sourceRequirementsRecorded"))) {
+                throw unreadable(document, "requiredSourceIds", null);
+            }
+            return Set.of();
+        }
+        Set<String> sources = Set.copyOf(ids);
+        if (sources.size() != ids.size()) {
+            throw unreadable(document, "requiredSourceIds", null);
+        }
+        return sources;
     }
 
     private static Document receipt(ClusterRecoveryStartupReceipt receipt) {
         return new Document("pipelineClaim", WorkloadClaimDocuments.stored(receipt.pipelineClaim()))
                 .append("nativeJobId", receipt.nativeJobId()).append("nativeInitializedAt", date(receipt.nativeInitializedAt()))
+                .append("preparedWitnesses", new TreeMap<>(receipt.preparedWitnesses()).values().stream()
+                        .map(CaptureStartupDocuments::witness).toList())
+                .append("requestedPositions", positions(receipt.requestedPositions()))
                 .append("acceptedPositions", positions(receipt.acceptedPositions())).append("positionsAcceptedAt", date(receipt.positionsAcceptedAt()))
                 .append("executionCompleted", receipt.executionCompleted());
     }
 
     private static ClusterRecoveryStartupReceipt receipt(Document document) {
         return new ClusterRecoveryStartupReceipt(fence(required(document, "pipelineClaim")), document.getString("nativeJobId"),
-                instant(document, "nativeInitializedAt"), positions(document.getList("acceptedPositions", Document.class)),
+                instant(document, "nativeInitializedAt"), witnesses(document.getList("preparedWitnesses", Document.class, List.of())),
+                positions(document.getList("requestedPositions", Document.class, List.of())), positions(document.getList("acceptedPositions", Document.class)),
                 instant(document, "positionsAcceptedAt"), Boolean.TRUE.equals(document.getBoolean("executionCompleted")));
+    }
+
+    private static Map<String, CaptureResumeWitness> witnesses(List<Document> documents) {
+        Map<String, CaptureResumeWitness> witnesses = new LinkedHashMap<>();
+        for (Document document : documents) {
+            CaptureResumeWitness witness = CaptureStartupDocuments.witness(document);
+            if (witnesses.put(witness.sourceId(), witness) != null) {
+                throw unreadable(document, "duplicatePreparedWitness", null);
+            }
+        }
+        return Map.copyOf(witnesses);
     }
 
     static Document diagnostic(ClusterRecoveryDiagnostic diagnostic) {

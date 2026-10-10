@@ -130,6 +130,11 @@ public final class CaptureRun implements AutoCloseable {
         return health;
     }
 
+    /** Source acceptance is independent of a submitted or RUNNING job. */
+    public boolean startupAccepted(io.tapstate.core.model.ReadMode mode) {
+        return mode == io.tapstate.core.model.ReadMode.SNAPSHOT_ONLY ? health.snapshotAccepted() : health.readerAccepted();
+    }
+
     /** Registers how this shared reader takes on tables requested after it opened. */
     public CaptureRun withWidening(Runnable handler) {
         widening.set(Objects.requireNonNull(handler, "handler"));

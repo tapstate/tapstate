@@ -128,6 +128,9 @@ public final class PipelineConverger {
                     .map(checkpoint -> ConvergeResult.failed(checkpoint, failure.get()))
                     .orElse(driven);
         }
+        if (actuator.hasCompleted(pipelineId)) {
+            return markCompleted(pipelineId);
+        }
         // Nothing failed and nothing is carrying it: this process has come up to a checkpoint an
         // earlier one wrote. The state already matches the intent, so the drive below would call
         // this converged and actuate nothing - which is how a pipeline ends up reporting RUNNING,

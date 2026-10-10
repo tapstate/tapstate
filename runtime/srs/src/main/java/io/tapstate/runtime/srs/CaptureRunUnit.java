@@ -227,10 +227,27 @@ public final class CaptureRunUnit {
             // Opened before the load, not with the tail: the load's rows are this run's too, and an
             // account opened after them would report a run that had read nothing until its first change.
             CaptureHealth health = new CaptureHealth();
+            if (spec.pipelineFence() != null && spec.resumeWitness() != null
+                    && spec.resumeWitness().snapshotOwed()) {
+                health.snapshotWitness(() -> {
+                    if (!meta.recordSnapshotStartup(spec.pipelineFence(), spec.resumeWitness())) {
+                        throw new TapstateException(CaptureError.CLAIM_LOST,
+                                Map.of("captureId", CaptureId.of(spec).value()), null);
+                    }
+                });
+            }
             attachConsumer(spec, plan, startTail, tables, state);
             markPipelineArrival(spec, plan, tables, state.chainId);
             Optional<StreamSource<SrsItem>> ringSource = ringSource(spec, plan, tables, state.chainId);
+            if (state.chainId != null && spec.pipelineFence() != null && spec.resumeWitness() != null
+                    && !meta.recordCaptureAttachment(spec.pipelineFence(), spec.resumeWitness(), state.epoch)) {
+                throw new TapstateException(CaptureError.RECOVERY_PROGRESS_UNPROVEN,
+                        Map.of("pipeline", spec.pipelineId(), "source", spec.sourceId()), null);
+            }
             state.load = openLoad(spec, plan, tables, state.chainId, state.epoch);
+            if (state.load != null && state.load.readsAnything()) {
+                health.snapshotOpened();
+            }
             // The seam this run's own load began at, for the tail that follows it -- null when no load ran
             // here. Carried from the phase rather than read back off the chain, because the chain records
             // one seam for however many pipelines load from it: read back, a pipeline new to the chain
@@ -366,7 +383,7 @@ public final class CaptureRunUnit {
             CaptureConfig config = plan.sharedRing() && durableLog() != null
                     ? spec.config().sharing(sharedNotes(spec, chainId.value())) : spec.config();
             return SnapshotPhase.open(
-                    port, config, chainId.value(), spec.consumerId(), tables, epoch, meta);
+                    port, config, chainId.value(), spec.consumerId(), tables, epoch, meta, spec.resumeWitness());
         }
         long snapshotEpoch = spec.snapshotEpoch() > 0
                 ? spec.snapshotEpoch()
@@ -407,7 +424,9 @@ public final class CaptureRunUnit {
             counts.merge(event.src(), 1L, Long::sum);
             health.received(event);
             handoff.accept(event);
+            health.snapshotDelivered();
         }, handoff::loaded);
+        health.snapshotCompleted();
         load.close();
         return new SnapshotRead(count, counts);
     }
@@ -573,13 +592,17 @@ public final class CaptureRunUnit {
             CaptureConfig config = new CaptureConfig(spec.config().connectorId(), spec.config().settings(),
                     tables, spec.config().node()).sharing(sharedNotes(spec, chain));
             Optional<SrsMeta> state = meta.read(chain);
-            CaptureStart start = state.filter(record -> record.sourceReadDurable()
+            CaptureStart start = serving.isEmpty() && spec.resumeWitness() != null
+                    ? frozenTailStart(spec, firstSeam, CaptureStart.present())
+                    : state.filter(record -> record.sourceReadDurable()
                             && record.sourceReadOffset() != null)
                     .map(record -> CaptureStart.resume(new SourcePosition(record.sourceReadOffset())))
                     .orElseGet(() -> tailStart(meta, chain, spec.consumerId(), firstSeam, CaptureStart.present()));
             refuseAnInstantThisBufferWillNeverReach(spec.startFrom(), start, spec.retention());
+            boolean firstOpen = serving.isEmpty();
             serving = tables;
-            subscription.set(CdcPhase.runDurable(port, config, start, routes, health, batchOrder));
+            subscription.set(CdcPhase.runDurable(port, config, start, routes, health, batchOrder,
+                    firstOpen ? spec : null));
         }
 
         private void trim(String table, String ring, Collection<ConsumerOffset> consumers,
@@ -730,7 +753,7 @@ public final class CaptureRunUnit {
                 LongConsumer trim = cuttable ? seq -> log.trim(ringName, seq) : seq -> { };
                 routes.put(table, new CdcPhase.TableRoute(chain, consumers, trim));
             }
-            CaptureStart minerStart = tailStart(meta, cid, spec.consumerId(), ownSeam, CaptureStart.present());
+            CaptureStart minerStart = frozenTailStart(spec, ownSeam, CaptureStart.present());
             refuseAnInstantThisBufferWillNeverReach(spec.startFrom(), minerStart, spec.retention());
             return Optional.of(sourceAcknowledgements.follow(
                     meta, cid, CdcPhase.run(port, spec.config(), minerStart, routes, health), health, false));
@@ -742,13 +765,11 @@ public final class CaptureRunUnit {
             Supplier<Collection<ConsumerOffset>> directConsumers = () -> meta.consumerOffsets(directChain);
             AtomicLong forwarded = new AtomicLong();
             AtomicReference<ChainPosition> directLastWritten = new AtomicReference<>();
-            CaptureStart start = tailStart(meta, directChain, spec.consumerId(), ownSeam,
-                    sourceStart(spec.startFrom()));
+            CaptureStart start = frozenTailStart(spec, ownSeam, sourceStart(spec.startFrom()));
             String anchor = start instanceof CaptureStart.Resume resume ? resume.position().token() : null;
             meta.beginDirectCapture(directChain, spec.consumerId(), epoch, anchor);
             Map<String, Long> targets = new LinkedHashMap<>();
-            Subscription direct = port.cdc(
-                    spec.config(), start, health.recording(new CaptureStartedListener() {
+            io.tapstate.spi.capture.CaptureListener directCallbacks = new CaptureStartedListener() {
                         @Override
                         public void onStart(SourcePosition position) {
                             meta.beginDirectCapture(directChain, spec.consumerId(), epoch, position.token());
@@ -775,7 +796,10 @@ public final class CaptureRunUnit {
                                     Map.copyOf(targets)));
                             ordered.forEach(passthrough);
                         }
-                    }));
+                    };
+            Subscription direct = CdcPhase.openReader(port, spec.config(), start, health.recording(CdcPhase.qualifiedReader(
+                    directCallbacks, meta, directChain, epoch, spec.config().streams(), start, spec.captureFence(),
+                    spec.pipelineFence(), spec.resumeWitness())));
             // Bounded by what this channel's targets confirmed: a direct channel has no log to replay from.
             return Optional.of(sourceAcknowledgements.follow(meta, directChain, direct, health, false));
         }
@@ -841,6 +865,22 @@ public final class CaptureRunUnit {
             meta.advanceSourceReadOffset(miningChainId, safe);
             lastWritten.set(safe);
         });
+    }
+
+    private CaptureStart frozenTailStart(CaptureRunSpec spec, String seam, CaptureStart fallback) {
+        if (spec.resumeWitness() == null) {
+            return tailStart(meta, spec.miningChainId().value(), spec.consumerId(), seam, fallback);
+        }
+        if (seam != null) { return CaptureStart.resume(new SourcePosition(seam)); }
+        var requested = spec.resumeWitness().requestedPosition(CaptureId.of(spec).value()).orElse(null);
+        if (requested != null && requested.position() != null && requested.position().token() != null) {
+            return CaptureStart.resume(new SourcePosition(requested.position().token()));
+        }
+        if (spec.resumeWitness().priorReader() != null) {
+            throw new TapstateException(CaptureError.RECOVERY_PROGRESS_UNPROVEN,
+                    Map.of("pipeline", spec.pipelineId(), "source", spec.sourceId()), null);
+        }
+        return fallback;
     }
 
     private RuntimeException rollbackStartFailure(
