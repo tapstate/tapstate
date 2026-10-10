@@ -1,5 +1,7 @@
 package io.tapstate.e2e;
 
+import io.tapstate.core.common.JsonWriter;
+
 import com.mongodb.ConnectionString;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
@@ -147,6 +149,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
     private final String operatorStateUri;
     private final RealProcessServer server;
     private final OwnedBoot boot;
+    private final BenchmarkOwnedProcessReceipt ownedProcessReceipt;
     private final ControlPlane control;
     private final Connection source;
     private final MongoClient mongo;
@@ -159,7 +162,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
 
     private BenchmarkForkEnvironment(BenchmarkWorkloadDefinitions.Workload workload, String forkId,
             Map<String, Object> sourceSettings, String storeUri, String externalTargetUri,
-            String managedViewsUri, String operatorStateUri, OwnedBoot boot,
+            String managedViewsUri, String operatorStateUri, OwnedBoot boot, BenchmarkOwnedProcessReceipt ownedProcessReceipt,
             ControlPlane control, Connection source, MongoClient mongo,
             SharedPostgres.Fixture postgresFixture, SharedPostgres.Closing bootClosing) {
         this.workload = workload;
@@ -170,6 +173,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
         this.managedViewsUri = managedViewsUri;
         this.operatorStateUri = operatorStateUri;
         this.boot = Objects.requireNonNull(boot); this.server = boot.server();
+        this.ownedProcessReceipt = Objects.requireNonNull(ownedProcessReceipt);
         this.control = control;
         this.source = source;
         this.mongo = mongo; this.postgresFixture = postgresFixture; this.bootClosing = bootClosing;
@@ -200,6 +204,7 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
         SharedPostgres.Closing bootClosing = postgresFixture.pending("owned benchmark boot");
         Connection source = null;
         OwnedBoot boot = null;
+        BenchmarkOwnedProcessReceipt ownedProcessReceipt = null;
         MongoClient mongo = null;
         try {
             Map<String, Object> sourceSettings = workload.database() == BenchmarkWorkloadDefinitions.Database.MYSQL
@@ -221,6 +226,18 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
             RealProcessServer server = boot.server();
             OwnedBoot ownedBoot = boot;
             postgresFixture.bind(bootClosing, ownedBoot, ownedBoot::terminated);
+            Map<String, Object> bindings = new LinkedHashMap<>();
+            bindings.put("namespace", namespace); bindings.put("forkId", forkId); bindings.put("workload", workload.id());
+            bindings.put("sourceDatabaseKind", workload.database().name());
+            Map<String, Object> sourceBinding = new LinkedHashMap<>();
+            for (String name : List.of("host", "port", "database", "schema")) {
+                if (sourceSettings.get(name) != null) { sourceBinding.put(name, sourceSettings.get(name)); }
+            }
+            bindings.put("sourceSettings", Map.copyOf(sourceBinding)); bindings.put("storeUri", storeUri);
+            bindings.put("externalTargetUri", externalTargetUri); bindings.put("managedViewsUri", managedViewsUri);
+            bindings.put("operatorDatabase", operatorDatabase); bindings.put("operatorStateUri", operatorStateUri);
+            bindings.put("captureBoundary", "AFTER_SOURCE_FIXTURE_PREPARATION_BEFORE_PIPELINE_CONFIGURATION_AND_START");
+            ownedProcessReceipt = BenchmarkOwnedProcessReceipt.capture(server, applicationJar, bindings);
             ControlPlane readiness = new ControlPlane(server.baseUrl());
             Await.until("benchmark owned boot readiness", () -> { ownedBoot.check(); return readiness.healthy(); },
                     () -> "owned process alive=" + server.isAlive());
@@ -257,12 +274,23 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
             }
             mongo = MongoClients.create(storeUri);
             return new BenchmarkForkEnvironment(workload, forkId, sourceSettings, storeUri,
-                    externalTargetUri, managedViewsUri, operatorStateUri, boot, control, source, mongo, postgresFixture, bootClosing);
+                    externalTargetUri, managedViewsUri, operatorStateUri, boot, ownedProcessReceipt,
+                    control, source, mongo, postgresFixture, bootClosing);
         } catch (Exception | Error failure) {
+            if (ownedProcessReceipt != null) {
+                try { ownedProcessReceipt.verifyBeforeClose(); }
+                catch (Exception | Error recording) { if (recording != failure) { failure.addSuppressed(recording); } }
+            }
             closeAfterFailure(bootClosing, failure);
             closeAfterFailure(mongo, failure);
             closeAfterFailure(source, failure);
             closeAfterFailure(postgresFixture, failure);
+            if (ownedProcessReceipt != null) {
+                try {
+                    ownedProcessReceipt.finishAfterClose();
+                    System.out.println("benchmark-owned-boot-at-failure=" + JsonWriter.write(ownedProcessReceipt.evidence()));
+                } catch (Exception | Error recording) { if (recording != failure) { failure.addSuppressed(recording); } }
+            }
             throw failure;
         }
     }
@@ -328,6 +356,8 @@ final class BenchmarkForkEnvironment implements AutoCloseable {
     RealProcessServer server() {
         return server;
     }
+
+    BenchmarkOwnedProcessReceipt ownedProcessReceipt() { return ownedProcessReceipt; }
 
     void beginTelemetryCapture() throws Exception { boot.begin(); }
     void cutoffTelemetryCapture() throws Exception { boot.cutoff(); }

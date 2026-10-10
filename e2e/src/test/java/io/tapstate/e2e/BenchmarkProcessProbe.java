@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.ArrayList;
 import java.util.Objects;
 import java.util.OptionalLong;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 /** Samples a child JVM from outside the product; unavailable readings remain absent. */
@@ -81,6 +82,42 @@ final class BenchmarkProcessProbe implements AutoCloseable {
     }
 
     enum CompilationState { SUCCESS, UNKNOWN }
+
+    /** Retains runtime identity through the existing resource connection before the measured window. */
+    Map<String, Object> runtimeEvidence() {
+        long before = System.nanoTime();
+        boolean aliveBefore = child != null && child.isAlive();
+        if (!aliveBefore || connection == null) {
+            return Map.of("status", "UNKNOWN", "reason", "OWNED_RUNTIME_UNAVAILABLE", "ownedPid", ownedPid);
+        }
+        try {
+            RuntimeMXBean runtime = ManagementFactory.newPlatformMXBeanProxy(
+                    connection, ManagementFactory.RUNTIME_MXBEAN_NAME, RuntimeMXBean.class);
+            long actualPid = runtime.getPid();
+            long startMillis = runtime.getStartTime();
+            List<String> arguments = runtime.getInputArguments();
+            Map<String, String> version = Map.of("vmName", runtime.getVmName(), "vmVersion", runtime.getVmVersion(),
+                    "vmVendor", runtime.getVmVendor());
+            boolean aliveAfter = child.isAlive();
+            if (actualPid != ownedPid || startMillis <= 0 || !aliveAfter || arguments.size() > 128
+                    || arguments.stream().anyMatch(value -> value.length() > 16384)
+                    || arguments.stream().mapToLong(value -> 4L * value.length() + 16).sum() > 2L * 1024 * 1024 - 4096
+                    || version.values().stream().anyMatch(value -> value.isBlank() || value.length() > 4096)) {
+                return Map.of("status", "UNKNOWN", "reason", "OWNED_RUNTIME_IDENTITY_OR_SHAPE",
+                        "ownedPid", ownedPid, "actualPid", actualPid);
+            }
+            Map<String, Object> out = new java.util.LinkedHashMap<>(version);
+            out.put("status", "COMPLETE"); out.put("scope", "EXISTING_OWNED_RESOURCE_JMX_PRE_WINDOW");
+            out.put("ownedPid", ownedPid); out.put("actualPid", actualPid); out.put("jvmStartTimeMillis", startMillis);
+            out.put("inputArguments", List.copyOf(arguments)); out.put("driverStartNanos", before);
+            out.put("driverEndNanos", System.nanoTime()); out.put("capturedAt", java.time.Instant.now().toString());
+            out.put("aliveBefore", aliveBefore); out.put("aliveAfter", aliveAfter);
+            return Map.copyOf(out);
+        } catch (IOException | RuntimeException failure) {
+            return Map.of("status", "UNKNOWN", "reason", "OWNED_RUNTIME_READ_FAILED", "ownedPid", ownedPid,
+                    "failureType", failure.getClass().getName());
+        }
+    }
 
     enum CompilationUnknownReason {
         NONE, CHILD_EXITED, JMX_UNAVAILABLE, OWNED_PID_MISMATCH, INVALID_COMPILER_NAME,

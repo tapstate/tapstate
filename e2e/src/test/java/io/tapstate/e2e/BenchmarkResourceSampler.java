@@ -67,6 +67,14 @@ final class BenchmarkResourceSampler implements AutoCloseable {
                 ScheduledExecutorService::awaitTermination);
     }
 
+    Map<String, Object> runtimeEvidence() {
+        synchronized (lifecycle) {
+            if (started || finished) { throw new IllegalStateException("runtime identity must precede resource measurement"); }
+            return probe == null ? Map.of("status", "UNKNOWN", "reason", "NO_OWNED_RESOURCE_PROBE")
+                    : probe.runtimeEvidence();
+        }
+    }
+
     static BenchmarkResourceSampler openForPhaseBudget(long childPid, Duration interval, Duration budget) {
         int retained = Math.toIntExact(budget.toNanos() / interval.toNanos() + 4);
         if (retained < 2 || retained > 4096) { throw new AssertionError("phase resource retention exceeds its declared finite budget"); }

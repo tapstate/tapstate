@@ -53,6 +53,7 @@ final class RealProcessServer implements ServerHandle {
     private final Path output;
     private final Path stagingDirectory;
     private final List<String> launchCommand;
+    private final Map<String, Object> launchEnvironment;
     private final boolean ownsStagingDirectory;
 
     RealProcessServer(Process process, URI baseUrl, Path output, Path stagingDirectory) {
@@ -65,11 +66,18 @@ final class RealProcessServer implements ServerHandle {
 
     private RealProcessServer(Process process, URI baseUrl, Path output, Path stagingDirectory,
             List<String> launchCommand, boolean ownsStagingDirectory) {
+        this(process, baseUrl, output, stagingDirectory, launchCommand, ownsStagingDirectory,
+                Map.of("status", "UNKNOWN", "scope", "LAUNCH_ENVIRONMENT_NOT_RETAINED"));
+    }
+
+    private RealProcessServer(Process process, URI baseUrl, Path output, Path stagingDirectory,
+            List<String> launchCommand, boolean ownsStagingDirectory, Map<String, Object> launchEnvironment) {
         this.process = process;
         this.baseUrl = baseUrl;
         this.output = output;
         this.stagingDirectory = stagingDirectory;
         this.launchCommand = List.copyOf(launchCommand);
+        this.launchEnvironment = Map.copyOf(launchEnvironment);
         this.ownsStagingDirectory = ownsStagingDirectory;
     }
 
@@ -321,7 +329,7 @@ final class RealProcessServer implements ServerHandle {
             }
             throw failure;
         }
-        return new RealProcessServer(launched.process(), baseUrl, output, staging, launched.command(), owned);
+        return new RealProcessServer(launched.process(), baseUrl, output, staging, launched.command(), owned, launched.environment());
     }
 
     /**
@@ -394,6 +402,8 @@ final class RealProcessServer implements ServerHandle {
 
     List<String> launchCommand() { return launchCommand; }
 
+    Map<String, Object> launchEnvironment() { return launchEnvironment; }
+
     String startupLog() { return startupLog(output); }
 
     private static String startupLog(Path output) {
@@ -444,7 +454,7 @@ final class RealProcessServer implements ServerHandle {
         }
     }
 
-    private record Launched(Process process, List<String> command) { }
+    private record Launched(Process process, List<String> command, Map<String, Object> environment) { }
 
     private static Launched launch(Path jar, List<String> jvmOptions, int port, String listenAddress,
             String storeUri, String operatorStateDatabase, Path workingDirectory, Path output,
@@ -478,12 +488,23 @@ final class RealProcessServer implements ServerHandle {
         command.addAll(extraArguments);
         try {
             releaseLaunchPorts(port, extraArguments);
-            Process child = new ProcessBuilder(command)
+            ProcessBuilder builder = new ProcessBuilder(command)
                     .directory(workingDirectory.toFile())
                     .redirectErrorStream(true)
-                    .redirectOutput(output.toFile())
-                    .start();
-            return new Launched(child, List.copyOf(command));
+                    .redirectOutput(output.toFile());
+            Map<String, String> selected = new LinkedHashMap<>();
+            List<String> absent = new ArrayList<>();
+            for (String name : List.of("JAVA_HOME", "JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS",
+                    "MAVEN_OPTS", "LANG", "LC_ALL", "LC_CTYPE", "TZ")) {
+                String value = builder.environment().get(name);
+                if (value == null) { absent.add(name); }
+                else { selected.put(name, value); }
+            }
+            Map<String, Object> environment = Map.of("status", "COMPLETE",
+                    "scope", "OWNED_PROCESS_BUILDER_BEFORE_START", "values", Map.copyOf(selected),
+                    "absentKeys", List.copyOf(absent), "capturedAt", java.time.Instant.now().toString());
+            Process child = builder.start();
+            return new Launched(child, List.copyOf(command), environment);
         } catch (IOException e) {
             throw new UncheckedIOException("could not launch " + jar, e);
         }

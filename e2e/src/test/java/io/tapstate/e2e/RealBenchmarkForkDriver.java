@@ -226,7 +226,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     Map<String, Long> observedTargetCoverage,
                     String checksum, long errorTotal,
                     List<Map<String, Object>> terminalMetaReceipts,
-                    Optional<BenchmarkJdiTelemetrySession.Evidence> telemetry) {
+                    Optional<BenchmarkJdiTelemetrySession.Evidence> telemetry,
+                    BenchmarkOwnedProcessReceipt processReceipt) {
         Evidence(String forkId, BenchmarkWorkloadDefinitions.Workload workload,
                 PipelineBenchmarkComparison.Arm arm, Path applicationJar,
                 List<MeasuredPhase> phases, BenchmarkResourceSampler.Summary resources,
@@ -234,7 +235,23 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 Map<String, Long> declaredSourceCoverage, Map<String, Long> observedTargetCoverage,
                 String checksum, long errorTotal, Optional<BenchmarkJdiTelemetrySession.Evidence> telemetry) {
             this(forkId, workload, arm, applicationJar, phases, resources, mongoCommands,
-                    declaredSourceCoverage, observedTargetCoverage, checksum, errorTotal, List.of(), telemetry);
+                    declaredSourceCoverage, observedTargetCoverage, checksum, errorTotal, List.of(), telemetry, null);
+        }
+
+        Evidence(String forkId, BenchmarkWorkloadDefinitions.Workload workload,
+                PipelineBenchmarkComparison.Arm arm, Path applicationJar,
+                List<MeasuredPhase> phases, BenchmarkResourceSampler.Summary resources,
+                BenchmarkMongoCommandSampler.Summary mongoCommands,
+                Map<String, Long> declaredSourceCoverage, Map<String, Long> observedTargetCoverage,
+                String checksum, long errorTotal, List<Map<String, Object>> terminalMetaReceipts,
+                Optional<BenchmarkJdiTelemetrySession.Evidence> telemetry) {
+            this(forkId, workload, arm, applicationJar, phases, resources, mongoCommands,
+                    declaredSourceCoverage, observedTargetCoverage, checksum, errorTotal, terminalMetaReceipts, telemetry, null);
+        }
+
+        Map<String, Object> runtimeEvidence() {
+            return processReceipt == null ? Map.of("status", "UNKNOWN", "reason", "OWNED_RUNTIME_NOT_RETAINED")
+                    : processReceipt.evidence();
         }
 
         Evidence {
@@ -293,7 +310,11 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 || arm != PipelineBenchmarkComparison.Arm.B)) {
             throw new AssertionError("deferred target witness requires the original copy B diagnostic profile");
         }
+        BenchmarkOwnedProcessReceipt ownedReceipt = null;
+        Throwable primary = null;
+        PipelineBenchmarkHarness.ForkResult result;
         try (BenchmarkForkEnvironment fork = BenchmarkForkEnvironment.open(workload, applicationJar, forkId, launcher)) {
+            ownedReceipt = fork.ownedProcessReceipt();
             BenchmarkSourceLineage.Witness lineage = workload.database()
                     == BenchmarkWorkloadDefinitions.Database.MYSQL
                     ? BenchmarkSourceLineage.readMySql(fork.sourceSettings())
@@ -435,14 +456,31 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                         }
                     }
                 }
+                ownedReceipt.verifyBeforeClose();
                 Evidence run = new Evidence(forkId, workload, arm, applicationJar,
                         measured, resources, mongoCommands,
                         declaredSourceCoverage, observedTargetCoverage, checksum, errorTotal, receipts,
-                        fork.finishTelemetryCapture());
+                        fork.finishTelemetryCapture(), ownedReceipt);
                 evidence.add(run);
-                return new PipelineBenchmarkHarness.ForkResult(performance, correctness);
+                result = new PipelineBenchmarkHarness.ForkResult(performance, correctness);
+            }
+        } catch (Exception | Error failure) {
+            primary = failure;
+            throw failure;
+        } finally {
+            if (ownedReceipt != null) {
+                try {
+                    ownedReceipt.finishAfterClose();
+                    if (primary != null) {
+                        System.out.println("benchmark-owned-runtime-at-failure=" + JsonWriter.write(ownedReceipt.evidence()));
+                    }
+                } catch (Exception | Error recording) {
+                    if (primary == null) { throw recording; }
+                    if (recording != primary) { primary.addSuppressed(recording); }
+                }
             }
         }
+        return result;
     }
 
     private static PhaseWindow runMeasuredPhase(BenchmarkWorkloadDefinitions.Workload workload,
@@ -502,6 +540,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
              BenchmarkMongoCommandSampler commandSampler = BenchmarkMongoCommandSampler.open(fork.storeUri());
              BenchmarkTargetClockSampler clockSampler = targetClockBefore == null ? null
                      : BenchmarkTargetClockSampler.open(targetClockUris.getFirst())) {
+            fork.ownedProcessReceipt().recordJvmRuntime(resourceSampler.runtimeEvidence());
             if (compilationDiagnostics) {
                 resourceSampler.enableCompilationDiagnostics();
             }

@@ -353,6 +353,7 @@ class PipelineBenchmarkLiveRunIT {
                 "id", evidence.forkId(), "workload", evidence.workload().id(),
                 "seed", evidence.workload().seed(), "arm", evidence.arm().name(),
                 "applicationJar", evidence.applicationJar().toString(),
+                "runtimeEvidence", evidence.runtimeEvidence(),
                 "startedAt", startedAt.toString(), "completedAt", Instant.now().toString(),
                 "throughputRecordsPerSecond", performance.recordsOutPerSecond(),
                 "deliveryP99Nanos", p99, "deliveryNanos", Arrays.stream(durations).boxed().toList(),

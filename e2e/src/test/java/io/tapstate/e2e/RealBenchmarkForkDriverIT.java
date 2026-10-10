@@ -251,6 +251,10 @@ class RealBenchmarkForkDriverIT {
                         StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
                 System.out.println("benchmark-real-fork-output=" + forkOutput);
             }
+            Map<String, Object> runtime = driver.evidence().getFirst().runtimeEvidence();
+            assertThat(runtime.get("status"))
+                    .as("owned startup, namespace, JVM and exit facts are complete: %s", runtime.get("reasons"))
+                    .isEqualTo("QUALIFIED");
         }
     }
 

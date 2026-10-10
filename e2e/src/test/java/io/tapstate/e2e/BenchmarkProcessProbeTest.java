@@ -35,6 +35,15 @@ class BenchmarkProcessProbeTest {
 
             try (BenchmarkProcessProbe probe = BenchmarkProcessProbe.open(child.pid())) {
                 assertThat(child.isAlive()).as("child JVM remains alive after attach").isTrue();
+                var runtime = probe.runtimeEvidence();
+                assertThat(runtime.get("status")).isEqualTo("COMPLETE");
+                assertThat(runtime.get("actualPid")).isEqualTo(child.pid());
+                assertThat(runtime.get("jvmStartTimeMillis")).isInstanceOf(Long.class);
+                assertThat((Long) runtime.get("jvmStartTimeMillis")).isPositive();
+                assertThat(runtime.get("vmVersion")).isEqualTo(System.getProperty("java.vm.version"));
+                assertThat(runtime.get("inputArguments")).isInstanceOf(java.util.List.class);
+                assertThat(runtime.get("aliveBefore")).isEqualTo(true);
+                assertThat(runtime.get("aliveAfter")).isEqualTo(true);
                 BenchmarkProcessProbe.Snapshot sample = probe.sample();
                 assertThat(sample.complete()).as("all four external readings are available: %s", sample).isTrue();
                 assertThat(sample.cpuNanos().orElseThrow()).isPositive();
@@ -83,6 +92,7 @@ class BenchmarkProcessProbeTest {
             child.getOutputStream().close();
             assertThat(child.waitFor(5, TimeUnit.SECONDS)).isTrue();
             try (BenchmarkProcessProbe probe = BenchmarkProcessProbe.open(child.pid())) {
+                assertThat(probe.runtimeEvidence().get("status")).isEqualTo("UNKNOWN");
                 BenchmarkProcessProbe.Snapshot unavailable = probe.sample();
                 assertThat(unavailable.complete()).isFalse();
                 assertThat(unavailable.cpuNanos()).isEmpty();
