@@ -12,6 +12,7 @@ import io.tapstate.control.core.SourceRepresentation;
 import io.tapstate.control.core.StateStoreSetupService;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.lifecycle.ParallelismBudget;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.SourceMode;
@@ -28,6 +29,7 @@ import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.StorePort;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.support.AbstractBeanDefinition;
@@ -149,6 +151,7 @@ class StateStoreModeWiringTest {
                 .withBean(ConnectionTestService.class, () -> fixture.connections)
                 .withBean(StorePort.class, () -> fixture.store)
                 .withBean(NestSettings.class, NestSettings::defaults)
+                .withBean(ParallelismBudget.class, () -> ParallelismBudget.DEFAULTS)
                 .withBean(ConnectionTester.class, () -> fixture.probe)
                 .withBean(HazelcastInstance.class, () -> fixture.member);
         return ABSENT.equals(legacyProfile) ? runner
@@ -183,6 +186,8 @@ class StateStoreModeWiringTest {
             Member local = mock(Member.class);
             when(member.getCluster()).thenReturn(cluster);
             when(cluster.getLocalMember()).thenReturn(local);
+            when(cluster.getMembers()).thenReturn(Set.of(local));
+            when(local.getAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE)).thenReturn("state-mode-node");
             when(local.getAddress()).thenReturn(new Address("127.0.0.1", 5701));
             store.artifacts().save(new SourceResource("orders_src", null, "mysql", Map.of("host", "example.test"),
                     SourceMode.CDC, List.of(TableRef.literal("orders")), null, null));
