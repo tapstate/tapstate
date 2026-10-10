@@ -53,6 +53,14 @@ class DataPlaneActuationConfiguration {
         return new Engine(hazelcastMember, operatorStateStores);
     }
 
+    @Bean(destroyMethod = "close")
+    BoundedPipelinePreviewExecutor boundedPipelinePreviewExecutor(
+            StorePort storePort, ConnectorProvisioner connectorProvisioner,
+            HazelcastInstance hazelcastMember, NestSettings nestSettings, java.time.Clock clock) {
+        return new BoundedPipelinePreviewExecutor(
+                storePort, connectorProvisioner, hazelcastMember, nestSettings, clock);
+    }
+
     /**
      * The store probe's deadline. Short on purpose: this runs while a person waits for `start` to answer,
      * and a store that has not replied in this long is not one the pipeline was about to write to either.

@@ -156,6 +156,31 @@ class PipelineDraftServiceTest {
     }
 
     @Test
+    void previewCandidateCompilesTransientEditsWithoutSavingAndRejectsMissingOrDifferentModeDrafts() {
+        PipelineDraft current = draft(4, "alice", "base-hash", 3L, "published-hash", NOW, NOW);
+        store.seed(current);
+        PipelineDraft candidate = new PipelineDraft("orders", 1, 99, PipelineDraft.Mode.WIZARD,
+                "Edited orders", "unsaved description", null,
+                new PipelineDraft.Wizard(new PipelineDraft.Root("root", "crm", "orders", List.of(), List.of()),
+                        List.of(), List.of(), new PipelineDraft.Output("atlas",
+                                Map.of("sourceId", "atlas", "table", "orders"))),
+                "forged-base", 88L, "forged-published", Instant.EPOCH, Instant.EPOCH, "editor");
+
+        PipelineResource preview = service.previewCandidate("orders", candidate);
+
+        assertThat(preview.id()).isEqualTo("orders");
+        assertThat(store.get("orders")).contains(current);
+        assertThatThrownBy(() -> service.previewCandidate("missing", candidate))
+                .isInstanceOf(io.tapstate.core.common.TapstateException.class);
+        PipelineDraft dagCandidate = new PipelineDraft("orders", 1, 1, PipelineDraft.Mode.DAG,
+                "Orders", "", new PipelineDraft.Graph(List.of(), List.of(),
+                        new PipelineDraft.Viewport(0, 0, 1)), null,
+                null, null, null, NOW, NOW, "alice");
+        assertThatThrownBy(() -> service.previewCandidate("orders", dagCandidate))
+                .isInstanceOf(io.tapstate.core.common.TapstateException.class);
+    }
+
+    @Test
     void previewWrapsCompilerFailuresAsInvalidDrafts() {
         PipelineDraft incomplete = new PipelineDraft("orders", 1, 2, PipelineDraft.Mode.WIZARD,
                 "Orders", "", null,
