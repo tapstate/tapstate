@@ -36,6 +36,11 @@ public final class ResourceAttributionPolicy {
         return new ResourceAttributionPolicy(true);
     }
 
+    /** Managed writes must atomically preserve the snapshot supplying their creator attribution. */
+    boolean requiresSnapshotFence() {
+        return managedCloud;
+    }
+
     /**
      * Returns the resource that may be persisted. {@code existing} is null for a create. The caller's
      * principal is already verified by the selected authentication implementation and is therefore the

@@ -14,6 +14,9 @@ import io.tapstate.core.model.ViewResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.ArtifactBatchWrite;
+import io.tapstate.spi.store.ArtifactMutation;
+import io.tapstate.spi.store.ArtifactWrite;
 import io.tapstate.spi.store.AuditRecord;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -347,6 +350,32 @@ class CloudExecutionPreservationTest {
             byId.putAll(staged);
             writes += resources.size();
             return Optional.empty();
+        }
+
+        @Override
+        public synchronized ArtifactBatchWrite writeAll(List<ArtifactWrite> batch) {
+            for (ArtifactWrite write : batch) {
+                for (var expected : write.readPreconditions().entrySet()) {
+                    Resource stored = get(expected.getKey()).orElse(null);
+                    if (stored == null || !CanonicalHash.of(stored).equals(expected.getValue())) {
+                        return ArtifactBatchWrite.refused(expected.getKey(), ArtifactMutation.VERSION_CONFLICT);
+                    }
+                }
+                Resource stored = get(write.resource().id()).orElse(null);
+                if (write.intent() == ArtifactWrite.Intent.CREATE_ONLY && stored != null) {
+                    return ArtifactBatchWrite.refused(write.resource().id(), ArtifactMutation.ALREADY_EXISTS);
+                }
+                if (write.intent() == ArtifactWrite.Intent.REPLACE_ONLY
+                        && (stored == null || !CanonicalHash.of(stored).equals(write.expectedContentHash()))) {
+                    return ArtifactBatchWrite.refused(write.resource().id(), stored == null
+                            ? ArtifactMutation.NOT_FOUND : ArtifactMutation.VERSION_CONFLICT);
+                }
+            }
+            Map<String, String> staged = new LinkedHashMap<>();
+            batch.forEach(write -> staged.put(write.resource().id(), writer.write(write.resource())));
+            byId.putAll(staged);
+            writes += batch.size();
+            return ArtifactBatchWrite.applied();
         }
 
         @Override
