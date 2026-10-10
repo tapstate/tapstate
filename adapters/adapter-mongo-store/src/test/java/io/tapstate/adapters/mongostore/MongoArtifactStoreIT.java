@@ -5,6 +5,7 @@ import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.IndexOptions;
+import com.mongodb.MongoWriteException;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Resource;
@@ -220,6 +221,70 @@ class MongoArtifactStoreIT {
             assertThat(staleOutcome.refusal()).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
             assertThat(storedBody(collection, "orders"))
                     .isEqualTo(canonicalAfterReplace);
+        });
+    }
+
+    @Test
+    void aPrimaryIdCollisionRefusesCreateAndRollsBackBatchSiblings() {
+        withStore((store, collection) -> {
+            Resource source = PARSER.parse(ORDERS);
+            assertThat(store.create(source)).isEqualTo(ArtifactMutation.CREATED);
+            Document before = collection.find(new Document("_id", "orders")).first();
+            MongoWriteException duplicate = (MongoWriteException) catchThrowable(() ->
+                    collection.insertOne(new Document("_id", "orders")));
+            assertThat(duplicate.getError().getCode()).isEqualTo(11000);
+            assertThat(duplicate.getError().getDetails()).isEmpty();
+
+            assertThat(store.create(source)).isEqualTo(ArtifactMutation.ALREADY_EXISTS);
+            Resource sibling = PARSER.parse(ORDERS.replace("id: orders", "id: new_sibling"));
+            ArtifactBatchWrite refused = store.writeAll(List.of(
+                    ArtifactWrite.createOnly(sibling), ArtifactWrite.createOnly(source)));
+            assertThat(refused.refusedId()).isEqualTo("orders");
+            assertThat(refused.refusal()).isEqualTo(ArtifactMutation.ALREADY_EXISTS);
+            assertThat(collection.find(new Document("_id", "new_sibling")).first()).isNull();
+            assertThat(collection.find(new Document("_id", "orders")).first()).isEqualTo(before);
+        });
+    }
+
+    @Test
+    void aNonIdUniqueCollisionRemainsAStoreFailureForSingleCreate() {
+        withStore((store, collection) -> {
+            collection.createIndex(new Document("kind", 1), new IndexOptions().unique(true));
+            Resource source = PARSER.parse(ORDERS);
+            assertThat(store.create(source)).isEqualTo(ArtifactMutation.CREATED);
+            Document before = collection.find(new Document("_id", "orders")).first();
+            Resource other = PARSER.parse(ORDERS.replace("id: orders", "id: other_source"));
+            MongoWriteException duplicate = (MongoWriteException) catchThrowable(() ->
+                    collection.insertOne(new Document("_id", "driver_probe").append("kind", "source")));
+            assertThat(duplicate.getError().getCode()).isEqualTo(11000);
+            assertThat(duplicate.getError().getDetails()).isEmpty();
+
+            assertThatThrownBy(() -> store.create(other)).isInstanceOfSatisfying(TapstateException.class, failure -> {
+                assertThat(failure.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                assertThat(failure.args()).containsExactlyEntriesOf(Map.of("detail", "MongoWriteException code=11000"));
+                assertThat(failure.getCause()).isNull();
+            });
+            assertThat(collection.find(new Document("_id", "other_source")).first()).isNull();
+            assertThat(collection.find(new Document("_id", "orders")).first()).isEqualTo(before);
+        });
+    }
+
+    @Test
+    void aNonIdUniqueCollisionRollsBackAnEntireConditionalCreateBatch() {
+        withStore((store, collection) -> {
+            collection.createIndex(new Document("kind", 1), new IndexOptions().unique(true));
+            Resource first = PARSER.parse(ORDERS);
+            Resource second = PARSER.parse(ORDERS.replace("id: orders", "id: second_source"));
+
+            assertThatThrownBy(() -> store.writeAll(List.of(
+                    ArtifactWrite.createOnly(first), ArtifactWrite.createOnly(second))))
+                    .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                        assertThat(failure.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                        assertThat(failure.args()).containsExactlyEntriesOf(
+                                Map.of("detail", "MongoWriteException code=11000"));
+                        assertThat(failure.getCause()).isNull();
+                    });
+            assertThat(collection.countDocuments()).isZero();
         });
     }
 
