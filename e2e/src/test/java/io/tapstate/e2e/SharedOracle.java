@@ -90,26 +90,52 @@ final class SharedOracle {
         try {
             // Supplemental logging waits for in-flight transactions after the database reopens.
             // Give that wait the same bounded budget as container startup.
+            // SQL*Plus does not echo redirected input, so mark statements before executing them.
             var result = starting.execInContainer("bash", "-c", """
                     timeout %d sqlplus -s / as sysdba <<'SQL'
                     WHENEVER SQLERROR EXIT SQL.SQLCODE
+                    PROMPT SHUTDOWN IMMEDIATE;
                     SHUTDOWN IMMEDIATE;
+                    PROMPT STARTUP MOUNT;
                     STARTUP MOUNT;
+                    PROMPT ALTER DATABASE ARCHIVELOG;
                     ALTER DATABASE ARCHIVELOG;
+                    PROMPT ALTER DATABASE OPEN;
                     ALTER DATABASE OPEN;
+                    PROMPT ALTER PLUGGABLE DATABASE FREEPDB1 OPEN;
                     BEGIN
                       EXECUTE IMMEDIATE 'ALTER PLUGGABLE DATABASE FREEPDB1 OPEN';
                     EXCEPTION WHEN OTHERS THEN
                       IF SQLCODE != -65019 THEN RAISE; END IF;
                     END;
                     /
+                    PROMPT ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;
                     ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;
+                    PROMPT ALTER DATABASE FORCE LOGGING;
                     ALTER DATABASE FORCE LOGGING;
+                    PROMPT CREATE USER C##TAPSTATE;
                     CREATE USER C##TAPSTATE IDENTIFIED BY "Tapstate_Test_42" CONTAINER=ALL;
+                    PROMPT GRANT DBA, LOGMINING TO C##TAPSTATE CONTAINER=ALL;
                     GRANT DBA, LOGMINING TO C##TAPSTATE CONTAINER=ALL;
+                    PROMPT ALTER SYSTEM REGISTER;
                     ALTER SYSTEM REGISTER;
                     EXIT;
                     SQL
+                    status=$?
+                    if [ "$status" -ne 0 ]; then
+                      printf '\\nSQL*Plus exit code: %%s\\n' "$status"
+                      timeout 10 bash -c '
+                        found=0
+                        for alert in "$ORACLE_BASE"/diag/rdbms/*/*/trace/alert_*.log; do
+                          [ -f "$alert" ] || continue
+                          found=1
+                          printf "\\nOracle alert log (last 200 lines): %%s\\n" "$alert"
+                          tail -n 200 "$alert" || exit $?
+                        done
+                        [ "$found" -eq 1 ] || exit 1
+                      ' 2>&1 || printf 'Oracle alert log collection failed or timed out.\\n'
+                    fi
+                    exit "$status"
                     """.formatted(STARTUP_BUDGET.toSeconds()));
             if (result.getExitCode() != 0) {
                 throw new EnvelopeException("cannot enable Oracle change capture: " + result.getStdout() + result.getStderr());
