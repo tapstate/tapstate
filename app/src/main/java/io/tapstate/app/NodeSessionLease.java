@@ -91,10 +91,12 @@ final class NodeSessionLease implements AutoCloseable {
             thread.setDaemon(true);
             return thread;
         });
-        renewer.scheduleWithFixedDelay(
-                this::renew, renewInterval.toMillis(), renewInterval.toMillis(), TimeUnit.MILLISECONDS);
+        // Register the lapse check before an immediate refusal can shut down this executor.
         long lapseCheck = Math.max(1L, Math.min(renewInterval.toMillis(), LAPSE_CHECK.toMillis()));
         renewer.scheduleWithFixedDelay(this::loseALapsedSession, lapseCheck, lapseCheck, TimeUnit.MILLISECONDS);
+        // Member formation may have consumed most of the original acquisition's remaining lease.
+        renewer.scheduleWithFixedDelay(
+                this::renew, 0L, renewInterval.toMillis(), TimeUnit.MILLISECONDS);
     }
 
     private void renew() {

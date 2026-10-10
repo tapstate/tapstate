@@ -15,6 +15,7 @@ import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -34,6 +35,27 @@ class NodeSessionLeaseTest {
         lease.close();
 
         assertThat(store.released.get()).isTrue();
+    }
+
+    @Test
+    void anAcquiredSessionNearItsOriginalDeadlineRequestsRenewalBeforeThePeriodicInterval() throws Exception {
+        RecordingStore store = new RecordingStore(true);
+        AtomicBoolean memberStopped = new AtomicBoolean();
+        Duration ttl = Duration.ofSeconds(9);
+        Duration remaining = Duration.ofSeconds(2);
+        long askedAt = System.nanoTime() - ttl.minus(remaining).toNanos();
+        long originalDeadline = askedAt + ttl.toNanos();
+        NodeSessionLease session = new NodeSessionLease(
+                store, CLAIM, askedAt, ttl, Duration.ofSeconds(3), () -> memberStopped.set(true));
+        try {
+            assertThat(store.renewed.await(1, TimeUnit.SECONDS))
+                    .as("the acquired session has two seconds left, so its first renewal cannot wait three")
+                    .isTrue();
+            assertThat(store.firstRenewalAskedAt.get()).isLessThan(originalDeadline);
+            assertThat(memberStopped).as("an available renewal preserves this exact boot's authority").isFalse();
+        } finally {
+            session.close();
+        }
     }
 
     @Test
@@ -93,13 +115,16 @@ class NodeSessionLeaseTest {
         SilentStore store = new SilentStore();
         CountDownLatch memberStopped = new CountDownLatch(1);
         Duration lease = Duration.ofMillis(500);
-        long askedAt = System.nanoTime();
+        long askedAt = System.nanoTime() - Duration.ofMillis(250).toNanos();
         NodeSessionLease session = new NodeSessionLease(
                 store, CLAIM, askedAt, lease, Duration.ofMillis(20), memberStopped::countDown);
         try {
             assertThat(store.asked.await(1, TimeUnit.SECONDS))
                     .as("a renewal was asked for, and the store is not answering it")
                     .isTrue();
+            assertThat(session.proof().deadlineNanos())
+                    .as("a stalled first renewal cannot reset the already acquired session's deadline")
+                    .isEqualTo(askedAt + lease.toNanos());
             assertThat(memberStopped.await(5, TimeUnit.SECONDS))
                     .as("the member leaves once the lease it last proved has run out")
                     .isTrue();
@@ -185,6 +210,7 @@ class NodeSessionLeaseTest {
         private static final Duration LIVE_LEASE = Duration.ofSeconds(30);
         private final boolean renews;
         private final CountDownLatch renewed = new CountDownLatch(1);
+        private final AtomicLong firstRenewalAskedAt = new AtomicLong();
         private final AtomicBoolean released = new AtomicBoolean();
 
         private RecordingStore(boolean renews) {
@@ -199,6 +225,7 @@ class NodeSessionLeaseTest {
 
         @Override
         public Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
+            firstRenewalAskedAt.compareAndSet(0L, System.nanoTime());
             renewed.countDown();
             return renews ? Optional.of(expected) : Optional.empty();
         }
