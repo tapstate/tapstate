@@ -86,4 +86,62 @@ class BenchmarkReturnTimeBoundsTest {
         assertThatThrownBy(() -> BenchmarkReturnTimeBounds.map(List.of(backwards), owner, clock))
                 .isInstanceOf(AssertionError.class).hasMessageContaining("clock order");
     }
+
+    @Test void nominal_return_and_source_uncertainty_keep_each_rows_full_call_weight_and_fractional_true_values() {
+        var owner = new BenchmarkCausalClock.Identity(17, 1000);
+        var clock = nominalClock(owner);
+        var target = BenchmarkWorkloadDefinitions.byId("copy").phase("cdc-update").targets().getFirst();
+        var one = new BenchmarkWriteReturnExpectations.Association(target, "1", 1, 83, 125,
+                7, 1, "pdk.state.bench_copy.sink", "orders", 83, 125, 166, 2, true);
+        var two = new BenchmarkWriteReturnExpectations.Association(target, "2", 0, 41, 83,
+                7, 1, "pdk.state.bench_copy.sink", "orders", 83, 125, 166, 2, true);
+        var mapped = BenchmarkReturnTimeBounds.map(List.of(one, two), owner, clock);
+        assertThat(mapped).hasSize(2);
+        assertThat(mapped.stream().map(BenchmarkReturnTimeBounds.Delivery::callSequence).toList()).containsExactly(7L, 7L);
+        assertThat(mapped.get(0).capturedPoint()).isEqualTo(new BenchmarkCausalClock.Interval(166, 167));
+        assertThat(mapped.get(0).literalReturn()).isEqualTo(new BenchmarkCausalClock.Interval(125, 167));
+        assertThat(mapped.get(1).literalReturn()).isEqualTo(mapped.get(0).literalReturn());
+        assertThat(mapped.get(0).latency()).isEqualTo(new BenchmarkCausalClock.Interval(41, 84));
+        assertThat(mapped.get(1).latency()).isEqualTo(new BenchmarkCausalClock.Interval(83, 126));
+        // Source ticks 2 and 1 and return ticks 3 or 4 have exact 125/3 nominal coordinates.
+        // Difference-of-floors alone excludes the 125/3 lower latency for the first row.
+        for (int row = 0; row < mapped.size(); row++) {
+            long sourceTicks = row == 0 ? 2 : 1;
+            for (long returnTicks : new long[]{3, 4}) {
+                var numerator = java.math.BigInteger.valueOf((returnTicks - sourceTicks) * 125);
+                var bounds = mapped.get(row).latency();
+                assertThat(java.math.BigInteger.valueOf(bounds.lowerNanos()).multiply(java.math.BigInteger.valueOf(3)))
+                        .isLessThanOrEqualTo(numerator);
+                assertThat(java.math.BigInteger.valueOf(bounds.upperNanos()).multiply(java.math.BigInteger.valueOf(3)))
+                        .isGreaterThanOrEqualTo(numerator);
+            }
+        }
+        assertThat(java.math.BigInteger.valueOf(42).multiply(java.math.BigInteger.valueOf(3)))
+                .isGreaterThan(java.math.BigInteger.valueOf(125));
+    }
+
+    @Test void nominal_source_bounds_preserve_negative_uncertainty_and_still_refuse_wholly_pre_issue_returns() {
+        var owner = new BenchmarkCausalClock.Identity(17, 1000);
+        var target = BenchmarkWorkloadDefinitions.byId("copy").phase("cdc-update").targets().getFirst();
+        var uncertain = new BenchmarkWriteReturnExpectations.Association(target, "1", 0, 83, 83,
+                1, 1, "pdk.state.bench_copy.sink", "orders", 83, 83, 83, 1, true);
+        assertThat(BenchmarkReturnTimeBounds.map(List.of(uncertain), owner, nominalClock(owner)).getFirst().latency())
+                .isEqualTo(new BenchmarkCausalClock.Interval(-1, 1));
+        var tooEarly = new BenchmarkWriteReturnExpectations.Association(target, "1", 0, 200, 208,
+                1, 1, "pdk.state.bench_copy.sink", "orders", 83, 125, 166, 1, true);
+        assertThatThrownBy(() -> BenchmarkReturnTimeBounds.map(List.of(tooEarly), owner, nominalClock(owner)))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("source issue");
+    }
+
+    private static BenchmarkReturnPointClock nominalClock(BenchmarkCausalClock.Identity owner) {
+        return new BenchmarkReturnPointClock() {
+            @Override public BenchmarkCausalClock.Interval map(BenchmarkCausalClock.Identity identity, long pointNanos) {
+                if (!owner.equals(identity)) { throw new AssertionError("nominal control requires its owned identity"); }
+                return new BenchmarkCausalClock.Interval(pointNanos, Math.addExact(pointNanos, 1));
+            }
+            @Override public BenchmarkCausalClock.Interval sourcePoint(long pointNanos) {
+                return new BenchmarkCausalClock.Interval(pointNanos, Math.addExact(pointNanos, 1));
+            }
+        };
+    }
 }

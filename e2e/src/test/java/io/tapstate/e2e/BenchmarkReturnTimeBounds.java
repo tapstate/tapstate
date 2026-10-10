@@ -31,7 +31,7 @@ final class BenchmarkReturnTimeBounds {
             var exited = clock.map(owner, row.callLastCallbackExitNanos());
             var observed = clock.map(owner, row.callObservedNanos());
             var returned = new BenchmarkCausalClock.Interval(exited.lowerNanos(), observed.upperNanos());
-            var latency = returned.relativeTo(row.sourceIssuedAtNanos());
+            var latency = BenchmarkCausalClock.elapsed(clock.sourcePoint(row.sourceIssuedAtNanos()), returned);
             require(latency.upperNanos() >= 0, "return bound is wholly before its registered source issue");
             deliveries.add(new Delivery(row.target().pipelineId() + "/" + row.target().table(), row.key(),
                     row.callSequence(), observed, returned, latency));
