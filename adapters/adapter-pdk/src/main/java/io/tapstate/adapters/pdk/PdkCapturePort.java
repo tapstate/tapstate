@@ -894,8 +894,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
                     acknowledgements.applyIfDue();
                     delivery.accept(() -> handOver(connector, declared, listener, events, offset));
                 });
-                Object readerOffset = MysqlResumeOffset.forReader(connector.connectorId(), startOffset,
-                        connector.context().getStateMap(), () -> InstanceFactory.instance(JsonParser.class));
+                Object readerOffset = readerOffset(connector, startOffset, resumeAt != null);
                 stream.streamRead(connector.context(), config.streams(), readerOffset, BATCH_SIZE, consumer);
                 return null;
             });
@@ -928,6 +927,13 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
             LOG.warn("cdc stream for connector {} stopped on a failure", connector.connectorId(), t);
             listener.onError(reported);
         }
+    }
+
+    private static Object readerOffset(PdkConnector connector, Object startOffset, boolean resumed) {
+        Object reader = MysqlResumeOffset.forReader(connector.connectorId(), startOffset,
+                connector.context().getStateMap(), () -> InstanceFactory.instance(JsonParser.class));
+        return resumed ? PostgresResumeOffset.forReader(connector.connectorId(), reader,
+                () -> InstanceFactory.instance(JsonParser.class)) : reader;
     }
 
     /**
