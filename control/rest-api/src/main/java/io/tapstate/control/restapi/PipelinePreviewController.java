@@ -13,8 +13,6 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 import tools.jackson.core.JacksonException;
-import tools.jackson.core.StreamWriteFeature;
-import tools.jackson.core.exc.JacksonIOException;
 import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
@@ -160,11 +158,11 @@ class PipelinePreviewController {
     }
 
     static void writeEvents(ObjectMapper json, OutputStream output, PipelinePreviewSession stream) throws IOException {
-        var eventWriter = json.writer().without(StreamWriteFeature.AUTO_CLOSE_TARGET);
+        SerializationOutputStream serializationOutput = new SerializationOutputStream(output);
         try {
             PipelinePreviewEvent event;
             while ((event = stream.next()) != null) {
-                eventWriter.writeValue(output, event);
+                json.writeValue(serializationOutput, event);
                 output.write('\n');
                 output.flush();
                 if ("run.completed".equals(event.kind()) || "run.failed".equals(event.kind())) {
@@ -175,12 +173,59 @@ class PipelinePreviewController {
             Thread.currentThread().interrupt();
             stream.cancel();
             throw new IOException("Pipeline preview stream was interrupted", interrupted);
-        } catch (JacksonIOException disconnected) {
-            stream.cancel();
-            throw new IOException("Pipeline preview stream could not be written", disconnected);
+        } catch (RuntimeException serializationFailure) {
+            if (serializationOutput.ioFailure != null) {
+                stream.cancel();
+                throw serializationOutput.ioFailure;
+            }
+            throw serializationFailure;
         } catch (IOException disconnected) {
             stream.cancel();
             throw disconnected;
+        }
+    }
+
+    private static final class SerializationOutputStream extends OutputStream {
+        private final OutputStream target;
+        private IOException ioFailure;
+
+        private SerializationOutputStream(OutputStream target) {
+            this.target = target;
+        }
+
+        @Override
+        public void write(int value) throws IOException {
+            try {
+                target.write(value);
+            } catch (IOException failure) {
+                ioFailure = failure;
+                throw failure;
+            }
+        }
+
+        @Override
+        public void write(byte[] bytes, int offset, int length) throws IOException {
+            try {
+                target.write(bytes, offset, length);
+            } catch (IOException failure) {
+                ioFailure = failure;
+                throw failure;
+            }
+        }
+
+        @Override
+        public void flush() throws IOException {
+            try {
+                target.flush();
+            } catch (IOException failure) {
+                ioFailure = failure;
+                throw failure;
+            }
+        }
+
+        @Override
+        public void close() {
+            // Serialization owns its generator; the servlet owns the response stream.
         }
     }
 }

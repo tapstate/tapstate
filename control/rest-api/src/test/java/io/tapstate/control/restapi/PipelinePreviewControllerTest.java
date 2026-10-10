@@ -151,6 +151,27 @@ class PipelinePreviewControllerTest {
         assertThat(output.closeCount).isEqualTo(1);
     }
 
+    @Test
+    void aSerializerWriteDisconnectCancelsThePreviewAndPropagatesTheTransportFailure() {
+        TestSession session = new TestSession(event("sample.completed"));
+        IOException disconnected = new IOException("client disconnected during serialization");
+        OutputStream output = new OutputStream() {
+            @Override
+            public void write(int value) throws IOException {
+                throw disconnected;
+            }
+
+            @Override
+            public void write(byte[] bytes, int offset, int length) throws IOException {
+                throw disconnected;
+            }
+        };
+
+        assertThatThrownBy(() -> PipelinePreviewController.writeEvents(new ObjectMapper(), output, session))
+                .isSameAs(disconnected);
+        assertThat(session.cancelled).isTrue();
+    }
+
     private static final class CloseAwareServletOutputStream extends ServletOutputStream {
         private final ByteArrayOutputStream content = new ByteArrayOutputStream();
         private boolean closed;
