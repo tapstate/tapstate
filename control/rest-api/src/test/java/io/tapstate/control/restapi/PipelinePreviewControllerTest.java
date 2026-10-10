@@ -5,6 +5,8 @@ import io.tapstate.control.core.PipelinePreviewCommand;
 import io.tapstate.control.core.ArtifactDraft;
 import io.tapstate.control.core.PipelinePreviewEvent;
 import io.tapstate.control.core.PipelinePreviewSession;
+import jakarta.servlet.ServletOutputStream;
+import jakarta.servlet.WriteListener;
 import tools.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 
@@ -127,6 +129,56 @@ class PipelinePreviewControllerTest {
                 .isInstanceOf(IOException.class).hasMessageContaining("interrupted");
         assertThat(interrupted.cancelled.get()).isTrue();
         Thread.interrupted();
+    }
+
+    @Test
+    void keepsTheServletOutputOpenForEveryEventUntilItsOwnerClosesIt() throws IOException {
+        ObjectMapper json = new ObjectMapper();
+        TestSession session = new TestSession(event("sample.completed"), event("run.completed"));
+        CloseAwareServletOutputStream output = new CloseAwareServletOutputStream();
+
+        PipelinePreviewController.writeEvents(json, output, session);
+
+        String[] lines = output.content.toString(java.nio.charset.StandardCharsets.UTF_8).split("\\n");
+        assertThat(lines).hasSize(2);
+        assertThat(json.readValue(lines[0], Map.class)).containsEntry("kind", "sample.completed");
+        assertThat(json.readValue(lines[1], Map.class)).containsEntry("kind", "run.completed");
+        assertThat(output.closed).isFalse();
+        assertThat(session.cancelled).isFalse();
+
+        output.close();
+        assertThat(output.closed).isTrue();
+        assertThat(output.closeCount).isEqualTo(1);
+    }
+
+    private static final class CloseAwareServletOutputStream extends ServletOutputStream {
+        private final ByteArrayOutputStream content = new ByteArrayOutputStream();
+        private boolean closed;
+        private int closeCount;
+
+        @Override
+        public boolean isReady() {
+            return !closed;
+        }
+
+        @Override
+        public void setWriteListener(WriteListener listener) {
+            throw new UnsupportedOperationException("this synchronous test stream has no write listener");
+        }
+
+        @Override
+        public void write(int value) throws IOException {
+            if (closed) {
+                throw new IOException("the servlet response is already closed");
+            }
+            content.write(value);
+        }
+
+        @Override
+        public void close() {
+            closed = true;
+            closeCount++;
+        }
     }
 
     private static PipelinePreviewEvent event(String kind) {

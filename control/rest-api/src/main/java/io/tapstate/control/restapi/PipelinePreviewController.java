@@ -13,6 +13,8 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 import tools.jackson.core.JacksonException;
+import tools.jackson.core.StreamWriteFeature;
+import tools.jackson.core.exc.JacksonIOException;
 import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
@@ -158,10 +160,11 @@ class PipelinePreviewController {
     }
 
     static void writeEvents(ObjectMapper json, OutputStream output, PipelinePreviewSession stream) throws IOException {
+        var eventWriter = json.writer().without(StreamWriteFeature.AUTO_CLOSE_TARGET);
         try {
             PipelinePreviewEvent event;
             while ((event = stream.next()) != null) {
-                json.writeValue(output, event);
+                eventWriter.writeValue(output, event);
                 output.write('\n');
                 output.flush();
                 if ("run.completed".equals(event.kind()) || "run.failed".equals(event.kind())) {
@@ -172,6 +175,9 @@ class PipelinePreviewController {
             Thread.currentThread().interrupt();
             stream.cancel();
             throw new IOException("Pipeline preview stream was interrupted", interrupted);
+        } catch (JacksonIOException disconnected) {
+            stream.cancel();
+            throw new IOException("Pipeline preview stream could not be written", disconnected);
         } catch (IOException disconnected) {
             stream.cancel();
             throw disconnected;
