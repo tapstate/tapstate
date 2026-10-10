@@ -40,7 +40,7 @@ import java.util.concurrent.Semaphore;
 public final class PipelinePreviewService {
 
     public static final int DEFAULT_ROOT_LIMIT = 100;
-    public static final Duration DEADLINE = Duration.ofSeconds(15);
+    public static final Duration DEADLINE = Duration.ofSeconds(45);
     public static final int MAX_DRAFTS = 256;
     public static final long MAX_DRAFT_BYTES = 4L * 1024L * 1024L;
     private static final int MAX_CONCURRENT_COMPILATIONS = 8;

@@ -76,6 +76,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
     private final NestSettings nestSettings;
     private final Clock clock;
     private final PreviewSelectionPlanner planner;
+    private final PdkBoundedSnapshotQueryPort snapshotQueries;
     private final PdkTargetPreviewRenderer targetPreviewRenderer;
     private final ThreadPoolExecutor workers;
 
@@ -86,7 +87,8 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
         this.member = Objects.requireNonNull(member, "member");
         this.nestSettings = Objects.requireNonNull(nestSettings, "nestSettings");
         this.clock = Objects.requireNonNull(clock, "clock");
-        this.planner = new PreviewSelectionPlanner(new PdkBoundedSnapshotQueryPort(connectors),
+        this.snapshotQueries = new PdkBoundedSnapshotQueryPort(connectors);
+        this.planner = new PreviewSelectionPlanner(snapshotQueries,
                 new PreviewSampleCache(member), clock);
         this.targetPreviewRenderer = new PdkTargetPreviewRenderer(connectors);
         ThreadFactory threads = task -> {
@@ -112,6 +114,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
     @Override
     public void close() {
         workers.shutdownNow();
+        snapshotQueries.close();
     }
 
     private final class PreviewStream extends PipelinePreviewStream {
@@ -165,7 +168,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
             if (remaining <= 0) {
                 cancel();
                 return event("run.failed", failure(ActuationError.PREVIEW_REFUSED.code(),
-                        "the preview exceeded its 15 second execution deadline"));
+                        "the preview exceeded its 45 second execution deadline"));
             }
             PipelinePreviewEvent next = events.poll(remaining, TimeUnit.NANOSECONDS);
             if (next != null) {
@@ -176,7 +179,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
             }
             cancel();
             return event("run.failed", failure(ActuationError.PREVIEW_REFUSED.code(),
-                    "the preview exceeded its 15 second execution deadline"));
+                    "the preview exceeded its 45 second execution deadline"));
         }
 
         @Override
@@ -461,7 +464,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                 submitted.getFuture().get(remaining, TimeUnit.NANOSECONDS);
             } catch (TimeoutException timeout) {
                 submitted.cancel();
-                throw refused("the preview exceeded its 15 second execution deadline");
+                throw refused("the preview exceeded its 45 second execution deadline");
             } catch (java.util.concurrent.ExecutionException failed) {
                 Throwable cause = failed.getCause();
                 while (cause instanceof java.util.concurrent.ExecutionException
@@ -607,7 +610,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
             }
             long remaining = Duration.between(clock.instant(), request.deadline()).toNanos();
             if (remaining <= 0) {
-                throw refused("the preview exceeded its 15 second execution deadline");
+                throw refused("the preview exceeded its 45 second execution deadline");
             }
             try {
                 if (!events.offer(new PipelinePreviewEvent(request.runId(), request.candidateHash(), 0,
@@ -626,7 +629,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                 throw new java.util.concurrent.CancellationException("preview was cancelled");
             }
             if (!clock.instant().isBefore(request.deadline())) {
-                throw refused("the preview exceeded its 15 second execution deadline");
+                throw refused("the preview exceeded its 45 second execution deadline");
             }
         }
 
