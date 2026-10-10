@@ -210,6 +210,100 @@ class CaptureToSinkAckFrontierTest {
     }
 
     @Test
+    void aFrozenProducerCheckpointReopensAheadOfTheConsumersRetainedChange() {
+        InMemoryStorePort store = seedStore();
+        GatedSource source = new GatedSource();
+        LifecycleActuator first = wireRuntime(store, source, UnaryOperator.identity());
+        LifecycleActuator[] current = {first};
+        SrsMetaStore meta = store.meta();
+        SourceCaptureResolution resolution = SourceCaptureResolution.of(
+                StoredArtifacts.requireSource(store.artifacts(), SOURCE_ID));
+        String chain = resolution.chainId().value();
+        String ring = resolution.ringName(TABLE);
+        first.start(PIPELINE);
+        try {
+            for (int id = 1; id <= 4; id++) {
+                source.feed(change(id));
+                awaitSinkSize(id);
+            }
+            awaitSinkAck(meta, chain, "src-4");
+            first.pause(PIPELINE);
+            var held = member.getJet().getJob(PIPELINE);
+            long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+            while (held.getStatus() != com.hazelcast.jet.core.JobStatus.SUSPENDED) {
+                if (System.nanoTime() > deadline) {
+                    throw new AssertionError("the job did not suspend before the source's fifth change");
+                }
+                park();
+            }
+            source.feed(change(5));
+            awaitSourceRead(meta, chain, "src-5");
+            assertThat(meta.read(chain).orElseThrow().sourceReadDurable()).isTrue();
+            assertThat(ackedPosition(meta, chain)).isEqualTo("src-4");
+            assertThat(CapturingSinkWriter.collected()).containsExactly("src-1", "src-2", "src-3", "src-4");
+            Map<String, Long> confirmed = Map.copyOf(meta.ringDoneThrough(chain, CONSUMER));
+            var retained = log.readBatch(ring, 0, 16).records().entrySet().stream()
+                    .filter(entry -> "src-5".equals(entry.getValue().srcToken())).toList();
+            assertThat(retained).as("the fifth change really exists in the recoverable log").hasSize(1);
+            assertThat(retained.getFirst().getValue().after()).containsEntry("id", 5L);
+            long retainedSequence = retained.getFirst().getKey();
+            var retainedRecord = retained.getFirst().getValue();
+
+            first.stop(PIPELINE, false);
+            assertThat(ackedPosition(meta, chain)).isEqualTo("src-4");
+            assertThat(meta.ringDoneThrough(chain, CONSUMER)).isEqualTo(confirmed);
+            assertThat(log.load(ring, retainedSequence)).contains(retainedRecord);
+            int[] beforeSubmission = {0};
+            UnaryOperator<CaptureAttacher> frozenReopen = actual -> (spec, handoff, startTail) -> {
+                var witness = io.tapstate.spi.store.CaptureResumeWitness.from(spec.sourceId(),
+                        spec.config().connectorId(), spec.miningChainId().value(), spec.consumerId(),
+                        spec.readMode(), spec.srsEnabled(), spec.config().streams(),
+                        meta.read(spec.miningChainId().value()));
+                assertThat(witness.sourceReadDurable()).isTrue();
+                assertThat(witness.sourceRead().token()).isEqualTo("src-5");
+                assertThat(witness.sinkAckedByTable().get(TABLE).token()).isEqualTo("src-4");
+                // The existing unfenced test binding exercises the production frozen selection, not HA admission.
+                var opened = actual.start(spec.withResumeWitness(witness, null), handoff, startTail);
+                try {
+                    assertThat(source.starts).hasSize(2);
+                    assertThat(source.starts.stream().toList().getLast())
+                            .isEqualTo(CaptureStart.resume(new SourcePosition("src-5")));
+                    assertThat(ackedPosition(meta, chain)).isEqualTo("src-4");
+                    assertThat(meta.ringDoneThrough(chain, CONSUMER)).isEqualTo(confirmed);
+                    assertThat(log.load(ring, retainedSequence)).contains(retainedRecord);
+                    assertThat(CapturingSinkWriter.collected()).hasSize(4);
+                    beforeSubmission[0]++;
+                    return opened;
+                } catch (RuntimeException | Error failure) {
+                    try { opened.close(); }
+                    catch (RuntimeException cleanup) { failure.addSuppressed(cleanup); }
+                    throw failure;
+                }
+            };
+            current[0] = wireRuntime(store, source, UnaryOperator.identity(),
+                    (connectorId, settings, mode, ddl, target, node) ->
+                            (SupplierEx<SinkWriter>) CapturingSinkWriter::new, frozenReopen);
+            current[0].start(PIPELINE);
+            assertThat(beforeSubmission[0]).isEqualTo(1);
+            awaitSinkSize(5);
+            awaitSinkAck(meta, chain, "src-5");
+            assertThat(CapturingSinkWriter.collected()).containsExactly("src-1", "src-2", "src-3", "src-4", "src-5");
+
+            assertThat(CapturingSinkWriter.writtenIds()).containsExactly("1", "2", "3", "4", "5");
+
+            source.feed(change(6));
+            awaitSinkSize(6);
+            awaitSinkAck(meta, chain, "src-6");
+            awaitSourceRead(meta, chain, "src-6");
+            assertThat(CapturingSinkWriter.collected())
+                    .containsExactly("src-1", "src-2", "src-3", "src-4", "src-5", "src-6");
+            assertThat(CapturingSinkWriter.writtenIds()).containsExactly("1", "2", "3", "4", "5", "6");
+        } finally {
+            current[0].stop(PIPELINE, true);
+        }
+    }
+
+    @Test
     void singleMemberRetiresSinkConfirmedChangesWithoutAnotherPipelineStarting() {
         InMemoryStorePort store = seedStore();
         GatedSource source = new GatedSource();
@@ -426,6 +520,13 @@ class CaptureToSinkAckFrontierTest {
     /** The same runtime with every sink bound through {@code sinks}. */
     private LifecycleActuator wireRuntime(InMemoryStorePort store, GatedSource gatedSource,
             UnaryOperator<DagSource> wrapDag, StoreBackedDagSource.SinkWriterBinder sinks) {
+        return wireRuntime(store, gatedSource, wrapDag, sinks, UnaryOperator.identity());
+    }
+
+    /** Adapts only source preparation while retaining the real coordinator, capture unit and native graph. */
+    private LifecycleActuator wireRuntime(InMemoryStorePort store, GatedSource gatedSource,
+            UnaryOperator<DagSource> wrapDag, StoreBackedDagSource.SinkWriterBinder sinks,
+            UnaryOperator<CaptureAttacher> captureStarter) {
         SrsMetaStore meta = store.meta();
         member.getUserContext().put(CaptureRunUnit.SRS_META_USER_CONTEXT_KEY, meta);
         member.getUserContext().put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY, store.srsLog());
@@ -440,7 +541,7 @@ class CaptureToSinkAckFrontierTest {
         SrsCoordinator srsCoordinator = new SrsCoordinator(meta);
         CaptureRunUnit captureRunUnit = new CaptureRunUnit(gatedSource, srsCoordinator, meta, member);
         coordinator = new StoreBackedPipelineCaptureCoordinator(
-                store, captureRunUnit::start, srsCoordinator, snapshotBuffer);
+                store, captureStarter.apply(captureRunUnit::start), srsCoordinator, snapshotBuffer);
 
         DagSource dagSource = wrapDag.apply(new StoreBackedDagSource(store, sinks));
         return new EngineLifecycleActuator(
@@ -827,19 +928,27 @@ class CaptureToSinkAckFrontierTest {
     private static final class CapturingSinkWriter implements SinkWriter {
 
         private static final Queue<String> COLLECTED = new ConcurrentLinkedQueue<>();
+        private static final Queue<String> WRITTEN_IDS = new ConcurrentLinkedQueue<>();
 
         static Queue<String> collected() {
             return COLLECTED;
         }
 
+        static Queue<String> writtenIds() {
+            return WRITTEN_IDS;
+        }
+
         static void reset() {
             COLLECTED.clear();
+            WRITTEN_IDS.clear();
         }
 
         @Override
         public CompletionStage<WriteResult> write(List<Envelope> records) {
             for (Envelope record : records) {
                 COLLECTED.add(record.position() == null ? null : record.position().token());
+                Map<String, Object> image = record.after() != null ? record.after() : record.before();
+                WRITTEN_IDS.add(image == null ? "null" : String.valueOf(image.get("id")));
             }
             return CompletableFuture.completedFuture(new WriteResult(records.size()));
         }

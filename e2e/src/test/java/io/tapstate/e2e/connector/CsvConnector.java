@@ -10,6 +10,7 @@ import io.tapdata.entity.logger.TapLogger;
 import io.tapdata.entity.schema.TapField;
 import io.tapdata.entity.schema.TapTable;
 import io.tapdata.entity.utils.cache.KVMap;
+import io.tapdata.exception.TapPdkConfigEx;
 import io.tapdata.pdk.apis.TapConnector;
 import io.tapdata.pdk.apis.annotations.TapConnectorClass;
 import io.tapdata.pdk.apis.consumer.StreamReadConsumer;
@@ -27,6 +28,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
+import java.math.BigDecimal;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.channels.OverlappingFileLockException;
@@ -40,10 +42,12 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Collections;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -79,12 +83,9 @@ import java.util.stream.Stream;
  *
  * <h2>What its tail can and cannot see</h2>
  *
- * <p>No read position is ever handed to a connector - the product passes a null offset to both reads -
- * so this tail has nowhere to resume from and replays the table from the beginning on its first poll.
- * The rows the snapshot already carried are therefore delivered twice. That is not a defect to paper
- * over here: it is the same overlap the product's own snapshot-to-cdc seam leaves, and an idempotent
- * upsert on the discovered key is what absorbs it. A specification that counts rows after both phases
- * is asserting exactly that absorption.
+ * <p>The tail resumes from its own cumulative map of table high-water marks. A callback carries the
+ * frontier reached by that delivery, and only a successfully accepted callback advances the local
+ * frontier. Rows already retained in the product's replay log are not mined again on a later read.
  *
  * <p>The tail sees rows appear; it does not see rows change or vanish. Detecting those in a flat file
  * would mean diffing every row on every poll, and no specification needs it yet.
@@ -279,14 +280,19 @@ public class CsvConnector implements TapConnector {
                 })
                 .supportStreamRead((context, tables, offset, size, consumer) -> {
                     mintTheIdentityOnce(context);
-                    tail(context, tables, consumer);
+                    tail(context, tables, offset, consumer);
                 })
                 // A streaming source states where its stream stands, and this one does the same. A snapshot
                 // samples it before reading its first row and hands it on as the seam the tail joins at; a
                 // source that names no position leaves that join to guesswork, which a snapshot followed by
                 // a tail refuses rather than papers over. Every stream-capable connector the ecosystem ships
                 // declares this -- the only ones that do not are its own benchmark fixtures.
-                .supportTimestampToStreamOffset((context, startTime) -> highWaterMarks(context))
+                .supportTimestampToStreamOffset((context, startTime) -> {
+                    LinkedHashMap<String, Long> marks = highWaterMarks(context);
+                    // The SDK beginning-of-time request names the initial origin, not sampled current rows.
+                    if (startTime != null && startTime == 0L) { marks.replaceAll((table, mark) -> 0L); }
+                    return marks;
+                })
                 .supportWriteRecord((context, events, table, consumer) ->
                         consumer.accept(write(context, events, table)))
                 .supportClearTable((context, event) -> clear(context, event.getTableId()))
@@ -407,8 +413,9 @@ public class CsvConnector implements TapConnector {
      * Cancellation arrives as an interrupt, a {@code stop}, or both; either ends the loop, because a
      * tail that outlived its cancel would hold the connector's loader open behind it.
      */
-    private void tail(TapConnectionContext context, List<String> tables, StreamReadConsumer consumer) {
-        Map<String, Long> delivered = new LinkedHashMap<>();
+    private void tail(TapConnectionContext context, List<String> tables, Object offset, StreamReadConsumer consumer) {
+        Map<String, Long> delivered = retainedPosition(offset, tables);
+        notePosition(context, "START", String.join("|", tables), offset);
         consumer.streamReadStarted();
         if (cdcRejected(context)) {
             // The stream started, then dies - the read-side mirror of a rejected write. The product wraps
@@ -424,16 +431,22 @@ public class CsvConnector implements TapConnector {
         while (!stopped && !Thread.currentThread().isInterrupted()) {
             for (String table : tables) {
                 List<TapEvent> fresh = new ArrayList<>();
+                long through = delivered.get(table);
                 for (Map<String, Object> row : rows(file(context, table))) {
                     long id = idOf(row);
-                    if (id > delivered.getOrDefault(table, 0L)) {
+                    if (id > delivered.get(table)) {
                         fresh.add(insert(table, row));
-                        delivered.put(table, id);
+                        through = Math.max(through, id);
                     }
                 }
                 if (!fresh.isEmpty()) {
+                    Map<String, Long> next = new LinkedHashMap<>(delivered);
+                    next.put(table, through);
+                    Map<String, Long> checkpoint = Collections.unmodifiableMap(new LinkedHashMap<>(next));
+                    consumer.accept(fresh, checkpoint);
+                    delivered.putAll(next);
                     noteRead(context, "tail", table, fresh.size());
-                    consumer.accept(fresh, null);
+                    notePosition(context, "DELIVERY", table, checkpoint);
                 }
             }
             if (!pausedBetweenPolls(POLL_MILLIS)) {
@@ -448,9 +461,8 @@ public class CsvConnector implements TapConnector {
      * holds, and zero for a table with no rows yet. Serializable on purpose -- a recorded position is
      * written down and read back by a later run, so it outlives the process that sampled it.
      *
-     * <p>This connector does not yet resume from one: its tail re-reads from the beginning and the sink
-     * absorbs the overlap, so the value is honest about where the stream stood without being acted on.
-     * Making the tail start here is what a resume witness needs, and it belongs with that witness.
+     * <p>This is the offset type the registered stream reader accepts. Subsequent callback offsets carry
+     * only the cumulative marks actually delivered, rather than sampling later rows still unread.
      */
     private static LinkedHashMap<String, Long> highWaterMarks(TapConnectionContext context) {
         LinkedHashMap<String, Long> marks = new LinkedHashMap<>();
@@ -462,6 +474,41 @@ public class CsvConnector implements TapConnector {
             marks.put(table, high);
         }
         return marks;
+    }
+
+    private static Map<String, Long> retainedPosition(Object offset, List<String> tables) {
+        if (offset == null) {
+            Map<String, Long> beginning = new LinkedHashMap<>();
+            tables.forEach(table -> beginning.put(table, 0L));
+            return beginning;
+        }
+        if (!(offset instanceof Map<?, ?> position)) {
+            throw invalidOffset("a stream offset must be a cumulative table high-water map", null);
+        }
+        Map<String, Long> sorted = new TreeMap<>();
+        for (var entry : position.entrySet()) {
+            if (!(entry.getKey() instanceof String table) || table.isBlank()
+                    || !(entry.getValue() instanceof Number number)) {
+                throw invalidOffset("a stream offset must contain table names and whole nonnegative marks", null);
+            }
+            long mark;
+            try { mark = new BigDecimal(number.toString()).longValueExact(); }
+            catch (ArithmeticException | NumberFormatException invalid) {
+                throw invalidOffset("a stream high-water mark must be a whole nonnegative long", invalid);
+            }
+            if (mark < 0) { throw invalidOffset("a stream high-water mark must be nonnegative", null); }
+            sorted.put(table, mark);
+        }
+        for (String table : tables) {
+            if (!sorted.containsKey(table)) {
+                throw invalidOffset("the stream offset has no high-water mark for table " + table, null);
+            }
+        }
+        return new LinkedHashMap<>(sorted);
+    }
+
+    private static TapPdkConfigEx invalidOffset(String message, Throwable cause) {
+        return new TapPdkConfigEx(message, "e2e_file", cause);
     }
 
     /**
@@ -1136,6 +1183,22 @@ public class CsvConnector implements TapConnector {
         } catch (IOException failure) {
             throw new UncheckedIOException(failure);
         }
+    }
+
+    private static void notePosition(TapConnectionContext context, String phase, String table, Object position) {
+        Object configured = context.getConnectionConfig() == null
+                ? null : context.getConnectionConfig().getObject(READ_WITNESS);
+        if (configured == null || String.valueOf(configured).isBlank()) { return; }
+        long pid = ProcessHandle.current().pid();
+        Path ledger = Path.of(String.valueOf(configured)).resolve("positions-" + pid + ".tsv");
+        String line = pid + "\t" + phase + "\t" + table + "\t" + (position == null ? "null" : position.getClass().getName())
+                + "\t" + position + System.lineSeparator();
+        try {
+            Files.createDirectories(ledger.getParent());
+            try (FileOutputStream out = new FileOutputStream(ledger.toFile(), true)) {
+                out.write(line.getBytes(StandardCharsets.UTF_8));
+            }
+        } catch (IOException failure) { throw new UncheckedIOException(failure); }
     }
 
     private static Path directory(TapConnectionContext context) {

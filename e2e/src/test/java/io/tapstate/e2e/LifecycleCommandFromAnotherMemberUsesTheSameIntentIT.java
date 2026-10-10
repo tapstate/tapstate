@@ -9,14 +9,17 @@ import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.MongoDesiredStore;
 import io.tapstate.adapters.mongostore.MongoObservationStore;
 import io.tapstate.adapters.mongostore.SystemCollections;
+import io.tapstate.control.core.ClusterCapacityView;
 import io.tapstate.control.core.ClusterClaimView;
 import io.tapstate.control.core.ClusterMemberState;
 import io.tapstate.control.core.ClusterMemberView;
 import io.tapstate.control.core.ClusterPipelineView;
+import io.tapstate.control.core.ClusterTopologyView;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.testsupport.DockerGate;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -201,10 +204,13 @@ class LifecycleCommandFromAnotherMemberUsesTheSameIntentIT {
             awaitIntent(desired, PipelineState.STOPPED, running.revision());
             awaitState(control, PipelineState.STOPPED);
             assertThat(desired.read(PIPELINE).orElseThrow().purgeState()).isFalse();
-            Await.until("the stopped execution's submission to retire", BOUND,
-                    () -> submissions(database, cluster.clusterId()).isEmpty(),
-                    () -> "submissions = " + submissions(database, cluster.clusterId()));
-            long stoppedGeneration = claim(control).executionGeneration();
+            // Retired receipts may remain stored; the live native and capacity views must be empty.
+            Await.until("the stopped native execution and its cached authority to retire", BOUND,
+                    () -> stoppedExecutionRetired(database, cluster.clusterId(), resumed, resumedJob)
+                            && stoppedView(control, resumed) && stoppedView(fifth, resumed),
+                    () -> "cluster = " + control.clusterStatus() + "; submissions = "
+                            + submissions(database, cluster.clusterId()));
+            long stoppedGeneration = resumed.executionGeneration();
 
             // With no run left, a legal START from this endpoint creates one new run using all active members.
             fifth.lifecycle(PIPELINE, LifecycleVerb.START);
@@ -323,6 +329,53 @@ class LifecycleCommandFromAnotherMemberUsesTheSameIntentIT {
     }
 
     private record Submitted(String jobId, long generation) {}
+
+    private static boolean stoppedView(ControlPlane control, ClusterClaimView expected) {
+        ClusterTopologyView view = control.clusterStatus();
+        ClusterPipelineView pipeline = view.pipelines().stream()
+                .filter(candidate -> PIPELINE.equals(candidate.pipelineId())).findFirst().orElse(null);
+        ClusterCapacityView capacity = view.recovery() == null ? null : view.recovery().capacity();
+        return pipeline != null && pipeline.vertices().isEmpty() && pipeline.controllerClaim() != null
+                && pipeline.controllerClaim().executionGeneration() == expected.executionGeneration()
+                && capacity != null && "AVAILABLE".equals(capacity.availability())
+                && "mongo-capacity-snapshot".equals(capacity.provenance()) && capacity.profile() != null
+                && Objects.equals(capacity.profile().hash(), expected.executionProfileHash())
+                && Objects.equals(capacity.profile().generation(), expected.executionProfileGeneration())
+                && capacity.occupiedByNode() != null && capacity.occupiedByNode().isEmpty();
+    }
+
+    private static boolean stoppedExecutionRetired(MongoDatabase database, String clusterId,
+            ClusterClaimView expected, Submitted submitted) {
+        Document key = new Document("clusterId", clusterId)
+                .append("resourceType", WorkloadClaimType.PIPELINE_ACTUATION.name()).append("resourceId", PIPELINE);
+        Document oldLiveAuthority = new Document("_id", key).append("ownerNodeId", expected.ownerNodeId())
+                .append("ownerBootId", expected.ownerBootId()).append("claimGeneration", expected.claimGeneration())
+                .append("executionGeneration", expected.executionGeneration()).append("profileGeneration", expected.profileGeneration())
+                .append("$expr", new Document("$gt", List.of("$leaseUntil", "$$NOW")));
+        Document retired = new Document("_id", key).append("retiredAuthorizationUntil", new Document("$type", "date"))
+                .append("$nor", List.of(oldLiveAuthority))
+                .append("$expr", new Document("$lte", List.of("$retiredAuthorizationUntil", "$$NOW")));
+        if (SystemCollections.WORKLOAD_CLAIMS.on(database).find(retired).first() == null) { return false; }
+        if (SystemCollections.PIPELINE_STATE.on(database).find(new Document("_id", PIPELINE)
+                .append("stateJson", PipelineState.STOPPED.name())
+                .append("pendingPipelineResume", new Document("$exists", false))).first() == null) { return false; }
+
+        Document receipt = new Document("clusterId", clusterId).append("pipelineId", PIPELINE)
+                .append("nativeJobId", submitted.jobId()).append("executionGeneration", submitted.generation());
+        var occupancy = SystemCollections.CLUSTER_CAPACITY_OCCUPANCY.on(database);
+        if (occupancy.find(receipt).first() == null) { return true; }
+        Document retiredReceipt = new Document(receipt)
+                .append("pipelineClaim.ownerNodeId", expected.ownerNodeId())
+                .append("pipelineClaim.ownerBootId", expected.ownerBootId())
+                .append("pipelineClaim.claimGeneration", expected.claimGeneration())
+                .append("pipelineClaim.executionGeneration", expected.executionGeneration())
+                .append("pipelineClaim.profileGeneration", expected.profileGeneration())
+                .append("authorityUntil", new Document("$type", "date")).append("deadline", new Document("$type", "date"))
+                .append("$expr", new Document("$and", List.of(
+                        new Document("$lte", List.of("$authorityUntil", "$$NOW")),
+                        new Document("$lte", List.of("$deadline", "$$NOW")))));
+        return occupancy.find(retiredReceipt).first() != null;
+    }
 
     private static List<Document> submissions(MongoDatabase database, String clusterId) {
         return SystemCollections.CLUSTER_CAPACITY_OCCUPANCY.on(database)
