@@ -52,6 +52,7 @@ final class BenchmarkReturnCommonWindow {
         long startLower = Long.MIN_VALUE, startUpper = Long.MIN_VALUE;
         long endLower = Long.MAX_VALUE, endUpper = Long.MAX_VALUE;
         var targetWindows = new ArrayList<Map<String, Object>>();
+        var targetLastLower = new LinkedHashMap<String, Long>();
         for (var target : targets.entrySet()) {
             long firstLower = Long.MAX_VALUE, firstUpper = Long.MAX_VALUE;
             long lastLower = Long.MIN_VALUE, lastUpper = Long.MIN_VALUE;
@@ -63,6 +64,7 @@ final class BenchmarkReturnCommonWindow {
             }
             startLower = Math.max(startLower, firstLower); startUpper = Math.max(startUpper, firstUpper);
             endLower = Math.min(endLower, lastLower); endUpper = Math.min(endUpper, lastUpper);
+            targetLastLower.put(target.getKey(), lastLower);
             targetWindows.add(Map.of("target", target.getKey(), "firstBoundsNanos", List.of(firstLower, firstUpper),
                     "lastBoundsNanos", List.of(lastLower, lastUpper)));
         }
@@ -83,8 +85,15 @@ final class BenchmarkReturnCommonWindow {
         BigInteger halfUpper = integer(startUpper).add(integer(endUpper));
         for (Call call : calls.values()) {
             long lower = call.returned.lowerNanos(), upper = call.returned.upperNanos();
-            boolean definite = lower > startUpper && upper <= endLower;
+            // A call is always at or before its own target's maximum; only other targets constrain the closed end.
+            boolean beforeOtherEnds = targetLastLower.entrySet().stream().allMatch(target ->
+                    target.getKey().equals(call.target) || upper <= target.getValue());
+            boolean definite = lower > startUpper && beforeOtherEnds;
             boolean possible = upper > startLower && lower <= endUpper;
+            boolean ownLatest = targets.get(call.target).stream().allMatch(other ->
+                    other == call || lower >= other.returned.upperNanos());
+            // Such a call is the common-end variable itself, preserving the inclusive final bin.
+            boolean atCommonEnd = ownLatest && beforeOtherEnds;
             if (definite) { completedLower += call.weight; }
             if (possible) { completedUpper += call.weight; }
             if (definite && integer(upper).shiftLeft(1).compareTo(halfLower) < 0) { earlyLower += call.weight; }
@@ -93,7 +102,8 @@ final class BenchmarkReturnCommonWindow {
             if (possible && integer(upper).shiftLeft(1).compareTo(halfLower) >= 0) { lateUpper += call.weight; }
             BigInteger scaledLower = integer(lower).multiply(TEN), scaledUpper = integer(upper).multiply(TEN);
             for (int bin = 0; bin < BINS; bin++) {
-                boolean definitelyAbove = bin == 0 || scaledLower.compareTo(edge(bin, startUpper, endUpper)) >= 0;
+                boolean definitelyAbove = bin == 0 || bin == BINS - 1 && atCommonEnd
+                        || scaledLower.compareTo(edge(bin, startUpper, endUpper)) >= 0;
                 boolean definitelyBelow = bin == BINS - 1 || scaledUpper.compareTo(edge(bin + 1, startLower, endLower)) < 0;
                 boolean possiblyAbove = bin == 0 || scaledUpper.compareTo(edge(bin, startLower, endLower)) >= 0;
                 boolean possiblyBelow = bin == BINS - 1 || scaledLower.compareTo(edge(bin + 1, startUpper, endUpper)) < 0;

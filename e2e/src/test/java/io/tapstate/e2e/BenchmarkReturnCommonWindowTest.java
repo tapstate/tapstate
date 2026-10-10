@@ -9,6 +9,83 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class BenchmarkReturnCommonWindowTest {
+    @Test void an_uncertain_latest_call_is_included_at_its_own_closed_common_end() {
+        var rows = new ArrayList<BenchmarkReturnTimeBounds.Delivery>();
+        add(rows, "target", 1, 0, 0, 1); add(rows, "target", 2, 90, 100, 7);
+        var certificate = BenchmarkReturnCommonWindow.evidence(rows);
+        assertThat(certificate).containsEntry("completedRowsLower", 7L).containsEntry("completedRowsUpper", 7L);
+        assertThat(binCounts(certificate, "lowerRows").getLast()).isEqualTo(7L);
+    }
+
+    @Test void a_wide_latest_call_interval_stays_in_the_final_bin_through_its_shared_end_variable() {
+        var rows = new ArrayList<BenchmarkReturnTimeBounds.Delivery>();
+        add(rows, "target", 1, 0, 0, 1); add(rows, "target", 2, 1, 100, 7);
+        var certificate = BenchmarkReturnCommonWindow.evidence(rows);
+        assertThat(certificate).containsEntry("completedRowsLower", 7L).containsEntry("completedRowsUpper", 7L);
+        assertThat(binCounts(certificate, "lowerRows").getLast()).isEqualTo(7L);
+    }
+
+    @Test void uncertain_closed_end_pairs_preserve_every_balanced_bin_and_the_original_half_trend() {
+        var rows = balanced(0, 10_000, 10_000);
+        for (int index = 0; index < rows.size(); index++) {
+            var delivery = rows.get(index);
+            if (delivery.literalReturn().lowerNanos() == 1000) {
+                rows.set(index, row(delivery.target(), delivery.key(), delivery.callSequence(), 1000, 1001));
+            }
+        }
+        var certificate = BenchmarkReturnCommonWindow.evidence(rows);
+        assertThat(certificate).containsEntry("completedRowsLower", 20_000L).containsEntry("completedRowsUpper", 20_000L)
+                .containsEntry("state", "PASS").containsEntry("earlyRowsLower", 10_000L).containsEntry("earlyRowsUpper", 10_000L)
+                .containsEntry("lateRowsLower", 10_000L).containsEntry("lateRowsUpper", 10_000L);
+        assertThat(binCounts(certificate, "lowerRows")).containsExactly(2000L, 2000L, 2000L, 2000L, 2000L,
+                2000L, 2000L, 2000L, 2000L, 2000L);
+        assertThat(binCounts(certificate, "upperRows")).isEqualTo(binCounts(certificate, "lowerRows"));
+    }
+
+    @Test void a_latest_own_call_after_the_other_target_end_is_excluded_from_the_common_window() {
+        var rows = new ArrayList<BenchmarkReturnTimeBounds.Delivery>();
+        add(rows, "one", 1, 0, 0, 1); add(rows, "one", 2, 90, 100, 7);
+        add(rows, "two", 3, 0, 0, 1); add(rows, "two", 4, 50, 60, 5);
+        var certificate = BenchmarkReturnCommonWindow.evidence(rows);
+        assertThat(certificate).containsEntry("completedRowsLower", 5L).containsEntry("completedRowsUpper", 5L);
+        assertThat(binCounts(certificate, "lowerRows").getLast()).isEqualTo(5L);
+        assertThat(binCounts(certificate, "upperRows").getLast()).isEqualTo(5L);
+    }
+
+    @Test void shared_call_assignments_are_enclosed_for_one_and_two_target_membership_bins_and_halves() {
+        List<List<CallRange>> scenarios = List.of(
+                List.of(new CallRange("one", 0, 1, 2), new CallRange("one", 2, 3, 3), new CallRange("one", 8, 10, 5)),
+                List.of(new CallRange("one", 0, 2, 1), new CallRange("one", 1, 3, 2), new CallRange("one", 2, 4, 3)),
+                List.of(new CallRange("one", 0, 1, 1), new CallRange("one", 8, 10, 3),
+                        new CallRange("two", 2, 3, 2), new CallRange("two", 6, 7, 4)),
+                List.of(new CallRange("one", 0, 1, 1), new CallRange("one", 5, 7, 3),
+                        new CallRange("two", 0, 2, 2), new CallRange("two", 6, 8, 4)),
+                List.of(new CallRange("one", 0, 1, 1), new CallRange("one", 1, 2, 2), new CallRange("one", 3, 4, 3),
+                        new CallRange("two", 0, 2, 4), new CallRange("two", 4, 5, 5)));
+        for (var scenario : scenarios) {
+            var rows = new ArrayList<BenchmarkReturnTimeBounds.Delivery>();
+            for (int index = 0; index < scenario.size(); index++) {
+                var call = scenario.get(index);
+                add(rows, call.target(), index + 1L, call.lower(), call.upper(), call.weight());
+            }
+            var certificate = BenchmarkReturnCommonWindow.evidence(rows);
+            var truth = new AssignmentBounds();
+            enumerate(scenario, 0, new long[scenario.size()], truth);
+            assertThat((Long) certificate.get("completedRowsLower")).isLessThanOrEqualTo(truth.minimum[0]);
+            assertThat((Long) certificate.get("completedRowsUpper")).isGreaterThanOrEqualTo(truth.maximum[0]);
+            assertThat((Long) certificate.get("earlyRowsLower")).isLessThanOrEqualTo(truth.minimum[1]);
+            assertThat((Long) certificate.get("earlyRowsUpper")).isGreaterThanOrEqualTo(truth.maximum[1]);
+            assertThat((Long) certificate.get("lateRowsLower")).isLessThanOrEqualTo(truth.minimum[2]);
+            assertThat((Long) certificate.get("lateRowsUpper")).isGreaterThanOrEqualTo(truth.maximum[2]);
+            for (int bin = 0; bin < 10; bin++) {
+                assertThat(binCounts(certificate, "lowerRows").get(bin)).isLessThanOrEqualTo(truth.minimum[bin + 3]);
+                assertThat(binCounts(certificate, "upperRows").get(bin)).isGreaterThanOrEqualTo(truth.maximum[bin + 3]);
+            }
+            assertThat(certificate).containsEntry("performanceAcceptanceEligible", false);
+            if ("PASS".equals(certificate.get("state"))) { assertThat(truth.allFrozenRulesHold).isTrue(); }
+        }
+    }
+
     @Test void exact_call_returns_reproduce_the_original_ten_bins_and_half_trend_rule() {
         var rows = balanced(0, 10_000, 10_000);
         var exact = rows.stream().map(row -> row.literalReturn().lowerNanos()).sorted().toList();
@@ -72,9 +149,10 @@ class BenchmarkReturnCommonWindowTest {
         add(rows, "target", 1, 0, 20, 1000); add(rows, "target", 2, 10, 30, 1000);
         add(rows, "target", 3, 90, 100, 1000);
         var certificate = BenchmarkReturnCommonWindow.evidence(rows);
+        // The last call dominates every earlier upper bound and belongs to its own closed target end.
         assertThat(certificate).containsEntry("state", "UNQUALIFIED")
-                .containsEntry("completedRowsLower", 0L).containsEntry("completedRowsUpper", 3000L)
-                .containsEntry("ambiguousMembershipRows", 3000L).containsEntry("fullCohortRows", 3000);
+                .containsEntry("completedRowsLower", 1000L).containsEntry("completedRowsUpper", 3000L)
+                .containsEntry("ambiguousMembershipRows", 2000L).containsEntry("fullCohortRows", 3000);
     }
 
     @Test void endpoint_uncertainty_cannot_be_hidden_by_selecting_a_convenient_shorter_window() {
@@ -164,5 +242,46 @@ class BenchmarkReturnCommonWindowTest {
     private static List<Long> binCounts(Map<String, Object> evidence, String field) {
         @SuppressWarnings("unchecked") var bins = (List<Map<String, Object>>) evidence.get("bins");
         return bins.stream().map(bin -> (Long) bin.get(field)).toList();
+    }
+
+    private record CallRange(String target, long lower, long upper, int weight) { }
+    private static final class AssignmentBounds {
+        final long[] minimum = new long[13], maximum = new long[13];
+        boolean allFrozenRulesHold = true;
+        AssignmentBounds() { java.util.Arrays.fill(minimum, Long.MAX_VALUE); }
+    }
+    private static void enumerate(List<CallRange> calls, int index, long[] times, AssignmentBounds bounds) {
+        if (index < calls.size()) {
+            var call = calls.get(index);
+            for (long at = call.lower(); at <= call.upper(); at++) {
+                times[index] = at; enumerate(calls, index + 1, times, bounds);
+            }
+            return;
+        }
+        var first = new java.util.LinkedHashMap<String, Long>();
+        var last = new java.util.LinkedHashMap<String, Long>();
+        for (int call = 0; call < calls.size(); call++) {
+            first.merge(calls.get(call).target(), times[call], Math::min);
+            last.merge(calls.get(call).target(), times[call], Math::max);
+        }
+        long start = first.values().stream().mapToLong(Long::longValue).max().orElseThrow();
+        long end = last.values().stream().mapToLong(Long::longValue).min().orElseThrow();
+        long[] actual = new long[13];
+        for (int call = 0; call < calls.size(); call++) {
+            long at = times[call], weight = calls.get(call).weight();
+            if (at <= start || at > end) { continue; }
+            actual[0] += weight;
+            actual[2 * at < start + end ? 1 : 2] += weight;
+            int bin = 0;
+            while (bin < 9 && 10 * at >= (9 - bin) * start + (bin + 1) * end) { bin++; }
+            actual[bin + 3] += weight;
+        }
+        for (int field = 0; field < actual.length; field++) {
+            bounds.minimum[field] = Math.min(bounds.minimum[field], actual[field]);
+            bounds.maximum[field] = Math.max(bounds.maximum[field], actual[field]);
+        }
+        bounds.allFrozenRulesHold &= end > start && actual[0] >= 10_000
+                && 20 * Math.abs(actual[2] - actual[1]) <= actual[1]
+                && java.util.Arrays.stream(actual, 3, 13).allMatch(count -> count > 0);
     }
 }
