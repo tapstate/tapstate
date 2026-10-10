@@ -101,7 +101,7 @@ public final class NestDag {
                     frontier == null ? null : frontier.axes(), chains)));
             built.put(spec.pathId(), vertex);
             for (NestInbound edge : spec.inbound()) {
-                connect(dag, vertex, edge, built, upstream, nextOutbound, frontier, width);
+                connect(dag, vertex, edge, built, upstream, nextOutbound, frontier, width, spec.mapName());
             }
             assembler = vertex;
         }
@@ -150,7 +150,8 @@ public final class NestDag {
         Vertex source = sources.size() == 1
                 ? sources.get(0)
                 : gatheredInto(dag, vertex, lookup.alias(), sources, nextOutbound, frontier);
-        draw(dag, source, vertex, LookupProcessor.ROWS, fieldKey(lookup.partitionKey()), nextOutbound, width);
+        draw(dag, source, vertex, LookupProcessor.ROWS,
+                fieldKey(lookup.partitionKey(), lookup.mapName()), nextOutbound, width);
 
         List<Vertex> referrers = upstream.apply(lookup.referrerAlias());
         if (referrers == null || referrers.isEmpty()) {
@@ -161,7 +162,7 @@ public final class NestDag {
                 ? referrers.get(0)
                 : gatheredInto(dag, vertex, lookup.referrerAlias(), referrers, nextOutbound, frontier);
         draw(dag, referrer, vertex, LookupProcessor.REGISTRATIONS,
-                fieldKey(lookup.referenceFields()), nextOutbound, width);
+                fieldKey(lookup.referenceFields(), lookup.mapName()), nextOutbound, width);
         // The same rows a second time, keyed by what they pointed at before, so a row that now names
         // something else lands where the entry recording the old one is held. Drawn for every referenced
         // embed rather than only where structural key changes are followed: that switch is about a
@@ -169,7 +170,7 @@ public final class NestDag {
         // this on it threw away an earlier row the source had already sent. A row carrying none is keyed
         // by what it carries, which lands it beside its twin, and is refused there rather than passed over.
         draw(dag, referrer, vertex, LookupProcessor.DEPARTED_REGISTRATIONS,
-                leavingKey(lookup.referenceFields()), nextOutbound, width);
+                leavingKey(lookup.referenceFields(), lookup.mapName()), nextOutbound, width);
 
         Vertex pointing = built.get(lookup.referrerPathId());
         if (pointing == null) {
@@ -237,7 +238,7 @@ public final class NestDag {
 
     private static void connect(DAG dag, Vertex destination, NestInbound edge, Map<List<String>, Vertex> built,
             Function<String, List<Vertex>> upstream, ToIntFunction<Vertex> nextOutbound,
-            NestFrontier frontier, NodeWidth width) {
+            NestFrontier frontier, NodeWidth width, String namespace) {
         if (edge.carriesTouches()) {
             // Drawn with the vertex that sends it, which does not exist yet: lookups are built after every
             // assembly vertex, so that the vertex a word of an edit lands on is already there to draw to.
@@ -260,7 +261,7 @@ public final class NestDag {
                 ? sources.get(0)
                 : merged(dag, destination, edge, sources, nextOutbound, frontier);
         draw(dag, source, destination, edge.ordinal(),
-                edge.carriesDepartures() ? leavingKey(edge.keyFields()) : fieldKey(edge.keyFields()),
+                edge.carriesDepartures() ? leavingKey(edge.keyFields(), namespace) : fieldKey(edge.keyFields(), namespace),
                 nextOutbound, width);
     }
 
@@ -409,9 +410,9 @@ public final class NestDag {
     }
 
     /** Reads a row's key, or routes a settlement with no row to the shared settlement lane. */
-    private static FunctionEx<Object, Object> fieldKey(List<String> fields) {
+    private static FunctionEx<Object, Object> fieldKey(List<String> fields, String namespace) {
         return item -> item instanceof SettledPositions ? SETTLED_POSITIONS_LANE
-                : NestKeys.valuesOf(NestKeys.rowOf((Envelope) item), fields);
+                : NestKeys.valuesOf(NestKeys.rowOf((Envelope) item), fields, namespace);
     }
 
     /**
@@ -420,14 +421,14 @@ public final class NestDag {
      * already has, which lands it on the same partition as its twin - where the two keys being equal is
      * exactly what says there is no departure to make.
      */
-    private static FunctionEx<Object, Object> leavingKey(List<String> fields) {
+    private static FunctionEx<Object, Object> leavingKey(List<String> fields, String namespace) {
         return item -> {
             if (item instanceof SettledPositions) {
                 return SETTLED_POSITIONS_LANE;
             }
             Envelope event = (Envelope) item;
             Map<String, Object> was = event.before();
-            return NestKeys.valuesOf(was == null ? NestKeys.rowOf(event) : was, fields);
+            return NestKeys.valuesOf(was == null ? NestKeys.rowOf(event) : was, fields, namespace);
         };
     }
 

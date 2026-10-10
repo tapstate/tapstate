@@ -478,9 +478,9 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
             }
             own(edge, event, row, touched);
         } else {
-            List<Object> parent = NestKeys.valuesOf(row, edge.keyFields());
+            List<Object> parent = NestKeys.valuesOf(row, edge.keyFields(), vertex.mapName());
             Map<String, Object> was = NestKeys.replacedRow(edge, event);
-            List<Object> parentBefore = was == null ? null : NestKeys.valuesOf(was, edge.keyFields());
+            List<Object> parentBefore = was == null ? null : NestKeys.valuesOf(was, edge.keyFields(), vertex.mapName());
             Object parentWas = was == null ? null : parentIdentity(edge, parentBefore);
             NestElement arriving = departing(
                     element(edge, event, row, parentIdentity(edge, parent), null, was, parentWas),
@@ -544,8 +544,8 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
     private void own(NestInbound edge, Envelope event, Map<String, Object> row,
             Map<Object, ResolverState> touched) {
         SourceOrder order = NestKeys.orderOf(event);
-        List<Object> key = NestKeys.valuesOf(row, vertex.partitionKey());
-        List<Object> parent = NestKeys.valuesOf(row, vertex.parentKeyFields());
+        List<Object> key = NestKeys.valuesOf(row, vertex.partitionKey(), vertex.mapName());
+        List<Object> parent = NestKeys.valuesOf(row, vertex.parentKeyFields(), vertex.mapName());
         ResolverState state = stateFor(key, touched);
         // Asked before anything goes out, because what this level sends on has to agree with what it kept.
         // The entry rejects a row it has already moved past - a replay resuming below a reparent is the
@@ -555,7 +555,7 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
             return;
         }
         Map<String, Object> was = NestKeys.replacedRow(edge, event);
-        List<Object> parentBefore = was == null ? null : NestKeys.valuesOf(was, vertex.parentKeyFields());
+        List<Object> parentBefore = was == null ? null : NestKeys.valuesOf(was, vertex.parentKeyFields(), vertex.mapName());
         Object parentWas = was == null ? null : parentIdentity(edge, parentBefore);
         NestElement arriving = departing(
                 element(edge, event, row, parentIdentity(edge, parent), key, was, parentWas),
@@ -629,8 +629,8 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
         if (was == null) {
             return;
         }
-        List<Object> leaving = NestKeys.valuesOf(was, vertex.partitionKey());
-        List<Object> joining = NestKeys.valuesOf(row, vertex.partitionKey());
+        List<Object> leaving = NestKeys.valuesOf(was, vertex.partitionKey(), vertex.mapName());
+        List<Object> joining = NestKeys.valuesOf(row, vertex.partitionKey(), vertex.mapName());
         if (leaving.equals(joining)) {
             return;
         }
@@ -790,8 +790,8 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
     /** Whether this row says the value its children point at has changed. */
     private boolean tookOverFrom(NestInbound edge, Envelope event, Map<String, Object> row) {
         Map<String, Object> was = NestKeys.replacedRow(edge, event);
-        return was != null && !NestKeys.valuesOf(was, vertex.partitionKey())
-                .equals(NestKeys.valuesOf(row, vertex.partitionKey()));
+        return was != null && !NestKeys.valuesOf(was, vertex.partitionKey(), vertex.mapName())
+                .equals(NestKeys.valuesOf(row, vertex.partitionKey(), vertex.mapName()));
     }
 
     /**
@@ -879,12 +879,12 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
      * identity is what rows beneath point at, not where this element is shown, and an entry filed under a
      * value that has changed is moved by the level that holds it rather than by the document.
      */
-    private static NestElement element(NestInbound edge, Envelope event, Map<String, Object> row,
+    private NestElement element(NestInbound edge, Envelope event, Map<String, Object> row,
             Object parentIdentity, Object identity, Map<String, Object> was, Object parentIdentityWas) {
         ElementRef ref = new ElementRef(edge.pathId(), parentIdentity,
-                NestKeys.valuesOf(row, edge.elementKey()), identity);
+                NestKeys.valuesOf(row, edge.elementKey(), vertex.mapName()), identity);
         ElementRef from = was == null ? null : new ElementRef(edge.pathId(), parentIdentityWas,
-                NestKeys.valuesOf(was, edge.elementKey()), identity);
+                NestKeys.valuesOf(was, edge.elementKey(), vertex.mapName()), identity);
         return new NestElement(ref, NestKeys.isDeletion(event) ? null : row,
                 NestKeys.orderOf(event), event.positions(), from);
     }

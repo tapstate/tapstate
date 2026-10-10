@@ -730,12 +730,12 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             return;
         }
         ElementRef ref = new ElementRef(edge.pathId(), null,
-                NestKeys.valuesOf(row, edge.elementKey()), null);
+                NestKeys.valuesOf(row, edge.elementKey(), vertex.mapName()), null);
         Map<String, Object> was = NestKeys.replacedRow(edge, event);
         ElementRef from = was == null ? null
-                : new ElementRef(edge.pathId(), null, NestKeys.valuesOf(was, edge.elementKey()), null);
-        List<Object> joining = NestKeys.valuesOf(row, edge.keyFields());
-        List<Object> leaving = was == null ? null : NestKeys.valuesOf(was, edge.keyFields());
+                : new ElementRef(edge.pathId(), null, NestKeys.valuesOf(was, edge.elementKey(), vertex.mapName()), null);
+        List<Object> joining = NestKeys.valuesOf(row, edge.keyFields(), vertex.mapName());
+        List<Object> leaving = was == null ? null : NestKeys.valuesOf(was, edge.keyFields(), vertex.mapName());
         boolean departed = leaving != null && !leaving.equals(joining);
         // Which document this copy is about is the key it was routed on, not the key its row now names. The
         // departure copy was sent here by what the row is leaving, so that is the document this instance
@@ -799,9 +799,9 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
 
     private void handleRoot(NestInbound edge, Envelope event, Map<String, Object> row, SourceOrder order,
             Map<Object, Touched> touched) {
-        List<Object> key = NestKeys.valuesOf(row, vertex.partitionKey());
+        List<Object> key = NestKeys.valuesOf(row, vertex.partitionKey(), vertex.mapName());
         Map<String, Object> was = NestKeys.replacedRow(edge, event);
-        List<Object> leaving = was == null ? null : NestKeys.valuesOf(was, vertex.partitionKey());
+        List<Object> leaving = was == null ? null : NestKeys.valuesOf(was, vertex.partitionKey(), vertex.mapName());
         boolean movedKey = leaving != null && !leaving.equals(key);
         if (edge.carriesDepartures()) {
             // Every root row travels the twin edge, not only the ones that moved - an edge cannot filter.

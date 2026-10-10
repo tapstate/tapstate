@@ -135,11 +135,12 @@ class NestDagRunTest {
     }
 
     @Test
-    void anExactDecimalChildKeyJoinsTheSameWholeNumberRoot() {
+    void aPreviewDecimalChildKeyJoinsTheSameWholeNumberRoot() {
         DAG dag = ordersWithItems(
                 List.of(row("order_id", 1L, "code", "A"), row("order_id", 2L, "code", "B")),
                 List.of(row("item_id", 10L, "order_id", new BigDecimal("1.00"), "sku", "s10"),
-                        row("item_id", 20L, "order_id", new BigDecimal("2.01"), "sku", "s20")));
+                        row("item_id", 20L, "order_id", new BigDecimal("2.01"), "sku", "s20")),
+                false, false, false, ".preview_numeric");
 
         member.getJet().newJob(dag).join();
 
@@ -148,6 +149,19 @@ class NestDagRunTest {
         assertThat(items(documents.get(1L)).get(0).get("order_id"))
                 .isEqualTo(new BigDecimal("1.00"));
         assertThat(items(documents.get(2L))).isEmpty();
+    }
+
+    @Test
+    void aPreviewDecimalReferenceFindsTheWholeNumberLookupRow() {
+        DAG dag = ordersWithCustomers(
+                List.of(row("order_id", 1L, "cust_ref", new BigDecimal("7.00"))),
+                List.of(row("customer_id", 7L, "name", "customer-seven")), ".preview_lookup_numeric");
+
+        member.getJet().newJob(dag).join();
+
+        Map<String, Object> document = latestPerRoot().get(1L);
+        assertThat(customer(document)).containsEntry("name", "customer-seven");
+        assertThat(document).containsEntry("cust_ref", new BigDecimal("7.00"));
     }
 
     /**
@@ -301,6 +315,11 @@ class NestDagRunTest {
 
     private static DAG ordersWithItems(List<Map<String, Object>> orders, List<Map<String, Object>> items,
             boolean endless, boolean trackKeyChanges, boolean filtered) {
+        return ordersWithItems(orders, items, endless, trackKeyChanges, filtered, "p");
+    }
+
+    private static DAG ordersWithItems(List<Map<String, Object>> orders, List<Map<String, Object>> items,
+            boolean endless, boolean trackKeyChanges, boolean filtered, String pipelineId) {
         Embed item = new Embed("item", Map.of("order_id", "order_id"), EmbedAs.ARRAY, "items",
                 List.of("item_id"), null, trackKeyChanges ? Boolean.TRUE : null, null);
         TransformBody.Nest body = new TransformBody.Nest(null, null,
@@ -319,7 +338,7 @@ class NestDagRunTest {
         }
         steps.add(step);
 
-        PipelineResource pipeline = new PipelineResource("p", null,
+        PipelineResource pipeline = new PipelineResource(pipelineId, null,
                 List.of(SourceRef.bare("orders"), SourceRef.bare("order_items")),
                 steps, null,
                 new ServeBlock.Inline("serve", FromRef.literal("order_doc"),
@@ -359,6 +378,11 @@ class NestDagRunTest {
      */
     private static DAG ordersWithCustomers(List<Map<String, Object>> orders,
             List<Map<String, Object>> customers) {
+        return ordersWithCustomers(orders, customers, "p");
+    }
+
+    private static DAG ordersWithCustomers(List<Map<String, Object>> orders,
+            List<Map<String, Object>> customers, String pipelineId) {
         Embed customer = new Embed("customer", Map.of("customer_id", "cust_ref"), EmbedAs.OBJECT,
                 "customer", null, null, null, null);
         TransformBody.Nest body = new TransformBody.Nest(null, null,
@@ -369,7 +393,7 @@ class NestDagRunTest {
         aliases.put("customer", FromRef.literal("customers"));
         Step step = Step.inline("order_doc", FromClause.aliases(aliases), body, null);
 
-        PipelineResource pipeline = new PipelineResource("p", null,
+        PipelineResource pipeline = new PipelineResource(pipelineId, null,
                 List.of(SourceRef.bare("orders"), SourceRef.bare("customers")),
                 List.of(step), null,
                 new ServeBlock.Inline("serve", FromRef.literal("order_doc"),
