@@ -23,6 +23,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -172,13 +173,13 @@ class PipelineActuationOwnershipTest {
     void theRunAKilledMemberLeftBehindIsAdmittedForRebuildingByTheOneThatInheritsIt() {
         PipelineActuationOwnership nodeA = ownership(NODE_A);
         assertThat(nodeA.permit("orders").granted()).isTrue();
-        assertThat(nodeA.aMemberLeftUnderTheRun("orders", SETTLING))
+        assertThat(nodeA.departure("orders", SETTLING))
                 .as("a pipeline nobody has run yet is not a run anybody left behind")
-                .isFalse();
+                .isEqualTo(PipelineActuationOwnership.Departure.NO_RUN);
         assertThat(nodeA.beginExecution("orders").allowed()).isTrue();
-        assertThat(nodeA.aMemberLeftUnderTheRun("orders", SETTLING))
+        assertThat(nodeA.departure("orders", SETTLING))
                 .as("and nothing has moved under the member that submitted it")
-                .isFalse();
+                .isEqualTo(PipelineActuationOwnership.Departure.NOBODY_LEFT);
 
         // That member is killed: it stops renewing, and the lease it never released runs out.
         claims.elapse(TTL.plusSeconds(1));
@@ -188,10 +189,105 @@ class PipelineActuationOwnershipTest {
         assertThat(nodeB.permit("orders").granted())
                 .as("the pipeline changes hands once the dead holder's lease expires")
                 .isTrue();
-        assertThat(nodeB.aMemberLeftUnderTheRun("orders", SETTLING))
+        assertThat(nodeB.departure("orders", SETTLING))
                 .as("the member that inherits a claim already carrying an execution is holding a run "
                         + "nobody is driving, and that is the whole of what it needs to know to replace it")
-                .isTrue();
+                .isEqualTo(PipelineActuationOwnership.Departure.INHERITED);
+    }
+
+    /**
+     * A member's pass is one thread over every pipeline it drives, and a start can hold that thread for
+     * longer than a lease. With claims renewed only from the pass, one slow start let every claim the member
+     * held run out behind it: on a three-member cluster a start of a pipeline over a hundred tables held the
+     * pass for 26 s, and seven claims were taken over from a member that was still there -- each one then
+     * counted as a member leaving, until a rebuild budget was spent on nothing.
+     */
+    @Test
+    void aStartThatHoldsThePassForLongerThanALeaseLetsNoClaimOfThisMemberRunOut() {
+        InMemoryDesiredStore desired = new InMemoryDesiredStore();
+        InMemoryStateStore state = new InMemoryStateStore();
+        PipelineActuationOwnership nodeA = ownership(NODE_A);
+        MemberActuator actuator = new MemberActuator(new VerbCounts());
+        // While the slow start runs, the pass is held and only the renewer moves, as it does on its own thread.
+        actuator.whileStarting = pipelineId -> {
+            if (pipelineId.equals("slow")) {
+                for (int second = 0; second <= TTL.toSeconds(); second += 5) {
+                    claims.elapse(Duration.ofSeconds(5));
+                    nanos.addAndGet(Duration.ofSeconds(5).toNanos());
+                    nodeA.renewDue();
+                }
+            }
+        };
+        ConvergenceDriver driver = new ConvergenceDriver(
+                new PipelineConverger(desired, state, actuator, Clock.fixed(T0, ZoneOffset.UTC)), desired,
+                new ObservationPublisher(state, new InMemoryObservationStore()), () -> true, nodeA);
+        desired.save(new DesiredState("orders", PipelineState.RUNNING, "rev-1"));
+        desired.save(new DesiredState("slow", PipelineState.RUNNING, "rev-1"));
+
+        driver.reconcile();
+
+        assertThat(actuator.carrying()).as("both were started in the one pass").contains("orders", "slow");
+        PipelineActuationOwnership nodeB = ownership(NODE_B);
+        assertThat(nodeB.permit("orders").granted())
+                .as("a pipeline started before the slow one in the same pass is still this member's")
+                .isFalse();
+        assertThat(nodeB.permit("slow").granted())
+                .as("and so is the slow one, whose run was submitted after more than a lease had gone by")
+                .isFalse();
+        assertThat(claims.read(ORDERS).orElseThrow().claim().claimGeneration())
+                .as("nobody took either over in between").isEqualTo(1);
+    }
+
+    /** A run is this member's to submit while its own claim is live under the run's generations, and only then. */
+    @Test
+    void aRunIsProvedOnlyWhileItsOwnClaimIsLiveUnderItsGenerations() {
+        PipelineActuationOwnership nodeA = ownership(NODE_A);
+        assertThat(nodeA.permit("orders").granted()).isTrue();
+        ExecutionFence fence = nodeA.beginExecution("orders").fence();
+
+        assertThat(nodeA.proveExecution(fence)).as("its own live claim, under its own generations").isTrue();
+        assertThat(nodeA.proveExecution(
+                new ExecutionFence("orders", fence.claimGeneration(), fence.executionGeneration() + 1)))
+                .as("a run under a generation the claim has not reached is not this run")
+                .isFalse();
+
+        claims.elapse(TTL.plusSeconds(1));
+        assertThat(nodeA.proveExecution(fence))
+                .as("a lease that ran out proves nothing, though nobody has taken the claim yet")
+                .isFalse();
+
+        nanos.addAndGet(RENEW.toNanos());
+        assertThat(ownership(NODE_B).permit("orders").granted()).isTrue();
+        assertThat(nodeA.proveExecution(fence)).as("nor does a claim another member holds now").isFalse();
+    }
+
+    /**
+     * The renewer keeps a held claim live on its own thread, with no pass running at all -- which is the
+     * whole point of it, since the pass is what a slow start holds.
+     */
+    @Test
+    void theRenewerKeepsAHeldClaimLiveWhileNoPassRuns() throws Exception {
+        Duration renew = Duration.ofMillis(20);
+        PipelineActuationOwnership nodeA = new PipelineActuationOwnership(
+                "cluster-a", NODE_A, membership, new ClusterWorkloadClaims(claims, membership), TTL, renew);
+        assertThat(nodeA.permit("orders").granted()).isTrue();
+
+        try (ActuationClaimRenewer renewer = new ActuationClaimRenewer(nodeA, renew)) {
+            for (int second = 0; second <= TTL.toSeconds(); second += 10) {
+                Instant leasedUntil = claims.read(ORDERS).orElseThrow().claim().leaseUntil();
+                claims.elapse(Duration.ofSeconds(10));
+                long giveUp = System.nanoTime() + Duration.ofSeconds(2).toNanos();
+                while (System.nanoTime() - giveUp < 0
+                        && !claims.read(ORDERS).orElseThrow().claim().leaseUntil().isAfter(leasedUntil)) {
+                    Thread.sleep(2);
+                }
+            }
+        }
+
+        assertThat(claims.read(ORDERS).orElseThrow().leased())
+                .as("more than a lease went by with no pass, and the claim is still live").isTrue();
+        assertThat(ownership(NODE_B).permit("orders").granted())
+                .as("so no other member could take it").isFalse();
     }
 
     private PipelineActuationOwnership ownership(WorkloadOwner owner) {
@@ -231,6 +327,8 @@ class PipelineActuationOwnershipTest {
 
         private final VerbCounts counts;
         private final Set<String> carrying = new HashSet<>();
+        /** What happens on this member while a start of the named pipeline is in progress. */
+        private Consumer<String> whileStarting = pipelineId -> { };
 
         private MemberActuator(VerbCounts counts) {
             this.counts = counts;
@@ -243,6 +341,7 @@ class PipelineActuationOwnershipTest {
         @Override
         public void start(String pipelineId) {
             counts.record("start");
+            whileStarting.accept(pipelineId);
             carrying.add(pipelineId);
         }
 

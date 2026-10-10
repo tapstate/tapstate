@@ -27,17 +27,27 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
@@ -167,6 +177,37 @@ public class CsvConnector implements TapConnector {
     /** How long a held read waits to be told to go on before it gives up. */
     private static final long PAUSE_LIMIT_MILLIS = 60_000;
 
+    /**
+     * A test affordance naming a directory this connector notes every row it writes into: which process and which
+     * writer wrote it, in which of that writer's batches, as what change, into which table, its id and sequence, and
+     * the table the row itself carries. The last is what a batch mixing tables shows: a write call names one table and
+     * every row of it lands there, so the table written into cannot tell a mixed batch from a clean one.
+     *
+     * <p>The write-side mirror of {@link #READ_WITNESS}, for the same reason: which writer a row goes to is decided
+     * inside the product, and the far end is the one witness the product cannot shape. A writer is a connector -
+     * each of a sink's writers opens one of its own - so this connector's identity in its process names the
+     * writer. One file per process, appended one batch at a time, so no two processes share a file and a batch is
+     * never split. A row is noted once it is in the table, and before anything holds it after the write.
+     */
+    private static final String WRITE_WITNESS = "write_witness";
+
+    /**
+     * A test affordance naming a directory whose files hold a read or a write back. On a source, while
+     * {@code read-<table>} is there, the table's load waits before it is read. On a target, while
+     * {@code before-<table>-<id>} is there, a batch carrying that row waits before it is written; while
+     * {@code after-<table>-<id>} is there, a batch carrying it is written and then waits before it is reported
+     * done. Whatever is held leaves {@code held-<read|before|after>-<table>[-<id>]-<pid>} beside it, so a case
+     * can tell which process holds it, and lets go once the case removes the file it is waiting on. A held write
+     * waits outside the table's lock, so the table's other writers are not held with it.
+     */
+    private static final String HOLD = "hold";
+
+    /** The column every table a case seeds is named by. */
+    private static final String ID_COLUMN = "id";
+
+    /** The column every table a case seeds carries a changing value in. */
+    private static final String SEQ_COLUMN = "seq";
+
     /** What this connector says when it is driven without the password its settings declare it needs. */
     private static final String CANNOT_AUTHENTICATE = "password authentication failed: no password was given";
 
@@ -193,6 +234,12 @@ public class CsvConnector implements TapConnector {
      */
     private static final String STAGING_SUFFIX = ".staging";
 
+    /** What the file a table's writes meet on ends with; see {@link #lockNameOf}. */
+    private static final String LOCK_SUFFIX = ".lock";
+
+    /** How long a write waits for the table while another holds it before saying so. */
+    private static final long LOCK_WAIT_NANOS = TimeUnit.SECONDS.toNanos(60);
+
     /**
      * The one command the read face dispatches. It is pinned on both sides on purpose: the caller sends
      * only this name and this connector answers only this name, so the command channel cannot become a
@@ -215,6 +262,9 @@ public class CsvConnector implements TapConnector {
     /** Set by {@code stop}; the tail also honours its thread's interrupt. Both signals arrive on cancel. */
     private volatile boolean stopped;
 
+    /** How many batches this writer has written, which numbers them in the write witness. */
+    private final AtomicLong batches = new AtomicLong();
+
     public CsvConnector() {
     }
 
@@ -222,6 +272,7 @@ public class CsvConnector implements TapConnector {
     public void registerCapabilities(ConnectorFunctions functions, TapCodecsRegistry codecs) {
         functions
                 .supportBatchRead((context, table, offset, size, consumer) -> {
+                    holdTheReadWhileHeld(context, table.getId());
                     List<TapEvent> rows = snapshot(context, table.getId());
                     noteRead(context, "snapshot", table.getId(), rows.size());
                     consumer.accept(rows, null);
@@ -455,6 +506,102 @@ public class CsvConnector implements TapConnector {
                     "the '" + FAIL_WRITES + "' setting makes this sink reject every write");
         }
         Path file = file(context, target.getId());
+        holdWhileHeld(context, "before", target.getId(), events);
+        WriteListResult<TapRecordEvent> written = exclusively(file, () -> apply(file, events, target));
+        noteWritten(context, target.getId(), events);
+        holdWhileHeld(context, "after", target.getId(), events);
+        return written;
+    }
+
+    /** Waits while the hold on reading {@code table}'s load is in place, leaving a note that this process holds it. */
+    private void holdTheReadWhileHeld(TapConnectionContext context, String table) {
+        Path holds = configuredDirectory(context, HOLD);
+        if (holds != null) {
+            waitWhileHeld(holds.resolve("read-" + table), holds.resolve("held-read-" + table + "-"
+                    + ProcessHandle.current().pid()));
+        }
+    }
+
+    /** Leaves {@code held} to say this process is held, then waits while {@code hold} is in place. */
+    private void waitWhileHeld(Path hold, Path held) {
+        if (!Files.exists(hold)) {
+            return;
+        }
+        try {
+            Files.writeString(held, "");
+        } catch (IOException failure) {
+            throw new UncheckedIOException(failure);
+        }
+        while (Files.exists(hold) && !stopped && !Thread.currentThread().isInterrupted()) {
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(POLL_MILLIS));
+        }
+    }
+
+    /**
+     * Waits while {@code phase}'s hold on any row of {@code events} is in place, leaving a note that this process
+     * holds it. Nothing is held on a connection that named no hold directory.
+     */
+    private void holdWhileHeld(TapConnectionContext context, String phase, String table, List<TapRecordEvent> events) {
+        Path holds = configuredDirectory(context, HOLD);
+        if (holds == null) {
+            return;
+        }
+        for (TapRecordEvent event : events) {
+            String id = String.valueOf(imageOf(event).get(ID_COLUMN));
+            waitWhileHeld(holds.resolve(phase + "-" + table + "-" + id),
+                    holds.resolve("held-" + phase + "-" + table + "-" + id + "-" + ProcessHandle.current().pid()));
+        }
+    }
+
+    /**
+     * Notes {@code events} in the write witness, one line a row, appended with a single write to this process's
+     * own file. Nothing is noted on a connection that named no witness directory.
+     */
+    private void noteWritten(TapConnectionContext context, String table, List<TapRecordEvent> events) {
+        Path witness = configuredDirectory(context, WRITE_WITNESS);
+        if (witness == null) {
+            return;
+        }
+        long pid = ProcessHandle.current().pid();
+        String writer = Integer.toHexString(System.identityHashCode(this));
+        long batch = batches.incrementAndGet();
+        StringBuilder lines = new StringBuilder();
+        for (TapRecordEvent event : events) {
+            Map<String, Object> image = imageOf(event);
+            String op = event instanceof TapDeleteRecordEvent ? "d" : event instanceof TapUpdateRecordEvent ? "u" : "i";
+            lines.append(pid).append('\t').append(writer).append('\t').append(batch).append('\t').append(op)
+                    .append('\t').append(table).append('\t').append(image.get(ID_COLUMN))
+                    .append('\t').append(image.get(SEQ_COLUMN))
+                    .append('\t').append(event.getTableId() == null ? "" : event.getTableId())
+                    .append(System.lineSeparator());
+        }
+        Path ledger = witness.resolve("writes-" + pid + ".tsv");
+        try {
+            Files.createDirectories(witness);
+            try (FileOutputStream out = new FileOutputStream(ledger.toFile(), true)) {
+                out.write(lines.toString().getBytes(StandardCharsets.UTF_8));
+            }
+        } catch (IOException failure) {
+            throw new UncheckedIOException(failure);
+        }
+    }
+
+    /** The image a change carries its row in: the earlier one for a removal, which has no other. */
+    private static Map<String, Object> imageOf(TapRecordEvent event) {
+        Map<String, Object> image = event instanceof TapDeleteRecordEvent delete ? delete.getBefore() : after(event);
+        return image == null ? Map.of() : image;
+    }
+
+    /** The directory a test affordance names on this connection, or null where it names none. */
+    private static Path configuredDirectory(TapConnectionContext context, String setting) {
+        Object configured = context.getConnectionConfig() == null
+                ? null
+                : context.getConnectionConfig().getObject(setting);
+        return configured == null || String.valueOf(configured).isBlank() ? null : Path.of(String.valueOf(configured));
+    }
+
+    /** Applies {@code events} to the table in {@code file}: read it, change it, put it back whole. */
+    private static WriteListResult<TapRecordEvent> apply(Path file, List<TapRecordEvent> events, TapTable target) {
         List<String> key = primaryKeyOf(target);
         Map<String, Map<String, Object>> byKey = new LinkedHashMap<>();
         List<Map<String, Object>> appended = new ArrayList<>();
@@ -514,6 +661,71 @@ public class CsvConnector implements TapConnector {
             if (!pausedBetweenPolls(20)) {
                 throw new IllegalStateException("a held target write was interrupted before release");
             }
+        }
+    }
+
+    /**
+     * Runs {@code work} as the only write of {@code file}'s table, in this process and in every other on this
+     * machine. A write reads the table, applies its batch and puts the whole table back, so two at once would each
+     * put back a table missing the other's rows - and a sink's writers write one table at once as a matter of
+     * course, each with a connector of its own and spread over every member, as they would a database.
+     *
+     * <p>A lock on a file beside the table is what they meet on, under a name that is not a table's. Nothing held
+     * in this class can do it: each writer's connector is loaded apart from the others', so a lock kept here is a
+     * lock per writer. The file lock is held for this machine as a whole; one already held by another writer in
+     * this process is refused rather than waited on, so that is waited out here as another process's is.
+     */
+    private static <T> T exclusively(Path file, java.util.function.Supplier<T> work) {
+        Path lockFile = file.resolveSibling(lockNameOf(file.getFileName().toString()));
+        try {
+            Files.createDirectories(file.getParent());
+            try (FileChannel channel = FileChannel.open(
+                    lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+                FileLock held = acquire(channel, file);
+                try {
+                    return work.get();
+                } finally {
+                    held.release();
+                }
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot hold the table at " + file + " for a write", e);
+        }
+    }
+
+    /**
+     * The name of the file the writes of the table in {@code tableFileName} meet on: fixed by the table's name, short
+     * whatever that name's length - a table whose own name fills the filesystem's limit still has one - and neither
+     * ending the way a table does nor visible beside the tables. Public so a case can tell the lock from anything
+     * left behind beside a table it replaced: the lock stays once released, since deleting it while another writer
+     * may have it open would leave two files to meet on.
+     */
+    public static String lockNameOf(String tableFileName) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(tableFileName.getBytes(StandardCharsets.UTF_8));
+            return "." + HexFormat.of().formatHex(digest, 0, 16) + LOCK_SUFFIX;
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("every Java runtime carries SHA-256", e);
+        }
+    }
+
+    /** The lock on {@code channel}'s file, waiting for whichever writer holds it now, here or elsewhere. */
+    private static FileLock acquire(FileChannel channel, Path file) throws IOException {
+        long deadline = System.nanoTime() + LOCK_WAIT_NANOS;
+        while (true) {
+            try {
+                FileLock held = channel.tryLock();
+                if (held != null) {
+                    return held;
+                }
+            } catch (OverlappingFileLockException heldInThisProcess) {
+                // Another writer in this process holds it; wait for it as for a writer in another process.
+            }
+            if (System.nanoTime() - deadline > 0) {
+                throw new IllegalStateException("the table at " + file + " was held by another write for over "
+                        + TimeUnit.NANOSECONDS.toSeconds(LOCK_WAIT_NANOS) + "s");
+            }
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1));
         }
     }
 
