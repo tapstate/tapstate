@@ -39,6 +39,7 @@ final class BenchmarkWriteReturnPhaseEvidence {
         var clock = new BenchmarkCausalClock(owner, capture.samples());
         for (var call : capture.calls()) {
             clock.map(owner, call.beganNanos());
+            clock.map(owner, call.lastCallbackExitNanos());
             clock.map(owner, call.observedNanos());
         }
         var deliveries = BenchmarkReturnTimeBounds.map(rows, owner, clock);
@@ -67,6 +68,7 @@ final class BenchmarkWriteReturnPhaseEvidence {
         evidence.put("endpoint", "ordinary nontransactional acknowledged writeRecord successful return");
         evidence.put("timestampMeaning", "first owned nanoTime observation after a full table call returns");
         evidence.put("rowTimeAssignment", "rows share their full call's conservative return interval");
+        evidence.put("literalReturnLowerBound", "last synchronous callback exit in the same owned writer thread");
         evidence.put("physicalPerRowCommitTime", false);
         evidence.put("ownedRuntime", Map.of("pid", owner.pid(), "jvmStartTimeMillis", owner.jvmStartTimeMillis()));
         evidence.put("sourceBatches", sourceBatches.stream().map(batch -> Map.<String, Object>of(

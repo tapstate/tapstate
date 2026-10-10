@@ -24,7 +24,7 @@ final class BenchmarkWriteReturnExpectations {
     record Association(BenchmarkWorkloadDefinitions.TargetExpectation target, String key,
             int sourceBatchIndex, long sourceIssuedAtNanos, long sourceCompletedAtNanos,
             long callSequence, int writer, String writerIdentity, String stream,
-            long callBeganNanos, long callObservedNanos, int inputTapKind, boolean fixedCohort) { }
+            long callBeganNanos, long callLastCallbackExitNanos, long callObservedNanos, int inputTapKind, boolean fixedCohort) { }
 
     private record Origin(BenchmarkWorkloadDefinitions.TargetExpectation target,
             BenchmarkForkEnvironment.BatchResult source) { }
@@ -78,7 +78,8 @@ final class BenchmarkWriteReturnExpectations {
                     && call.rows().size() == call.totalRows(), "call row roster differs");
             frames += (call.totalRows() + MAX_PART_ROWS - 1) / MAX_PART_ROWS;
             require(frames <= MAX_FRAMES, "call pieces exceed the frame bound");
-            require(ordered(call.beganNanos(), call.observedNanos()), "call clock order is invalid");
+            require(ordered(call.beganNanos(), call.lastCallbackExitNanos())
+                    && ordered(call.lastCallbackExitNanos(), call.observedNanos()), "call callback clock order is invalid");
             require(call.returnedNormally() && call.callbackCount() > 0 && call.callbackCount() <= MAX_PART_ROWS
                     && call.errors() == 0 && call.errorDetails().isEmpty()
                     && call.failureType() != null && call.failureType().isEmpty()
@@ -118,7 +119,7 @@ final class BenchmarkWriteReturnExpectations {
                 var source = origin.source();
                 associated.add(new Association(origin.target(), logicalKey, source.index(), source.issuedAtNanos(),
                         source.completedAtNanos(), call.sequence(), call.writer(), call.writerIdentity(), call.stream(),
-                        call.beganNanos(), call.observedNanos(), row.kind(), workload.inFixedCohort(logicalKey)));
+                        call.beganNanos(), call.lastCallbackExitNanos(), call.observedNanos(), row.kind(), workload.inFixedCohort(logicalKey)));
             }
         }
         require(seen.size() == origins.size(), "measured phase has missing target rows");

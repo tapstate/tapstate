@@ -21,6 +21,7 @@ import java.util.function.LongSupplier;
 
 /**
  * Default-off, bounded receipts at the first clock observation after a table's write call returns.
+ * The last synchronous callback exit bounds that return from below; it is not the completion endpoint.
  * These observations are not physical per-row commit timestamps. Unknown scope, partial callbacks,
  * lost receipts and unsupported keys remain explicit and never change the connector's write result.
  */
@@ -171,9 +172,13 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
         private final long sequence;
         private final int writer;
         private final long began;
+        private final long beginThreadId;
         private List<byte[]> identityChunks;
         private int rows;
         private int callbacks;
+        private int callbackExits;
+        private long lastCallbackExit;
+        private boolean lastCallbackExitObserved;
         private long inserted;
         private long modified;
         private long removed;
@@ -183,6 +188,7 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
         private boolean finished;
         private long returnObservation;
         private boolean returnObserved;
+        private boolean returnOnBeginThread;
         private volatile boolean returnStarted;
         private PdkMongoWriteScope scope;
         private PdkMongoWriteScope.Call scopeCall;
@@ -190,10 +196,12 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
 
         private Ticket(PdkWriteReturnProbe probe, long epoch, long sequence, int writer, long began) {
             this.probe = probe; this.epoch = epoch; this.sequence = sequence; this.writer = writer; this.began = began;
+            this.beginThreadId = Thread.currentThread().getId();
         }
         void callback(WriteListResult<TapRecordEvent> result) {
             synchronized (probe) {
                 if (returnStarted || finished || epoch != probe.epoch) { probe.unknown("LATE_CALLBACK"); return; }
+                if (Thread.currentThread().getId() != beginThreadId) { probe.unknown("CALLBACK_THREAD_MISMATCH"); return; }
                 try {
                     callbacks = Math.incrementExact(callbacks);
                     if (callbacks > MAX_BATCH_RECORDS) { probe.unknown("CALLBACK_ROSTER_OVERFLOW"); }
@@ -218,13 +226,37 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
                 } catch (RuntimeException invalid) { probe.unknown("INVALID_CALLBACK_RESULT"); }
             }
         }
+        void callbackExited() {
+            // Observe the delegated callback exit before waiting for the receipt lock.
+            long observed;
+            try { observed = probe.clock.getAsLong(); }
+            catch (RuntimeException unavailable) {
+                synchronized (probe) { probe.unknown("CALLBACK_EXIT_UNAVAILABLE"); }
+                return;
+            }
+            synchronized (probe) {
+                if (returnStarted || finished || epoch != probe.epoch) { probe.unknown("LATE_CALLBACK_EXIT"); return; }
+                if (Thread.currentThread().getId() != beginThreadId) {
+                    probe.unknown("CALLBACK_EXIT_THREAD_MISMATCH"); return;
+                }
+                if (callbackExits >= callbacks) { probe.unknown("CALLBACK_EXIT_COUNT_MISMATCH"); return; }
+                if (observed < began || lastCallbackExitObserved && observed < lastCallbackExit) {
+                    probe.unknown("CALLBACK_EXIT_CLOCK_ORDER"); return;
+                }
+                callbackExits++;
+                lastCallbackExit = observed; lastCallbackExitObserved = true;
+                if (returnStarted) { probe.unknown("LATE_CALLBACK_EXIT"); }
+            }
+        }
         void returned(Throwable failure) {
             observeReturn(); completed(failure);
         }
         void observeReturn() {
             // Capture before waiting for the receipt lock or encoding its payload.
             returnStarted = true;
-            returnObservation = probe.clock.getAsLong(); returnObserved = true;
+            returnObservation = probe.clock.getAsLong();
+            returnOnBeginThread = Thread.currentThread().getId() == beginThreadId;
+            returnObserved = true;
         }
         void completed(Throwable failure) {
             if (!returnObserved) {
@@ -257,7 +289,7 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
                 var out = new DataOutputStream(bytes);
                 out.writeLong(ticket.sequence); out.writeInt(ticket.writer);
                 out.writeInt(ticket.rows); out.writeInt(part); out.writeInt(ticket.identityChunks.size());
-                out.writeLong(ticket.began); out.writeLong(observed);
+                out.writeLong(ticket.began); out.writeLong(ticket.lastCallbackExit); out.writeLong(observed);
                 out.writeBoolean(failure == null); out.writeInt(ticket.callbacks);
                 out.writeLong(ticket.inserted); out.writeLong(ticket.modified); out.writeLong(ticket.removed);
                 out.writeInt(ticket.errors);
@@ -282,6 +314,12 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
             retainedBytes += bytesTotal; retainedRecords += ticket.rows;
             if (failure != null || ticket.errors != 0 || ticket.callbacks == 0 || count != ticket.rows) {
                 unknown("FAILED_PARTIAL_OR_MISSING_CALLBACK");
+            } else if (!ticket.lastCallbackExitObserved || ticket.callbackExits != ticket.callbacks) {
+                unknown("CALLBACK_EXIT_MISSING_OR_UNPAIRED");
+            } else if (ticket.lastCallbackExit < ticket.began || ticket.lastCallbackExit > observed) {
+                unknown("CALLBACK_EXIT_CLOCK_ORDER");
+            } else if (!ticket.returnOnBeginThread || Thread.currentThread().getId() != ticket.beginThreadId) {
+                unknown("RETURN_THREAD_MISMATCH");
             }
         } catch (IOException | RuntimeException unavailable) { unknown("RECEIPT_UNAVAILABLE"); }
     }
@@ -338,7 +376,7 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
             }
             var bytes = new BoundedBytes();
             var out = new DataOutputStream(bytes);
-            out.writeInt(0x57525031); out.writeInt(2);
+            out.writeInt(0x57525031); out.writeInt(3);
             out.writeLong(epoch); out.writeInt(first); out.writeInt(next); out.writeInt(frames.size());
             text(out, window, 512); text(out, state, 128);
             for (int i = first; i < next; i++) {

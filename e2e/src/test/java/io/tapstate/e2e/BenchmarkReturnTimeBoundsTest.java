@@ -50,7 +50,7 @@ class BenchmarkReturnTimeBoundsTest {
                 .multiply(java.math.BigDecimal.valueOf(duration))).isGreaterThanOrEqualTo(numerator);
     }
 
-    @Test void a_return_read_cannot_become_a_literal_return_or_physical_row_commit_point() {
+    @Test void the_last_callback_exit_narrows_a_return_bound_without_becoming_a_physical_commit_point() {
         var owner = new BenchmarkCausalClock.Identity(17, 1000);
         var clock = new BenchmarkCausalClock(owner, List.of(
                 new BenchmarkCausalClock.Sample(0, owner, 100, 110, 1000),
@@ -58,11 +58,15 @@ class BenchmarkReturnTimeBoundsTest {
                 new BenchmarkCausalClock.Sample(2, owner, 300, 310, 3000)));
         var target = BenchmarkWorkloadDefinitions.byId("copy").phase("cdc-update").targets().getFirst();
         var row = new BenchmarkWriteReturnExpectations.Association(target, "1", 0, 150, 160,
-                1, 1, "pdk.state.bench_copy.sink", "orders", 1500, 2500, 2, true);
+                1, 1, "pdk.state.bench_copy.sink", "orders", 1500, 2200, 2500, 2, true);
         var delivery = BenchmarkReturnTimeBounds.map(List.of(row), owner, clock).getFirst();
         assertThat(delivery.capturedPoint()).isEqualTo(new BenchmarkCausalClock.Interval(200, 310));
-        assertThat(delivery.literalReturn()).isEqualTo(new BenchmarkCausalClock.Interval(100, 310));
-        assertThat(delivery.latency()).isEqualTo(new BenchmarkCausalClock.Interval(-50, 160));
+        assertThat(delivery.literalReturn()).isEqualTo(new BenchmarkCausalClock.Interval(200, 310));
+        assertThat(delivery.latency()).isEqualTo(new BenchmarkCausalClock.Interval(50, 160));
+        var uncertain = new BenchmarkWriteReturnExpectations.Association(target, "1", 0, 250, 260,
+                1, 1, "pdk.state.bench_copy.sink", "orders", 1500, 2200, 2500, 2, true);
+        assertThat(BenchmarkReturnTimeBounds.map(List.of(uncertain), owner, clock).getFirst().latency())
+                .isEqualTo(new BenchmarkCausalClock.Interval(-50, 60));
     }
 
     @Test void a_wholly_pre_issue_return_and_a_reused_runtime_are_rejected() {
@@ -72,13 +76,13 @@ class BenchmarkReturnTimeBoundsTest {
                 new BenchmarkCausalClock.Sample(1, owner, 200, 210, 2000)));
         var target = BenchmarkWorkloadDefinitions.byId("copy").phase("cdc-update").targets().getFirst();
         var row = new BenchmarkWriteReturnExpectations.Association(target, "1", 0, 300, 310,
-                1, 1, "pdk.state.bench_copy.sink", "orders", 1200, 1500, 2, true);
+                1, 1, "pdk.state.bench_copy.sink", "orders", 1200, 1300, 1500, 2, true);
         assertThatThrownBy(() -> BenchmarkReturnTimeBounds.map(List.of(row), owner, clock))
                 .isInstanceOf(AssertionError.class).hasMessageContaining("source issue");
         assertThatThrownBy(() -> BenchmarkReturnTimeBounds.map(List.of(row),
                 new BenchmarkCausalClock.Identity(17, 1001), clock)).isInstanceOf(AssertionError.class);
         var backwards = new BenchmarkWriteReturnExpectations.Association(target, "1", 0, 150, 160,
-                1, 1, "pdk.state.bench_copy.sink", "orders", 1500, 1200, 2, true);
+                1, 1, "pdk.state.bench_copy.sink", "orders", 1500, 1400, 1600, 2, true);
         assertThatThrownBy(() -> BenchmarkReturnTimeBounds.map(List.of(backwards), owner, clock))
                 .isInstanceOf(AssertionError.class).hasMessageContaining("clock order");
     }

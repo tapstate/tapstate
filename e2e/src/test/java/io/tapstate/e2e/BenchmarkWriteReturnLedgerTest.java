@@ -18,7 +18,7 @@ class BenchmarkWriteReturnLedgerTest {
 
     @Test void completion_order_and_composite_keys_survive_without_sorting_or_rounding() throws Exception {
         var first = new Fixture();
-        first.sequence = 2; first.writer = 2; first.began = -10; first.observed = 10;
+        first.sequence = 2; first.writer = 2; first.began = -10; first.lastCallbackExit = 0; first.observed = 10;
         first.callbacks = 2; first.inserted = 1; first.modified = 1;
         first.keyFields = List.of("account_id", "line_id");
         first.rows = List.of(new Row(1, List.of(5, 6)), new Row(2, List.of(-7, Integer.MAX_VALUE)));
@@ -31,6 +31,7 @@ class BenchmarkWriteReturnLedgerTest {
         assertThat(page.calls()).extracting(BenchmarkWriteReturnLedger.Call::sequence).containsExactly(2L, 1L);
         var call = page.calls().getFirst();
         assertThat(call.writer()).isEqualTo(2); assertThat(call.beganNanos()).isEqualTo(-10);
+        assertThat(call.lastCallbackExitNanos()).isZero();
         assertThat(call.observedNanos()).isEqualTo(10); assertThat(call.callbackCount()).isEqualTo(2);
         assertThat(call.inserted()).isEqualTo(1); assertThat(call.modified()).isEqualTo(1);
         assertThat(call.removed()).isZero(); assertThat(call.errors()).isZero();
@@ -124,7 +125,7 @@ class BenchmarkWriteReturnLedgerTest {
     }
 
     @Test void the_largest_admissible_payload_pages_but_one_more_byte_is_rejected() throws Exception {
-        var large = new Fixture(); large.writerIdentity = "w".repeat(512); large.stream = "s".repeat(303);
+        var large = new Fixture(); large.writerIdentity = "w".repeat(512); large.stream = "s".repeat(295);
         large.rows = IntStream.range(0, 512).mapToObj(key -> new Row(1, List.of(key))).toList();
         large.inserted = 12; large.errors = 500;
         large.errorDetails = IntStream.range(0, 500)
@@ -177,6 +178,36 @@ class BenchmarkWriteReturnLedgerTest {
         assertThatThrownBy(() -> decode(overflow, UNKNOWN)).isInstanceOf(AssertionError.class).hasMessageContaining("overflow");
         overflow.inserted = 1; overflow.modified = 0; overflow.began = Long.MIN_VALUE; overflow.observed = Long.MAX_VALUE;
         assertThatThrownBy(() -> decode(overflow, UNKNOWN)).isInstanceOf(AssertionError.class).hasMessageContaining("overflow");
+    }
+
+    @Test void version_two_receipts_never_supply_a_callback_exit_by_default() throws Exception {
+        byte[] current = new Fixture().bytes();
+        byte[] legacy = new byte[current.length - Long.BYTES];
+        System.arraycopy(current, 0, legacy, 0, 32);
+        System.arraycopy(current, 40, legacy, 32, current.length - 40);
+        byte[] receipt = page(legacy);
+        ByteBuffer.wrap(receipt).putInt(4, 2);
+        assertThatThrownBy(() -> BenchmarkWriteReturnLedger.decode(receipt))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("version differs");
+    }
+
+    @Test void recorded_callback_exit_order_is_strict_but_signed_coordinates_are_preserved() throws Exception {
+        for (long invalid : List.of(0L, 99L, 201L)) {
+            var fixture = new Fixture(); fixture.lastCallbackExit = invalid;
+            assertThatThrownBy(() -> decode(fixture, RECORDED))
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("callback exit clock order");
+        }
+        var signed = new Fixture(); signed.began = -10; signed.lastCallbackExit = -5; signed.observed = 0;
+        assertThat(decode(signed, RECORDED).calls().getFirst().lastCallbackExitNanos()).isEqualTo(-5);
+    }
+
+    @Test void unknown_partial_receipts_keep_exact_unproved_exit_values_as_diagnostics() throws Exception {
+        for (long unproved : List.of(0L, -50L, 300L)) {
+            var partial = new Fixture(); partial.inserted = 0; partial.lastCallbackExit = unproved;
+            var decoded = decode(partial, UNKNOWN);
+            assertThat(decoded.calls().getFirst().lastCallbackExitNanos()).isEqualTo(unproved);
+            assertThat(decoded.state()).isEqualTo(UNKNOWN);
+        }
     }
 
     @Test void detailed_errors_are_bounded_and_must_name_a_row_or_explicit_unknown_identity() throws Exception {
@@ -249,6 +280,7 @@ class BenchmarkWriteReturnLedgerTest {
         List<Consumer<Fixture>> changes = List.of(
                 call -> call.writer = 2,
                 call -> call.began = 101,
+                call -> call.lastCallbackExit = 151,
                 call -> call.observed = 201,
                 call -> call.callbacks = 2,
                 call -> { call.inserted = 1023; call.modified = 1; },
@@ -315,7 +347,7 @@ class BenchmarkWriteReturnLedgerTest {
     private static byte[] page(long epoch, int cursor, int next, int total, String window, String state,
                                List<byte[]> calls) throws Exception {
         var bytes = new ByteArrayOutputStream(); var out = new DataOutputStream(bytes);
-        out.writeInt(0x57525031); out.writeInt(2); out.writeLong(epoch);
+        out.writeInt(0x57525031); out.writeInt(3); out.writeLong(epoch);
         out.writeInt(cursor); out.writeInt(next); out.writeInt(total); text(out, window); text(out, state);
         for (byte[] call : calls) { out.writeInt(call.length); out.write(call); }
         return bytes.toByteArray();
@@ -326,7 +358,7 @@ class BenchmarkWriteReturnLedgerTest {
     private record Row(int kind, List<Integer> keys) { }
     private record Error(int ordinal, String type) { }
     private static final class Fixture {
-        long sequence = 1, began = 100, observed = 200, inserted = 1, modified, removed;
+        long sequence = 1, began = 100, lastCallbackExit = 150, observed = 200, inserted = 1, modified, removed;
         int writer = 1, normal = 1, callbacks = 1, errors, totalRows = -1, partIndex, partCount = -1;
         String failureType = "", scope = "UNKNOWN", writerIdentity = "pipeline/sink", stream = "source", target = "target";
         List<String> keyFields = List.of("id");
@@ -338,7 +370,7 @@ class BenchmarkWriteReturnLedgerTest {
             int parts = partCount == -1 ? (total + 511) / 512 : partCount;
             out.writeLong(sequence); out.writeInt(writer);
             out.writeInt(total); out.writeInt(partIndex); out.writeInt(parts);
-            out.writeLong(began); out.writeLong(observed);
+            out.writeLong(began); out.writeLong(lastCallbackExit); out.writeLong(observed);
             out.writeByte(normal); out.writeInt(callbacks); out.writeLong(inserted); out.writeLong(modified); out.writeLong(removed);
             out.writeInt(errors); out.writeInt(errorDetails.size());
             for (Error error : errorDetails) { out.writeInt(error.ordinal()); text(out, error.type()); }

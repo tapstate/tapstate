@@ -111,6 +111,7 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
         var clock = new BenchmarkCausalClock(samples.getFirst().identity(), samples);
         for (var call : calls) {
             clock.map(samples.getFirst().identity(), call.beganNanos());
+            clock.map(samples.getFirst().identity(), call.lastCallbackExitNanos());
             clock.map(samples.getFirst().identity(), call.observedNanos());
         }
         completed = true;

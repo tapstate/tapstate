@@ -23,6 +23,7 @@ class BenchmarkWriteReturnAssemblyTest {
         var call = calls.getFirst();
         assertThat(call.totalRows()).isEqualTo(1024); assertThat(call.inserted()).isEqualTo(1024);
         assertThat(call.callbackCount()).isEqualTo(1); assertThat(call.beganNanos()).isEqualTo(100);
+        assertThat(call.lastCallbackExitNanos()).isEqualTo(150);
         assertThat(call.observedNanos()).isEqualTo(200); assertThat(call.scope()).isEqualTo(ACK);
         assertThat(call.rows().stream().map(row -> row.keys().getFirst()).toList())
                 .containsExactlyElementsOf(IntStream.range(0, 1024).boxed().toList());
@@ -100,6 +101,7 @@ class BenchmarkWriteReturnAssemblyTest {
         List<Consumer<Fixture>> changes = List.of(
                 call -> call.writer = 2,
                 call -> call.began = 101,
+                call -> call.lastCallbackExit = 151,
                 call -> call.observed = 201,
                 call -> call.callbacks = 2,
                 call -> { call.inserted = 1023; call.modified = 1; },
@@ -150,6 +152,15 @@ class BenchmarkWriteReturnAssemblyTest {
             assertThatThrownBy(() -> assembly.finish(1, fixture.inserted))
                     .isInstanceOf(AssertionError.class).hasMessageContaining("state is unknown");
         }
+    }
+
+    @Test void unknown_partial_exit_stamps_are_retained_without_qualification() throws Exception {
+        var fixture = new Fixture(); fixture.inserted = 0; fixture.lastCallbackExit = 0;
+        byte[] bytes = page(1, 0, 1, 1, "window", "UNKNOWN:MISSING_CALLBACK_EXIT", fixture);
+        assertThat(BenchmarkWriteReturnLedger.decode(bytes).calls().getFirst().lastCallbackExitNanos()).isZero();
+        var assembly = new BenchmarkWriteReturnAssembly("window");
+        assembly.add(bytes);
+        assertThatThrownBy(() -> assembly.finish(1, 0)).isInstanceOf(AssertionError.class).hasMessageContaining("state is unknown");
     }
 
     @Test void scope_markers_or_unacknowledged_concern_cannot_supply_an_ordinary_return_declaration() throws Exception {
@@ -229,7 +240,7 @@ class BenchmarkWriteReturnAssemblyTest {
     private static byte[] page(long epoch, int cursor, int next, int total, String window, String state,
                                Fixture... calls) throws Exception {
         var bytes = new ByteArrayOutputStream(); var out = new DataOutputStream(bytes);
-        out.writeInt(0x57525031); out.writeInt(2); out.writeLong(epoch);
+        out.writeInt(0x57525031); out.writeInt(3); out.writeLong(epoch);
         out.writeInt(cursor); out.writeInt(next); out.writeInt(total); text(out, window); text(out, state);
         for (Fixture call : calls) { byte[] payload = call.bytes(); out.writeInt(payload.length); out.write(payload); }
         return bytes.toByteArray();
@@ -240,7 +251,7 @@ class BenchmarkWriteReturnAssemblyTest {
     private record Row(int kind, List<Integer> keys) { }
     private record Error(int ordinal, String type) { }
     private static final class Fixture {
-        long sequence = 1, began = 100, observed = 200, inserted = 1, modified, removed;
+        long sequence = 1, began = 100, lastCallbackExit = 150, observed = 200, inserted = 1, modified, removed;
         int writer = 1, totalRows = -1, partIndex, normal = 1, callbacks = 1, errors;
         String scope = ACK, failureType = "", writerIdentity = "writer", stream = "source", target = "target";
         List<String> keyFields = List.of("id");
@@ -250,7 +261,7 @@ class BenchmarkWriteReturnAssemblyTest {
             var bytes = new ByteArrayOutputStream(); var out = new DataOutputStream(bytes);
             int total = totalRows == -1 ? rows.size() : totalRows;
             out.writeLong(sequence); out.writeInt(writer); out.writeInt(total); out.writeInt(partIndex); out.writeInt((total + 511) / 512);
-            out.writeLong(began); out.writeLong(observed); out.writeByte(normal); out.writeInt(callbacks);
+            out.writeLong(began); out.writeLong(lastCallbackExit); out.writeLong(observed); out.writeByte(normal); out.writeInt(callbacks);
             out.writeLong(inserted); out.writeLong(modified); out.writeLong(removed);
             out.writeInt(errors); out.writeInt(errorDetails.size());
             for (Error error : errorDetails) { out.writeInt(error.ordinal()); text(out, error.type()); }

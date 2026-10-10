@@ -14,6 +14,7 @@ class BenchmarkWriteReturnCaptureTest {
         try (var capture = BenchmarkWriteReturnCapture.open(access, "measured")) {
             var result = capture.finish();
             assertThat(result.calls()).hasSize(1);
+            assertThat(result.calls().getFirst().lastCallbackExitNanos()).isEqualTo(1550);
             assertThat(result.calls().getFirst().rows().getFirst().keys()).containsExactly(1);
             assertThat(result.samples().size()).isBetween(2, 512);
             assertThat(result.pagesBase64()).containsExactly(java.util.Base64.getEncoder().encodeToString(access.page));
@@ -128,14 +129,14 @@ class BenchmarkWriteReturnCaptureTest {
     private static byte[] page() throws Exception {
         var record = new ByteArrayOutputStream(); var call = new DataOutputStream(record);
         call.writeLong(1); call.writeInt(1); call.writeInt(1); call.writeInt(0); call.writeInt(1);
-        call.writeLong(1500); call.writeLong(1600); call.writeBoolean(true); call.writeInt(1);
+        call.writeLong(1500); call.writeLong(1550); call.writeLong(1600); call.writeBoolean(true); call.writeInt(1);
         call.writeLong(1); call.writeLong(0); call.writeLong(0); call.writeInt(0); call.writeInt(0);
         text(call, ""); text(call, "state=ORDINARY_ACKNOWLEDGED;reason=PINNED_RUNTIME_SCOPE;concern=w:1,j:DEFAULT,timeoutMs:DEFAULT");
         text(call, "pdk.state.pipeline.sink"); text(call, "orders"); text(call, "orders");
         call.writeByte(1); text(call, "id"); call.writeInt(1); call.writeByte(1); call.writeInt(1);
         call.flush(); var raw = record.toByteArray();
         var page = new ByteArrayOutputStream(); var out = new DataOutputStream(page);
-        out.writeInt(0x57525031); out.writeInt(2); out.writeLong(1); out.writeInt(0); out.writeInt(1); out.writeInt(1);
+        out.writeInt(0x57525031); out.writeInt(3); out.writeLong(1); out.writeInt(0); out.writeInt(1); out.writeInt(1);
         text(out, "measured"); text(out, "RECORDED_SCOPE_UNQUALIFIED"); out.writeInt(raw.length); out.write(raw);
         out.flush(); return page.toByteArray();
     }

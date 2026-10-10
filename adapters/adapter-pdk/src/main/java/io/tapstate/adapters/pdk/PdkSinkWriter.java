@@ -214,6 +214,7 @@ final class PdkSinkWriter implements SinkWriter {
                                     write.writeRecord(connector.context(), rows, table, result -> {
                                         if (receipt != null) { receipt.callback(result); }
                                         accepted[0] += accepted(result);
+                                        if (receipt != null) { receipt.callbackExited(); }
                                     });
                                 } finally {
                                     if (receipt != null) { receipt.observeReturn(); }

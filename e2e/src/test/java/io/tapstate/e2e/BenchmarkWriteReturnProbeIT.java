@@ -110,6 +110,7 @@ class BenchmarkWriteReturnProbeIT {
                     assertThat(page.calls()).allSatisfy(call -> {
                         assertThat(call.returnedNormally()).isTrue(); assertThat(call.errors()).isZero();
                         assertThat(call.callbackCount()).isPositive(); assertThat(call.writer()).isEqualTo(1);
+                        assertThat(call.lastCallbackExitNanos()).isBetween(call.beganNanos(), call.observedNanos());
                         assertThat(call.target()).isEqualTo("orders"); assertThat(call.keyFields()).containsExactly("id");
                         assertThat(call.scope()).startsWith("state=ORDINARY_ACKNOWLEDGED;reason=PINNED_RUNTIME_SCOPE;")
                                 .contains("concern=w:1,");
@@ -125,10 +126,10 @@ class BenchmarkWriteReturnProbeIT {
                     List<Map<String, Object>> bounds = new ArrayList<>();
                     for (var call : page.calls()) {
                         var point = clock.map(samples.getFirst().identity(), call.observedNanos());
-                        var began = clock.map(samples.getFirst().identity(), call.beganNanos());
+                        var exited = clock.map(samples.getFirst().identity(), call.lastCallbackExitNanos());
                         assertThat(point.widthNanos()).isPositive();
                         bounds.add(Map.of("sequence", call.sequence(), "capturedPointBounds", List.of(point.lowerNanos(), point.upperNanos()),
-                                "literalReturnBounds", List.of(began.lowerNanos(), point.upperNanos()),
+                                "literalReturnBounds", List.of(exited.lowerNanos(), point.upperNanos()),
                                 "scope", call.scope()));
                     }
                     Map<Object, Long> insertedKeys = new java.util.HashMap<>();

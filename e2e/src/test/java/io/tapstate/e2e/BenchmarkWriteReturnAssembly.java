@@ -20,7 +20,7 @@ final class BenchmarkWriteReturnAssembly {
     private static final int MAX_WRITERS = 128;
     private static final String RECORDED = "RECORDED_SCOPE_UNQUALIFIED";
 
-    record FullCall(long sequence, int writer, int totalRows, long beganNanos, long observedNanos,
+    record FullCall(long sequence, int writer, int totalRows, long beganNanos, long lastCallbackExitNanos, long observedNanos,
                     boolean returnedNormally, int callbackCount, long inserted, long modified, long removed,
                     int errors, List<BenchmarkWriteReturnLedger.ErrorDetail> errorDetails, String failureType,
                     String scope, String writerIdentity, String stream, String target, List<String> keyFields,
@@ -96,6 +96,8 @@ final class BenchmarkWriteReturnAssembly {
                     "terminal call or reported-record totals disagree");
             for (FullCall call : calls) {
                 require(call.returnedNormally() && call.callbackCount() > 0 && call.callbackCount() <= 512
+                        && Math.subtractExact(call.lastCallbackExitNanos(), call.beganNanos()) >= 0
+                        && Math.subtractExact(call.observedNanos(), call.lastCallbackExitNanos()) >= 0
                         && call.errors() == 0 && call.errorDetails().isEmpty() && call.failureType().isEmpty()
                         && count(call.inserted(), call.modified(), call.removed()) == call.totalRows(),
                         "call failed or reported partial delivery");
@@ -134,7 +136,7 @@ final class BenchmarkWriteReturnAssembly {
             reportedRecords = Math.addExact(reportedRecords,
                     count(pending.inserted(), pending.modified(), pending.removed()));
             calls.add(new FullCall(pending.sequence(), pending.writer(), pending.totalRows(), pending.beganNanos(),
-                    pending.observedNanos(), pending.returnedNormally(), pending.callbackCount(), pending.inserted(),
+                    pending.lastCallbackExitNanos(), pending.observedNanos(), pending.returnedNormally(), pending.callbackCount(), pending.inserted(),
                     pending.modified(), pending.removed(), pending.errors(), pending.errorDetails(), pending.failureType(),
                     pending.scope(), pending.writerIdentity(), pending.stream(), pending.target(), pending.keyFields(), pendingRows));
             pending = null;
@@ -146,6 +148,7 @@ final class BenchmarkWriteReturnAssembly {
     private static boolean sameMetadata(BenchmarkWriteReturnLedger.Call first, BenchmarkWriteReturnLedger.Call next) {
         return first.writer() == next.writer() && first.totalRows() == next.totalRows()
                 && first.partCount() == next.partCount() && first.beganNanos() == next.beganNanos()
+                && first.lastCallbackExitNanos() == next.lastCallbackExitNanos()
                 && first.observedNanos() == next.observedNanos() && first.returnedNormally() == next.returnedNormally()
                 && first.callbackCount() == next.callbackCount() && first.inserted() == next.inserted()
                 && first.modified() == next.modified() && first.removed() == next.removed()

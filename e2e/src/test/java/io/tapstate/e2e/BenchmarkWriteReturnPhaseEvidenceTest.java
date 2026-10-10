@@ -91,7 +91,7 @@ class BenchmarkWriteReturnPhaseEvidenceTest {
         var calls = new ArrayList<>(result.calls());
         var first = calls.getFirst();
         calls.set(0, new BenchmarkWriteReturnAssembly.FullCall(first.sequence(), first.writer(), first.totalRows(),
-                first.beganNanos() + 1, first.observedNanos(), first.returnedNormally(), first.callbackCount(),
+                first.beganNanos() + 1, first.lastCallbackExitNanos(), first.observedNanos(), first.returnedNormally(), first.callbackCount(),
                 first.inserted(), first.modified(), first.removed(), first.errors(), first.errorDetails(), first.failureType(),
                 first.scope(), first.writerIdentity(), first.stream(), first.target(), first.keyFields(), first.rows()));
         reject(fixture, new BenchmarkWriteReturnCapture.Result(calls, result.samples(), result.summary(), result.pagesBase64()),
@@ -170,7 +170,7 @@ class BenchmarkWriteReturnPhaseEvidenceTest {
                 var slice = rows.subList(offset, Math.min(offset + 1024, rows.size()));
                 long sequence = calls.size() + 1L;
                 calls.add(new BenchmarkWriteReturnAssembly.FullCall(sequence, writer, slice.size(), sequence * 1000 + 100,
-                        sequence * 1000 + 200, true, 1, slice.size(), 0, 0, 0, List.of(), "", SCOPE,
+                        sequence * 1000 + 150, sequence * 1000 + 200, true, 1, slice.size(), 0, 0, 0, List.of(), "", SCOPE,
                         "pdk.state." + plan.target().pipelineId() + ".sink", "stream", plan.target().table(), fields, slice));
             }
         }
@@ -194,7 +194,7 @@ class BenchmarkWriteReturnPhaseEvidenceTest {
             int next = cursor, bytes = 32 + window.length() + STATE.length();
             while (next < pieces.size() && bytes + 4 + pieces.get(next).length <= 64 * 1024) bytes += 4 + pieces.get(next++).length;
             var buffer = new ByteArrayOutputStream(); var out = new DataOutputStream(buffer);
-            out.writeInt(0x57525031); out.writeInt(2); out.writeLong(1); out.writeInt(cursor); out.writeInt(next); out.writeInt(pieces.size());
+            out.writeInt(0x57525031); out.writeInt(3); out.writeLong(1); out.writeInt(cursor); out.writeInt(next); out.writeInt(pieces.size());
             text(out, window); text(out, STATE);
             for (int index = cursor; index < next; index++) { out.writeInt(pieces.get(index).length); out.write(pieces.get(index)); }
             out.flush(); pages.add(Base64.getEncoder().encodeToString(buffer.toByteArray())); cursor = next;
@@ -209,7 +209,7 @@ class BenchmarkWriteReturnPhaseEvidenceTest {
         var buffer = new ByteArrayOutputStream(); var out = new DataOutputStream(buffer);
         out.writeLong(call.sequence()); out.writeInt(call.writer()); out.writeInt(call.totalRows());
         out.writeInt(index); out.writeInt((call.totalRows() + 511) / 512);
-        out.writeLong(call.beganNanos()); out.writeLong(call.observedNanos()); out.writeBoolean(true); out.writeInt(1);
+        out.writeLong(call.beganNanos()); out.writeLong(call.lastCallbackExitNanos()); out.writeLong(call.observedNanos()); out.writeBoolean(true); out.writeInt(1);
         out.writeLong(call.inserted()); out.writeLong(0); out.writeLong(0); out.writeInt(0); out.writeInt(0);
         text(out, ""); text(out, SCOPE); text(out, call.writerIdentity()); text(out, call.stream()); text(out, call.target());
         out.writeByte(call.keyFields().size()); for (String field : call.keyFields()) text(out, field);

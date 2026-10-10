@@ -63,6 +63,20 @@ class BenchmarkWriteReturnExpectationsTest {
                 .forBatch(0).getFirst().kind()).isEqualTo(BenchmarkMongoDeliveryObserver.Kind.UPDATE);
         assertThat(associate(fixture)).extracting(BenchmarkWriteReturnExpectations.Association::inputTapKind)
                 .containsOnly(1);
+        assertThat(associate(fixture).getFirst().callLastCallbackExitNanos())
+                .isEqualTo(fixture.calls().getFirst().lastCallbackExitNanos());
+    }
+
+    @Test
+    void anUnorderedCallbackExitCannotBeAssociatedAsAnAcknowledgedMeasuredRow() {
+        Fixture fixture = fixture("copy", false, "cdc-update", 233);
+        var call = fixture.calls().getFirst();
+        var calls = new ArrayList<>(fixture.calls());
+        calls.set(0, new BenchmarkWriteReturnAssembly.FullCall(call.sequence(), call.writer(), call.totalRows(),
+                call.beganNanos(), call.observedNanos() + 1, call.observedNanos(), true, 1,
+                call.inserted(), call.modified(), call.removed(), call.errors(), call.errorDetails(), call.failureType(),
+                call.scope(), call.writerIdentity(), call.stream(), call.target(), call.keyFields(), call.rows()));
+        reject(fixture, fixture.batches(), calls, "callback clock order");
     }
 
     @Test
@@ -276,7 +290,7 @@ class BenchmarkWriteReturnExpectationsTest {
                 List<BenchmarkWriteReturnLedger.Row> nativeRows = rows.subList(index, Math.min(index + callSize, rows.size()));
                 long sequence = calls.size() + 1L;
                 calls.add(new BenchmarkWriteReturnAssembly.FullCall(sequence, writer, nativeRows.size(),
-                        -1_000_000 + sequence * 100, -999_950 + sequence * 100, true, 1,
+                        -1_000_000 + sequence * 100, -999_975 + sequence * 100, -999_950 + sequence * 100, true, 1,
                         nativeRows.size(), 0, 0, 0, List.of(), "",
                         "state=ORDINARY_ACKNOWLEDGED;reason=PINNED_RUNTIME_SCOPE;concern=w:1,j:DEFAULT,timeoutMs:DEFAULT",
                         "pdk.state." + plan.target().pipelineId() + ".sink", "stream", plan.target().table(), fields, nativeRows));
@@ -291,7 +305,7 @@ class BenchmarkWriteReturnExpectationsTest {
 
     private static BenchmarkWriteReturnAssembly.FullCall changed(BenchmarkWriteReturnAssembly.FullCall call,
             long sequence, String writerIdentity, String target, List<String> fields, List<BenchmarkWriteReturnLedger.Row> rows) {
-        return new BenchmarkWriteReturnAssembly.FullCall(sequence, call.writer(), rows.size(), call.beganNanos(), call.observedNanos(),
+        return new BenchmarkWriteReturnAssembly.FullCall(sequence, call.writer(), rows.size(), call.beganNanos(), call.lastCallbackExitNanos(), call.observedNanos(),
                 true, 1, rows.size(), 0, 0, 0, List.of(), "", call.scope(), writerIdentity, call.stream(), target, fields, rows);
     }
 

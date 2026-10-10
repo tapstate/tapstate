@@ -24,12 +24,13 @@ final class BenchmarkReturnTimeBounds {
             require(row != null, "source association is missing");
             if (!row.fixedCohort()) { continue; }
             try {
-                require(Math.subtractExact(row.callObservedNanos(), row.callBeganNanos()) >= 0,
-                        "owned call clock order is invalid");
+                require(Math.subtractExact(row.callLastCallbackExitNanos(), row.callBeganNanos()) >= 0
+                        && Math.subtractExact(row.callObservedNanos(), row.callLastCallbackExitNanos()) >= 0,
+                        "owned call callback clock order is invalid");
             } catch (ArithmeticException overflow) { throw new AssertionError("return time bounds owned call span overflow", overflow); }
-            var began = clock.map(owner, row.callBeganNanos());
+            var exited = clock.map(owner, row.callLastCallbackExitNanos());
             var observed = clock.map(owner, row.callObservedNanos());
-            var returned = new BenchmarkCausalClock.Interval(began.lowerNanos(), observed.upperNanos());
+            var returned = new BenchmarkCausalClock.Interval(exited.lowerNanos(), observed.upperNanos());
             var latency = returned.relativeTo(row.sourceIssuedAtNanos());
             require(latency.upperNanos() >= 0, "return bound is wholly before its registered source issue");
             deliveries.add(new Delivery(row.target().pipelineId() + "/" + row.target().table(), row.key(),

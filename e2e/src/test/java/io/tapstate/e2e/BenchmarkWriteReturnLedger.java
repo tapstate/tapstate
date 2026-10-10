@@ -16,7 +16,7 @@ import java.util.Set;
 /** Exact bounded diagnostic decoding; a receipt never establishes formal timing qualification. */
 final class BenchmarkWriteReturnLedger {
     private static final int MAGIC = 0x57525031;
-    private static final int VERSION = 2;
+    private static final int VERSION = 3;
     private static final int MAX_PAGE_BYTES = 64 * 1024;
     private static final int MAX_CALL_BYTES = MAX_PAGE_BYTES - 2048 - Integer.BYTES;
     private static final int MAX_FRAMES = 512;
@@ -34,7 +34,7 @@ final class BenchmarkWriteReturnLedger {
 
     /** One ordered identity piece; full-call metadata and counters repeat across pieces. */
     record Call(long sequence, int writer, int totalRows, int partIndex, int partCount,
-                long beganNanos, long observedNanos, boolean returnedNormally,
+                long beganNanos, long lastCallbackExitNanos, long observedNanos, boolean returnedNormally,
                 int callbackCount, long inserted, long modified, long removed, int errors,
                 List<ErrorDetail> errorDetails, String failureType, String scope, String writerIdentity,
                 String stream, String target, List<String> keyFields, List<Row> rows) {
@@ -123,7 +123,7 @@ final class BenchmarkWriteReturnLedger {
         int totalRows = input.readInt(), partIndex = input.readInt(), partCount = input.readInt();
         require(totalRows > 0 && totalRows <= MAX_NATIVE_ROWS && partCount == (totalRows + MAX_BATCH_ROWS - 1) / MAX_BATCH_ROWS
                 && partIndex >= 0 && partIndex < partCount, "call part metadata is invalid");
-        long began = input.readLong(), observed = input.readLong();
+        long began = input.readLong(), lastCallbackExit = input.readLong(), observed = input.readLong();
         int normal = input.readUnsignedByte();
         require(normal <= 1, "call return flag is not a boolean");
         int callbacks = input.readInt();
@@ -179,7 +179,14 @@ final class BenchmarkWriteReturnLedger {
         boolean incomplete = normal == 0 || errors != 0 || callbacks == 0
                 || callbacks > MAX_BATCH_ROWS || reported != totalRows;
         require(!incomplete || pageState.startsWith("UNKNOWN:"), "incomplete call lacks an unknown page state");
-        return new Call(sequence, writer, totalRows, partIndex, partCount, began, observed, normal == 1,
+        // Unknown producer receipts retain exact stamp values without supplying an ordering proof.
+        // Zero and negative coordinates never indicate whether a callback exit was actually observed.
+        if (!pageState.startsWith("UNKNOWN:")) {
+            require(Math.subtractExact(lastCallbackExit, began) >= 0
+                    && Math.subtractExact(observed, lastCallbackExit) >= 0,
+                    "call callback exit clock order is invalid");
+        }
+        return new Call(sequence, writer, totalRows, partIndex, partCount, began, lastCallbackExit, observed, normal == 1,
                 callbacks, inserted, modified, removed,
                 errors, errorDetails, failure, scope, identity, stream, target, fields, rows);
     }
@@ -189,6 +196,7 @@ final class BenchmarkWriteReturnLedger {
     private static boolean sameMetadata(Call first, Call next) {
         return first.writer() == next.writer() && first.totalRows() == next.totalRows()
                 && first.partCount() == next.partCount() && first.beganNanos() == next.beganNanos()
+                && first.lastCallbackExitNanos() == next.lastCallbackExitNanos()
                 && first.observedNanos() == next.observedNanos() && first.returnedNormally() == next.returnedNormally()
                 && first.callbackCount() == next.callbackCount() && first.inserted() == next.inserted()
                 && first.modified() == next.modified() && first.removed() == next.removed()
