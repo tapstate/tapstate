@@ -65,6 +65,13 @@ public final class CloudAuthenticationService {
         return sessions.clusterContext(cookie);
     }
 
+    /** Projects authenticated display fields without exposing a persistence record to presentation adapters. */
+    public Optional<CloudClusterContextView> clusterContextView(String cookie) {
+        return clusterContext(cookie).map(context -> new CloudClusterContextView(
+                context.organizationId(), context.clusterId(), context.organizationName(),
+                context.clusterName(), context.region()));
+    }
+
     public boolean logout(String cookie) {
         return sessions.logout(cookie);
     }

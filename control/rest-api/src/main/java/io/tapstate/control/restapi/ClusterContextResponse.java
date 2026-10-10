@@ -2,7 +2,7 @@ package io.tapstate.control.restapi;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
-import io.tapstate.spi.store.CloudSessionContext;
+import io.tapstate.control.core.CloudClusterContextView;
 
 /** Public projection of the display context bound to the current managed Cloud session. */
 public record ClusterContextResponse(
@@ -15,7 +15,7 @@ public record ClusterContextResponse(
         return null;
     }
 
-    static ClusterContextResponse from(CloudSessionContext context) {
+    static ClusterContextResponse from(CloudClusterContextView context) {
         return new ClusterContextResponse(context.organizationId(), context.clusterId(), context.organizationName(),
                 context.clusterName(), context.region());
     }
