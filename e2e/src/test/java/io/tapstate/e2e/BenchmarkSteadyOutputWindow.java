@@ -131,6 +131,14 @@ final class BenchmarkSteadyOutputWindow {
     }
 
     private static void validateWallSamples(List<Long> stream) {
+        for (Long current : stream) {
+            if (current == null) {
+                throw new AssertionError("target operation wall date is missing" + BenchmarkTargetClock.OPERATION_DATE_REFUSAL_SCOPE);
+            }
+        }
+    }
+
+    static void validateLegacyWallSamples(List<Long> stream) {
         var samples = new BenchmarkTargetClock.WallSamples();
         for (Long current : stream) {
             if (!samples.accept(current)) {

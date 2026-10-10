@@ -10,11 +10,64 @@ import java.util.Map;
 import java.util.Optional;
 import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Formal clock qualification is independent of output steadiness and survives report serialization. */
 class BenchmarkClockQualificationContractTest {
+    @Test void aPilotWithoutMeasuredPhasesCannotVacuouslyPassTimingQualification() {
+        var empty = new RealBenchmarkForkDriver.Evidence("clock-empty", BenchmarkWorkloadDefinitions.steadyPilot("copy"),
+                PipelineBenchmarkComparison.Arm.B, Path.of("clock-empty.jar"), List.of(),
+                new BenchmarkResourceSampler.Summary(70, 3, 1_500, 2_500, 2),
+                new BenchmarkMongoCommandSampler.Summary(Map.of(), Map.of(), 1), Map.of(), Map.of(),
+                "qualified", 0, Optional.empty());
+        assertThatThrownBy(empty::requireSteadyStateWindow)
+                .isInstanceOf(AssertionError.class).hasMessageContaining("no measured phases");
+    }
+    @Test void qualifiedHelloSamplesCannotSupplyAnOperationDateErrorBound() {
+        assertThatThrownBy(() -> evidence(phase(proof(), false)).requireSteadyStateWindow())
+                .isInstanceOf(AssertionError.class).hasMessageContaining("operation time lacks measured error bounds");
+    }
+
+    @Test void aCallerQualificationMarkerCannotReplaceAnActualOperationTimingMethod() {
+        var claimed = new java.util.LinkedHashMap<String, Object>(proof());
+        claimed.put("operationDateTimeEvidence", Map.of("state", "QUALIFIED", "maximumErrorNanos", 0));
+        var input = phase(claimed, false);
+        assertThatThrownBy(() -> evidence(input).requireSteadyStateWindow())
+                .isInstanceOf(AssertionError.class).hasMessageContaining("operation time lacks measured error bounds");
+        var output = PipelineBenchmarkLiveRunIT.phaseEvidence(input);
+        assertThat(((Map<?, ?>) output.get("operationDateTimeEvidence")).get("state")).isEqualTo("UNQUALIFIED");
+        assertThat(output.get("steadyStateEstablished")).isEqualTo(false);
+    }
+
+    @Test void anUnsupportedFormalTimingMethodStopsBeforeConfigurationOrFixtureAccess() {
+        String property = "tapstate.e2e.benchmark.gate";
+        String previous = System.getProperty(property);
+        try {
+            System.setProperty(property, "overhead");
+            assertThatThrownBy(() -> new PipelineBenchmarkLiveRunIT()
+                    .interleavedRealForksWriteEvidenceAndEnforceTheSelectedGate())
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("operation time lacks measured error bounds");
+        } finally {
+            if (previous == null) { System.clearProperty(property); }
+            else { System.setProperty(property, previous); }
+        }
+    }
+
+    @Test void anArithmeticDateMappingCannotBeReportedAsACalibratedResourceWindow() {
+        var input = phase(proof(), false);
+        var mapped = new RealBenchmarkForkDriver.MeasuredPhase(input.id(), input.acknowledgedOutputs(),
+                input.firstIssuedAtNanos(), input.sourceCompletedAtNanos(), input.completedAckAtNanos(),
+                input.expectedSourceChanges(), input.observedDeliveries(), input.reportedRecordsOut(),
+                input.clockAnchor(), input.sourceBatches(), input.resources(), input.confirmationTiming(),
+                input.deliveryTimeline(), input.steadyOutputProfile(),
+                Optional.of(new BenchmarkTargetClock.LocalWindow(2, 4, 6, 8)), input.targetClockEvidence());
+        var output = PipelineBenchmarkLiveRunIT.phaseEvidence(mapped);
+        var window = (Map<?, ?>) output.get("operationResourceWindow");
+        assertThat(window.get("state")).isEqualTo("UNQUALIFIED");
+        assertThat(window.get("reason")).isEqualTo("OPERATION_TIME_ERROR_BOUND_NOT_ESTABLISHED");
+        assertThat(window.get("earliestStartNanos")).isNull();
+        assertThat(window.get("latestEndNanos")).isNull();
+    }
     @Test void missingOuterOrInteriorClockEvidenceCannotEnterFormalSteadyQualification() {
         var complete = proof();
         for (var incomplete : List.of(Map.<String, Object>of(), Map.<String, Object>of("state", "QUALIFIED"),
@@ -22,7 +75,8 @@ class BenchmarkClockQualificationContractTest {
             assertThatThrownBy(() -> evidence(phase(incomplete, false)).requireSteadyStateWindow())
                     .isInstanceOf(AssertionError.class).hasMessageContaining("outer and sampled interior clocks");
         }
-        assertThatCode(() -> evidence(phase(complete, false)).requireSteadyStateWindow()).doesNotThrowAnyException();
+        assertThatThrownBy(() -> evidence(phase(complete, false)).requireSteadyStateWindow())
+                .isInstanceOf(AssertionError.class).hasMessageContaining("operation time lacks measured error bounds");
     }
 
     @Test void qualifiedClockProofCannotMaskExcessiveOutputTrendAndItsFullReadingsRemainSerialized() {

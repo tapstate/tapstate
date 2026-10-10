@@ -54,6 +54,7 @@ class PipelineBenchmarkLiveRunIT {
         if (Boolean.getBoolean("tapstate.e2e.benchmark.thread-point-diagnostics")) {
             throw new AssertionError("thread point diagnostics cannot establish a live performance gate");
         }
+        BenchmarkTargetClock.requireOperationTimeErrorBound();
 
         Path output = Path.of(required(OUTPUT));
         Path harnessRoot = harnessRoot();
@@ -67,7 +68,7 @@ class PipelineBenchmarkLiveRunIT {
             Map<String, Object> environment = environment();
             var steadyWorkloads = BenchmarkWorkloadDefinitions.all().stream()
                     .map(workload -> BenchmarkWorkloadDefinitions.steadyPilot(workload.id())).toList();
-            inputs.put("measurementMethod", "FIXED_MIDDLE_COMMON_SAMPLED_CLOCK_OPERATION_INTERVAL_V8");
+            inputs.put("measurementMethod", BenchmarkTargetClock.OPERATION_DATE_MEASUREMENT_METHOD);
             inputs.put("steadyProfileRows", BenchmarkWorkloadDefinitions.STEADY_PILOT_ROWS);
             inputs.put("loadDiagnosticsEnabled", Boolean.getBoolean("tapstate.e2e.benchmark.load-diagnostics"));
             report.begin(inputs, environment, workloads(steadyWorkloads));
@@ -479,7 +480,8 @@ class PipelineBenchmarkLiveRunIT {
                 "durationNanos", phase.completedAckAtNanos() - phase.firstIssuedAtNanos(),
                 "throughputRecordsPerSecond", phase.confirmationTiming().isPresent()
                         ? phase.recordsOutPerSecond() : null,
-                "throughputMethod", phase.steadyOutputProfile() ? "FIXED_MIDDLE_COMMON_SAMPLED_CLOCK_OPERATION_INTERVAL_V8" : "SOURCE_ISSUE_TO_OBSERVED_TARGET_V2",
+                "throughputMethod", phase.steadyOutputProfile() ? BenchmarkTargetClock.OPERATION_DATE_MEASUREMENT_METHOD : "SOURCE_ISSUE_TO_OBSERVED_TARGET_V2",
+                "operationDateTimeEvidence", BenchmarkTargetClock.operationDateTimeEvidence(),
                 "steadyStateEstablished", phase.steadyOutputEstablished(),
                 "steadyOutputRule", "COMMON_ACTIVE_INTERVAL_TEN_PROGRESS_BINS_HALF_TREND_AT_MOST_5_PERCENT",
                 "throughputWindowScope", "COMMON_ACTIVE_TARGET_INTERVAL_OPEN_START_CLOSED_END",
@@ -494,10 +496,7 @@ class PipelineBenchmarkLiveRunIT {
                 "confirmationRecordsPerSecond", phase.confirmationRecordsPerSecond(),
                 "resourceAndCommandWindowScope", "SOURCE_ISSUE_THROUGH_PROOF_CONFIRMATION",
                 "targetClockQualification", phase.targetClockEvidence(),
-                "operationResourceWindow", phase.operationResourceWindow().map(window -> object("state", "CALIBRATED_INTERIOR",
-                        "earliestStartNanos", window.earliestStartNanos(), "latestStartNanos", window.latestStartNanos(),
-                        "earliestEndNanos", window.earliestEndNanos(), "latestEndNanos", window.latestEndNanos()))
-                        .orElseGet(() -> object("state", "UNQUALIFIED")),
+                "operationResourceWindow", object("state", "UNQUALIFIED", "reason", "OPERATION_TIME_ERROR_BOUND_NOT_ESTABLISHED"),
                 "observedDeliveries", phase.observedDeliveries(),
                 "reportedRecordsOut", phase.reportedRecordsOut(),
                 "confirmationTiming", phase.confirmationTiming().map(timing -> object(

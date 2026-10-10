@@ -213,7 +213,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             var timeline = deliveryTimeline.orElseThrow();
             try { BenchmarkSteadyOutputWindow.requireSteady(timeline.operationWindow()); }
             catch (AssertionError notSteady) { return false; }
-            return true;
+            return BenchmarkTargetClock.operationDateTimingQualified();
         }
     }
 
@@ -264,6 +264,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
 
         void requireSteadyStateWindow() {
             if (!workload.pilotProfile()) { throw new AssertionError("steady output requires the predeclared load profile"); }
+            if (phases.isEmpty()) { throw new AssertionError("timing qualification has no measured phases"); }
             for (var phase : phases) {
                 if (Boolean.TRUE.equals(phase.targetClockEvidence().get("operationClockRefusalEvidenceEnabled"))
                         || clockRefusalEvidenceRecorded(phase.targetClockEvidence().get("targetWitnessReadReceipts"))) {
@@ -279,6 +280,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 }
                 var timeline = phase.deliveryTimeline().orElseThrow(() -> new AssertionError("steady output has no complete timeline"));
                 BenchmarkSteadyOutputWindow.requireSteady(timeline.operationWindow());
+                BenchmarkTargetClock.requireOperationTimeErrorBound();
             }
         }
     }
@@ -410,11 +412,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                         || resourceWindows.isEmpty() || commandWindows.isEmpty()) {
                     throw new AssertionError("benchmark fork ended without terminal or resource evidence");
                 }
-                BenchmarkResourceSampler.Summary resources = workload.pilotProfile()
-                        ? summarizeResources(measured.stream().map(phase -> {
-                            var window = phase.operationResourceWindow().orElseThrow(() -> new AssertionError("target operation resource window is uncalibrated"));
-                            return BenchmarkResourceSampler.slice(phase.resources(), window.latestStartNanos(), window.earliestEndNanos());
-                        }).toList()) : summarizeResources(resourceWindows);
+                BenchmarkResourceSampler.Summary resources = summarizeResources(resourceWindows);
                 BenchmarkMongoCommandSampler.Summary mongoCommands = summarizeCommands(commandWindows);
                 BenchmarkSourceLineage.verifyAfterTerminalAck(lineage, fork.sourceSettings());
                 String checksum = checksum(terminal.targets());
@@ -724,23 +722,9 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 cohort.stream().map(BenchmarkMongoDeliveryObserver.Delivery::observedAtNanos).sorted().toList(),
                 deliveries.stream().map(BenchmarkMongoDeliveryObserver.Delivery::observedAtNanos).sorted().toList(),
                 BenchmarkSteadyOutputWindow.mergeValidatedOperationStreams(operationStreams), operationStreams);
-        var commonInterval = BenchmarkSteadyOutputWindow.commonIntervalMillis(operationStreams);
-        long commonFirst = commonInterval.first(), commonLast = commonInterval.last();
-        Optional<BenchmarkTargetClock.LocalWindow> resourceWindow = targetClockBefore == null ? Optional.empty()
-                : Optional.of(BenchmarkTargetClock.mapWindow(targetClockBefore, targetClockAfter,
-                        commonFirst, commonLast));
-        if (targetClocksBefore.size() > 1) {
-            List<BenchmarkTargetClock.LocalWindow> windows = new ArrayList<>();
-            for (int i=0;i<targetClocksBefore.size();i++) {
-                windows.add(BenchmarkTargetClock.mapWindow(targetClocksBefore.get(i), targetClocksAfter.get(i),
-                        commonFirst, commonLast));
-            }
-            resourceWindow = Optional.of(new BenchmarkTargetClock.LocalWindow(
-                    windows.stream().mapToLong(BenchmarkTargetClock.LocalWindow::earliestStartNanos).min().orElseThrow(),
-                    windows.stream().mapToLong(BenchmarkTargetClock.LocalWindow::latestStartNanos).max().orElseThrow(),
-                    windows.stream().mapToLong(BenchmarkTargetClock.LocalWindow::earliestEndNanos).min().orElseThrow(),
-                    windows.stream().mapToLong(BenchmarkTargetClock.LocalWindow::latestEndNanos).max().orElseThrow()));
-        }
+        BenchmarkSteadyOutputWindow.commonIntervalMillis(operationStreams);
+        // Cached operation dates have no established mapping error; retain the full measured resource samples.
+        Optional<BenchmarkTargetClock.LocalWindow> resourceWindow = Optional.empty();
         if (workload.pilotProfile()) {
             System.out.println("benchmark-pre-evaluation-output-timeline=" + JsonWriter.write(Map.ofEntries(
                     Map.entry("workload", workload.id()), Map.entry("phase", phase.id()), Map.entry("rows", workload.rows()),

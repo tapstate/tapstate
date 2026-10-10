@@ -16,6 +16,25 @@ final class BenchmarkTargetClock {
     // Operation dates and logical slots are sampled separately; their ordering does not identify a clock step.
     static final String OPERATION_DATE_REFUSAL_SCOPE =
             "; evidenceScope=OPERATION_DATE_ORDER_IN_LOGICAL_STREAM; clockCause=UNKNOWN";
+    static final String OPERATION_DATE_MEASUREMENT_METHOD = "FIXED_MIDDLE_OPERATION_DATE_DIAGNOSTIC_V9";
+
+    static boolean rejectOperationDate(Long value, WallSamples legacyOrder, boolean legacyDiagnostic) {
+        boolean withinLegacyTolerance = legacyOrder.accept(value);
+        return value == null || legacyDiagnostic && !withinLegacyTolerance;
+    }
+
+    static Map<String, Object> operationDateTimeEvidence() {
+        return Map.of("state", "UNQUALIFIED", "reason", "OPERATION_TIME_ERROR_BOUND_NOT_ESTABLISHED",
+                "timeField", "MONGO_CHANGE_EVENT_WALL_TIME", "storageUnit", "ms",
+                "measurementMethod", OPERATION_DATE_MEASUREMENT_METHOD, "performanceAcceptanceEligible", false);
+    }
+
+    static boolean operationDateTimingQualified() { return false; }
+
+    static void requireOperationTimeErrorBound() {
+        // This date-based method has no measured cache-age, scheduling or timestamp error bound.
+        throw new AssertionError("operation time lacks measured error bounds; method=" + OPERATION_DATE_MEASUREMENT_METHOD);
+    }
 
     /** Retains the fixed operation-date ordering tolerance without assigning the cause of a refusal. */
     static final class WallSamples {

@@ -240,7 +240,7 @@ class RealBenchmarkForkDriverIT {
                         : settlingCalibration ? "FIXED_FIRST_QUARTER_CDC_SETTLING_CALIBRATION"
                         : pacedCalibration ? "FIXED_PACING_CALIBRATION_5MS_50MS" : "ORIGINAL_BATCH_SCHEDULE";
                 var output = new java.util.LinkedHashMap<String, Object>(Map.of(
-                        "forkOutputSchemaVersion", 2,
+                        "forkOutputSchemaVersion", 3,
                         "dualGcDiagnostics", dualGc == null
                                 ? Map.of("schemaVersion", 1, "enabled", false) : dualGc.evidence(),
                         "formalPerformance", false,

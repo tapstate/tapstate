@@ -45,11 +45,20 @@ class BenchmarkTargetClockTest {
         var dates = new BenchmarkTargetClock.WallSamples();
         assertThat(dates.accept(operationDatesInLogicalOrder.getFirst())).isTrue();
         assertThat(dates.accept(operationDatesInLogicalOrder.getLast())).isFalse();
-        assertThatThrownBy(() -> BenchmarkSteadyOutputWindow.readServerOperations(operationDatesInLogicalOrder))
+        assertThatThrownBy(() -> BenchmarkSteadyOutputWindow.validateLegacyWallSamples(operationDatesInLogicalOrder))
                 .isInstanceOf(AssertionError.class).hasMessageContaining("beyond clock uncertainty")
                 .hasMessageContaining("uncertaintyMillis=2")
                 .hasMessageContaining("clockCause=UNKNOWN")
                 .hasMessageContaining("evidenceScope=OPERATION_DATE_ORDER_IN_LOGICAL_STREAM");
+    }
+    @Test void ordinaryDateAdmissionRetainsLogicalIndependenceWhileLegacyEvidenceRetainsItsRefusal() {
+        var ordinary = new BenchmarkTargetClock.WallSamples();
+        assertThat(BenchmarkTargetClock.rejectOperationDate(1_010L, ordinary, false)).isFalse();
+        assertThat(BenchmarkTargetClock.rejectOperationDate(1_006L, ordinary, false)).isFalse();
+        assertThat(BenchmarkTargetClock.rejectOperationDate(null, ordinary, false)).isTrue();
+        var legacy = new BenchmarkTargetClock.WallSamples();
+        assertThat(BenchmarkTargetClock.rejectOperationDate(1_010L, legacy, true)).isFalse();
+        assertThat(BenchmarkTargetClock.rejectOperationDate(1_006L, legacy, true)).isTrue();
     }
     @Test void missingOperationDateCannotIdentifyAClockFailure() {
         assertThatThrownBy(() -> BenchmarkSteadyOutputWindow.readServerOperations(java.util.Arrays.asList(1_000L, null)))

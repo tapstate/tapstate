@@ -6,7 +6,17 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class BenchmarkSteadyOutputWindowTest {
-    @Test void anInteriorClockStepAndReturnCannotHideBehindOrderedLogicalTimeAndValidOuterBrackets() {
+    @Test void concurrentOperationDatesBeyondTwoMillisRemainACompleteDiagnosticCohort() {
+        var ordered = new ArrayList<Long>();
+        for (int i = 0; i < 12_000; i++) { ordered.add(1_000_000L + i); }
+        var logicalOrder = new ArrayList<>(ordered);
+        java.util.Collections.swap(logicalOrder, 499, 503);
+        assertThat(BenchmarkSteadyOutputWindow.readServerOperations(logicalOrder))
+                .isEqualTo(BenchmarkSteadyOutputWindow.readServerOperations(ordered));
+        assertThat(BenchmarkSteadyOutputWindow.commonIntervalMillis(java.util.List.of(logicalOrder)))
+                .isEqualTo(BenchmarkSteadyOutputWindow.commonIntervalMillis(java.util.List.of(ordered)));
+    }
+    @Test void validHelloAndLogicalOrderDoNotAssignACauseToADisorderedOperationDateTimeline() {
         long base = 1_000_000;
         var before = new BenchmarkTargetClock.Reading("owned:27017", "one", base, 0, 2_000_000, base - 1, base + 1);
         var after = new BenchmarkTargetClock.Reading("owned:27017", "one", base + 30_000,
@@ -18,11 +28,12 @@ class BenchmarkSteadyOutputWindowTest {
             assertThat(logical.accept(new org.bson.BsonTimestamp(2_000, i))).isTrue();
             wall.add(base + i - (i >= 6_000 ? 1_000 : 0));
         }
-        assertThatThrownBy(() -> BenchmarkSteadyOutputWindow.readCommonOperations(java.util.List.of(wall)))
+        assertThatThrownBy(() -> BenchmarkSteadyOutputWindow.validateLegacyWallSamples(wall))
                 .isInstanceOf(AssertionError.class).hasMessageContaining("beyond clock uncertainty");
-        assertThatThrownBy(() -> BenchmarkSteadyOutputWindow.commonIntervalMillis(java.util.List.of(wall)))
-                .as("the same unsafe temporal slice cannot be mapped into a resource window")
-                .isInstanceOf(AssertionError.class).hasMessageContaining("beyond clock uncertainty");
+        var diagnostic = BenchmarkSteadyOutputWindow.readCommonOperations(java.util.List.of(wall), false);
+        assertThat(diagnostic.completedDeliveries()).isEqualTo(11_999);
+        assertThat(BenchmarkSteadyOutputWindow.commonIntervalMillis(java.util.List.of(wall)))
+                .isEqualTo(new BenchmarkSteadyOutputWindow.ServerInterval(base, base + 10_999));
     }
 
     @Test void ordinaryConcurrentOperationsKeepTheirExactTemporalCohortDespiteAdjacentWallTimeInversions() {

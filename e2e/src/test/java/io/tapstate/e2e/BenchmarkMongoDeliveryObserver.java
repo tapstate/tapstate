@@ -500,7 +500,8 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                             + "; currentWallMillis=" + operationWall + "; clusterTime=" + change.getClusterTime()
                             + "; observedAtNanos=" + observedAtNanos, null); return;
                 }
-                if (!operationWalls.accept(operationWall)) {
+                if (BenchmarkTargetClock.rejectOperationDate(operationWall, operationWalls,
+                        clockRejectionEvidence != null)) {
                     AssertionError original = new AssertionError("target operation clock is missing or moved backward beyond clock uncertainty"
                             + "; namespace=" + namespace + "; target=" + targetId + "; phase=" + activePhase
                             + "; key=" + key + "; highWaterMillis=" + operationWalls.highWaterMillis()
