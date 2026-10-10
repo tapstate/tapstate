@@ -4,9 +4,11 @@ import io.tapstate.core.lifecycle.CasOutcome;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.DesiredStateFingerprint;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.spi.store.DesiredStore;
+import io.tapstate.spi.store.PendingPipelineResume;
 import io.tapstate.spi.store.StateStore;
 
 import java.time.Clock;
@@ -68,6 +70,15 @@ public final class PipelineConverger {
         boolean reassemble = intent.get().reassemble();
         Optional<CheckpointDoc> actualDoc = state.read(pipelineId);
         PipelineState actual = actualDoc.map(doc -> StateJson.parse(doc.stateJson())).orElse(null);
+        if (target == PipelineState.RUNNING && actual == PipelineState.RUNNING) {
+            Optional<PendingPipelineResume> pending = state.pendingResume(pipelineId)
+                    .filter(receipt -> receipt.stateEpoch() == actualDoc.orElseThrow().epoch()
+                            && receipt.intentFingerprint().equals(DesiredStateFingerprint.of(intent.orElseThrow())))
+                    .filter(actuator::acceptsPendingResume);
+            if (pending.isPresent()) {
+                return convergePendingResume(pipelineId, actualDoc.orElseThrow(), pending.orElseThrow());
+            }
+        }
         // The one intent that is carried out once rather than held true: a start superseding a stop
         // this side never got to read. It is owed only while the actual state still stands where it
         // stood when the intent was written -- and carrying it out is itself a fenced write, so the
@@ -114,6 +125,36 @@ public final class PipelineConverger {
         }
 
         return driveTo(pipelineId, target, true, actualDoc.orElse(null), purgeState, rebuild, rebuildOwed);
+    }
+
+    private ConvergeResult convergePendingResume(
+            String pipelineId, CheckpointDoc current, PendingPipelineResume pending) {
+        // A previous pass may have resumed the real job and died before acknowledging it. Consume
+        // that exact proof first, rather than resuming or reassembling the same accepted action twice.
+        try {
+            if (actuator.resumeCompleted(pending)) { return acknowledgeResume(pipelineId, pending); }
+            Optional<Throwable> failure = actuator.failure(pipelineId);
+            if (failure.isPresent()) { return failedWith(pipelineId, failure.orElseThrow()); }
+            actuator.resume(pipelineId);
+            return actuator.resumeCompleted(pending)
+                    ? acknowledgeResume(pipelineId, pending) : ConvergeResult.converged(current);
+        } catch (TapstateException refused) { return failedWith(pipelineId, refused); }
+    }
+
+    private ConvergeResult acknowledgeResume(
+            String pipelineId, PendingPipelineResume pending) {
+        boolean stillRequested = desired.read(pipelineId)
+                .filter(intent -> intent.targetState() == PipelineState.RUNNING
+                        && DesiredStateFingerprint.of(intent).equals(pending.intentFingerprint())).isPresent();
+        if (!stillRequested || state.pendingResume(pipelineId).filter(pending::sameRequestAs).isEmpty()) {
+            return ConvergeResult.superseded();
+        }
+        // Completion belongs to the accepted epoch. It must never rebase onto a superseding pause,
+        // stop, failure or a later resume with the same value-based desired fingerprint.
+        CasOutcome outcome = state.compareAndSwap(pipelineId, pending.stateEpoch(),
+                StateJson.of(PipelineState.RUNNING), clock.instant());
+        return outcome instanceof CasOutcome.Applied applied
+                ? ConvergeResult.converged(applied.next()) : ConvergeResult.superseded();
     }
 
     private ConvergeResult convergeRunning(
@@ -218,7 +259,20 @@ public final class PipelineConverger {
         }
         for (int attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
             PipelineState from = StateJson.parse(current.stateJson());
-            CasOutcome outcome = state.compareAndSwap(pipelineId, current.epoch(), targetJson, clock.instant());
+            PendingPipelineResume pendingResume = null;
+            if (from == PipelineState.PAUSED && target == PipelineState.RUNNING) {
+                DesiredState accepted = desired.read(pipelineId).orElse(null);
+                if (accepted == null || accepted.targetState() != PipelineState.RUNNING) {
+                    return ConvergeResult.superseded();
+                }
+                if (accepted.rebuiltAtStateEpoch() == null) {
+                    try { pendingResume = actuator.prepareResume(pipelineId, accepted, current.epoch() + 1).orElse(null); }
+                    catch (TapstateException refused) { return failedWith(pipelineId, refused); }
+                }
+            }
+            CasOutcome outcome = pendingResume == null
+                    ? state.compareAndSwap(pipelineId, current.epoch(), targetJson, clock.instant())
+                    : state.compareAndSwap(pipelineId, current.epoch(), targetJson, clock.instant(), pendingResume);
             if (outcome instanceof CasOutcome.Applied applied) {
                 if (target == PipelineState.FAILED) {
                     rebuilds.recordFailure(pipelineId);
@@ -226,9 +280,13 @@ public final class PipelineConverger {
                 // Record first, then actuate: the store is the source of truth and Jet is subordinate, so the
                 // fenced write lands the intent durably before the job side is driven to match it.
                 try {
-                    actuate(pipelineId, from, target, purgeState, rebuild);
+                    if (pendingResume != null) { actuator.resume(pipelineId); }
+                    else { actuate(pipelineId, from, target, purgeState, rebuild); }
                     if (target == PipelineState.FAILED) {
                         rebuilds.afterFailedStop(pipelineId);
+                    }
+                    if (pendingResume != null && actuator.resumeCompleted(pendingResume)) {
+                        return acknowledgeResume(pipelineId, pendingResume);
                     }
                 } catch (TapstateException refused) {
                     // The job side refused with a diagnosis. Record it the way a job that died is recorded,

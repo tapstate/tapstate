@@ -2,6 +2,8 @@ package io.tapstate.app;
 
 import com.hazelcast.jet.core.DAG;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.spi.store.PendingPipelineResume;
 import io.tapstate.spi.store.WorkloadClaim;
 import java.util.Optional;
 
@@ -24,6 +26,23 @@ interface PipelineExecutionAdmission {
     default void submitted(String pipelineId, PipelineActuationOwnership.Execution execution, String nativeJobId) { }
 
     default void refused(String pipelineId, TapstateException failure) { }
+
+    default Optional<PendingPipelineResume> prepareResume(
+            String pipelineId, DesiredState intent, long acceptedStateEpoch) {
+        return Optional.empty();
+    }
+
+    default Optional<PendingPipelineResume> pendingResume(String pipelineId) { return Optional.empty(); }
+
+    default boolean acceptsPendingResume(PendingPipelineResume pendingResume) { return false; }
+
+    enum ResumeDisposition { HELD, RECOMPILE, START, WAIT }
+
+    default ResumeDisposition resumeDisposition(PendingPipelineResume pendingResume, boolean loadDelivered) {
+        return ResumeDisposition.WAIT;
+    }
+
+    default boolean resumeCompleted(PendingPipelineResume pendingResume) { return false; }
 
     /** The still-owned allocation waiting for submission, if an earlier start already issued it. */
     default Optional<PipelineActuationOwnership.Execution> pendingExecution(String pipelineId) {

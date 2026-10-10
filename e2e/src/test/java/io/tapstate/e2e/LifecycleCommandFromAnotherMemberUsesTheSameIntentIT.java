@@ -41,8 +41,9 @@ import org.junit.jupiter.api.io.TempDir;
 /**
  * A late member's lifecycle commands reach the same durable intent and the existing claim holder.
  *
- * <p>All four members are packaged server processes. The fourth leaves before the first run is
- * admitted and returns afterwards, so its absence from that run is observed rather than assumed.
+ * <p>All five members are packaged server processes. Two leave before the first run is admitted.
+ * The fourth returns before resume and the fifth before stop, keeping each issuer outside the
+ * native cohort present when that command is sent.
  * The file connector's read and write witnesses distinguish a paused or duplicated job from a
  * successful HTTP response; this case makes no claim about a connector resume token.
  */
@@ -54,8 +55,10 @@ class LifecycleCommandFromAnotherMemberUsesTheSameIntentIT {
     private static final String TARGET = "other_member_tgt";
     private static final String TABLE = "orders";
     private static final String JOINING = "node-d";
+    private static final String STOP_ISSUER = "node-e";
     private static final List<String> ORIGINAL = List.of("node-a", "node-b", "node-c");
     private static final List<String> ALL = List.of("node-a", "node-b", "node-c", JOINING);
+    private static final List<String> FLEET = List.of("node-a", "node-b", "node-c", JOINING, STOP_ISSUER);
     private static final long SEEDED_ROWS = 3;
     private static final Duration BOUND = Duration.ofMinutes(3);
 
@@ -79,17 +82,19 @@ class LifecycleCommandFromAnotherMemberUsesTheSameIntentIT {
 
         try (FileEndpoints files = new FileEndpoints();
                 MongoClient mongo = MongoClients.create(store);
-                PartitionableCluster cluster = PartitionableCluster.start(store, "e2e-other-member", ALL)) {
+                PartitionableCluster cluster = PartitionableCluster.start(store, "e2e-other-member", FLEET)) {
             MongoDatabase database = mongo.getDatabase(DATABASE);
             MongoDesiredStore desired = new MongoDesiredStore(SystemCollections.PIPELINE_DESIRED.on(database));
             MongoObservationStore observations = new MongoObservationStore(SystemCollections.PIPELINE_OBSERVATION.on(database));
             ControlPlane control = cluster.member(ORIGINAL.getFirst());
-            awaitActive(control, ALL);
+            awaitActive(control, FLEET);
             cluster.stop(JOINING);
+            cluster.stop(STOP_ISSUER);
             awaitActive(control, ORIGINAL);
             Await.until("the fourth boot's node session to retire before admission", BOUND,
-                    () -> control.clusterStatus().members().stream().anyMatch(member -> JOINING.equals(member.nodeId())
-                            && Boolean.FALSE.equals(member.live()) && Boolean.FALSE.equals(member.sessionLeased())),
+                    () -> List.of(JOINING, STOP_ISSUER).stream().allMatch(node -> control.clusterStatus().members().stream()
+                            .anyMatch(member -> node.equals(member.nodeId()) && Boolean.FALSE.equals(member.live())
+                                    && Boolean.FALSE.equals(member.sessionLeased()))),
                     () -> "members = " + control.clusterStatus().members());
 
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);
@@ -116,6 +121,7 @@ class LifecycleCommandFromAnotherMemberUsesTheSameIntentIT {
             awaitLanded(control, files, targetAddress, SEEDED_ROWS);
             awaitMeasured(control, ORIGINAL);
             ClusterClaimView originalClaim = claim(control);
+            assertThat(originalClaim.ownerNodeId()).isIn(ORIGINAL);
             Submitted originalJob = awaitOneSubmitted(database, cluster.clusterId());
             assertThat(originalClaim.executionMembers().stream().map(ClusterClaimView.Member::nodeId))
                     .containsExactlyInAnyOrderElementsOf(ORIGINAL);
@@ -166,42 +172,55 @@ class LifecycleCommandFromAnotherMemberUsesTheSameIntentIT {
             assertThat(writes.rowsOf(TABLE).stream().filter(row -> row.id().equals(String.valueOf(SEEDED_ROWS + 2))))
                     .isEmpty();
 
+            assertOutsideRun(fourth);
             fourth.lifecycle(PIPELINE, LifecycleVerb.RESUME);
             awaitIntent(desired, PipelineState.RUNNING, running.revision());
             awaitState(control, PipelineState.RUNNING);
             awaitRow(files, targetAddress, SEEDED_ROWS + 2);
             assertWrittenOnce(writes, SEEDED_ROWS + 2);
-            assertSameDriver(originalClaim, claim(fourth));
+            awaitMeasured(control, ALL);
+            ClusterClaimView resumed = claim(fourth);
+            assertSameDriver(claim(control), resumed);
+            assertThat(resumed.claimGeneration()).isGreaterThan(originalClaim.claimGeneration());
+            assertThat(resumed.executionGeneration()).isEqualTo(originalClaim.executionGeneration() + 1);
+            assertThat(resumed.executionMembers().stream().map(ClusterClaimView.Member::nodeId))
+                    .containsExactlyInAnyOrderElementsOf(ALL);
             Submitted resumedJob = awaitOneSubmitted(database, cluster.clusterId());
-            assertThat(resumedJob.generation()).isEqualTo(claim(fourth).executionGeneration());
+            assertThat(resumedJob.generation()).isEqualTo(resumed.executionGeneration());
+            assertThat(resumedJob.jobId()).isNotEqualTo(originalJob.jobId());
             assertThat(executions(fourth)).hasSize(1);
 
-            assertOutsideRun(fourth);
-            fourth.stop(PIPELINE, false);
+            ControlPlane fifth = cluster.relaunch(STOP_ISSUER);
+            awaitActive(control, FLEET);
+            Await.until("the fifth member to remain outside the already resumed job", BOUND,
+                    () -> fifth.awaitingRebalance(PIPELINE).equals(List.of(STOP_ISSUER)),
+                    () -> "awaiting = " + fifth.awaitingRebalance(PIPELINE));
+            assertOutsideRun(fifth, STOP_ISSUER);
+            assertSameRun(resumed, claim(fifth), resumedJob, database, cluster.clusterId());
+            fifth.stop(PIPELINE, false);
             awaitIntent(desired, PipelineState.STOPPED, running.revision());
             awaitState(control, PipelineState.STOPPED);
             assertThat(desired.read(PIPELINE).orElseThrow().purgeState()).isFalse();
-            assertSameDriver(originalClaim, claim(control));
             Await.until("the stopped execution's submission to retire", BOUND,
                     () -> submissions(database, cluster.clusterId()).isEmpty(),
                     () -> "submissions = " + submissions(database, cluster.clusterId()));
             long stoppedGeneration = claim(control).executionGeneration();
 
             // With no run left, a legal START from this endpoint creates one new run using all active members.
-            fourth.lifecycle(PIPELINE, LifecycleVerb.START);
+            fifth.lifecycle(PIPELINE, LifecycleVerb.START);
             awaitIntent(desired, PipelineState.RUNNING, running.revision());
             awaitState(control, PipelineState.RUNNING);
             awaitLanded(control, files, targetAddress, SEEDED_ROWS + 2);
-            awaitMeasured(control, ALL);
-            ClusterClaimView restarted = claim(fourth);
-            assertSameDriver(originalClaim, restarted);
+            awaitMeasured(control, FLEET);
+            ClusterClaimView restarted = claim(fifth);
+            assertSameDriver(claim(control), restarted);
             assertThat(restarted.executionGeneration()).isEqualTo(stoppedGeneration + 1);
             Submitted nextJob = awaitOneSubmitted(database, cluster.clusterId());
             assertThat(nextJob.generation()).isEqualTo(restarted.executionGeneration());
             assertThat(nextJob.jobId()).isNotEqualTo(resumedJob.jobId());
             assertThat(restarted.executionMembers().stream().map(ClusterClaimView.Member::nodeId))
-                    .containsExactlyInAnyOrderElementsOf(ALL);
-            assertThat(executions(fourth)).hasSize(1);
+                    .containsExactlyInAnyOrderElementsOf(FLEET);
+            assertThat(executions(fifth)).hasSize(1);
             assertThat(desired.pipelineIds()).containsExactly(PIPELINE);
             files.cdc(sourceAddress, TABLE, CdcOp.INSERT, 1);
             awaitRow(files, targetAddress, SEEDED_ROWS + 3);
@@ -265,16 +284,19 @@ class LifecycleCommandFromAnotherMemberUsesTheSameIntentIT {
     }
 
     private static void assertOutsideRun(ControlPlane control) {
-        assertThat(control.awaitingRebalance(PIPELINE)).containsExactly(JOINING);
-        assertThat(control.membersCarryingPartOf(PIPELINE)).doesNotContain(JOINING);
-        assertThat(claim(control).executionMembers().stream().map(ClusterClaimView.Member::nodeId)).doesNotContain(JOINING);
+        assertOutsideRun(control, JOINING);
+    }
+
+    private static void assertOutsideRun(ControlPlane control, String nodeId) {
+        assertThat(control.awaitingRebalance(PIPELINE)).containsExactly(nodeId);
+        assertThat(control.membersCarryingPartOf(PIPELINE)).doesNotContain(nodeId);
+        assertThat(claim(control).executionMembers().stream().map(ClusterClaimView.Member::nodeId)).doesNotContain(nodeId);
     }
 
     private static void assertSameDriver(ClusterClaimView expected, ClusterClaimView actual) {
         assertThat(actual.ownerNodeId()).isEqualTo(expected.ownerNodeId());
         assertThat(actual.ownerBootId()).isEqualTo(expected.ownerBootId());
         assertThat(actual.claimGeneration()).isEqualTo(expected.claimGeneration());
-        assertThat(actual.ownerNodeId()).isNotEqualTo(JOINING);
     }
 
     private static void assertSameRun(ClusterClaimView expected, ClusterClaimView actual, Submitted submitted,

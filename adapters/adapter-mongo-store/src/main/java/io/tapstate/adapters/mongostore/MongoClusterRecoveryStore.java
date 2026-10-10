@@ -71,7 +71,7 @@ public final class MongoClusterRecoveryStore implements ClusterRecoveryStore {
         }
         return StoreIo.call(() -> {
             Document includeTerminal = new Document("$and", List.of(
-                    new Document("$ne", java.util.Arrays.asList("$latestTerminal", null)),
+                    new Document("$eq", List.of(new Document("$type", "$latestTerminal"), "object")),
                     new Document("$not", List.of(new Document("$in", List.of("$status", List.of("RECOVERED", "REBUILD_FAILED", "CANCELLED")))))));
             List<Document> pipeline = List.of(new Document("$match", new Document("clusterId", clusterId)),
                     new Document("$project", new Document("rows", new Document("$concatArrays", List.of(List.of("$$ROOT"),
@@ -98,6 +98,9 @@ public final class MongoClusterRecoveryStore implements ClusterRecoveryStore {
             MongoClusterCapacityStore.Context context = capacity.guard(session, event.key(), event.targetProfile(), event.intentFingerprint(), true);
             if (context.outcome() != ClusterCapacityStore.Outcome.APPLIED) {
                 return result(mutation(context.outcome()), null);
+            }
+            if (capacity.hasPendingOriginalResume(context, event.originalExecutionGeneration())) {
+                return result(ClusterRecoveryMutation.STALE_EXECUTION, null);
             }
             Document current = queue.find(session, new Document("_id", ClusterRecoveryDocuments.id(event.key()))).first();
             if (current != null) {

@@ -287,7 +287,59 @@ public final class Engine {
      * topology, so the source re-reads its start position from the store rather than a Jet snapshot.
      */
     public void resume(String pipelineId) {
-        requireJob(pipelineId).resume();
+        Job job = requireJob(pipelineId);
+        Long claim = job.getConfig().getArgument(NativeExecutionStartup.CLAIM_ARGUMENT);
+        Long execution = job.getConfig().getArgument(NativeExecutionStartup.EXECUTION_ARGUMENT);
+        Long profile = job.getConfig().getArgument(NativeExecutionStartup.PROFILE_ARGUMENT);
+        if (claim == null && execution == null && profile == null) {
+            job.resume();
+            return;
+        }
+        NativeExecutionStartup.Evidence evidence = NativeExecutionStartup.read(member, pipelineId).orElse(null);
+        String previousRuntime = evidence == null ? null : evidence.runtimeExecutionId() != null
+                ? evidence.runtimeExecutionId() : evidence.previousRuntimeExecutionId();
+        if (claim == null || execution == null || profile == null || evidence == null
+                || previousRuntime == null) {
+            throw resumeRefused(pipelineId, "native-resume-evidence", "a complete fenced native iteration",
+                    evidence == null ? "unobserved" : String.valueOf(evidence.runtimeExecutionId()));
+        }
+        resume(pipelineId, Long.toUnsignedString(job.getId()), claim, execution, profile, previousRuntime);
+    }
+
+    /** Resumes only the captured native iteration, retaining its job and product execution generation. */
+    public synchronized void resume(String pipelineId, String expectedJobId, long expectedClaim,
+            long expectedExecution, long expectedProfile, String previousRuntimeExecutionId) {
+        Objects.requireNonNull(expectedJobId, "expectedJobId");
+        Objects.requireNonNull(previousRuntimeExecutionId, "previousRuntimeExecutionId");
+        Job job = requireJob(pipelineId);
+        if (!expectedJobId.equals(Long.toUnsignedString(job.getId()))
+                || !matchesExecution(job, expectedClaim, expectedExecution, expectedProfile)) {
+            throw resumeRefused(pipelineId, "native-resume-job", expectedJobId + ":" + expectedClaim + ":"
+                    + expectedExecution + ":" + expectedProfile, Long.toUnsignedString(job.getId()));
+        }
+        NativeExecutionStartup.Evidence evidence = NativeExecutionStartup.read(member, pipelineId).orElse(null);
+        if (!NativeExecutionStartup.matchesResume(evidence, expectedJobId, expectedClaim,
+                expectedExecution, expectedProfile, previousRuntimeExecutionId)) {
+            throw resumeRefused(pipelineId, "native-resume-evidence", previousRuntimeExecutionId,
+                    evidence == null ? "unobserved" : String.valueOf(evidence.runtimeExecutionId()));
+        }
+        // A retry observes the invocation already in progress. It neither clears the new callbacks nor
+        // asks a running job to resume again; the caller still needs actual initialization evidence.
+        if (job.getStatus() != JobStatus.SUSPENDED) { return; }
+        NativeExecutionStartup.ResumeState reset = NativeExecutionStartup.prepareResume(member, pipelineId,
+                expectedJobId, expectedClaim, expectedExecution, expectedProfile, previousRuntimeExecutionId);
+        if (reset == NativeExecutionStartup.ResumeState.REFUSED) {
+            throw resumeRefused(pipelineId, "native-resume-evidence", previousRuntimeExecutionId,
+                    "the suspended iteration was not initialized under this exact fence");
+        }
+        if (reset != NativeExecutionStartup.ResumeState.ALREADY_RESUMED && job.getStatus() == JobStatus.SUSPENDED) {
+            job.resume();
+        }
+    }
+
+    private static TapstateException resumeRefused(String pipeline, String reason, String planned, String actual) {
+        return new TapstateException(EngineError.EXECUTION_COHORT_CHANGED_BEFORE_START,
+                Map.of("pipeline", pipeline, "reason", reason, "planned", planned, "actual", actual), null);
     }
 
     /**
@@ -309,6 +361,25 @@ public final class Engine {
             job.cancel();
         }
         JobFailureRegistry.of(member).clear(pipelineId);
+    }
+
+    /**
+     * Cancels and awaits one captured job reference. A different job under the name is left alone;
+     * native absence does not prove that the stopped execution's cached store authority has retired.
+     */
+    public boolean cancelAndAwaitTerminal(String pipelineId, String expectedJobId, long expectedClaim,
+            long expectedExecution, long expectedProfile, Duration budget) {
+        Objects.requireNonNull(expectedJobId, "expectedJobId");
+        Objects.requireNonNull(budget, "budget");
+        if (isLost()) { return false; }
+        Job captured = jobNamed(pipelineId);
+        if (captured == null) { return !isLost(); }
+        if (!expectedJobId.equals(Long.toUnsignedString(captured.getId()))
+                || !matchesExecution(captured, expectedClaim, expectedExecution, expectedProfile)) {
+            return false;
+        }
+        if (!captured.getStatus().isTerminal()) { captured.cancel(); }
+        return awaitTerminal(captured, budget);
     }
 
     /**
@@ -348,6 +419,10 @@ public final class Engine {
         if (job == null) {
             return true;
         }
+        return awaitTerminal(job, budget);
+    }
+
+    private static boolean awaitTerminal(Job job, Duration budget) {
         try {
             job.getFuture().toCompletableFuture().get(budget.toMillis(), TimeUnit.MILLISECONDS);
             return true;

@@ -11,6 +11,7 @@ import io.tapstate.core.lifecycle.CasOutcome;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.StateStore;
+import io.tapstate.spi.store.PendingPipelineResume;
 import org.bson.Document;
 
 import java.time.Instant;
@@ -41,7 +42,7 @@ public final class MongoStateStore implements StateStore {
     private final MongoCollection<Document> collection;
 
     public MongoStateStore(MongoCollection<Document> collection) {
-        this.collection = Objects.requireNonNull(collection, "collection");
+        this.collection = MongoClusterCapacityStore.durable(collection);
     }
 
     @Override
@@ -78,15 +79,41 @@ public final class MongoStateStore implements StateStore {
 
     @Override
     public CasOutcome compareAndSwap(String pipelineId, long expectedEpoch, String nextStateJson, Instant touchTime) {
+        return compareAndSwap(pipelineId, expectedEpoch, nextStateJson, touchTime, null);
+    }
+
+    @Override
+    public Optional<PendingPipelineResume> pendingResume(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        return StoreIo.call(() -> PendingPipelineResumeDocuments.current(collection.find(new Document("_id", pipelineId)).first()));
+    }
+
+    @Override
+    public CasOutcome compareAndSwap(String pipelineId, long expectedEpoch, String nextStateJson, Instant touchTime,
+            PendingPipelineResume pendingResume) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(nextStateJson, "nextStateJson");
         Objects.requireNonNull(touchTime, "touchTime");
         // The atomic fence: swap the state and bump the epoch only where the stored epoch still equals
         // the writer's expectation. This is the sole legal transition write.
         Document filter = new Document("_id", pipelineId).append("epoch", expectedEpoch);
+        if (pendingResume != null) {
+            if (!pipelineId.equals(pendingResume.originalClaim().key().resourceId())
+                    || pendingResume.stateEpoch() != Math.addExact(expectedEpoch, 1L)
+                    || !"RUNNING".equals(nextStateJson) || pendingResume.reservationId() != null) {
+                throw new IllegalArgumentException("resume marker must name the accepted unallocated RUNNING transition");
+            }
+            filter.append("stateJson", "PAUSED");
+        }
         Document update = new Document("$set",
                 new Document("stateJson", nextStateJson).append("touchMillis", touchTime.toEpochMilli()))
                 .append("$inc", new Document("epoch", 1L));
+        if (pendingResume == null) {
+            update.append("$unset", new Document(PendingPipelineResumeDocuments.FIELD, ""));
+        } else {
+            update.get("$set", Document.class).append(PendingPipelineResumeDocuments.FIELD,
+                    PendingPipelineResumeDocuments.document(pendingResume));
+        }
         Document applied = StoreIo.call(() -> collection.findOneAndUpdate(filter, update, RETURN_AFTER));
         if (applied != null) {
             return new CasOutcome.Applied(toCheckpoint(applied));

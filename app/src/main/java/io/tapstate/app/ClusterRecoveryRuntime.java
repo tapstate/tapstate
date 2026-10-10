@@ -55,7 +55,12 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
     private WorkloadClaim recoveryClaim;
 
     private record Allocation(DagSource.PlanningFacts facts, ClusterExecutionProfile profile,
-            ClusterRecoveryKey key, ClusterCapacityReservation capacity, boolean recovery) { }
+            ClusterRecoveryKey key, ClusterCapacityReservation capacity, boolean recovery, PendingPipelineResume resume) {
+        Allocation(DagSource.PlanningFacts facts, ClusterExecutionProfile profile,
+                ClusterRecoveryKey key, ClusterCapacityReservation capacity, boolean recovery) {
+            this(facts, profile, key, capacity, recovery, null);
+        }
+    }
     private record FailedExecution(long executionGeneration, WorkloadClaimFence authority, ClusterRecoveryDiagnostic diagnostic,
             CaptureStartupFailure sourceFailure, Throwable executionCause) {
         boolean belongsTo(WorkloadClaim claim) {
@@ -96,6 +101,7 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
         WorkloadClaim current = actuation.currentClaim(pipelineId).orElse(null);
         if (current == null) { return false; }
         if (current.executionGeneration() == 0) { return true; }
+        if (pendingResume(pipelineId).isPresent()) { return true; }
         Allocation local = allocations.get(pipelineId);
         // A start waiting for a shared ring resumes its already allocated, still-owned ordinary step.
         if (local != null && !local.recovery() && local.capacity().executionGeneration() != null
@@ -133,28 +139,39 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
                 || current.profileGeneration() != profile.generation()) { return false; }
         ClusterRecoveryKey key = new ClusterRecoveryKey(properties.getId(), pipelineId, artifact.incarnation());
         ClusterRecoveryItem item = stores.clusterRecovery().read(key).orElse(null);
+        PendingPipelineResume resume = pendingResume(pipelineId).orElse(null);
+        ClusterCapacityReservation resumedCapacity = resume == null ? null
+                : stores.clusterCapacity().resumeReservation(resume).orElse(null);
         Allocation pending = allocations.get(pipelineId);
-        boolean pendingCapacity = pendingCapacity(pending, current);
+        boolean pendingCapacity = pendingCapacity(pending, current) || (resumedCapacity != null
+                && resumedCapacity.executionGeneration() != null && resumedCapacity.nativeJobId() == null
+                && resumedCapacity.executionGeneration() == current.executionGeneration());
         boolean pendingRecovery = pendingRecovery(item, current);
         if (pendingCapacity || pendingRecovery) {
             Set<String> frozen = current.executionNodeIds();
             Set<String> proposed = facts.perMemberUpperBounds().keySet();
             if (!frozen.equals(proposed)) { throw changedCohort(pipelineId, frozen, proposed); }
+            requirePendingCohort(pipelineId, current);
             Map<String, io.tapstate.core.lifecycle.ClusterCapacityDemand> frozenDemand = pendingCapacity
-                    ? pending.capacity().demandByNode() : item.permit().demandByNode();
+                    ? resumedCapacity != null ? resumedCapacity.demandByNode() : pending.capacity().demandByNode()
+                    : item.permit().demandByNode();
             if (!frozenDemand.equals(facts.perMemberUpperBounds())) {
                 throw unproven(pipelineId, "the allocated resource demand differs from the compiled start");
             }
         }
         if (item != null && !item.status().terminal()
-                && item.event().intentFingerprint().equals(DesiredStateFingerprint.of(intent))) {
+                && item.event().intentFingerprint().equals(DesiredStateFingerprint.of(intent))
+                && (resume == null || item.event().originalExecutionGeneration() > resume.originalClaim().executionGeneration())) {
             if (item.permit() == null || !item.permit().demandByNode().equals(facts.perMemberUpperBounds())
                     || !item.targetProfile().equals(profile)) { return false; }
             allocations.put(pipelineId, new Allocation(facts, profile, key, null, true));
             return true;
         }
-        ClusterCapacityStore.Result reserved = stores.clusterCapacity().reserve(current, profile, artifact.incarnation(),
-                DesiredStateFingerprint.of(intent), facts.perMemberUpperBounds(), limits, properties.getWorkloadClaimTtl());
+        ClusterCapacityStore.Result reserved = resume == null
+                ? stores.clusterCapacity().reserve(current, profile, artifact.incarnation(),
+                        DesiredStateFingerprint.of(intent), facts.perMemberUpperBounds(), limits, properties.getWorkloadClaimTtl())
+                : stores.clusterCapacity().reserveResume(resume, current, profile, artifact.incarnation(),
+                        DesiredStateFingerprint.of(intent), facts.perMemberUpperBounds(), limits, properties.getWorkloadClaimTtl());
         if (reserved.outcome() == ClusterCapacityStore.Outcome.CAPACITY_REFUSED) {
             var violation = reserved.violations().getFirst();
             throw new TapstateException(LifecycleError.CLUSTER_CAPACITY_REFUSED,
@@ -167,7 +184,7 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
         }
         if (reserved.reservation() == null || (reserved.outcome() != ClusterCapacityStore.Outcome.APPLIED
                 && reserved.outcome() != ClusterCapacityStore.Outcome.ALREADY_RESERVED)) { return false; }
-        allocations.put(pipelineId, new Allocation(facts, profile, key, reserved.reservation(), false));
+        allocations.put(pipelineId, new Allocation(facts, profile, key, reserved.reservation(), false, resume));
         return true;
     }
 
@@ -181,32 +198,79 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
                 && !current.executionNodeIds().equals(membership.visibleNodeIds())) {
             throw changedCohort(pipelineId, current.executionNodeIds(), membership.visibleNodeIds());
         }
-        return ownership.beginExecution(pipelineId, (expected, topology, nodes) -> {
-            if (!nodes.equals(allocation.facts().perMemberUpperBounds().keySet())) { return Optional.empty(); }
-            if (allocation.recovery()) {
-                ClusterRecoveryItem item = stores.clusterRecovery().read(allocation.key()).orElse(null);
+        if (pendingExecution(pipelineId).isPresent() && current != null) {
+            requirePendingCohort(pipelineId, current);
+        }
+        WorkloadClaim qualifiedClaim = null;
+        if (allocation.resume() != null && allocation.capacity().executionGeneration() != null) {
+            ArtifactIdentity artifact = stores.artifacts().identity(pipelineId).orElse(null);
+            DesiredState intent = stores.desired().read(pipelineId).orElse(null);
+            if (current == null || artifact == null || intent == null) { return PipelineActuationOwnership.Execution.refused(); }
+            var checked = stores.clusterCapacity().reserveResume(allocation.resume(), current, allocation.profile(),
+                    artifact.incarnation(), DesiredStateFingerprint.of(intent), allocation.facts().perMemberUpperBounds(),
+                    limits, properties.getWorkloadClaimTtl());
+            if (checked.outcome() == ClusterCapacityStore.Outcome.UNKNOWN_DEMAND) {
+                throw unproven(pipelineId, "the accepted allocated resume cannot be qualified for submission");
+            }
+            if (checked.reservation() == null || (checked.outcome() != ClusterCapacityStore.Outcome.APPLIED
+                    && checked.outcome() != ClusterCapacityStore.Outcome.ALREADY_RESERVED)) {
+                return PipelineActuationOwnership.Execution.refused();
+            }
+            var selected = stores.clusterCapacity().resumeSourceRequirements(allocation.resume());
+            if (selected.isPresent() && !selected.orElseThrow().equals(allocation.facts().selectedSourceIds())) {
+                throw unproven(pipelineId, "the allocated resume's frozen source selection differs from its compiled start");
+            }
+            allocation = new Allocation(allocation.facts(), allocation.profile(), allocation.key(), checked.reservation(),
+                    false, allocation.resume());
+            allocations.put(pipelineId, allocation);
+            qualifiedClaim = checked.advancedPipelineClaim();
+        }
+        Allocation admitted = allocation;
+        WorkloadClaim adopted = qualifiedClaim;
+        PipelineActuationOwnership.Execution execution = ownership.beginExecution(pipelineId, (expected, topology, nodes) -> {
+            if (!nodes.equals(admitted.facts().perMemberUpperBounds().keySet())) { return Optional.empty(); }
+            if (admitted.recovery()) {
+                ClusterRecoveryItem item = stores.clusterRecovery().read(admitted.key()).orElse(null);
                 if (item == null || item.permit() == null) { return Optional.empty(); }
                 if (item.hasAllocatedSuccessor() && item.successor().pipelineClaim().sameAuthorityAs(WorkloadClaimFence.from(expected))
                         && item.successor().submittedAt() == null) { return Optional.of(expected); }
                 var advanced = stores.clusterRecovery().advanceExecution(fence(item), expected, nodes,
-                        allocation.facts().selectedSourceIds()).advancedPipelineClaim();
+                        admitted.facts().selectedSourceIds()).advancedPipelineClaim();
                 if (advanced != null) { forgetFailure(pipelineId); }
                 return Optional.ofNullable(advanced);
             }
-            ClusterCapacityReservation reservation = allocation.capacity();
+            ClusterCapacityReservation reservation = admitted.capacity();
             if (reservation.executionGeneration() != null) {
                 return reservation.executionGeneration() == expected.executionGeneration()
                         && reservation.pipelineClaim().sameAuthorityAs(WorkloadClaimFence.from(expected))
-                        && reservation.nativeJobId() == null ? Optional.of(expected) : Optional.empty();
+                        && reservation.nativeJobId() == null ? Optional.ofNullable(adopted == null ? expected : adopted) : Optional.empty();
             }
             ClusterCapacityStore.Result advanced = stores.clusterCapacity().advanceExecution(reservation, expected, nodes);
             if (advanced.reservation() != null) {
-                allocations.put(pipelineId, new Allocation(allocation.facts(), allocation.profile(), allocation.key(),
-                        advanced.reservation(), false));
+                allocations.put(pipelineId, new Allocation(admitted.facts(), admitted.profile(), admitted.key(),
+                        advanced.reservation(), false, admitted.resume()));
             }
             if (advanced.advancedPipelineClaim() != null) { forgetFailure(pipelineId); }
             return Optional.ofNullable(advanced.advancedPipelineClaim());
         });
+        if (execution.allowed() && !admitted.recovery()) {
+            Allocation allocated = allocations.get(pipelineId);
+            WorkloadClaim held = ownership.currentClaim(pipelineId).orElse(null);
+            if (allocated == null || held == null) { return PipelineActuationOwnership.Execution.refused(); }
+            var recorded = allocated.resume() == null
+                    ? stores.clusterCapacity().recordExecutionSources(allocated.capacity(), WorkloadClaimFence.from(held),
+                            allocated.facts().selectedSourceIds())
+                    : stores.clusterCapacity().recordResumeSources(allocated.resume(), allocated.capacity(), WorkloadClaimFence.from(held),
+                            allocated.facts().selectedSourceIds());
+            if (recorded.outcome() == ClusterCapacityStore.Outcome.UNKNOWN_DEMAND) {
+                throw unproven(pipelineId, "the execution's compiled source selection cannot be durably qualified");
+            }
+            if (recorded.outcome() != ClusterCapacityStore.Outcome.APPLIED
+                    && recorded.outcome() != ClusterCapacityStore.Outcome.ALREADY_RESERVED) {
+                return PipelineActuationOwnership.Execution.refused();
+            }
+        }
+        return execution;
     }
 
     @Override public void guard(String pipelineId, PipelineActuationOwnership.Execution execution, DAG dag) {
@@ -228,7 +292,7 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
             var submitted = stores.clusterCapacity().submitted(allocation.capacity(), WorkloadClaimFence.from(claim), nativeJobId);
             if (submitted.reservation() != null) {
                 allocations.put(pipelineId, new Allocation(allocation.facts(), allocation.profile(), allocation.key(),
-                        submitted.reservation(), false));
+                        submitted.reservation(), false, allocation.resume()));
             }
         }
     }
@@ -309,9 +373,12 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
                 || current.executionClaimGeneration() != current.claimGeneration()) { return Optional.empty(); }
         Allocation local = allocations.get(pipelineId);
         if (!pendingCapacity(local, current)) {
+            boolean resumed = pendingResume(pipelineId)
+                    .flatMap(stores.clusterCapacity()::resumeReservation)
+                    .filter(capacity -> pendingResumeCapacity(capacity, current)).isPresent();
             ClusterRecoveryItem queued = local != null && local.recovery()
                     ? stores.clusterRecovery().read(local.key()).orElse(null) : item(pipelineId).orElse(null);
-            if (!pendingRecovery(queued, current)) { return Optional.empty(); }
+            if (!resumed && !pendingRecovery(queued, current)) { return Optional.empty(); }
         }
         return Optional.of(new PipelineActuationOwnership.Execution(true,
                 new ExecutionFence(pipelineId, current.claimGeneration(), current.executionGeneration(), current.profileGeneration()),
@@ -325,6 +392,163 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
                 && allocation.capacity().pipelineClaim().sameAuthorityAs(WorkloadClaimFence.from(current));
     }
 
+    private static boolean pendingResumeCapacity(ClusterCapacityReservation capacity, WorkloadClaim current) {
+        return current != null && capacity != null && capacity.executionGeneration() != null && capacity.nativeJobId() == null
+                && capacity.executionGeneration() == current.executionGeneration()
+                && capacity.pipelineClaim().sameAuthorityAs(WorkloadClaimFence.from(current));
+    }
+
+    @Override public Optional<PendingPipelineResume> prepareResume(
+            String pipelineId, DesiredState intent, long acceptedStateEpoch) {
+        if (!active()) { return Optional.empty(); }
+        WorkloadClaim current = actuation.currentClaim(pipelineId).orElse(null);
+        var nativeRun = engine.nativeRun(pipelineId).orElse(null);
+        ClusterExecutionProfile profile = stores.clusterProfiles().profile(properties.getId()).orElse(null);
+        ArtifactIdentity artifact = stores.artifacts().identity(pipelineId).orElse(null);
+        if (current == null || nativeRun == null || profile == null || artifact == null
+                || intent.targetState() != PipelineState.RUNNING || !artifact.contentHash().equals(intent.revision())
+                || !artifact.incarnation().equals(current.executionIncarnation())
+                || current.executionProfile() == null || !profile.equals(current.executionProfile())
+                || current.contextExecutionGeneration() != current.executionGeneration()
+                || current.executionClaimGeneration() != current.claimGeneration()
+                || current.executionMembers().isEmpty() || !matchesNative(nativeRun, WorkloadClaimFence.from(current))
+                || !nativeRun.initialized() || !nativeMembersMatch(nativeRun, current)
+                || !actuation.proveExecution(new ExecutionFence(pipelineId, current.claimGeneration(),
+                        current.executionGeneration(), current.profileGeneration()))) {
+            throw unproven(pipelineId, "the paused native execution's original authority and member context are unproven");
+        }
+        return Optional.of(new PendingPipelineResume(acceptedStateEpoch, DesiredStateFingerprint.of(intent), current,
+                nativeRun.nativeJobId(), nativeRun.initialization().orElseThrow().runtimeExecutionId()));
+    }
+
+    @Override public Optional<PendingPipelineResume> pendingResume(String pipelineId) {
+        if (!active()) { return Optional.empty(); }
+        DesiredState intent = stores.desired().read(pipelineId).orElse(null);
+        ArtifactIdentity artifact = stores.artifacts().identity(pipelineId).orElse(null);
+        ClusterExecutionProfile profile = stores.clusterProfiles().profile(properties.getId()).orElse(null);
+        if (intent == null || artifact == null || profile == null || intent.targetState() != PipelineState.RUNNING
+                || !artifact.contentHash().equals(intent.revision())) { return Optional.empty(); }
+        return stores.state().pendingResume(pipelineId)
+                .filter(receipt -> receipt.originalClaim().key().clusterId().equals(properties.getId())
+                        && receipt.originalClaim().key().resourceId().equals(pipelineId)
+                        && receipt.intentFingerprint().equals(DesiredStateFingerprint.of(intent))
+                        && receipt.originalClaim().executionIncarnation().equals(artifact.incarnation())
+                        && profile.equals(receipt.originalClaim().executionProfile()));
+    }
+
+    @Override public boolean acceptsPendingResume(PendingPipelineResume receipt) {
+        return pendingResume(receipt.originalClaim().key().resourceId()).filter(receipt::sameRequestAs).isPresent();
+    }
+
+    @Override public ResumeDisposition resumeDisposition(PendingPipelineResume receipt, boolean loadDelivered) {
+        String pipeline = receipt.originalClaim().key().resourceId();
+        if (!acceptsPendingResume(receipt) || !membership.businessEligible()) { return ResumeDisposition.WAIT; }
+        if (resumeCompleted(receipt)) { return ResumeDisposition.WAIT; }
+        if (!membership.submissionEligible(member.getCluster().getMembers())) { return ResumeDisposition.WAIT; }
+        var nativeRun = engine.nativeRun(pipeline).orElse(null);
+        WorkloadClaim current = actuation.currentClaim(pipeline).orElse(null);
+        ClusterCapacityReservation linked = stores.clusterCapacity().resumeReservation(receipt).orElse(null);
+        if (linked != null && linked.executionGeneration() != null && nativeRun != null
+                && matchesNative(nativeRun, linked.pipelineClaim())) {
+            if (current == null || !linked.pipelineClaim().sameAuthorityAs(WorkloadClaimFence.from(current))) {
+                if (current != null && stores.clusterCapacity().resumeAuthorityRetired(receipt, current, linked.pipelineClaim())) {
+                    throw unproven(pipeline, "the linked resume was submitted under a different native authority");
+                }
+                return ResumeDisposition.WAIT;
+            }
+            if (linked.nativeJobId() == null && current != null
+                    && linked.pipelineClaim().sameAuthorityAs(WorkloadClaimFence.from(current))) {
+                stores.clusterCapacity().submitted(linked, WorkloadClaimFence.from(current), nativeRun.nativeJobId());
+            }
+            return ResumeDisposition.WAIT;
+        }
+        if (nativeRun != null && receipt.originalNativeJobId().equals(nativeRun.nativeJobId())
+                && matchesNative(nativeRun, WorkloadClaimFence.from(receipt.originalClaim()))
+                && (nativeRun.status() == JobStatus.SUSPENDED || nativeRun.status() == JobStatus.RUNNING)) {
+            DesiredState intent = stores.desired().read(pipeline).orElseThrow();
+            boolean sameAuthority = current != null
+                    && WorkloadClaimFence.from(receipt.originalClaim()).sameAuthorityAs(WorkloadClaimFence.from(current));
+            boolean sameCohort = receipt.originalClaim().executionMembers().equals(completeLiveMembers(pipeline));
+            if (loadDelivered && !intent.reassemble() && sameAuthority && sameCohort) {
+                if (!actuation.proveExecution(new ExecutionFence(pipeline, current.claimGeneration(),
+                        current.executionGeneration(), current.profileGeneration()))) { return ResumeDisposition.WAIT; }
+                String observed = nativeRun.initialization().map(value -> value.runtimeExecutionId()).orElse(null);
+                return nativeRun.status() == JobStatus.SUSPENDED || receipt.originalRuntimeExecutionId().equals(observed)
+                        ? ResumeDisposition.HELD : ResumeDisposition.WAIT;
+            }
+            return ResumeDisposition.RECOMPILE;
+        }
+        if (nativeRun != null && nativeRun.status() != JobStatus.FAILED && nativeRun.status() != JobStatus.COMPLETED) {
+            throw unproven(pipeline, "a different native execution is already carrying the accepted resume");
+        }
+        return ResumeDisposition.START;
+    }
+
+    @Override public boolean resumeCompleted(PendingPipelineResume receipt) {
+        String pipeline = receipt.originalClaim().key().resourceId();
+        if (!acceptsPendingResume(receipt) || !membership.businessEligible()) { return false; }
+        WorkloadClaim current = actuation.currentClaim(pipeline).orElse(null);
+        var nativeRun = engine.nativeRun(pipeline).orElse(null);
+        if (current == null || nativeRun == null || !nativeRun.initialized()
+                || (nativeRun.status() != JobStatus.RUNNING && nativeRun.status() != JobStatus.COMPLETED)
+                || !matchesNative(nativeRun, WorkloadClaimFence.from(current)) || !nativeMembersMatch(nativeRun, current)
+                || !actuation.proveExecution(new ExecutionFence(pipeline, current.claimGeneration(),
+                        current.executionGeneration(), current.profileGeneration()))) { return false; }
+        ClusterCapacityReservation linked = stores.clusterCapacity().resumeReservation(receipt).orElse(null);
+        if (linked == null) {
+            if (!receipt.originalNativeJobId().equals(nativeRun.nativeJobId())
+                    || !WorkloadClaimFence.from(receipt.originalClaim()).sameAuthorityAs(WorkloadClaimFence.from(current))
+                    || receipt.originalRuntimeExecutionId().equals(nativeRun.initialization().orElseThrow().runtimeExecutionId())) {
+                return false;
+            }
+        } else {
+            if (linked.executionGeneration() == null || linked.executionGeneration() != current.executionGeneration()
+                    || !linked.pipelineClaim().sameAuthorityAs(WorkloadClaimFence.from(current))) { return false; }
+            if (linked.nativeJobId() == null) {
+                var submitted = stores.clusterCapacity().submitted(linked, WorkloadClaimFence.from(current), nativeRun.nativeJobId());
+                linked = submitted.reservation();
+            }
+            if (linked == null || !nativeRun.nativeJobId().equals(linked.nativeJobId())) { return false; }
+        }
+        WorkloadClaimFence fence = WorkloadClaimFence.from(current);
+        Optional<Set<String>> selected = stores.clusterCapacity().resumeSourceRequirements(receipt);
+        if (selected.isEmpty() && linked == null) {
+            selected = item(pipeline).filter(item -> item.hasAllocatedSuccessor()
+                            && item.successor().executionGeneration() == receipt.originalClaim().executionGeneration()
+                            && item.successor().pipelineClaim().sameAuthorityAs(WorkloadClaimFence.from(receipt.originalClaim()))
+                            && item.successor().sourceRequirementsRecorded())
+                    .map(item -> item.successor().requiredSourceIds());
+        }
+        if (selected.isEmpty()) { throw unproven(pipeline, "the resumed execution's frozen compiled source selection is absent"); }
+        Set<String> sources = selected.orElseThrow();
+        return captures.requiredSources(pipeline, fence).equals(sources)
+                && captures.startupProofs(pipeline, fence).keySet().equals(sources);
+    }
+
+    private static boolean matchesNative(Engine.NativeRun run, WorkloadClaimFence fence) {
+        return run.claimGeneration() == fence.claimGeneration() && run.executionGeneration() == fence.executionGeneration()
+                && run.profileGeneration() == fence.profileGeneration();
+    }
+
+    private static boolean nativeMembersMatch(Engine.NativeRun run, WorkloadClaim claim) {
+        if (!run.initialized() || claim.contextExecutionGeneration() != claim.executionGeneration()
+                || claim.executionClaimGeneration() != run.claimGeneration() || claim.executionMembers().isEmpty()) { return false; }
+        Map<String, ClusterExecutionMember> observed = new LinkedHashMap<>();
+        for (var processor : run.initialization().orElseThrow().processors().values()) {
+            if (processor.nodeId() == null || processor.bootId() == null || processor.memberUuid() == null
+                    || processor.memberCount() != claim.executionMembers().size()
+                    || !processor.jobId().equals(run.nativeJobId())
+                    || !processor.runtimeExecutionId().equals(run.initialization().orElseThrow().runtimeExecutionId())
+                    || processor.claimGeneration() != run.claimGeneration()
+                    || processor.executionGeneration() != run.executionGeneration()
+                    || processor.profileGeneration() != run.profileGeneration()) { return false; }
+            ClusterExecutionMember identity = new ClusterExecutionMember(processor.nodeId(), processor.bootId(), processor.memberUuid());
+            ClusterExecutionMember previous = observed.putIfAbsent(identity.nodeId(), identity);
+            if (previous != null && !previous.equals(identity)) { return false; }
+        }
+        return observed.equals(claim.executionMembers());
+    }
+
     private static boolean pendingRecovery(ClusterRecoveryItem item, WorkloadClaim current) {
         return current != null && item != null && !item.status().terminal() && item.hasAllocatedSuccessor()
                 && item.successor().submittedAt() == null
@@ -335,6 +559,40 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
         return new TapstateException(EngineError.EXECUTION_COHORT_CHANGED_BEFORE_START,
                 Map.of("pipeline", pipeline, "reason", "live-membership", "planned", original.stream().sorted().toList().toString(),
                         "actual", actual.stream().sorted().toList().toString()), null);
+    }
+
+    private void requirePendingCohort(String pipelineId, WorkloadClaim current) {
+        if (current.executionMembers().isEmpty()
+                || current.contextExecutionGeneration() != current.executionGeneration()) {
+            throw unproven(pipelineId, "the allocated execution's original member identities are absent");
+        }
+        Map<String, ClusterExecutionMember> live = completeLiveMembers(pipelineId);
+        if (!current.executionMembers().equals(live)) {
+            var byNode = java.util.Comparator.comparing(ClusterExecutionMember::nodeId);
+            throw new TapstateException(EngineError.EXECUTION_COHORT_CHANGED_BEFORE_START,
+                    Map.of("pipeline", pipelineId, "reason", "member-incarnation",
+                            "planned", current.executionMembers().values().stream().sorted(byNode).toList().toString(),
+                            "actual", live.values().stream().sorted(byNode).toList().toString()), null);
+        }
+    }
+
+    private Map<String, ClusterExecutionMember> completeLiveMembers(String pipelineId) {
+        Map<String, ClusterExecutionMember> live = new LinkedHashMap<>();
+        for (var peer : member.getCluster().getMembers()) {
+            if (peer.isLiteMember()) { continue; }
+            String node = peer.getAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE);
+            String boot = peer.getAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE);
+            if (node == null || node.isBlank() || boot == null || boot.isBlank() || peer.getUuid() == null) {
+                throw unproven(pipelineId, "a live data member has incomplete runtime identity");
+            }
+            if (live.putIfAbsent(node, new ClusterExecutionMember(node, boot, peer.getUuid().toString())) != null) {
+                throw unproven(pipelineId, "live data members have duplicate stable node identity");
+            }
+        }
+        if (!live.keySet().equals(membership.visibleNodeIds())) {
+            throw unproven(pipelineId, "the live member identities differ from the eligible member view");
+        }
+        return Map.copyOf(live);
     }
 
     @Override public void stopped(String pipelineId, WorkloadClaim stoppedClaim, boolean jobOver) {
@@ -414,6 +672,8 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
         WorkloadClaim execution = stores.workloadClaims().read(new WorkloadClaimKey(properties.getId(),
                 WorkloadClaimType.PIPELINE_ACTUATION, pipeline)).map(WorkloadClaimReading::claim).orElse(null);
         if (desired == null || checkpoint == null || artifact == null || execution == null) { return; }
+        if (pendingResume(pipeline).filter(receipt -> receipt.originalClaim().executionGeneration()
+                == execution.executionGeneration()).isPresent()) { return; }
         var cause = PipelineRecoveryDiscovery.cause(desired, StateJson.parse(checkpoint.stateJson()), artifact, execution,
                 profile, engine.hasLiveJob(pipeline), execution.originalMembersPresent(live).filter(present -> !present).isPresent());
         if (cause.isEmpty()) { return; }
@@ -431,6 +691,10 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
         if (artifact == null) { stores.clusterRecovery().removeDeleted(expected); return; }
         if (!artifact.incarnation().equals(item.event().key().incarnation()) || desired == null
                 || !DesiredStateFingerprint.of(desired).equals(item.event().intentFingerprint())) {
+            stores.clusterRecovery().cancel(expected); return;
+        }
+        PendingPipelineResume explicit = pendingResume(item.event().key().pipelineId()).orElse(null);
+        if (explicit != null && item.executionAliases().contains(explicit.originalClaim().executionGeneration())) {
             stores.clusterRecovery().cancel(expected); return;
         }
         // A compatible addition does not replace an already successful native execution. Consume its

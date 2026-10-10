@@ -2,11 +2,13 @@ package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.ExecutionPlan;
+import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.NodeParallelism;
 import io.tapstate.core.model.BatchSpec;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.PendingPipelineResume;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -40,8 +42,8 @@ import java.util.Set;
  *       here would have the state dropped by the next start of a pipeline nobody asked to clear.</li>
  *   <li>{@code pause} / {@code resume} are engine-only once the initial load has reached the target: the
  *       capture keeps running while a pipeline is paused, held back by the ring's headroom backpressure,
- *       and a resume replays the buffered ring. A load still undelivered is the one case that cannot be
- *       resumed in place, and it rebuilds instead.</li>
+ *       and a resume replays the buffered ring. An undelivered load or changed native member cohort
+ *       requires an ordinary rebuild that keeps positions.</li>
  * </ul>
  */
 final class EngineLifecycleActuator implements LifecycleActuator {
@@ -273,12 +275,57 @@ final class EngineLifecycleActuator implements LifecycleActuator {
      */
     @Override
     public void resume(String pipelineId) {
+        Optional<PendingPipelineResume> pending = admission.pendingResume(pipelineId);
+        if (pending.isPresent()) {
+            PendingPipelineResume receipt = pending.orElseThrow();
+            switch (admission.resumeDisposition(receipt, captureCoordinator.loadDelivered(pipelineId))) {
+                case WAIT -> { return; }
+                case HELD -> {
+                    WorkloadClaim original = receipt.originalClaim();
+                    engine.resume(pipelineId, receipt.originalNativeJobId(), original.claimGeneration(),
+                            original.executionGeneration(), original.profileGeneration(), receipt.originalRuntimeExecutionId());
+                    return;
+                }
+                case RECOMPILE -> {
+                    if (!stopResumeExecution(pipelineId, receipt)) { return; }
+                }
+                case START -> { }
+            }
+            // Stopping can release PIPE ownership. Re-entry is the existing store-qualified permit,
+            // and the linked ordinary reservation waits for the original authorization horizon.
+            if (actuation.permit(pipelineId).granted()) { start(pipelineId); }
+            return;
+        }
         if (!captureCoordinator.loadDelivered(pipelineId)) {
             stop(pipelineId, false);
             start(pipelineId);
             return;
         }
         engine.resume(pipelineId);
+    }
+
+    @Override public Optional<PendingPipelineResume> prepareResume(
+            String pipelineId, DesiredState intent, long acceptedStateEpoch) {
+        return admission.prepareResume(pipelineId, intent, acceptedStateEpoch);
+    }
+
+    @Override public boolean acceptsPendingResume(PendingPipelineResume receipt) {
+        return admission.acceptsPendingResume(receipt);
+    }
+
+    @Override public boolean resumeCompleted(PendingPipelineResume receipt) {
+        return admission.resumeCompleted(receipt);
+    }
+
+    private boolean stopResumeExecution(String pipelineId, PendingPipelineResume receipt) {
+        WorkloadClaim original = receipt.originalClaim();
+        boolean over = engine.cancelAndAwaitTerminal(pipelineId, receipt.originalNativeJobId(), original.claimGeneration(),
+                original.executionGeneration(), original.profileGeneration(), JOB_TEARDOWN_BUDGET);
+        if (!over) { return false; }
+        if (!engine.isLost()) { plans.forget(pipelineId); }
+        captureCoordinator.stopCapture(pipelineId, false);
+        admission.stopped(pipelineId, original, true);
+        return true;
     }
 
     @Override

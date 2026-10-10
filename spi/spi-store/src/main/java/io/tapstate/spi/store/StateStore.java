@@ -42,6 +42,21 @@ public interface StateStore {
      */
     CasOutcome compareAndSwap(String pipelineId, long expectedEpoch, String nextStateJson, Instant touchTime);
 
+    /** Accepts a resume with its state transition; implementations must persist both atomically. */
+    default CasOutcome compareAndSwap(String pipelineId, long expectedEpoch, String nextStateJson, Instant touchTime,
+            PendingPipelineResume pendingResume) {
+        if (pendingResume != null) {
+            throw new io.tapstate.core.common.TapstateException(IoError.STORE_UNAVAILABLE,
+                    java.util.Map.of("detail", "State store cannot persist an explicit resume atomically"), null);
+        }
+        return compareAndSwap(pipelineId, expectedEpoch, nextStateJson, touchTime);
+    }
+
+    /** Internal accepted resume facts, available only while their exact RUNNING state epoch remains current. */
+    default Optional<PendingPipelineResume> pendingResume(String pipelineId) {
+        return Optional.empty();
+    }
+
     /**
      * Removes a pipeline's checkpoint, discarding its fencing epoch along with it. That discard is the
      * point rather than a side effect: an id whose pipeline is gone must not hand a later pipeline of the

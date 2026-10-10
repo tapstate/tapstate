@@ -13,6 +13,7 @@ import io.tapstate.core.lifecycle.ClusterCapacityLimits;
 import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
+import io.tapstate.core.model.PipelineResource;
 import io.tapstate.spi.store.ClusterCapacityReservation;
 import io.tapstate.spi.store.ClusterCapacityStore;
 import io.tapstate.spi.store.ClusterExecutionProfile;
@@ -23,6 +24,7 @@ import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
+import io.tapstate.spi.store.PendingPipelineResume;
 import org.bson.Document;
 
 import java.time.Duration;
@@ -112,21 +114,279 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
         });
     }
 
+    @Override
+    public java.util.Optional<ClusterCapacityReservation> resumeReservation(PendingPipelineResume expected) {
+        Objects.requireNonNull(expected, "expected");
+        return profileStore.transaction(session -> {
+            Document state = states.find(session, new Document("_id", expected.originalClaim().key().resourceId())).first();
+            PendingPipelineResume pending = PendingPipelineResumeDocuments.current(state).orElse(null);
+            if (pending == null || !pending.sameRequestAs(expected) || pending.reservationId() == null
+                    || (expected.reservationId() != null && !expected.reservationId().equals(pending.reservationId()))) {
+                return java.util.Optional.empty();
+            }
+            Document linked = occupancy.find(session, new Document("_id", pending.reservationId())).first();
+            if (linked == null || !resumeIdentity(linked, pending)) {
+                throw ClusterRecoveryDocuments.unreadable(state, "resumeReservation", null);
+            }
+            return java.util.Optional.of(reservation(linked));
+        });
+    }
+
+    @Override
+    public boolean resumeAuthorityRetired(PendingPipelineResume expected, WorkloadClaim current, WorkloadClaimFence former) {
+        Objects.requireNonNull(expected, "expected");
+        Objects.requireNonNull(current, "current");
+        Objects.requireNonNull(former, "former");
+        return profileStore.transaction(session -> {
+            if (workloadStore.conditionTouchClaim(session, WorkloadClaimFence.from(current)) == null) {
+                return false;
+            }
+            WorkloadClaim original = expected.originalClaim();
+            Context context = guard(session, new ClusterRecoveryKey(original.key().clusterId(), original.key().resourceId(),
+                    original.executionIncarnation()), original.executionProfile(), expected.intentFingerprint(), true);
+            PendingPipelineResume pending = context.outcome == Outcome.APPLIED
+                    ? PendingPipelineResumeDocuments.current(context.actual).orElse(null) : null;
+            if (pending == null || !pending.sameRequestAs(expected) || !resumeContext(pending, context)
+                    || !current.key().equals(original.key()) || current.profileGeneration() != original.profileGeneration()
+                    || (expected.reservationId() != null && !expected.reservationId().equals(pending.reservationId()))) {
+                return false;
+            }
+            boolean recognized = WorkloadClaimFence.from(original).sameAuthorityAs(former);
+            if (!recognized && pending.reservationId() != null) {
+                Document linked = occupancy.find(session, new Document("_id", pending.reservationId())).first();
+                recognized = linked != null && resumeIdentity(linked, pending)
+                        && reservation(linked).pipelineClaim().sameAuthorityAs(former);
+            }
+            return recognized && states.updateOne(session, PendingPipelineResumeDocuments.filter(context.actual),
+                    new Document("$inc", new Document("resumeFenceSerial", 1L))).getMatchedCount() == 1
+                    && workloadStore.provesRetired(session, former);
+        });
+    }
+
+    @Override
+    public java.util.Optional<Set<String>> resumeSourceRequirements(PendingPipelineResume expected) {
+        return profileStore.transaction(session -> {
+            Document state = states.find(session, new Document("_id", expected.originalClaim().key().resourceId())).first();
+            PendingPipelineResume pending = PendingPipelineResumeDocuments.current(state).orElse(null);
+            if (pending == null || !pending.sameRequestAs(expected)
+                    || (expected.reservationId() != null && !expected.reservationId().equals(pending.reservationId()))) {
+                return java.util.Optional.empty();
+            }
+            if (pending.reservationId() == null) {
+                return originalSourceRequirements(session, pending, state);
+            }
+            Document linked = occupancy.find(session, new Document("_id", pending.reservationId())).first();
+            if (linked == null || !resumeIdentity(linked, pending)) {
+                throw ClusterRecoveryDocuments.unreadable(state, "resumeReservation", null);
+            }
+            return sourceRequirements(linked);
+        });
+    }
+
+    private java.util.Optional<Set<String>> originalSourceRequirements(ClientSession session, PendingPipelineResume pending, Document state) {
+        WorkloadClaim original = pending.originalClaim();
+        Document exactOriginal = new Document("clusterId", original.key().clusterId())
+                .append("pipelineId", original.key().resourceId()).append("incarnationId", original.executionIncarnation())
+                .append("executionGeneration", original.executionGeneration()).append("nativeJobId", pending.originalNativeJobId())
+                .append("pipelineClaim.ownerNodeId", original.owner().nodeId()).append("pipelineClaim.ownerBootId", original.owner().bootId())
+                .append("pipelineClaim.claimGeneration", original.claimGeneration())
+                .append("pipelineClaim.executionGeneration", original.executionGeneration())
+                .append("pipelineClaim.profileGeneration", original.profileGeneration());
+        List<Document> rows = occupancy.find(session, exactOriginal).limit(2).into(new ArrayList<>());
+        if (rows.isEmpty()) {
+            return java.util.Optional.empty();
+        }
+        ClusterCapacityReservation prior = reservation(rows.getFirst());
+        if (rows.size() != 1 || !prior.profile().equals(original.executionProfile())
+                || !prior.pipelineClaim().sameAuthorityAs(WorkloadClaimFence.from(original))) {
+            throw ClusterRecoveryDocuments.unreadable(state, "originalResumeReservation", null);
+        }
+        return sourceRequirements(rows.getFirst());
+    }
+
+    @Override
+    public Result recordResumeSources(PendingPipelineResume pending, ClusterCapacityReservation expected,
+            WorkloadClaimFence current, Set<String> selectedSources) {
+        Objects.requireNonNull(pending, "pending");
+        Set<String> requested = Set.copyOf(selectedSources);
+        return profileStore.transaction(session -> recordSources(session, pending, expected, current, requested));
+    }
+
+    @Override
+    public Result recordExecutionSources(ClusterCapacityReservation expected, WorkloadClaimFence current, Set<String> selectedSources) {
+        Set<String> requested = Set.copyOf(selectedSources);
+        return profileStore.transaction(session -> recordSources(session, null, expected, current, requested));
+    }
+
+    private Result recordSources(ClientSession session, PendingPipelineResume pending, ClusterCapacityReservation expected,
+            WorkloadClaimFence current, Set<String> requested) {
+            Document row = exact(session, expected);
+            if (row == null || expected.executionGeneration() == null) {
+                return result(Outcome.STALE_EXECUTION, expected, null, List.of());
+            }
+            Document authority = workloadStore.conditionTouchClaim(session, current);
+            if (authority == null || !expected.pipelineClaim().sameAuthorityAs(current)) {
+                return result(Outcome.STALE_CLAIM, expected, null, List.of());
+            }
+            Context context = guard(session, key(expected), expected.profile(), expected.intentFingerprint(), true);
+            if (context.outcome != Outcome.APPLIED) {
+                return result(context.outcome, expected, null, List.of());
+            }
+            PendingPipelineResume stored = PendingPipelineResumeDocuments.current(context.actual).orElse(null);
+            if (!guardResumeLink(session, row, context) || (pending != null && (stored == null || !stored.sameRequestAs(pending)
+                    || (pending.reservationId() != null && !pending.reservationId().equals(stored.reservationId()))))) {
+                return result(Outcome.STALE_INTENT, expected, null, List.of());
+            }
+            Set<String> declared = Set.copyOf(((PipelineResource) MongoArtifactStore.toResource(context.artifact)).sourceIds());
+            if (!declared.containsAll(requested) || requested.stream().anyMatch(String::isBlank)
+                    || !matchesExecutionContext(authority, expected.pipelineClaim(), expected.profile(), key(expected),
+                            context.intent.getString("revision"), expected.demandByNode().keySet())
+                    || !expected.demandByNode().keySet().equals(context.liveNodes)
+                    || !MongoWorkloadClaimStore.readDocument(authority).executionMembers()
+                            .equals(liveExecutionMembers(session, expected.profile(), context.liveNodes))) {
+                return result(Outcome.UNKNOWN_DEMAND, expected, null, List.of());
+            }
+            var previous = sourceRequirements(row);
+            if (previous.isPresent()) {
+                return result(previous.orElseThrow().equals(requested) ? Outcome.ALREADY_RESERVED : Outcome.UNKNOWN_DEMAND,
+                        expected, null, List.of());
+            }
+            if (expected.nativeJobId() != null) {
+                return result(Outcome.UNKNOWN_DEMAND, expected, null, List.of());
+            }
+            if (occupancy.updateOne(session, new Document("_id", expected.reservationId()).append("revision", row.get("revision")),
+                    new Document("$set", new Document("sourceRequirementsRecorded", true)
+                            .append("requiredSourceIds", requested.stream().sorted().toList()))
+                            .append("$inc", new Document("revision", 1L))).getMatchedCount() != 1) {
+                throw new IllegalStateException("the linked resume changed while recording its compiled source selection");
+            }
+            return result(Outcome.APPLIED, expected, null, List.of());
+    }
+
+    @Override
+    public Result reserveResume(PendingPipelineResume expectedResume, WorkloadClaim expected,
+            ClusterExecutionProfile profile, String incarnation, String fingerprint,
+            Map<String, ClusterCapacityDemand> demand, ClusterCapacityLimits limits, Duration ttl) {
+        Objects.requireNonNull(expectedResume, "expectedResume");
+        positive(ttl);
+        Objects.requireNonNull(limits, "limits");
+        Map<String, ClusterCapacityDemand> requested = Map.copyOf(demand);
+        ClusterRecoveryKey key = new ClusterRecoveryKey(expected.key().clusterId(), expected.key().resourceId(), incarnation);
+        return profileStore.transaction(session -> {
+            Document authority = workloadStore.conditionTouchClaim(session, WorkloadClaimFence.from(expected));
+            if (authority == null) {
+                return result(Outcome.STALE_CLAIM, null, null, List.of());
+            }
+            Context context = guard(session, key, profile, fingerprint, true);
+            if (context.outcome != Outcome.APPLIED) {
+                return result(context.outcome, null, null, List.of());
+            }
+            PendingPipelineResume pending = PendingPipelineResumeDocuments.current(context.actual).orElse(null);
+            if (pending == null || !pending.sameRequestAs(expectedResume) || !resumeContext(pending, context)
+                    || (expectedResume.reservationId() != null && !expectedResume.reservationId().equals(pending.reservationId()))) {
+                return result(Outcome.STALE_INTENT, null, null, List.of());
+            }
+            if (states.updateOne(session, PendingPipelineResumeDocuments.filter(context.actual),
+                    new Document("$inc", new Document("resumeFenceSerial", 1L))).getMatchedCount() != 1) {
+                return result(Outcome.STALE_INTENT, null, null, List.of());
+            }
+            WorkloadClaim currentClaim = MongoWorkloadClaimStore.readDocument(authority);
+            if (pending.reservationId() == null) {
+                if (!PendingPipelineResume.sameExecutionContext(pending.originalClaim(), currentClaim)
+                        || !workloadStore.provesRetired(session, WorkloadClaimFence.from(pending.originalClaim()))) {
+                    return result(Outcome.STALE_EXECUTION, null, null, List.of());
+                }
+                Result reserved = reserve(session, context, WorkloadClaimFence.from(currentClaim), requested, limits, ttl,
+                        false, Set.of(executionKey(currentClaim)));
+                if (reserved.outcome() != Outcome.APPLIED) {
+                    return reserved;
+                }
+                if (occupancy.updateOne(session, new Document("_id", reserved.reservation().reservationId()),
+                        new Document("$set", new Document(PendingPipelineResumeDocuments.CAPACITY_EPOCH, pending.stateEpoch())))
+                        .getMatchedCount() != 1) {
+                    throw new IllegalStateException("the fresh resume reservation disappeared before its origin receipt");
+                }
+                if (states.updateOne(session, PendingPipelineResumeDocuments.filter(context.actual), new Document("$set",
+                        new Document(PendingPipelineResumeDocuments.FIELD + ".reservationId", reserved.reservation().reservationId())))
+                        .getMatchedCount() != 1) {
+                    throw new IllegalStateException("the accepted resume changed before its atomic reservation link");
+                }
+                return reserved;
+            }
+            Document linked = occupancy.find(session, new Document("_id", pending.reservationId())).first();
+            if (linked == null || !resumeIdentity(linked, pending)) {
+                return result(Outcome.UNKNOWN_DEMAND, null, null, List.of());
+            }
+            ClusterCapacityReservation previous = reservation(linked);
+            if (!previous.demandByNode().equals(requested) || !requested.keySet().equals(context.liveNodes)) {
+                return result(Outcome.UNKNOWN_DEMAND, previous, null, List.of());
+            }
+            WorkloadClaimFence currentFence = WorkloadClaimFence.from(currentClaim);
+            boolean sameAuthority = previous.pipelineClaim().sameAuthorityAs(currentFence);
+            if (previous.executionGeneration() == null) {
+                if (!PendingPipelineResume.sameExecutionContext(pending.originalClaim(), currentClaim)) {
+                    return result(Outcome.STALE_EXECUTION, previous, null, List.of());
+                }
+            } else if (!matchesExecutionContext(authority, previous.pipelineClaim(), previous.profile(), key,
+                    context.intent.getString("revision"), previous.demandByNode().keySet())
+                    || !currentClaim.executionMembers().equals(liveExecutionMembers(session, profile, context.liveNodes))) {
+                return result(Outcome.STALE_EXECUTION, previous, null, List.of());
+            }
+            if (!sameAuthority && !fenced(session, linked, context.now)) {
+                return result(Outcome.STALE_EXECUTION, previous, null, List.of());
+            }
+            if (previous.nativeJobId() != null) {
+                return result(sameAuthority ? Outcome.ALREADY_RESERVED : Outcome.UNKNOWN_DEMAND, previous, null, List.of());
+            }
+            if (!sameAuthority) {
+                Occupied other = occupied(session, profile.clusterId(), context.now, true, Set.of(executionKey(currentClaim)));
+                Result refusal = budgetRefusal(other, requested, limits);
+                if (refusal != null) {
+                    return refusal;
+                }
+                if (previous.executionGeneration() != null) {
+                    if (currentClaim.failureClaimGeneration() > 0) {
+                        return result(Outcome.UNKNOWN_DEMAND, previous, null, List.of());
+                    }
+                    if (claims.updateOne(session, WorkloadClaimDocuments.live(currentFence), new Document("$set",
+                            new Document("executionClaimGeneration", currentClaim.claimGeneration()))).getMatchedCount() != 1) {
+                        return result(Outcome.STALE_CLAIM, previous, null, List.of());
+                    }
+                    currentClaim = MongoWorkloadClaimStore.readDocument(claims.find(session, WorkloadClaimDocuments.live(currentFence)).first());
+                }
+            }
+            Instant deadline = context.now.plus(ttl);
+            if (deadline.isAfter(currentClaim.leaseUntil())) {
+                deadline = currentClaim.leaseUntil();
+            }
+            if (!deadline.isAfter(context.now)) {
+                return result(Outcome.STALE_CLAIM, previous, null, List.of());
+            }
+            WorkloadClaimFence reboundFence = previous.executionGeneration() == null ? WorkloadClaimFence.from(currentClaim)
+                    : new WorkloadClaimFence(currentClaim.key(), currentClaim.owner(), currentClaim.claimGeneration(),
+                            currentClaim.executionGeneration(), currentClaim.executionTopologyRevision(), currentClaim.profileGeneration());
+            ClusterCapacityReservation rebound = new ClusterCapacityReservation(previous.reservationId(), previous.clusterId(),
+                    previous.pipelineId(), previous.incarnationId(), previous.intentFingerprint(), previous.profile(), reboundFence,
+                    previous.demandByNode(), previous.reservedAt(), deadline, previous.executionGeneration(), null);
+            replace(session, linked, rebound, currentClaim.leaseUntil());
+            return result(Outcome.ALREADY_RESERVED, rebound, rebound.executionGeneration() == null ? null : currentClaim, List.of());
+        });
+    }
+
     Result reserve(ClientSession session, Context context, WorkloadClaimFence pipelineClaim,
             Map<String, ClusterCapacityDemand> demand, ClusterCapacityLimits limits, Duration ttl, boolean recovery) {
+        return reserve(session, context, pipelineClaim, demand, limits, ttl, recovery, Set.of());
+    }
+
+    private Result reserve(ClientSession session, Context context, WorkloadClaimFence pipelineClaim,
+            Map<String, ClusterCapacityDemand> demand, ClusterCapacityLimits limits, Duration ttl, boolean recovery,
+            Set<String> retiredExplicitExecutions) {
         if (demand.isEmpty() || !context.liveNodes.equals(demand.keySet())) {
             return result(Outcome.UNKNOWN_DEMAND, null, null, List.of());
         }
-        Occupied occupied = occupied(session, context.profile.clusterId(), context.now);
-        if (occupied.unknown) {
-            return result(Outcome.UNKNOWN_DEMAND, null, null, List.of());
-        }
-        for (Map.Entry<String, ClusterCapacityDemand> entry : new TreeMap<>(demand).entrySet()) {
-            List<ClusterCapacityLimits.Violation> violations = limits.violations(
-                    occupied.demand.getOrDefault(entry.getKey(), ClusterCapacityDemand.ZERO), entry.getValue());
-            if (!violations.isEmpty()) {
-                return new Result(Outcome.CAPACITY_REFUSED, null, null, violations, entry.getKey());
-            }
+        Result refusal = budgetRefusal(occupied(session, context.profile.clusterId(), context.now, true, retiredExplicitExecutions), demand, limits);
+        if (refusal != null) {
+            return refusal;
         }
         Instant deadline = context.now.plus(ttl);
         Document authority = claims.find(session, WorkloadClaimDocuments.live(pipelineClaim)).first();
@@ -166,6 +426,9 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
         Context context = guard(session, key(expected), expected.profile(), expected.intentFingerprint(), true);
         if (context.outcome != Outcome.APPLIED) {
             return result(context.outcome, expected, null, List.of());
+        }
+        if (!guardResumeLink(session, current, context)) {
+            return result(Outcome.STALE_INTENT, expected, null, List.of());
         }
         if (!expected.demandByNode().keySet().equals(executionNodes) || !context.liveNodes.equals(executionNodes)
                 || !expected.deadline().isAfter(context.now)) {
@@ -217,6 +480,9 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
         Context context = guard(session, key(expected), expected.profile(), expected.intentFingerprint(), true);
         if (context.outcome != Outcome.APPLIED) {
             return result(context.outcome, expected, null, List.of());
+        }
+        if (!guardResumeLink(session, current, context)) {
+            return result(Outcome.STALE_INTENT, expected, null, List.of());
         }
         if (!matchesExecutionContext(authority, expected.pipelineClaim(), expected.profile(), key(expected),
                 context.intent.getString("revision"), expected.demandByNode().keySet())) {
@@ -283,6 +549,11 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
     }
 
     private Occupied occupied(ClientSession session, String clusterId, Instant now, boolean cleanup) {
+        return occupied(session, clusterId, now, cleanup, Set.of());
+    }
+
+    private Occupied occupied(ClientSession session, String clusterId, Instant now, boolean cleanup,
+            Set<String> retiredExplicitExecutions) {
         Map<String, ClusterCapacityDemand> total = new LinkedHashMap<>();
         List<Document> records = occupancy.find(session, new Document("clusterId", clusterId)).into(new ArrayList<>());
         Set<String> recordedExecutions = new java.util.HashSet<>();
@@ -290,7 +561,8 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
             ClusterCapacityReservation reservation = reservation(record);
             if ((cleanup ? fenced(session, record, now) : fencedAt(session, record, now)) && !reservation.deadline().isAfter(now)) {
                 // An unsubmitted recovery retains its authority evidence until its queue step releases it.
-                if (cleanup && (!record.getBoolean("recovery", false) || reservation.nativeJobId() != null)) {
+                if (cleanup && (!record.getBoolean("recovery", false) || reservation.nativeJobId() != null)
+                        && !retainedResume(session, record)) {
                     occupancy.deleteOne(session, new Document("_id", record.get("_id")).append("revision", record.get("revision")));
                 }
                 continue;
@@ -310,7 +582,8 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
         }
         for (Document claim : claims.find(session, live).into(new ArrayList<>())) {
             long execution = ClusterRecoveryDocuments.number(claim, "executionGeneration");
-            if (execution == 0 || recordedExecutions.contains(claim.getString("resourceId") + ":" + execution)) {
+            if (execution == 0 || recordedExecutions.contains(claim.getString("resourceId") + ":" + execution)
+                    || retiredExplicitExecutions.contains(claim.getString("resourceId") + ":" + execution)) {
                 continue;
             }
             Document actual = states.find(session, new Document("_id", claim.getString("resourceId"))).first();
@@ -570,6 +843,14 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
     private void replace(ClientSession session, Document current, ClusterCapacityReservation next, Instant authorityUntil) {
         Document replacement = document(next).append("revision", Math.addExact(ClusterRecoveryDocuments.number(current, "revision"), 1L))
                 .append("recovery", current.getBoolean("recovery", false)).append("authorityUntil", Date.from(authorityUntil));
+        if (current.containsKey(PendingPipelineResumeDocuments.CAPACITY_EPOCH)) {
+            replacement.append(PendingPipelineResumeDocuments.CAPACITY_EPOCH, current.get(PendingPipelineResumeDocuments.CAPACITY_EPOCH));
+        }
+        for (String field : List.of("sourceRequirementsRecorded", "requiredSourceIds")) {
+            if (current.containsKey(field)) {
+                replacement.append(field, current.get(field));
+            }
+        }
         if (occupancy.replaceOne(session, new Document("_id", next.reservationId()).append("revision", current.get("revision")), replacement).getMatchedCount() != 1) {
             throw new IllegalStateException("profile-guarded capacity reservation changed in its transaction");
         }
@@ -613,6 +894,85 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
     static TapstateException capacityError(String node, String resource, Object occupied, Object requested, Object limit) {
         return new TapstateException(LifecycleError.CLUSTER_CAPACITY_REFUSED,
                 Map.of("node", node, "resource", resource, "occupied", occupied, "requested", requested, "limit", limit), null);
+    }
+
+    private static Result budgetRefusal(Occupied occupied, Map<String, ClusterCapacityDemand> requested, ClusterCapacityLimits limits) {
+        if (occupied.unknown) {
+            return result(Outcome.UNKNOWN_DEMAND, null, null, List.of());
+        }
+        for (Map.Entry<String, ClusterCapacityDemand> entry : new TreeMap<>(requested).entrySet()) {
+            List<ClusterCapacityLimits.Violation> violations = limits.violations(
+                    occupied.demand.getOrDefault(entry.getKey(), ClusterCapacityDemand.ZERO), entry.getValue());
+            if (!violations.isEmpty()) {
+                return new Result(Outcome.CAPACITY_REFUSED, null, null, violations, entry.getKey());
+            }
+        }
+        return null;
+    }
+
+    private static String executionKey(WorkloadClaim claim) {
+        return claim.key().resourceId() + ":" + claim.executionGeneration();
+    }
+
+    private static boolean resumeContext(PendingPipelineResume resume, Context context) {
+        WorkloadClaim original = resume.originalClaim();
+        return original.key().clusterId().equals(context.key.clusterId())
+                && original.key().resourceId().equals(context.key.pipelineId())
+                && original.executionIncarnation().equals(context.key.incarnation())
+                && original.executionProfile().equals(context.profile)
+                && resume.intentFingerprint().equals(context.intentFingerprint);
+    }
+
+    boolean hasPendingOriginalResume(Context context, long originalExecution) {
+        PendingPipelineResume resume = PendingPipelineResumeDocuments.current(context.actual).orElse(null);
+        return resume != null && resume.originalClaim().executionGeneration() == originalExecution && resumeContext(resume, context);
+    }
+
+    private static boolean resumeIdentity(Document row, PendingPipelineResume resume) {
+        ClusterCapacityReservation reservation = reservation(row);
+        return row.containsKey(PendingPipelineResumeDocuments.CAPACITY_EPOCH)
+                && PendingPipelineResumeDocuments.integer(row, PendingPipelineResumeDocuments.CAPACITY_EPOCH) == resume.stateEpoch()
+                && reservation.reservationId().equals(resume.reservationId())
+                && reservation.clusterId().equals(resume.originalClaim().key().clusterId())
+                && reservation.pipelineId().equals(resume.originalClaim().key().resourceId())
+                && reservation.incarnationId().equals(resume.originalClaim().executionIncarnation())
+                && reservation.intentFingerprint().equals(resume.intentFingerprint())
+                && reservation.profile().equals(resume.originalClaim().executionProfile());
+    }
+
+    private boolean guardResumeLink(ClientSession session, Document row, Context context) {
+        if (!row.containsKey(PendingPipelineResumeDocuments.CAPACITY_EPOCH)) {
+            return true;
+        }
+        PendingPipelineResume resume = PendingPipelineResumeDocuments.current(context.actual).orElse(null);
+        return resume != null && resumeContext(resume, context) && resumeIdentity(row, resume)
+                && states.updateOne(session, PendingPipelineResumeDocuments.filter(context.actual),
+                        new Document("$inc", new Document("resumeFenceSerial", 1L))).getMatchedCount() == 1;
+    }
+
+    private boolean retainedResume(ClientSession session, Document row) {
+        if (!row.containsKey(PendingPipelineResumeDocuments.CAPACITY_EPOCH) || row.get("nativeJobId") != null) {
+            return false;
+        }
+        PendingPipelineResume resume = PendingPipelineResumeDocuments.current(states.find(session,
+                new Document("_id", row.getString("pipelineId"))).first()).orElse(null);
+        return resume != null && resumeIdentity(row, resume);
+    }
+
+    private static java.util.Optional<Set<String>> sourceRequirements(Document row) {
+        Object recorded = row.get("sourceRequirementsRecorded");
+        if (recorded == null && !row.containsKey("requiredSourceIds")) {
+            return java.util.Optional.empty();
+        }
+        if (!Boolean.TRUE.equals(recorded) || !(row.get("requiredSourceIds") instanceof List<?> values)
+                || values.stream().anyMatch(value -> !(value instanceof String source) || source.isBlank())) {
+            throw ClusterRecoveryDocuments.unreadable(row, "resumeSourceRequirements", null);
+        }
+        Set<String> required = Set.copyOf(row.getList("requiredSourceIds", String.class));
+        if (required.size() != values.size()) {
+            throw ClusterRecoveryDocuments.unreadable(row, "resumeSourceRequirements", null);
+        }
+        return java.util.Optional.of(required);
     }
 
     static void positive(Duration duration) {

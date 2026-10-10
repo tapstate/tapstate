@@ -22,6 +22,41 @@ public interface ClusterCapacityStore {
             String incarnationId, String intentFingerprint, Map<String, ClusterCapacityDemand> demandByNode,
             ClusterCapacityLimits limits, Duration ttl);
 
+    /** Reserves or continues only the same durable explicit request after prior authority retirement. */
+    default Result reserveResume(PendingPipelineResume pendingResume, WorkloadClaim expectedPipelineClaim,
+            ClusterExecutionProfile profile, String incarnationId, String intentFingerprint,
+            Map<String, ClusterCapacityDemand> demandByNode, ClusterCapacityLimits limits, Duration ttl) {
+        return new Result(Outcome.UNKNOWN_DEMAND, null, null, List.of());
+    }
+
+    /** Read-only restoration of the reservation linked to the exact accepted request and state epoch. */
+    default Optional<ClusterCapacityReservation> resumeReservation(PendingPipelineResume pendingResume) {
+        return Optional.empty();
+    }
+
+    /** Store-time retirement proof without adopting a reservation or authorizing another execution. */
+    default boolean resumeAuthorityRetired(PendingPipelineResume pendingResume, WorkloadClaim current,
+            WorkloadClaimFence formerNativeAuthority) {
+        return false;
+    }
+
+    /** Freezes the actual compiled source selection before any capture or native submission. */
+    default Result recordResumeSources(PendingPipelineResume pendingResume, ClusterCapacityReservation reservation,
+            WorkloadClaimFence current, Set<String> compiledSelectedSourceIds) {
+        return new Result(Outcome.UNKNOWN_DEMAND, null, null, List.of());
+    }
+
+    /** Records the actual ordinary compilation before capture/native effects under the allocated receipt. */
+    default Result recordExecutionSources(ClusterCapacityReservation reservation, WorkloadClaimFence current,
+            Set<String> compiledSelectedSourceIds) {
+        return new Result(Outcome.UNKNOWN_DEMAND, null, null, List.of());
+    }
+
+    /** Known empty is distinct from absent preparation; restoration does not infer sources from proof count. */
+    default Optional<Set<String>> resumeSourceRequirements(PendingPipelineResume pendingResume) {
+        return Optional.empty();
+    }
+
     /** Records the successor with the existing allocator in the same transaction as this reservation. */
     Result advanceExecution(ClusterCapacityReservation expected, WorkloadClaim expectedPipelineClaim,
             Set<String> executionNodeIds);

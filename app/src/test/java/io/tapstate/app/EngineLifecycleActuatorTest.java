@@ -2,12 +2,23 @@ package io.tapstate.app;
 
 import com.hazelcast.config.Config;
 import com.hazelcast.config.JoinConfig;
+import com.hazelcast.cluster.Cluster;
+import com.hazelcast.cluster.Member;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.jet.Job;
 import com.hazelcast.jet.core.DAG;
+import com.hazelcast.jet.core.AbstractProcessor;
+import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.JobStatus;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.ClusterCapacityDemand;
+import io.tapstate.core.lifecycle.CheckpointDoc;
+import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.DesiredStateFingerprint;
+import io.tapstate.core.lifecycle.LifecycleError;
+import io.tapstate.core.lifecycle.ProcessorRuntimeContext;
+import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
@@ -19,6 +30,8 @@ import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.runtime.engine.Engine;
+import io.tapstate.runtime.engine.ExecutionShape;
+import io.tapstate.runtime.engine.NativeExecutionStartup;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
 import io.tapstate.runtime.srs.CaptureHealth;
 import io.tapstate.runtime.srs.CaptureId;
@@ -28,6 +41,23 @@ import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ClusterMembership;
+import io.tapstate.spi.store.ArtifactIdentity;
+import io.tapstate.spi.store.ClusterCapacityReservation;
+import io.tapstate.spi.store.ClusterCapacityStore;
+import io.tapstate.spi.store.ClusterExecutionMember;
+import io.tapstate.spi.store.ClusterExecutionProfile;
+import io.tapstate.spi.store.ClusterProfileStore;
+import io.tapstate.spi.store.ClusterRecoveryStore;
+import io.tapstate.spi.store.DesiredStore;
+import io.tapstate.spi.store.ExecutionProfile;
+import io.tapstate.spi.store.PendingPipelineResume;
+import io.tapstate.spi.store.SrsMetaStore;
+import io.tapstate.spi.store.StateStore;
+import io.tapstate.spi.store.StorePort;
+import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -35,21 +65,38 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.time.Clock;
+import java.time.Instant;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
+import java.util.function.UnaryOperator;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.ArgumentMatchers.anySet;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.eq;
 
 /**
  * The assembly-layer binding from the lifecycle actuator seam to the Jet engine and the capture coordinator,
@@ -550,6 +597,155 @@ class EngineLifecycleActuatorTest {
         awaitStatus(rebuilt, JobStatus.RUNNING);
     }
 
+    @Test
+    void aSettledLoadOnTheExactSameCohortResumesItsHeldJob() {
+        ResumeCohortRun run = new ResumeCohortRun(ResumeCohortRun.ORIGINAL);
+
+        run.actuator.resume(PIPE);
+
+        verify(run.engine).resume(PIPE, "held-native-job", 1, 9, 2, "held-native-execution");
+        verify(run.engine, never()).cancel(PIPE);
+        verify(run.capacity, never()).reserve(any(), any(), anyString(), anyString(), anyMap(), any(), any());
+        verify(run.capacity, never()).reserveResume(any(), any(), any(), anyString(), anyString(), anyMap(), any(), any());
+        verify(run.capacity, never()).advanceExecution(any(), any(), anySet());
+        verify(run.capacity, never()).submitted(any(), any(), anyString());
+        verifyNoInteractions(run.recovery);
+        assertThat(run.events).isEmpty();
+        assertThat(run.held.get().executionGeneration()).isEqualTo(9);
+    }
+
+    @Test
+    void aSettledLoadResumedAfterACompatibleMemberJoinsRecompilesOnce() {
+        Map<String, ClusterExecutionMember> expanded = new LinkedHashMap<>(ResumeCohortRun.ORIGINAL);
+        expanded.put("node-d", new ClusterExecutionMember("node-d", "boot-node-d",
+                "00000000-0000-4000-8000-000000000004"));
+        ResumeCohortRun run = new ResumeCohortRun(expanded);
+
+        run.actuator.resume(PIPE);
+
+        run.assertOneKeepingRecompile();
+        assertThat(run.held.get().executionMembers()).isEqualTo(expanded);
+    }
+
+    @Test
+    void aSettledLoadResumedAfterTheSameStableMemberRebootsRecompilesOnce() {
+        Map<String, ClusterExecutionMember> reincarnated = new LinkedHashMap<>(ResumeCohortRun.ORIGINAL);
+        reincarnated.put("node-b", new ClusterExecutionMember("node-b", "boot-node-b-next",
+                "00000000-0000-4000-8000-000000000005"));
+        ResumeCohortRun run = new ResumeCohortRun(reincarnated);
+
+        run.actuator.resume(PIPE);
+
+        run.assertOneKeepingRecompile();
+        assertThat(run.held.get().executionMembers()).isEqualTo(reincarnated);
+    }
+
+    @Test
+    void aFreshCompleteResumeIterationIsConsumedWithoutRepeatingNativeOrCaptureEffects() {
+        ResumeCohortRun run = new ResumeCohortRun(ResumeCohortRun.ORIGINAL);
+        Engine.NativeRun resumed = run.freshNativeIteration(UnaryOperator.identity());
+        when(run.engine.nativeRun(PIPE)).thenReturn(Optional.of(resumed));
+
+        assertThat(run.actuator.resumeCompleted(run.pending.get())).isTrue();
+        run.actuator.resume(PIPE);
+        run.actuator.resume(PIPE);
+
+        verify(run.engine, never()).resume(PIPE);
+        verify(run.engine, never()).resume(eq(PIPE), anyString(), anyLong(), anyLong(), anyLong(), anyString());
+        verify(run.engine, never()).cancel(PIPE);
+        verify(run.engine, never()).cancelAndAwaitTerminal(anyString(), anyString(), anyLong(), anyLong(), anyLong(), any());
+        verify(run.capacity, never()).reserveResume(any(), any(), any(), anyString(), anyString(), anyMap(), any(), any());
+        verify(run.capacity, never()).advanceExecution(any(), any(), anySet());
+        verify(run.engine, never()).submitFenced(eq(PIPE), any(), anyMap(), any(), anyLong(), anyLong(), anyLong());
+        verify(run.captures, never()).startCapture(PIPE);
+        assertThat(run.events).isEmpty();
+        assertThat(run.held.get().executionGeneration()).isEqualTo(9);
+    }
+
+    @Test
+    void mixedNativeProcessorTuplesCannotCompleteAnAcceptedResume() {
+        for (String axis : List.of("job", "runtime", "claim", "execution", "profile")) {
+            ResumeCohortRun run = new ResumeCohortRun(ResumeCohortRun.ORIGINAL);
+            Engine.NativeRun mixed = run.freshNativeIteration(context -> context.nodeId().equals("node-b")
+                    ? ResumeCohortRun.mismatchedTuple(context, axis) : context);
+            assertThat(mixed.initialized()).as(axis).isTrue();
+            assertThat(mixed.initialization().orElseThrow().processors().values().stream()
+                    .map(ProcessorRuntimeContext::nodeId).collect(java.util.stream.Collectors.toSet()))
+                    .as(axis).isEqualTo(ResumeCohortRun.ORIGINAL.keySet());
+            when(run.engine.nativeRun(PIPE)).thenReturn(Optional.of(mixed));
+
+            assertThat(run.actuator.resumeCompleted(run.pending.get())).as(axis).isFalse();
+
+            verify(run.engine, never()).resume(eq(PIPE), anyString(), anyLong(), anyLong(), anyLong(), anyString());
+            verify(run.capacity, never()).advanceExecution(any(), any(), anySet());
+            assertThat(run.events).as(axis).isEmpty();
+        }
+    }
+
+    @Test
+    void aSupersededAllocatedResumeIsRefusedAtBeginBeforeItsSourcesOpenAgain() {
+        Map<String, ClusterExecutionMember> expanded = new LinkedHashMap<>(ResumeCohortRun.ORIGINAL);
+        expanded.put("node-d", new ClusterExecutionMember("node-d", "boot-node-d",
+                "00000000-0000-4000-8000-000000000004"));
+        ResumeCohortRun run = new ResumeCohortRun(expanded);
+        PendingPipelineResume accepted = run.pending.get();
+        AtomicLong captureAttempts = new AtomicLong();
+        doAnswer(call -> {
+            captureAttempts.incrementAndGet();
+            run.events.add("waitForRing");
+            throw new RingNotOpenYet(new CaptureId("capture-pending"));
+        }).when(run.captures).startCapture(PIPE);
+
+        run.actuator.resume(PIPE);
+
+        assertThat(run.held.get().executionGeneration()).isEqualTo(10);
+        assertThat(run.allocated.get().nativeJobId()).isNull();
+        verify(run.capacity).recordResumeSources(argThat(accepted::sameRequestAs), any(),
+                argThat(fence -> fence.claimGeneration() == 2 && fence.executionGeneration() == 10 && fence.profileGeneration() == 2),
+                eq(Set.of()));
+        assertThat(run.events).containsSubsequence("advanceExecution", "recordSourceSelection", "waitForRing");
+        run.activation = () -> {
+            run.events.add("supersedeAcceptedResume");
+            PendingPipelineResume later = new PendingPipelineResume(22, accepted.intentFingerprint(), accepted.originalClaim(),
+                    accepted.originalNativeJobId(), accepted.originalRuntimeExecutionId());
+            run.pending.set(later);
+            when(run.state.read(PIPE)).thenReturn(Optional.of(new CheckpointDoc(PIPE, "RUNNING", 22, ResumeCohortRun.NOW)));
+        };
+
+        run.actuator.resume(PIPE);
+
+        assertThat(run.pending.get().stateEpoch()).isEqualTo(22);
+        assertThat(run.pending.get().intentFingerprint()).isEqualTo(accepted.intentFingerprint());
+        assertThat(captureAttempts).hasValue(1);
+        assertThat(run.events).containsSubsequence("supersedeAcceptedResume", "refuseSupersededResume");
+        verify(run.capacity, times(3)).reserveResume(argThat(accepted::sameRequestAs), any(), any(), anyString(), anyString(),
+                anyMap(), any(), any());
+        verify(run.capacity, times(1)).advanceExecution(any(), any(), eq(expanded.keySet()));
+        verify(run.ownership, times(1)).beginExecution(eq(PIPE), any());
+        verify(run.engine, never()).submitFenced(eq(PIPE), any(), anyMap(), any(), anyLong(), anyLong(), anyLong());
+        assertThat(run.held.get().executionGeneration()).isEqualTo(10);
+    }
+
+    @Test
+    void anUnknownFrozenResumeSourceSelectionIsACodedRefusal() {
+        ResumeCohortRun run = new ResumeCohortRun(ResumeCohortRun.ORIGINAL);
+        Engine.NativeRun resumed = run.freshNativeIteration(UnaryOperator.identity());
+        when(run.engine.nativeRun(PIPE)).thenReturn(Optional.of(resumed));
+        assertThat(run.actuator.resumeCompleted(run.pending.get())).isTrue();
+        when(run.capacity.resumeSourceRequirements(any())).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> run.actuator.resume(PIPE)).isInstanceOfSatisfying(TapstateException.class, failure -> {
+            assertThat(failure.code()).isEqualTo(LifecycleError.CLUSTER_CAPACITY_UNPROVEN);
+            assertThat(failure.args()).containsEntry("pipeline", PIPE);
+        });
+
+        verify(run.engine, never()).resume(eq(PIPE), anyString(), anyLong(), anyLong(), anyLong(), anyString());
+        verify(run.engine, never()).cancelAndAwaitTerminal(anyString(), anyString(), anyLong(), anyLong(), anyLong(), any());
+        verify(run.capacity, never()).advanceExecution(any(), any(), anySet());
+        verify(run.captures, never()).startCapture(PIPE);
+        assertThat(run.events).isEmpty();
+    }
+
     /**
      * The same hold over a pipeline that reads its source once and opens no tail. It rebuilds too, and for
      * the same reason: what a resume cannot carry on from is the load, and a load is no less unfinished for
@@ -666,6 +862,273 @@ class EngineLifecycleActuatorTest {
             Thread.sleep(25);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+    }
+
+    /** Drives real ordinary admission with explicit native identities and a store-controlled allocator. */
+    private static final class ResumeCohortRun {
+        private static final Instant NOW = Instant.parse("2026-10-11T00:00:00Z");
+        private static final Map<String, ClusterExecutionMember> ORIGINAL = Map.of(
+                "node-a", new ClusterExecutionMember("node-a", "boot-node-a", "00000000-0000-4000-8000-000000000001"),
+                "node-b", new ClusterExecutionMember("node-b", "boot-node-b", "00000000-0000-4000-8000-000000000002"),
+                "node-c", new ClusterExecutionMember("node-c", "boot-node-c", "00000000-0000-4000-8000-000000000003"));
+        private final List<String> events = new CopyOnWriteArrayList<>();
+        private final Engine engine = mock(Engine.class);
+        private final ClusterCapacityStore capacity = mock(ClusterCapacityStore.class);
+        private final ClusterRecoveryStore recovery = mock(ClusterRecoveryStore.class);
+        private final PipelineActuationOwnership ownership = mock(PipelineActuationOwnership.class);
+        private final PipelineCaptureCoordinator captures = mock(PipelineCaptureCoordinator.class);
+        private final StateStore state = mock(StateStore.class);
+        private final WorkloadOwner owner = new WorkloadOwner("node-a", "boot-node-a");
+        private final ClusterExecutionProfile profile = new ClusterExecutionProfile("cluster-a", 2,
+                new ExecutionProfile(1, Map.of("runtime", "test")));
+        private final AtomicReference<WorkloadClaim> held;
+        private final LifecycleActuator actuator;
+        private final Map<String, ClusterExecutionMember> live;
+        private final long topology;
+        private final AtomicReference<PendingPipelineResume> pending = new AtomicReference<>();
+        private final AtomicReference<ClusterCapacityReservation> allocated = new AtomicReference<>();
+        private Runnable activation = () -> { };
+
+        ResumeCohortRun(Map<String, ClusterExecutionMember> live) {
+            this.live = Map.copyOf(live);
+            topology = live.keySet().equals(ORIGINAL.keySet()) ? 7 : 8;
+            held = new AtomicReference<>(claim(1, 9, ORIGINAL));
+            var stores = mock(StorePort.class);
+            var profiles = mock(ClusterProfileStore.class);
+            var artifacts = mock(ArtifactStore.class);
+            var desired = mock(DesiredStore.class);
+            when(stores.clusterCapacity()).thenReturn(capacity);
+            when(stores.clusterProfiles()).thenReturn(profiles);
+            when(stores.clusterRecovery()).thenReturn(recovery);
+            when(stores.artifacts()).thenReturn(artifacts);
+            when(stores.desired()).thenReturn(desired);
+            when(stores.state()).thenReturn(state);
+            when(stores.meta()).thenReturn(mock(SrsMetaStore.class));
+            when(profiles.profile("cluster-a")).thenReturn(Optional.of(profile));
+            when(artifacts.identity(PIPE)).thenReturn(Optional.of(new ArtifactIdentity(PIPE, "inc", "a".repeat(64))));
+            when(desired.read(PIPE)).thenReturn(Optional.of(new DesiredState(PIPE, PipelineState.RUNNING, "a".repeat(64))));
+            when(recovery.read(any())).thenReturn(Optional.empty());
+            pending.set(new PendingPipelineResume(21, DesiredStateFingerprint.of(desired.read(PIPE).orElseThrow()),
+                    held.get(), "held-native-job", "held-native-execution"));
+            when(state.read(PIPE)).thenReturn(Optional.of(new CheckpointDoc(PIPE, "RUNNING", 21, NOW)));
+            when(state.pendingResume(PIPE)).thenAnswer(call -> Optional.of(pending.get()));
+
+            var nativeMember = mock(HazelcastInstance.class);
+            var cluster = mock(Cluster.class);
+            when(nativeMember.getCluster()).thenReturn(cluster);
+            Set<Member> peers = live.values().stream().map(identity -> {
+                Member peer = mock(Member.class);
+                when(peer.getAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE)).thenReturn(identity.nodeId());
+                when(peer.getAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE)).thenReturn(identity.bootId());
+                when(peer.getAttribute(ClusterMembershipGate.PROFILE_GENERATION_ATTRIBUTE)).thenReturn("2");
+                when(peer.getAttribute(ClusterMembershipGate.PROFILE_HASH_ATTRIBUTE)).thenReturn(profile.profile().hash());
+                when(peer.getUuid()).thenReturn(UUID.fromString(identity.memberUuid()));
+                when(peer.getAddress()).thenReturn(com.hazelcast.cluster.Address.createUnresolvedAddress("127.0.0.1",
+                        6000 + identity.nodeId().charAt(identity.nodeId().length() - 1)));
+                return peer;
+            }).collect(java.util.stream.Collectors.toSet());
+            when(cluster.getMembers()).thenReturn(peers);
+            var context = new java.util.concurrent.ConcurrentHashMap<String, Object>();
+            context.put(HazelcastConfiguration.NODE_SESSION_CONTEXT_KEY, new WorkloadClaim(
+                    new WorkloadClaimKey("cluster-a", WorkloadClaimType.NODE_SESSION, owner.nodeId()), owner, 1, 0, 0,
+                    NOW.plusSeconds(60), 0, 0, Set.of(), 0, false, 2));
+            when(nativeMember.getUserContext()).thenReturn(context);
+            var gate = mock(ClusterMembershipGate.class);
+            when(gate.businessEligible()).thenReturn(true);
+            when(gate.submissionEligible(any())).thenReturn(true);
+            when(gate.visibleNodeIds()).thenReturn(live.keySet());
+            when(gate.committed()).thenReturn(new ClusterMembership("cluster-a", topology, live.keySet(), 2));
+
+            when(ownership.isFenced()).thenReturn(true);
+            Map<String, ProcessorRuntimeContext> initialized = new LinkedHashMap<>();
+            int index = 0;
+            for (var identity : ORIGINAL.values()) {
+                initialized.put("read:" + index, new ProcessorRuntimeContext(PIPE, "read", "held-native-job",
+                        "held-native-execution", 1, 9, 2, identity.nodeId(), identity.bootId(), identity.memberUuid(),
+                        "127.0.0.1:6000", index, 0, index, 1, ORIGINAL.size(), ORIGINAL.size(), NOW));
+                index++;
+            }
+            when(engine.nativeRun(PIPE)).thenReturn(Optional.of(new Engine.NativeRun(
+                    "held-native-job", 1, 9, 2, JobStatus.SUSPENDED, Optional.of(new NativeExecutionStartup.Evidence(
+                            1, 9, 2, "held-native-job", "held-native-execution", Set.of("read"),
+                            Map.of("read", ORIGINAL.size()), initialized)))));
+            when(ownership.currentClaim(PIPE)).thenAnswer(call -> Optional.ofNullable(held.get()));
+            when(ownership.mayStart(PIPE)).thenAnswer(call -> held.get() != null);
+            when(ownership.proveExecution(any())).thenReturn(true);
+            when(ownership.retireStoppedExecution(any())).thenAnswer(call -> {
+                WorkloadClaim stopped = call.getArgument(0);
+                assertThat(held.get()).isEqualTo(stopped);
+                events.add("retireExecution");
+                held.set(null);
+                return true;
+            });
+            when(ownership.permit(PIPE)).thenAnswer(call -> {
+                if (held.get() == null) {
+                    events.add("acquireClaim");
+                    held.set(claim(2, 9, ORIGINAL));
+                }
+                return new PipelineActuationOwnership.Permit(true, held.get());
+            });
+            when(ownership.beginExecution(eq(PIPE), any())).thenAnswer(call -> {
+                var issuer = call.<PipelineActuationOwnership.ExecutionAdvance>getArgument(1);
+                WorkloadClaim expected = held.get();
+                return issuer.advance(expected, topology, live.keySet()).map(advanced -> {
+                    held.set(advanced);
+                    return new PipelineActuationOwnership.Execution(true,
+                            new ExecutionFence(PIPE, advanced.claimGeneration(), advanced.executionGeneration(), advanced.profileGeneration()),
+                            topology);
+                }).orElseGet(PipelineActuationOwnership.Execution::refused);
+            });
+            when(capacity.resumeReservation(any())).thenAnswer(call -> Optional.ofNullable(allocated.get()));
+            when(capacity.recordResumeSources(any(), any(), any(), anySet())).thenAnswer(call -> {
+                events.add("recordSourceSelection");
+                return result(call.getArgument(1), null);
+            });
+            when(capacity.resumeSourceRequirements(any())).thenReturn(Optional.of(Set.of()));
+            when(capacity.reserveResume(any(), any(), any(), anyString(), anyString(), anyMap(), any(), any())).thenAnswer(call -> {
+                PendingPipelineResume requested = call.getArgument(0);
+                if (!requested.sameRequestAs(pending.get())) {
+                    events.add("refuseSupersededResume");
+                    return new ClusterCapacityStore.Result(ClusterCapacityStore.Outcome.STALE_INTENT, null, null, List.of());
+                }
+                events.add("reserveCapacity");
+                if (allocated.get() != null) {
+                    return result(allocated.get(), allocated.get().executionGeneration() == null ? null : held.get());
+                }
+                ClusterCapacityReservation reserved = reservation(null, call.getArgument(1), call.getArgument(5));
+                allocated.set(reserved);
+                pending.set(pending.get().withReservation(reserved.reservationId()));
+                return result(reserved, null);
+            });
+            when(capacity.advanceExecution(any(), any(), anySet())).thenAnswer(call -> {
+                events.add("advanceExecution");
+                WorkloadClaim expected = call.getArgument(1);
+                WorkloadClaim advanced = claim(expected.claimGeneration(), expected.executionGeneration() + 1, live);
+                ClusterCapacityReservation reserved = call.getArgument(0);
+                allocated.set(reservation(advanced.executionGeneration(), advanced, reserved.demandByNode()));
+                return result(allocated.get(), advanced);
+            });
+            when(capacity.submitted(any(), any(), anyString())).thenAnswer(call -> {
+                events.add("recordSubmission");
+                ClusterCapacityReservation previous = call.getArgument(0);
+                allocated.set(new ClusterCapacityReservation(previous.reservationId(), previous.clusterId(), previous.pipelineId(),
+                        previous.incarnationId(), previous.intentFingerprint(), previous.profile(), previous.pipelineClaim(),
+                        previous.demandByNode(), previous.reservedAt(), previous.deadline(), previous.executionGeneration(), call.getArgument(2)));
+                return result(allocated.get(), null);
+            });
+            when(engine.cancelAndAwaitTerminal(eq(PIPE), eq("held-native-job"), eq(1L), eq(9L), eq(2L), any()))
+                    .thenAnswer(call -> {
+                        events.add("cancelJob"); events.add("jobTerminal");
+                        when(engine.nativeRun(PIPE)).thenReturn(Optional.of(new Engine.NativeRun(
+                                "held-native-job", 1, 9, 2, JobStatus.FAILED, Optional.empty())));
+                        return true;
+                    });
+            when(engine.submitFenced(eq(PIPE), any(), anyMap(), any(), anyLong(), anyLong(), anyLong())).thenAnswer(call -> {
+                events.add("submitJob");
+                when(engine.nativeRun(PIPE)).thenReturn(Optional.of(new Engine.NativeRun(
+                        "new-native-job", 2, 10, 2, JobStatus.RUNNING, Optional.empty())));
+                return "new-native-job";
+            });
+
+            Map<String, ClusterCapacityDemand> demands = live.keySet().stream().collect(java.util.stream.Collectors.toMap(
+                    node -> node, node -> new ClusterCapacityDemand(0, 0, 1, 0, 0, 0)));
+            ExecutionShape shape = new ExecutionShape(live.size(), Map.of(), Map.of());
+            DagSource.FactBearingBuilder builder = new DagSource.FactBearingBuilder() {
+                @Override public void activate() { activation.run(); }
+                @Override public Optional<DagSource.PlanningFacts> planningFacts() {
+                    return Optional.of(new DagSource.PlanningFacts(live.keySet().stream().sorted().toList(), shape,
+                            demands, demands.values().stream().reduce(ClusterCapacityDemand.ZERO, ClusterCapacityDemand::plus),
+                            Map.of(), List.of(), List.of(), List.of(), Set.of()));
+                }
+                @Override public DagSource.PlannedDag apply(ExecutionFence fence) {
+                    events.add("buildDag");
+                    DAG dag = new DAG();
+                    dag.newVertex("read", ProcessorMetaSupplier.of(() -> new AbstractProcessor() { }));
+                    return new DagSource.PlannedDag(dag, shape, live.keySet().stream().sorted().toList(), Map.of(), Map.of());
+                }
+            };
+            DagSource dags = mock(DagSource.class);
+            when(dags.prepareStart(eq(PIPE), anyString())).thenAnswer(call -> {
+                events.add("prepareStart");
+                return new DagSource.StartPreparation(DagSource.NestCapacity.none(), Set.of(), Optional.empty(),
+                        () -> builder, Map.of());
+            });
+            when(captures.loadDelivered(PIPE)).thenReturn(true);
+            when(captures.requiredSources(eq(PIPE), any())).thenReturn(Set.of());
+            when(captures.startupProofs(eq(PIPE), any())).thenReturn(Map.of());
+            doAnswer(call -> { events.add("stopCapture[keep]"); return null; }).when(captures).stopCapture(PIPE, false);
+            doAnswer(call -> { events.add("startCapture"); return null; }).when(captures).startCapture(PIPE);
+            NestStateTeardown teardown = mock(NestStateTeardown.class);
+            when(teardown.defaultDatabase()).thenReturn("default");
+            ClusterProperties properties = new ClusterProperties();
+            properties.setId("cluster-a");
+            properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
+            var admission = new ClusterRecoveryRuntime(stores, dags, captures, engine, ownership,
+                    mock(ClusterWorkloadClaims.class), gate, nativeMember, properties,
+                    new ClusterCapacityProperties().limits(), "default", Duration.ofSeconds(30));
+            actuator = new EngineLifecycleActuator(engine, dags, captures, teardown, ownership,
+                    ExecutionPlanRecorder.NONE, Clock.fixed(NOW, java.time.ZoneOffset.UTC), ConnectorReadiness.NONE, admission);
+        }
+
+        private WorkloadClaim claim(long claimGeneration, long executionGeneration, Map<String, ClusterExecutionMember> members) {
+            return new WorkloadClaim(new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, PIPE),
+                    owner, claimGeneration, executionGeneration, topology, NOW.plusSeconds(60), executionGeneration,
+                    executionGeneration == 9 ? 1 : claimGeneration, members.keySet(), 0, false, 2, profile,
+                    executionGeneration == 9 ? 7L : topology, "inc", "a".repeat(64), members);
+        }
+
+        private Engine.NativeRun freshNativeIteration(UnaryOperator<ProcessorRuntimeContext> transform) {
+            Engine.NativeRun previous = engine.nativeRun(PIPE).orElseThrow();
+            NativeExecutionStartup.Evidence old = previous.initialization().orElseThrow();
+            Map<String, ProcessorRuntimeContext> processors = new LinkedHashMap<>();
+            old.processors().forEach((key, context) -> processors.put(key, transform.apply(new ProcessorRuntimeContext(
+                    context.pipelineId(), context.vertex(), context.jobId(), "fresh-native-execution",
+                    context.claimGeneration(), context.executionGeneration(), context.profileGeneration(),
+                    context.nodeId(), context.bootId(), context.memberUuid(), context.memberAddress(), context.memberIndex(),
+                    context.localProcessorIndex(), context.globalProcessorIndex(), context.localParallelism(),
+                    context.totalParallelism(), context.memberCount(), NOW.plusSeconds(1)))));
+            var initialized = new NativeExecutionStartup.Evidence(previous.claimGeneration(), previous.executionGeneration(),
+                    previous.profileGeneration(), previous.nativeJobId(), "fresh-native-execution", old.vertices(),
+                    old.expectedProcessors(), processors, old.runtimeExecutionId());
+            return new Engine.NativeRun(previous.nativeJobId(), previous.claimGeneration(), previous.executionGeneration(),
+                    previous.profileGeneration(), JobStatus.RUNNING, Optional.of(initialized));
+        }
+
+        private static ProcessorRuntimeContext mismatchedTuple(ProcessorRuntimeContext context, String axis) {
+            return new ProcessorRuntimeContext(context.pipelineId(), context.vertex(),
+                    axis.equals("job") ? "another-native-job" : context.jobId(),
+                    axis.equals("runtime") ? "held-native-execution" : context.runtimeExecutionId(),
+                    axis.equals("claim") ? context.claimGeneration() + 1 : context.claimGeneration(),
+                    axis.equals("execution") ? context.executionGeneration() + 1 : context.executionGeneration(),
+                    axis.equals("profile") ? context.profileGeneration() + 1 : context.profileGeneration(),
+                    context.nodeId(), context.bootId(), context.memberUuid(), context.memberAddress(), context.memberIndex(),
+                    context.localProcessorIndex(), context.globalProcessorIndex(), context.localParallelism(),
+                    context.totalParallelism(), context.memberCount(), context.initializedAt());
+        }
+
+        private ClusterCapacityReservation reservation(Long execution, WorkloadClaim claim, Map<String, ClusterCapacityDemand> demand) {
+            return new ClusterCapacityReservation("reserved", "cluster-a", PIPE, "inc", pending.get().intentFingerprint(), profile,
+                    WorkloadClaimFence.from(claim), demand, NOW, NOW.plusSeconds(30), execution, null);
+        }
+
+        private static ClusterCapacityStore.Result result(ClusterCapacityReservation reservation, WorkloadClaim advanced) {
+            return new ClusterCapacityStore.Result(ClusterCapacityStore.Outcome.APPLIED, reservation, advanced, List.of());
+        }
+
+        private void assertOneKeepingRecompile() {
+            verify(engine, never()).resume(PIPE);
+            verify(engine).cancelAndAwaitTerminal(eq(PIPE), eq("held-native-job"), eq(1L), eq(9L), eq(2L), any());
+            verify(engine).submitFenced(eq(PIPE), any(), anyMap(), any(), eq(2L), eq(10L), eq(2L));
+            verify(capacity, times(1)).advanceExecution(any(), any(), eq(live.keySet()));
+            assertThat(held.get().executionGeneration()).isEqualTo(10);
+            assertThat(events).containsSubsequence("cancelJob", "jobTerminal", "stopCapture[keep]", "retireExecution",
+                    "prepareStart", "reserveCapacity", "advanceExecution", "startCapture", "buildDag", "submitJob",
+                    "recordSubmission");
+            assertThat(events.indexOf("acquireClaim")).isGreaterThan(events.indexOf("retireExecution"))
+                    .isLessThan(events.indexOf("reserveCapacity"));
+            verify(recovery, never()).enqueue(any(), any());
+            verify(recovery, never()).advanceExecution(any(), any(), anySet(), anySet());
         }
     }
 

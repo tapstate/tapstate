@@ -19,6 +19,11 @@ import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Vertex;
+import com.hazelcast.jet.core.Outbox;
+import com.hazelcast.jet.core.Inbox;
+import com.hazelcast.jet.core.Watermark;
+import com.hazelcast.jet.config.JobConfig;
+import com.hazelcast.jet.JetService;
 import io.tapstate.core.common.Severity;
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.TapstateException;
@@ -26,6 +31,8 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 import java.time.Duration;
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Proxy;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
@@ -33,7 +40,10 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -173,6 +183,267 @@ class EngineTest {
         engine.resume("orders-pipe");
 
         awaitStatus(member.getJet().getJob("orders-pipe"), JobStatus.RUNNING);
+    }
+
+    @Test
+    void aFencedResumePublishesTheNewNativeExecutionRatherThanItsPreviousProcessors() {
+        RecordingResumeSource.executions.clear();
+        Engine engine = new Engine(member);
+        DAG dag = new DAG();
+        dag.newVertex("records-resume", ProcessorMetaSupplier.forceTotalParallelismOne(
+                ProcessorSupplier.of((SupplierEx<Processor>) RecordingResumeSource::new)));
+        String jobId = engine.submitFenced("resumed-context", dag, Map.of(),
+                io.tapstate.runtime.engine.nest.NestSettings.defaults(), 4, 9, 2);
+        Job job = member.getJet().getJob("resumed-context");
+        awaitStatus(job, JobStatus.RUNNING);
+        awaitResumeExecutions(1);
+        NativeExecutionStartup.Evidence original = engine.nativeRun("resumed-context").orElseThrow()
+                .initialization().orElseThrow();
+        assertThat(original.initialized()).isTrue();
+        assertThat(original.runtimeExecutionId()).isEqualTo(RecordingResumeSource.executions.getFirst());
+        engine.suspend("resumed-context");
+        awaitStatus(job, JobStatus.SUSPENDED);
+
+        engine.resume("resumed-context");
+
+        awaitStatus(job, JobStatus.RUNNING);
+        awaitResumeExecutions(2);
+        String resumedRuntime = RecordingResumeSource.executions.get(1);
+        assertThat(resumedRuntime).isNotEqualTo(original.runtimeExecutionId());
+        Engine.NativeRun resumed = engine.nativeRun("resumed-context").orElseThrow();
+        assertThat(resumed.nativeJobId()).isEqualTo(jobId);
+        assertThat(resumed.claimGeneration()).isEqualTo(4);
+        assertThat(resumed.executionGeneration()).isEqualTo(9);
+        assertThat(resumed.profileGeneration()).isEqualTo(2);
+        NativeExecutionStartup.Evidence observed = resumed.initialization().orElseThrow();
+        assertThat(observed.runtimeExecutionId())
+                .as("the delegate already processes the new native execution, so old initialization is stale")
+                .isEqualTo(resumedRuntime);
+        assertThat(resumed.initialized()).isTrue();
+        assertThat(observed.processors().values()).allSatisfy(context ->
+                assertThat(context.runtimeExecutionId()).isEqualTo(resumedRuntime));
+    }
+
+    private static void awaitResumeExecutions(int count) {
+        long deadline = System.nanoTime() + Duration.ofSeconds(15).toNanos();
+        while (RecordingResumeSource.executions.size() < count && System.nanoTime() < deadline) {
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("interrupted waiting for the native resume callback", interrupted);
+            }
+        }
+        assertThat(RecordingResumeSource.executions).hasSize(count);
+    }
+
+    @Test
+    void aFencedResumeRetryKeepsTheAlreadyInitializedNewIteration() {
+        RecordingResumeSource.executions.clear();
+        Engine engine = new Engine(member);
+        DAG dag = new DAG();
+        dag.newVertex("records-resume", ProcessorMetaSupplier.forceTotalParallelismOne(
+                ProcessorSupplier.of((SupplierEx<Processor>) RecordingResumeSource::new)));
+        String job = engine.submitFenced("resume-retry", dag, Map.of(),
+                io.tapstate.runtime.engine.nest.NestSettings.defaults(), 4, 9, 2);
+        awaitResumeExecutions(1);
+        String originalRuntime = engine.nativeRun("resume-retry").orElseThrow().initialization().orElseThrow().runtimeExecutionId();
+        engine.suspend("resume-retry");
+        awaitStatus(member.getJet().getJob("resume-retry"), JobStatus.SUSPENDED);
+        assertThat(NativeExecutionStartup.prepareResume(member, "resume-retry", job, 4, 9, 2, originalRuntime))
+                .isEqualTo(NativeExecutionStartup.ResumeState.PREPARED);
+        engine.resume("resume-retry", job, 4, 9, 2, originalRuntime);
+        awaitResumeExecutions(2);
+        awaitStatus(member.getJet().getJob("resume-retry"), JobStatus.RUNNING);
+        NativeExecutionStartup.Evidence resumed = engine.nativeRun("resume-retry").orElseThrow().initialization().orElseThrow();
+
+        engine.resume("resume-retry", job, 4, 9, 2, originalRuntime);
+
+        assertThat(engine.nativeRun("resume-retry").orElseThrow().initialization()).contains(resumed);
+        assertThat(RecordingResumeSource.executions).hasSize(2);
+        engine.suspend("resume-retry");
+        awaitStatus(member.getJet().getJob("resume-retry"), JobStatus.SUSPENDED);
+        engine.resume("resume-retry", job, 4, 9, 2, originalRuntime);
+        assertThat(member.getJet().getJob("resume-retry").getStatus())
+                .as("an old accepted resume cannot undo a subsequent pause").isEqualTo(JobStatus.SUSPENDED);
+        assertThat(engine.nativeRun("resume-retry").orElseThrow().initialization()).contains(resumed);
+    }
+
+    @Test
+    void aFencedResumeRefusesAnUnmatchedJobFenceOrRuntimeWithoutClearingEvidence() {
+        RecordingResumeSource.executions.clear();
+        Engine engine = new Engine(member);
+        DAG dag = new DAG();
+        dag.newVertex("records-resume", ProcessorMetaSupplier.forceTotalParallelismOne(
+                ProcessorSupplier.of((SupplierEx<Processor>) RecordingResumeSource::new)));
+        String job = engine.submitFenced("resume-fence", dag, Map.of(),
+                io.tapstate.runtime.engine.nest.NestSettings.defaults(), 4, 9, 2);
+        awaitResumeExecutions(1);
+        NativeExecutionStartup.Evidence original = engine.nativeRun("resume-fence").orElseThrow().initialization().orElseThrow();
+        engine.suspend("resume-fence");
+        awaitStatus(member.getJet().getJob("resume-fence"), JobStatus.SUSPENDED);
+        List<ThrowingCallable> foreign = List.of(
+                () -> engine.resume("resume-fence", "different-job", 4, 9, 2, original.runtimeExecutionId()),
+                () -> engine.resume("resume-fence", job, 5, 9, 2, original.runtimeExecutionId()),
+                () -> engine.resume("resume-fence", job, 4, 10, 2, original.runtimeExecutionId()),
+                () -> engine.resume("resume-fence", job, 4, 9, 3, original.runtimeExecutionId()),
+                () -> engine.resume("resume-fence", job, 4, 9, 2, "unobserved-runtime"));
+
+        foreign.forEach(call -> assertThatThrownBy(call).isInstanceOfSatisfying(TapstateException.class,
+                refused -> assertThat(refused.code()).isEqualTo(EngineError.EXECUTION_COHORT_CHANGED_BEFORE_START)));
+
+        assertThat(engine.nativeRun("resume-fence").orElseThrow().initialization()).contains(original);
+        assertThat(member.getJet().getJob("resume-fence").getStatus()).isEqualTo(JobStatus.SUSPENDED);
+    }
+
+    @Test
+    void aResumeBoundaryRejectsDelayedOldCallbacksAndBindsOnlyOneNewRuntime() throws Exception {
+        DAG dag = new DAG();
+        dag.newVertex("callback", ProcessorMetaSupplier.of(ProcessorSupplier.of(() -> new Processor() {
+            @Override public void process(int ordinal, Inbox inbox) { inbox.clear(); }
+            @Override public boolean tryProcessWatermark(Watermark watermark) { return true; }
+            @Override public boolean complete() { return true; }
+        })));
+        NativeExecutionStartup.install(dag, member, "callbacks", 4, 9, 2);
+        nativeCallback(dag, 11, 21);
+        NativeExecutionStartup.Evidence original = NativeExecutionStartup.read(member, "callbacks").orElseThrow();
+        assertThat(original.initialized()).isTrue();
+        assertThat(NativeExecutionStartup.prepareResume(member, "callbacks", "11", 4, 9, 2, "21"))
+                .isEqualTo(NativeExecutionStartup.ResumeState.PREPARED);
+        NativeExecutionStartup.Evidence reset = NativeExecutionStartup.read(member, "callbacks").orElseThrow();
+        assertThat(reset.initialized()).isFalse();
+        assertThat(reset.expectedProcessors()).isEmpty();
+        assertThat(reset.processors()).isEmpty();
+        assertThat(NativeExecutionStartup.prepareResume(member, "callbacks", "11", 4, 9, 2, "21"))
+                .isEqualTo(NativeExecutionStartup.ResumeState.ALREADY_PREPARED);
+
+        nativeCallback(dag, 11, 21);
+        assertThat(NativeExecutionStartup.read(member, "callbacks")).contains(reset);
+        nativeCallback(dag, 11, 22);
+        NativeExecutionStartup.Evidence resumed = NativeExecutionStartup.read(member, "callbacks").orElseThrow();
+        assertThat(resumed.initialized()).isTrue();
+        assertThat(resumed.runtimeExecutionId()).isEqualTo("22");
+        assertThat(resumed.previousRuntimeExecutionId()).isEqualTo("21");
+        nativeCallback(dag, 11, 21);
+        nativeCallback(dag, 11, 23);
+        nativeCallback(dag, 12, 22);
+        assertThat(NativeExecutionStartup.read(member, "callbacks")).contains(resumed);
+        assertThat(NativeExecutionStartup.prepareResume(member, "callbacks", "11", 4, 9, 2, "21"))
+                .isEqualTo(NativeExecutionStartup.ResumeState.ALREADY_RESUMED);
+        assertThat(NativeExecutionStartup.prepareResume(member, "callbacks", "11", 5, 9, 2, "22"))
+                .isEqualTo(NativeExecutionStartup.ResumeState.REFUSED);
+        assertThat(NativeExecutionStartup.read(member, "callbacks")).contains(resumed);
+    }
+
+    private void nativeCallback(DAG dag, long job, long runtime) throws Exception {
+        ProcessorMetaSupplier supplier = dag.getVertex("callback").getMetaSupplier();
+        supplier.init(nativeContext(ProcessorMetaSupplier.Context.class, job, runtime));
+        var address = member.getCluster().getLocalMember().getAddress();
+        Processor processor = supplier.get(List.of(address)).apply(address).get(1).iterator().next();
+        Outbox outbox = nativeProxy(Outbox.class, (proxy, method, arguments) -> {
+            throw new UnsupportedOperationException("the no-op callback fixture must not emit");
+        });
+        processor.init(outbox, nativeContext(Processor.Context.class, job, runtime));
+    }
+
+    private <T> T nativeContext(Class<T> type, long job, long runtime) {
+        return nativeProxy(type, (proxy, method, arguments) -> switch (method.getName()) {
+            case "hazelcastInstance" -> member;
+            case "jobId" -> job;
+            case "executionId" -> runtime;
+            case "vertexName" -> "callback";
+            case "totalParallelism", "localParallelism", "memberCount" -> 1;
+            case "memberIndex", "localProcessorIndex", "globalProcessorIndex" -> 0;
+            default -> throw new UnsupportedOperationException("unexpected native context call " + method.getName());
+        });
+    }
+
+    private static <T> T nativeProxy(Class<T> type, InvocationHandler calls) {
+        return type.cast(Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[]{type}, calls));
+    }
+
+    @Test
+    void aCapturedCancellationDoesNotCancelTheNewExecutionUnderTheSameName() {
+        Engine engine = new Engine(member);
+        String first = engine.submitFenced("captured-cancel", foreverDag(), Map.of(),
+                io.tapstate.runtime.engine.nest.NestSettings.defaults(), 4, 9, 2);
+        awaitStatus(member.getJet().getJob("captured-cancel"), JobStatus.RUNNING);
+        assertThat(engine.cancelAndAwaitTerminal("captured-cancel", first, 5, 9, 2, Duration.ofMillis(10))).isFalse();
+        assertThat(member.getJet().getJob("captured-cancel").getStatus()).isEqualTo(JobStatus.RUNNING);
+        assertThat(engine.cancelAndAwaitTerminal("captured-cancel", first, 4, 9, 2, Duration.ofSeconds(15))).isTrue();
+        String successor = engine.submitFenced("captured-cancel", foreverDag(), Map.of(),
+                io.tapstate.runtime.engine.nest.NestSettings.defaults(), 4, 10, 2);
+        awaitStatus(member.getJet().getJob("captured-cancel"), JobStatus.RUNNING);
+
+        assertThat(engine.cancelAndAwaitTerminal("captured-cancel", first, 4, 9, 2, Duration.ofMillis(10))).isFalse();
+
+        assertThat(successor).isNotEqualTo(first);
+        assertThat(member.getJet().getJob("captured-cancel").getStatus()).isEqualTo(JobStatus.RUNNING);
+    }
+
+    @Test
+    void aCapturedCancellationWaitsOnTheCapturedReferenceInsteadOfLookingUpTheNameAgain() {
+        var terminated = new CompletableFuture<Void>();
+        var originalCancels = new AtomicInteger();
+        var successorCancels = new AtomicInteger();
+        JobConfig originalConfig = new JobConfig().setArgument(NativeExecutionStartup.CLAIM_ARGUMENT, 4L)
+                .setArgument(NativeExecutionStartup.EXECUTION_ARGUMENT, 9L).setArgument(NativeExecutionStartup.PROFILE_ARGUMENT, 2L);
+        Job original = nativeProxy(Job.class, (proxy, method, arguments) -> switch (method.getName()) {
+            case "getId" -> 11L;
+            case "getConfig" -> originalConfig;
+            case "getStatus" -> JobStatus.RUNNING;
+            case "getFuture" -> terminated;
+            case "cancel" -> { originalCancels.incrementAndGet(); terminated.cancel(true); yield null; }
+            default -> throw new UnsupportedOperationException("unexpected captured job call " + method.getName());
+        });
+        Job successor = nativeProxy(Job.class, (proxy, method, arguments) -> {
+            if (method.getName().equals("cancel")) { successorCancels.incrementAndGet(); return null; }
+            throw new UnsupportedOperationException("the successor must not be inspected by the old cancellation");
+        });
+        var lookups = new AtomicInteger();
+        JetService jet = nativeProxy(JetService.class, (proxy, method, arguments) -> {
+            if (method.getName().equals("getJob")) { return lookups.getAndIncrement() == 0 ? original : successor; }
+            throw new UnsupportedOperationException("unexpected Jet call " + method.getName());
+        });
+        var context = new ConcurrentHashMap<String, Object>();
+        HazelcastInstance local = nativeProxy(HazelcastInstance.class, (proxy, method, arguments) -> switch (method.getName()) {
+            case "getUserContext" -> context;
+            case "getJet" -> jet;
+            default -> throw new UnsupportedOperationException("unexpected member call " + method.getName());
+        });
+
+        assertThat(new Engine(local).cancelAndAwaitTerminal("captured", "11", 4, 9, 2, Duration.ofSeconds(1))).isTrue();
+
+        assertThat(originalCancels).hasValue(1);
+        assertThat(successorCancels).hasValue(0);
+        assertThat(lookups).hasValue(1);
+    }
+
+    /** Records processing only after the wrapper's real native initialization callback has returned. */
+    private static final class RecordingResumeSource extends AbstractProcessor {
+        private static final List<String> executions = new CopyOnWriteArrayList<>();
+        private String runtimeExecution;
+        private boolean recorded;
+
+        @Override protected void init(Context context) {
+            runtimeExecution = Long.toUnsignedString(context.executionId());
+        }
+
+        @Override public boolean isCooperative() { return false; }
+
+        @Override public boolean complete() {
+            if (!recorded) {
+                executions.add(runtimeExecution);
+                recorded = true;
+            }
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return true;
+            }
+            return false;
+        }
     }
 
     @Test

@@ -62,7 +62,8 @@ public final class NativeExecutionStartup {
 
     public record Evidence(long claimGeneration, long executionGeneration, long profileGeneration,
             String jobId, String runtimeExecutionId, Set<String> vertices,
-            Map<String, Integer> expectedProcessors, Map<String, ProcessorRuntimeContext> processors)
+            Map<String, Integer> expectedProcessors, Map<String, ProcessorRuntimeContext> processors,
+            String previousRuntimeExecutionId)
             implements Serializable {
         private static final long serialVersionUID = 1L;
         public Evidence {
@@ -71,12 +72,56 @@ public final class NativeExecutionStartup {
             processors = Map.copyOf(processors);
         }
 
+        public Evidence(long claimGeneration, long executionGeneration, long profileGeneration,
+                String jobId, String runtimeExecutionId, Set<String> vertices,
+                Map<String, Integer> expectedProcessors, Map<String, ProcessorRuntimeContext> processors) {
+            this(claimGeneration, executionGeneration, profileGeneration, jobId, runtimeExecutionId,
+                    vertices, expectedProcessors, processors, null);
+        }
+
         /** All actual native processors must initialize; job state alone never supplies this evidence. */
         public boolean initialized() {
-            return jobId != null && !vertices.isEmpty() && expectedProcessors.keySet().equals(vertices)
+            return jobId != null && runtimeExecutionId != null && !vertices.isEmpty() && expectedProcessors.keySet().equals(vertices)
                     && vertices.stream().allMatch(vertex -> processors.values().stream()
                             .filter(context -> context.vertex().equals(vertex)).count() == expectedProcessors.get(vertex));
         }
+    }
+
+    enum ResumeState { PREPARED, ALREADY_PREPARED, ALREADY_RESUMED, REFUSED }
+
+    /**
+     * Resets only a proved suspended iteration. The previous iteration is the bounded tombstone: a
+     * completed suspend closes its callbacks, and a new resume cannot be prepared until its own
+     * initialization has completed. The first fresh callback binds one new runtime identity.
+     */
+    static ResumeState prepareResume(HazelcastInstance member, String pipeline, String job,
+            long claim, long execution, long profile, String previousRuntime) {
+        return member.<String, Evidence>getMap(MAP_NAME).executeOnKey(pipeline,
+                (EntryProcessor<String, Evidence, ResumeState>) entry -> {
+                    Evidence old = entry.getValue();
+                    if (!sameRun(old, job, claim, execution, profile)) { return ResumeState.REFUSED; }
+                    if (previousRuntime.equals(old.previousRuntimeExecutionId())) {
+                        return old.runtimeExecutionId() == null ? ResumeState.ALREADY_PREPARED : ResumeState.ALREADY_RESUMED;
+                    }
+                    if (!previousRuntime.equals(old.runtimeExecutionId()) || !old.initialized()) {
+                        return ResumeState.REFUSED;
+                    }
+                    entry.setValue(new Evidence(claim, execution, profile, job, null, old.vertices(),
+                            Map.of(), Map.of(), previousRuntime));
+                    return ResumeState.PREPARED;
+                });
+    }
+
+    static boolean matchesResume(Evidence evidence, String job, long claim, long execution, long profile,
+            String previousRuntime) {
+        return sameRun(evidence, job, claim, execution, profile)
+                && (previousRuntime.equals(evidence.runtimeExecutionId())
+                        || previousRuntime.equals(evidence.previousRuntimeExecutionId()));
+    }
+
+    private static boolean sameRun(Evidence evidence, String job, long claim, long execution, long profile) {
+        return evidence != null && evidence.claimGeneration() == claim && evidence.executionGeneration() == execution
+                && evidence.profileGeneration() == profile && job.equals(evidence.jobId());
     }
 
     private static void mutate(HazelcastInstance member, String pipeline, long claim, long execution,
@@ -85,8 +130,9 @@ public final class NativeExecutionStartup {
             Evidence old = entry.getValue();
             if (old == null || old.claimGeneration() != claim || old.executionGeneration() != execution
                     || old.profileGeneration() != profile || !old.vertices().contains(vertex)
-                    || (old.jobId() != null && (!old.jobId().equals(job)
-                            || !old.runtimeExecutionId().equals(runtimeExecution)))) {
+                    || (old.jobId() != null && !old.jobId().equals(job))
+                    || runtimeExecution.equals(old.previousRuntimeExecutionId())
+                    || (old.runtimeExecutionId() != null && !old.runtimeExecutionId().equals(runtimeExecution))) {
                 return false;
             }
             Map<String, Integer> totals = new LinkedHashMap<>(old.expectedProcessors());
@@ -103,7 +149,8 @@ public final class NativeExecutionStartup {
                     throw new IllegalStateException("one native processor index initialized on two members");
                 }
             }
-            entry.setValue(new Evidence(claim, execution, profile, job, runtimeExecution, old.vertices(), totals, contexts));
+            entry.setValue(new Evidence(claim, execution, profile, job, runtimeExecution, old.vertices(), totals, contexts,
+                    old.previousRuntimeExecutionId()));
             return true;
         });
     }

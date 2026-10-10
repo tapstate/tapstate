@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import com.hazelcast.cluster.Cluster;
+import com.hazelcast.cluster.Member;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.JobStatus;
@@ -22,6 +23,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -32,6 +34,14 @@ import static org.mockito.Mockito.*;
 class ClusterRecoveryRuntimeTest {
     private static final Set<String> NODES = Set.of("a", "b", "c");
     private static final Set<String> EXPANDED_NODES = Set.of("a", "b", "c", "d");
+    private static final Map<String, ClusterExecutionMember> ORIGINAL_MEMBERS = Map.of(
+            "a", new ClusterExecutionMember("a", "boot-a", "00000000-0000-4000-8000-000000000001"),
+            "b", new ClusterExecutionMember("b", "boot-b", "00000000-0000-4000-8000-000000000002"),
+            "c", new ClusterExecutionMember("c", "boot-c", "00000000-0000-4000-8000-000000000003"));
+    private static final Map<String, ClusterExecutionMember> REJOINED_MEMBERS = Map.of(
+            "a", ORIGINAL_MEMBERS.get("a"),
+            "b", new ClusterExecutionMember("b", "boot-b-next", "00000000-0000-4000-8000-000000000004"),
+            "c", ORIGINAL_MEMBERS.get("c"));
     private static final Instant NOW = Instant.parse("2026-10-10T06:00:00Z");
     private final StorePort store = mock(StorePort.class);
     private final ClusterCapacityStore capacity = mock(ClusterCapacityStore.class);
@@ -45,13 +55,14 @@ class ClusterRecoveryRuntimeTest {
             new ExecutionProfile(1, Map.of("runtime", "test")));
     private final ClusterCapacityDemand demand = new ClusterCapacityDemand(1, 0, 1, 2, 4, 5);
     private final WorkloadClaim initial = claim(0);
+    private Cluster cluster;
     private ClusterRecoveryRuntime runtime;
 
     @BeforeEach void setup() {
         var member = mock(HazelcastInstance.class);
-        var cluster = mock(Cluster.class);
+        cluster = mock(Cluster.class);
         when(member.getCluster()).thenReturn(cluster);
-        when(cluster.getMembers()).thenReturn(Set.of());
+        useLiveMembers(ORIGINAL_MEMBERS);
         var context = new java.util.concurrent.ConcurrentHashMap<String, Object>();
         context.put(HazelcastConfiguration.NODE_SESSION_CONTEXT_KEY, new WorkloadClaim(
                 new WorkloadClaimKey("cluster", WorkloadClaimType.NODE_SESSION, "a"), owner, 1, 0, 0,
@@ -73,6 +84,8 @@ class ClusterRecoveryRuntimeTest {
         when(store.clusterRecovery()).thenReturn(recovery);
         when(store.meta()).thenReturn(mock(SrsMetaStore.class));
         when(store.state()).thenReturn(mock(StateStore.class));
+        when(capacity.recordExecutionSources(any(), any(), anySet())).thenAnswer(call ->
+                new ClusterCapacityStore.Result(ClusterCapacityStore.Outcome.APPLIED, call.getArgument(0), null, List.of()));
         when(profiles.profile("cluster")).thenReturn(Optional.of(profile));
         when(artifacts.identity("p")).thenReturn(Optional.of(new ArtifactIdentity("p", "inc", "a".repeat(64))));
         when(desired.read("p")).thenReturn(Optional.of(new DesiredState("p", PipelineState.RUNNING, "a".repeat(64))));
@@ -85,9 +98,12 @@ class ClusterRecoveryRuntimeTest {
                 new ClusterCapacityProperties().limits(), "default", Duration.ofSeconds(30));
         when(ownership.beginExecution(eq("p"), any())).thenAnswer(call -> {
             var issuer = call.<PipelineActuationOwnership.ExecutionAdvance>getArgument(1);
-            return issuer.advance(initial, 7, NODES).map(advanced -> new PipelineActuationOwnership.Execution(true,
-                    new ExecutionFence("p", advanced.claimGeneration(), advanced.executionGeneration(), advanced.profileGeneration()),
-                    advanced.topologyRevision())).orElseGet(PipelineActuationOwnership.Execution::refused);
+            return issuer.advance(initial, 7, NODES).map(advanced -> {
+                when(ownership.currentClaim("p")).thenReturn(Optional.of(advanced));
+                return new PipelineActuationOwnership.Execution(true,
+                        new ExecutionFence("p", advanced.claimGeneration(), advanced.executionGeneration(), advanced.profileGeneration()),
+                        advanced.topologyRevision());
+            }).orElseGet(PipelineActuationOwnership.Execution::refused);
         });
     }
 
@@ -178,6 +194,70 @@ class ClusterRecoveryRuntimeTest {
 
         assertThat(pending.held().get().executionGeneration()).isEqualTo(9);
         verify(store.clusterRecovery(), times(1)).advanceExecution(any(), any(), anySet(), anySet());
+        assertNoNativeSubmission();
+    }
+
+    @Test void aPendingOrdinaryAllocationRefusesAReincarnatedMemberWithTheSameStableId() {
+        useLiveMembers(ORIGINAL_MEMBERS);
+        when(gate.committed()).thenReturn(new ClusterMembership("cluster", 7, NODES, 2));
+        PendingStart pending = ordinaryPendingStart(allocatedClaim(1, ORIGINAL_MEMBERS));
+        assertThat(pending.held().get().originalMembersPresent(ORIGINAL_MEMBERS)).contains(true);
+
+        useLiveMembers(REJOINED_MEMBERS);
+        assertThat(pending.held().get().originalMembersPresent(REJOINED_MEMBERS)).contains(false);
+        assertThat(runtime.admitsMissingJob("p")).isTrue();
+        assertThatThrownBy(() -> {
+            if (runtime.prepare("p", pending.planned(), ownership)) {
+                runtime.begin("p", pending.planned(), ownership);
+            }
+        }).isInstanceOfSatisfying(TapstateException.class, this::assertReincarnatedCohort);
+
+        assertThat(pending.held().get().executionGeneration()).isEqualTo(1);
+        assertThat(pending.held().get().executionMembers()).isEqualTo(ORIGINAL_MEMBERS);
+        verify(capacity, times(1)).advanceExecution(any(), any(), anySet());
+        verify(ownership, times(1)).beginExecution(eq("p"), any());
+        assertNoNativeSubmission();
+    }
+
+    @Test void aPendingRecoveryAllocationRefusesAReincarnatedMemberWithTheSameStableId() {
+        useLiveMembers(ORIGINAL_MEMBERS);
+        when(gate.committed()).thenReturn(new ClusterMembership("cluster", 7, NODES, 2));
+        PendingStart pending = recoveryPendingStart(allocatedClaim(8, ORIGINAL_MEMBERS), allocatedClaim(9, ORIGINAL_MEMBERS));
+        assertThat(pending.held().get().originalMembersPresent(ORIGINAL_MEMBERS)).contains(true);
+
+        useLiveMembers(REJOINED_MEMBERS);
+        assertThat(pending.held().get().originalMembersPresent(REJOINED_MEMBERS)).contains(false);
+        assertThatThrownBy(() -> {
+            if (runtime.prepare("p", pending.planned(), ownership)) {
+                runtime.begin("p", pending.planned(), ownership);
+            }
+        }).isInstanceOfSatisfying(TapstateException.class, this::assertReincarnatedCohort);
+
+        assertThat(pending.held().get().executionGeneration()).isEqualTo(9);
+        assertThat(pending.held().get().executionMembers()).isEqualTo(ORIGINAL_MEMBERS);
+        verify(store.clusterRecovery(), times(1)).advanceExecution(any(), any(), anySet(), anySet());
+        verify(ownership, times(1)).beginExecution(eq("p"), any());
+        assertNoNativeSubmission();
+    }
+
+    @Test void aPendingOrdinaryAllocationRefusesAnUnknownOriginalCohort() {
+        PendingStart pending = ordinaryPendingStart(allocatedClaim(1, Map.of()));
+        WorkloadClaim allocated = pending.held().get();
+        assertThat(allocated.contextExecutionGeneration()).isEqualTo(allocated.executionGeneration());
+        assertThat(allocated.executionProfile()).isEqualTo(profile);
+        assertThat(allocated.executionMembers()).isEmpty();
+        assertThat(allocated.originalMembersPresent(ORIGINAL_MEMBERS)).isEmpty();
+
+        assertThatThrownBy(() -> runtime.prepare("p", pending.planned(), ownership))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(LifecycleError.CLUSTER_CAPACITY_UNPROVEN);
+                    assertThat(failure.args()).containsEntry("pipeline", "p");
+                });
+
+        assertThat(pending.held().get().executionGeneration()).isEqualTo(1);
+        verify(capacity, times(1)).reserve(any(), any(), anyString(), anyString(), anyMap(), any(), any());
+        verify(capacity, times(1)).advanceExecution(any(), any(), anySet());
+        verify(ownership, times(1)).beginExecution(eq("p"), any());
         assertNoNativeSubmission();
     }
 
@@ -684,9 +764,12 @@ class ClusterRecoveryRuntimeTest {
     private record CompletionFixture(ClusterRecoveryItem item, WorkloadClaim coordinator) { }
 
     private PendingStart ordinaryPendingStart() {
+        return ordinaryPendingStart(allocatedClaim(1));
+    }
+
+    private PendingStart ordinaryPendingStart(WorkloadClaim allocated) {
         var held = new java.util.concurrent.atomic.AtomicReference<>(initial);
         ClusterCapacityReservation reserved = reservation(null, initial);
-        WorkloadClaim allocated = allocatedClaim(1);
         ClusterCapacityReservation pending = reservation(1L, allocated);
         when(ownership.currentClaim("p")).thenAnswer(call -> Optional.of(held.get()));
         bindIssuerToCurrentClaim(held);
@@ -703,8 +786,10 @@ class ClusterRecoveryRuntimeTest {
     }
 
     private PendingStart recoveryPendingStart() {
-        WorkloadClaim previous = allocatedClaim(8);
-        WorkloadClaim allocated = allocatedClaim(9);
+        return recoveryPendingStart(allocatedClaim(8), allocatedClaim(9));
+    }
+
+    private PendingStart recoveryPendingStart(WorkloadClaim previous, WorkloadClaim allocated) {
         var held = new java.util.concurrent.atomic.AtomicReference<>(previous);
         when(ownership.currentClaim("p")).thenAnswer(call -> Optional.of(held.get()));
         bindIssuerToCurrentClaim(held);
@@ -744,12 +829,36 @@ class ClusterRecoveryRuntimeTest {
     }
 
     private WorkloadClaim allocatedClaim(long execution) {
+        return allocatedClaim(execution, ORIGINAL_MEMBERS);
+    }
+
+    private WorkloadClaim allocatedClaim(long execution, Map<String, ClusterExecutionMember> members) {
         WorkloadClaim base = claim(execution);
-        Map<String, ClusterExecutionMember> members = NODES.stream().collect(java.util.stream.Collectors.toMap(node -> node,
-                node -> new ClusterExecutionMember(node, "boot-" + node, "uuid-" + node)));
         return new WorkloadClaim(base.key(), base.owner(), base.claimGeneration(), base.executionGeneration(), base.topologyRevision(),
                 base.leaseUntil(), base.contextExecutionGeneration(), base.executionClaimGeneration(), base.executionNodeIds(),
                 0, false, base.profileGeneration(), profile, 7L, "inc", "a".repeat(64), members);
+    }
+
+    private void useLiveMembers(Map<String, ClusterExecutionMember> identities) {
+        Set<Member> peers = identities.values().stream().map(identity -> {
+            Member peer = mock(Member.class);
+            when(peer.getAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE)).thenReturn(identity.nodeId());
+            when(peer.getAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE)).thenReturn(identity.bootId());
+            when(peer.getAttribute(ClusterMembershipGate.PROFILE_GENERATION_ATTRIBUTE)).thenReturn("2");
+            when(peer.getAttribute(ClusterMembershipGate.PROFILE_HASH_ATTRIBUTE)).thenReturn(profile.profile().hash());
+            when(peer.getUuid()).thenReturn(UUID.fromString(identity.memberUuid()));
+            return peer;
+        }).collect(java.util.stream.Collectors.toSet());
+        when(cluster.getMembers()).thenReturn(peers);
+    }
+
+    private void assertReincarnatedCohort(TapstateException failure) {
+        assertThat(failure.code()).isEqualTo(EngineError.EXECUTION_COHORT_CHANGED_BEFORE_START);
+        assertThat(failure.args()).containsEntry("pipeline", "p");
+        assertThat(String.valueOf(failure.args().get("planned")))
+                .contains(ORIGINAL_MEMBERS.get("b").bootId(), ORIGINAL_MEMBERS.get("b").memberUuid());
+        assertThat(String.valueOf(failure.args().get("actual")))
+                .contains(REJOINED_MEMBERS.get("b").bootId(), REJOINED_MEMBERS.get("b").memberUuid());
     }
 
     private void assertChangedCohort(TapstateException failure) {

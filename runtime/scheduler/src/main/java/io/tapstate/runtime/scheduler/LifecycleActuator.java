@@ -1,5 +1,7 @@
 package io.tapstate.runtime.scheduler;
 
+import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.spi.store.PendingPipelineResume;
 import java.util.Optional;
 
 /**
@@ -24,6 +26,18 @@ public interface LifecycleActuator {
 
     /** Continues the pipeline's paused job, re-reading its start position from the store. */
     void resume(String pipelineId);
+
+    /** Freezes the existing native run before the converge loop accepts a durable resume transition. */
+    default Optional<PendingPipelineResume> prepareResume(
+            String pipelineId, DesiredState intent, long acceptedStateEpoch) {
+        return Optional.empty();
+    }
+
+    /** Whether this receipt still belongs to the current artifact and execution profile. */
+    default boolean acceptsPendingResume(PendingPipelineResume pendingResume) { return false; }
+
+    /** Actual native initialization and source proof, never the lifecycle method's normal return. */
+    default boolean resumeCompleted(PendingPipelineResume pendingResume) { return false; }
 
     /**
      * Ends the pipeline's job, and clears what the pipeline has accumulated when {@code purgeState} says
