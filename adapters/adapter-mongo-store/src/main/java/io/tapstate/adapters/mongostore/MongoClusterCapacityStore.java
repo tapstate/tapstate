@@ -438,6 +438,7 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
         if (!executionMembers.keySet().equals(executionNodes)) {
             return result(Outcome.WAITING_QUORUM, expected, null, List.of());
         }
+        List<Document> retiredHistory = retiredSubmittedHistory(session, pipelineClaim, context.now);
         OptionalAdvance allocated = allocate(session, pipelineClaim, context.topologyRevision, executionNodes);
         if (allocated.claim == null) {
             return result(Outcome.STALE_CLAIM, expected, null, List.of());
@@ -455,6 +456,9 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
         WorkloadClaim recorded = MongoWorkloadClaimStore.readDocument(claims.find(session,
                 WorkloadClaimDocuments.live(WorkloadClaimFence.from(allocated.claim))).first());
         replace(session, current, advanced, allocated.claim.leaseUntil());
+        for (Document retired : retiredHistory) {
+            occupancy.deleteOne(session, new Document("_id", retired.get("_id")).append("revision", retired.get("revision")));
+        }
         return result(Outcome.APPLIED, advanced, recorded, List.of());
     }
 
@@ -557,12 +561,19 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
         Map<String, ClusterCapacityDemand> total = new LinkedHashMap<>();
         List<Document> records = occupancy.find(session, new Document("clusterId", clusterId)).into(new ArrayList<>());
         Set<String> recordedExecutions = new java.util.HashSet<>();
+        Map<String, List<ClusterCapacityReservation>> retiredSubmissions = new LinkedHashMap<>();
         for (Document record : records) {
             ClusterCapacityReservation reservation = reservation(record);
             if ((cleanup ? fenced(session, record, now) : fencedAt(session, record, now)) && !reservation.deadline().isAfter(now)) {
+                if (reservation.nativeJobId() != null && reservation.executionGeneration() != null) {
+                    retiredSubmissions.computeIfAbsent(reservation.pipelineId() + ":" + reservation.executionGeneration(),
+                            ignored -> new ArrayList<>()).add(reservation);
+                }
                 // An unsubmitted recovery retains its authority evidence until its queue step releases it.
                 if (cleanup && (!record.getBoolean("recovery", false) || reservation.nativeJobId() != null)
-                        && !retainedResume(session, record)) {
+                        && !retainedResume(session, record)
+                        && !retiredSubmittedContext(claims.find(session,
+                                new Document("_id", claimId(reservation.clusterId(), reservation.pipelineId()))).first(), List.of(reservation))) {
                     occupancy.deleteOne(session, new Document("_id", record.get("_id")).append("revision", record.get("revision")));
                 }
                 continue;
@@ -586,6 +597,10 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
                     || retiredExplicitExecutions.contains(claim.getString("resourceId") + ":" + execution)) {
                 continue;
             }
+            if (retiredSubmittedContext(claim, retiredSubmissions.getOrDefault(claim.getString("resourceId") + ":" + execution,
+                    List.of()))) {
+                continue;
+            }
             Document actual = states.find(session, new Document("_id", claim.getString("resourceId"))).first();
             Document executionProfile = claim.get("executionProfile", Document.class);
             boolean oldProfile = executionProfile != null && ClusterRecoveryDocuments.number(executionProfile, "generation")
@@ -599,6 +614,35 @@ public final class MongoClusterCapacityStore implements ClusterCapacityStore {
             }
         }
         return new Occupied(Map.copyOf(total), false);
+    }
+
+    /** A submitted receipt proves history only after its exact authority and cached horizon retire. */
+    private static boolean retiredSubmittedContext(Document document, List<ClusterCapacityReservation> submitted) {
+        if (document == null || submitted.isEmpty()) { return false; }
+        WorkloadClaim claim = MongoWorkloadClaimStore.readDocument(document);
+        if (claim.executionRevision() == null || claim.executionRevision().isBlank() || claim.executionTopologyRevision() == null) {
+            return false;
+        }
+        return submitted.stream().anyMatch(receipt -> {
+            if (receipt.nativeJobId() == null || receipt.executionGeneration() == null) { return false; }
+            WorkloadClaimFence authority = receipt.pipelineClaim();
+            // Acquisition topology can refresh; only the retained allocator context names execution topology.
+            WorkloadClaimFence original = new WorkloadClaimFence(authority.key(), authority.owner(), authority.claimGeneration(),
+                    authority.executionGeneration(), claim.executionTopologyRevision(), authority.profileGeneration());
+            return matchesExecutionContext(document, original, receipt.profile(), key(receipt), claim.executionRevision(),
+                    receipt.demandByNode().keySet());
+        });
+    }
+
+    private List<Document> retiredSubmittedHistory(ClientSession session, WorkloadClaim current, Instant now) {
+        Document context = claims.find(session, new Document("_id", claimId(current.key().clusterId(), current.key().resourceId()))).first();
+        return occupancy.find(session, new Document("clusterId", current.key().clusterId()).append("pipelineId", current.key().resourceId())
+                .append("executionGeneration", current.executionGeneration()).append("nativeJobId", new Document("$ne", null)))
+                .into(new ArrayList<>()).stream().filter(row -> {
+                    ClusterCapacityReservation receipt = reservation(row);
+                    return !receipt.deadline().isAfter(now) && fenced(session, row, now)
+                            && retiredSubmittedContext(context, List.of(receipt));
+                }).toList();
     }
 
     private boolean fencedAt(ClientSession session, Document record, Instant now) {

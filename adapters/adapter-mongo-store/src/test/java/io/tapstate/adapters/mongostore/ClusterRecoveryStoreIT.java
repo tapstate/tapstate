@@ -113,7 +113,10 @@ class ClusterRecoveryStoreIT {
             Map<String, List<Document>> beforeRead = fixture.storedFacts();
             assertThat(fixture.capacity.resumeReservation(resume.pending())).contains(reserved.reservation());
             assertThat(fixture.storedFacts()).isEqualTo(beforeRead);
-            assertThat(fixture.occupancy.countDocuments()).isEqualTo(1);
+            assertThat(fixture.occupancy.countDocuments(new Document("_id", reserved.reservation().reservationId()))).isEqualTo(1);
+            assertThat(fixture.occupancy.countDocuments(new Document("pipelineId", "orders")
+                    .append("executionGeneration", resume.original().executionGeneration()).append("nativeJobId", "1"))).isEqualTo(1);
+            assertThat(fixture.capacity.readOccupied("east").orElseThrow().occupiedByNode()).isEqualTo(DEMAND);
             assertThat(fixture.states.read("orders").orElseThrow().epoch()).isEqualTo(resume.pending().stateEpoch());
         }
     }
@@ -131,8 +134,9 @@ class ClusterRecoveryStoreIT {
             assertThat(results).extracting(ClusterCapacityStore.Result::outcome).containsExactlyInAnyOrder(
                     ClusterCapacityStore.Outcome.APPLIED, ClusterCapacityStore.Outcome.ALREADY_RESERVED);
             assertThat(results.getFirst().reservation().reservationId()).isEqualTo(results.getLast().reservation().reservationId());
-            assertThat(fixture.occupancy.countDocuments()).isEqualTo(1);
             ClusterCapacityReservation receipt = fixture.capacity.resumeReservation(resume.pending()).orElseThrow();
+            assertThat(fixture.occupancy.countDocuments(new Document("_id", receipt.reservationId()))).isEqualTo(1);
+            assertThat(fixture.capacity.readOccupied("east").orElseThrow().occupiedByNode()).isEqualTo(DEMAND);
             var advanced = fixture.capacity.advanceExecution(receipt, current, LIVE);
             assertThat(advanced.outcome()).isEqualTo(ClusterCapacityStore.Outcome.APPLIED);
             assertThat(advanced.advancedPipelineClaim().executionGeneration()).isEqualTo(2);
@@ -155,7 +159,8 @@ class ClusterRecoveryStoreIT {
             assertThat(adopted.reservation().reservationId()).isEqualTo(reserved.reservation().reservationId());
             assertThat(adopted.reservation().executionGeneration()).isNull();
             assertThat(adopted.reservation().pipelineClaim()).isEqualTo(WorkloadClaimFence.from(next));
-            assertThat(fixture.occupancy.countDocuments()).isEqualTo(1);
+            assertThat(fixture.occupancy.countDocuments(new Document("_id", adopted.reservation().reservationId()))).isEqualTo(1);
+            assertThat(fixture.capacity.readOccupied("east").orElseThrow().occupiedByNode()).isEqualTo(DEMAND);
             assertThat(next.executionGeneration()).isEqualTo(1);
         }
     }
@@ -285,7 +290,8 @@ class ClusterRecoveryStoreIT {
                         : fixture.capacity.advanceExecution(receipt, current, LIVE).outcome()).isEqualTo(ClusterCapacityStore.Outcome.STALE_INTENT);
                 assertThat(fixture.capacity.resumeReservation(resume.pending())).isEmpty();
                 assertThat(fixture.workloads.read(current.key()).orElseThrow().claim().executionGeneration()).isEqualTo(frontier);
-                assertThat(fixture.occupancy.countDocuments()).isEqualTo(1);
+                assertThat(fixture.occupancy.countDocuments(new Document("_id", receipt.reservationId()))).isEqualTo(1);
+                assertThat(fixture.capacity.readOccupied("east").orElseThrow().occupiedByNode()).isEqualTo(DEMAND);
             }
         }
     }
@@ -1001,6 +1007,136 @@ class ClusterRecoveryStoreIT {
     }
 
     @Test
+    void aRetiredSubmittedExecutionAllowsAnOrdinaryStartInANewControllerTenure() {
+        try (Fixture fixture = new Fixture()) {
+            OrdinaryRestart restart = fixture.ordinaryRestart("restart", true, Duration.ofSeconds(3), true);
+            assertThat(restart.controller().claimGeneration()).isGreaterThan(restart.executed().claimGeneration());
+            assertThat(restart.controller().executionGeneration()).isEqualTo(restart.executed().executionGeneration());
+            assertThat(restart.controller().executionClaimGeneration()).isEqualTo(restart.executed().claimGeneration());
+            assertThat(restart.controller().executionMembers()).isEqualTo(restart.executed().executionMembers());
+            assertThat(restart.controller().executionProfile()).isEqualTo(restart.executed().executionProfile());
+            assertThat(fixture.states.pendingResume("restart")).isEmpty();
+
+            var reserved = fixture.capacity.reserve(restart.controller(), fixture.profile, restart.pipeline().key().incarnation(),
+                    DesiredStateFingerprint.of(restart.accepted()), DEMAND, LIMITS, PERMIT_TTL);
+
+            assertThat(reserved.outcome()).isEqualTo(ClusterCapacityStore.Outcome.APPLIED);
+            assertThat(reserved.reservation().executionGeneration()).isNull();
+            var advanced = fixture.capacity.advanceExecution(reserved.reservation(), restart.controller(), LIVE);
+            assertThat(advanced.outcome()).isEqualTo(ClusterCapacityStore.Outcome.APPLIED);
+            assertThat(advanced.advancedPipelineClaim().executionGeneration()).isEqualTo(restart.executed().executionGeneration() + 1);
+            assertThat(advanced.advancedPipelineClaim().executionClaimGeneration()).isEqualTo(restart.controller().claimGeneration());
+            assertThat(fixture.queue.countDocuments()).isZero();
+        }
+    }
+
+    @Test
+    void retiredSubmittedHistorySurvivesBudgetRefusalAndPreAdvanceReentry() {
+        try (Fixture fixture = new Fixture()) {
+            OrdinaryRestart restart = fixture.ordinaryRestart("restart", true, Duration.ofSeconds(3), true);
+            Pipeline busy = fixture.pipeline("busy", false, List.of(SourceRef.bare("crm")), true,
+                    fixture.nodeB.owner(), Duration.ofSeconds(5));
+            fixture.running("busy");
+            var busyReserved = fixture.capacity.reserve(busy.claim(), fixture.profile, busy.key().incarnation(),
+                    busy.intentFingerprint(), DEMAND, LIMITS, PERMIT_TTL);
+            var busyAdvanced = fixture.capacity.advanceExecution(busyReserved.reservation(), busy.claim(), LIVE);
+            assertThat(fixture.capacity.submitted(busyAdvanced.reservation(), WorkloadClaimFence.from(busyAdvanced.advancedPipelineClaim()),
+                    "busy-job").outcome()).isEqualTo(ClusterCapacityStore.Outcome.APPLIED);
+            ClusterCapacityLimits one = new ClusterCapacityLimits(1, 1, 1, 1, 1, 1);
+
+            assertThat(fixture.capacity.reserve(restart.controller(), fixture.profile, restart.pipeline().key().incarnation(),
+                    DesiredStateFingerprint.of(restart.accepted()), DEMAND, one, PERMIT_TTL).outcome())
+                    .isEqualTo(ClusterCapacityStore.Outcome.CAPACITY_REFUSED);
+            assertThat(fixture.occupancy.find(new Document("_id", restart.historicalReceipt().reservationId())).first()).isNotNull();
+            assertThat(fixture.capacity.readOccupied("east").orElseThrow().occupiedByNode()).isEqualTo(DEMAND);
+
+            fixture.desired.save(new DesiredState("busy", PipelineState.STOPPED, busyAdvanced.advancedPipelineClaim().executionRevision()));
+            var current = fixture.states.read("busy").orElseThrow();
+            fixture.states.compareAndSwap("busy", current.epoch(), "STOPPED", java.time.Instant.now());
+            assertThat(fixture.workloads.release(busyAdvanced.advancedPipelineClaim())).isTrue();
+            fixture.awaitRetirement(busy.claim().key());
+            var reserved = fixture.capacity.reserve(restart.controller(), fixture.profile, restart.pipeline().key().incarnation(),
+                    DesiredStateFingerprint.of(restart.accepted()), DEMAND, one, PERMIT_TTL);
+            assertThat(reserved.outcome()).isEqualTo(ClusterCapacityStore.Outcome.APPLIED);
+            assertThat(fixture.capacity.readOccupied("east").orElseThrow().occupiedByNode()).isEqualTo(DEMAND);
+            var retried = fixture.capacity.reserve(restart.controller(), fixture.profile, restart.pipeline().key().incarnation(),
+                    DesiredStateFingerprint.of(restart.accepted()), DEMAND, one, PERMIT_TTL);
+            assertThat(retried.outcome()).isEqualTo(ClusterCapacityStore.Outcome.ALREADY_RESERVED);
+            assertThat(retried.reservation().reservationId()).isEqualTo(reserved.reservation().reservationId());
+            assertThat(fixture.occupancy.find(new Document("_id", restart.historicalReceipt().reservationId())).first()).isNotNull();
+
+            var advanced = fixture.capacity.advanceExecution(retried.reservation(), restart.controller(), LIVE);
+            assertThat(advanced.outcome()).isEqualTo(ClusterCapacityStore.Outcome.APPLIED);
+            assertThat(fixture.occupancy.find(new Document("_id", restart.historicalReceipt().reservationId())).first()).isNull();
+            assertThat(fixture.capacity.readOccupied("east").orElseThrow().occupiedByNode()).isEqualTo(DEMAND);
+        }
+    }
+
+    @Test
+    void anUnsubmittedRetiredAllocationCannotProveHistoricalOrdinaryDemand() {
+        try (Fixture fixture = new Fixture()) {
+            OrdinaryRestart restart = fixture.ordinaryRestart("pending", false, Duration.ofSeconds(3), true);
+            assertThat(fixture.capacity.reserve(restart.controller(), fixture.profile, restart.pipeline().key().incarnation(),
+                    DesiredStateFingerprint.of(restart.accepted()), DEMAND, LIMITS, PERMIT_TTL).outcome())
+                    .isEqualTo(ClusterCapacityStore.Outcome.UNKNOWN_DEMAND);
+        }
+    }
+
+    @Test
+    void aSubmittedOriginalStillOccupiesBudgetBeforeItsCachedAuthorityRetires() {
+        try (Fixture fixture = new Fixture()) {
+            OrdinaryRestart restart = fixture.ordinaryRestart("live-horizon", true, Duration.ofSeconds(30), false);
+            ClusterCapacityLimits one = new ClusterCapacityLimits(1, 1, 1, 1, 1, 1);
+            assertThat(fixture.capacity.reserve(restart.controller(), fixture.profile, restart.pipeline().key().incarnation(),
+                    DesiredStateFingerprint.of(restart.accepted()), DEMAND, one, PERMIT_TTL).outcome())
+                    .isEqualTo(ClusterCapacityStore.Outcome.CAPACITY_REFUSED);
+            assertThat(fixture.capacity.readOccupied("east").orElseThrow().occupiedByNode()).isEqualTo(DEMAND);
+            assertThat(fixture.occupancy.countDocuments()).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void aRetiredReceiptCannotQualifyAnotherIncarnationProfileOrExecutionContext() {
+        for (String field : List.of("executionIncarnation", "executionProfile", "executionClaimGeneration")) {
+            try (Fixture fixture = new Fixture()) {
+                OrdinaryRestart restart = fixture.ordinaryRestart("mismatch", true, Duration.ofSeconds(3), true);
+                Object incompatible = switch (field) {
+                    case "executionIncarnation" -> "another-incarnation";
+                    case "executionProfile" -> {
+                        ExecutionProfile other = new ExecutionProfile(1, Map.of("build", "other", "threads", "4"));
+                        Document original = fixture.claims.find(new Document("_id", MongoClusterCapacityStore.claimId("east", "mismatch")))
+                                .first().get("executionProfile", Document.class);
+                        yield new Document(original).append("formatVersion", other.formatVersion())
+                                .append("attributes", new Document(other.attributes())).append("hash", other.hash());
+                    }
+                    default -> restart.controller().claimGeneration();
+                };
+                fixture.claims.updateOne(new Document("_id", MongoClusterCapacityStore.claimId("east", "mismatch")),
+                        new Document("$set", new Document(field, incompatible)));
+                WorkloadClaim current = fixture.workloads.read(restart.controller().key()).orElseThrow().claim();
+                assertThat(fixture.capacity.reserve(current, fixture.profile, restart.pipeline().key().incarnation(),
+                        DesiredStateFingerprint.of(restart.accepted()), DEMAND, LIMITS, PERMIT_TTL).outcome()).as(field)
+                        .isEqualTo(ClusterCapacityStore.Outcome.UNKNOWN_DEMAND);
+            }
+        }
+    }
+
+    @Test
+    void retiredSubmittedHistoryMatchesTheImmutableContextAfterAcquisitionTopologyRefresh() {
+        try (Fixture fixture = new Fixture()) {
+            OrdinaryRestart restart = fixture.ordinaryRestart("refreshed", true, Duration.ofSeconds(3), true);
+            fixture.memberDocuments.updateOne(new Document("_id", "east"), new Document("$set", new Document("revision", 3L)));
+            WorkloadClaim refreshed = fixture.workloads.acquire(restart.controller().key(), restart.controller().owner(), 3, TTL).claim();
+            assertThat(refreshed.claimGeneration()).isEqualTo(restart.controller().claimGeneration());
+            assertThat(refreshed.executionTopologyRevision()).isEqualTo(2L);
+            assertThat(refreshed.topologyRevision()).isEqualTo(3L);
+            assertThat(fixture.capacity.reserve(refreshed, fixture.profile, restart.pipeline().key().incarnation(),
+                    DesiredStateFingerprint.of(restart.accepted()), DEMAND, LIMITS, PERMIT_TTL).outcome())
+                    .isEqualTo(ClusterCapacityStore.Outcome.APPLIED);
+        }
+    }
+
+    @Test
     void aPipelineFailureNoteSurvivesMissingRecoveryOwnerWithoutReleasingDemand() {
         try (Fixture fixture = new Fixture()) {
             Pipeline pipeline = fixture.pipeline("orders", true, List.of(SourceRef.bare("crm")), true,
@@ -1458,6 +1594,9 @@ class ClusterRecoveryStoreIT {
     private record RetryPermit(ClusterRecoveryItem item, WorkloadClaim claim, ClusterRecoveryStartupReceipt receipt) {}
     private record Resume(Pipeline pipeline, WorkloadClaim original, PendingPipelineResume pending) {}
 
+    private record OrdinaryRestart(Pipeline pipeline, WorkloadClaim executed, WorkloadClaim controller,
+            ClusterCapacityReservation historicalReceipt, DesiredState accepted) {}
+
     private static final class Fixture implements AutoCloseable {
         private final MongoClient client = MongoClients.create(MONGO.getReplicaSetUrl());
         private final String database = "recovery_" + UUID.randomUUID().toString().replace("-", "");
@@ -1555,6 +1694,40 @@ class ClusterRecoveryStoreIT {
             assertThat(workloads.release(original)).isTrue();
             awaitRetirement(original.key());
             return workloads.acquire(original.key(), owner, original.topologyRevision(), ttl).claim();
+        }
+
+        private OrdinaryRestart ordinaryRestart(String id, boolean submitted, Duration originalTtl, boolean awaitRetired) {
+            Pipeline pipeline = pipeline(id, false, List.of(SourceRef.bare("crm")), true, nodeB.owner(), originalTtl);
+            running(id);
+            var reserved = capacity.reserve(pipeline.claim(), profile, pipeline.key().incarnation(), pipeline.intentFingerprint(),
+                    DEMAND, LIMITS, PERMIT_TTL);
+            assertThat(reserved.outcome()).isEqualTo(ClusterCapacityStore.Outcome.APPLIED);
+            var advanced = capacity.advanceExecution(reserved.reservation(), pipeline.claim(), LIVE);
+            assertThat(advanced.outcome()).isEqualTo(ClusterCapacityStore.Outcome.APPLIED);
+            WorkloadClaim executed = advanced.advancedPipelineClaim();
+            ClusterCapacityReservation receipt = advanced.reservation();
+            if (submitted) {
+                var recorded = capacity.submitted(receipt, WorkloadClaimFence.from(executed), "ordinary-original-job");
+                assertThat(recorded.outcome()).isEqualTo(ClusterCapacityStore.Outcome.APPLIED);
+                receipt = recorded.reservation();
+            }
+            desired.save(new DesiredState(id, PipelineState.STOPPED, executed.executionRevision()));
+            var checkpoint = states.read(id).orElseThrow();
+            var stopped = (io.tapstate.core.lifecycle.CasOutcome.Applied) states.compareAndSwap(id, checkpoint.epoch(),
+                    StateJson.of(PipelineState.STOPPED), java.time.Instant.now());
+            assertThat(workloads.release(executed)).isTrue();
+            WorkloadClaim controller = workloads.acquire(executed.key(), recovery.owner(), executed.topologyRevision(), TTL).claim();
+            if (awaitRetired) {
+                awaitRetirement(controller.key());
+                assertThat(capacity.readOccupied("east").orElseThrow().occupiedByNode()).isEmpty();
+            }
+            DesiredState accepted = new DesiredState(id, PipelineState.RUNNING, executed.executionRevision(),
+                    false, null, true, stopped.next().epoch());
+            desired.save(accepted);
+            assertThat(states.compareAndSwap(id, stopped.next().epoch(), StateJson.of(PipelineState.RUNNING), java.time.Instant.now()))
+                    .isInstanceOf(io.tapstate.core.lifecycle.CasOutcome.Applied.class);
+            assertThat(states.pendingResume(id)).isEmpty();
+            return new OrdinaryRestart(pipeline, executed, controller, receipt, accepted);
         }
 
         private ClusterCapacityStore.Result resume(PendingPipelineResume pending, WorkloadClaim current) {

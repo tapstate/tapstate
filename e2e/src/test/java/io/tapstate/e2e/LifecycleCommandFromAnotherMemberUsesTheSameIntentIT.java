@@ -125,7 +125,7 @@ class LifecycleCommandFromAnotherMemberUsesTheSameIntentIT {
             awaitMeasured(control, ORIGINAL);
             ClusterClaimView originalClaim = claim(control);
             assertThat(originalClaim.ownerNodeId()).isIn(ORIGINAL);
-            Submitted originalJob = awaitOneSubmitted(database, cluster.clusterId());
+            Submitted originalJob = awaitOneSubmitted(database, cluster.clusterId(), originalClaim);
             assertThat(originalClaim.executionMembers().stream().map(ClusterClaimView.Member::nodeId))
                     .containsExactlyInAnyOrderElementsOf(ORIGINAL);
             assertThat(originalJob.generation()).isEqualTo(originalClaim.executionGeneration());
@@ -141,7 +141,7 @@ class LifecycleCommandFromAnotherMemberUsesTheSameIntentIT {
             assertOutsideRun(fourth);
             assertSameDriver(originalClaim, claim(fourth));
             assertThat(executions(fourth)).isEqualTo(originalExecution);
-            assertThat(oneSubmitted(database, cluster.clusterId())).isEqualTo(originalJob);
+            assertThat(oneSubmitted(database, cluster.clusterId(), originalClaim)).isEqualTo(originalJob);
 
             DesiredState running = desired.read(PIPELINE).orElseThrow();
             assertThat(fourth.startUnlessRunning(PIPELINE))
@@ -188,7 +188,7 @@ class LifecycleCommandFromAnotherMemberUsesTheSameIntentIT {
             assertThat(resumed.executionGeneration()).isEqualTo(originalClaim.executionGeneration() + 1);
             assertThat(resumed.executionMembers().stream().map(ClusterClaimView.Member::nodeId))
                     .containsExactlyInAnyOrderElementsOf(ALL);
-            Submitted resumedJob = awaitOneSubmitted(database, cluster.clusterId());
+            Submitted resumedJob = awaitOneSubmitted(database, cluster.clusterId(), resumed);
             assertThat(resumedJob.generation()).isEqualTo(resumed.executionGeneration());
             assertThat(resumedJob.jobId()).isNotEqualTo(originalJob.jobId());
             assertThat(executions(fourth)).hasSize(1);
@@ -211,17 +211,27 @@ class LifecycleCommandFromAnotherMemberUsesTheSameIntentIT {
                     () -> "cluster = " + control.clusterStatus() + "; submissions = "
                             + submissions(database, cluster.clusterId()));
             long stoppedGeneration = resumed.executionGeneration();
+            long keptSnapshotReads = readRows(reads, "snapshot");
+            long keptTailReads = tailRows(reads);
+            long keptReaderStarts = readerStartsAt(reads, SEEDED_ROWS + 2);
 
             // With no run left, a legal START from this endpoint creates one new run using all active members.
             fifth.lifecycle(PIPELINE, LifecycleVerb.START);
             awaitIntent(desired, PipelineState.RUNNING, running.revision());
             awaitState(control, PipelineState.RUNNING);
-            awaitLanded(control, files, targetAddress, SEEDED_ROWS + 2);
             awaitMeasured(control, FLEET);
+            Await.until("the kept source reader to open at its persisted point", BOUND,
+                    () -> readerStartsAt(reads, SEEDED_ROWS + 2) == keptReaderStarts + 1,
+                    () -> "reader starts = " + readerStartsAt(reads, SEEDED_ROWS + 2)
+                            + ", state = " + control.state(PIPELINE) + ", failure = " + control.failure(PIPELINE));
+            assertThat(files.count(targetAddress, TABLE)).isEqualTo(SEEDED_ROWS + 2);
+            assertThat(readRows(reads, "snapshot")).as("a settled kept snapshot is not mined again").isEqualTo(keptSnapshotReads);
+            assertThat(tailRows(reads)).as("the kept producer point is not mined again").isEqualTo(keptTailReads);
+            assertWrittenOnce(writes, SEEDED_ROWS + 2);
             ClusterClaimView restarted = claim(fifth);
             assertSameDriver(claim(control), restarted);
             assertThat(restarted.executionGeneration()).isEqualTo(stoppedGeneration + 1);
-            Submitted nextJob = awaitOneSubmitted(database, cluster.clusterId());
+            Submitted nextJob = awaitOneSubmitted(database, cluster.clusterId(), restarted);
             assertThat(nextJob.generation()).isEqualTo(restarted.executionGeneration());
             assertThat(nextJob.jobId()).isNotEqualTo(resumedJob.jobId());
             assertThat(restarted.executionMembers().stream().map(ClusterClaimView.Member::nodeId))
@@ -271,11 +281,15 @@ class LifecycleCommandFromAnotherMemberUsesTheSameIntentIT {
 
     private static void awaitMeasured(ControlPlane control, List<String> cohort) {
         Await.until("each planned member to report its actual processors", BOUND, () -> {
+            if (control.state(PIPELINE).filter(PipelineState.FAILED::equals).isPresent()) {
+                throw new AssertionError("native startup failed: " + control.failure(PIPELINE));
+            }
             List<String> uuids = control.clusterStatus().members().stream().filter(member -> cohort.contains(member.nodeId()))
                     .map(ClusterMemberView::memberUuid).toList();
             return uuids.size() == cohort.size() && control.membersMeasuring(PIPELINE).containsAll(uuids)
                     && control.membersCarryingPartOf(PIPELINE).containsAll(cohort) && executions(control).size() == 1;
-        }, () -> "measured = " + control.membersMeasuring(PIPELINE) + ", carrying = "
+        }, () -> "state = " + control.state(PIPELINE) + ", failure = " + control.failure(PIPELINE)
+                + ", measured = " + control.membersMeasuring(PIPELINE) + ", carrying = "
                 + control.membersCarryingPartOf(PIPELINE));
     }
 
@@ -309,7 +323,7 @@ class LifecycleCommandFromAnotherMemberUsesTheSameIntentIT {
             MongoDatabase database, String clusterId) {
         assertSameDriver(expected, actual);
         assertThat(actual.executionGeneration()).isEqualTo(expected.executionGeneration());
-        assertThat(oneSubmitted(database, clusterId)).isEqualTo(submitted);
+        assertThat(oneSubmitted(database, clusterId, actual)).isEqualTo(submitted);
     }
 
     private static void assertStartRefused(ControlPlane control, PipelineState from) {
@@ -383,9 +397,22 @@ class LifecycleCommandFromAnotherMemberUsesTheSameIntentIT {
                 .into(new ArrayList<>());
     }
 
-    private static Submitted awaitOneSubmitted(MongoDatabase database, String clusterId) {
+    private static List<Document> executionSubmissions(MongoDatabase database, String clusterId, ClusterClaimView expected) {
+        assertThat(expected.executionClaimGeneration()).isNotNull().isPositive();
+        assertThat(expected.executionProfileGeneration()).isNotNull().isPositive();
+        assertThat(expected.executionIncarnation()).isNotBlank();
+        return SystemCollections.CLUSTER_CAPACITY_OCCUPANCY.on(database).find(new Document("clusterId", clusterId)
+                .append("pipelineId", PIPELINE).append("incarnationId", expected.executionIncarnation())
+                .append("executionGeneration", expected.executionGeneration())
+                .append("pipelineClaim.claimGeneration", expected.executionClaimGeneration())
+                .append("pipelineClaim.profileGeneration", expected.executionProfileGeneration())
+                .append("profile.hash", expected.executionProfileHash()).append("nativeJobId", new Document("$type", "string")))
+                .into(new ArrayList<>());
+    }
+
+    private static Submitted awaitOneSubmitted(MongoDatabase database, String clusterId, ClusterClaimView expected) {
         return Await.answered("one actual native-job submission receipt", BOUND, () -> {
-            List<Document> submissions = submissions(database, clusterId);
+            List<Document> submissions = executionSubmissions(database, clusterId, expected);
             if (submissions.size() != 1 || !(submissions.getFirst().get("nativeJobId") instanceof String jobId)
                     || !(submissions.getFirst().get("executionGeneration") instanceof Number generation)) {
                 return java.util.Optional.empty();
@@ -394,8 +421,8 @@ class LifecycleCommandFromAnotherMemberUsesTheSameIntentIT {
         });
     }
 
-    private static Submitted oneSubmitted(MongoDatabase database, String clusterId) {
-        List<Document> submissions = submissions(database, clusterId);
+    private static Submitted oneSubmitted(MongoDatabase database, String clusterId, ClusterClaimView expected) {
+        List<Document> submissions = executionSubmissions(database, clusterId, expected);
         assertThat(submissions).as("one submission for this resource, not a job local to each endpoint").hasSize(1);
         Document submitted = submissions.getFirst();
         assertThat(submitted.getString("nativeJobId")).isNotBlank();
@@ -417,12 +444,16 @@ class LifecycleCommandFromAnotherMemberUsesTheSameIntentIT {
     }
 
     private static long tailRows(Path directory) {
+        return readRows(directory, "tail");
+    }
+
+    private static long readRows(Path directory, String phase) {
         try (Stream<Path> files = Files.list(directory)) {
             long rows = 0;
             for (Path file : files.filter(path -> path.getFileName().toString().startsWith("reads-")).toList()) {
                 for (String line : Files.readAllLines(file)) {
                     String[] cells = line.split("\t", -1);
-                    if (cells.length == 4 && "tail".equals(cells[1]) && TABLE.equals(cells[2])) {
+                    if (cells.length == 4 && phase.equals(cells[1]) && TABLE.equals(cells[2])) {
                         rows += Long.parseLong(cells[3]);
                     }
                 }
@@ -430,6 +461,22 @@ class LifecycleCommandFromAnotherMemberUsesTheSameIntentIT {
             return rows;
         } catch (IOException failure) {
             throw new UncheckedIOException("reading the physical capture witness", failure);
+        }
+    }
+
+    private static long readerStartsAt(Path directory, long position) {
+        try (Stream<Path> files = Files.list(directory)) {
+            long starts = 0;
+            for (Path file : files.filter(path -> path.getFileName().toString().startsWith("positions-")).toList()) {
+                for (String line : Files.readAllLines(file)) {
+                    String[] cells = line.split("\t", -1);
+                    if (cells.length == 5 && "START".equals(cells[1]) && TABLE.equals(cells[2])
+                            && ("{" + TABLE + "=" + position + "}").equals(cells[4])) { starts++; }
+                }
+            }
+            return starts;
+        } catch (IOException failure) {
+            throw new UncheckedIOException("reading the physical source-position witness", failure);
         }
     }
 }

@@ -1,6 +1,7 @@
 package io.tapstate.e2e;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.mongodb.ConnectionString;
 import com.mongodb.client.MongoClient;
@@ -12,6 +13,7 @@ import io.tapstate.control.core.ClusterMemberView;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.testsupport.DockerGate;
 import java.io.IOException;
+import java.net.BindException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.nio.file.Files;
@@ -50,8 +52,10 @@ class AnIncompatibleMemberNeverJoinsTheClusterIT {
             assertThat(committed.getList("activeNodeIds", String.class)).containsExactlyInAnyOrderElementsOf(NODES);
             ClusterMemberView old = member(surviving, CANDIDATE);
             // Process arguments are read while the owned process is alive; no URI or other setting is reported.
-            InetSocketAddress physicalListener = listenerOf(cluster.processCarrying(CANDIDATE));
+            RealProcessServer killed = cluster.processCarrying(CANDIDATE);
+            InetSocketAddress physicalListener = listenerOf(killed);
             cluster.kill(CANDIDATE);
+            assertThat(killed.isAlive()).as("the fixture's old native listener has exited").isFalse();
             awaitActive(surviving, NODES.stream().filter(node -> !node.equals(CANDIDATE)).toList());
             Document oldSession = nodeSession(store, cluster.clusterId(), CANDIDATE);
             assertThat(liveSessions(store, cluster.clusterId())).isPositive();
@@ -59,8 +63,12 @@ class AnIncompatibleMemberNeverJoinsTheClusterIT {
             // A real exclusive bind makes member creation-before-validation fail for a different reason.
             // The product config fixes this port and disables port auto-increment.
             try (ServerSocket reserved = new ServerSocket()) {
-                reserved.setReuseAddress(false);
+                reserved.setReuseAddress(true);
                 reserved.bind(physicalListener);
+                try (ServerSocket duplicate = new ServerSocket()) {
+                    duplicate.setReuseAddress(true);
+                    assertThatThrownBy(() -> duplicate.bind(physicalListener)).isInstanceOf(BindException.class);
+                }
                 RealProcessServer rejected = cluster.launchCandidate(CANDIDATE,
                         Map.of("tapstate.cluster.execution-profile.heap-tier", "incompatible-profile-probe"));
                 Await.until("the mismatched profile to exit before member binding", BOUND,
