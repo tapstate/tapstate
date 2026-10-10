@@ -77,6 +77,85 @@ class ClusterRecoveryStoreIT {
                     new ChainPosition(new SourceOrder(3, 7), "resume-7"), "capture-majority-read", "srs/crm/3"));
 
     @Test
+    void liveReacquisitionMovesTheHorizonWhileRenewalAllowsOneRecoveryAdvance() {
+        try (Fixture fixture = new Fixture()) {
+            Pipeline pipeline = fixture.pipeline("deferred-issuer", true, List.of(SourceRef.bare("crm")),
+                    true, fixture.nodeB.owner(), Duration.ofSeconds(6));
+            WorkloadClaim stopping = fixture.workloads.renew(pipeline.claim(), Duration.ofSeconds(3)).orElseThrow();
+            var granted = fixture.permit(fixture.enqueue(pipeline).item(), DEMAND, LIMITS);
+            assertThat(granted.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            ClusterRecoveryItem item = granted.item();
+            assertThat(item.permit().transferredExecutionGeneration()).isZero();
+            assertThat(item.successor()).isNull();
+            fixture.running(pipeline.key().pipelineId());
+            assertThat(fixture.workloads.release(stopping)).isTrue();
+            WorkloadClaim current = fixture.workloads.acquire(stopping.key(), stopping.owner(),
+                    stopping.topologyRevision(), Duration.ofSeconds(3)).claim();
+            assertThat(current.claimGeneration()).isEqualTo(stopping.claimGeneration() + 1);
+            assertThat(current.executionGeneration()).isEqualTo(pipeline.claim().executionGeneration());
+            assertThat(item.permit().deadline()).isBeforeOrEqualTo(stopping.leaseUntil());
+            String reservation = item.permit().reservationId();
+            java.time.Instant originalPermitDeadline = item.permit().deadline();
+            var resumedPermit = fixture.store.resumePermit(fixture.fence(item), reservation, PERMIT_TTL);
+            assertThat(resumedPermit.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            item = resumedPermit.item();
+            assertThat(item.permit().reservationId()).isEqualTo(reservation);
+            assertThat(item.permit().deadline()).isAfter(originalPermitDeadline);
+            assertThat(item.permit().transferredExecutionGeneration()).isZero();
+            assertThat(item.attempt()).isZero();
+            assertThat(item.event().resumePositions()).isEqualTo(pipeline.event().resumePositions());
+            Document id = new Document("_id", MongoClusterCapacityStore.claimId("east", pipeline.key().pipelineId()));
+            java.time.Instant horizon = fixture.claims.find(id).first().getDate("retiredAuthorizationUntil").toInstant();
+            assertThat(fixture.advance(item, current).outcome()).isEqualTo(ClusterRecoveryMutation.WAITING_PERMIT);
+
+            List<java.time.Instant> observedHorizons = new ArrayList<>();
+            observedHorizons.add(horizon);
+            for (int turn = 0; turn < 2; turn++) {
+                WorkloadClaim renewed = fixture.workloads.renew(current, Duration.ofSeconds(4 + turn)).orElseThrow();
+                assertThat(fixture.claims.find(id).first().getDate("retiredAuthorizationUntil").toInstant()).isEqualTo(horizon);
+                assertThat(renewed.leaseUntil()).isAfter(horizon);
+                WorkloadClaim reacquired = fixture.workloads.acquire(current.key(), current.owner(), current.topologyRevision(),
+                        Duration.ofSeconds(4 + turn)).claim();
+                java.time.Instant moved = fixture.claims.find(id).first().getDate("retiredAuthorizationUntil").toInstant();
+                assertThat(moved).isEqualTo(renewed.leaseUntil()).isAfter(horizon);
+                assertThat(reacquired.claimGeneration()).isEqualTo(current.claimGeneration());
+                assertThat(reacquired.executionGeneration()).isEqualTo(current.executionGeneration());
+                assertThat(fixture.advance(item, reacquired).outcome()).isEqualTo(ClusterRecoveryMutation.WAITING_PERMIT);
+                ClusterRecoveryItem waiting = fixture.store.read(pipeline.key()).orElseThrow();
+                assertThat(waiting.attempt()).isZero();
+                assertThat(waiting.permit().reservationId()).isEqualTo(item.permit().reservationId());
+                assertThat(waiting.permit().transferredExecutionGeneration()).isZero();
+                assertThat(waiting.successor()).isNull();
+                assertThat(waiting.event().resumePositions()).isEqualTo(item.event().resumePositions());
+                observedHorizons.add(moved);
+                current = reacquired;
+                horizon = moved;
+            }
+            assertThat(observedHorizons).isSorted().doesNotHaveDuplicates();
+            WorkloadClaim retained = fixture.workloads.renew(current, Duration.ofSeconds(6)).orElseThrow();
+            assertThat(fixture.claims.find(id).first().getDate("retiredAuthorizationUntil").toInstant()).isEqualTo(horizon);
+            fixture.awaitRetirement(retained.key());
+            assertThat(fixture.workloads.read(retained.key()).orElseThrow().leased()).isTrue();
+            Document livePermit = new Document("_id", "east").append("$expr", new Document("$gt",
+                    List.of(java.util.Date.from(item.permit().deadline()), "$$NOW")));
+            assertThat(fixture.profileDocuments.find(livePermit).first()).isNotNull();
+            var advanced = fixture.advance(item, retained);
+            assertThat(advanced.outcome()).isEqualTo(ClusterRecoveryMutation.APPLIED);
+            assertThat(advanced.advancedPipelineClaim().executionGeneration()).isEqualTo(pipeline.claim().executionGeneration() + 1);
+            assertThat(advanced.item().permit().reservationId()).isEqualTo(item.permit().reservationId());
+            assertThat(advanced.item().permit().transferredExecutionGeneration())
+                    .isEqualTo(advanced.advancedPipelineClaim().executionGeneration());
+            assertThat(advanced.item().successor()).isNotNull();
+            assertThat(advanced.item().attempt()).isEqualTo(1);
+            assertThat(advanced.item().event().resumePositions()).isEqualTo(item.event().resumePositions());
+            assertThat(fixture.advance(advanced.item(), advanced.advancedPipelineClaim()).outcome())
+                    .isEqualTo(ClusterRecoveryMutation.SUCCESSOR_STILL_AUTHORIZED);
+            assertThat(fixture.workloads.read(retained.key()).orElseThrow().claim().executionGeneration())
+                    .isEqualTo(advanced.advancedPipelineClaim().executionGeneration());
+        }
+    }
+
+    @Test
     void anExplicitResumeMarkerIsAtomicWithItsAcceptedEpochAndOrdinaryCasSupersedesIt() {
         try (Fixture fixture = new Fixture()) {
             Resume resume = fixture.resumePipeline("orders", Duration.ofSeconds(3));
