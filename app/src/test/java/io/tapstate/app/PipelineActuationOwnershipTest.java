@@ -1,5 +1,7 @@
 package io.tapstate.app;
 
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
@@ -26,6 +28,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.spy;
 
 /**
  * One pipeline is driven by one member. Every member reconciles the whole desired set, so what decides
@@ -288,6 +292,83 @@ class PipelineActuationOwnershipTest {
                 .as("more than a lease went by with no pass, and the claim is still live").isTrue();
         assertThat(ownership(NODE_B).permit("orders").granted())
                 .as("so no other member could take it").isFalse();
+    }
+
+    @Test
+    void aDeferredIssuerKeepsOnlyTheExactStillLiveClaimAndRenewsWithoutReacquiring() {
+        PipelineActuationOwnership nodeA = ownership(NODE_A);
+        assertThat(nodeA.permit("orders").granted()).isTrue();
+        assertThat(nodeA.beginExecution("orders").allowed()).isTrue();
+        WorkloadClaim original = nodeA.currentClaim("orders").orElseThrow();
+
+        assertThat(nodeA.beginExecution("orders", (expected, topology, members) -> Optional.empty()).allowed()).isFalse();
+        assertThat(nodeA.currentClaim("orders")).contains(original);
+        assertThat(nodeA.permit("orders").claim()).isEqualTo(original);
+        assertThat(claims.read(ORDERS).orElseThrow().claim()).isEqualTo(original);
+        claims.elapse(RENEW);
+        nanos.addAndGet(RENEW.toNanos());
+        assertThat(nodeA.permit("orders").granted()).isTrue();
+        WorkloadClaim renewed = nodeA.currentClaim("orders").orElseThrow();
+        assertThat(renewed.claimGeneration()).isEqualTo(original.claimGeneration());
+        assertThat(renewed.executionGeneration()).isEqualTo(original.executionGeneration());
+        assertThat(renewed.leaseUntil()).isAfter(original.leaseUntil());
+        assertThat(nodeA.beginExecution("orders", claims::advanceExecution).allowed()).isTrue();
+        assertThat(nodeA.currentClaim("orders").orElseThrow().executionGeneration()).isEqualTo(original.executionGeneration() + 1);
+    }
+
+    @Test
+    void aDeferredIssuerCannotRetainAnExpiredReleasedOrChangedAuthority() {
+        for (String change : List.of("expired", "released", "foreign", "new-claim", "new-execution", "topology")) {
+            InMemoryWorkloadClaimStore durable = new InMemoryWorkloadClaimStore();
+            PipelineActuationOwnership nodeA = new PipelineActuationOwnership("cluster-a", NODE_A, membership,
+                    new ClusterWorkloadClaims(durable, membership), TTL, RENEW, nanos::get);
+            assertThat(nodeA.permit("orders").granted()).isTrue();
+            assertThat(nodeA.beginExecution("orders").allowed()).isTrue();
+            WorkloadClaim original = nodeA.currentClaim("orders").orElseThrow();
+            var refused = nodeA.beginExecution("orders", (expected, topology, members) -> {
+                switch (change) {
+                    case "expired" -> durable.elapse(TTL.plusSeconds(1));
+                    case "released" -> assertThat(durable.release(expected)).isTrue();
+                    case "foreign" -> {
+                        assertThat(durable.release(expected)).isTrue();
+                        assertThat(durable.acquire(ORDERS, NODE_B, topology, TTL).acquired()).isTrue();
+                    }
+                    case "new-claim" -> {
+                        assertThat(durable.release(expected)).isTrue();
+                        assertThat(durable.acquire(ORDERS, NODE_A, topology, TTL).claim().claimGeneration())
+                                .isEqualTo(original.claimGeneration() + 1);
+                    }
+                    case "new-execution" -> assertThat(durable.advanceExecution(expected, topology, members)).isPresent();
+                    case "topology" -> assertThat(durable.acquire(ORDERS, NODE_A, topology + 1, TTL).acquired()).isTrue();
+                    default -> throw new IllegalStateException("unexpected authority change");
+                }
+                return Optional.empty();
+            });
+            assertThat(refused.allowed()).as(change).isFalse();
+            assertThat(nodeA.currentClaim("orders")).as(change).isEmpty();
+        }
+    }
+
+    @Test
+    void anUnavailableIssuerDoesNotRetainItsCachedClaimAsPermission() {
+        PipelineActuationOwnership nodeA = ownership(NODE_A);
+        assertThat(nodeA.permit("orders").granted()).isTrue();
+        assertThat(nodeA.beginExecution("orders", (expected, topology, members) -> {
+            throw new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "issuer is unavailable"), null);
+        }).allowed()).isFalse();
+        assertThat(nodeA.currentClaim("orders")).isEmpty();
+    }
+
+    @Test
+    void aDeferredIssuerDoesNotKeepACachedClaimWhenItsQualificationReadFails() {
+        InMemoryWorkloadClaimStore durable = spy(new InMemoryWorkloadClaimStore());
+        PipelineActuationOwnership nodeA = new PipelineActuationOwnership("cluster-a", NODE_A, membership,
+                new ClusterWorkloadClaims(durable, membership), TTL, RENEW, nanos::get);
+        assertThat(nodeA.permit("orders").granted()).isTrue();
+        doThrow(new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "claim read is unavailable"), null))
+                .when(durable).read(ORDERS);
+        assertThat(nodeA.beginExecution("orders", (expected, topology, members) -> Optional.empty()).allowed()).isFalse();
+        assertThat(nodeA.currentClaim("orders")).isEmpty();
     }
 
     private PipelineActuationOwnership ownership(WorkloadOwner owner) {

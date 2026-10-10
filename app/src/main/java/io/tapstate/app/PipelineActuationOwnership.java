@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
@@ -260,17 +261,20 @@ final class PipelineActuationOwnership {
         }
         ClusterMembership planned = membership.committed();
         Set<String> runMembers = planned == null ? Set.of() : plannedOver(planned);
+        WorkloadClaim expected = state.claim;
         Optional<WorkloadClaim> advanced;
         try {
             // At the claim's own topology revision, which is the committed one: a revision change refuses
             // the renew above, so a claim still held is a claim granted under the current topology.
             advanced = Objects.requireNonNull(advance, "advance")
-                    .advance(state.claim, state.claim.topologyRevision(), runMembers);
+                    .advance(expected, expected.topologyRevision(), runMembers);
         } catch (RuntimeException unreachable) {
-            advanced = Optional.empty();
+            state.claim = null;
+            return Execution.refused();
         }
         if (advanced.isEmpty()) {
-            state.claim = null;
+            // A deferred allocation cannot submit, but may retain the exact live claim for renewal.
+            if (!stillOwns(expected)) { state.claim = null; }
             return Execution.refused();
         }
         state.claim = advanced.get();
@@ -289,6 +293,21 @@ final class PipelineActuationOwnership {
                 pipelineId, state.claim.claimGeneration(), state.claim.executionGeneration(),
                 state.claim.profileGeneration()),
                 state.claim.topologyRevision());
+    }
+
+    private boolean stillOwns(WorkloadClaim expected) {
+        try {
+            return claims.read(expected.key()).filter(WorkloadClaimReading::leased)
+                    .map(WorkloadClaimReading::claim)
+                    .filter(actual -> actual.key().equals(expected.key()) && actual.owner().equals(expected.owner())
+                            && actual.claimGeneration() == expected.claimGeneration()
+                            && actual.executionGeneration() == expected.executionGeneration()
+                            && actual.profileGeneration() == expected.profileGeneration()
+                            && actual.topologyRevision() == expected.topologyRevision())
+                    .isPresent();
+        } catch (TapstateException unavailable) {
+            return false;
+        }
     }
 
     /**
