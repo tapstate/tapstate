@@ -22,6 +22,7 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 
 /**
  * Locks the canonical serialization of the whole valid corpus two ways.
@@ -52,6 +53,62 @@ class CanonicalRoundTripTest {
 
     private final CanonicalWriter writer = new CanonicalWriter();
     private final DslParser parser = new DslParser();
+
+    @ParameterizedTest
+    @MethodSource("structuredLiterals")
+    void structuredLiteralsKeepEmptyValuesThroughTextTreeAndHash(String literal, Object expected) {
+        Resource resource = parser.parse("""
+                version: tapstate/v1
+                kind: transform
+                id: structured_literal
+                type: map
+                fields:
+                  value: %s
+                """.formatted(literal));
+
+        Map<String, Object> tree = writer.tree(resource);
+        assertThat(tree.get("fields")).isEqualTo(Map.of("value", expected));
+        String canonical = assertDoesNotThrow(() -> writer.write(resource));
+        Resource fromText = assertDoesNotThrow(() -> parser.parse(canonical));
+        Resource fromTree = parser.fromTree(tree);
+
+        assertThat(fromText).isEqualTo(resource);
+        assertThat(fromTree).isEqualTo(resource);
+        assertThat(writer.write(fromText)).isEqualTo(canonical);
+        assertThat(CanonicalHash.of(fromText)).isEqualTo(CanonicalHash.of(resource));
+        assertThat(CanonicalHash.of(fromTree)).isEqualTo(CanonicalHash.of(resource));
+    }
+
+    static Stream<Arguments> structuredLiterals() {
+        return Stream.of(
+                Arguments.of("[]", List.of()),
+                Arguments.of("{}", Map.of()),
+                Arguments.of("{array: [], object: {}, nonEmpty: [{children: [], properties: {}}]}",
+                        Map.of("array", List.of(), "object", Map.of(), "nonEmpty", List.of(
+                                Map.of("children", List.of(), "properties", Map.of())))),
+                Arguments.of("[[], {}, [{}]]", List.of(List.of(), Map.of(), List.of(Map.of()))),
+                Arguments.of("[first-item, second-item]", List.of("first-item", "second-item")),
+                Arguments.of("{name: populated, items: [{name: first-item}]}",
+                        Map.of("name", "populated", "items", List.of(Map.of("name", "first-item")))));
+    }
+
+    @Test
+    void sourceOptionalContainersKeepTheirExistingOmissionSemantics() {
+        Resource resource = parser.parse("""
+                version: tapstate/v1
+                kind: source
+                id: optional_containers
+                metadata: {}
+                connector: mongodb
+                config: { host: db, emptyList: [], emptyObject: {}, nested: { host: inner, emptyList: [] } }
+                experimental: {}
+                """);
+
+        Map<String, Object> tree = writer.tree(resource);
+        assertThat(tree).doesNotContainKeys("metadata", "experimental");
+        assertThat(tree.get("config")).isEqualTo(Map.of("host", "db", "nested", Map.of("host", "inner")));
+        assertThat(writer.write(resource)).doesNotContain("emptyList", "emptyObject", "metadata", "experimental");
+    }
 
     @ParameterizedTest(name = "{0}/{1}")
     @MethodSource("canonicalResources")
