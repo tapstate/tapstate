@@ -1,0 +1,493 @@
+{
+  "id": "db2",
+  "name": "DB2",
+  "displayName": "Db2",
+  "icon": "icons/db2.png",
+  "group": "database",
+  "modes": [
+    "cdc",
+    "snapshot"
+  ],
+  "discovery": "catalog",
+  "sink": {
+    "capable": false,
+    "writeSemantics": []
+  },
+  "pushOut": false,
+  "config": [
+    {
+      "name": "host",
+      "type": "string",
+      "label": {
+        "en_US": "DB Address"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "port",
+      "type": "number",
+      "label": {
+        "en_US": "Port"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "database",
+      "type": "string",
+      "label": {
+        "en_US": "Service name"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "schema",
+      "type": "string",
+      "label": {
+        "en_US": "schema"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "user",
+      "type": "string",
+      "label": {
+        "en_US": "user"
+      },
+      "required": false,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "password",
+      "type": "string",
+      "label": {
+        "en_US": "password"
+      },
+      "required": false,
+      "default": null,
+      "secret": true,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "useNativeMiner",
+      "type": "boolean",
+      "label": {
+        "en_US": "Native log miner"
+      },
+      "required": false,
+      "default": "false",
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "rawLogServerHost",
+      "type": "string",
+      "label": {
+        "en_US": "grpc server host"
+      },
+      "required": false,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "rawLogServerPort",
+      "type": "number",
+      "label": {
+        "en_US": "grpc server port"
+      },
+      "required": false,
+      "default": "50051",
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "rawLogServerTimeoutSeconds",
+      "type": "number",
+      "label": {
+        "en_US": "Raw log RPC timeout (s)"
+      },
+      "required": false,
+      "default": "30",
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "highAvailability",
+      "type": "boolean",
+      "label": {
+        "en_US": "High availability"
+      },
+      "required": false,
+      "default": "false",
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "rawNameAddress",
+      "type": "array",
+      "label": {
+        "en_US": "Raw Log Cluster"
+      },
+      "required": false,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "autoLri",
+      "type": "boolean",
+      "label": {
+        "en_US": "Auto Lri"
+      },
+      "required": false,
+      "default": "true",
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "sshPort",
+      "type": "number",
+      "label": {
+        "en_US": "Ssh Port"
+      },
+      "required": true,
+      "default": "22",
+      "secret": false,
+      "options": [],
+      "visibleWhen": {
+        "controllingField": "autoLri",
+        "equalsAnyOf": [
+          "false"
+        ]
+      }
+    },
+    {
+      "name": "db2Profile",
+      "type": "string",
+      "label": {
+        "en_US": "DB2 Profile"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": {
+        "controllingField": "autoLri",
+        "equalsAnyOf": [
+          "false"
+        ]
+      }
+    },
+    {
+      "name": "archived",
+      "type": "boolean",
+      "label": {
+        "en_US": "Is Archive Log"
+      },
+      "required": false,
+      "default": "false",
+      "secret": false,
+      "options": [],
+      "visibleWhen": {
+        "controllingField": "autoLri",
+        "equalsAnyOf": [
+          "false"
+        ]
+      }
+    },
+    {
+      "name": "archiveDir",
+      "type": "string",
+      "label": {
+        "en_US": "Archive Dir"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": {
+        "controllingField": "archived",
+        "equalsAnyOf": [
+          "true"
+        ]
+      }
+    },
+    {
+      "name": "sqlCtlDir",
+      "type": "string",
+      "label": {
+        "en_US": "LFH Dir"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": {
+        "controllingField": "archived",
+        "equalsAnyOf": [
+          "true"
+        ]
+      }
+    },
+    {
+      "name": "extParams",
+      "type": "string",
+      "label": {
+        "en_US": "Connection String Params"
+      },
+      "required": false,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "initialLri",
+      "type": "string",
+      "label": {
+        "en_US": "Initial Lri"
+      },
+      "required": false,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "timeBack",
+      "type": "number",
+      "label": {
+        "en_US": "LRI Time Back (Day)"
+      },
+      "required": false,
+      "default": "7",
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "readlogBufsize",
+      "type": "number",
+      "label": {
+        "en_US": "Readlog Bufsize (KB)"
+      },
+      "required": true,
+      "default": "20480",
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "timezone",
+      "type": "string",
+      "label": {
+        "en_US": "timezone"
+      },
+      "required": false,
+      "default": "",
+      "secret": false,
+      "options": [
+        {
+          "value": "",
+          "label": {
+            "en_US": ""
+          }
+        },
+        {
+          "value": "-11:00",
+          "label": {
+            "en_US": "UTC -11"
+          }
+        },
+        {
+          "value": "-10:00",
+          "label": {
+            "en_US": "UTC -10"
+          }
+        },
+        {
+          "value": "-09:00",
+          "label": {
+            "en_US": "UTC -09"
+          }
+        },
+        {
+          "value": "-08:00",
+          "label": {
+            "en_US": "UTC -08"
+          }
+        },
+        {
+          "value": "-07:00",
+          "label": {
+            "en_US": "UTC -07"
+          }
+        },
+        {
+          "value": "-06:00",
+          "label": {
+            "en_US": "UTC -06"
+          }
+        },
+        {
+          "value": "-05:00",
+          "label": {
+            "en_US": "UTC -05"
+          }
+        },
+        {
+          "value": "-04:00",
+          "label": {
+            "en_US": "UTC -04"
+          }
+        },
+        {
+          "value": "-03:00",
+          "label": {
+            "en_US": "UTC -03"
+          }
+        },
+        {
+          "value": "-02:00",
+          "label": {
+            "en_US": "UTC -02"
+          }
+        },
+        {
+          "value": "-01:00",
+          "label": {
+            "en_US": "UTC -01"
+          }
+        },
+        {
+          "value": "+00:00",
+          "label": {
+            "en_US": "UTC"
+          }
+        },
+        {
+          "value": "+01:00",
+          "label": {
+            "en_US": "UTC +01"
+          }
+        },
+        {
+          "value": "+02:00",
+          "label": {
+            "en_US": "UTC +02"
+          }
+        },
+        {
+          "value": "+03:00",
+          "label": {
+            "en_US": "UTC +03"
+          }
+        },
+        {
+          "value": "+04:00",
+          "label": {
+            "en_US": "UTC +04"
+          }
+        },
+        {
+          "value": "+05:00",
+          "label": {
+            "en_US": "UTC +05"
+          }
+        },
+        {
+          "value": "+06:00",
+          "label": {
+            "en_US": "UTC +06"
+          }
+        },
+        {
+          "value": "+07:00",
+          "label": {
+            "en_US": "UTC +07"
+          }
+        },
+        {
+          "value": "+08:00",
+          "label": {
+            "en_US": "UTC +08"
+          }
+        },
+        {
+          "value": "+09:00",
+          "label": {
+            "en_US": "UTC +09"
+          }
+        },
+        {
+          "value": "+10:00",
+          "label": {
+            "en_US": "UTC +10"
+          }
+        },
+        {
+          "value": "+11:00",
+          "label": {
+            "en_US": "UTC +11"
+          }
+        },
+        {
+          "value": "+12:00",
+          "label": {
+            "en_US": "UTC +12"
+          }
+        },
+        {
+          "value": "+13:00",
+          "label": {
+            "en_US": "UTC +13"
+          }
+        },
+        {
+          "value": "+14:00",
+          "label": {
+            "en_US": "UTC +14"
+          }
+        }
+      ],
+      "visibleWhen": null
+    }
+  ],
+  "provenance": {
+    "specPath": "connectors/db2-connector/src/main/resources/spec_db2.json",
+    "specContentHash": "8a3ed6478e7e7151",
+    "pdkApiVersion": null,
+    "requiredLevel": null,
+    "modeSource": {
+      "cdc": "derived",
+      "snapshot": "derived"
+    }
+  }
+}

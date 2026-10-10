@@ -21,7 +21,13 @@ public sealed interface ViewBlock {
                        required = true)
                   String primaryKey,
                   @Doc("Storage backend used to persist this view.")
-                  Storage storage) implements ViewBlock {
+                  Storage storage,
+                  @Doc("How this node runs: its target total parallelism across the cluster and its batch.")
+                  ExecutionSpec execution) implements ViewBlock {
+        public Inline(String id, FromRef from, String primaryKey, Storage storage) {
+            this(id, from, primaryKey, storage, null);
+        }
+
         public Inline {
             Objects.requireNonNull(id, "id");
             Objects.requireNonNull(from, "from");

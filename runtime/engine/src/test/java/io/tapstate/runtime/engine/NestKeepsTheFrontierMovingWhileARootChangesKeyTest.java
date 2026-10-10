@@ -150,8 +150,8 @@ class NestKeepsTheFrontierMovingWhileARootChangesKeyTest {
         run(true, true);
 
         assertThat(assembled.getLocalParallelism())
-                .describedAs("left at the member's own default - a graph that pinned this to one would make "
-                        + "every hand-over local, and every case covering one would be testing nothing")
+                .describedAs("drawn wider than one - a graph that pinned this to one would make every "
+                        + "hand-over local, and every case covering one would be testing nothing")
                 .isNotEqualTo(1);
         assertThat(COOPERATIVE_THREADS)
                 .describedAs("and the default it is left at really is more than one on this member")
@@ -220,7 +220,8 @@ class NestKeepsTheFrontierMovingWhileARootChangesKeyTest {
                 alias -> List.of(byAlias.get(alias)),
                 new NestBinding(tables::get, HeapNestStores.onHeap(), (from, released) -> { }),
                 vertex -> outbound.merge(vertex, 1, Integer::sum) - 1,
-                new NestFrontier(AXES, alias -> List.of(List.of(chainOfAlias.get(alias)))));
+                new NestFrontier(AXES, alias -> List.of(List.of(chainOfAlias.get(alias)))),
+                new NodeWidth("doc", 4, 1, null));
 
         Vertex collector = dag.newVertex("collector", ProcessorMetaSupplier.forceTotalParallelismOne(
                 ProcessorSupplier.of((SupplierEx<Processor>) Collector::new)));

@@ -28,6 +28,7 @@ pipeline. The history and explanation responses, including coded errors, carry
 | What did this node log for the pipeline? | `GET /api/pipelines/{id}/logs` | `logs <id>` | `pipeline_logs` |
 | How did output rate and selected table lag change? | `GET /api/pipelines/{id}/metrics/history` | `metrics <id> --from ... --to ...` | `pipeline_metrics_history` |
 | Why does the latest observation look this way? | `GET /api/pipelines/{id}/explain` | `explain <id>` or `status <id>` | `pipeline_explain` |
+| How wide does each node of the current run run, and why? | `plan` in `GET /api/pipelines/{id}/status` or `.../explain` | `explain <id>` or `status <id>` | `pipeline_status` or `pipeline_explain` |
 
 The snapshot read shows progress for the pipeline's initial load. A replacement run keeps a table's
 confirmed progress even when it skips reading that table again. Once the target confirms the load,
@@ -35,6 +36,12 @@ the face shows 100% and uses the durably recorded row count when available; an o
 that count falls back to the last discovery's estimate. Before confirmation, `rowsTotal` is only
 that estimate and can lag a growing table. The current run's own snapshot read count is available as
 `snapshot.rows.read.<table>` on the metrics face.
+
+A table appears on the snapshot read once its load has been read through, and `landed` says whether the target
+has durably confirmed every row of that load. A table read through and not landed is still being written. A sink
+whose writers share one target table's rows writes that table's changes only once its load has landed, so its
+changes wait for it until then; each table crosses on its own, so one table can take changes while another is
+still landing.
 
 `pipeline.explain` requires a current observation. A newly started pipeline may return
 `monitor.no-observation` until its first observation is published. History is independent of the
@@ -260,6 +267,54 @@ the available observation cannot establish. In particular, `NO_MATCH` is not a h
 always has a non-empty `cannotSay` list. `next`, when present, is an operator suggestion rather than
 authorization to perform an action. An optional `pending` field is reserved for a server-provided
 capacity or lifecycle wait reason; its absence does not prove that no wait exists.
+
+## Read how wide a run is
+
+`status` and `explain` both carry an optional `plan`: the plan the pipeline's current run was submitted
+on, written down when the run was submitted and replaced by the next run's. The two faces send it in
+the same shape. It is absent when no run has one recorded, for example after the pipeline was stopped.
+No explanation rule reads it; it answers beside the diagnosis.
+
+| Field | Meaning |
+|---|---|
+| `claimGeneration`, `executionGeneration`, `topologyRevision` | Which run the plan belongs to. Absent where nothing fences the run, such as a server that is not a cluster member |
+| `members` | The members the widths were worked out for, by stable id |
+| `plannedAt` | When the run was planned |
+| `replaces` | The run this plan replaced, after a lost member, a stop or a restart: its `executionGeneration` where it had one, its `members`, and when it was planned. Absent for a pipeline's first run |
+| `nodes[].requested`, `nodes[].requestedOrigin` | The target total the node was given, and whether its author wrote it (`explicit`) or it is the default for the node's kind (`node-default`) |
+| `nodes[].scope` | `total-one`: one processor for the whole cluster. `native`: the same number of processors on every member |
+| `nodes[].memberCount`, `nodes[].computedLocal`, `nodes[].effective` | The member count and per-member count the width was worked out for, and the processors that makes in total. `computedLocal` is absent for `total-one` |
+| `nodes[].reasons` | Stable ids for why the width is what it is: `requested-one`, `source-reads-not-split`, `single-target-keyless`, `key-not-derivable`, `rounded-up`, `rounded-down`, or `budget:<name>` |
+| `nodes[].batch` | `maxRecords` and `maxWaitMillis`: the batch the node takes its input in |
+| `nodes[].change` | How the node's width moved from the run before: `previousEffective`, and `causes` naming each input that moved it apart - `members-changed`, `target-changed`, `capability-changed`. Absent where the width did not move |
+| `nodes[].resources` | Sinks only: `writers`; `connectorMode` (`isolated`: a connector per writer, `shared`: one per member, used only for an artifact certified to be shared) and `connectorInstances`; `bufferedRecords`, two batches per writer; and `edgeQueueRecords`, a full queue from every processor sending into the sink to every processor it takes its input on. These are upper bounds worked out before anything opens. A connector's own connection pool is sized inside the connector and is not counted; see [Connections behind a connector instance](#connections-behind-a-connector-instance) |
+
+Beside the plan, both faces send `awaitingRebalance`: members of the cluster the plan was not worked
+out for, by stable id. A running pipeline keeps the members it was planned over, so a member that joins
+afterwards is given no part of it until a rebalance. This is not a failure, and it is told apart from a
+run rebuilt after a member was lost, whose plan names the run it `replaces`.
+
+The status watch stream does not carry the plan. Read `status` again after a restart to see the new
+run's plan.
+
+### Connections behind a connector instance
+
+`connectorInstances` counts connector instances, not connections: how many connections an instance opens is
+decided inside the connector. Multiply the instances by the figure below for the most a sink's connectors hold
+at once. It is a ceiling: some connectors open a connection only for part of a write, and some share part of
+their pool among their instances in one server, so several instances can hold fewer, as the last column shows.
+None holds more.
+
+| Connector | Most connections one instance holds | Four instances in one server, most measured |
+|---|---|---|
+| MySQL | 2 | 5 |
+| PostgreSQL | 2 | 5 |
+| MongoDB | 3 | 12 |
+| SQL Server | 2 | 6 |
+| Oracle | 3 | 12 |
+
+Measured against each database, with one writer per instance writing batches of fifty rows at the same time, and
+given as the most any run saw: how many an instance holds at a given moment varies between runs.
 
 ## Coded errors and operator response
 

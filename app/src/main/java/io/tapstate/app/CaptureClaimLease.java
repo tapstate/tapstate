@@ -10,14 +10,25 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
-/** Renews one capture claim and stops its local capture immediately when ownership can no longer be proved. */
+/**
+ * Renews one capture claim from the moment it is taken, and stops its local capture immediately when
+ * ownership can no longer be proved.
+ *
+ * <p>Renewing starts before the capture it guards is open, because opening one can take longer than a lease
+ * -- a source slow to answer, many tables, an overloaded host -- and a claim nothing renewed meanwhile has run
+ * out by the time the capture is open. What losing the claim stops is bound once there is something to stop;
+ * a claim lost before that is answered as soon as it is bound.
+ */
 final class CaptureClaimLease implements AutoCloseable {
 
     private final CaptureOwnership ownership;
     private final AtomicReference<WorkloadClaim> current;
-    private final Runnable lost;
     private final ScheduledExecutorService renewer;
     private final AtomicBoolean closed = new AtomicBoolean();
+    /** What losing the claim stops; null until the capture it guards is open. Guarded by this. */
+    private Runnable lost;
+    /** Whether the claim was lost while nothing was bound to answer for it yet. Guarded by this. */
+    private boolean lostUnanswered;
 
     private CaptureClaimLease() {
         this.ownership = null;
@@ -36,9 +47,14 @@ final class CaptureClaimLease implements AutoCloseable {
             WorkloadClaim initial,
             Duration renewInterval,
             Runnable lost) {
+        this(ownership, initial, renewInterval);
+        onLost(lost);
+    }
+
+    /** Starts renewing {@code initial} now; what losing it stops is bound later with {@link #onLost}. */
+    CaptureClaimLease(CaptureOwnership ownership, WorkloadClaim initial, Duration renewInterval) {
         this.ownership = Objects.requireNonNull(ownership, "ownership");
         this.current = new AtomicReference<>(Objects.requireNonNull(initial, "initial"));
-        this.lost = Objects.requireNonNull(lost, "lost");
         Objects.requireNonNull(renewInterval, "renewInterval");
         this.renewer = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "tapstate-capture-claim-renewer");
@@ -47,6 +63,23 @@ final class CaptureClaimLease implements AutoCloseable {
         });
         renewer.scheduleWithFixedDelay(
                 this::renew, renewInterval.toMillis(), renewInterval.toMillis(), TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Binds what losing the claim stops, once the capture it guards is open. A claim already lost by then is
+     * answered at once, on the caller's thread: the capture was opened over a claim somebody else may hold.
+     */
+    void onLost(Runnable action) {
+        Objects.requireNonNull(action, "action");
+        boolean answerNow;
+        synchronized (this) {
+            lost = action;
+            answerNow = lostUnanswered;
+            lostUnanswered = false;
+        }
+        if (answerNow) {
+            action.run();
+        }
     }
 
     void renew() {
@@ -72,8 +105,15 @@ final class CaptureClaimLease implements AutoCloseable {
         if (!closed.compareAndSet(false, true)) {
             return;
         }
+        Runnable action;
+        synchronized (this) {
+            action = lost;
+            lostUnanswered = action == null;
+        }
         try {
-            lost.run();
+            if (action != null) {
+                action.run();
+            }
         } finally {
             renewer.shutdownNow();
         }

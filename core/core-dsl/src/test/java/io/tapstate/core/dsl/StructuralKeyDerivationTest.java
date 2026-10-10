@@ -2,6 +2,8 @@ package io.tapstate.core.dsl;
 
 import io.tapstate.core.model.Doc;
 import io.tapstate.core.model.Embed;
+import io.tapstate.core.model.BatchSpec;
+import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.Metadata;
 import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.NestStateStorage;
@@ -126,6 +128,8 @@ class StructuralKeyDerivationTest {
         assertWhitelist(DslParser.STEP_USE_KEYS, Step.Use.class, Set.of("options"));
         assertWhitelist(DslParser.SOURCE_REF_KEYS, SourceRef.Spec.class, Set.of());
         assertWhitelist(DslParser.NEST_STATE_KEYS, NestStateStorage.class, Set.of());
+        assertWhitelist(DslParser.EXECUTION_KEYS, ExecutionSpec.class, Set.of());
+        assertWhitelist(DslParser.BATCH_KEYS, BatchSpec.class, Set.of());
     }
 
     private static Set<String> union(Set<String> a, Set<String> b) {
@@ -291,7 +295,7 @@ class StructuralKeyDerivationTest {
     private static final Set<String> DERIVED = Set.of(
             "SOURCE_KEYS", "PIPELINE_KEYS", "TRANSFORM_DEF_KEYS", "METADATA_KEYS", "SRS_KEYS",
             "TABLE_SPEC_KEYS", "SYNC_KEYS", "PUSH_KEYS", "STEP_BASE_KEYS", "STEP_USE_KEYS",
-            "SOURCE_REF_KEYS", "NEST_STATE_KEYS");
+            "SOURCE_REF_KEYS", "NEST_STATE_KEYS", "EXECUTION_KEYS", "BATCH_KEYS");
 
     /** The required-key sets, re-derived above from their record's {@code @Doc(required = true)}. */
     private static final Set<String> REQUIRED_DERIVED = Set.of(

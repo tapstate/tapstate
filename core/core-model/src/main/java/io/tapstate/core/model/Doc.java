@@ -29,4 +29,16 @@ public @interface Doc {
 
     /** Documented default value (the YAML form), rendered as the schema {@code default}; empty = none. */
     String def() default "";
+
+    /** The least value a number may take, rendered as the schema {@code minimum}; {@code Long.MIN_VALUE} = none. */
+    long min() default Long.MIN_VALUE;
+
+    /** The greatest value a number may take, rendered as the schema {@code maximum}; {@code Long.MAX_VALUE} = none. */
+    long max() default Long.MAX_VALUE;
+
+    /**
+     * A regular expression a text value must contain a match of, rendered as the schema {@code pattern}; empty =
+     * none. It constrains the whole value only where it anchors itself at both ends.
+     */
+    String pattern() default "";
 }

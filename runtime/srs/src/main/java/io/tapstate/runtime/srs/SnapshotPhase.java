@@ -7,6 +7,7 @@ import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.SourcePosition;
+import io.tapstate.spi.capture.SnapshotOnlyCapture;
 import io.tapstate.spi.capture.SnapshotSession;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SrsMeta;
@@ -76,6 +77,8 @@ public final class SnapshotPhase {
      * <p>One seam covers the whole round, taken from the first read and never replaced. A port may keep one
      * connector across the table reads or open one for each. Any later seam remains a check, not a new
      * start: moving the tail past a table already read would lose intervening deletes without a warning.
+     * A partial load with no recorded snapshot generation retains the prior checkpoint or consumer seam,
+     * because its unread, confirmed tables still need every change since that position.
      *
      * <p>Seeding the chain's meta record is a separate lifecycle step; recording the cdc-start position on
      * an unseeded chain is a caller ordering error surfaced by the store.
@@ -133,18 +136,18 @@ public final class SnapshotPhase {
         if (owed.isEmpty()) {
             return new Load(null, miningChainId, tables, owed, order, null, null, false);
         }
-        // A resume reuses the pair it read back. Both halves come from the same record and the same
-        // question, so one of them moving on its own is the state that has no meaning: rows pinned to a
-        // generation whose seam is somewhere else.
-        String resumedStart = resumed.map(ConsumerOffset::cdcStartPosition).orElse(null);
+        // A known generation keeps its recorded seam. A legacy partial load must also replay changes
+        // for confirmed tables it leaves unread, so retain their start before recording a new epoch.
+        String resumedStart = resumed.map(ConsumerOffset::cdcStartPosition)
+                .orElseGet(() -> owed.size() < tables.size() ? recordedTailStart(record, pipelineId) : null);
         SnapshotSession session = SnapshotSession.open(port, readOf(config, owed));
         CaptureBatch first = null;
         try {
             first = session.read(owed.getFirst());
             SourcePosition seam = seamOf(first, miningChainId);
             String tailSeam = resumedStart != null ? resumedStart : seam.token();
-            // A resume writes back the pair it read, unchanged; a new load writes the pair it sampled. Both
-            // are scoped to this pipeline, so neither can move another pipeline's tail or generation.
+            // Persist the replay anchor with the row generation. A partial legacy load can anchor before
+            // its sampled seam, so a restart also preserves changes for the tables left unread.
             meta.setCdcStart(miningChainId, pipelineId, tailSeam, epoch);
             return new Load(session, miningChainId, tables, owed, order, tailSeam, first, false);
         } catch (RuntimeException | Error failure) {
@@ -154,6 +157,13 @@ public final class SnapshotPhase {
             session.close();
             throw failure;
         }
+    }
+
+    private static String recordedTailStart(Optional<SrsMeta> record, String pipelineId) {
+        return record.map(stored -> stored.sourceReadOffset() != null
+                        ? stored.sourceReadOffset()
+                        : stored.consumerOffset(pipelineId).map(ConsumerOffset::cdcStartPosition).orElse(null))
+                .orElse(null);
     }
 
     /**
@@ -173,8 +183,8 @@ public final class SnapshotPhase {
      * samples no seam and starts no snapshot the tail has to cover.
      *
      * <p>The seam is handed back rather than left to be read off the chain's record, and that is the whole
-     * point of it being here. It is the seam sampled by this invocation, so the tail can start without a
-     * second store read and without racing a later update to the same pipeline's durable record.
+     * point of it being here. It is the replay anchor settled by this invocation, so the tail can start
+     * without a second store read or racing a later update to the same pipeline's durable record.
      */
     public record Outcome(long rows, String tailSeam) {
     }
@@ -283,8 +293,10 @@ public final class SnapshotPhase {
                     "a chainless snapshot generation must be positive, got " + snapshotEpoch);
         }
         SourceOrder order = SourceOrder.snapshotRow(snapshotEpoch);
-        CaptureBatch batch = port.snapshot(config);
-        return new Load(null, null, config.streams(), config.streams(), order, null, batch, true);
+        // Construct the owner before opening a source read that it must release.
+        Load load = new Load(null, null, config.streams(), config.streams(), order, null, null, true);
+        load.open = SnapshotOnlyCapture.open(port, config);
+        return load;
     }
 
     /**
