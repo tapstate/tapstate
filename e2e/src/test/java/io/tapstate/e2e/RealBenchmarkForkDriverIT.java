@@ -56,6 +56,18 @@ class RealBenchmarkForkDriverIT {
                 System.getProperty(ARM_PROPERTY, "A"));
         var mode = BenchmarkCaptureCalibrationLiveRunIT.Mode.valueOf(System.getProperty(MODE_PROPERTY, "PLAIN"));
         Path applicationJar = Path.of(System.getProperty(BOOT_JAR_PROPERTY));
+        boolean writeReturnDiagnostics = Boolean.getBoolean(RealBenchmarkForkDriver.WRITE_RETURN_DIAGNOSTICS_PROPERTY);
+        if (writeReturnDiagnostics && (mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN || forkOutput == null
+                || !Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot")
+                || List.of("tapstate.e2e.benchmark.load-diagnostics", "tapstate.e2e.benchmark.compilation-diagnostics",
+                        "tapstate.e2e.benchmark.thread-point-diagnostics", "tapstate.e2e.benchmark-smoke.jvm-gap-diagnostics",
+                        BenchmarkDualGcDiagnostics.ENABLED_PROPERTY, BenchmarkWitnessReadGate.PROPERTY,
+                        BenchmarkMongoDeliveryObserver.CLOCK_REJECTION_EVIDENCE_PROPERTY,
+                        BenchmarkMongoDeliveryObserver.NATIVE_OPERATION_WALL_EVIDENCE_PROPERTY,
+                        "tapstate.e2e.benchmark-smoke.paced-calibration", "tapstate.e2e.benchmark-smoke.cdc-settling-calibration",
+                        "tapstate.e2e.benchmark-smoke.full-cdc-settling-calibration").stream().anyMatch(Boolean::getBoolean))) {
+            throw new AssertionError("return diagnostics require an original plain pilot with an explicit fork receipt");
+        }
         if (Boolean.getBoolean(BenchmarkMongoDeliveryObserver.NATIVE_OPERATION_WALL_EVIDENCE_PROPERTY)
                 && !Boolean.getBoolean(BenchmarkMongoDeliveryObserver.CLOCK_REJECTION_EVIDENCE_PROPERTY)) {
             throw new AssertionError("native operation wall evidence requires decoded clock refusal evidence");
@@ -127,7 +139,11 @@ class RealBenchmarkForkDriverIT {
             }
             BenchmarkDualGcDiagnostics.Session dualGc = dualGcDiagnostics
                     ? BenchmarkDualGcDiagnostics.open() : null;
-            RealBenchmarkForkDriver driver = dualGc != null
+            RealBenchmarkForkDriver driver = writeReturnDiagnostics
+                    ? new RealBenchmarkForkDriver((store, operator, jar) -> new BenchmarkForkEnvironment.OwnedBoot(
+                            RealProcessServer.start(store, operator, jar, "127.0.0.1",
+                                    port -> List.of(), List.of("-Dtapstate.benchmark.write-return=true")), null))
+                    : dualGc != null
                     ? new RealBenchmarkForkDriver(dualGc::start)
                     : jvmDiagnostics ? new RealBenchmarkForkDriver(BenchmarkJvmDiagnostics::start)
                     : mode.driver(applicationJar, artifact);
@@ -185,6 +201,15 @@ class RealBenchmarkForkDriverIT {
                 evidence.phases().forEach(phase -> assertThat(phase.reportedRecordsOut())
                         .as("replayed sink work remains visible as a cost beside logical delivery")
                         .isGreaterThanOrEqualTo(phase.acknowledgedOutputs()));
+                if (writeReturnDiagnostics) {
+                    evidence.phases().forEach(phase -> {
+                        @SuppressWarnings("unchecked")
+                        Map<String, Object> capture = (Map<String, Object>) phase.targetClockEvidence()
+                                .get("writeReturnDiagnostics");
+                        assertThat(capture).containsEntry("performanceAcceptanceEligible", false)
+                                .containsEntry("samplingCostQualified", false);
+                    });
+                }
                 long sourceChanges = evidence.phases().stream()
                         .mapToLong(RealBenchmarkForkDriver.MeasuredPhase::expectedSourceChanges).sum();
                 long sourceIssueNanos = evidence.phases().stream().mapToLong(phase ->
@@ -252,6 +277,11 @@ class RealBenchmarkForkDriverIT {
                         "measurement", PipelineBenchmarkLiveRunIT.fork(evidence, result, startedAt)));
                 if (compilationDiagnostics) {
                     output.put("compilationDiagnostics", true);
+                }
+                if (writeReturnDiagnostics) {
+                    output.put("writeReturnDiagnostics", true);
+                    output.put("writeReturnPerformanceAcceptanceEligible", false);
+                    output.put("retainedLegacyMeasurementEndpoint", "OPERATION_DATE_AND_OBSERVER_DIAGNOSTICS");
                 }
                 if (threadPointDiagnostics) {
                     output.put("threadPointDiagnostics", true);

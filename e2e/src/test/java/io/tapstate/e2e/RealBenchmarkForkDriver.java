@@ -26,6 +26,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
     private static final Duration RESOURCE_INTERVAL = Duration.ofMillis(200);
     private static final Duration COUNTER_POLL = Duration.ofMillis(100);
     private static final Duration PRE_WINDOW_QUIET = Duration.ofSeconds(3);
+    static final String WRITE_RETURN_DIAGNOSTICS_PROPERTY = "tapstate.e2e.benchmark.write-return-diagnostics";
 
     /** Local observation intervals distinguish data arrival from subsequent proof reads. */
     record ConfirmationTiming(long sourceMarkerWaitStartedAtNanos, long sourceMarkerWaitCompletedAtNanos,
@@ -317,6 +318,9 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             throw new IllegalArgumentException("a positive fork number and application JAR are required");
         }
         String forkId = workload.id() + "-" + arm + "-" + armFork;
+        if (Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY) && !workload.pilotProfile()) {
+            throw new AssertionError("return diagnostics require the fixed pilot profile");
+        }
         if (Boolean.getBoolean(BenchmarkWitnessReadGate.PROPERTY)
                 && (!"copy".equals(workload.id()) || !workload.pilotProfile()
                 || arm != PipelineBenchmarkComparison.Arm.B)) {
@@ -512,6 +516,9 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         long sourceMarkerWaitCompletedAt;
         BenchmarkResourceSampler.Summary resources;
         BenchmarkMongoCommandSampler.Summary commands;
+        BenchmarkWriteReturnCapture.Result writeReturns = null;
+        Map<String, Object> retainedReturnEvidence = Map.of();
+        Map<String, Object> retainedSourceIssue = Map.of("state", "UNAVAILABLE", "completeSourceRoster", false);
         List<String> targetClockUris = phase.targets().stream().map(target ->
                 target.location() == BenchmarkWorkloadDefinitions.TargetLocation.MANAGED_VIEW
                         ? fork.managedViewsUri() : fork.externalTargetUri()).distinct().toList();
@@ -559,21 +566,40 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             try {
                 resourceSampler.start();
                 commandSampler.start();
-                issued = fork.issuePhase(phase, true, (current, batchIndex, issuedAt, sql) -> {
-                    for (BenchmarkExpectedChanges.TargetPlan plan : plans) {
-                        List<BenchmarkMongoDeliveryObserver.ExpectedChange> changes = plan.forBatch(batchIndex);
-                        if (!changes.isEmpty()) {
-                            targets.expectBatch(plan.target(), phase.id(), issuedAt, changes);
+                try (BenchmarkWriteReturnCapture returnCapture = Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY)
+                        ? BenchmarkWriteReturnCapture.open(resourceSampler.writeReturnReader(),
+                                workload.id() + "/" + phase.id()) : null) {
+                    try {
+                        issued = fork.issuePhase(phase, true, (current, batchIndex, issuedAt, sql) -> {
+                            for (BenchmarkExpectedChanges.TargetPlan plan : plans) {
+                                List<BenchmarkMongoDeliveryObserver.ExpectedChange> changes = plan.forBatch(batchIndex);
+                                if (!changes.isEmpty()) {
+                                    targets.expectBatch(plan.target(), phase.id(), issuedAt, changes);
+                                }
+                            }
+                        });
+                        if (returnCapture != null) { retainedSourceIssue = sourceIssueEvidence(issued); }
+                        if (issued.batches().isEmpty()) {
+                            throw new AssertionError("measured phase has no source batches: " + phase.id());
                         }
+                        sourceMarkerWaitStartedAt = System.nanoTime();
+                        captures.awaitMeasuredSourceMarkers(workload, phase);
+                        sourceMarkerWaitCompletedAt = System.nanoTime();
+                        completedAckAt = tables.awaitMeasured(workload, phase.id());
+                        if (returnCapture != null) {
+                            writeReturns = returnCapture.finish();
+                            retainedReturnEvidence = returnCapture.retainedEvidence();
+                        }
+                    } catch (Exception | Error failure) {
+                        if (returnCapture != null) {
+                            System.out.println("benchmark-write-return-refusal=" + JsonWriter.write(
+                                    Map.of("state", "UNKNOWN", "capture", returnCapture.retainedEvidence(),
+                                            "sourceIssue", retainedSourceIssue, "resourceSummaryAvailable", false,
+                                            "performanceAcceptanceEligible", false)));
+                        }
+                        throw failure;
                     }
-                });
-                if (issued.batches().isEmpty()) {
-                    throw new AssertionError("measured phase has no source batches: " + phase.id());
                 }
-                sourceMarkerWaitStartedAt = System.nanoTime();
-                captures.awaitMeasuredSourceMarkers(workload, phase);
-                sourceMarkerWaitCompletedAt = System.nanoTime();
-                completedAckAt = tables.awaitMeasured(workload, phase.id());
                 resources = resourceSampler.finish();
                 commands = commandSampler.finish();
                 if (clockSampler != null) {
@@ -608,6 +634,12 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 }
             }
         } catch (BenchmarkResourceSampler.SamplingFailure failure) {
+            if (!retainedReturnEvidence.isEmpty()) {
+                System.out.println("benchmark-write-return-resource-refusal=" + JsonWriter.write(Map.of(
+                        "state", "UNKNOWN", "capture", retainedReturnEvidence, "sourceIssue", retainedSourceIssue,
+                        "resourceFailureStage", failure.stage().name(), "resourceFailureReason", failure.reason().name(),
+                        "performanceAcceptanceEligible", false)));
+            }
             phaseFailure = failure.inPhase(phase.id());
             throw (BenchmarkResourceSampler.SamplingFailure) phaseFailure;
         } catch (Exception | Error failure) {
@@ -666,6 +698,27 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 ? Map.of("state", "UNQUALIFIED", "reason", "MULTI_TARGET_CLOCKS_NOT_YET_CALIBRATED")
                 : BenchmarkTargetClock.validate(targetClockBefore, targetClockAfter);
         var clockProof = new LinkedHashMap<String, Object>(outerClockEvidence);
+        if (writeReturns != null) {
+            try {
+                Map<String, Object> returnEvidence = new LinkedHashMap<>(BenchmarkWriteReturnPhaseEvidence.record(
+                        workload, phase, issued.batches(), writeReturns));
+                var associations = BenchmarkWriteReturnExpectations.associate(
+                        workload, phase, issued.batches(), writeReturns.calls());
+                var owner = writeReturns.samples().getFirst().identity();
+                var causalClock = new BenchmarkCausalClock(owner, writeReturns.samples());
+                returnEvidence.put("resourceBounds", BenchmarkReturnResourceBounds.evidence(resources,
+                        BenchmarkReturnTimeBounds.map(associations, owner, causalClock)));
+                returnEvidence.put("resourceReceiptScope", "FULL_PHASE_RETAINED_THROUGH_CAPTURE_CLOSE");
+                clockProof.put("writeReturnDiagnostics", Map.copyOf(returnEvidence));
+                System.out.println("benchmark-write-return-phase-evidence=" + JsonWriter.write(returnEvidence));
+            } catch (RuntimeException | Error refusal) {
+                System.out.println("benchmark-write-return-association-refusal=" + JsonWriter.write(Map.of(
+                        "state", "UNKNOWN", "capture", retainedReturnEvidence, "sourceIssue", retainedSourceIssue,
+                        "resources", PipelineBenchmarkLiveRunIT.resourceEvidence(resources, issued.clockAnchor()),
+                        "reason", "SOURCE_ASSOCIATION_OR_TIME_BOUNDS_REFUSED", "performanceAcceptanceEligible", false)));
+                throw refusal;
+            }
+        }
         clockProof.put("sampledInterior", interiorClockEvidence);
         boolean deferredWitness = targets.readDeferred();
         if (workload.pilotProfile()) {
@@ -745,6 +798,16 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 Optional.of(timing), Optional.of(timeline), workload.pilotProfile(), resourceWindow, targetClockEvidence),
                 cohort.stream().map(BenchmarkMongoDeliveryObserver.Delivery::durationNanos).toList(),
                 resources, commands);
+    }
+
+    private static Map<String, Object> sourceIssueEvidence(BenchmarkForkEnvironment.PhaseIssue issued) {
+        var anchor = issued.clockAnchor();
+        return Map.of("state", "RECORDED", "completeSourceRoster", true,
+                "startedAtNanos", issued.startedAtNanos(), "sourceCompletedAtNanos", issued.sourceCompletedAtNanos(),
+                "clockAnchor", Map.of("utc", anchor.utc().toString(), "beforeNanos", anchor.beforeNanos(),
+                        "afterNanos", anchor.afterNanos()),
+                "batches", issued.batches().stream().map(batch -> Map.of("index", batch.index(),
+                        "issuedAtNanos", batch.issuedAtNanos(), "completedAtNanos", batch.completedAtNanos())).toList());
     }
 
     /** Records idempotent replay work as a cost while logical delivery remains the target-change oracle. */

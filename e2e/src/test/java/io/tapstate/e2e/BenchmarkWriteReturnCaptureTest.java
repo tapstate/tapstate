@@ -16,6 +16,8 @@ class BenchmarkWriteReturnCaptureTest {
             assertThat(result.calls()).hasSize(1);
             assertThat(result.calls().getFirst().rows().getFirst().keys()).containsExactly(1);
             assertThat(result.samples().size()).isBetween(2, 512);
+            assertThat(result.pagesBase64()).containsExactly(java.util.Base64.getEncoder().encodeToString(access.page));
+            assertThatThrownBy(() -> result.pagesBase64().clear()).isInstanceOf(UnsupportedOperationException.class);
             assertThat(access.starts).hasValue(1); assertThat(access.stops).hasValue(1);
             assertThat(access.firstBeforeStart).isTrue(); assertThat(access.finalAfterStop).isTrue();
         }
@@ -74,7 +76,7 @@ class BenchmarkWriteReturnCaptureTest {
 
     private static final class Fake implements BenchmarkWriteReturnCapture.Access {
         final AtomicInteger starts = new AtomicInteger(), stops = new AtomicInteger();
-        boolean acceptStart = true, acceptStop = true, foreignSummary, extraCount, wrongBytes, throwStop;
+        boolean acceptStart = true, acceptStop = true, foreignSummary, extraCount, wrongBytes, throwStop, failedSummary;
         volatile boolean firstBeforeStart, finalAfterStop;
         final byte[] page;
         Fake() throws Exception { page = BenchmarkWriteReturnCaptureTest.page(); }
@@ -92,7 +94,8 @@ class BenchmarkWriteReturnCaptureTest {
         }
         public BenchmarkWriteReturnReader.Summary summary() {
             return new BenchmarkWriteReturnReader.Summary(foreignSummary ? "foreign" : "measured",
-                    "RECORDED_SCOPE_UNQUALIFIED", extraCount ? 2 : 1, 0, extraCount ? 2 : 1, 0,
+                    failedSummary ? "UNKNOWN:PARTIAL_OR_FAILED_CALL" : "RECORDED_SCOPE_UNQUALIFIED",
+                    extraCount ? 2 : 1, failedSummary ? 1 : 0, extraCount ? 2 : 1, 0,
                     wrongBytes ? 0 : page.length - 32 - "measured".length() - "RECORDED_SCOPE_UNQUALIFIED".length());
         }
         public byte[] page(long cursor) { return page; }
@@ -103,7 +106,23 @@ class BenchmarkWriteReturnCaptureTest {
         var capture = BenchmarkWriteReturnCapture.open(access, "measured");
         try {
             assertThatThrownBy(capture::finish).isInstanceOf(AssertionError.class).hasMessageContaining("retained-byte");
+            assertThat(capture.retainedEvidence()).containsEntry("completed", false)
+                    .containsEntry("terminalSummaryAvailable", true);
+            assertThat(capture.retainedEvidence().get("retainedPagesBase64"))
+                    .isEqualTo(java.util.List.of(java.util.Base64.getEncoder().encodeToString(access.page)));
         } finally { capture.close(); }
+    }
+
+    @Test void an_unknown_failed_terminal_retains_its_original_pages_without_promoting_them() throws Exception {
+        var access = new Fake(); access.failedSummary = true;
+        var capture = BenchmarkWriteReturnCapture.open(access, "measured");
+        try {
+            assertThatThrownBy(capture::finish).isInstanceOf(AssertionError.class).hasMessageContaining("unqualified");
+            assertThat(capture.retainedEvidence()).containsEntry("completed", false);
+            assertThat(capture.retainedEvidence().get("retainedPagesBase64"))
+                    .isEqualTo(java.util.List.of(java.util.Base64.getEncoder().encodeToString(access.page)));
+        } finally { capture.close(); }
+        assertThat(access.stops).hasValue(1);
     }
 
     private static byte[] page() throws Exception {

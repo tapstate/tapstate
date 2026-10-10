@@ -1,6 +1,8 @@
 package io.tapstate.e2e;
 
 import java.util.List;
+import java.util.ArrayList;
+import java.util.Map;
 
 /** Owns one diagnostic capture window; borrowed runtime connections and the child stay caller-owned. */
 final class BenchmarkWriteReturnCapture implements AutoCloseable {
@@ -13,8 +15,11 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
     }
 
     record Result(List<BenchmarkWriteReturnAssembly.FullCall> calls,
-                  List<BenchmarkCausalClock.Sample> samples, BenchmarkWriteReturnReader.Summary summary) {
-        Result { calls = List.copyOf(calls); samples = List.copyOf(samples); }
+                  List<BenchmarkCausalClock.Sample> samples, BenchmarkWriteReturnReader.Summary summary,
+                  List<String> pagesBase64) {
+        Result {
+            calls = List.copyOf(calls); samples = List.copyOf(samples); pagesBase64 = List.copyOf(pagesBase64);
+        }
     }
 
     private final Access access;
@@ -24,6 +29,9 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
     private boolean completed;
     private boolean closed;
     private long epoch;
+    private BenchmarkWriteReturnReader.Summary terminalSummary;
+    private final List<String> retainedPages = new ArrayList<>();
+    private long retainedPageBytes;
 
     static BenchmarkWriteReturnCapture open(BenchmarkWriteReturnReader reader, String window) {
         return open(new Access() {
@@ -69,15 +77,21 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
         if (!stopped) { throw new AssertionError("owned return capture stop left an incomplete call"); }
         var samples = sampler.finishAfterSuccessfulStop();
         var summary = access.summary();
-        if (!window.equals(summary.window()) || !"RECORDED_SCOPE_UNQUALIFIED".equals(summary.state())
-                || summary.openCalls() != 0 || summary.failedCalls() != 0) {
-            throw new AssertionError("owned return capture terminal scope or counters are unqualified");
+        terminalSummary = summary;
+        if (!window.equals(summary.window()) || summary.openCalls() != 0) {
+            throw new AssertionError("owned return capture terminal window or open-call counters are unqualified");
         }
         var assembly = new BenchmarkWriteReturnAssembly(window);
         int cursor = 0;
         long storedBytes = 0;
         while (true) {
             byte[] bytes = access.page(cursor);
+            if (bytes == null || bytes.length > 64 * 1024 || retainedPages.size() >= 512
+                    || retainedPageBytes + bytes.length > 2 * 1024 * 1024) {
+                throw new AssertionError("owned return capture page exceeds its retention bound");
+            }
+            retainedPages.add(java.util.Base64.getEncoder().encodeToString(bytes));
+            retainedPageBytes += bytes.length;
             var page = BenchmarkWriteReturnLedger.decode(bytes);
             if (page.epoch() != epoch) { throw new AssertionError("owned return capture epoch changed after start"); }
             int headerBytes = 32 + page.window().getBytes(java.nio.charset.StandardCharsets.UTF_8).length
@@ -90,6 +104,9 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
         if (storedBytes != summary.retainedBytes()) {
             throw new AssertionError("owned return capture retained-byte total contradicts its pages");
         }
+        if (!"RECORDED_SCOPE_UNQUALIFIED".equals(summary.state()) || summary.failedCalls() != 0) {
+            throw new AssertionError("owned return capture terminal scope or counters are unqualified");
+        }
         var calls = assembly.finish(summary.completedCalls(), summary.reportedRecords());
         var clock = new BenchmarkCausalClock(samples.getFirst().identity(), samples);
         for (var call : calls) {
@@ -97,7 +114,24 @@ final class BenchmarkWriteReturnCapture implements AutoCloseable {
             clock.map(samples.getFirst().identity(), call.observedNanos());
         }
         completed = true;
-        return new Result(calls, samples, summary);
+        return new Result(calls, samples, summary, retainedPages);
+    }
+
+    /** Keeps already obtained facts after refusal without retrying a remote read or stop. */
+    Map<String, Object> retainedEvidence() {
+        return Map.of("window", window, "epoch", epoch, "completed", completed,
+                "sampler", sampler.evidence(), "samples", sampler.readings().stream().map(sample -> Map.of(
+                        "sequence", sample.sequence(), "pid", sample.identity().pid(),
+                        "jvmStartTimeMillis", sample.identity().jvmStartTimeMillis(),
+                        "driverBeforeNanos", sample.driverBeforeNanos(), "driverAfterNanos", sample.driverAfterNanos(),
+                        "ownedNanos", sample.ownedNanos())).toList(),
+                "terminalSummaryAvailable", terminalSummary != null,
+                "terminalSummary", terminalSummary == null ? Map.of() : Map.of(
+                        "window", terminalSummary.window(), "state", terminalSummary.state(),
+                        "completedCalls", terminalSummary.completedCalls(), "openCalls", terminalSummary.openCalls(),
+                        "reportedRecords", terminalSummary.reportedRecords(), "failedCalls", terminalSummary.failedCalls(),
+                        "retainedBytes", terminalSummary.retainedBytes()),
+                "retainedPagesBase64", List.copyOf(retainedPages), "performanceAcceptanceEligible", false);
     }
 
     @Override public void close() {
