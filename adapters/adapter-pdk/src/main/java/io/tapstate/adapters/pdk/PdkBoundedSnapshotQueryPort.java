@@ -210,7 +210,7 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
             filter.projection(projection);
         }
 
-        List<Envelope> rows = new ArrayList<>(Math.min(queryLimit, 1024));
+        QueryRows rows = new QueryRows(queryLimit);
         AtomicReference<Throwable> reported = new AtomicReference<>();
         queryCount[0]++;
         try {
@@ -234,7 +234,7 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
         }
         ensureBeforeDeadline(request);
         cancellation.throwIfCancelled();
-        return rows;
+        return rows.snapshot();
     }
 
     private void collect(
@@ -243,11 +243,11 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
             TapTable table,
             int cap,
             FilterResults result,
-            List<Envelope> rows,
+            QueryRows rows,
             AtomicReference<Throwable> reported,
             long[] bytesUsed,
             BoundedQueryCancellation cancellation) {
-        synchronized (rows) {
+        synchronized (rows.monitor) {
             if (reported.get() != null) {
                 return;
             }
@@ -271,7 +271,7 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
                 if (reported.get() != null || cancellation.isCancelled()) {
                     return;
                 }
-                if (rows.size() >= cap) {
+                if (rows.values.size() >= cap) {
                     return;
                 }
                 try {
@@ -288,12 +288,28 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
                         return;
                     }
                     bytesUsed[0] += rowBytes;
-                    rows.add(envelope);
+                    rows.values.add(envelope);
                 } catch (RuntimeException failure) {
                     reported.compareAndSet(null, new IllegalArgumentException(
                             "connector row could not be decoded for preview table " + request.table().name(), failure));
                     return;
                 }
+            }
+        }
+    }
+
+    /** The callback monitor stays private even when a completed sample is handed to its caller. */
+    private static final class QueryRows {
+        private final Object monitor = new Object();
+        private final List<Envelope> values;
+
+        private QueryRows(int limit) {
+            values = new ArrayList<>(Math.min(limit, 1024));
+        }
+
+        private List<Envelope> snapshot() {
+            synchronized (monitor) {
+                return List.copyOf(values);
             }
         }
     }

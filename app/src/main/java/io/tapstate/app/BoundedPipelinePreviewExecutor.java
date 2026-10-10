@@ -128,7 +128,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
         private final String traceMapName;
         private final String leaseBase;
         private volatile String leaseKey;
-        private volatile Future<?> worker;
+        private final AtomicReference<Future<?>> worker = new AtomicReference<>();
         private volatile boolean cacheHit;
         private boolean workerStarted;
 
@@ -144,7 +144,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
         void start() {
             leaseKey = acquireLease(leaseBase, request.runId());
             try {
-                worker = workers.submit(this::execute);
+                worker.set(workers.submit(this::execute));
             } catch (RejectedExecutionException overloaded) {
                 releaseLease();
                 throw refused("the preview service is at its bounded concurrency limit");
@@ -196,7 +196,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
             if (!releaseBeforeStart) {
                 StatelessTransforms.cancelPreviewJs(executionId);
             }
-            Future<?> task = worker;
+            Future<?> task = worker.get();
             if (task != null) {
                 task.cancel(true);
             }
@@ -300,6 +300,9 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                     active.cancel();
                     try {
                         active.getFuture().get(CANCEL_JOIN.toMillis(), TimeUnit.MILLISECONDS);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        jobJoined = active.getFuture().isDone();
                     } catch (Exception stillEnding) {
                         jobJoined = active.getFuture().isDone();
                     }
