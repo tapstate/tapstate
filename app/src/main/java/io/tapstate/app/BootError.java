@@ -64,7 +64,13 @@ enum BootError implements TapstateErrorCode {
     COORDINATION_STORE_REQUIRED("boot.coordination-store-required", Set.of()),
 
     /** Another live boot already holds this stable node id. */
-    NODE_ID_IN_USE("boot.node-id-in-use", Set.of("nodeId"));
+    NODE_ID_IN_USE("boot.node-id-in-use", Set.of("nodeId")),
+
+    /** A development-only embedded Web artifact needs explicit runtime confirmation. */
+    WEB_DEVELOPMENT_CONFIRMATION_REQUIRED("boot.web-development-confirmation-required", Set.of()),
+
+    /** A development Web marker is malformed or unsupported by this runtime. */
+    WEB_DEVELOPMENT_ARTIFACT_INVALID("boot.web-development-artifact-invalid", Set.of("reason"));
 
     private final String code;
     private final Set<String> placeholders;

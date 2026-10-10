@@ -54,6 +54,8 @@ boot.node-id-in-use
 boot.node-id-required
 boot.node-session-renew-interval-invalid
 boot.node-session-ttl-invalid
+boot.web-development-artifact-invalid
+boot.web-development-confirmation-required
 boot.workload-claim-renew-interval-invalid
 boot.workload-claim-ttl-invalid
 capture.claim-lost

@@ -77,6 +77,35 @@ git -C "$web_root" diff --cached --quiet || die "web checkout has staged changes
 [ -n "$(find "$web_root/apps/web/dist" -type f -print -quit)" ] \
     || die "production bundle contains no files"
 
+producer_marker="$web_root/apps/web/dist/tapstate-web-build.json"
+if [ -f "$producer_marker" ]; then
+    python3 - "$producer_marker" <<'PY' || die "Web producer metadata is not release-compatible"
+import json
+import sys
+from urllib.parse import urlsplit
+
+try:
+    marker = json.load(open(sys.argv[1], encoding="utf-8"))
+    if marker.get("purpose") == "local-development":
+        raise ValueError("local-development Web artifacts cannot enter a release")
+    if marker.get("schemaVersion") != 1 or marker.get("purpose") != "release":
+        raise ValueError("unsupported Web producer metadata")
+    if marker.get("profile") not in ("op", "cloud"):
+        raise ValueError("unsupported Web producer profile")
+    if marker["profile"] == "cloud":
+        url = urlsplit(marker.get("cloudConsoleUrl", ""))
+        if url.scheme != "https" or not url.hostname or url.username or url.password or url.fragment:
+            raise ValueError("release Cloud Console URL must use HTTPS without credentials or a fragment")
+        if url.port is not None and not 1 <= url.port <= 65535:
+            raise ValueError("invalid release Cloud Console port")
+    elif "cloudConsoleUrl" in marker:
+        raise ValueError("OP producer metadata must not contain Cloud Console configuration")
+except (ValueError, TypeError, AttributeError) as error:
+    print("prepare-web-assets.sh: " + str(error), file=sys.stderr)
+    sys.exit(2)
+PY
+fi
+
 mkdir -p "$output/static" "$output/META-INF"
 cp -R "$web_root/apps/web/dist/." "$output/static/"
 

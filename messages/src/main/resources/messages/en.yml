@@ -150,6 +150,12 @@ boot.workload-claim-renew-interval-invalid:
 boot.workload-claim-ttl-invalid:
   message: "The workload-claim lease must be positive."
   solution: "Set tapstate.cluster.workload-claim-ttl to a positive duration."
+boot.web-development-confirmation-required:
+  message: "This embedded Web artifact is for local development and requires explicit confirmation."
+  solution: "For an intended development environment, set tapstate.local-development.enabled=true; otherwise use a release artifact."
+boot.web-development-artifact-invalid:
+  message: "The development Web artifact is invalid: {reason}."
+  solution: "Rebuild the intended supported development profile or use a verified release artifact."
 capture.start-from-unparsable:
   message: "Cannot start consuming from `{value}`; expected `earliest`, `latest`, or an ISO-8601 timestamp."
   solution: "Set start_from to earliest, latest, or an ISO-8601 timestamp like 2026-07-11T00:00:00Z."

@@ -40,6 +40,49 @@ else
     fail "a clean checkout at the explicit revision is staged with provenance"
 fi
 
+printf '%s\n' '{"schemaVersion":1,"profile":"op","purpose":"local-development"}' \
+    >"$web/apps/web/dist/tapstate-web-build.json"
+git -C "$web" add apps/web/dist/tapstate-web-build.json
+git -C "$web" commit -qm 'add local development producer marker'
+sha="$(git -C "$web" rev-parse HEAD)"
+if output="$("$script" --web-root "$web" --web-revision "$sha" \
+   --tapstate-revision 0123456789abcdef0123456789abcdef01234567 \
+   --release-version 0.5.0 --output "$work/local-marker" 2>&1)"; then
+    fail "local development artifacts are refused by the release stager"
+elif grep -Fq 'local-development Web artifacts cannot enter a release' <<<"$output" &&
+     test ! -e "$work/local-marker"; then
+    pass "local development artifacts are refused before staging"
+else
+    fail "local development artifacts are refused for the expected reason"
+fi
+
+printf '%s\n' '{"schemaVersion":1,"profile":"cloud","purpose":"release","cloudConsoleUrl":"http://localhost:28175/"}' \
+    >"$web/apps/web/dist/tapstate-web-build.json"
+git -C "$web" commit -qam 'add invalid release producer URL'
+sha="$(git -C "$web" rev-parse HEAD)"
+if output="$("$script" --web-root "$web" --web-revision "$sha" \
+   --tapstate-revision 0123456789abcdef0123456789abcdef01234567 \
+   --release-version 0.5.0 --output "$work/http-marker" 2>&1)"; then
+    fail "an HTTP Console URL cannot be relabeled as a release"
+elif grep -Fq 'release Cloud Console URL must use HTTPS' <<<"$output"; then
+    pass "an HTTP Console URL cannot be relabeled as a release"
+else
+    fail "an HTTP producer URL is refused for the expected reason"
+fi
+
+printf '%s\n' '{"schemaVersion":1,"profile":"op","purpose":"release"}' \
+    >"$web/apps/web/dist/tapstate-web-build.json"
+git -C "$web" commit -qam 'add ordinary release producer marker'
+sha="$(git -C "$web" rev-parse HEAD)"
+if "$script" --web-root "$web" --web-revision "$sha" \
+   --tapstate-revision 0123456789abcdef0123456789abcdef01234567 \
+   --release-version 0.5.0 --output "$work/release-marker" >/dev/null &&
+   grep -Fxq "revision=$sha" "$work/release-marker/META-INF/tapstate-web.properties"; then
+    pass "ordinary release producer metadata preserves provenance staging"
+else
+    fail "ordinary release producer metadata preserves provenance staging"
+fi
+
 ln -s assets/app.js "$web/apps/web/dist/bundle.js"
 git -C "$web" add apps/web/dist/bundle.js
 git -C "$web" commit -qm 'add symlink to fixture bundle'

@@ -115,6 +115,8 @@ class HazelcastConfiguration {
         if (identity != null) {
             identify(config, identity);
             configureClusterProtection(config, membershipGate);
+        } else {
+            identifyConfiguredSingleMember(config, clusterProperties, controlProperties, bootId);
         }
         HazelcastInstance member;
         try {
@@ -397,6 +399,39 @@ class HazelcastConfiguration {
      * set here -- before the member joins -- rather than published afterwards, which would leave a window
      * in which a member is in the cluster and anonymous.
      */
+    /** Publishes an explicitly configured single member without enabling distributed coordination. */
+    private static void identifyConfiguredSingleMember(Config config, ClusterProperties cluster,
+            ControlEndpointProperties control, BootId bootId) {
+        if (!hasText(cluster.getNodeId())) {
+            return;
+        }
+        if (!hasText(cluster.getId())) {
+            throw new TapstateException(BootError.CLUSTER_ID_REQUIRED, Map.of(), null);
+        }
+        try {
+            new io.tapstate.spi.store.ClusterIdentity(cluster.getId().trim());
+        } catch (IllegalArgumentException invalid) {
+            throw new TapstateException(BootError.CLUSTER_ID_INVALID, Map.of(), invalid);
+        }
+        config.getMemberAttributeConfig()
+                .setAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE, cluster.getNodeId().trim())
+                .setAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE, bootId.value());
+        if (hasText(control.getAdvertiseUrl())) {
+            java.net.URI url;
+            try {
+                url = java.net.URI.create(control.getAdvertiseUrl().trim());
+            } catch (IllegalArgumentException invalid) {
+                throw new TapstateException(BootError.CONTROL_ADVERTISE_URL_INVALID, Map.of(), invalid);
+            }
+            if (url.getHost() == null || !("http".equalsIgnoreCase(url.getScheme())
+                    || "https".equalsIgnoreCase(url.getScheme()))) {
+                throw new TapstateException(BootError.CONTROL_ADVERTISE_URL_INVALID, Map.of(), null);
+            }
+            config.getMemberAttributeConfig().setAttribute(
+                    ClusterMembershipGate.CONTROL_URL_ATTRIBUTE, url.toString());
+        }
+    }
+
     static Config identify(Config config, ClusterMemberPreflight.Identity identity) {
         config.setClusterName(identity.clusterId());
         config.getMemberAttributeConfig()
