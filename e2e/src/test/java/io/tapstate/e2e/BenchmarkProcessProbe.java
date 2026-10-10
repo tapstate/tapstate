@@ -83,6 +83,16 @@ final class BenchmarkProcessProbe implements AutoCloseable {
 
     enum CompilationState { SUCCESS, UNKNOWN }
 
+    BenchmarkWriteReturnReader writeReturnReader() {
+        var runtime = runtimeEvidence();
+        if (!"COMPLETE".equals(runtime.get("status")) || connection == null || child == null
+                || !(runtime.get("jvmStartTimeMillis") instanceof Long start)) {
+            throw new AssertionError("owned return probe has no verified resource runtime");
+        }
+        return new BenchmarkWriteReturnReader(new BenchmarkCausalClock.Identity(ownedPid, start),
+                connection, child::isAlive, System::nanoTime);
+    }
+
     /** Retains runtime identity through the existing resource connection before the measured window. */
     Map<String, Object> runtimeEvidence() {
         long before = System.nanoTime();

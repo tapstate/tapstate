@@ -52,6 +52,7 @@ final class PdkSinkWriter implements SinkWriter {
     private final Map<String, TargetTable> targets;
     private final PdkTargetPreparation preparation;
     private final PdkExternalCallStats externalCalls;
+    private final PdkWriteReturnProbe.Writer writeReturnProbe;
     // What closing this writer does to its connector: stops and closes it, or - where the connector is shared
     // by the writers of one sink - lets go of this writer's hold on it.
     private final Runnable letGo;
@@ -128,6 +129,7 @@ final class PdkSinkWriter implements SinkWriter {
         this.targets = targets == null ? Map.of() : Map.copyOf(targets);
         this.preparation = preparation;
         this.externalCalls = Objects.requireNonNull(externalCalls, "externalCalls");
+        this.writeReturnProbe = PdkWriteReturnProbe.forWriter(connector);
     }
 
     /** Prepare selected tables even when their source snapshot contains no rows. */
@@ -197,11 +199,34 @@ final class PdkSinkWriter implements SinkWriter {
                         rows.forEach(row -> row.setTableId(target.name()));
                     }
                     // A connector may report the batch in several flushes, one callback each; accumulate.
-                    measuredWrite(() -> {
-                        write.writeRecord(connector.context(), rows, table,
-                                result -> accepted[0] += accepted(result));
-                        return null;
-                    });
+                    if (writeReturnProbe == null) {
+                        measuredWrite(() -> {
+                            write.writeRecord(connector.context(), rows, table,
+                                    result -> accepted[0] += accepted(result));
+                            return null;
+                        });
+                    } else {
+                        var receipt = writeReturnProbe.begin(entry.getKey(), table, rows);
+                        Throwable failure = null;
+                        try {
+                            measuredWrite(() -> {
+                                try {
+                                    write.writeRecord(connector.context(), rows, table, result -> {
+                                        if (receipt != null) { receipt.callback(result); }
+                                        accepted[0] += accepted(result);
+                                    });
+                                } finally {
+                                    if (receipt != null) { receipt.observeReturn(); }
+                                }
+                                return null;
+                            });
+                        } catch (Throwable thrown) {
+                            failure = thrown;
+                            throw thrown;
+                        } finally {
+                            if (receipt != null) { receipt.completed(failure); }
+                        }
+                    }
                 }
                 return new WriteResult(accepted[0]);
             });
