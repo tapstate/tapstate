@@ -352,7 +352,10 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                                  : BenchmarkConnectorPositionCoverage.Mode.POSTGRES_PGOUTPUT,
                          connectorJar, connectorConfig,
                          lineage instanceof BenchmarkSourceLineage.MySql mysql
-                                 ? mysql.decoderLineage() : null)) {
+                                 ? mysql.decoderLineage() : null);
+                 BenchmarkNativeQueueProbe returnCounters = Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY)
+                         ? new BenchmarkNativeQueueProbe(fork.control(), fork.server().baseUrl().toString(), "tapstate",
+                                 new com.hazelcast.config.MetricsConfig().getCollectionFrequencySeconds()) : null) {
                 captures.awaitPreflight(workload, fork);
                 List<MeasuredPhase> measured = new ArrayList<>();
                 List<Long> allDurations = new ArrayList<>();
@@ -380,6 +383,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                     throw new AssertionError("benchmark has no measured phase");
                 }
                 captures.awaitMeasurementBoundary(workload, fork, previousPhase, positionCoverage);
+                long acknowledgedBoundaryAt = System.nanoTime();
                 awaitFreshObservationAfterBoundary(workload, fork.control());
                 awaitQuiescentRecordsOut(workload, fork.control());
                 try (TargetWatchSet targets = TargetWatchSet.open(
@@ -390,11 +394,12 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                             workload.phases().size())) {
                         if (phase.measured()) {
                             PhaseWindow window = runMeasuredPhase(workload, fork, phase,
-                                    captures, positionCoverage, targets, tables);
+                                    captures, positionCoverage, targets, tables, returnCounters, acknowledgedBoundaryAt);
                             measured.add(window.measurement());
                             allDurations.addAll(window.deliveryDurations());
                             resourceWindows.add(window.resources());
                             commandWindows.add(window.mongoCommands());
+                            acknowledgedBoundaryAt = window.measurement().completedAckAtNanos();
                         } else if (phase.stage() == BenchmarkWorkloadDefinitions.Stage.TERMINAL) {
                             if (measured.isEmpty()) {
                                 throw new AssertionError("terminal arrived before any measured delivery");
@@ -498,7 +503,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
     private static PhaseWindow runMeasuredPhase(BenchmarkWorkloadDefinitions.Workload workload,
             BenchmarkForkEnvironment fork, BenchmarkWorkloadDefinitions.Phase phase,
             CaptureSet captures, BenchmarkConnectorPositionCoverage positionCoverage,
-            TargetWatchSet targets, BenchmarkTableCaptureSet tables) throws Exception {
+            TargetWatchSet targets, BenchmarkTableCaptureSet tables, BenchmarkNativeQueueProbe returnCounters,
+            long acknowledgedBoundaryAt) throws Exception {
         boolean compilationDiagnostics = Boolean.getBoolean("tapstate.e2e.benchmark.compilation-diagnostics");
         if (compilationDiagnostics && !workload.pilotProfile()) {
             throw new AssertionError("compilation diagnostics require the declared steady pilot profile");
@@ -509,7 +515,9 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
             throw new AssertionError("thread point diagnostics require the original copy pilot with load points");
         }
         List<BenchmarkExpectedChanges.TargetPlan> plans = BenchmarkExpectedChanges.forPhase(workload, phase);
-        long initialAcknowledged = recordsOut(workload, fork.control());
+        NativeCounterBaseline counterBefore = returnCounters == null ? null
+                : awaitNativeCounterBaselines(workload, fork.control(), returnCounters, acknowledgedBoundaryAt, phase.id() + "/before");
+        long initialAcknowledged = counterBefore == null ? recordsOut(workload, fork.control()) : counterBefore.total();
         BenchmarkForkEnvironment.PhaseIssue issued;
         long completedAckAt;
         long sourceMarkerWaitStartedAt;
@@ -698,6 +706,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 ? Map.of("state", "UNQUALIFIED", "reason", "MULTI_TARGET_CLOCKS_NOT_YET_CALIBRATED")
                 : BenchmarkTargetClock.validate(targetClockBefore, targetClockAfter);
         var clockProof = new LinkedHashMap<String, Object>(outerClockEvidence);
+        if (counterBefore != null) { clockProof.put("nativeCounterBaselineBefore", counterBefore.evidence()); }
         if (writeReturns != null) {
             try {
                 Map<String, Object> returnEvidence = new LinkedHashMap<>(BenchmarkWriteReturnPhaseEvidence.record(
@@ -706,8 +715,9 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                         workload, phase, issued.batches(), writeReturns.calls());
                 var owner = writeReturns.samples().getFirst().identity();
                 var causalClock = new BenchmarkCausalClock(owner, writeReturns.samples());
-                returnEvidence.put("resourceBounds", BenchmarkReturnResourceBounds.evidence(resources,
-                        BenchmarkReturnTimeBounds.map(associations, owner, causalClock)));
+                var mappedReturns = BenchmarkReturnTimeBounds.map(associations, owner, causalClock);
+                returnEvidence.put("resourceBounds", BenchmarkReturnResourceBounds.evidence(resources, mappedReturns));
+                returnEvidence.put("commonWindowCertificate", BenchmarkReturnCommonWindow.evidence(mappedReturns));
                 returnEvidence.put("resourceReceiptScope", "FULL_PHASE_RETAINED_THROUGH_CAPTURE_CLOSE");
                 clockProof.put("writeReturnDiagnostics", Map.copyOf(returnEvidence));
                 System.out.println("benchmark-write-return-phase-evidence=" + JsonWriter.write(returnEvidence));
@@ -736,15 +746,34 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         if (clockRefusalEvidenceRecorded(readReceipts)) {
             clockProof.put("operationClockRefusalEvidenceEnabled", true);
         }
-        Map<String, Object> targetClockEvidence = Map.copyOf(clockProof);
         List<BenchmarkMongoDeliveryObserver.Delivery> deliveries = targetStreams.values().stream().flatMap(List::stream).toList();
         if (deliveries.size() != phase.expectedLogicalOutputChanges()) {
             throw new AssertionError("observed " + deliveries.size() + " deliveries for " + phase.id()
                     + ", expected " + phase.expectedLogicalOutputChanges());
         }
         fork.completePhase(phase);
-        long reportedRecordsOut = awaitRecordsOut(workload, fork.control(), initialAcknowledged,
-                phase.expectedLogicalOutputChanges());
+        long reportedRecordsOut;
+        if (returnCounters == null) {
+            reportedRecordsOut = awaitRecordsOut(workload, fork.control(), initialAcknowledged, phase.expectedLogicalOutputChanges());
+        } else {
+            NativeCounterBaseline counterAfter = awaitNativeCounterBaselines(workload, fork.control(), returnCounters,
+                    completedAckAt, phase.id() + "/after");
+            reportedRecordsOut = Math.subtractExact(counterAfter.total(), initialAcknowledged);
+            long nativeDelta = 0;
+            for (String pipeline : workload.pipelineIds()) {
+                nativeDelta = Math.addExact(nativeDelta, BenchmarkNativeCounterBaseline.delta(
+                        counterBefore.snapshots().get(pipeline), counterAfter.snapshots().get(pipeline)));
+            }
+            if (reportedRecordsOut != nativeDelta) {
+                throw new AssertionError("native and flat baseline phase deltas contradict each other");
+            }
+            if (reportedRecordsOut < phase.expectedLogicalOutputChanges()) {
+                throw new AssertionError("fresh native counter delta has fewer rows than the complete measured phase");
+            }
+            clockProof.put("nativeCounterBaselineAfter", counterAfter.evidence());
+            clockProof.put("reportedRecordsOutScope", "FRESH_NATIVE_AND_FLAT_CORRESPONDING_BASELINES");
+        }
+        Map<String, Object> targetClockEvidence = Map.copyOf(clockProof);
         long firstIssued = issued.batches().getFirst().issuedAtNanos();
         long expectedSourceChanges = phase.expectedLogicalCoverage().values().stream()
                 .mapToLong(Long::longValue).sum();
@@ -808,6 +837,53 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                         "afterNanos", anchor.afterNanos()),
                 "batches", issued.batches().stream().map(batch -> Map.of("index", batch.index(),
                         "issuedAtNanos", batch.issuedAtNanos(), "completedAtNanos", batch.completedAtNanos())).toList());
+    }
+
+    private record NativeCounterBaseline(long total, Map<String, Object> evidence,
+                                         Map<String, BenchmarkNativeCounterBaseline.Snapshot> snapshots) {
+        NativeCounterBaseline { evidence = Map.copyOf(evidence); snapshots = Map.copyOf(snapshots); }
+    }
+
+    /** The benchmark creates one fresh process and pipeline scope and performs no continuation. */
+    private static NativeCounterBaseline awaitNativeCounterBaselines(BenchmarkWorkloadDefinitions.Workload workload,
+            ControlPlane control, BenchmarkNativeQueueProbe probe, long acknowledgedAt, String stage) throws InterruptedException {
+        var guards = new LinkedHashMap<String, BenchmarkNativeCounterBaseline>();
+        workload.pipelineIds().forEach(pipeline -> guards.put(pipeline,
+                new BenchmarkNativeCounterBaseline(acknowledgedAt, PRE_WINDOW_QUIET)));
+        long deadline = System.nanoTime() + ACK_WAIT.toNanos();
+        var complete = new java.util.HashSet<String>();
+        try {
+            while (complete.size() != guards.size()) {
+                for (var entry : guards.entrySet()) {
+                    if (complete.contains(entry.getKey())) { continue; }
+                    var snapshot = probe.delivery(entry.getKey());
+                    long flat = control.recordsOut(entry.getKey()).orElseThrow(() ->
+                            new AssertionError("native baseline has no matching flat observation"));
+                    if (entry.getValue().observe(snapshot, flat, System.nanoTime())) { complete.add(entry.getKey()); }
+                }
+                if (complete.size() == guards.size()) { break; }
+                if (System.nanoTime() >= deadline) { throw new AssertionError("native baseline publications did not qualify"); }
+                TimeUnit.NANOSECONDS.sleep(COUNTER_POLL.toNanos());
+            }
+        } catch (RuntimeException | Error | InterruptedException failure) {
+            System.out.println("benchmark-native-baseline-refusal=" + JsonWriter.write(Map.of(
+                    "stage", stage, "state", "UNKNOWN", "pipelines", guards.entrySet().stream().map(entry ->
+                            Map.of("pipeline", entry.getKey(), "evidence", entry.getValue().evidence())).toList(),
+                    "performanceAcceptanceEligible", false)));
+            throw failure;
+        }
+        long total = 0;
+        var readings = new LinkedHashMap<String, Object>();
+        var snapshots = new LinkedHashMap<String, BenchmarkNativeCounterBaseline.Snapshot>();
+        for (var entry : guards.entrySet()) {
+            total = Math.addExact(total, entry.getValue().total());
+            readings.put(entry.getKey(), entry.getValue().evidence());
+            snapshots.put(entry.getKey(), entry.getValue().snapshot());
+        }
+        var evidence = Map.<String, Object>of("stage", stage, "state", "RECORDED_FRESH_NATIVE_BASELINES",
+                "total", total, "pipelines", Map.copyOf(readings), "performanceAcceptanceEligible", false);
+        System.out.println("benchmark-native-counter-baselines=" + JsonWriter.write(evidence));
+        return new NativeCounterBaseline(total, evidence, snapshots);
     }
 
     /** Records idempotent replay work as a cost while logical delivery remains the target-change oracle. */

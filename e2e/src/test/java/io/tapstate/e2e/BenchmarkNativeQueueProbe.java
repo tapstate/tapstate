@@ -4,6 +4,8 @@ import com.hazelcast.client.HazelcastClient;
 import com.hazelcast.client.config.ClientConfig;
 import com.hazelcast.client.config.ClientConnectionStrategyConfig;
 import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.jet.core.JobStatus;
+import com.hazelcast.jet.core.metrics.JobMetrics;
 import com.hazelcast.jet.core.metrics.MetricNames;
 import com.hazelcast.jet.core.metrics.MetricTags;
 import java.util.ArrayList;
@@ -68,6 +70,98 @@ final class BenchmarkNativeQueueProbe implements AutoCloseable {
         String actual = members.iterator().next().getAddress().toString().replace("[127.0.0.1]:", "127.0.0.1:");
         if (!actual.equals(owner.hzAddress().replace("[127.0.0.1]:", "127.0.0.1:"))) {
             throw new AssertionError("native benchmark member address differs from its declared endpoint");
+        }
+    }
+
+    /** One latest settled-row publication, with its timestamp treated only as an opaque cycle label. */
+    BenchmarkNativeCounterBaseline.Snapshot delivery(String pipeline) {
+        requireOwner();
+        var job = client.getJet().getJob(pipeline);
+        if (job == null || !pipeline.equals(job.getName()) || job.getStatus() != JobStatus.RUNNING) {
+            throw new AssertionError("native delivery witness requires the named running job");
+        }
+        long jobId = job.getId();
+        String jobIdString = job.getIdString();
+        long started = System.nanoTime();
+        var metrics = job.getMetrics();
+        Map<?, ?> topology = control.benchmarkPipelineTopology(pipeline);
+        var current = client.getJet().getJob(pipeline);
+        requireOwner();
+        if (current == null || current.getId() != jobId || !pipeline.equals(current.getName())
+                || current.getStatus() != JobStatus.RUNNING || job.getStatus() != JobStatus.RUNNING) {
+            throw new AssertionError("native delivery job changed during its snapshot");
+        }
+        return deliverySnapshot(pipeline, jobIdString, owner.uuid(), metrics, topology, started, System.nanoTime());
+    }
+
+    static BenchmarkNativeCounterBaseline.Snapshot deliverySnapshot(String pipeline, String jobId,
+            String memberUuid, JobMetrics metrics, Map<?, ?> topology, long started, long completed) {
+        boundedDeliveryField(pipeline); boundedDeliveryField(jobId); boundedDeliveryField(memberUuid);
+        if (metrics == null) { throw new AssertionError("native delivery metrics are missing"); }
+        try {
+            if (Math.subtractExact(completed, started) < 0) { throw new AssertionError("native delivery request clock moved backward"); }
+        } catch (ArithmeticException overflow) {
+            throw new AssertionError("native delivery request clock overflow", overflow);
+        }
+        TopologyRoster topologyRoster = topologyRoster(topology, memberUuid);
+        if (topologyRoster.executions().size() != 1) {
+            throw new AssertionError("native delivery topology has no unique execution");
+        }
+        String execution = topologyRoster.executions().iterator().next();
+        boundedDeliveryField(execution);
+        Set<String> expected = new HashSet<>();
+        for (String identity : topologyRoster.identities()) {
+            if (identity.startsWith(memberUuid + "/serve.") || identity.startsWith(memberUuid + "/view.")) {
+                boundedDeliveryField(identity);
+                expected.add(identity);
+            }
+        }
+        if (expected.isEmpty() || expected.size() > 128) {
+            throw new AssertionError("native delivery sink roster is missing or exceeds its bound");
+        }
+        Map<String, Long> counters = new java.util.LinkedHashMap<>();
+        Set<String> represented = new HashSet<>();
+        Long publication = null;
+        for (String name : metrics.metrics()) {
+            if (!name.startsWith("recordsOut.")) { continue; }
+            boundedDeliveryField(name);
+            String suffix = name.substring("recordsOut.".length());
+            int separator = suffix.indexOf('.');
+            if (separator < 1 || separator == suffix.length() - 1) {
+                throw new AssertionError("native delivery metric has no operation and table");
+            }
+            for (var row : metrics.get(name)) {
+                String member = row.tag(MetricTags.MEMBER), vertex = row.tag(MetricTags.VERTEX);
+                String processor = row.tag(MetricTags.PROCESSOR), actualExecution = row.tag(MetricTags.EXECUTION);
+                boundedDeliveryField(member); boundedDeliveryField(vertex); boundedDeliveryField(processor);
+                boundedDeliveryField(actualExecution); boundedDeliveryField(row.tag(MetricTags.JOB));
+                if (!processor.matches("0|[1-9][0-9]*")) { throw new AssertionError("native delivery processor is not an exact index"); }
+                String identity = member + "/" + vertex + "/" + processor;
+                boundedDeliveryField(identity);
+                if (!name.equals(row.metric()) || !memberUuid.equals(member) || !jobId.equals(row.tag(MetricTags.JOB))
+                        || !execution.equals(actualExecution) || !expected.contains(identity) || row.value() < 0) {
+                    throw new AssertionError("native delivery row has another identity or an invalid counter");
+                }
+                if (publication == null) { publication = row.timestamp(); }
+                if (publication != row.timestamp()) { throw new AssertionError("native delivery rows mix publication snapshots"); }
+                String key = name + "|" + identity;
+                if (counters.size() >= 4096 || counters.putIfAbsent(key, row.value()) != null) {
+                    throw new AssertionError("native delivery counter is duplicate or exceeds its bound");
+                }
+                represented.add(identity);
+            }
+        }
+        if (publication == null || !represented.equals(expected)) {
+            throw new AssertionError("native delivery counter roster is incomplete");
+        }
+        return new BenchmarkNativeCounterBaseline.Snapshot(pipeline, jobId, memberUuid, execution, publication,
+                started, completed, Set.copyOf(expected), Map.copyOf(counters));
+    }
+
+    private static void boundedDeliveryField(String value) {
+        if (value == null || value.isBlank() || value.length() > 512 || value.indexOf('|') >= 0
+                || value.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 512) {
+            throw new AssertionError("native delivery identity field is missing, ambiguous or exceeds its bound");
         }
     }
 
