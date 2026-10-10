@@ -783,7 +783,7 @@ class ControlPlaneConfiguration {
     @Bean
     SampleSourceCredentialsProvider sampleSourceCredentialsProvider(
             CloudRuntimeSettings cloudSettings, ObjectMapper objectMapper,
-            @Value("${tapstate.sample.host:113.98.206.139}") String host,
+            @Value("${tapstate.sample.host:47.238.126.103}") String host,
             @Value("${tapstate.sample.password:}") String password) {
         if (cloudSettings.cloud()) {
             return new CloudSampleSourceCredentialsProvider(cloudSettings, objectMapper);
