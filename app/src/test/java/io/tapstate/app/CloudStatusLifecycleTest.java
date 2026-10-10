@@ -162,6 +162,22 @@ class CloudStatusLifecycleTest {
     }
 
     @Test
+    void aFailingDiagnosticHookPreservesTheOriginalWorkerDefect() {
+        IllegalStateException defect = new IllegalStateException("original worker defect");
+        IllegalArgumentException observerFailure = new IllegalArgumentException("diagnostic hook defect");
+        bind(new CloudStatusReporter("validated-cluster", () -> { throw defect; },
+                (cluster, nonce, status) -> { throw new AssertionError("must not send"); }, () -> "nonce"),
+                (thread, failure) -> {
+                    assertThat(failure).isSameAs(defect);
+                    throw observerFailure;
+                });
+        lifecycle.onApplicationEvent(ready(owner));
+
+        assertThatThrownBy(() -> scheduled.getFirst().run()).isSameAs(defect);
+        assertThat(defect.getSuppressed()).containsExactly(observerFailure);
+    }
+
+    @Test
     void aRealPeriodicExecutorSurfacesAnUncodedWorkerDefectWithItsOriginalIdentity() throws Exception {
         IllegalStateException defect = new IllegalStateException("broken periodic provider invariant");
         AtomicReference<Throwable> observed = new AtomicReference<>();
@@ -197,12 +213,16 @@ class CloudStatusLifecycleTest {
     }
 
     private void bind(CloudStatusReporter reporter) {
+        bind(reporter, (thread, failure) -> { });
+    }
+
+    private void bind(CloudStatusReporter reporter, java.util.function.BiConsumer<Thread, Throwable> defects) {
         when(executor.scheduleWithFixedDelay(any(Runnable.class), eq(0L), eq(30L), eq(TimeUnit.SECONDS)))
                 .thenAnswer(call -> {
                     scheduled.add(call.getArgument(0));
                     return future;
                 });
-        lifecycle = new CloudStatusLifecycle(reporter, () -> executor, (thread, failure) -> { });
+        lifecycle = new CloudStatusLifecycle(reporter, () -> executor, defects);
         lifecycle.setApplicationContext(owner);
     }
 
