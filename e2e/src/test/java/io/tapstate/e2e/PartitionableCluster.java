@@ -111,6 +111,13 @@ final class PartitionableCluster implements AutoCloseable {
 
     /** The same owned cluster, with an explicit node-session window for expiry witnesses. */
     static PartitionableCluster start(String storeUri, String name, List<String> nodeIds, Duration nodeSessionTtl) {
+        return start(storeUri, name, nodeIds, nodeSessionTtl, Map.of());
+    }
+
+    /** Applies the same allowed immutable profile inputs to every member's first launch. */
+    static PartitionableCluster start(String storeUri, String name, List<String> nodeIds, Duration nodeSessionTtl,
+            Map<String, String> initialProfileInputs) {
+        Map<String, String> profileInputs = checkedProfileInputs(initialProfileInputs);
         if (nodeSessionTtl != null && (nodeSessionTtl.isNegative() || nodeSessionTtl.dividedBy(3).isZero())) {
             throw new IllegalArgumentException("the node-session window must allow a positive renewal interval");
         }
@@ -136,8 +143,8 @@ final class PartitionableCluster implements AutoCloseable {
                 int memberPort = memberPorts.get(nodeId);
                 String advertised = links.get(nodeId).address();
                 int[] range = outbound.get(nodeId);
-                launchArguments.put(nodeId, httpPort -> arguments(clusterId, nodeId, memberPort, advertised,
-                        seeds, httpPort, bindAddress, nodeIds.size(), range, nodeSessionTtl));
+                launchArguments.put(nodeId, withProfileInputs(httpPort -> arguments(clusterId, nodeId, memberPort, advertised,
+                        seeds, httpPort, bindAddress, nodeIds.size(), range, nodeSessionTtl), profileInputs));
             }
             for (String nodeId : nodeIds) {
                 servers.put(nodeId,
@@ -402,14 +409,7 @@ final class PartitionableCluster implements AutoCloseable {
 
     private static IntFunction<List<String>> withProfileInputs(IntFunction<List<String>> retained,
             Map<String, String> requested) {
-        Map<String, String> inputs = Map.copyOf(requested);
-        inputs.forEach((key, value) -> {
-            if (!(key.startsWith("tapstate.cluster.execution-profile.")
-                    || key.equals("tapstate.hz.jet.cooperative-thread-count"))) {
-                throw new IllegalArgumentException("a profile witness cannot override launch identity: " + key);
-            }
-            if (value.isBlank()) throw new IllegalArgumentException("a profile input cannot be blank: " + key);
-        });
+        Map<String, String> inputs = checkedProfileInputs(requested);
         return httpPort -> {
             Map<String, String> arguments = new LinkedHashMap<>();
             for (String argument : retained.apply(httpPort)) {
@@ -422,6 +422,19 @@ final class PartitionableCluster implements AutoCloseable {
             arguments.putAll(inputs);
             return arguments.entrySet().stream().map(entry -> "--" + entry.getKey() + "=" + entry.getValue()).toList();
         };
+    }
+
+    private static Map<String, String> checkedProfileInputs(Map<String, String> requested) {
+        Map<String, String> inputs = Map.copyOf(requested);
+        inputs.forEach((key, value) -> {
+            if (!(key.startsWith("tapstate.cluster.execution-profile.")
+                    || key.equals("tapstate.hz.jet.cooperative-thread-count")
+                    || key.equals("tapstate.execution.cluster-capacity.writers"))) {
+                throw new IllegalArgumentException("a profile witness cannot override launch identity: " + key);
+            }
+            if (value.isBlank()) throw new IllegalArgumentException("a profile input cannot be blank: " + key);
+        });
+        return inputs;
     }
 
     /** Whether one member's process is still running -- what tells failing closed from falling over. */

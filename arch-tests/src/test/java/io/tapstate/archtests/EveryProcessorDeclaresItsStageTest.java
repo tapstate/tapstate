@@ -42,13 +42,17 @@ class EveryProcessorDeclaresItsStageTest {
      * when the processor it wraps is handed its rows; that one times its own stage, and timing the wrapper too
      * would count the same work twice. And a vertex that runs one processor for the whole cluster keeps a stand-in
      * on every other member that takes no rows and only passes the vertex's bounds on: the processor it stands in
-     * for times the stage, on the one member where the work is done.
+     * for times the stage, on the one member where the work is done. Native initialization observers
+     * publish one receipt after the delegate initializes and forward every processing callback unchanged;
+     * the working delegate owns its timer, and a wrapped stand-in remains untimed.
      */
     private static final Set<String> TOPOLOGY = Set.of(
             "io.tapstate.runtime.engine.PassthroughProcessor",
             "io.tapstate.runtime.engine.SinkRouter",
             "io.tapstate.runtime.engine.InputBatches",
-            "io.tapstate.runtime.engine.TotalOne$BoundsStandIn");
+            "io.tapstate.runtime.engine.TotalOne$BoundsStandIn",
+            "io.tapstate.runtime.engine.NativeExecutionStartup$Initialized",
+            "io.tapstate.runtime.engine.NativeExecutionStartup$InitializedStandIn");
 
     private static JavaClasses tapstateClasses;
 

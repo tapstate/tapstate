@@ -21,6 +21,9 @@ import java.util.Map;
  * written entry by entry (a leading count, {@code -1} for an absent image) so the serializer does not
  * lean on Hazelcast's support for any particular map implementation; the row values are the standard
  * scalar types Hazelcast serializes natively.
+ *
+ * <p>The ring transports each item in its own bounded Data payload. Optional tails are read inside
+ * that boundary; this layout does not support unframed nesting of earlier items beside other objects.
  */
 public final class SrsItemSerializer implements StreamSerializer<SrsItem> {
 
@@ -44,6 +47,10 @@ public final class SrsItemSerializer implements StreamSerializer<SrsItem> {
         out.writeLong(item.schemaVer());
         writeFence(out, item.captureFence());
         out.writeLong(item.epoch());
+        // Keep the complete earlier prefix and the exact bytes of unqualified items unchanged.
+        if (item.captureFence() != null && item.captureFence().profileGeneration() > 0) {
+            out.writeLong(item.captureFence().profileGeneration());
+        }
     }
 
     @Override
@@ -61,6 +68,15 @@ public final class SrsItemSerializer implements StreamSerializer<SrsItem> {
             epoch = in.readLong();
         } catch (java.io.EOFException legacy) {
             epoch = 0L;
+        }
+        if (fence != null) {
+            try {
+                long profile = in.readLong();
+                fence = new WorkloadClaimFence(fence.key(), fence.owner(), fence.claimGeneration(),
+                        fence.executionGeneration(), fence.topologyRevision(), profile);
+            } catch (java.io.EOFException legacy) {
+                // The earlier epoch-bearing and no-epoch layouts carry no profile authority.
+            }
         }
         return new SrsItem(srcPos, op, ts, before, after, schemaVer, fence, epoch);
     }

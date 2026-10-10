@@ -7,12 +7,19 @@ import com.hazelcast.config.RingbufferStoreConfig;
 import com.hazelcast.config.SerializerConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.internal.nio.IOUtil;
+import com.hazelcast.internal.serialization.Data;
+import com.hazelcast.internal.serialization.InternalSerializationService;
+import com.hazelcast.internal.serialization.impl.DefaultSerializationServiceBuilder;
 import com.hazelcast.jet.Job;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.JobStatus;
 import com.hazelcast.jet.core.Vertex;
 import com.hazelcast.jet.core.processor.Processors;
 import com.hazelcast.jet.core.processor.SinkProcessors;
+import com.hazelcast.nio.ObjectDataInput;
+import com.hazelcast.nio.ObjectDataOutput;
+import com.hazelcast.nio.serialization.StreamSerializer;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
@@ -31,6 +38,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -137,6 +145,138 @@ class SrsLogRingbufferStoreTest {
             assertThat(log.load(RING, 0L).orElseThrow().captureFence()).isEqualTo(fence);
             assertThat(new SrsRingbuffer(member.getRingbuffer(RING)).readOne(0).captureFence()).isEqualTo(fence);
         });
+    }
+
+    @Test
+    void nativeSerializationRetainsThePositiveProfileGenerationOfTheCaptureFence() {
+        WorkloadClaimFence fence = new WorkloadClaimFence(
+                new WorkloadClaimKey("cluster-a", WorkloadClaimType.CAPTURE, "capture-orders"),
+                new WorkloadOwner("node-a", "boot-a"), 3, 7, 2, 11);
+        SrsItem item = new SrsItem(new SourcePosition("resume-token"), Op.UPDATE, 19L,
+                Map.of("id", 1, "value", "before"), Map.of("id", 1, "value", "after"), 5L, fence, 9L);
+        InternalSerializationService serialization = serialization(new SrsItemSerializer());
+        try {
+            Data written = serialization.toData(item);
+            assertThat(written.getType()).isEqualTo(SrsItemSerializer.TYPE_ID);
+            SrsItem read = serialization.toObject(written);
+            assertThat(read.captureFence())
+                    .as("the exact admitted owner, claim, execution, topology and profile tuple crosses the native wire")
+                    .isEqualTo(fence);
+            assertThat(read).isEqualTo(item);
+        } finally {
+            serialization.dispose();
+        }
+    }
+
+    @Test
+    void legacyProfileZeroAndUnfencedItemsKeepTheirExactNativeBytes() {
+        InternalSerializationService previous = serialization(new LegacyItemWriter(true));
+        InternalSerializationService current = serialization(new SrsItemSerializer());
+        try {
+            for (SrsItem item : List.of(legacyItem(9), new SrsItem(null, Op.INSERT, 4L, null, Map.of("id", 1), 0L))) {
+                Data oldBytes = previous.toData(item);
+                Data currentBytes = current.toData(item);
+                assertThat(currentBytes.toByteArray()).isEqualTo(oldBytes.toByteArray());
+                SrsItem read = current.toObject(oldBytes);
+                assertThat(read).isEqualTo(item);
+            }
+        } finally {
+            current.dispose();
+            previous.dispose();
+        }
+    }
+
+    @Test
+    void aLegacyEnvelopeWithoutAnEpochDoesNotInventProfileAuthority() {
+        InternalSerializationService previous = serialization(new LegacyItemWriter(false));
+        InternalSerializationService current = serialization(new SrsItemSerializer());
+        try {
+            SrsItem expected = legacyItem(0);
+            SrsItem read = current.toObject(previous.toData(expected));
+            assertThat(read).isEqualTo(expected);
+            assertThat(read.epoch()).isZero();
+            assertThat(read.captureFence().profileGeneration()).isZero();
+        } finally {
+            current.dispose();
+            previous.dispose();
+        }
+    }
+
+    @Test
+    void optionalTailsStayInsideTheActualDataFramesUsedByTheRing() throws IOException {
+        InternalSerializationService previous = serialization(new LegacyItemWriter(true));
+        InternalSerializationService older = serialization(new LegacyItemWriter(false));
+        InternalSerializationService current = serialization(new SrsItemSerializer());
+        try {
+            SrsItem withEpoch = legacyItem(9);
+            SrsItem withoutEpoch = legacyItem(0);
+            var output = current.createObjectDataOutput();
+            // The ring's bulk operation writes each item as length-delimited Data, not nested writeObject.
+            IOUtil.writeData(output, previous.toData(withEpoch));
+            IOUtil.writeData(output, older.toData(withoutEpoch));
+            output.writeObject("following-record");
+            var input = current.createObjectDataInput(output.toByteArray());
+            SrsItem first = current.toObject(IOUtil.readData(input));
+            SrsItem second = current.toObject(IOUtil.readData(input));
+            assertThat(first).isEqualTo(withEpoch);
+            assertThat(second).isEqualTo(withoutEpoch);
+            assertThat(input.<String>readObject()).isEqualTo("following-record");
+        } finally {
+            current.dispose();
+            older.dispose();
+            previous.dispose();
+        }
+    }
+
+    private static InternalSerializationService serialization(StreamSerializer<SrsItem> serializer) {
+        return new DefaultSerializationServiceBuilder().setConfig(new Config().getSerializationConfig()
+                .addSerializerConfig(new SerializerConfig().setTypeClass(SrsItem.class).setImplementation(serializer))).build();
+    }
+
+    private static SrsItem legacyItem(long epoch) {
+        return new SrsItem(new SourcePosition("legacy-token"), Op.INSERT, 17L, null, Map.of("id", 1), 2L,
+                new WorkloadClaimFence(new WorkloadClaimKey("legacy-cluster", WorkloadClaimType.CAPTURE, "capture-orders"),
+                        new WorkloadOwner("node-a", "old-boot"), 3, 0, 2), epoch);
+    }
+
+    /** Produces the earlier bounded item layouts independently of the current serializer. */
+    private static final class LegacyItemWriter implements StreamSerializer<SrsItem> {
+        private final boolean epoch;
+
+        LegacyItemWriter(boolean epoch) { this.epoch = epoch; }
+        @Override public int getTypeId() { return SrsItemSerializer.TYPE_ID; }
+        @Override public SrsItem read(ObjectDataInput input) { throw new UnsupportedOperationException("legacy fixture is write-only"); }
+        @Override public void write(ObjectDataOutput output, SrsItem item) throws IOException {
+            output.writeString(item.srcPos() == null ? null : item.srcPos().token());
+            output.writeString(item.op().symbol());
+            output.writeLong(item.ts());
+            writeRow(output, item.before());
+            writeRow(output, item.after());
+            output.writeLong(item.schemaVer());
+            WorkloadClaimFence fence = item.captureFence();
+            output.writeBoolean(fence != null);
+            if (fence != null) {
+                output.writeString(fence.key().clusterId());
+                output.writeString(fence.key().type().name());
+                output.writeString(fence.key().resourceId());
+                output.writeString(fence.owner().nodeId());
+                output.writeString(fence.owner().bootId());
+                output.writeLong(fence.claimGeneration());
+                output.writeLong(fence.executionGeneration());
+                output.writeLong(fence.topologyRevision());
+            }
+            if (epoch) output.writeLong(item.epoch());
+        }
+
+        private static void writeRow(ObjectDataOutput output, Map<String, Object> row) throws IOException {
+            output.writeInt(row == null ? -1 : row.size());
+            if (row != null) {
+                for (Map.Entry<String, Object> field : row.entrySet()) {
+                    output.writeString(field.getKey());
+                    output.writeObject(field.getValue());
+                }
+            }
+        }
     }
 
     /**

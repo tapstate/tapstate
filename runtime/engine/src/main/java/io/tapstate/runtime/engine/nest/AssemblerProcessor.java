@@ -1098,7 +1098,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
     private void settle(Map<Object, Touched> touched) {
         // A drain or imported handover may have grown a document since its last write. Refuse before
         // materializing reference rows or rendered output beyond the limits that admission reserved.
-        touched.forEach((key, document) -> verifyDocumentForRead(key, document.assembly));
+        touched.forEach((key, document) -> refuseToLetOneDocumentGrowPastItsWidth(key, document.assembly));
         Map<String, Map<Object, Map<String, Object>>> resolved = resolveReferences(touched);
         touched.forEach((key, document) -> {
             document.assembly.render(slots, resolved).ifPresentOrElse(

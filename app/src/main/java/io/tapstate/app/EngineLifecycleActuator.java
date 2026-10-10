@@ -131,11 +131,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
             sharedConnectors = connectors.requireEveryMemberCanLoad(pipelineId, Set.copyOf(requiredConnectors));
             planned = prepared.plan();
         } catch (TapstateException refused) {
-            // Refused before this start took a run, so the claim still names the run before it. Judged by that
-            // run, the failure this refusal records would read as its death - and right after a member left,
-            // as the departure again, spending the rebuilds meant for it on a refusal nobody leaving caused.
-            actuation.startRefusedBeforeItsRun(pipelineId);
-            admission.refused(pipelineId, refused);
+            recordStartRefusal(pipelineId, refused);
             throw refused;
         }
         // Reserve the frozen demand before teardown or allocation. A refusal here opens no source and
@@ -145,8 +141,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
                 return;
             }
         } catch (TapstateException refused) {
-            actuation.startRefusedBeforeItsRun(pipelineId);
-            admission.refused(pipelineId, refused);
+            recordStartRefusal(pipelineId, refused);
             throw refused;
         }
         // Before anything reads it: a drop the last stop noted but did not finish is finished here, so this
@@ -167,11 +162,15 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         try {
             planned.activate();
         } catch (TapstateException refused) {
-            actuation.startRefusedBeforeItsRun(pipelineId);
-            admission.refused(pipelineId, refused);
+            recordStartRefusal(pipelineId, refused);
             throw refused;
         }
-        PipelineActuationOwnership.Execution execution = admission.begin(pipelineId, planned, actuation);
+        PipelineActuationOwnership.Execution execution;
+        try { execution = admission.begin(pipelineId, planned, actuation); }
+        catch (TapstateException refused) {
+            recordStartRefusal(pipelineId, refused);
+            throw refused;
+        }
         if (!execution.allowed()) {
             LOG.warn("Not starting pipeline {} on this member: its admitted run could not be fenced", pipelineId);
             return;
@@ -238,6 +237,16 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         } catch (TapstateException failed) {
             admission.failedAfterAllocation(pipelineId, execution, failed);
             throw failed;
+        }
+    }
+
+    private void recordStartRefusal(String pipelineId, TapstateException refusal) {
+        Optional<PipelineActuationOwnership.Execution> pending = admission.pendingExecution(pipelineId);
+        if (pending.isPresent()) {
+            admission.failedAfterAllocation(pipelineId, pending.orElseThrow(), refusal);
+        } else {
+            actuation.startRefusedBeforeItsRun(pipelineId);
+            admission.refused(pipelineId, refusal);
         }
     }
 

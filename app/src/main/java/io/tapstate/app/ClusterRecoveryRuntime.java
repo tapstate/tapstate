@@ -101,7 +101,7 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
         if (local != null && !local.recovery() && local.capacity().executionGeneration() != null
                 && local.capacity().nativeJobId() == null
                 && local.capacity().executionGeneration() == current.executionGeneration()
-                && local.capacity().pipelineClaim().equals(WorkloadClaimFence.from(current))) {
+                && local.capacity().pipelineClaim().sameAuthorityAs(WorkloadClaimFence.from(current))) {
             return true;
         }
         return permitted(pipelineId);
@@ -133,6 +133,19 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
                 || current.profileGeneration() != profile.generation()) { return false; }
         ClusterRecoveryKey key = new ClusterRecoveryKey(properties.getId(), pipelineId, artifact.incarnation());
         ClusterRecoveryItem item = stores.clusterRecovery().read(key).orElse(null);
+        Allocation pending = allocations.get(pipelineId);
+        boolean pendingCapacity = pendingCapacity(pending, current);
+        boolean pendingRecovery = pendingRecovery(item, current);
+        if (pendingCapacity || pendingRecovery) {
+            Set<String> frozen = current.executionNodeIds();
+            Set<String> proposed = facts.perMemberUpperBounds().keySet();
+            if (!frozen.equals(proposed)) { throw changedCohort(pipelineId, frozen, proposed); }
+            Map<String, io.tapstate.core.lifecycle.ClusterCapacityDemand> frozenDemand = pendingCapacity
+                    ? pending.capacity().demandByNode() : item.permit().demandByNode();
+            if (!frozenDemand.equals(facts.perMemberUpperBounds())) {
+                throw unproven(pipelineId, "the allocated resource demand differs from the compiled start");
+            }
+        }
         if (item != null && !item.status().terminal()
                 && item.event().intentFingerprint().equals(DesiredStateFingerprint.of(intent))) {
             if (item.permit() == null || !item.permit().demandByNode().equals(facts.perMemberUpperBounds())
@@ -163,6 +176,11 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
         if (!active()) { return PipelineExecutionAdmission.super.begin(pipelineId, planned, ownership); }
         Allocation allocation = allocations.get(pipelineId);
         if (allocation == null) { return PipelineActuationOwnership.Execution.refused(); }
+        WorkloadClaim current = ownership.currentClaim(pipelineId).orElse(null);
+        if (pendingExecution(pipelineId).isPresent() && current != null
+                && !current.executionNodeIds().equals(membership.visibleNodeIds())) {
+            throw changedCohort(pipelineId, current.executionNodeIds(), membership.visibleNodeIds());
+        }
         return ownership.beginExecution(pipelineId, (expected, topology, nodes) -> {
             if (!nodes.equals(allocation.facts().perMemberUpperBounds().keySet())) { return Optional.empty(); }
             if (allocation.recovery()) {
@@ -178,7 +196,7 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
             ClusterCapacityReservation reservation = allocation.capacity();
             if (reservation.executionGeneration() != null) {
                 return reservation.executionGeneration() == expected.executionGeneration()
-                        && reservation.pipelineClaim().equals(WorkloadClaimFence.from(expected))
+                        && reservation.pipelineClaim().sameAuthorityAs(WorkloadClaimFence.from(expected))
                         && reservation.nativeJobId() == null ? Optional.of(expected) : Optional.empty();
             }
             ClusterCapacityStore.Result advanced = stores.clusterCapacity().advanceExecution(reservation, expected, nodes);
@@ -281,6 +299,42 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
                 current == null ? null : WorkloadClaimFence.from(current),
                 ClusterRecoveryDiagnostic.from(ClusterRecoveryDiagnostic.Reason.REBUILD_REFUSED,
                         failure, diagnosticPositions(pipelineId), "Correct the reported configuration or capacity; the source position has not been reset."), null, null));
+    }
+
+    @Override public Optional<PipelineActuationOwnership.Execution> pendingExecution(String pipelineId) {
+        if (!active()) { return Optional.empty(); }
+        WorkloadClaim current = actuation.currentClaim(pipelineId).orElse(null);
+        if (current == null || !current.owner().equals(owner) || current.executionGeneration() < 1
+                || current.contextExecutionGeneration() != current.executionGeneration()
+                || current.executionClaimGeneration() != current.claimGeneration()) { return Optional.empty(); }
+        Allocation local = allocations.get(pipelineId);
+        if (!pendingCapacity(local, current)) {
+            ClusterRecoveryItem queued = local != null && local.recovery()
+                    ? stores.clusterRecovery().read(local.key()).orElse(null) : item(pipelineId).orElse(null);
+            if (!pendingRecovery(queued, current)) { return Optional.empty(); }
+        }
+        return Optional.of(new PipelineActuationOwnership.Execution(true,
+                new ExecutionFence(pipelineId, current.claimGeneration(), current.executionGeneration(), current.profileGeneration()),
+                current.topologyRevision()));
+    }
+
+    private static boolean pendingCapacity(Allocation allocation, WorkloadClaim current) {
+        return current != null && allocation != null && !allocation.recovery() && allocation.capacity() != null
+                && allocation.capacity().executionGeneration() != null && allocation.capacity().nativeJobId() == null
+                && allocation.capacity().executionGeneration() == current.executionGeneration()
+                && allocation.capacity().pipelineClaim().sameAuthorityAs(WorkloadClaimFence.from(current));
+    }
+
+    private static boolean pendingRecovery(ClusterRecoveryItem item, WorkloadClaim current) {
+        return current != null && item != null && !item.status().terminal() && item.hasAllocatedSuccessor()
+                && item.successor().submittedAt() == null
+                && item.successor().pipelineClaim().sameAuthorityAs(WorkloadClaimFence.from(current));
+    }
+
+    private static TapstateException changedCohort(String pipeline, Set<String> original, Set<String> actual) {
+        return new TapstateException(EngineError.EXECUTION_COHORT_CHANGED_BEFORE_START,
+                Map.of("pipeline", pipeline, "reason", "live-membership", "planned", original.stream().sorted().toList().toString(),
+                        "actual", actual.stream().sorted().toList().toString()), null);
     }
 
     @Override public void stopped(String pipelineId, WorkloadClaim stoppedClaim, boolean jobOver) {

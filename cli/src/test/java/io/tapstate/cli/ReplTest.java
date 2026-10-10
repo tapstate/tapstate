@@ -723,9 +723,10 @@ class ReplTest {
         // is the more common question of the two, and it was the one that did not work.
         Harness h = harness();
         assertThat(h.repl().dispatch("help status")).isTrue();
-        assertThat(h.sink().toString())
+        // Descriptions may wrap while still naming the same verb and its complete behavior.
+        assertThat(h.sink().toString().replaceAll("\\s+", " "))
                 .contains("Usage: tapstate status")
-                .contains(Cli.VERB_HELP.get("status").summary());
+                .contains(Cli.VERB_HELP.get("status").summary().replaceAll("\\s+", " "));
     }
 
     @Test

@@ -176,6 +176,7 @@ public final class NativeExecutionStartup {
         }
     }
 
+    /** Publishes only initialization; all processing and its stage timer remain with the delegate. */
     private static class Initialized implements Processor {
         private final Processor delegate;
         private final String pipeline;

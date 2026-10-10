@@ -31,6 +31,7 @@ import static org.mockito.Mockito.*;
 
 class ClusterRecoveryRuntimeTest {
     private static final Set<String> NODES = Set.of("a", "b", "c");
+    private static final Set<String> EXPANDED_NODES = Set.of("a", "b", "c", "d");
     private static final Instant NOW = Instant.parse("2026-10-10T06:00:00Z");
     private final StorePort store = mock(StorePort.class);
     private final ClusterCapacityStore capacity = mock(ClusterCapacityStore.class);
@@ -125,6 +126,87 @@ class ClusterRecoveryRuntimeTest {
         verify(capacity).advanceExecution(reservation, initial, NODES);
     }
 
+    @Test void aPendingOrdinaryAllocationContinuesAfterOnlyAcquisitionTopologyRefresh() {
+        PendingStart pending = ordinaryPendingStart();
+        pending.held().set(atTopology(pending.held().get(), 8));
+        when(gate.committed()).thenReturn(new ClusterMembership("cluster", 8, NODES, 2));
+
+        assertThat(runtime.admitsMissingJob("p")).isTrue();
+        assertThat(runtime.prepare("p", pending.planned(), ownership)).isTrue();
+        PipelineActuationOwnership.Execution continued = runtime.begin("p", pending.planned(), ownership);
+        assertThat(continued.allowed()).isTrue();
+        assertThat(continued.fence().executionGeneration()).isEqualTo(1);
+        verify(capacity, times(1)).advanceExecution(any(), any(), anySet());
+        assertNoNativeSubmission();
+    }
+
+    @Test void aPendingOrdinaryAllocationRefusesAChangedCohortBeforeOpeningOrAllocatingAgain() {
+        PendingStart pending = ordinaryPendingStart();
+        pending.held().set(atTopology(pending.held().get(), 8));
+        when(gate.committed()).thenReturn(new ClusterMembership("cluster", 8, EXPANDED_NODES, 2));
+        when(gate.visibleNodeIds()).thenReturn(EXPANDED_NODES);
+
+        assertThatThrownBy(() -> runtime.prepare("p", plan(List.of(), EXPANDED_NODES), ownership))
+                .isInstanceOfSatisfying(TapstateException.class, this::assertChangedCohort);
+
+        assertThat(pending.held().get().executionGeneration()).isEqualTo(1);
+        verify(capacity, times(1)).advanceExecution(any(), any(), anySet());
+        assertNoNativeSubmission();
+    }
+
+    @Test void aPendingRecoveryAllocationContinuesAfterOnlyAcquisitionTopologyRefresh() {
+        PendingStart pending = recoveryPendingStart();
+        pending.held().set(atTopology(pending.held().get(), 8));
+        when(gate.committed()).thenReturn(new ClusterMembership("cluster", 8, NODES, 2));
+
+        assertThat(runtime.prepare("p", pending.planned(), ownership)).isTrue();
+        PipelineActuationOwnership.Execution continued = runtime.begin("p", pending.planned(), ownership);
+        assertThat(continued.allowed()).isTrue();
+        assertThat(continued.fence().executionGeneration()).isEqualTo(9);
+        verify(store.clusterRecovery(), times(1)).advanceExecution(any(), any(), anySet(), anySet());
+        assertNoNativeSubmission();
+    }
+
+    @Test void aPendingRecoveryAllocationRefusesAChangedCohortInsteadOfWaitingBehindItsOldPermit() {
+        PendingStart pending = recoveryPendingStart();
+        pending.held().set(atTopology(pending.held().get(), 8));
+        when(gate.committed()).thenReturn(new ClusterMembership("cluster", 8, EXPANDED_NODES, 2));
+        when(gate.visibleNodeIds()).thenReturn(EXPANDED_NODES);
+
+        assertThatThrownBy(() -> runtime.prepare("p", plan(List.of(), EXPANDED_NODES), ownership))
+                .isInstanceOfSatisfying(TapstateException.class, this::assertChangedCohort);
+
+        assertThat(pending.held().get().executionGeneration()).isEqualTo(9);
+        verify(store.clusterRecovery(), times(1)).advanceExecution(any(), any(), anySet(), anySet());
+        assertNoNativeSubmission();
+    }
+
+    @Test void aPendingAllocatedCohortRefusalUsesItsAllocatedFailureStageWithoutANativeJob() {
+        PendingStart pending = recoveryPendingStart();
+        pending.held().set(atTopology(pending.held().get(), 8));
+        WorkloadClaim current = pending.held().get();
+        doAnswer(call -> { pending.held().set(failed(pending.held().get(), true)); return null; })
+                .when(ownership).recordClassifiedFailure("p", true);
+        var failure = new TapstateException(EngineError.EXECUTION_COHORT_CHANGED_BEFORE_START,
+                Map.of("pipeline", "p", "reason", "live-membership", "planned", NODES.stream().sorted().toList().toString(),
+                        "actual", EXPANDED_NODES.stream().sorted().toList().toString()), null);
+        when(store.clusterRecovery().recordFailureNote(any(), any(), any(), isNull())).thenAnswer(call ->
+                new ClusterRecoveryStore.Result(ClusterRecoveryMutation.APPLIED,
+                        store.clusterRecovery().read(new ClusterRecoveryKey("cluster", "p", "inc")).orElseThrow(), null));
+
+        runtime.failedAfterAllocation("p", new PipelineActuationOwnership.Execution(true,
+                new ExecutionFence("p", current.claimGeneration(), current.executionGeneration(), current.profileGeneration()),
+                current.topologyRevision()), failure);
+
+        verify(ownership).recordClassifiedFailure("p", true);
+        verify(ownership, never()).startRefusedBeforeItsRun(anyString());
+        verify(store.clusterRecovery()).recordFailureNote(argThat(expected -> expected.pipelineClaim().equals(WorkloadClaimFence.from(current))),
+                argThat(diagnostic -> diagnostic.code().equals(failure.code().code()) && diagnostic.params().equals(failure.args())),
+                eq(ClusterRecoveryStore.FailureStage.ALLOCATED_EXECUTION), isNull());
+        verify(store.clusterRecovery(), times(1)).advanceExecution(any(), any(), anySet(), anySet());
+        assertNoNativeSubmission();
+    }
+
     @Test void anExpiredRetiredPermitIsReleasedBeforeItCanBeRenewedForever() {
         ClusterRecoveryStore queue = store.clusterRecovery();
         when(gate.committed()).thenReturn(new ClusterMembership("cluster", 7, NODES, 2));
@@ -216,7 +298,8 @@ class ClusterRecoveryRuntimeTest {
 
     @Test void aCompatibleMemberJoinDoesNotRetargetAProvenSuccessfulSuccessor() {
         var completion = finiteSuccessor();
-        when(gate.committed()).thenReturn(new ClusterMembership("cluster", 8, NODES, 2));
+        when(gate.committed()).thenReturn(new ClusterMembership("cluster", 8, EXPANDED_NODES, 2));
+        when(gate.visibleNodeIds()).thenReturn(EXPANDED_NODES);
         WorkloadClaim coordinator = new WorkloadClaim(completion.coordinator().key(), owner, 5, 0, 8,
                 NOW.plusSeconds(30), 0, 0, Set.of(), 0, false, 2);
         when(workloads.acquire(any(), eq(owner), eq(8L), any())).thenReturn(Optional.of(WorkloadClaimAttempt.acquired(coordinator)));
@@ -235,6 +318,8 @@ class ClusterRecoveryRuntimeTest {
 
         verify(store.clusterRecovery()).complete(any());
         verify(store.clusterRecovery(), never()).retarget(any(), any(), anyLong());
+        verify(store.clusterRecovery(), never()).advanceExecution(any(), any(), anySet(), anySet());
+        assertNoNativeSubmission();
     }
 
     @Test void aCodedOperatorFailureIsClassifiedBeforeAnUnrelatedMembershipObservation() {
@@ -294,9 +379,13 @@ class ClusterRecoveryRuntimeTest {
     }
 
     private static WorkloadClaim failed(WorkloadClaim current) {
+        return failed(current, false);
+    }
+
+    private static WorkloadClaim failed(WorkloadClaim current, boolean topologyFailure) {
         return new WorkloadClaim(current.key(), current.owner(), current.claimGeneration(), current.executionGeneration(),
                 current.topologyRevision(), current.leaseUntil(), current.contextExecutionGeneration(), current.executionClaimGeneration(),
-                current.executionNodeIds(), current.claimGeneration(), false, current.profileGeneration(), current.executionProfile(),
+                current.executionNodeIds(), current.claimGeneration(), topologyFailure, current.profileGeneration(), current.executionProfile(),
                 current.executionTopologyRevision(), current.executionIncarnation(), current.executionRevision(), current.executionMembers());
     }
 
@@ -594,9 +683,98 @@ class ClusterRecoveryRuntimeTest {
 
     private record CompletionFixture(ClusterRecoveryItem item, WorkloadClaim coordinator) { }
 
+    private PendingStart ordinaryPendingStart() {
+        var held = new java.util.concurrent.atomic.AtomicReference<>(initial);
+        ClusterCapacityReservation reserved = reservation(null, initial);
+        WorkloadClaim allocated = allocatedClaim(1);
+        ClusterCapacityReservation pending = reservation(1L, allocated);
+        when(ownership.currentClaim("p")).thenAnswer(call -> Optional.of(held.get()));
+        bindIssuerToCurrentClaim(held);
+        when(capacity.reserve(any(), any(), anyString(), anyString(), anyMap(), any(), any())).thenAnswer(call ->
+                held.get().executionGeneration() == 0
+                        ? new ClusterCapacityStore.Result(ClusterCapacityStore.Outcome.APPLIED, reserved, null, List.of())
+                        : new ClusterCapacityStore.Result(ClusterCapacityStore.Outcome.ALREADY_RESERVED, pending, null, List.of()));
+        when(capacity.advanceExecution(reserved, initial, NODES)).thenReturn(
+                new ClusterCapacityStore.Result(ClusterCapacityStore.Outcome.APPLIED, pending, allocated, List.of()));
+        DagSource.PlannedStart planned = plan(List.of());
+        assertThat(runtime.prepare("p", planned, ownership)).isTrue();
+        assertThat(runtime.begin("p", planned, ownership).fence().executionGeneration()).isEqualTo(1);
+        return new PendingStart(planned, held);
+    }
+
+    private PendingStart recoveryPendingStart() {
+        WorkloadClaim previous = allocatedClaim(8);
+        WorkloadClaim allocated = allocatedClaim(9);
+        var held = new java.util.concurrent.atomic.AtomicReference<>(previous);
+        when(ownership.currentClaim("p")).thenAnswer(call -> Optional.of(held.get()));
+        bindIssuerToCurrentClaim(held);
+        WorkloadClaim coordinator = new WorkloadClaim(new WorkloadClaimKey("cluster", WorkloadClaimType.CLUSTER_RECOVERY, "cluster"),
+                new WorkloadOwner("b", "boot-b"), 4, 0, 7, NOW.plusSeconds(30), 0, 0, Set.of(), 0, false, 2);
+        var event = new ClusterRecoveryEvent(new ClusterRecoveryKey("cluster", "p", "inc"), ClusterRecoveryCause.FULL_CLUSTER_RESTART,
+                8, "old", 6L, new ClusterExecutionProfile("cluster", 1, profile.profile()), profile, 7,
+                io.tapstate.core.lifecycle.DesiredStateFingerprint.of(store.desired().read("p").orElseThrow()), Map.of());
+        var permitted = ClusterRecoveryItem.enqueued(event, 1, NOW.minusSeconds(30), 3)
+                .permitted(new ClusterRecoveryPermit("reserved", WorkloadClaimFence.from(coordinator),
+                        NOW.minusSeconds(20), NOW.plusSeconds(30), Map.of("a", demand, "b", demand, "c", demand), 0), NOW);
+        var item = new java.util.concurrent.atomic.AtomicReference<>(permitted);
+        when(store.clusterRecovery().read(any())).thenAnswer(call -> Optional.of(item.get()));
+        when(store.clusterRecovery().advanceExecution(any(), eq(previous), eq(NODES), eq(Set.of("s")))).thenAnswer(call -> {
+            ClusterRecoveryItem issued = item.get().advanced(new ClusterRecoverySuccessor(WorkloadClaimFence.from(allocated), profile,
+                    NODES, Set.of("s"), NOW, null, null, Map.of(), null), NOW);
+            item.set(issued);
+            return new ClusterRecoveryStore.Result(ClusterRecoveryMutation.APPLIED, issued, allocated);
+        });
+        DagSource.PlannedStart planned = plan(List.of());
+        assertThat(runtime.prepare("p", planned, ownership)).isTrue();
+        assertThat(runtime.begin("p", planned, ownership).fence().executionGeneration()).isEqualTo(9);
+        return new PendingStart(planned, held);
+    }
+
+    private void bindIssuerToCurrentClaim(java.util.concurrent.atomic.AtomicReference<WorkloadClaim> held) {
+        when(ownership.beginExecution(eq("p"), any())).thenAnswer(call -> {
+            var issuer = call.<PipelineActuationOwnership.ExecutionAdvance>getArgument(1);
+            WorkloadClaim current = held.get();
+            return issuer.advance(current, current.topologyRevision(), gate.visibleNodeIds()).map(advanced -> {
+                held.set(advanced);
+                return new PipelineActuationOwnership.Execution(true,
+                        new ExecutionFence("p", advanced.claimGeneration(), advanced.executionGeneration(), advanced.profileGeneration()),
+                        advanced.topologyRevision());
+            }).orElseGet(PipelineActuationOwnership.Execution::refused);
+        });
+    }
+
+    private WorkloadClaim allocatedClaim(long execution) {
+        WorkloadClaim base = claim(execution);
+        Map<String, ClusterExecutionMember> members = NODES.stream().collect(java.util.stream.Collectors.toMap(node -> node,
+                node -> new ClusterExecutionMember(node, "boot-" + node, "uuid-" + node)));
+        return new WorkloadClaim(base.key(), base.owner(), base.claimGeneration(), base.executionGeneration(), base.topologyRevision(),
+                base.leaseUntil(), base.contextExecutionGeneration(), base.executionClaimGeneration(), base.executionNodeIds(),
+                0, false, base.profileGeneration(), profile, 7L, "inc", "a".repeat(64), members);
+    }
+
+    private void assertChangedCohort(TapstateException failure) {
+        assertThat(failure.code()).isEqualTo(EngineError.EXECUTION_COHORT_CHANGED_BEFORE_START);
+        assertThat(failure.args()).containsEntry("pipeline", "p")
+                .containsEntry("planned", NODES.stream().sorted().toList().toString())
+                .containsEntry("actual", EXPANDED_NODES.stream().sorted().toList().toString());
+    }
+
+    private void assertNoNativeSubmission() {
+        verify(engine, never()).submit(anyString(), any(DAG.class), anyMap(), any());
+        verify(engine, never()).submitFenced(anyString(), any(DAG.class), anyMap(), any(), anyLong(), anyLong(), anyLong());
+    }
+
+    private record PendingStart(DagSource.PlannedStart planned, java.util.concurrent.atomic.AtomicReference<WorkloadClaim> held) { }
+
     private DagSource.PlannedStart plan(List<String> unknown) {
-        var facts = new DagSource.PlanningFacts(List.of("a", "b", "c"), new ExecutionShape(3, Map.of(), Map.of()),
-                Map.of("a", demand, "b", demand, "c", demand), new ClusterCapacityDemand(3, 0, 3, 6, 12, 15),
+        return plan(unknown, NODES);
+    }
+
+    private DagSource.PlannedStart plan(List<String> unknown, Set<String> nodes) {
+        Map<String, ClusterCapacityDemand> demands = nodes.stream().collect(java.util.stream.Collectors.toMap(node -> node, node -> demand));
+        ClusterCapacityDemand total = demands.values().stream().reduce(ClusterCapacityDemand.ZERO, ClusterCapacityDemand::plus);
+        var facts = new DagSource.PlanningFacts(nodes.stream().sorted().toList(), new ExecutionShape(nodes.size(), Map.of(), Map.of()),
+                demands, total,
                 Map.of(), List.of(), unknown, List.of(), Set.of("s"));
         DagSource.FactBearingBuilder builder = new DagSource.FactBearingBuilder() {
             @Override public Optional<DagSource.PlanningFacts> planningFacts() { return Optional.of(facts); }

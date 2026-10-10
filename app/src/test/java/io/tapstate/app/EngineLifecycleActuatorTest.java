@@ -41,11 +41,15 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.verify;
 
 /**
  * The assembly-layer binding from the lifecycle actuator seam to the Jet engine and the capture coordinator,
@@ -214,6 +218,65 @@ class EngineLifecycleActuatorTest {
 
         assertThat(ownership.departure(PIPE, Duration.ofSeconds(90).toNanos()))
                 .isEqualTo(PipelineActuationOwnership.Departure.START_REFUSED);
+    }
+
+    @Test
+    void aPrepareRefusalOnAPendingAllocationIsNotMaskedAsAPreExecutionRefusal() {
+        assertPendingRefusalIsReported(false);
+    }
+
+    @Test
+    void aBeginRefusalOnAPendingAllocationKeepsTheAlreadyIssuedExecutionCause() {
+        assertPendingRefusalIsReported(true);
+    }
+
+    private void assertPendingRefusalIsReported(boolean duringBegin) {
+        PipelineActuationOwnership ownership = spy(clusteredOwnership());
+        try {
+            assertThat(ownership.permit(PIPE).granted()).isTrue();
+            PipelineActuationOwnership.Execution pending = ownership.beginExecution(PIPE);
+            assertThat(pending.allowed()).isTrue();
+            TapstateException refusal = new TapstateException(io.tapstate.runtime.engine.EngineError.EXECUTION_COHORT_CHANGED_BEFORE_START,
+                    Map.of("pipeline", PIPE, "reason", "live-membership", "planned", "[a, b]", "actual", "[a, b, c]"), null);
+            var observedExecution = new AtomicReference<PipelineActuationOwnership.Execution>();
+            var observedCause = new AtomicReference<TapstateException>();
+            var unallocatedCause = new AtomicReference<TapstateException>();
+            PipelineExecutionAdmission admission = new PipelineExecutionAdmission() {
+                @Override public Optional<PipelineActuationOwnership.Execution> pendingExecution(String pipeline) {
+                    return Optional.of(pending);
+                }
+                @Override public boolean prepare(String pipeline, DagSource.PlannedStart planned,
+                        PipelineActuationOwnership actor) {
+                    if (!duringBegin) { throw refusal; }
+                    return true;
+                }
+                @Override public PipelineActuationOwnership.Execution begin(String pipeline, DagSource.PlannedStart planned,
+                        PipelineActuationOwnership actor) {
+                    throw refusal;
+                }
+                @Override public void failedAfterAllocation(String pipeline, PipelineActuationOwnership.Execution execution,
+                        TapstateException failure) {
+                    observedExecution.set(execution);
+                    observedCause.set(failure);
+                }
+                @Override public void refused(String pipeline, TapstateException failure) {
+                    unallocatedCause.set(failure);
+                }
+            };
+            LifecycleActuator actuator = new EngineLifecycleActuator(new Engine(member),
+                    new RecordingDagSource(new CopyOnWriteArrayList<>()), new RecordingCaptureCoordinator(new CopyOnWriteArrayList<>()),
+                    teardown(), ownership, ExecutionPlanRecorder.NONE, java.time.Clock.systemUTC(), ConnectorReadiness.NONE, admission);
+
+            assertThatThrownBy(() -> actuator.start(PIPE)).isSameAs(refusal);
+
+            assertThat(observedExecution.get()).isSameAs(pending);
+            assertThat(observedCause.get()).isSameAs(refusal);
+            assertThat(unallocatedCause.get()).isNull();
+            verify(ownership, never()).startRefusedBeforeItsRun(PIPE);
+            assertThat(member.getJet().getJob(PIPE)).isNull();
+        } finally {
+            ownership.stopForShutdown();
+        }
     }
 
     /** A rejected resource plan must not spend an execution generation or open a source. */

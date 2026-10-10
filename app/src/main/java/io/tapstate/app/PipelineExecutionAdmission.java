@@ -3,6 +3,7 @@ package io.tapstate.app;
 import com.hazelcast.jet.core.DAG;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.WorkloadClaim;
+import java.util.Optional;
 
 /** Admission and durable receipts around the existing pipeline actuator, before physical side effects. */
 interface PipelineExecutionAdmission {
@@ -23,6 +24,11 @@ interface PipelineExecutionAdmission {
     default void submitted(String pipelineId, PipelineActuationOwnership.Execution execution, String nativeJobId) { }
 
     default void refused(String pipelineId, TapstateException failure) { }
+
+    /** The still-owned allocation waiting for submission, if an earlier start already issued it. */
+    default Optional<PipelineActuationOwnership.Execution> pendingExecution(String pipelineId) {
+        return Optional.empty();
+    }
 
     default void failedAfterAllocation(String pipelineId, PipelineActuationOwnership.Execution execution,
             TapstateException failure) { }
