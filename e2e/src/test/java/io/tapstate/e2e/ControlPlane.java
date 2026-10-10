@@ -1,12 +1,19 @@
 package io.tapstate.e2e;
 
 import io.tapstate.control.core.ClusterError;
+import io.tapstate.control.core.ClusterPipelineRecoveryView;
+import io.tapstate.control.core.ClusterRecoveryItemView;
+import io.tapstate.control.core.ClusterRecoveryView;
+import io.tapstate.control.core.ClusterTopologyView;
 import io.tapstate.control.core.MonitorError;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.TableSnapshot;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -48,6 +55,8 @@ import java.util.function.Predicate;
 final class ControlPlane {
 
     private static final Duration TIMEOUT = Duration.ofSeconds(20);
+
+    private static final ObjectMapper TYPED_JSON = new ObjectMapper();
 
     /** How often a caller waiting on a pushed change looks again; a follow is told, never asked. */
     private static final Duration POLL = Duration.ofMillis(100);
@@ -387,6 +396,48 @@ final class ControlPlane {
             }
         }
         return facts;
+    }
+
+    /** The exact core projection, preserving absent facts and read diagnostics from this endpoint. */
+    ClusterTopologyView clusterStatus() {
+        HttpResponse<String> response = send(authedGet("/api/cluster/status"));
+        expect(response, 200, "read the typed cluster status");
+        return typed(response.body(), ClusterTopologyView.class);
+    }
+
+    /** The core queue/profile/capacity projection, without deriving a recovery state in the harness. */
+    ClusterRecoveryView clusterRecovery() {
+        ClusterRecoveryView recovery = clusterStatus().recovery();
+        if (recovery == null) throw new AssertionError("cluster status omitted its recovery projection");
+        return recovery;
+    }
+
+    /** The installed profile exactly as projected; null retains an unavailable/absent server reading. */
+    ClusterRecoveryItemView.Profile clusterProfile() {
+        return clusterRecovery().currentProfile();
+    }
+
+    /** The pipeline's recovery field, decoded as its core DTO from the existing lifecycle status face. */
+    ClusterPipelineRecoveryView pipelineRecovery(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + urlSegment(pipelineId) + "/status"));
+        expect(response, 200, "read the recovery of " + pipelineId);
+        try {
+            JsonNode recovery = TYPED_JSON.readTree(response.body()).get("recovery");
+            if (recovery == null || recovery.isNull()) {
+                throw new AssertionError("pipeline status omitted its recovery projection: " + response.body());
+            }
+            return TYPED_JSON.treeToValue(recovery, ClusterPipelineRecoveryView.class);
+        } catch (JacksonException invalid) {
+            throw new AssertionError("pipeline recovery differs from its core DTO: " + response.body(), invalid);
+        }
+    }
+
+    private static <T> T typed(String body, Class<T> type) {
+        try {
+            return TYPED_JSON.readValue(body, type);
+        } catch (JacksonException invalid) {
+            throw new AssertionError("response differs from " + type.getSimpleName() + ": " + body, invalid);
+        }
     }
 
     private static String asText(Object value) {

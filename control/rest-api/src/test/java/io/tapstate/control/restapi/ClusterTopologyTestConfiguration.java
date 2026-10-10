@@ -68,10 +68,13 @@ class ClusterTopologyTestConfiguration {
             "node-d", null, "boot-d1", null, "https://node-d.example:8443");
 
     @Bean
-    ClusterTopologyService clusterTopologyService() {
+    ClusterTopologyService clusterTopologyService(RecoveryTestQueries recovery) {
         LiveClusterMembers members = () -> List.of(SECOND, FIRST);
-        return new ClusterTopologyService(members, membership(), pipelines(), CLUSTER, profiles());
+        return new ClusterTopologyService(members, membership(), pipelines(), CLUSTER, profiles(), recovery);
     }
+
+    @Bean
+    RecoveryTestQueries recoveryTestQueries() { return new RecoveryTestQueries(); }
 
     private static ClusterMembershipStore membership() {
         return new ClusterMembershipStore() {

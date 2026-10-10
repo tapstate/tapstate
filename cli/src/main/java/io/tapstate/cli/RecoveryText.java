@@ -11,7 +11,7 @@ final class RecoveryText {
 
     static void cluster(PrintWriter out, RemoteRecovery.Cluster view) {
         if (view == null) { return; }
-        out.println("recovery  " + view.recoveryState() + "  quorum " + known(view.quorumReady()) + "  causes " + view.causes());
+        out.println("recovery  " + known(view.recoveryState()) + "  quorum " + known(view.quorumReady()) + "  causes " + view.causes());
         profile(out, "current profile", view.currentProfile());
         failure(out, "profile unavailable", view.profileUnavailable());
         claim(out, "recovery coordinator", view.coordinatorClaim());
@@ -23,7 +23,7 @@ final class RecoveryText {
 
     static void pipeline(PrintWriter out, RemoteRecovery.Pipeline view) {
         if (view == null) { return; }
-        out.println("  recovery   " + view.recoveryState() + "  incarnation " + known(view.currentIncarnation()) + "  causes " + view.causes());
+        out.println("  recovery   " + known(view.recoveryState()) + "  incarnation " + known(view.currentIncarnation()) + "  causes " + view.causes());
         failure(out, "recovery unavailable", view.unavailable());
         capacity(out, view.capacity());
         items(out, view.items());

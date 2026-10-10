@@ -24,8 +24,7 @@ record RemotePipeline(
         String measuredAt,
         List<String> measuredFrom,
         List<String> awaitingRebalance,
-        List<RemoteVertex> vertices,
-        RemoteRecovery.Pipeline recovery) {
+        List<RemoteVertex> vertices) {
 
     RemotePipeline {
         captureClaims = List.copyOf(captureClaims);
@@ -34,8 +33,4 @@ record RemotePipeline(
         vertices = List.copyOf(vertices);
     }
 
-    RemotePipeline(String pipelineId, RemoteClaim controllerClaim, List<RemoteClaim> captureClaims,
-            String measuredAt, List<String> measuredFrom, List<String> awaitingRebalance, List<RemoteVertex> vertices) {
-        this(pipelineId, controllerClaim, captureClaims, measuredAt, measuredFrom, awaitingRebalance, vertices, null);
-    }
 }

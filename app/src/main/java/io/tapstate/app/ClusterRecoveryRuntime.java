@@ -12,7 +12,10 @@ import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.engine.ExecutionCohortGuard;
+import io.tapstate.runtime.engine.EngineError;
 import io.tapstate.runtime.scheduler.RebuildAdmission;
+import io.tapstate.runtime.srs.CaptureError;
+import io.tapstate.runtime.srs.CaptureStartupException;
 import io.tapstate.spi.store.*;
 
 import java.time.Duration;
@@ -47,11 +50,14 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
     private final Duration detectionWindow;
     private final Map<String, Allocation> allocations = new HashMap<>();
     private final Map<String, FailedExecution> failures = new HashMap<>();
+    private final Map<String, WorkloadClaim> failedStops = new HashMap<>();
+    private final Map<String, WorkloadClaimFence> notedFailures = new HashMap<>();
     private WorkloadClaim recoveryClaim;
 
     private record Allocation(DagSource.PlanningFacts facts, ClusterExecutionProfile profile,
             ClusterRecoveryKey key, ClusterCapacityReservation capacity, boolean recovery) { }
-    private record FailedExecution(long executionGeneration, ClusterRecoveryDiagnostic diagnostic) { }
+    private record FailedExecution(long executionGeneration, ClusterRecoveryDiagnostic diagnostic,
+            CaptureStartupFailure sourceFailure, Throwable executionCause) { }
 
     ClusterRecoveryRuntime(StorePort stores, DagSource dags, PipelineCaptureCoordinator captures, Engine engine,
             PipelineActuationOwnership actuation, ClusterWorkloadClaims claims, ClusterMembershipGate membership,
@@ -162,7 +168,7 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
                         && item.successor().submittedAt() == null) { return Optional.of(expected); }
                 var advanced = stores.clusterRecovery().advanceExecution(fence(item), expected, nodes,
                         allocation.facts().selectedSourceIds()).advancedPipelineClaim();
-                if (advanced != null) { failures.remove(pipelineId); }
+                if (advanced != null) { forgetFailure(pipelineId); }
                 return Optional.ofNullable(advanced);
             }
             ClusterCapacityReservation reservation = allocation.capacity();
@@ -176,7 +182,7 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
                 allocations.put(pipelineId, new Allocation(allocation.facts(), allocation.profile(), allocation.key(),
                         advanced.reservation(), false));
             }
-            if (advanced.advancedPipelineClaim() != null) { failures.remove(pipelineId); }
+            if (advanced.advancedPipelineClaim() != null) { forgetFailure(pipelineId); }
             return Optional.ofNullable(advanced.advancedPipelineClaim());
         });
     }
@@ -210,14 +216,21 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
         WorkloadClaim failedClaim = actuation.currentClaim(pipelineId).orElse(null);
         long failedGeneration = failedClaim == null ? 0 : failedClaim.executionGeneration();
         Throwable failure = PipelineFailures.current(pipelineId, failedClaim, true, engine, captures).orElse(null);
+        FailedExecution recorded = failures.get(pipelineId);
+        if (failure == null && recorded != null && recorded.executionGeneration() == failedGeneration) {
+            failure = recorded.executionCause();
+        }
         if (failure != null) {
-            String code = PipelineFailures.of(pipelineId, failure).code();
-            if (code.startsWith("connector.") || code.equals(io.tapstate.runtime.srs.CaptureError.START_FROM_OUTSIDE_WINDOW.code())
+            TapstateException coded = PipelineFailures.codedCause(failure);
+            if (ordinaryFailure(coded)
                     || containsCode(failure, io.tapstate.adapters.pdk.ConnectorError.WRITE_FAILED)
                     || containsCode(failure, io.tapstate.adapters.pdk.ConnectorError.CAPTURE_FAILED)
                     || containsCode(failure, io.tapstate.adapters.pdk.ConnectorError.READ_FAILED)) {
                 actuation.recordClassifiedFailure(pipelineId, false);
             } else if (ClusterRebuildAdmission.isMembershipChangedBeforeStart(failure)) {
+                actuation.recordClassifiedFailure(pipelineId, true);
+            } else if (containsCode(failure, EngineError.OUT_OF_MEMORY)) {
+                // The lost local member cannot be queried for a live membership view.
                 actuation.recordClassifiedFailure(pipelineId, true);
             } else if (failedClaim != null && failedClaim.originalMembersPresent(liveMembers())
                     .filter(present -> !present).isPresent()) {
@@ -227,25 +240,62 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
         actuation.recordFailure(pipelineId, ClusterRebuildAdmission.MAX_ATTEMPTS * properties.getWorkloadClaimTtl().toNanos(),
                 detectionWindow.toNanos());
         if (failure != null) {
-            var coded = PipelineFailures.of(pipelineId, failure);
-            failures.put(pipelineId, new FailedExecution(failedGeneration,
-                    new ClusterRecoveryDiagnostic(coded.code().equals(io.tapstate.runtime.srs.CaptureError.START_FROM_OUTSIDE_WINDOW.code())
-                            ? ClusterRecoveryDiagnostic.Reason.SOURCE_POSITION_REJECTED : ClusterRecoveryDiagnostic.Reason.EXECUTION_FAILED,
-                    coded.code(), new LinkedHashMap<>(coded.params()), diagnosticPositions(pipelineId),
-                    "Inspect the original coded failure and retained source position before retrying this pipeline.")));
+            FailedExecution previous = failures.get(pipelineId);
+            if (previous == null || previous.executionGeneration() != failedGeneration) {
+                failures.put(pipelineId, failedExecution(pipelineId, failedClaim, failure));
+            }
         }
+        WorkloadClaim current = actuation.currentClaim(pipelineId).orElse(null);
+        if (current != null && verdictRecorded(current)) {
+            // A generic native result can disappear during cleanup. The durable FAILED verdict still
+            // names that execution; the original diagnosis is preferred whenever it was observed.
+            failures.computeIfAbsent(pipelineId, ignored -> failedExecution(pipelineId, current, null));
+            boolean noted = persistFailure(pipelineId, current);
+            WorkloadClaim stopped = failedStops.get(pipelineId);
+            if (noted && sameAuthority(stopped, current)) { retireStopped(pipelineId, stopped); }
+        }
+    }
+
+    @Override public void afterFailedStop(String pipelineId) { recordFailure(pipelineId); }
+
+    @Override public void failedAfterAllocation(String pipelineId, PipelineActuationOwnership.Execution execution,
+            TapstateException failure) {
+        if (!active() || execution.fence() == null) { return; }
+        WorkloadClaim claim = actuation.currentClaim(pipelineId).orElse(null);
+        if (claim == null || !claim.owner().equals(owner) || claim.claimGeneration() != execution.fence().claimGeneration()
+                || claim.executionGeneration() != execution.fence().executionGeneration()
+                || claim.profileGeneration() != execution.fence().profileGeneration()) { return; }
+        failures.putIfAbsent(pipelineId, failedExecution(pipelineId, claim, failure));
+        recordFailure(pipelineId);
     }
 
     @Override public void refused(String pipelineId, TapstateException failure) {
         if (!active()) { return; }
         failures.put(pipelineId, new FailedExecution(actuation.heldExecutionGeneration(pipelineId),
                 ClusterRecoveryDiagnostic.from(ClusterRecoveryDiagnostic.Reason.REBUILD_REFUSED,
-                        failure, diagnosticPositions(pipelineId), "Correct the reported configuration or capacity; the source position has not been reset.")));
+                        failure, diagnosticPositions(pipelineId), "Correct the reported configuration or capacity; the source position has not been reset."), null, null));
     }
 
     @Override public void stopped(String pipelineId, WorkloadClaim stoppedClaim, boolean jobOver) {
         if (!active() || !jobOver || stoppedClaim == null) { return; }
-        actuation.retireStoppedExecution(stoppedClaim);
+        WorkloadClaim current = actuation.currentClaim(pipelineId).orElse(null);
+        boolean failed = stores.state().read(pipelineId)
+                .map(checkpoint -> StateJson.parse(checkpoint.stateJson()) == PipelineState.FAILED).orElse(false);
+        if (failed && sameAuthority(stoppedClaim, current)
+                && current.executionGeneration() > 0
+                && current.contextExecutionGeneration() == current.executionGeneration()
+                && (!verdictRecorded(current) || !persistFailure(pipelineId, current))) {
+            // Keep the existing detector and renewal alive until a later membership publication can
+            // classify this stopped run. Only this captured execution may be retired afterwards.
+            failedStops.put(pipelineId, stoppedClaim);
+            return;
+        }
+        retireStopped(pipelineId, stoppedClaim);
+    }
+
+    private void retireStopped(String pipelineId, WorkloadClaim stoppedClaim) {
+        if (!actuation.retireStoppedExecution(stoppedClaim)) { return; }
+        failedStops.remove(pipelineId);
         Allocation allocation = allocations.get(pipelineId);
         if (allocation != null && allocation.capacity() != null) { stores.clusterCapacity().release(allocation.capacity()); }
     }
@@ -281,6 +331,9 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
         }
         allocations.entrySet().removeIf(entry -> !pipelineIds.contains(entry.getKey()));
         failures.keySet().retainAll(pipelineIds);
+        notedFailures.keySet().retainAll(pipelineIds);
+        failedStops.entrySet().removeIf(entry -> !pipelineIds.contains(entry.getKey())
+                || !sameAuthority(entry.getValue(), actuation.currentClaim(entry.getKey()).orElse(null)));
     }
 
     private boolean holdRecoveryClaim() {
@@ -321,13 +374,16 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
         }
         // A compatible addition does not replace an already successful native execution. Consume its
         // matching proof on the topology it actually used before retargeting unfinished work.
-        if (item.permit() != null && item.targetProfile().equals(profile) && observeStartup(item, expected)) { return; }
+        if (item.permit() != null && item.targetProfile().equals(profile)) {
+            if (consumeFailure(item, expected) || observeStartup(item, expected)) { return; }
+        }
         if (!item.targetProfile().equals(profile) || item.targetTopologyRevision() != membership.committed().revision()) {
             var retargeted = stores.clusterRecovery().retarget(expected, profile, membership.committed().revision());
             if (retargeted.item() == null || retargeted.outcome() != ClusterRecoveryMutation.APPLIED) { return; }
             item = retargeted.item(); expected = coordinatorFence(item);
         }
         if (item.permit() != null) {
+            if (consumeFailure(item, expected)) { return; }
             // Only the store can prove both expiration and retirement. Renewal first would move the
             // deadline every pass and keep an orphaned recovery slot occupied forever.
             var retired = stores.clusterRecovery().releaseExpiredPermit(expected);
@@ -365,7 +421,7 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
     }
 
     private boolean observeStartup(ClusterRecoveryItem item, ClusterRecoveryFence expected) {
-        if (item.successor() == null) { return false; }
+        if (item.successor() == null || item.successor().failureNote() != null) { return false; }
         String pipeline = item.event().key().pipelineId();
         var successor = item.successor();
         var nativeRun = engine.nativeRun(pipeline).filter(run -> run.executionGeneration() == successor.executionGeneration()
@@ -402,10 +458,113 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
                 recorded.item().itemRevision(), recorded.item().event().intentFingerprint(), recorded.item().targetProfile(),
                 recorded.item().executionFrontier(), expected.recoveryClaim()));
         if (completed.outcome() == ClusterRecoveryMutation.APPLIED && completed.item().status() == ClusterRecoveryStatus.RECOVERED) {
-            failures.remove(pipeline);
+            forgetFailure(pipeline);
             return true;
         }
         return false;
+    }
+
+    private boolean consumeFailure(ClusterRecoveryItem item, ClusterRecoveryFence expected) {
+        ClusterRecoveryFailureNote note = item.successor() == null ? null : item.successor().failureNote();
+        if (note == null) { return false; }
+        stores.clusterRecovery().fail(expected, note.pipelineClaim(), note.diagnostic(), note.stage(),
+                properties.getWorkloadClaimTtl());
+        return true;
+    }
+
+    private FailedExecution failedExecution(String pipeline, WorkloadClaim claim, Throwable failure) {
+        TapstateException coded = PipelineFailures.codedCause(failure);
+        CaptureStartupFailure source = coded instanceof CaptureStartupException remote ? remote.failure() : null;
+        if (source == null && coded != null && claim != null) {
+            source = captures.startupFailures(pipeline, WorkloadClaimFence.from(claim)).values().stream()
+                    .filter(fact -> fact.code().equals(coded.code().code()) && fact.params().equals(coded.args()))
+                    .findFirst().orElse(null);
+        }
+        String code;
+        Map<String, Object> params;
+        Map<String, ClusterRecoveryPosition> positions = new LinkedHashMap<>(diagnosticPositions(pipeline));
+        String disposition = "Inspect the original coded failure and retained source position before retrying this pipeline.";
+        if (source != null) {
+            code = source.code(); params = source.params(); disposition = source.disposition();
+            String sourceId = source.witness().sourceId();
+            if (source.requestedPosition() == null) { positions.remove(sourceId); }
+            else { positions.put(sourceId, source.requestedPosition()); }
+        } else if (coded != null) {
+            code = coded.code().code(); params = coded.args();
+        } else {
+            var observed = PipelineFailures.of(pipeline, failure);
+            code = observed.code(); params = new LinkedHashMap<>(observed.params());
+        }
+        var diagnostic = new ClusterRecoveryDiagnostic(sourcePositionRejected(code)
+                ? ClusterRecoveryDiagnostic.Reason.SOURCE_POSITION_REJECTED : ClusterRecoveryDiagnostic.Reason.EXECUTION_FAILED,
+                code, params, positions, disposition);
+        return new FailedExecution(claim == null ? 0 : claim.executionGeneration(), diagnostic, source, failure);
+    }
+
+    /** Report under PIPE authority before its retirement; a recovery coordinator is not required. */
+    private boolean persistFailure(String pipeline, WorkloadClaim claim) {
+        WorkloadClaimFence authority = WorkloadClaimFence.from(claim);
+        ClusterRecoveryItem current = item(pipeline).orElse(null);
+        for (int retry = 0; retry < 2; retry++) {
+            if (current == null || current.status().terminal() || current.permit() == null || current.successor() == null
+                    || !current.successor().pipelineClaim().equals(authority)) { return true; }
+            if (authority.equals(notedFailures.get(pipeline)) || current.successor().failureNote() != null) { return true; }
+            FailedExecution failure = failures.get(pipeline);
+            if (failure == null || failure.executionGeneration() != claim.executionGeneration()) { return false; }
+            var expected = new ClusterRecoveryPipelineFence(current.event().key(), current.itemRevision(),
+                    current.event().intentFingerprint(), current.targetProfile(), authority);
+            var result = stores.clusterRecovery().recordFailureNote(expected, failure.diagnostic(),
+                    failure.diagnostic().reason() == ClusterRecoveryDiagnostic.Reason.SOURCE_POSITION_REJECTED
+                            ? ClusterRecoveryStore.FailureStage.SOURCE_POSITION_REJECTION
+                            : ClusterRecoveryStore.FailureStage.ALLOCATED_EXECUTION, failure.sourceFailure());
+            if (result.outcome() == ClusterRecoveryMutation.APPLIED || result.outcome() == ClusterRecoveryMutation.DUPLICATE) {
+                notedFailures.put(pipeline, authority);
+                return true;
+            }
+            if (result.outcome() != ClusterRecoveryMutation.STALE_ITEM) { return false; }
+            current = result.item();
+        }
+        return false;
+    }
+
+    private void forgetFailure(String pipeline) {
+        failures.remove(pipeline); notedFailures.remove(pipeline); failedStops.remove(pipeline);
+    }
+
+    private static boolean verdictRecorded(WorkloadClaim claim) {
+        return claim.executionGeneration() > 0 && claim.contextExecutionGeneration() == claim.executionGeneration()
+                && claim.failureClaimGeneration() == claim.executionClaimGeneration() && claim.failureClaimGeneration() > 0;
+    }
+
+    private static boolean sameAuthority(WorkloadClaim expected, WorkloadClaim actual) {
+        return expected != null && actual != null && expected.key().equals(actual.key()) && expected.owner().equals(actual.owner())
+                && expected.claimGeneration() == actual.claimGeneration() && expected.executionGeneration() == actual.executionGeneration()
+                && expected.profileGeneration() == actual.profileGeneration();
+    }
+
+    private static boolean ordinaryFailure(TapstateException coded) {
+        if (coded == null) { return false; }
+        if (coded instanceof CaptureStartupException) { return true; }
+        if (coded.code() instanceof EngineError error) {
+            return switch (error) {
+                case FRONTIER_ORDER_NOT_ENCODABLE, VIEW_KEY_MISSING_FROM_BEFORE_IMAGE, ROUTING_KEY_MISSING,
+                        KEY_CHANGE_ON_PARALLEL_NODE -> true;
+                default -> false;
+            };
+        }
+        if (coded.code() instanceof CaptureError error) {
+            return switch (error) {
+                case CLAIM_LOST, NO_RING_TO_ATTACH, CLUSTER_REFUSED_WRITES, CLUSTER_REFUSED_THE_READ -> false;
+                default -> true;
+            };
+        }
+        return coded.code() != IoError.WORKLOAD_CLAIM_FENCED && coded.code() != IoError.STORE_UNAVAILABLE
+                && coded.code() != IoError.STORE_UNAUTHORIZED;
+    }
+
+    private static boolean sourcePositionRejected(String code) {
+        return code.equals(CaptureError.START_FROM_OUTSIDE_WINDOW.code())
+                || code.equals(io.tapstate.adapters.pdk.ConnectorError.RESUME_POSITION_REJECTED.code());
     }
 
     private Optional<ClusterRecoveryItem> item(String pipeline) {
@@ -414,10 +573,7 @@ final class ClusterRecoveryRuntime implements RebuildAdmission, PipelineExecutio
     }
 
     private Map<String, ClusterRecoveryPosition> positions(String pipeline) {
-        Map<String, ClusterRecoveryPosition> positions = new LinkedHashMap<>();
-        captures.resumeWitnesses(pipeline, stores.artifacts()).forEach((source, witness) ->
-                witness.requestedPosition(witness.miningChainId()).ifPresent(position -> positions.put(source, position)));
-        return Map.copyOf(positions);
+        return captures.resumePositions(pipeline, stores.artifacts());
     }
 
     private Map<String, ClusterRecoveryPosition> diagnosticPositions(String pipeline) {

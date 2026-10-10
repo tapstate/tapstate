@@ -388,6 +388,7 @@ public final class ControlApiSchema {
         properties.put("awaitingRebalance", array(string(
                 "Stable id of a member that joined after the run was planned and is given no part of it until a "
                         + "rebalance")));
+        properties.put("recovery", RecoverySchemas.pipeline());
         return object(List.of(
                 "pipelineId", "state", "kind", "message", "freshness", "evidence", "cannotSay", "next"),
                 properties, false);

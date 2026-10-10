@@ -5691,7 +5691,7 @@ class ReplTest {
         h.repl().dispatch(command + " orders");
 
         assertThat(h.repl().lastExitCode()).isZero();
-        assertThat(h.sink().toString().substring(mark)).contains("orders  failed", "why:", "recovery   REBUILDING",
+        assertThat(h.sink().toString().substring(mark)).contains("orders  failed", "why:", "recovery   RECOVERING",
                 "FULL_CLUSTER_RESTART", "attempt 2/3", "capture.start-from-outside-window", "resume-7", "resume-12")
                 .doesNotContain("occupied   0");
         assertThat(client.statusCalls).isEmpty();

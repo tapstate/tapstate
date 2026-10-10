@@ -13,7 +13,7 @@ final class RecoveryWire {
 
     static RemoteRecovery.Cluster cluster(Object raw) {
         return read(raw, m -> new RemoteRecovery.Cluster(text(m, "clusterId"), bool(m, "quorumReady"),
-                required(text(m, "recoveryState")), strings(m, "causes"), objects(m, "items", RecoveryWire::item),
+                text(m, "recoveryState"), strings(m, "causes"), objects(m, "items", RecoveryWire::item),
                 profile(m.get("currentProfile")), failure(m.get("profileUnavailable")),
                 claimReading(m.get("coordinatorClaim")), failure(m.get("claimUnavailable")),
                 capacity(m.get("capacity")), failure(m.get("queueUnavailable"))));
@@ -21,7 +21,7 @@ final class RecoveryWire {
 
     static RemoteRecovery.Pipeline pipeline(Object raw) {
         return read(raw, m -> new RemoteRecovery.Pipeline(text(m, "pipelineId"), text(m, "currentIncarnation"),
-                required(text(m, "recoveryState")), strings(m, "causes"), objects(m, "items", RecoveryWire::item),
+                text(m, "recoveryState"), strings(m, "causes"), objects(m, "items", RecoveryWire::item),
                 failure(m.get("unavailable")), capacity(m.get("capacity"))));
     }
 

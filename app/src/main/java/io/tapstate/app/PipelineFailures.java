@@ -70,6 +70,8 @@ final class PipelineFailures {
     static Optional<Throwable> current(String pipelineId, WorkloadClaim claim, boolean fenced,
             Engine engine, PipelineCaptureCoordinator captures) {
         if (claim == null && fenced) { return Optional.empty(); }
+        Optional<Throwable> lost = engine.lost(pipelineId).map(Throwable.class::cast);
+        if (lost.isPresent()) { return lost; }
         if (claim == null || claim.profileGeneration() == 0) {
             return engine.failureOf(pipelineId).or(() -> captures.captureFailure(pipelineId));
         }
@@ -92,7 +94,7 @@ final class PipelineFailures {
      * code. The data plane wraps what a sink or a connector threw before it reaches the converge loop, so the
      * coded fault is usually not the outermost throwable.
      */
-    private static TapstateException codedCause(Throwable failure) {
+    static TapstateException codedCause(Throwable failure) {
         Throwable current = failure;
         for (int depth = 0; current != null && depth < MAX_CAUSE_DEPTH; depth++) {
             if (current instanceof TapstateException coded) {

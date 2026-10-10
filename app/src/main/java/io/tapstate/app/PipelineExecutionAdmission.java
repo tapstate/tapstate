@@ -24,6 +24,9 @@ interface PipelineExecutionAdmission {
 
     default void refused(String pipelineId, TapstateException failure) { }
 
+    default void failedAfterAllocation(String pipelineId, PipelineActuationOwnership.Execution execution,
+            TapstateException failure) { }
+
     default void stopped(String pipelineId, WorkloadClaim stoppedClaim, boolean jobOver) { }
 
     default boolean mayComplete(String pipelineId) { return true; }

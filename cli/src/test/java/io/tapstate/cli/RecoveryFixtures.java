@@ -86,7 +86,7 @@ final class RecoveryFixtures {
         topology.put("members", List.of());
         topology.put("pipelines", List.of(Map.of("pipelineId", "orders", "controllerClaim", currentClaim(),
                 "captureClaims", List.of(), "measuredAt", "2026-10-10T09:01:00Z", "measuredFrom", List.of("uuid-b2"),
-                "awaitingRebalance", List.of(), "vertices", List.of(vertex()), "recovery", pipelineRecovery())));
+                "awaitingRebalance", List.of(), "vertices", List.of(vertex()))));
         topology.put("recovery", clusterRecovery());
         return topology;
     }
@@ -131,15 +131,15 @@ final class RecoveryFixtures {
         actual.put("nodeId", "node-b");
         actual.put("context", processorContext());
         return Map.of("name", "serve-orders", "requested", 4L, "effective", 4L, "computedLocal", 2L,
-                "executionId", "runtime-22", "processors", List.of(unknown, actual));
+                "executionId", "1729407264346316802", "processors", List.of(unknown, actual));
     }
 
     static Map<String, Object> processorContext() {
         Map<String, Object> context = new LinkedHashMap<>();
         context.put("pipelineId", "orders");
         context.put("vertex", "serve-orders");
-        context.put("jobId", "job-22");
-        context.put("runtimeExecutionId", "runtime-22");
+        context.put("jobId", "1729407264346316801");
+        context.put("runtimeExecutionId", "1729407264346316802");
         context.put("claimGeneration", 12L);
         context.put("executionGeneration", 22L);
         context.put("profileGeneration", 2L);

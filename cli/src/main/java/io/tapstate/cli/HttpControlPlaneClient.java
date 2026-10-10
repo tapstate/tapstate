@@ -885,8 +885,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                     stringOrNull(m.get("measuredAt")),
                     measuredFrom,
                     awaiting,
-                    vertices,
-                    RecoveryWire.pipeline(m.get("recovery"))));
+                    vertices));
         }
         return pipelines;
     }

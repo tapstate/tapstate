@@ -42,7 +42,12 @@ record RemoteClaim(
 
     RemoteClaim(String resourceId, String ownerNodeId, String ownerBootId,
             Long claimGeneration, Long executionGeneration, Boolean leased) {
-        this(resourceId, ownerNodeId, ownerBootId, claimGeneration, executionGeneration, null, leased,
+        this(resourceId, ownerNodeId, ownerBootId, claimGeneration, executionGeneration, null, leased);
+    }
+
+    RemoteClaim(String resourceId, String ownerNodeId, String ownerBootId,
+            Long claimGeneration, Long executionGeneration, Long topologyRevision, Boolean leased) {
+        this(resourceId, ownerNodeId, ownerBootId, claimGeneration, executionGeneration, topologyRevision, leased,
                 null, null, null, null, null, null, null, null, null, null, null, null, null, null);
     }
 

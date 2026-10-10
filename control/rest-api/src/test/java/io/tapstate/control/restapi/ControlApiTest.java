@@ -137,6 +137,7 @@ class ControlApiTest {
     void resetStore() {
         ((InMemoryArtifactStore) context.getBean(ArtifactStore.class)).clear();
         context.getBean(RecordingAuditStore.class).records.clear();
+        context.getBean(RecoveryTestQueries.class).clear();
     }
 
     private RestClient client() {
@@ -755,6 +756,21 @@ class ControlApiTest {
             assertThat(JsonReader.parse(body)).isEqualTo(JsonReader.parse(
                     new String(golden.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8)));
         }
+    }
+
+    @Test
+    void clusterRecoveryUsesTheSameTypedReadingOnBothExistingEndpoints() throws Exception {
+        RecoveryTestQueries recovery = context.getBean(RecoveryTestQueries.class);
+        recovery.enable(ClusterTopologyTestConfiguration.CLUSTER, "orders");
+
+        ClusterTopologyView members = client().get().uri("/api/cluster/members").retrieve().body(ClusterTopologyView.class);
+        ClusterTopologyView status = client().get().uri("/api/cluster/status").retrieve().body(ClusterTopologyView.class);
+
+        assertThat(members).isEqualTo(status);
+        assertThat(status.recovery()).isEqualTo(recovery.cluster());
+        assertThat(status.recovery().capacity().occupiedByNode()).isNull();
+        assertThat(status.recovery().items().getFirst().successor().failureNote().diagnostic().params())
+                .containsEntry("requested", "resume-12");
     }
 
     @Test

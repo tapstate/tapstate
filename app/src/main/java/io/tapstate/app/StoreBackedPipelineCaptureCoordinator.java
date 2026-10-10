@@ -25,6 +25,7 @@ import io.tapstate.spi.capture.CapturePlan;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.CaptureResumeWitness;
+import io.tapstate.spi.store.ClusterRecoveryPosition;
 import io.tapstate.spi.store.CaptureResumePreparation;
 import io.tapstate.spi.store.CaptureStartupProof;
 import io.tapstate.spi.store.CaptureStartupFailure;
@@ -347,15 +348,29 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
 
     @Override
     public Map<String, CaptureResumeWitness> resumeWitnesses(String pipelineId, ArtifactStore captured) {
-        PipelineResource pipeline = StoredArtifacts.requirePipeline(captured, pipelineId);
         Map<String, CaptureResumeWitness> found = new LinkedHashMap<>();
+        diagnosticSpecs(pipelineId, captured).forEach((source, spec) -> found.put(source, witness(spec)));
+        return Map.copyOf(found);
+    }
+
+    @Override
+    public Map<String, ClusterRecoveryPosition> resumePositions(String pipelineId, ArtifactStore captured) {
+        Map<String, ClusterRecoveryPosition> found = new LinkedHashMap<>();
+        diagnosticSpecs(pipelineId, captured).forEach((source, spec) ->
+                witness(spec).requestedPosition(CaptureId.of(spec).value()).ifPresent(position -> found.put(source, position)));
+        return Map.copyOf(found);
+    }
+
+    private Map<String, CaptureRunSpec> diagnosticSpecs(String pipelineId, ArtifactStore captured) {
+        PipelineResource pipeline = StoredArtifacts.requirePipeline(captured, pipelineId);
+        Map<String, CaptureRunSpec> found = new LinkedHashMap<>();
         for (SourceRef ref : pipeline.sources()) {
             SourceResource source = StoredArtifacts.requireSource(captured, ref.id());
             SourceModel model = SourceDiscovery.model(storePort, source);
             SourceCaptureResolution.forPipeline(pipeline, source, model).ifPresent(resolution -> {
                 CaptureRunSpec spec = deriveSpec(pipelineId, pipeline.settings(), source, resolution,
                         srsSwitchOf(pipelineId, ref), 1L);
-                found.put(ref.id(), witness(spec));
+                found.put(ref.id(), spec);
             });
         }
         return Map.copyOf(found);

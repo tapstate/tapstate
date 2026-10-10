@@ -5,6 +5,7 @@ import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.CaptureResumeWitness;
+import io.tapstate.spi.store.ClusterRecoveryPosition;
 import io.tapstate.spi.store.CaptureStartupProof;
 import io.tapstate.spi.store.CaptureStartupFailure;
 import io.tapstate.spi.store.CaptureResumePreparation;
@@ -56,6 +57,11 @@ interface PipelineCaptureCoordinator {
 
     /** Pure diagnostic projection of every actual selected source before startup. */
     default Map<String, CaptureResumeWitness> resumeWitnesses(String pipelineId, ArtifactStore artifactSnapshot) {
+        return Map.of();
+    }
+
+    /** Original diagnostic positions name the capture contract, separately from its mining-chain reference. */
+    default Map<String, ClusterRecoveryPosition> resumePositions(String pipelineId, ArtifactStore artifactSnapshot) {
         return Map.of();
     }
 

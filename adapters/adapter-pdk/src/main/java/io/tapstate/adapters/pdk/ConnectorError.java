@@ -151,6 +151,10 @@ public enum ConnectorError implements TapstateErrorCode {
      */
     CAPTURE_FAILED("connector.capture-failed", Set.of("connector", "detail")),
 
+    /** The SDK explicitly refused a retained position that is outside its source log window. */
+    RESUME_POSITION_REJECTED("connector.resume-position-rejected",
+            Set.of("connector", "requested", "pdkId", "pdkCode", "serverCode", "pdkArgs")),
+
     /**
      * The connector's own connection test could not be run to completion — the connector threw out of
      * {@code connectionTest} rather than reporting a failed check. A reported failed check is a normal

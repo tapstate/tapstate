@@ -2,6 +2,7 @@ package io.tapstate.control.restapi;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.tapstate.control.core.PipelineStatus;
+import io.tapstate.control.core.ClusterPipelineRecoveryView;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.messages.MessageCatalog;
@@ -40,7 +41,7 @@ import java.util.TreeMap;
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 record PipelineStatusResponse(String pipelineId, PipelineState state, Failure failure, Instant observedAt,
-        Long observedAgeMillis, ExecutionPlanResponse plan, List<String> awaitingRebalance) {
+        Long observedAgeMillis, ExecutionPlanResponse plan, List<String> awaitingRebalance, ClusterPipelineRecoveryView recovery) {
 
     /**
      * A coded failure as a client reads it: the canonical code string (the stable identity — the enum never
@@ -65,7 +66,7 @@ record PipelineStatusResponse(String pipelineId, PipelineState state, Failure fa
                 observedAt == null ? null
                         : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
                 ExecutionPlanResponse.of(status.plan()),
-                status.awaitingRebalance().isEmpty() ? null : status.awaitingRebalance());
+                status.awaitingRebalance().isEmpty() ? null : status.awaitingRebalance(), status.recovery());
     }
 
     private static Failure failure(ObservationFailure failure, MessageCatalog catalog) {

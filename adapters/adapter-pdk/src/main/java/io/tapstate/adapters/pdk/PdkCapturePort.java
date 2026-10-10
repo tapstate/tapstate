@@ -28,6 +28,7 @@ import io.tapdata.entity.utils.JsonParser;
 import io.tapdata.entity.utils.cache.Entry;
 import io.tapdata.entity.utils.cache.Iterator;
 import io.tapdata.entity.utils.cache.KVReadOnlyMap;
+import io.tapdata.exception.TapPdkOffsetOutOfLogEx;
 import io.tapdata.pdk.apis.consumer.StreamReadConsumer;
 import io.tapdata.pdk.apis.functions.connector.common.ReleaseExternalFunction;
 import io.tapdata.pdk.apis.functions.connector.source.BatchReadFunction;
@@ -342,8 +343,9 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
         CdcDelivery delivery = new CdcDelivery();
         Acknowledgements acknowledgements = new Acknowledgements(connector, listener,
                 connector.functions().getFlushOffsetFunction(), acknowledgeIntervalNanos, nanoClock);
+        String requestedToken = start instanceof CaptureStart.Resume resume ? resume.position().token() : null;
         Thread thread = new Thread(
-                () -> streamLoop(connector, config, resumeAt, startAt, listener, stream, preflight,
+                () -> streamLoop(connector, config, resumeAt, startAt, requestedToken, listener, stream, preflight,
                         acknowledgements, delivery),
                 "tapstate-cdc-" + connector.connectorId());
         thread.setDaemon(true);
@@ -881,6 +883,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
     }
 
     private void streamLoop(PdkConnector connector, CaptureConfig config, Object resumeAt, Long startAt,
+            String requestedToken,
             CaptureListener listener, StreamReadFunction stream, CompletableFuture<Void> preflight,
             Acknowledgements acknowledgements, CdcDelivery delivery) {
         try {
@@ -940,10 +943,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
             // cause chain for something coded. Handed on uncoded, a connector that refused to start for a
             // reason it stated precisely arrives as "the job died", with the sentence naming what to
             // reconfigure surviving only in a log line.
-            TapstateException reported = t instanceof TapstateException coded
-                    ? coded
-                    : new TapstateException(ConnectorError.CAPTURE_FAILED,
-                            Map.of("connector", connector.connectorId(), "detail", detail(t)), t);
+            TapstateException reported = captureFailure(connector.connectorId(), t, requestedToken);
             if (preflight != null && preflight.completeExceptionally(reported)) {
                 return;
             }
@@ -1220,9 +1220,44 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
         } catch (TapstateException e) {
             throw e;
         } catch (Throwable t) {
-            throw new TapstateException(ConnectorError.CAPTURE_FAILED,
-                    Map.of("connector", connector.connectorId(), "detail", detail(t)), t);
+            throw captureFailure(connector.connectorId(), t);
         }
+    }
+
+    /** The single coded boundary for a connector-side capture failure. */
+    static TapstateException captureFailure(String connectorId, Throwable failure) {
+        return captureFailure(connectorId, failure, null);
+    }
+
+    static TapstateException captureFailure(String connectorId, Throwable failure, String requestedToken) {
+        if (failure instanceof TapstateException coded) {
+            return coded;
+        }
+        Throwable each = failure;
+        for (int depth = 0; each != null && depth < 32; depth++, each = each.getCause()) {
+            if (each instanceof TapPdkOffsetOutOfLogEx refused) {
+                Map<String, Object> args = new LinkedHashMap<>();
+                String requested = requestedToken;
+                if (requested == null && refused.getOffset() != null) {
+                    try {
+                        requested = ConnectorOffsetCodec.toToken(connectorId, refused.getOffset());
+                    } catch (TapstateException unrenderable) {
+                        // Rendering a diagnostic cannot replace the source's declared refusal.
+                        args.put("requestedEncodingCode", unrenderable.code().code());
+                        args.put("requestedEncodingParams", unrenderable.args());
+                    }
+                }
+                args.put("connector", connectorId);
+                args.put("requested", requested);
+                args.put("pdkId", refused.getPdkId());
+                args.put("pdkCode", refused.getCode());
+                args.put("serverCode", refused.getServerErrorCode());
+                args.put("pdkArgs", List.of(refused.getDynamicDescriptionParameters()));
+                return new TapstateException(ConnectorError.RESUME_POSITION_REJECTED, args, failure);
+            }
+        }
+        return new TapstateException(ConnectorError.CAPTURE_FAILED,
+                Map.of("connector", connectorId, "detail", detail(failure)), failure);
     }
 
     /** Projects raw snapshot rows to envelopes; a codec refusal is a projection failure, not a read failure. */

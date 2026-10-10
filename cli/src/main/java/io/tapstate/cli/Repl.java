@@ -2915,7 +2915,6 @@ final class Repl {
                         out.println("  " + cell(vertex.name()) + "  " + where(vertex) + backlogOf(vertex));
                         for (RemoteProcessor processor : vertex.processors()) { renderProcessorContext(out, processor); }
                     }
-                    RecoveryText.pipeline(out, pipeline.recovery());
                 }
             }
             case JSON -> out.println(JsonOut.write(clusterMap(listed)));
@@ -3152,7 +3151,6 @@ final class Repl {
             vertices.add(entry);
         }
         row.put("vertices", vertices);
-        putIfPresent(row, "recovery", RecoveryWire.tree(pipeline.recovery()));
         return row;
     }
 
@@ -3695,7 +3693,7 @@ final class Repl {
      * working.
      */
     private int statusOnline(List<String> words) {
-        IdAndFormat target = parseIdAndFormat(words.stream().filter(word -> !word.equals("--rate")).toList());
+        IdAndFormat target = parseIdAndFormat("status", words.stream().filter(word -> !word.equals("--rate")).toList());
         if (target == null) {
             return Cli.EXIT_USAGE;
         }
@@ -3958,7 +3956,7 @@ final class Repl {
     }
 
     private int explainOnline(List<String> words) {
-        IdAndFormat target = parseIdAndFormat(words);
+        IdAndFormat target = parseIdAndFormat("explain", words);
         if (target == null) {
             return Cli.EXIT_USAGE;
         }

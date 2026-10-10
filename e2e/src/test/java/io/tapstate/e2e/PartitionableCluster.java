@@ -43,6 +43,9 @@ final class PartitionableCluster implements AutoCloseable {
     /** Membership is committed through the coordination store, so it converges rather than being instant. */
     private static final Duration JOIN_BUDGET = Duration.ofSeconds(90);
 
+    /** All required bootstrap processes are launched before this readiness budget starts. */
+    private static final Duration HEALTH_BUDGET = Duration.ofSeconds(120);
+
     /**
      * Ports per member for dialling out. They are used in turn and one still in its close-wait is
      * skipped, so this is far wider than the handful of connections a member of this size holds.
@@ -103,6 +106,14 @@ final class PartitionableCluster implements AutoCloseable {
      * on its command line and cannot be told any of it afterwards.
      */
     static PartitionableCluster start(String storeUri, String name, List<String> nodeIds) {
+        return start(storeUri, name, nodeIds, null);
+    }
+
+    /** The same owned cluster, with an explicit node-session window for expiry witnesses. */
+    static PartitionableCluster start(String storeUri, String name, List<String> nodeIds, Duration nodeSessionTtl) {
+        if (nodeSessionTtl != null && (nodeSessionTtl.isNegative() || nodeSessionTtl.dividedBy(3).isZero())) {
+            throw new IllegalArgumentException("the node-session window must allow a positive renewal interval");
+        }
         String clusterId = name + "-" + UUID.randomUUID();
         String bindAddress = RoutableAddress.ofThisMachine();
         Map<String, Integer> memberPorts = new LinkedHashMap<>();
@@ -126,15 +137,15 @@ final class PartitionableCluster implements AutoCloseable {
                 String advertised = links.get(nodeId).address();
                 int[] range = outbound.get(nodeId);
                 launchArguments.put(nodeId, httpPort -> arguments(clusterId, nodeId, memberPort, advertised,
-                        seeds, httpPort, bindAddress, nodeIds.size(), range));
+                        seeds, httpPort, bindAddress, nodeIds.size(), range, nodeSessionTtl));
             }
             for (String nodeId : nodeIds) {
                 servers.put(nodeId,
-                        RealProcessServer.start(storeUri, "0.0.0.0", launchArguments.get(nodeId)));
+                        RealProcessServer.launching(storeUri, "0.0.0.0", launchArguments.get(nodeId)));
             }
         } catch (RuntimeException | Error failure) {
-            servers.values().forEach(RealProcessServer::close);
-            links.values().forEach(CuttableLink::close);
+            closeAfterFailure(servers.values(), failure);
+            closeAfterFailure(links.values(), failure);
             throw failure;
         } finally {
             memberPorts.values().forEach(RealProcessServer::releasePort);
@@ -142,11 +153,18 @@ final class PartitionableCluster implements AutoCloseable {
         PartitionableCluster cluster = new PartitionableCluster(
                 nodeIds, servers, links, clusterId, storeUri, launchArguments);
         try {
+            for (String node : nodeIds) {
+                awaitHealthy(node, servers.get(node), cluster.planes.get(node));
+            }
             cluster.planes.get(nodeIds.getFirst()).bootstrapAndLogin(ADMIN, PASSWORD);
             // The administrator lives in the store they all share, so the rest do not create one.
             nodeIds.stream().skip(1).forEach(nodeId -> cluster.planes.get(nodeId).login(ADMIN, PASSWORD));
         } catch (RuntimeException | Error failure) {
-            cluster.close();
+            try {
+                cluster.close();
+            } catch (RuntimeException | Error cleanup) {
+                failure.addSuppressed(cleanup);
+            }
             throw failure;
         }
         return cluster;
@@ -154,7 +172,54 @@ final class PartitionableCluster implements AutoCloseable {
 
     /** The control plane of one member. Every read face answers the same while the cluster is whole. */
     ControlPlane member(String nodeId) {
-        return planes.get(requireKnown(nodeId));
+        String known = requireKnown(nodeId);
+        ControlPlane plane = planes.get(known);
+        if (plane == null) throw new AssertionError("member " + known + " is stopped or not signed in");
+        return plane;
+    }
+
+    /** The owned process, selected from observed placement rather than assumed by a witness. */
+    RealProcessServer processCarrying(String nodeId) {
+        return servers.get(requireKnown(nodeId));
+    }
+
+    /** Crashes one owned member without releasing its node session or closing the retained links. */
+    void kill(String nodeId) {
+        String known = requireKnown(nodeId);
+        servers.get(known).kill();
+        planes.remove(known);
+    }
+
+    /** Stops one member gracefully, retaining the identity and launch settings for its next boot. */
+    void stop(String nodeId) {
+        String known = requireKnown(nodeId);
+        servers.get(known).close();
+        planes.remove(known);
+    }
+
+    /** Stops all member processes while retaining the fixture's member links and durable store. */
+    void stopAll() {
+        endAll(false);
+    }
+
+    /** Crashes all members, leaving their leases to expire on the store clock. */
+    void killAll() {
+        endAll(true);
+    }
+
+    private void endAll(boolean crash) {
+        Throwable first = null;
+        for (String node : nodeIds) {
+            try {
+                if (crash) kill(node);
+                else stop(node);
+            } catch (RuntimeException | Error failure) {
+                if (first == null) first = failure;
+                else first.addSuppressed(failure);
+            }
+        }
+        if (first instanceof RuntimeException failure) throw failure;
+        if (first instanceof Error failure) throw failure;
     }
 
     /** The link in front of one member -- what it carried, from whom, and what a cut severs. */
@@ -237,15 +302,126 @@ final class PartitionableCluster implements AutoCloseable {
      * come back on its own, so a case that wants to see it rejoin has to restart it.
      */
     void restart(String nodeId) {
-        String known = requireKnown(nodeId);
+        stop(nodeId);
+        relaunch(nodeId);
+    }
+
+    /** Starts a stopped member with its retained cluster/member/link ports and a fresh real HTTP address. */
+    ControlPlane relaunch(String nodeId) {
+        return relaunch(nodeId, Map.of());
+    }
+
+    /** The same restart with explicit profile-input differences, without changing the retained base settings. */
+    ControlPlane relaunch(String nodeId, Map<String, String> profileInputs) {
+        String known = requireStopped(nodeId);
         servers.get(known).close();
         RealProcessServer replacement =
-                RealProcessServer.start(storeUri, "0.0.0.0", launchArguments.get(known));
+                RealProcessServer.start(storeUri, "0.0.0.0", withProfileInputs(launchArguments.get(known), profileInputs));
         servers.put(known, replacement);
         remember(known, replacement);
         ControlPlane plane = new ControlPlane(replacement.baseUrl());
         plane.login(ADMIN, PASSWORD);
         planes.put(known, plane);
+        return plane;
+    }
+
+    /** Reopens the stopped cluster without inventing a new cluster id, seed set or member identity. */
+    void relaunchAll() {
+        relaunchAll(Map.of());
+    }
+
+    /** Reopens all members with the same explicit profile-input changes after their old sessions expire. */
+    void relaunchAll(Map<String, String> profileInputs) {
+        for (String node : nodeIds) requireStopped(node);
+        Map<String, IntFunction<List<String>>> arguments = new LinkedHashMap<>();
+        for (String node : nodeIds) {
+            arguments.put(node, withProfileInputs(launchArguments.get(node), profileInputs));
+        }
+        endAll(false);
+        Map<String, RealProcessServer> launched = new LinkedHashMap<>();
+        try {
+            for (String node : nodeIds) {
+                RealProcessServer replacement = RealProcessServer.launching(storeUri, "0.0.0.0", arguments.get(node));
+                launched.put(node, replacement);
+                servers.put(node, replacement);
+                remember(node, replacement);
+            }
+            for (String node : nodeIds) {
+                RealProcessServer server = launched.get(node);
+                ControlPlane plane = new ControlPlane(server.baseUrl());
+                awaitHealthy(node, server, plane);
+                plane.login(ADMIN, PASSWORD);
+                planes.put(node, plane);
+            }
+        } catch (RuntimeException | Error failure) {
+            launched.keySet().forEach(planes::remove);
+            closeAfterFailure(launched.values(), failure);
+            throw failure;
+        }
+    }
+
+    private static void awaitHealthy(String nodeId, RealProcessServer server, ControlPlane plane) {
+        Await.until(nodeId + " to answer health at its actual HTTP address " + server.baseUrl(), HEALTH_BUDGET,
+                () -> {
+                    if (!server.isAlive()) {
+                        throw new AssertionError("member " + nodeId + " exited with status " + server.exitValue()
+                                + " before health at " + server.baseUrl() + "; output:\n" + server.tail());
+                    }
+                    return plane.healthy();
+                }, () -> "member " + nodeId + " has not answered health; output:\n" + server.tail());
+    }
+
+    private static void closeAfterFailure(Iterable<? extends AutoCloseable> owned, Throwable failure) {
+        for (AutoCloseable resource : owned) {
+            try {
+                resource.close();
+            } catch (Exception | Error cleanup) {
+                failure.addSuppressed(cleanup);
+            }
+        }
+    }
+
+    /** Starts a stopped candidate without waiting for health, so a pre-join refusal can be observed. */
+    RealProcessServer launchCandidate(String nodeId, Map<String, String> profileInputs) {
+        String known = requireStopped(nodeId);
+        servers.get(known).close();
+        RealProcessServer candidate = RealProcessServer.launching(storeUri, "0.0.0.0",
+                withProfileInputs(launchArguments.get(known), profileInputs));
+        servers.put(known, candidate);
+        remember(known, candidate);
+        return candidate;
+    }
+
+    private String requireStopped(String nodeId) {
+        String known = requireKnown(nodeId);
+        if (servers.get(known).isAlive()) {
+            throw new AssertionError("member " + known + " still has a running owned process");
+        }
+        return known;
+    }
+
+    private static IntFunction<List<String>> withProfileInputs(IntFunction<List<String>> retained,
+            Map<String, String> requested) {
+        Map<String, String> inputs = Map.copyOf(requested);
+        inputs.forEach((key, value) -> {
+            if (!(key.startsWith("tapstate.cluster.execution-profile.")
+                    || key.equals("tapstate.hz.jet.cooperative-thread-count"))) {
+                throw new IllegalArgumentException("a profile witness cannot override launch identity: " + key);
+            }
+            if (value.isBlank()) throw new IllegalArgumentException("a profile input cannot be blank: " + key);
+        });
+        return httpPort -> {
+            Map<String, String> arguments = new LinkedHashMap<>();
+            for (String argument : retained.apply(httpPort)) {
+                int equals = argument.indexOf('=');
+                if (!argument.startsWith("--") || equals < 3) {
+                    throw new IllegalStateException("retained launch setting has no named value");
+                }
+                arguments.put(argument.substring(2, equals), argument.substring(equals + 1));
+            }
+            arguments.putAll(inputs);
+            return arguments.entrySet().stream().map(entry -> "--" + entry.getKey() + "=" + entry.getValue()).toList();
+        };
     }
 
     /** Whether one member's process is still running -- what tells failing closed from falling over. */
@@ -259,20 +435,32 @@ final class PartitionableCluster implements AutoCloseable {
 
     @Override
     public void close() {
-        List<RuntimeException> failures = new ArrayList<>();
+        Throwable first = null;
         for (RealProcessServer server : servers.values()) {
             try {
                 server.close();
-            } catch (RuntimeException failure) {
-                failures.add(failure);
+            } catch (RuntimeException | Error failure) {
+                if (first == null) first = failure;
+                else first.addSuppressed(failure);
             }
         }
-        links.values().forEach(CuttableLink::close);
-        // After the processes are down, so what a member said on its way out is in what is kept.
-        FailureScene.writeMemberLogs(clusterId, logs);
-        if (!failures.isEmpty()) {
-            throw failures.getFirst();
+        for (CuttableLink link : links.values()) {
+            try {
+                link.close();
+            } catch (RuntimeException | Error failure) {
+                if (first == null) first = failure;
+                else first.addSuppressed(failure);
+            }
         }
+        // After the processes are down, so what a member said on its way out is in what is kept.
+        try {
+            FailureScene.writeMemberLogs(clusterId, logs);
+        } catch (RuntimeException | Error failure) {
+            if (first == null) first = failure;
+            else first.addSuppressed(failure);
+        }
+        if (first instanceof RuntimeException failure) throw failure;
+        if (first instanceof Error failure) throw failure;
     }
 
     private List<String> await(String asSeenBy, String what, Duration budget,
@@ -338,8 +526,9 @@ final class PartitionableCluster implements AutoCloseable {
     }
 
     private static List<String> arguments(String clusterId, String nodeId, int memberPort,
-            String advertised, String seeds, int httpPort, String bindAddress, int members, int[] outbound) {
-        return List.of(
+            String advertised, String seeds, int httpPort, String bindAddress, int members, int[] outbound,
+            Duration nodeSessionTtl) {
+        List<String> arguments = new ArrayList<>(List.of(
                 "--tapstate.cluster.id=" + clusterId,
                 "--tapstate.cluster.node-id=" + nodeId,
                 "--tapstate.cluster.profile=production-ha",
@@ -353,6 +542,11 @@ final class PartitionableCluster implements AutoCloseable {
                 "--tapstate.hz.advertised-member-address=" + advertised,
                 "--tapstate.hz.outbound-member-ports=" + outbound[0] + "-" + outbound[1],
                 "--tapstate.hz.discovery.mode=tcp-ip",
-                "--tapstate.hz.discovery.tcp-ip.seeds=" + seeds);
+                "--tapstate.hz.discovery.tcp-ip.seeds=" + seeds));
+        if (nodeSessionTtl != null) {
+            arguments.add("--tapstate.cluster.node-session-ttl=" + nodeSessionTtl);
+            arguments.add("--tapstate.cluster.node-session-renew-interval=" + nodeSessionTtl.dividedBy(3));
+        }
+        return List.copyOf(arguments);
     }
 }

@@ -176,63 +176,68 @@ final class EngineLifecycleActuator implements LifecycleActuator {
             LOG.warn("Not starting pipeline {} on this member: its admitted run could not be fenced", pipelineId);
             return;
         }
-        // A capture still open here while no job carries the pipeline was left by a run that ended with no stop:
-        // a job lost with a member, which this member can replace before it can see that job fail. That run's
-        // sources had begun taking the load the capture handed them, and a source of this run cannot vouch for a
-        // load another run began, so the table would never land in this run. Closed first, keeping the pipeline's
-        // position, the capture opens a load for this run. A second start over a running job leaves it alone.
-        if (captureCoordinator.isCapturing(pipelineId) && !engine.hasLiveJob(pipelineId)) {
-            captureCoordinator.stopCapture(pipelineId, false);
-        }
         try {
-            prepared.artifactSnapshot().ifPresentOrElse(
-                    snapshot -> {
-                        if (execution.fence() != null && execution.fence().profileGeneration() > 0) {
-                            WorkloadClaim claim = actuation.currentClaim(pipelineId).orElseThrow();
-                            captureCoordinator.startCapture(pipelineId, snapshot, planned.sourceModels().orElseThrow(),
-                                    io.tapstate.spi.store.WorkloadClaimFence.from(claim));
-                        } else { captureCoordinator.startCapture(pipelineId, snapshot); }
-                    },
-                    () -> captureCoordinator.startCapture(pipelineId));
-        } catch (RingNotOpenYet notYet) {
-            // Nothing was opened, so nothing is submitted: the pipeline reads as started and carries no job,
-            // which is exactly what the next pass starts again. Not recorded as failed -- a capture it reads is
-            // being opened on another member, and how long that may take is bounded where it is decided.
-            return;
-        }
-        // Capture opens the SRS generation that source vertices compile into the DAG, so the topology is built
-        // only now, from the plan worked out above.
-        DagSource.StartPlan plan = planned.build(execution.fence());
-        admission.guard(pipelineId, execution, plan.dag());
-        // Proved once more, against the store, before anything is recorded or submitted. Everything above can
-        // take longer than a lease, and the renewer keeping the claim alive through it can still lose it: the
-        // store out of reach, the process paused, another member taking the pipeline over. A run submitted over
-        // a claim this member no longer holds dies at its first write, and whoever holds the pipeline then reads
-        // that death as the pipeline's. Not recorded as failed, for the reason a start refused its generation
-        // is not: the member that holds the pipeline puts a run behind it, over a capture this start closes
-        // again keeping its position.
-        if (!actuation.proveExecution(execution.fence())) {
-            LOG.warn("Not submitting pipeline {} on this member: the claim its run was taken under could not "
-                    + "be proved once the start was ready to submit it", pipelineId);
-            captureCoordinator.stopCapture(pipelineId, false);
-            return;
-        }
-        // Written down before the run is submitted, so a reader never finds a run executing on a plan nobody
-        // recorded; a run that goes on to fail keeps its plan until the next start replaces it or a stop lets go.
-        // Compared with the plan of the run before - lost to a failed member, a stop or a restart - so a node
-        // whose width moved says what it was and which of its inputs moved it.
-        plans.record(planOf(pipelineId, execution, plan.planned(), clock.instant(), prepared.sinkConnectors(),
-                sharedConnectors).replacing(plans.last(pipelineId)));
-        // The capacity travels with the submission because the maps are made by the job: what a state map
-        // holds is fixed as it is created, so a number applied after the job started would be accepted and
-        // change nothing.
-        if (execution.fence() != null && execution.fence().profileGeneration() > 0) {
-            String nativeJobId = engine.submitFenced(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings(),
-                    execution.fence().claimGeneration(), execution.fence().executionGeneration(),
-                    execution.fence().profileGeneration());
-            admission.submitted(pipelineId, execution, nativeJobId);
-        } else {
-            engine.submit(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings());
+            // A capture still open here while no job carries the pipeline was left by a run that ended with no stop:
+            // a job lost with a member, which this member can replace before it can see that job fail. That run's
+            // sources had begun taking the load the capture handed them, and a source of this run cannot vouch for a
+            // load another run began, so the table would never land in this run. Closed first, keeping the pipeline's
+            // position, the capture opens a load for this run. A second start over a running job leaves it alone.
+            if (captureCoordinator.isCapturing(pipelineId) && !engine.hasLiveJob(pipelineId)) {
+                captureCoordinator.stopCapture(pipelineId, false);
+            }
+            try {
+                prepared.artifactSnapshot().ifPresentOrElse(
+                        snapshot -> {
+                            if (execution.fence() != null && execution.fence().profileGeneration() > 0) {
+                                WorkloadClaim claim = actuation.currentClaim(pipelineId).orElseThrow();
+                                captureCoordinator.startCapture(pipelineId, snapshot, planned.sourceModels().orElseThrow(),
+                                        io.tapstate.spi.store.WorkloadClaimFence.from(claim));
+                            } else { captureCoordinator.startCapture(pipelineId, snapshot); }
+                        },
+                        () -> captureCoordinator.startCapture(pipelineId));
+            } catch (RingNotOpenYet notYet) {
+                // Nothing was opened, so nothing is submitted: the pipeline reads as started and carries no job,
+                // which is exactly what the next pass starts again. Not recorded as failed -- a capture it reads is
+                // being opened on another member, and how long that may take is bounded where it is decided.
+                return;
+            }
+            // Capture opens the SRS generation that source vertices compile into the DAG, so the topology is built
+            // only now, from the plan worked out above.
+            DagSource.StartPlan plan = planned.build(execution.fence());
+            admission.guard(pipelineId, execution, plan.dag());
+            // Proved once more, against the store, before anything is recorded or submitted. Everything above can
+            // take longer than a lease, and the renewer keeping the claim alive through it can still lose it: the
+            // store out of reach, the process paused, another member taking the pipeline over. A run submitted over
+            // a claim this member no longer holds dies at its first write, and whoever holds the pipeline then reads
+            // that death as the pipeline's. Not recorded as failed, for the reason a start refused its generation
+            // is not: the member that holds the pipeline puts a run behind it, over a capture this start closes
+            // again keeping its position.
+            if (!actuation.proveExecution(execution.fence())) {
+                LOG.warn("Not submitting pipeline {} on this member: the claim its run was taken under could not "
+                        + "be proved once the start was ready to submit it", pipelineId);
+                captureCoordinator.stopCapture(pipelineId, false);
+                return;
+            }
+            // Written down before the run is submitted, so a reader never finds a run executing on a plan nobody
+            // recorded; a run that goes on to fail keeps its plan until the next start replaces it or a stop lets go.
+            // Compared with the plan of the run before - lost to a failed member, a stop or a restart - so a node
+            // whose width moved says what it was and which of its inputs moved it.
+            plans.record(planOf(pipelineId, execution, plan.planned(), clock.instant(), prepared.sinkConnectors(),
+                    sharedConnectors).replacing(plans.last(pipelineId)));
+            // The capacity travels with the submission because the maps are made by the job: what a state map
+            // holds is fixed as it is created, so a number applied after the job started would be accepted and
+            // change nothing.
+            if (execution.fence() != null && execution.fence().profileGeneration() > 0) {
+                String nativeJobId = engine.submitFenced(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings(),
+                        execution.fence().claimGeneration(), execution.fence().executionGeneration(),
+                        execution.fence().profileGeneration());
+                admission.submitted(pipelineId, execution, nativeJobId);
+            } else {
+                engine.submit(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings());
+            }
+        } catch (TapstateException failed) {
+            admission.failedAfterAllocation(pipelineId, execution, failed);
+            throw failed;
         }
     }
 

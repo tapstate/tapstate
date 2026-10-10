@@ -41,6 +41,20 @@ class ObservabilityConsumerContractTest {
     private static final Instant CUTOFF = Instant.parse("2026-09-05T11:00:00Z");
 
     @Test
+    void theRecoveryCompanionUsesThePublishedExplanationContract() throws Exception {
+        RecoveryTestQueries recovery = new RecoveryTestQueries();
+        recovery.enable("cluster-a", "orders");
+        PipelineExplanation explanation = new PipelineExplanation("orders", PipelineState.FAILED,
+                PipelineExplanation.Kind.CODED_FAILURE, "The source rejected its retained position.",
+                FROM, 1_000L, PipelineExplanation.Freshness.FRESH, List.of(), List.of(), null, null)
+                .withRecovery(recovery.pipeline("orders"));
+        Map<?, ?> answer = JSON.readValue(JSON.writeValueAsString(PipelineExplanationResponse.of(explanation)), Map.class);
+        assertThat(answer.containsKey("recovery")).isTrue();
+        Map<?, ?> schema = ControlApiSchema.resolve(ControlOperations.PIPELINE_EXPLAIN.schema().result());
+        assertThat(refusals("$", answer, schema)).isEmpty();
+    }
+
+    @Test
     void manifestPinsTheFirstBackendRevisionAndEveryFixture() throws Exception {
         Map<?, ?> manifest = JSON.readValue(golden("manifest.json"), Map.class);
 
@@ -375,7 +389,7 @@ class ObservabilityConsumerContractTest {
                     refused.add(path + ": not an object");
                     break;
                 }
-                Map<?, ?> properties = (Map<?, ?>) schema.get("properties");
+                Map<?, ?> properties = schema.get("properties") instanceof Map<?, ?> declared ? declared : Map.of();
                 if (schema.get("required") instanceof List<?> required) {
                     required.stream().filter(key -> !object.containsKey(key))
                             .forEach(key -> refused.add(path + "." + key + ": required and absent"));
@@ -383,6 +397,8 @@ class ObservabilityConsumerContractTest {
                 object.forEach((key, field) -> {
                     if (properties.get(key) instanceof Map<?, ?> property) {
                         refused.addAll(refusals(path + "." + key, field, property));
+                    } else if (schema.get("additionalProperties") instanceof Map<?, ?> valueSchema) {
+                        refused.addAll(refusals(path + "." + key, field, valueSchema));
                     } else if (Boolean.FALSE.equals(schema.get("additionalProperties"))) {
                         refused.add(path + "." + key + ": not a property this closed object names");
                     }

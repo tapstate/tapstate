@@ -16,6 +16,33 @@ import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 class PipelineAdmissionRefusalsTest {
+    @Test void aCodedPhysicalStartFailureIsReportedForItsAllocatedExecution() {
+        Engine engine = mock(Engine.class);
+        DagSource dags = mock(DagSource.class);
+        PipelineCaptureCoordinator captures = mock(PipelineCaptureCoordinator.class);
+        PipelineActuationOwnership ownership = mock(PipelineActuationOwnership.class);
+        PipelineExecutionAdmission admission = mock(PipelineExecutionAdmission.class);
+        NestStateTeardown teardown = mock(NestStateTeardown.class);
+        when(teardown.defaultDatabase()).thenReturn("default");
+        var failure = new TapstateException(io.tapstate.runtime.engine.EngineError.ROUTING_KEY_MISSING,
+                Map.of("node", "join", "stream", "s.orders", "columns", "id"), null);
+        var prepared = new DagSource.StartPreparation(DagSource.NestCapacity.none(), Set.of(), Optional.empty(),
+                () -> fence -> { throw failure; }, Map.of());
+        when(dags.prepareStart("p", "default")).thenReturn(prepared);
+        when(admission.prepare(eq("p"), any(), eq(ownership))).thenReturn(true);
+        when(ownership.mayStart("p")).thenReturn(true);
+        var execution = new PipelineActuationOwnership.Execution(true, new ExecutionFence("p", 1, 9, 2), 7L);
+        when(admission.begin(eq("p"), any(), eq(ownership))).thenReturn(execution);
+        var actuator = new EngineLifecycleActuator(engine, dags, captures, teardown, ownership,
+                ExecutionPlanRecorder.NONE, Clock.systemUTC(), (pipeline, connectors) -> Set.of(), admission);
+
+        assertThatThrownBy(() -> actuator.start("p")).isSameAs(failure);
+
+        verify(admission).failedAfterAllocation("p", execution, failure);
+        verify(ownership, never()).startRefusedBeforeItsRun(anyString());
+        verify(engine, never()).submitFenced(anyString(), any(), anyMap(), any(), anyLong(), anyLong(), anyLong());
+    }
+
     @Test void aCapacityRefusalIsRecordedBeforeAnyPhysicalStartOrExecutionAllocation() {
         Engine engine = mock(Engine.class);
         DagSource dags = mock(DagSource.class);

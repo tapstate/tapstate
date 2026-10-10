@@ -92,11 +92,11 @@ class HttpControlPlaneClientTest {
             assertThat(listed.pipelines()).hasSize(1);
             RemotePipeline pipeline = listed.pipelines().get(0);
             assertThat(pipeline.controllerClaim())
-                    .isEqualTo(new RemoteClaim("orders", "node-b", "boot-b", 3L, 7L, true));
+                    .isEqualTo(new RemoteClaim("orders", "node-b", "boot-b", 3L, 7L, 4L, true));
             assertThat(pipeline.captureClaims())
                     .as("a capture's ownership is its own, with its own generations and its own lease")
                     .containsExactly(
-                            new RemoteClaim("capture-f00d", "node-a", "boot-a", 1L, 1L, false));
+                            new RemoteClaim("capture-f00d", "node-a", "boot-a", 1L, 1L, 4L, false));
             assertThat(pipeline.measuredAt())
                     .as("read as a time, so a server that sent a number instead would be caught here "
                             + "rather than by a reader wondering why a placement has no moment")
@@ -180,7 +180,6 @@ class HttpControlPlaneClientTest {
                 assertThat(found.recovery().quorumReady()).isNull();
                 assertThat(found.recovery().capacity().occupiedByNode()).isNull();
                 var pipeline = found.pipelines().getFirst();
-                assertThat(JsonReader.parse(JsonOut.compact(RecoveryWire.tree(pipeline.recovery())))).isEqualTo(RecoveryFixtures.pipelineRecovery());
                 assertThat(pipeline.controllerClaim().executionContextCurrent()).isFalse();
                 assertThat(pipeline.controllerClaim().executionGeneration()).isEqualTo(22);
                 assertThat(pipeline.controllerClaim().contextExecutionGeneration()).isEqualTo(21);
@@ -227,6 +226,28 @@ class HttpControlPlaneClientTest {
         try {
             assertThat(new HttpControlPlaneClient().explain(baseOf(server), "token", "orders"))
                     .isInstanceOf(ExplainOutcome.Unreachable.class);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void anUnavailableQueueKeepsItsUnknownStateAndOriginalReadDiagnostic() throws Exception {
+        Map<String, Object> unknown = new java.util.LinkedHashMap<>(RecoveryFixtures.clusterRecovery());
+        unknown.put("recoveryState", null);
+        unknown.put("items", List.of());
+        unknown.put("causes", List.of());
+        unknown.put("queueUnavailable", Map.of("code", "io.document-unreadable",
+                "params", Map.of("id", "orders", "field", "targetProfile")));
+        HttpServer server = serverReplying("/api/cluster/status", 200,
+                JsonOut.compact(Map.of("clusterId", "cluster-a", "members", List.of(), "pipelines", List.of(), "recovery", unknown)));
+        try {
+            var outcome = new HttpControlPlaneClient().clusterStatus(baseOf(server), "token");
+            assertThat(outcome).isInstanceOf(ClusterMembersOutcome.Listed.class);
+            var view = ((ClusterMembersOutcome.Listed) outcome).recovery();
+            assertThat(view.recoveryState()).isNull();
+            assertThat(view.queueUnavailable().code()).isEqualTo("io.document-unreadable");
+            assertThat(JsonReader.parse(JsonOut.compact(RecoveryWire.tree(view)))).isEqualTo(unknown);
         } finally {
             server.stop(0);
         }
@@ -1781,7 +1802,8 @@ class HttpControlPlaneClientTest {
             StatusOutcome outcome = new HttpControlPlaneClient().status(baseOf(server), "tok-abc", "pl1");
 
             assertThat(outcome).isEqualTo(new StatusOutcome.Found("pl1", "FAILED", "engine.job-failed",
-                    "Pipeline pl1 stopped because its job failed: sink refused."));
+                    "Pipeline pl1 stopped because its job failed: sink refused.", null, null, null,
+                    Map.of("cause", "sink refused"), null, List.of()));
         } finally {
             server.stop(0);
         }

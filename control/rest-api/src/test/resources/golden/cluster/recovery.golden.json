@@ -1,7 +1,7 @@
 {
   "clusterId": "cluster-a",
   "quorumReady": null,
-  "recoveryState": "REBUILDING",
+  "recoveryState": "RECOVERING",
   "causes": ["FULL_CLUSTER_RESTART"],
   "items": [{
     "pipelineId": "orders",
@@ -23,7 +23,7 @@
     "sourceTopologyRevision": 6,
     "originalProfile": {"generation": 1, "formatVersion": 1, "hash": "profile-original", "attributes": {"build": "one", "threads": "4"}},
     "legacySourceProfile": false,
-    "targetProfile": {"generation": 2, "formatVersion": 1, "hash": "profile-current", "attributes": {"build": "two", "threads": "6"}},
+    "targetProfile": {"generation": 2, "formatVersion": 1, "hash": "profile-current", "attributes": {"build": "two", "threads": "6", "capacityProcessors": "16", "capacityBlockingProcessors": "8", "capacityWriters": "4", "capacityConnectorInstances": "4", "capacityBufferedRecords": "4096", "capacityEdgeQueueRecords": "8192"}},
     "targetTopologyRevision": 9,
     "executionFrontier": 22,
     "originalPositions": {
@@ -36,16 +36,19 @@
       "deadline": "2026-10-10T09:01:30Z",
       "coordinator": {"clusterId": "cluster-a", "type": "CLUSTER_RECOVERY", "resourceId": "cluster-a", "ownerNodeId": "node-a", "ownerBootId": "boot-a2", "claimGeneration": 4, "executionGeneration": 0, "topologyRevision": 9, "profileGeneration": 2},
       "transferredExecutionGeneration": 22,
-      "demandByNode": {"node-a": {"processors": 6, "blockingProcessors": 2, "writers": 1, "connectorInstances": 2, "bufferedRecords": 512, "edgeQueueRecords": 1024}}
+      "demandByNode": {
+        "node-a": {"processors": 6, "blockingProcessors": 2, "writers": 1, "connectorInstances": 2, "bufferedRecords": 512, "edgeQueueRecords": 1024},
+        "node-b": {"processors": 6, "blockingProcessors": 2, "writers": 1, "connectorInstances": 2, "bufferedRecords": 512, "edgeQueueRecords": 1024}
+      }
     },
     "successor": {
       "pipelineClaim": {"clusterId": "cluster-a", "type": "PIPELINE_ACTUATION", "resourceId": "orders", "ownerNodeId": "node-b", "ownerBootId": "boot-b2", "claimGeneration": 12, "executionGeneration": 22, "topologyRevision": 9, "profileGeneration": 2},
-      "profile": {"generation": 2, "formatVersion": 1, "hash": "profile-current", "attributes": {"build": "two", "threads": "6"}},
+      "profile": {"generation": 2, "formatVersion": 1, "hash": "profile-current", "attributes": {"build": "two", "threads": "6", "capacityProcessors": "16", "capacityBlockingProcessors": "8", "capacityWriters": "4", "capacityConnectorInstances": "4", "capacityBufferedRecords": "4096", "capacityEdgeQueueRecords": "8192"}},
       "executionNodeIds": ["node-a", "node-b"],
       "requiredSourceIds": ["crm"],
       "sourceRequirementsRecorded": true,
       "allocatedAt": "2026-10-10T09:00:30Z",
-      "nativeJobId": "job-22",
+      "nativeJobId": "1729407264346316801",
       "submittedAt": "2026-10-10T09:00:40Z",
       "nativeInitializedAt": "2026-10-10T09:00:45Z",
       "sourcesAcceptedAt": "2026-10-10T09:00:50Z",
@@ -59,14 +62,14 @@
         "recordedAt": "2026-10-10T09:01:00Z"
       }
     },
-    "diagnostic": {"reason": "EXECUTION_FAILED", "code": "io.workload-claim-fenced", "params": {}, "positions": {"crm": {"connectorId": "mongo", "captureId": "capture-crm", "kind": "DURABLE_POSITION", "epoch": 3, "sequence": 7, "token": "resume-7", "provenance": "durable consumer floor", "reference": "consumer-orders-crm"}}, "disposition": "Wait for authority retirement before retrying"},
+    "diagnostic": {"reason": "SOURCE_POSITION_REJECTED", "code": "capture.start-from-outside-window", "params": {"earliest": "resume-15", "requested": "resume-12", "retention": "2h"}, "positions": {"crm": {"connectorId": "mongo", "captureId": "capture-crm", "kind": "DURABLE_POSITION", "epoch": 4, "sequence": 12, "token": "resume-12", "provenance": "prepared consumer floor", "reference": "consumer-orders-crm"}}, "disposition": "Restore the retained source position before starting explicitly"},
     "currentPipelineClaim": {"claim": {"clusterId": "cluster-a", "type": "PIPELINE_ACTUATION", "resourceId": "orders", "ownerNodeId": "node-b", "ownerBootId": "boot-b2", "claimGeneration": 12, "executionGeneration": 22, "topologyRevision": 9, "profileGeneration": 2}, "leaseUntil": "2026-10-10T09:01:20Z", "leaseRemainingMillis": 20000, "leased": true},
     "claimUnavailable": null
   }],
-  "currentProfile": {"generation": 2, "formatVersion": 1, "hash": "profile-current", "attributes": {"build": "two", "threads": "6"}},
+  "currentProfile": {"generation": 2, "formatVersion": 1, "hash": "profile-current", "attributes": {"build": "two", "threads": "6", "capacityProcessors": "16", "capacityBlockingProcessors": "8", "capacityWriters": "4", "capacityConnectorInstances": "4", "capacityBufferedRecords": "4096", "capacityEdgeQueueRecords": "8192"}},
   "profileUnavailable": null,
   "coordinatorClaim": {"claim": {"clusterId": "cluster-a", "type": "CLUSTER_RECOVERY", "resourceId": "cluster-a", "ownerNodeId": "node-a", "ownerBootId": "boot-a2", "claimGeneration": 4, "executionGeneration": 0, "topologyRevision": 9, "profileGeneration": 2}, "leaseUntil": "2026-10-10T09:01:30Z", "leaseRemainingMillis": 30000, "leased": true},
   "claimUnavailable": null,
-  "capacity": {"availability": "UNAVAILABLE", "provenance": "durable aggregate occupancy", "profile": {"generation": 2, "formatVersion": 1, "hash": "profile-current", "attributes": {"build": "two", "threads": "6"}}, "configuredLimits": {"processors": 16, "blockingProcessors": 8, "writers": 4, "connectorInstances": 4, "bufferedRecords": 4096, "edgeQueueRecords": 8192}, "occupiedByNode": null, "unavailable": {"code": "lifecycle.cluster-capacity-refused", "params": {"node": "node-b", "resource": "processors", "occupied": "unknown", "requested": 6, "limit": 16}}},
+  "capacity": {"availability": "UNAVAILABLE", "provenance": "mongo-capacity-unavailable", "profile": {"generation": 2, "formatVersion": 1, "hash": "profile-current", "attributes": {"build": "two", "threads": "6", "capacityProcessors": "16", "capacityBlockingProcessors": "8", "capacityWriters": "4", "capacityConnectorInstances": "4", "capacityBufferedRecords": "4096", "capacityEdgeQueueRecords": "8192"}}, "configuredLimits": {"processors": 16, "blockingProcessors": 8, "writers": 4, "connectorInstances": 4, "bufferedRecords": 4096, "edgeQueueRecords": 8192}, "occupiedByNode": null, "unavailable": {"code": "lifecycle.cluster-capacity-refused", "params": {"node": "node-b", "resource": "processors", "occupied": "unknown", "requested": 6, "limit": 16}}},
   "queueUnavailable": null
 }

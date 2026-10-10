@@ -555,6 +555,9 @@ connector.projection-failed:
 connector.capture-failed:
   message: "Connector '{connector}' failed while reading: {detail}."
   solution: "Check the source is reachable and the connection settings are correct."
+connector.resume-position-rejected:
+  message: "Connector '{connector}' rejected retained position '{requested}' because its source log no longer contains it."
+  solution: "The SDK reported {pdkId} error {pdkCode}, server code {serverCode}, and arguments {pdkArgs}. Stop the pipeline and inspect source log retention before explicitly choosing a new start; recovery does not reset the position."
 connector.position-unrenderable:
   message: "Connector '{connector}' produced a stream position that could not be recorded: {detail}."
   solution: "Without a recordable position this source can only be read from the present; report the connector build that produced it."
