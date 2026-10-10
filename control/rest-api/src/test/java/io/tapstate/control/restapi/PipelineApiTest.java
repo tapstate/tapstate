@@ -41,6 +41,13 @@ import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.SessionService;
 import io.tapstate.control.core.Scope;
 import io.tapstate.control.core.SourceSchemaQueryService;
+import io.tapstate.control.core.SourceProjectionService;
+import io.tapstate.control.core.ViewCatalogService;
+import io.tapstate.control.core.SampleSourceService;
+import io.tapstate.control.core.SampleSourceCredentialsProvider;
+import io.tapstate.control.core.SourceRepresentation;
+import io.tapstate.control.core.StateStoreSetupService;
+import io.tapstate.control.core.DeploymentProfile;
 import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.TokenSigner;
@@ -1488,6 +1495,33 @@ class PipelineApiTest {
         @Bean
         SourceSchemaQueryService sourceSchemaQueryService(ArtifactStore store) {
             return new SourceSchemaQueryService(store, new EmptySchemaStore());
+        }
+
+        @Bean
+        ViewCatalogService viewCatalogService(ArtifactQueryService artifacts,
+                PipelineObservationQueryService observations, DataBrowserService browser,
+                SourceSchemaQueryService schemas, Clock clock) {
+            return new ViewCatalogService(artifacts, observations, browser, schemas, clock);
+        }
+
+        @Bean
+        SampleSourceService sampleSourceService(SourceProjectionService sources,
+                SchemaDiscoveryService discovery, ConnectionTestService connections,
+                ConnectorCatalogView connectors) {
+            return new SampleSourceService(sources, discovery, connections, connectors,
+                    new SampleSourceCredentialsProvider() {
+                        @Override public boolean available() { return false; }
+                        @Override public Credentials fetch() {
+                            throw new IllegalStateException("Sample credentials are not configured in this fixture");
+                        }
+                    });
+        }
+
+        @Bean
+        StateStoreSetupService stateStoreSetupService(ApplyService apply, ArtifactQueryService artifacts,
+                SourceRepresentation representation, ConnectionTestService connections) {
+            return new StateStoreSetupService(apply, artifacts, representation,
+                    DeploymentProfile.ON_PREM, connections);
         }
 
         @Bean
