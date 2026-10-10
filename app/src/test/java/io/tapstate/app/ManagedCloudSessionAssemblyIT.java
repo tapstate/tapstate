@@ -19,6 +19,7 @@ import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.CloudSessionIdentity;
 import io.tapstate.spi.store.CloudSessionStore;
+import io.tapstate.runtime.probe.PipelinePreviewProbe;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -32,6 +33,7 @@ import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
+import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.http.HttpHeaders;
@@ -581,10 +583,20 @@ class ManagedCloudSessionAssemblyIT {
         }
     }
 
+    @Configuration(proxyBeanMethods = false)
+    static class PreviewProbeAssembly {
+        @Bean
+        PipelinePreviewProbe pipelinePreviewProbe() {
+            return request -> {
+                throw new AssertionError("Runtime preview is outside this authentication fixture");
+            };
+        }
+    }
+
     @SpringBootConfiguration
     @EnableAutoConfiguration
     @ConditionalOnProperty(prefix = "tapstate.test", name = "managed-auth-two-users", havingValue = "true")
-    @Import({StoreConfiguration.class, ControlPlaneConfiguration.class})
+    @Import({StoreConfiguration.class, ControlPlaneConfiguration.class, PreviewProbeAssembly.class})
     static class TwoUserAssembly {
         @Bean
         @Primary
@@ -622,7 +634,7 @@ class ManagedCloudSessionAssemblyIT {
     @SpringBootConfiguration
     @EnableAutoConfiguration
     @ConditionalOnProperty(prefix = "tapstate.test", name = "managed-auth", havingValue = "true")
-    @Import({StoreConfiguration.class, ControlPlaneConfiguration.class})
+    @Import({StoreConfiguration.class, ControlPlaneConfiguration.class, PreviewProbeAssembly.class})
     static class Assembly {
         @Bean
         @Primary
