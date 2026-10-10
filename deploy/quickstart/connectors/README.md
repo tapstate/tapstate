@@ -51,8 +51,9 @@ all-data-type matrix. The default accepted set contains 17 connector ids: the Db
 and 16 across these five database kinds, including existing managed variants of MySQL,
 PostgreSQL and MongoDB. Except for `mongodb-atlas`, those managed variants have not been
 live-verified individually. The Atlas connector was verified with snapshot and change-stream
-reads, restart continuation, and target writes against a real Atlas deployment in the existing
-on-prem runtime; Cloud-mode verification is pending.
+reads, restart continuation, and target writes against a real Atlas deployment in both cloud
+and on-prem runtimes. This verifies the tested deployment and does not establish an exhaustive
+Atlas version or tier compatibility matrix.
 Other managed variants of Oracle, SQL Server and Db2 are outside the default accepted set.
 
 `tapstate.connectors.also-accept-ids` lets an operator accept additional connector ids
