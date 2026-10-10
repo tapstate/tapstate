@@ -380,6 +380,10 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         return true;
     }
 
+    static boolean nativeClockArmAllowed(PipelineBenchmarkComparison.Arm arm, boolean commonDomain) {
+        return arm == PipelineBenchmarkComparison.Arm.B || commonDomain && arm == PipelineBenchmarkComparison.Arm.A;
+    }
+
     static boolean admitWriteReturnMethodProtocol(String value, boolean diagnostics, boolean pilot,
             BenchmarkReturnClockSampler.Mode clockMode, boolean conflictingDiagnostics) {
         if (value == null) { return false; }
@@ -399,7 +403,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                 Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY), workload.pilotProfile());
         String selectedNativeLibrary = nativeClockLibrary(System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY),
                 Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY), workload.pilotProfile(), clockMode,
-                !"stateless".equals(workload.id()) || arm != PipelineBenchmarkComparison.Arm.B
+                !"stateless".equals(workload.id()) || !nativeClockArmAllowed(arm, Boolean.getBoolean(NATIVE_COUNTER_DOMAIN_PROPERTY))
                         || System.getProperty(WRITE_RETURN_METHOD_CONTROL_PROPERTY) != null
                         || Boolean.getBoolean(WRITE_RETURN_COST_STAGES_PROPERTY)
                         || List.of("tapstate.e2e.benchmark-smoke.jvm-gap-diagnostics",

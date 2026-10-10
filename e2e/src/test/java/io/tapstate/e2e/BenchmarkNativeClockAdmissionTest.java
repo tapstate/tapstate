@@ -66,6 +66,28 @@ class BenchmarkNativeClockAdmissionTest {
                 BenchmarkReturnClockSampler.Mode.PERIODIC, true)).isInstanceOf(AssertionError.class);
     }
 
+    @Test void a_reference_arm_cannot_pass_the_real_entry_scope_without_explicit_common_counter_diagnostics() {
+        String libraryProperty = RealBenchmarkForkDriver.NATIVE_CLOCK_LIBRARY_PROPERTY;
+        String domainProperty = RealBenchmarkForkDriver.NATIVE_COUNTER_DOMAIN_PROPERTY;
+        String diagnosticsProperty = RealBenchmarkForkDriver.WRITE_RETURN_DIAGNOSTICS_PROPERTY;
+        String library = System.getProperty(libraryProperty), domain = System.getProperty(domainProperty);
+        String diagnostics = System.getProperty(diagnosticsProperty);
+        try {
+            System.setProperty(libraryProperty, LIBRARY);
+            System.setProperty(diagnosticsProperty, "true");
+            System.clearProperty(domainProperty);
+            assertThatThrownBy(() -> new RealBenchmarkForkDriver().run(BenchmarkWorkloadDefinitions.steadyPilot("stateless"),
+                    PipelineBenchmarkComparison.Arm.A, 1, null))
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("original plain stateless B");
+            System.setProperty(domainProperty, "true");
+            assertThatThrownBy(() -> new RealBenchmarkForkDriver().run(BenchmarkWorkloadDefinitions.steadyPilot("stateless"),
+                    PipelineBenchmarkComparison.Arm.A, 1, null))
+                    .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("application JAR");
+        } finally {
+            restore(libraryProperty, library); restore(domainProperty, domain); restore(diagnosticsProperty, diagnostics);
+        }
+    }
+
     @Test void formal_entry_refuses_shared_mapping_before_configuration_without_a_library() {
         String property = RealBenchmarkForkDriver.NATIVE_COUNTER_DOMAIN_PROPERTY;
         String previous = System.getProperty(property);

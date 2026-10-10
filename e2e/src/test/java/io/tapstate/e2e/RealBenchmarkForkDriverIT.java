@@ -95,7 +95,9 @@ class RealBenchmarkForkDriverIT {
                 System.getProperty(RealBenchmarkForkDriver.NATIVE_CLOCK_LIBRARY_PROPERTY), writeReturnDiagnostics,
                 Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot"), returnClockMode,
                 conflictingReturnDiagnostics || jvmDiagnostics || !"stateless".equals(workloadId)
-                        || arm != PipelineBenchmarkComparison.Arm.B || mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN
+                        || !RealBenchmarkForkDriver.nativeClockArmAllowed(arm,
+                                Boolean.getBoolean(RealBenchmarkForkDriver.NATIVE_COUNTER_DOMAIN_PROPERTY))
+                        || mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN
                         || forkOutput == null || costStages
                         || System.getProperty(RealBenchmarkForkDriver.WRITE_RETURN_METHOD_CONTROL_PROPERTY) != null);
         boolean nativeCounterDomain = RealBenchmarkForkDriver.nativeCounterDomain(
