@@ -338,7 +338,7 @@ public final class NestDag {
                 : NestSendPolicy.everyChange();
         return ProcessorMetaSupplier.of(new NestVertexSupplier(spec, slots, stores, deadLetter, outputStream,
                 axes, chainsByOrdinal, binding.replayFloor(), binding.settings(), binding.clock(), sending,
-                topology.lookups()));
+                topology.lookups(), binding.settleMissingReferencesOnComplete()));
     }
 
     /**
@@ -469,6 +469,7 @@ public final class NestDag {
         private final NestClock clock;
         private final NestSendPolicy sending;
         private final List<NestLookup> lookups;
+        private final boolean settleMissingReferencesOnComplete;
         private transient ReplayFloor floor;
         private transient NestBinding.NestStores bound;
         private transient NestDeadLetter boundDeadLetter;
@@ -476,10 +477,12 @@ public final class NestDag {
         private NestVertexSupplier(NestVertex spec, List<EmbedSlot> slots, NestBinding.NestStores stores,
                 NestDeadLetter deadLetter, String outputStream, ChainAxes axes,
                 Map<Integer, List<String>> chainsByOrdinal, ReplayFloorFactory replayFloor,
-                NestSettings settings, NestClock clock, NestSendPolicy sending, List<NestLookup> lookups) {
+                NestSettings settings, NestClock clock, NestSendPolicy sending, List<NestLookup> lookups,
+                boolean settleMissingReferencesOnComplete) {
             this.lookups = lookups;
             this.clock = clock;
             this.sending = sending;
+            this.settleMissingReferencesOnComplete = settleMissingReferencesOnComplete;
             this.spec = spec;
             this.slots = slots;
             this.stores = stores;
@@ -509,7 +512,8 @@ public final class NestDag {
                 processors.add(spec.isAssembler()
                         ? new AssemblerProcessor(spec, slots, bound.forAssembler(spec), outputStream,
                                 axes, chainsByOrdinal, floor, settings, clock, sending,
-                                bound.forParking(spec), boundDeadLetter, referenced())
+                                bound.forParking(spec), boundDeadLetter, referenced(),
+                                settleMissingReferencesOnComplete)
                         : new ResolverProcessor(spec, bound.forResolver(spec), boundDeadLetter, axes,
                                 chainsByOrdinal, floor, clock, settings, bound.forParking(spec)));
             }

@@ -10,10 +10,8 @@ import io.tapstate.spi.store.SourceModel;
  * cannot be expressed as desired state, so it crosses the same narrow seam rather than decoupling
  * through the store.
  *
- * <p>The whitelist of such calls is a closed set — the connection probe and this discovery probe —
- * pinned by the ring-dependency gate. Any further synchronous control-to-runtime call is a deliberate
- * widening of the seam that must change the gate and the sync-whitelist decision, not slip in beside
- * them.
+ * <p>The whitelist of such calls is a closed set of seven probes, pinned by the ring-dependency gate.
+ * Any further synchronous call is a deliberate widening of the seam that must change the gate and the sync-whitelist decision, not slip in beside it.
  *
  * <p>The probe drives the target connector's own schema discovery and reports the normalized
  * {@link SourceModel}: the tables the source exposes, each with its fields, primary key and indexes.

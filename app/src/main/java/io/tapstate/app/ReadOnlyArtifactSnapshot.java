@@ -30,6 +30,16 @@ final class ReadOnlyArtifactSnapshot implements ArtifactStore {
         return new ReadOnlyArtifactSnapshot(Objects.requireNonNull(source, "source").list());
     }
 
+    /** Overlays one validated candidate closure without mutating the underlying artifact store. */
+    static ReadOnlyArtifactSnapshot overlay(ArtifactStore source, List<Resource> overrides) {
+        Objects.requireNonNull(source, "source");
+        Objects.requireNonNull(overrides, "overrides");
+        Map<String, Resource> merged = new LinkedHashMap<>();
+        source.list().forEach(resource -> merged.put(resource.id(), resource));
+        overrides.forEach(resource -> merged.put(resource.id(), resource));
+        return new ReadOnlyArtifactSnapshot(List.copyOf(merged.values()));
+    }
+
     @Override
     public void saveAll(List<Resource> artifacts) {
         throw new UnsupportedOperationException("an artifact snapshot is read-only");

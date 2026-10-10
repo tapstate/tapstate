@@ -71,8 +71,8 @@ class CliFaceProjectionGatesTest {
      * oversight. The security domain has no face anywhere — no command and no endpoint — so nothing
      * invokes those verbs today; the first administrator is created through the bootstrap entry point
      * instead. Frontend-only source and connector details/icons, the unified Pipeline catalog, and
-     * Pipeline draft authoring/rebase endpoints and the authenticated current-user read are HTTP
-     * contracts with no command shape yet.
+     * Pipeline draft authoring/rebase, bounded preview, sample source management, state store connection,
+     * view listing, and authenticated current-user reads are HTTP contracts with no command shape yet.
      *
      * <p>An entry here is a reviewed decision, not a running to-do list: an operation added to the
      * registry with no verb must turn this gate red, and deleting its entry is how it earns one.
@@ -87,6 +87,8 @@ class CliFaceProjectionGatesTest {
             "pipeline.catalog",
             "pipeline-draft.list", "pipeline-draft.get", "pipeline-draft.create", "pipeline-draft.replace",
             "pipeline-draft.delete", "pipeline-draft.preview", "pipeline-draft.publish", "pipeline-draft.rebase",
+            "pipeline.preview",
+            "sample-source.list", "sample-source.install", "state-store.connect", "view.list",
             "user.create", "user.passwd", "user.list");
 
     @Test

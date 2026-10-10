@@ -51,8 +51,10 @@ final class NestKeys {
      * hands over both. A join key drops the trailing zeros for this reason, so the two key boundaries
      * now answer alike.
      *
-     * <p>Only the scale goes. Kinds stay apart in the state layer as they always were - {@code 1} the
-     * whole number and {@code 1.0} the decimal are still two keys - and nothing here merges them.
+     * <p>An integral decimal within the INT64 range is also an INT64 key. Both sides of a numeric
+     * relation must route to the same partition and use the same state name; changing only comparison
+     * would leave the child under a different key. Fractional and out-of-range decimals retain their
+     * exact decimal representation, and the row value itself is never changed.
      */
     private static Object normalized(Object value) {
         if (!(value instanceof BigDecimal decimal)) {
@@ -62,7 +64,14 @@ final class NestKeys {
         // A stripped whole number carries a negative scale (100 becomes 1E+2), which renders in the
         // state layer as the exponent form. The value is the same either way; this keeps the name the
         // one an operator reading it would expect.
-        return stripped.scale() < 0 ? stripped.setScale(0) : stripped;
+        if (stripped.scale() <= 0) {
+            try {
+                return stripped.longValueExact();
+            } catch (ArithmeticException outOfRange) {
+                return stripped.scale() < 0 ? stripped.setScale(0) : stripped;
+            }
+        }
+        return stripped;
     }
 
     /** The row an event carries: what it became, or what it was when that is all a deletion leaves. */

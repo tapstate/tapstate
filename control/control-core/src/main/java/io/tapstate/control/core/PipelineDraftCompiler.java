@@ -93,6 +93,9 @@ public final class PipelineDraftCompiler {
             previous = nestId;
         }
         for (PipelineDraft.Transform transform : wizard.transforms()) {
+            if (isNoOpMap(transform)) {
+                continue;
+            }
             Step step = compileTransform(transform, previous);
             steps.add(step);
             previous = step.id();
@@ -195,13 +198,22 @@ public final class PipelineDraftCompiler {
         String previous = source;
         int index = 0;
         for (PipelineDraft.Transform transform : transforms) {
-            String stepId = index++ == 0 ? owner + "__pre" : owner + "__pre__" + index + "__" + transform.id();
+            int transformIndex = ++index;
+            if (isNoOpMap(transform)) {
+                continue;
+            }
+            String stepId = transformIndex == 1 ? owner + "__pre"
+                    : owner + "__pre__" + transformIndex + "__" + transform.id();
             Step step = compileTransform(new PipelineDraft.Transform(stepId, transform.type(), transform.fields()), previous);
             steps.add(step);
             previous = stepId;
         }
         aliases.put(owner, FromRef.literal(previous));
         return previous;
+    }
+
+    private static boolean isNoOpMap(PipelineDraft.Transform transform) {
+        return "map".equals(transform.type()) && transform.fields().isEmpty();
     }
 
     private static List<Embed> embedsFor(String parentId, Map<String, List<PipelineDraft.Related>> children) {

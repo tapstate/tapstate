@@ -28,6 +28,9 @@ class ControlOperationsTest {
                         "source.schema",
                         "source.update",
                         "source.delete",
+                        "sample-source.list",
+                        "sample-source.install",
+                        "state-store.connect",
                         "connection.test",
                         "connection.test-result",
                         "connection.discover-schema",
@@ -40,8 +43,10 @@ class ControlOperationsTest {
                         "data-browser.find",
                         "data-browser.stats",
                         "cluster.members",
+                        "cluster.context",
                         "pipeline.list",
                         "pipeline.catalog",
+                        "view.list",
                         "pipeline.get",
                         "pipeline.layout.get",
                         "pipeline.layout.update",
@@ -53,6 +58,7 @@ class ControlOperationsTest {
                         "pipeline-draft.replace",
                         "pipeline-draft.delete",
                         "pipeline-draft.preview",
+                        "pipeline.preview",
                         "pipeline-draft.publish",
                         "pipeline-draft.rebase",
                         "pipeline.start",
@@ -82,6 +88,7 @@ class ControlOperationsTest {
     void scopesMatchTheOperationInventory() {
         assertThat(registry.resolve("artifact.apply").scope()).isEqualTo(Scope.WRITE);
         assertThat(registry.resolve("artifact.validate").scope()).isEqualTo(Scope.READ);
+        assertThat(registry.resolve("pipeline.preview").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("artifact.get").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("artifact.list").scope()).isEqualTo(Scope.READ);
         // artifact.delete removes a stored resource for good, so it is the most consequential write in
@@ -169,6 +176,7 @@ class ControlOperationsTest {
                 "artifact.get",
                 "artifact.list",
                 "artifact.validate",
+                "pipeline.preview",
                 "source.draft",
                 "source.list",
                 "source.get",
@@ -201,13 +209,15 @@ class ControlOperationsTest {
 
     @Test
     void theRegistryOpensEveryUsableOperationOnCliAndKeepsTheRevealReservationClosed() {
-        // Every usable operation remains on CLI. The reveal reservation is the sole exception: its schema
-        // and authorizer seam exist, but publishing it on a face would turn a future contract into a
-        // callable plaintext feature before the dedicated authorizer exists.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(61);
-        assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())).allSatisfy(op ->
+        // The cluster context is REST-only. The reveal reservation stays unpublished until its
+        // dedicated authorizer exists.
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(66);
+        assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())
+                && !"cluster.context".equals(op.id())).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
         assertThat(registry.resolve("source.reveal-config").exposure()).isEmpty();
+        assertThat(registry.resolve("cluster.context").exposure())
+                .containsEntry(Frontend.REST, Maturity.CURRENT).doesNotContainKey(Frontend.CLI);
     }
 
     @Test
@@ -248,8 +258,11 @@ class ControlOperationsTest {
         assertThat(registry.exposedOn(Frontend.REST, Maturity.GA))
                 .extracting(Operation::id)
                 .containsExactlyInAnyOrder(
+                        "sample-source.list", "sample-source.install", "state-store.connect",
+                        "cluster.context", "view.list",
                         "pipeline-draft.list", "pipeline-draft.get", "pipeline-draft.create",
                         "pipeline-draft.replace", "pipeline-draft.delete", "pipeline-draft.preview",
+                        "pipeline.preview",
                         "pipeline-draft.publish", "pipeline-draft.rebase", "pipeline.catalog");
     }
 

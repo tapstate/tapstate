@@ -109,7 +109,7 @@ class NestKeysTest {
         // Dropping the trailing zeros alone leaves 1E+2, which is the same number and a name nobody
         // reading the state layer would connect to the column it came from.
         assertThat(NestStateKeys.nameOf(NestKeys.valuesOf(row, List.of("amount"))))
-                .isEqualTo("[100]~m");
+                .isEqualTo("[100]~l");
     }
 
     @Test
@@ -130,14 +130,21 @@ class NestKeysTest {
     }
 
     @Test
-    void anExactDecimalAndAWholeNumberAreStillTwoKeys() {
+    void anIntegralExactDecimalAndAWholeNumberShareOneKeyAndPartition() {
         Map<String, Object> decimal = Map.of("amount", new BigDecimal("1.0"));
         Map<String, Object> whole = Map.of("amount", 1L);
 
-        // Normalizing the scale is not coercion between kinds. The state layer names a decimal and a
-        // whole number with different letters on purpose, and merging them here would file two keys it
-        // tells apart under one name.
         assertThat(NestKeys.valuesOf(decimal, List.of("amount")))
+                .isEqualTo(NestKeys.valuesOf(whole, List.of("amount")));
+        assertThat(NestKeys.valuesOf(decimal, List.of("amount")).hashCode())
+                .isEqualTo(NestKeys.valuesOf(whole, List.of("amount")).hashCode());
+        assertThat(NestStateKeys.nameOf(NestKeys.valuesOf(decimal, List.of("amount"))))
+                .isEqualTo(NestStateKeys.nameOf(NestKeys.valuesOf(whole, List.of("amount"))));
+        assertThat(NestKeys.valuesOf(Map.of("amount", new BigDecimal("9007199254740993.00")),
+                List.of("amount"))).isEqualTo(List.of(9007199254740993L));
+        assertThat(NestKeys.valuesOf(Map.of("amount", new BigDecimal("1.01")), List.of("amount")))
                 .isNotEqualTo(NestKeys.valuesOf(whole, List.of("amount")));
+        assertThat(NestKeys.valuesOf(Map.of("amount", new BigDecimal("9223372036854775808.0")),
+                List.of("amount"))).containsExactly(new BigDecimal("9223372036854775808"));
     }
 }

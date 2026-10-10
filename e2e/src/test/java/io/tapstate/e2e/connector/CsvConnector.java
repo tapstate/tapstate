@@ -17,6 +17,7 @@ import io.tapdata.pdk.apis.context.TapConnectionContext;
 import io.tapdata.pdk.apis.context.TapConnectorContext;
 import io.tapdata.pdk.apis.entity.ConnectionOptions;
 import io.tapdata.pdk.apis.entity.ExecuteResult;
+import io.tapdata.pdk.apis.entity.FilterResults;
 import io.tapdata.pdk.apis.entity.TapExecuteCommand;
 import io.tapdata.pdk.apis.entity.TestItem;
 import io.tapdata.pdk.apis.entity.WriteListResult;
@@ -37,6 +38,7 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
@@ -225,6 +227,23 @@ public class CsvConnector implements TapConnector {
                     List<TapEvent> rows = snapshot(context, table.getId());
                     noteRead(context, "snapshot", table.getId(), rows.size());
                     consumer.accept(rows, null);
+                })
+                .supportQueryByAdvanceFilter((context, filter, table, consumer) -> {
+                    Map<String, Object> match = filter.getMatch() == null ? Map.of() : filter.getMatch();
+                    List<Map<String, Object>> selected = new ArrayList<>();
+                    int limit = filter.getLimit() == null ? Integer.MAX_VALUE : filter.getLimit();
+                    for (Map<String, Object> row : rows(file(context, table.getId()))) {
+                        if (match.entrySet().stream()
+                                .allMatch(entry -> Objects.equals(row.get(entry.getKey()), entry.getValue()))) {
+                            selected.add(row);
+                            if (selected.size() == limit) {
+                                break;
+                            }
+                        }
+                    }
+                    FilterResults result = new FilterResults();
+                    result.setResults(selected);
+                    consumer.accept(result);
                 })
                 .supportStreamRead((context, tables, offset, size, consumer) -> {
                     mintTheIdentityOnce(context);
