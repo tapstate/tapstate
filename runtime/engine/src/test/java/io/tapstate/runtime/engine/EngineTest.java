@@ -63,6 +63,8 @@ class EngineTest {
         // Job metrics are read live off the member's last collection, so collect once a second rather
         // than the multi-second default to keep the record-count assertions prompt.
         config.getMetricsConfig().setCollectionFrequencySeconds(1);
+        config.getMemberAttributeConfig().setAttribute("tapstate.node-id", "node-a")
+                .setAttribute("tapstate.boot-id", "boot-a");
         member = Hazelcast.newHazelcastInstance(config);
     }
 
@@ -82,6 +84,71 @@ class EngineTest {
         Job job = member.getJet().getJob("orders-pipe");
         assertThat(job).isNotNull();
         awaitStatus(job, JobStatus.RUNNING);
+    }
+
+    @Test
+    void aFencedSubmissionPublishesTheActualNativeProcessorContext() {
+        Engine engine = new Engine(member);
+        String jobId = engine.submitFenced("fenced-pipe", foreverDag(), Map.of(),
+                io.tapstate.runtime.engine.nest.NestSettings.defaults(), 4, 9, 2);
+        awaitStatus(member.getJet().getJob("fenced-pipe"), JobStatus.RUNNING);
+        Engine.NativeRun run = engine.nativeRun("fenced-pipe").orElseThrow();
+        assertThat(run.nativeJobId()).isEqualTo(jobId);
+        assertThat(run.executionGeneration()).isEqualTo(9);
+        assertThat(run.claimGeneration()).isEqualTo(4);
+        assertThat(run.profileGeneration()).isEqualTo(2);
+        assertThat(run.initialized()).isTrue();
+        assertThat(run.initialization().orElseThrow().processors()).isNotEmpty();
+        assertThat(run.initialization().orElseThrow().processors().values()).allSatisfy(context -> {
+            assertThat(context.nodeId()).isEqualTo("node-a");
+            assertThat(context.bootId()).isEqualTo("boot-a");
+            assertThat(context.memberUuid()).isEqualTo(member.getCluster().getLocalMember().getUuid().toString());
+            assertThat(context.jobId()).isEqualTo(jobId);
+            assertThat(context.memberIndex()).isZero();
+            assertThat(context.localProcessorIndex()).isBetween(0, context.localParallelism() - 1);
+            assertThat(context.globalProcessorIndex()).isBetween(0, context.totalParallelism() - 1);
+        });
+    }
+
+    @Test
+    void anUnfencedRunningJobDoesNotProduceAFencedStartupReceipt() {
+        Engine engine = new Engine(member);
+        engine.submit("legacy-pipe", foreverDag());
+        awaitStatus(member.getJet().getJob("legacy-pipe"), JobStatus.RUNNING);
+        assertThat(engine.nativeRun("legacy-pipe")).isEmpty();
+    }
+
+    @Test
+    void anIdempotentFencedSubmissionKeepsItsActualInitializationEvidence() {
+        Engine engine = new Engine(member);
+        String first = engine.submitFenced("same-run", foreverDag(), Map.of(),
+                io.tapstate.runtime.engine.nest.NestSettings.defaults(), 4, 9, 2);
+        awaitStatus(member.getJet().getJob("same-run"), JobStatus.RUNNING);
+        assertThat(engine.nativeRun("same-run").orElseThrow().initialized()).isTrue();
+        assertThat(engine.submitFenced("same-run", foreverDag(), Map.of(),
+                io.tapstate.runtime.engine.nest.NestSettings.defaults(), 4, 9, 2)).isEqualTo(first);
+        assertThat(engine.nativeRun("same-run").orElseThrow().initialized())
+                .as("returning the same live job must preserve its already observed native callbacks").isTrue();
+    }
+
+    @Test
+    void aNativeProcessorThatFailsInitializationNeverProducesSuccessEvidence() {
+        Engine engine = new Engine(member);
+        DAG dag = new DAG();
+        dag.newVertex("fails-init", ProcessorMetaSupplier.of(FailsInitialization::new)).localParallelism(1);
+        engine.submitFenced("failed-startup", dag, Map.of(),
+                io.tapstate.runtime.engine.nest.NestSettings.defaults(), 4, 10, 2);
+        awaitStatus(member.getJet().getJob("failed-startup"), JobStatus.FAILED);
+        Engine.NativeRun run = engine.nativeRun("failed-startup").orElseThrow();
+        assertThat(run.initialized()).isFalse();
+        assertThat(run.initialization().orElseThrow().expectedProcessors()).containsEntry("fails-init", 1);
+        assertThat(run.initialization().orElseThrow().processors()).isEmpty();
+    }
+
+    private static final class FailsInitialization extends AbstractProcessor {
+        @Override protected void init(Context context) {
+            throw new IllegalStateException("fixture processor never initialized");
+        }
     }
 
     @Test

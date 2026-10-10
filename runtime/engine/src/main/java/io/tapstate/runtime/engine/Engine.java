@@ -127,6 +127,61 @@ public final class Engine {
         submitJob(pipelineId, dag);
     }
 
+    /** Submits the real fenced execution and returns the actual native job identity. */
+    public String submitFenced(String pipelineId, DAG dag, Map<String, String> stateDatabases,
+            NestSettings settings, long claimGeneration, long executionGeneration, long profileGeneration) {
+        refuseIfLost(pipelineId);
+        configureNestState(stateDatabases, settings);
+        NativeExecutionStartup.install(dag, member, pipelineId, claimGeneration, executionGeneration, profileGeneration);
+        Job job = submitJob(pipelineId, dag, claimGeneration, executionGeneration, profileGeneration);
+        if (!matchesExecution(job, claimGeneration, executionGeneration, profileGeneration)) {
+            throw new TapstateException(EngineError.EXECUTION_COHORT_CHANGED_BEFORE_START,
+                    Map.of("pipeline", pipelineId, "reason", "existing-job-execution",
+                            "planned", claimGeneration + ":" + executionGeneration + ":" + profileGeneration,
+                            "actual", Long.toUnsignedString(job.getId())), null);
+        }
+        return Long.toUnsignedString(job.getId());
+    }
+
+    public record NativeRun(String nativeJobId, long claimGeneration, long executionGeneration,
+            long profileGeneration, JobStatus status, Optional<NativeExecutionStartup.Evidence> initialization) {
+        public NativeRun {
+            initialization = Objects.requireNonNull(initialization, "initialization");
+        }
+        public boolean initialized() {
+            return initialization.filter(NativeExecutionStartup.Evidence::initialized)
+                    .filter(evidence -> evidence.jobId().equals(nativeJobId)
+                            && evidence.claimGeneration() == claimGeneration
+                            && evidence.executionGeneration() == executionGeneration
+                            && evidence.profileGeneration() == profileGeneration).isPresent();
+        }
+    }
+
+    /** Reads identities from the actual job configuration and native callbacks, never the current holder. */
+    public Optional<NativeRun> nativeRun(String pipelineId) {
+        if (isLost()) {
+            return Optional.empty();
+        }
+        Job job = jobNamed(pipelineId);
+        if (job == null) {
+            return Optional.empty();
+        }
+        Long claim = job.getConfig().getArgument(NativeExecutionStartup.CLAIM_ARGUMENT);
+        Long execution = job.getConfig().getArgument(NativeExecutionStartup.EXECUTION_ARGUMENT);
+        Long profile = job.getConfig().getArgument(NativeExecutionStartup.PROFILE_ARGUMENT);
+        if (claim == null || execution == null || profile == null) {
+            return Optional.empty();
+        }
+        return Optional.of(new NativeRun(Long.toUnsignedString(job.getId()), claim, execution, profile,
+                job.getStatus(), NativeExecutionStartup.read(member, pipelineId)));
+    }
+
+    private static boolean matchesExecution(Job job, long claim, long execution, long profile) {
+        return Objects.equals(job.getConfig().getArgument(NativeExecutionStartup.CLAIM_ARGUMENT), claim)
+                && Objects.equals(job.getConfig().getArgument(NativeExecutionStartup.EXECUTION_ARGUMENT), execution)
+                && Objects.equals(job.getConfig().getArgument(NativeExecutionStartup.PROFILE_ARGUMENT), profile);
+    }
+
     /** Validates and pins placement before capture or graph construction performs a side effect. */
     public void configureNestState(Map<String, String> stateDatabases, NestSettings settings) {
         NestStatePlacement.applyTo(member, stateDatabases, settings);
@@ -159,7 +214,11 @@ public final class Engine {
      * no engine-side re-planning of a changed cluster, and a previous run that has to be over first -- is
      * carried here, so an overload cannot be added that quietly starts a run without any of it.
      */
-    private void submitJob(String pipelineId, DAG dag) {
+    private Job submitJob(String pipelineId, DAG dag) {
+        return submitJob(pipelineId, dag, null, null, null);
+    }
+
+    private Job submitJob(String pipelineId, DAG dag, Long claim, Long execution, Long profile) {
         JobFailureRegistry.of(member).clear(pipelineId);
         awaitPreviousRunOver(pipelineId);
         JobConfig config = new JobConfig()
@@ -173,7 +232,12 @@ public final class Engine {
                 // members changed ends, and what starts in its place is submitted deliberately, once, by
                 // whoever holds the pipeline.
                 .setAutoScaling(false);
-        member.getJet().newJobIfAbsent(dag, config);
+        if (claim != null) {
+            config.setArgument(NativeExecutionStartup.CLAIM_ARGUMENT, claim)
+                    .setArgument(NativeExecutionStartup.EXECUTION_ARGUMENT, execution)
+                    .setArgument(NativeExecutionStartup.PROFILE_ARGUMENT, profile);
+        }
+        return member.getJet().newJobIfAbsent(dag, config);
     }
 
     /**
