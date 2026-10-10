@@ -1,9 +1,15 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.ErrorCategory;
+import com.mongodb.MongoWriteException;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.MongoCursor;
 import com.mongodb.client.gridfs.GridFSBucket;
 import com.mongodb.client.gridfs.model.GridFSFile;
 import com.mongodb.client.gridfs.model.GridFSUploadOptions;
+import com.mongodb.client.model.Accumulators;
+import com.mongodb.client.model.Aggregates;
 import com.mongodb.client.model.Filters;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ConnectorRegistration;
@@ -12,7 +18,9 @@ import io.tapstate.spi.store.ContentHash;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.RegistrationOutcome;
 import io.tapstate.spi.store.RegistrationSource;
+import org.bson.BsonObjectId;
 import org.bson.Document;
+import org.bson.types.ObjectId;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -38,8 +46,41 @@ public final class MongoConnectorRegistry implements ConnectorRegistry {
 
     private final GridFSBucket artifacts;
 
-    public MongoConnectorRegistry(GridFSBucket artifacts) {
-        this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
+    private final MongoCollection<Document> chunks;
+    private final String filesNamespace;
+    private final String contentHashIndex;
+
+    /** Binds the immutable bucket and verifies its content-hash constraint before any registration. */
+    public MongoConnectorRegistry(MongoDatabase database) {
+        Objects.requireNonNull(database, "database");
+        SystemCollections collection = SystemCollections.CONNECTOR_ARTIFACTS;
+        this.artifacts = collection.bucketOn(database);
+        this.chunks = collection.chunksOn(database);
+        MongoCollection<Document> files = collection.indexTargetOn(database);
+        this.filesNamespace = files.getNamespace().getFullName();
+        SystemCollections.IndexSpec index = collection.indexes().stream()
+                .filter(spec -> spec.keys().equals(List.of("filename")) && spec.unique())
+                .findFirst().orElseThrow(() -> new IllegalStateException("content-hash constraint is undeclared"));
+        this.contentHashIndex = index.indexName();
+        StoreIo.run(() -> {
+            Document existing = IndexEnsure.existing(files, index);
+            if (existing != null && (!existing.getBoolean("unique", false)
+                    || !new Document("filename", 1).equals(existing.get("key"))
+                    || existing.getBoolean("sparse", false)
+                    || existing.containsKey("partialFilterExpression"))) {
+                throw unreadable(filesNamespace + "." + contentHashIndex, "index");
+            }
+            if (existing == null) {
+                Document duplicate = files.aggregate(List.of(
+                        Aggregates.group("$filename", Accumulators.sum("count", 1)),
+                        Aggregates.match(Filters.gt("count", 1)), Aggregates.limit(1))).first();
+                if (duplicate != null) {
+                    // Refuse existing corruption without choosing a winner or deleting any bytes.
+                    throw unreadable(String.valueOf(duplicate.get("_id")), "filename");
+                }
+            }
+            IndexEnsure.ensure(database, files, index);
+        });
     }
 
     @Override
@@ -52,12 +93,29 @@ public final class MongoConnectorRegistry implements ConnectorRegistry {
         return StoreIo.call(() -> {
             // register-if-absent: the bytes are stored under their content hash (the filename), so an
             // already-registered artifact is found here and the call is a no-op returning what is stored.
-            GridFSFile existing = artifacts.find(Filters.eq("filename", contentHash)).first();
+            GridFSFile existing = uniqueArtifact(contentHash);
             if (existing != null) {
                 return new RegistrationOutcome(toRegistration(contentHash, existing.getMetadata()), false);
             }
             GridFSUploadOptions options = new GridFSUploadOptions().metadata(metadata(connectorId, pdkApiVersion, source));
-            artifacts.uploadFromStream(contentHash, new ByteArrayInputStream(artifact), options);
+            // Each contender owns a different upload id. A shared deterministic id would let the
+            // driver's failed-upload cleanup remove another contender's chunks.
+            BsonObjectId attempt = new BsonObjectId(new ObjectId());
+            try {
+                artifacts.uploadFromStream(attempt, contentHash, new ByteArrayInputStream(artifact), options);
+            } catch (MongoWriteException e) {
+                if (!isContentHashDuplicate(e, contentHash)) {
+                    throw e;
+                }
+                GridFSFile winner = uniqueArtifact(contentHash);
+                if (winner == null || winner.getId().equals(attempt)) {
+                    throw e;
+                }
+                // The losing file was never published; remove only chunks written by this attempt.
+                // A cleanup failure remains an IO failure rather than claiming an idempotent success.
+                chunks.deleteMany(Filters.eq("files_id", attempt));
+                return new RegistrationOutcome(toRegistration(contentHash, winner.getMetadata()), false);
+            }
             return new RegistrationOutcome(
                     new ConnectorRegistration(connectorId, contentHash, pdkApiVersion, source), true);
         });
@@ -105,7 +163,7 @@ public final class MongoConnectorRegistry implements ConnectorRegistry {
     public Optional<byte[]> artifact(String contentHash) {
         Objects.requireNonNull(contentHash, "contentHash");
         return StoreIo.call(() -> {
-            GridFSFile file = artifacts.find(Filters.eq("filename", contentHash)).first();
+            GridFSFile file = uniqueArtifact(contentHash);
             if (file == null) {
                 return Optional.empty();
             }
@@ -150,14 +208,37 @@ public final class MongoConnectorRegistry implements ConnectorRegistry {
     }
 
     private static TapstateException unreadable(String contentHash) {
+        return unreadable(contentHash, "artifact");
+    }
+
+    private static TapstateException unreadable(String id, String field) {
         return new TapstateException(IoError.DOCUMENT_UNREADABLE,
-                Map.of("id", String.valueOf(contentHash), "field", "artifact"), null);
+                Map.of("id", String.valueOf(id), "field", field), null);
     }
 
     @Override
     public boolean hasArtifact(String contentHash) {
         Objects.requireNonNull(contentHash, "contentHash");
         // The same GridFS lookup artifact() does, stopping before the download.
-        return StoreIo.call(() -> artifacts.find(Filters.eq("filename", contentHash)).first()) != null;
+        return StoreIo.call(() -> uniqueArtifact(contentHash)) != null;
+    }
+
+    private GridFSFile uniqueArtifact(String contentHash) {
+        List<GridFSFile> matches = artifacts.find(Filters.eq("filename", contentHash))
+                .limit(2).into(new ArrayList<>());
+        if (matches.size() > 1) {
+            throw unreadable(contentHash, "filename");
+        }
+        return matches.isEmpty() ? null : matches.getFirst();
+    }
+
+    /** Only the exact declared filename constraint's duplicate is an idempotent registration race. */
+    private boolean isContentHashDuplicate(MongoWriteException failure, String contentHash) {
+        // The sync driver's WriteError details can be empty. Accept only the endpoint's exact
+        // namespace, constraint name and SHA value; an unfamiliar response remains an IO failure.
+        String expected = "E11000 duplicate key error collection: " + filesNamespace
+                + " index: " + contentHashIndex + " dup key: { filename: \"" + contentHash + "\" }";
+        return failure.getError().getCategory() == ErrorCategory.DUPLICATE_KEY
+                && expected.equals(failure.getError().getMessage());
     }
 }

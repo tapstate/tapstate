@@ -84,7 +84,8 @@ public enum SystemCollections {
      */
     CONNECTOR_ARTIFACTS(MongoStorePort.CONNECTOR_ARTIFACTS, Database.STORE, MongoConnectorRegistry.class,
             Strategy.IMMUTABLE, 0, Kind.GRIDFS_BUCKET,
-            new IndexSpec(List.of("metadata.connectorId"), false)),
+            new IndexSpec(List.of("metadata.connectorId"), false),
+            new IndexSpec(List.of("filename"), true)),
 
     /**
      * One coordination record per mining chain. Another line owns what this record means and how its
@@ -265,6 +266,14 @@ public enum SystemCollections {
             throw new IllegalStateException(collectionName + " is a plain collection; ask for the collection");
         }
         return GridFSBuckets.create(database, collectionName);
+    }
+
+    /** The chunks half of a declared bucket, for cleanup of one unpublished upload's own chunks. */
+    public MongoCollection<Document> chunksOn(MongoDatabase database) {
+        if (kind != Kind.GRIDFS_BUCKET) {
+            throw new IllegalStateException(collectionName + " is a plain collection; it has no chunks");
+        }
+        return database.getCollection(physicalNames().get(1));
     }
 
     public String collectionName() {
