@@ -1,0 +1,169 @@
+{
+  "id": "sybase",
+  "name": "Sybase",
+  "displayName": "Sybase",
+  "icon": "icons/sybase.png",
+  "group": "database",
+  "modes": [],
+  "discovery": "catalog",
+  "sink": {
+    "capable": false,
+    "writeSemantics": []
+  },
+  "pushOut": false,
+  "config": [
+    {
+      "name": "host",
+      "type": "string",
+      "label": {
+        "en_US": "Host"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "port",
+      "type": "number",
+      "label": {
+        "en_US": "Port"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "database",
+      "type": "string",
+      "label": {
+        "en_US": "database"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "schema",
+      "type": "string",
+      "label": {
+        "en_US": "Schema"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "username",
+      "type": "string",
+      "label": {
+        "en_US": "username"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "password",
+      "type": "string",
+      "label": {
+        "en_US": "password"
+      },
+      "required": false,
+      "default": null,
+      "secret": true,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "endian",
+      "type": "string",
+      "label": {
+        "en_US": "Endian"
+      },
+      "required": false,
+      "default": "0",
+      "secret": false,
+      "options": [
+        {
+          "value": "0",
+          "label": {
+            "en_US": "Big Endian"
+          }
+        },
+        {
+          "value": "1",
+          "label": {
+            "en_US": "Little Endian"
+          }
+        }
+      ],
+      "visibleWhen": null
+    },
+    {
+      "name": "socketReadTimeOut",
+      "type": "number",
+      "label": {
+        "en_US": "Socket ReadTimeOut (seconds)"
+      },
+      "required": false,
+      "default": "60",
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "logCdcQuery",
+      "type": "string",
+      "label": {
+        "en_US": "Log CDC Query"
+      },
+      "required": false,
+      "default": "1",
+      "secret": false,
+      "options": [
+        {
+          "value": "0",
+          "label": {
+            "en_US": "Read Log"
+          }
+        },
+        {
+          "value": "1",
+          "label": {
+            "en_US": "Query Source"
+          }
+        }
+      ],
+      "visibleWhen": null
+    },
+    {
+      "name": "addtionalString",
+      "type": "string",
+      "label": {
+        "en_US": "Connection Parameter String"
+      },
+      "required": false,
+      "default": "",
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    }
+  ],
+  "provenance": {
+    "specPath": "connectors/sybase-connector/src/main/resources/spec.json",
+    "specContentHash": "041748ee40b3b5f3",
+    "pdkApiVersion": null,
+    "requiredLevel": null,
+    "modeSource": {}
+  }
+}

@@ -1,20 +1,14 @@
 {
-  "id": "sqlserver",
-  "name": "SQL Server",
-  "displayName": "SQL Server",
-  "icon": "icons/mssql.png",
+  "id": "gbase8s",
+  "name": "GBase-8s",
+  "displayName": "GBase 8s",
+  "icon": "icons/gbase8s.png",
   "group": "database",
-  "modes": [
-    "cdc",
-    "snapshot"
-  ],
+  "modes": [],
   "discovery": "catalog",
   "sink": {
-    "capable": true,
-    "writeSemantics": [
-      "upsert",
-      "append"
-    ]
+    "capable": false,
+    "writeSemantics": []
   },
   "pushOut": false,
   "config": [
@@ -22,7 +16,7 @@
       "name": "host",
       "type": "string",
       "label": {
-        "en_US": "DB Address"
+        "en_US": "Host"
       },
       "required": true,
       "default": null,
@@ -37,7 +31,7 @@
         "en_US": "Port"
       },
       "required": true,
-      "default": "1433",
+      "default": null,
       "secret": false,
       "options": [],
       "visibleWhen": null
@@ -46,7 +40,19 @@
       "name": "database",
       "type": "string",
       "label": {
-        "en_US": "DB Name"
+        "en_US": "database"
+      },
+      "required": true,
+      "default": null,
+      "secret": false,
+      "options": [],
+      "visibleWhen": null
+    },
+    {
+      "name": "schema",
+      "type": "string",
+      "label": {
+        "en_US": "schema"
       },
       "required": true,
       "default": null,
@@ -58,9 +64,9 @@
       "name": "user",
       "type": "string",
       "label": {
-        "en_US": "User"
+        "en_US": "username"
       },
-      "required": false,
+      "required": true,
       "default": null,
       "secret": false,
       "options": [],
@@ -70,7 +76,7 @@
       "name": "password",
       "type": "string",
       "label": {
-        "en_US": "Password"
+        "en_US": "password"
       },
       "required": false,
       "default": null,
@@ -79,50 +85,13 @@
       "visibleWhen": null
     },
     {
-      "name": "schema",
-      "type": "string",
-      "label": {
-        "en_US": "Schema"
-      },
-      "required": true,
-      "default": null,
-      "secret": false,
-      "options": [],
-      "visibleWhen": null
-    },
-    {
-      "name": "cdcSolution",
-      "type": "string",
-      "label": {
-        "en_US": "CDC Solution"
-      },
-      "required": false,
-      "default": "CT",
-      "secret": false,
-      "options": [
-        {
-          "value": "CT",
-          "label": {
-            "en_US": "CT"
-          }
-        },
-        {
-          "value": "LogParser",
-          "label": {
-            "en_US": "LogParser"
-          }
-        }
-      ],
-      "visibleWhen": null
-    },
-    {
       "name": "extParams",
       "type": "string",
       "label": {
-        "en_US": "Other connection string parameters"
+        "en_US": "Connection Parameter String"
       },
       "required": false,
-      "default": null,
+      "default": ":delimident=y",
       "secret": false,
       "options": [],
       "visibleWhen": null
@@ -131,7 +100,7 @@
       "name": "timezone",
       "type": "string",
       "label": {
-        "en_US": "Timezone for Datetime"
+        "en_US": "timezone"
       },
       "required": false,
       "default": "",
@@ -301,62 +270,13 @@
         }
       ],
       "visibleWhen": null
-    },
-    {
-      "name": "useSSL",
-      "type": "boolean",
-      "label": {
-        "en_US": "Use SSL/TLS"
-      },
-      "required": false,
-      "default": "false",
-      "secret": false,
-      "options": [],
-      "visibleWhen": null
-    },
-    {
-      "name": "sslKeyPassword",
-      "type": "string",
-      "label": {
-        "en_US": "SSL/TLS Certificate Password"
-      },
-      "required": true,
-      "default": null,
-      "secret": true,
-      "options": [],
-      "visibleWhen": {
-        "controllingField": "useSSL",
-        "equalsAnyOf": [
-          "true"
-        ]
-      }
-    },
-    {
-      "name": "hostNameInCertificate",
-      "type": "string",
-      "label": {
-        "en_US": "Server hostname"
-      },
-      "required": false,
-      "default": null,
-      "secret": false,
-      "options": [],
-      "visibleWhen": {
-        "controllingField": "useSSL",
-        "equalsAnyOf": [
-          "true"
-        ]
-      }
     }
   ],
   "provenance": {
-    "specPath": "connectors/mssql-connector/src/main/resources/mssql-spec.json",
-    "specContentHash": "87de7d6c6902c8a2",
+    "specPath": "connectors/gbase8s-connector/src/main/resources/spec_gbase8s.json",
+    "specContentHash": "a79f02f0760a1b4c",
     "pdkApiVersion": null,
     "requiredLevel": null,
-    "modeSource": {
-      "cdc": "derived",
-      "snapshot": "derived"
-    }
+    "modeSource": {}
   }
 }
