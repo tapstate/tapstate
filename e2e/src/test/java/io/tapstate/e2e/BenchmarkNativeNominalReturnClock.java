@@ -7,11 +7,25 @@ import java.util.Map;
 /** Conditional unrounded nominal bounds; fractional conversion enclosure is not physical clock qualification. */
 final class BenchmarkNativeNominalReturnClock implements BenchmarkReturnPointClock {
     private final BenchmarkNativeReturnClock integerClock;
+    private final List<BenchmarkCausalClock.Sample> samples;
 
     BenchmarkNativeNominalReturnClock(BenchmarkCausalClock.Identity owned, BenchmarkCausalClock.Identity root,
             String library, List<BenchmarkCausalClock.Sample> samples,
             Map<String, Object> before, Map<String, Object> after) {
-        integerClock = new BenchmarkNativeReturnClock(owned, root, library, samples, before, after);
+        if (samples == null || samples.size() < 2 || samples.size() > BenchmarkCausalClock.MAX_SAMPLES) {
+            throw new AssertionError("nominal counter requires a bounded sample roster");
+        }
+        List<BenchmarkCausalClock.Sample> snapshot;
+        try { snapshot = List.copyOf(samples); }
+        catch (NullPointerException corrupt) { throw new AssertionError("nominal counter sample roster contains a missing read", corrupt); }
+        integerClock = new BenchmarkNativeReturnClock(owned, root, library, snapshot, before, after);
+        this.samples = snapshot;
+    }
+
+    void requireCaptureSamples(List<BenchmarkCausalClock.Sample> captured) {
+        if (!samples.equals(captured)) {
+            throw new AssertionError("nominal counter capture sample roster differs from its validated mapping");
+        }
     }
 
     @Override public BenchmarkCausalClock.Interval map(BenchmarkCausalClock.Identity identity, long pointNanos) {

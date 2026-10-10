@@ -1,5 +1,6 @@
 package io.tapstate.e2e;
 
+import io.tapstate.core.common.JsonWriter;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayOutputStream;
@@ -8,6 +9,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -38,6 +40,8 @@ class BenchmarkWriteReturnPhaseEvidenceTest {
         assertThat(evidence.get("formalCommonActiveWindowQualified")).isEqualTo(false);
         assertThat(evidence.get("completionSpanScope")).isEqualTo("FULL_FIXED_COHORT_EARLIEST_TO_LATEST_RETURN");
         assertThat(evidence.get("physicalPerRowCommitTime")).isEqualTo(false);
+        assertThat(evidence).isEqualTo(BenchmarkWriteReturnPhaseEvidence.record(fixture.workload(), fixture.phase(),
+                fixture.batches(), fixture.result(), null));
         assertThatThrownBy(evidence::clear).isInstanceOf(UnsupportedOperationException.class);
         assertThatThrownBy(((List<?>) evidence.get("pagesBase64"))::clear).isInstanceOf(UnsupportedOperationException.class);
     }
@@ -174,6 +178,88 @@ class BenchmarkWriteReturnPhaseEvidenceTest {
                 "owned clock samples are missing");
     }
 
+    @Test
+    void nominalPilotRetainsCompleteRawFactsAndExpandsBothSourceAndReturnQuantizationBounds() throws Exception {
+        Fixture fixture = commonCounterFixture(fixture(BenchmarkWorkloadDefinitions.steadyPilot("copy"), false));
+        var result = fixture.result();
+        var nominal = BenchmarkWriteReturnPhaseEvidence.recordNominal(fixture.workload(), fixture.phase(),
+                fixture.batches(), result, nominalClock(result));
+        var owner = result.samples().getFirst().identity();
+        var integerClock = new BenchmarkNativeReturnClock(owner, ROOT, LIBRARY, result.samples(), cold(owner), cold(owner));
+        var integer = BenchmarkWriteReturnPhaseEvidence.record(fixture.workload(), fixture.phase(), fixture.batches(), result, integerClock);
+        assertThat(integer).containsEntry("state", "CONDITIONAL_NATIVE_COUNTER_RETURN_BOUNDS");
+        assertThat(integer.containsKey("returnTimeCoordinate")).isFalse();
+        assertThat(nominal).containsEntry("state", "CONDITIONAL_UNROUNDED_NOMINAL_RETURN_BOUNDS")
+                .containsEntry("returnTimeCoordinate", "UNROUNDED_NOMINAL_COUNTER_ENCLOSURES")
+                .containsEntry("fullRows", 96_000).containsEntry("fixedCohortRows", 48_000L);
+        for (String field : List.of("p99LatencyNanos", "completionSpanNanos")) {
+            assertThat(bound(nominal, field, "lowerNanos")).isEqualTo(bound(integer, field, "lowerNanos") - 1);
+            assertThat(bound(nominal, field, "upperNanos")).isEqualTo(bound(integer, field, "upperNanos") + 1);
+        }
+        var nominalRate = (Map<?, ?>) nominal.get("throughput"); var integerRate = (Map<?, ?>) integer.get("throughput");
+        assertThat(((Number) nominalRate.get("lowerRecordsPerSecond")).doubleValue())
+                .isLessThanOrEqualTo(((Number) integerRate.get("lowerRecordsPerSecond")).doubleValue());
+        assertThat(((Number) nominalRate.get("upperRecordsPerSecond")).doubleValue())
+                .isGreaterThanOrEqualTo(((Number) integerRate.get("upperRecordsPerSecond")).doubleValue());
+        for (String field : List.of("pagesBase64", "sourceBatches", "clockSamples", "summary", "captureEpoch",
+                "frameCount", "rawPageBytes", "pageCount", "callCount", "fullRows", "fixedCohortRows")) {
+            assertThat(nominal.get(field)).isEqualTo(integer.get(field));
+        }
+        var mapping = (Map<?, ?>) nominal.get("nativeCounterDomainMapping");
+        assertThat(mapping.get("state")).isEqualTo("CONDITIONAL_UNROUNDED_NOMINAL_COUNTER");
+        assertThat(mapping.get("fractionalFloorUpperErrorNominalNanos")).isEqualTo(1L);
+        for (String flag : BenchmarkNativeClockEvidence.FLAGS) {
+            assertThat(mapping.get(flag)).isEqualTo(false); assertThat(nominal.get(flag)).isEqualTo(false);
+        }
+        assertThat(nominal.get("physicalPerRowCommitTime")).isEqualTo(false);
+        assertThat(nominal.get("formalCommonActiveWindowQualified")).isEqualTo(false);
+    }
+
+    @Test
+    void nominalCaptureCannotBorrowCoverageOrRelabelIncompleteDifferentOrMalformedSampleRosters() throws Exception {
+        Fixture fixture = commonCounterFixture(fixture(BenchmarkWorkloadDefinitions.byId("copy"), false));
+        var result = fixture.result(); var clock = nominalClock(result);
+        var samples = new ArrayList<>(result.samples());
+        var second = samples.get(1);
+        samples.set(1, new BenchmarkCausalClock.Sample(second.sequence(), second.identity(),
+                second.driverBeforeNanos(), second.driverAfterNanos() + 1, second.ownedNanos()));
+        // This different serial roster still encloses every call, but it was not the mapper's retained roster.
+        new BenchmarkCausalClock(second.identity(), samples);
+        rejectNominal(fixture, new BenchmarkWriteReturnCapture.Result(result.calls(), samples, result.summary(), result.pagesBase64()),
+                clock, "sample roster differs");
+        samples.set(1, new BenchmarkCausalClock.Sample(second.sequence(), new BenchmarkCausalClock.Identity(17, 1001),
+                second.driverBeforeNanos(), second.driverAfterNanos(), second.ownedNanos()));
+        rejectNominal(fixture, new BenchmarkWriteReturnCapture.Result(result.calls(), samples, result.summary(), result.pagesBase64()),
+                clock, "sample roster differs");
+        for (var missing : List.of(List.<BenchmarkCausalClock.Sample>of(), result.samples().subList(0, 2))) {
+            rejectNominal(fixture, new BenchmarkWriteReturnCapture.Result(result.calls(), missing, result.summary(), result.pagesBase64()),
+                    clock, "sample roster differs");
+        }
+        rejectNominal(fixture, new BenchmarkWriteReturnCapture.Result(result.calls(), result.samples(), result.summary(), result.pagesBase64(),
+                BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL), clock, "complete periodic sample roster");
+        assertThatThrownBy(() -> BenchmarkWriteReturnPhaseEvidence.recordNominal(fixture.workload(), fixture.phase(),
+                fixture.batches(), result, null)).isInstanceOf(AssertionError.class).hasMessageContaining("mapping is missing");
+    }
+
+    @Test
+    void nominalSelectionCannotBypassRawSourceOrTerminalCompletenessChecks() throws Exception {
+        Fixture fixture = commonCounterFixture(fixture(BenchmarkWorkloadDefinitions.byId("copy"), false));
+        var result = fixture.result(); var clock = nominalClock(result); var summary = result.summary();
+        rejectNominal(fixture, new BenchmarkWriteReturnCapture.Result(result.calls(), result.samples(), summary, List.of()),
+                clock, "raw page roster");
+        var changed = new BenchmarkWriteReturnReader.Summary(summary.window(), STATE, summary.completedCalls(), 0,
+                summary.reportedRecords() + 1, 0, summary.retainedBytes());
+        rejectNominal(fixture, new BenchmarkWriteReturnCapture.Result(result.calls(), result.samples(), changed, result.pagesBase64()),
+                clock, "totals disagree");
+        var open = new BenchmarkWriteReturnReader.Summary(summary.window(), STATE, summary.completedCalls(), 0,
+                summary.reportedRecords(), 1, summary.retainedBytes());
+        rejectNominal(fixture, new BenchmarkWriteReturnCapture.Result(result.calls(), result.samples(), open, result.pagesBase64()),
+                clock, "terminal counters are unqualified");
+        assertThatThrownBy(() -> BenchmarkWriteReturnPhaseEvidence.recordNominal(fixture.workload(), fixture.phase(),
+                fixture.batches().subList(1, fixture.batches().size()), result, clock))
+                .isInstanceOf(AssertionError.class).hasMessageContaining("source batch roster");
+    }
+
     private record Fixture(BenchmarkWorkloadDefinitions.Workload workload, BenchmarkWorkloadDefinitions.Phase phase,
             List<BenchmarkForkEnvironment.BatchResult> batches, BenchmarkWriteReturnCapture.Result result) { }
 
@@ -263,5 +349,54 @@ class BenchmarkWriteReturnPhaseEvidenceTest {
     }
     private static void reject(Fixture fixture, BenchmarkWriteReturnCapture.Result result, String reason) {
         assertThatThrownBy(() -> record(fixture, result)).isInstanceOf(AssertionError.class).hasMessageContaining(reason);
+    }
+
+    private static long bound(Map<String, Object> evidence, String field, String limit) {
+        return ((Number) ((Map<?, ?>) evidence.get(field)).get(limit)).longValue();
+    }
+    private static void rejectNominal(Fixture fixture, BenchmarkWriteReturnCapture.Result result,
+            BenchmarkNativeNominalReturnClock clock, String reason) {
+        assertThatThrownBy(() -> BenchmarkWriteReturnPhaseEvidence.recordNominal(fixture.workload(), fixture.phase(),
+                fixture.batches(), result, clock)).isInstanceOf(AssertionError.class).hasMessageContaining(reason);
+    }
+    private static Fixture commonCounterFixture(Fixture original) {
+        var result = original.result();
+        var samples = result.samples().stream().map(sample -> new BenchmarkCausalClock.Sample(sample.sequence(), sample.identity(),
+                sample.ownedNanos(), sample.ownedNanos() + 10, sample.ownedNanos())).toList();
+        return new Fixture(original.workload(), original.phase(), original.batches(),
+                new BenchmarkWriteReturnCapture.Result(result.calls(), samples, result.summary(), result.pagesBase64()));
+    }
+    private static final String LIBRARY = BenchmarkNativeClockEvidenceTest.LIBRARY;
+    private static final BenchmarkCausalClock.Identity ROOT = new BenchmarkCausalClock.Identity(29, 2000);
+    private static BenchmarkNativeNominalReturnClock nominalClock(BenchmarkWriteReturnCapture.Result result) {
+        var owner = result.samples().getFirst().identity();
+        return new BenchmarkNativeNominalReturnClock(owner, ROOT, LIBRARY, result.samples(), cold(owner), cold(owner));
+    }
+    /** Synthetic cold facts reuse the existing complete source, call and raw-page fixtures. */
+    private static Map<String, Object> cold(BenchmarkCausalClock.Identity owner) {
+        var owned = nativeMetadata(owner); var root = nativeMetadata(ROOT);
+        var result = new LinkedHashMap<String, Object>(owned);
+        result.put("rawRetained", true); result.put("raw", JsonWriter.write(owned));
+        result.put("expectedPid", owner.pid()); result.put("expectedJvmStartTimeMillis", owner.jvmStartTimeMillis());
+        result.put("expectedRootPid", ROOT.pid()); result.put("expectedRootJvmStartTimeMillis", ROOT.jvmStartTimeMillis());
+        result.put("matchedRuntimeFlag", "-Dtapstate.benchmark.write-return=true");
+        result.put("matchedNativeClockFlag", "-Dtapstate.benchmark.native-clock-library=" + LIBRARY);
+        result.put("ownedMetadata", owned); result.put("parsedRootMetadata", root);
+        result.put("rootMetadata", Map.of("rawRetained", true, "raw", JsonWriter.write(root)));
+        return result;
+    }
+    private static Map<String, Object> nativeMetadata(BenchmarkCausalClock.Identity owner) {
+        var metadata = BenchmarkNativeClockEvidenceTest.metadataMap(owner);
+        @SuppressWarnings("unchecked") var snapshot = new LinkedHashMap<>((Map<String, Object>) metadata.get("before"));
+        snapshot.put("loadedJniSha256", "4ce1204977af372080e3a3a8ada2c03ce678a15b337e3201f13d30b22a4700c9");
+        snapshot.put("classSha256", "42fffc3e10a70ae503e85c909cac3d5f437c07c2310115a59db875124c53b1f2");
+        snapshot.put("classHashes", Map.of("PdkBenchmarkClock", "42fffc3e10a70ae503e85c909cac3d5f437c07c2310115a59db875124c53b1f2",
+                "PdkBenchmarkClock$Clock", "82c52a87d590e4ac400af03e51827a892d7988e27496883169f817fc83a89751",
+                "PdkBenchmarkClock$JniAccess", "2ccedc46ae98b4ea4e6c79c112a53fc3953efc3c344d2f3e6ba1e4d78eabaeb2",
+                "PdkBenchmarkClock$NativeAccess", "4b67c17ed28c1d341d9e27819563d1d89eb017073b8492f808e35da31f5ddfb7"));
+        snapshot.put("osImageUuid", "f63bf4188f7534a4aaf18caf2b9b6a05"); snapshot.put("osFunctionImageOffsetUnsigned", "4236");
+        snapshot.put("osFunctionCodePrefixSha256", "c615a84440f8ae7325e75d236ace6e038838f5cf634f9bba912d2904c99ff2fd");
+        snapshot.put("userTimebaseSelector", 3L);
+        metadata.put("before", snapshot); metadata.put("after", snapshot); return metadata;
     }
 }

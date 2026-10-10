@@ -23,6 +23,23 @@ final class BenchmarkWriteReturnPhaseEvidence {
     static Map<String, Object> record(BenchmarkWorkloadDefinitions.Workload workload,
             BenchmarkWorkloadDefinitions.Phase phase, List<BenchmarkForkEnvironment.BatchResult> sourceBatches,
             BenchmarkWriteReturnCapture.Result capture, BenchmarkNativeReturnClock nativeClock) {
+        return recordBounded(workload, phase, sourceBatches, capture, nativeClock,
+                "CONDITIONAL_NATIVE_COUNTER_RETURN_BOUNDS", nativeClock == null ? Map.of() : nativeClock.evidence());
+    }
+
+    static Map<String, Object> recordNominal(BenchmarkWorkloadDefinitions.Workload workload,
+            BenchmarkWorkloadDefinitions.Phase phase, List<BenchmarkForkEnvironment.BatchResult> sourceBatches,
+            BenchmarkWriteReturnCapture.Result capture, BenchmarkNativeNominalReturnClock nativeClock) {
+        require(capture != null && nativeClock != null, "actual capture or nominal counter mapping is missing");
+        nativeClock.requireCaptureSamples(capture.samples());
+        return recordBounded(workload, phase, sourceBatches, capture, nativeClock,
+                "CONDITIONAL_UNROUNDED_NOMINAL_RETURN_BOUNDS", nativeClock.evidence());
+    }
+
+    private static Map<String, Object> recordBounded(BenchmarkWorkloadDefinitions.Workload workload,
+            BenchmarkWorkloadDefinitions.Phase phase, List<BenchmarkForkEnvironment.BatchResult> sourceBatches,
+            BenchmarkWriteReturnCapture.Result capture, BenchmarkReturnPointClock mappedClock,
+            String mappedState, Map<String, Object> mappingEvidence) {
         require(workload != null && phase != null && sourceBatches != null
                 && capture != null && capture.summary() != null, "actual capture or source registration is missing");
         var summary = capture.summary();
@@ -42,8 +59,8 @@ final class BenchmarkWriteReturnPhaseEvidence {
         require(cohort == expectedCohort, "fixed cohort is incomplete");
         require(!capture.samples().isEmpty(), "actual owned clock samples are missing");
         var owner = capture.samples().getFirst().identity();
-        BenchmarkReturnPointClock clock = nativeClock == null ? new BenchmarkCausalClock(owner, capture.samples()) : nativeClock;
-        require(nativeClock == null || capture.clockMode() == BenchmarkReturnClockSampler.Mode.PERIODIC,
+        BenchmarkReturnPointClock clock = mappedClock == null ? new BenchmarkCausalClock(owner, capture.samples()) : mappedClock;
+        require(mappedClock == null || capture.clockMode() == BenchmarkReturnClockSampler.Mode.PERIODIC,
                 "common native counter diagnostics require the complete periodic sample roster");
         for (var call : capture.calls()) {
             clock.map(owner, call.beganNanos());
@@ -79,9 +96,13 @@ final class BenchmarkWriteReturnPhaseEvidence {
             }
         }
         Map<String, Object> evidence = new LinkedHashMap<>();
-        evidence.put("state", clockControl ? "RECORDED_CLOCK_COST_CONTROL" : nativeClock == null
-                ? "RECORDED_CAUSAL_RETURN_BOUNDS" : "CONDITIONAL_NATIVE_COUNTER_RETURN_BOUNDS");
-        if (nativeClock != null) { evidence.put("nativeCounterDomainMapping", nativeClock.evidence()); }
+        evidence.put("state", clockControl ? "RECORDED_CLOCK_COST_CONTROL" : mappedClock == null
+                ? "RECORDED_CAUSAL_RETURN_BOUNDS" : mappedState);
+        if (mappedClock != null) { evidence.put("nativeCounterDomainMapping", mappingEvidence); }
+        if (mappedClock instanceof BenchmarkNativeNominalReturnClock) {
+            evidence.put("returnTimeCoordinate", "UNROUNDED_NOMINAL_COUNTER_ENCLOSURES");
+            BenchmarkNativeClockEvidence.FLAGS.forEach(flag -> evidence.put(flag, false));
+        }
         evidence.put("clockSamplingMode", capture.clockMode().name());
         evidence.put("workload", workload.id()); evidence.put("phase", phase.id());
         evidence.put("endpoint", "ordinary nontransactional acknowledged writeRecord successful return");
