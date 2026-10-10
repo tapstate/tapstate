@@ -16,7 +16,7 @@ final class BenchmarkReturnTimeBounds {
 
     /** Each row shares its full call's return bound; this is not a per-row physical commit time. */
     static List<Delivery> map(List<BenchmarkWriteReturnExpectations.Association> associations,
-                              BenchmarkCausalClock.Identity owner, BenchmarkCausalClock clock) {
+                              BenchmarkCausalClock.Identity owner, BenchmarkReturnPointClock clock) {
         require(associations != null && associations.size() <= MAX_ROWS && owner != null && clock != null,
                 "bounded source associations and an owned clock are required");
         List<Delivery> deliveries = new ArrayList<>();

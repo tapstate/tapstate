@@ -37,6 +37,9 @@ class PipelineBenchmarkLiveRunIT {
 
     @Test
     void interleavedRealForksWriteEvidenceAndEnforceTheSelectedGate() throws Exception {
+        if (Boolean.getBoolean(RealBenchmarkForkDriver.NATIVE_COUNTER_DOMAIN_PROPERTY)) {
+            throw new AssertionError("common native counter diagnostics cannot establish a live performance gate");
+        }
         if (System.getProperty(RealBenchmarkForkDriver.NATIVE_CLOCK_LIBRARY_PROPERTY) != null) {
             throw new AssertionError("native clock diagnostic cannot establish a live performance gate");
         }

@@ -7,7 +7,7 @@ import java.util.List;
  * The supplied clock must preserve temporal order within that JVM. This mapper does not establish
  * its resolution, the delay between a write return and its clock read, or instrumentation cost.
  */
-final class BenchmarkCausalClock {
+final class BenchmarkCausalClock implements BenchmarkReturnPointClock {
     static final int MAX_SAMPLES = 512;
 
     record Identity(long pid, long jvmStartTimeMillis) {
@@ -98,7 +98,7 @@ final class BenchmarkCausalClock {
         return samples;
     }
 
-    Interval map(Identity actualIdentity, long ownedPointNanos) {
+    @Override public Interval map(Identity actualIdentity, long ownedPointNanos) {
         if (!identity.equals(actualIdentity)) {
             throw new AssertionError("causal clock point has another or missing owned runtime identity");
         }

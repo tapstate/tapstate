@@ -43,6 +43,51 @@ class BenchmarkNativeClockAdmissionTest {
                 .isInstanceOf(AssertionError.class);
     }
 
+    @Test void common_counter_mapping_is_default_off_and_requires_the_native_isolated_scope() {
+        assertThat(RealBenchmarkForkDriver.nativeCounterDomain(null, null, false, false,
+                BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL, true)).isFalse();
+        assertThat(RealBenchmarkForkDriver.nativeCounterDomain("false", null, false, false,
+                BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL, true)).isFalse();
+        assertThat(RealBenchmarkForkDriver.nativeCounterDomain("true", LIBRARY, true, true,
+                BenchmarkReturnClockSampler.Mode.PERIODIC, false)).isTrue();
+        for (String value : List.of("", "yes", "TRUE")) {
+            assertThatThrownBy(() -> RealBenchmarkForkDriver.nativeCounterDomain(value, LIBRARY, true, true,
+                    BenchmarkReturnClockSampler.Mode.PERIODIC, false)).isInstanceOf(AssertionError.class);
+        }
+        assertThatThrownBy(() -> RealBenchmarkForkDriver.nativeCounterDomain("true", null, true, true,
+                BenchmarkReturnClockSampler.Mode.PERIODIC, false)).isInstanceOf(AssertionError.class);
+        assertThatThrownBy(() -> RealBenchmarkForkDriver.nativeCounterDomain("true", LIBRARY, false, true,
+                BenchmarkReturnClockSampler.Mode.PERIODIC, false)).isInstanceOf(AssertionError.class);
+        assertThatThrownBy(() -> RealBenchmarkForkDriver.nativeCounterDomain("true", LIBRARY, true, false,
+                BenchmarkReturnClockSampler.Mode.PERIODIC, false)).isInstanceOf(AssertionError.class);
+        assertThatThrownBy(() -> RealBenchmarkForkDriver.nativeCounterDomain("true", LIBRARY, true, true,
+                BenchmarkReturnClockSampler.Mode.FIRST_FINAL_CONTROL, false)).isInstanceOf(AssertionError.class);
+        assertThatThrownBy(() -> RealBenchmarkForkDriver.nativeCounterDomain("true", LIBRARY, true, true,
+                BenchmarkReturnClockSampler.Mode.PERIODIC, true)).isInstanceOf(AssertionError.class);
+    }
+
+    @Test void formal_entry_refuses_shared_mapping_before_configuration_without_a_library() {
+        String property = RealBenchmarkForkDriver.NATIVE_COUNTER_DOMAIN_PROPERTY;
+        String previous = System.getProperty(property);
+        try {
+            System.setProperty(property, "true");
+            assertThatThrownBy(() -> new PipelineBenchmarkLiveRunIT()
+                    .interleavedRealForksWriteEvidenceAndEnforceTheSelectedGate())
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("common native counter diagnostics cannot establish");
+        } finally { restore(property, previous); }
+    }
+
+    @Test void driver_refuses_shared_mapping_without_native_before_missing_artifact_access() {
+        String property = RealBenchmarkForkDriver.NATIVE_COUNTER_DOMAIN_PROPERTY;
+        String previous = System.getProperty(property);
+        try {
+            System.setProperty(property, "true");
+            assertThatThrownBy(() -> new RealBenchmarkForkDriver().run(BenchmarkWorkloadDefinitions.steadyPilot("stateless"),
+                    PipelineBenchmarkComparison.Arm.B, 1, Path.of("/missing-shared-counter.jar")))
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("common native counter diagnostics require");
+        } finally { restore(property, previous); }
+    }
+
     @Test void formal_entry_refuses_native_diagnostics_before_configuration_or_fixtures() {
         String property = RealBenchmarkForkDriver.NATIVE_CLOCK_LIBRARY_PROPERTY;
         String previous = System.getProperty(property);

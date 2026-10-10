@@ -98,6 +98,11 @@ class RealBenchmarkForkDriverIT {
                         || arm != PipelineBenchmarkComparison.Arm.B || mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN
                         || forkOutput == null || costStages
                         || System.getProperty(RealBenchmarkForkDriver.WRITE_RETURN_METHOD_CONTROL_PROPERTY) != null);
+        boolean nativeCounterDomain = RealBenchmarkForkDriver.nativeCounterDomain(
+                System.getProperty(RealBenchmarkForkDriver.NATIVE_COUNTER_DOMAIN_PROPERTY), nativeLibrary, writeReturnDiagnostics,
+                Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot"), returnClockMode,
+                conflictingReturnDiagnostics || jvmDiagnostics || costStages
+                        || System.getProperty(RealBenchmarkForkDriver.WRITE_RETURN_METHOD_CONTROL_PROPERTY) != null);
         if (writeReturnDiagnostics && (mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN || forkOutput == null
                 || !Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot")
                 || conflictingReturnDiagnostics)) {
@@ -344,6 +349,7 @@ class RealBenchmarkForkDriverIT {
                     output.put("writeReturnPerformanceAcceptanceEligible", false);
                     if (costStages) { output.put("writeReturnCostStages", true); }
                     if (nativeLibrary != null) { output.put("nativeClockDiagnostic", true); }
+                    if (nativeCounterDomain) { output.put("nativeCounterDomainDiagnostic", true); }
                     output.put("retainedLegacyMeasurementEndpoint", "OPERATION_DATE_AND_OBSERVER_DIAGNOSTICS");
                 }
                 if (threadPointDiagnostics) {

@@ -17,6 +17,12 @@ final class BenchmarkWriteReturnPhaseEvidence {
     static Map<String, Object> record(BenchmarkWorkloadDefinitions.Workload workload,
             BenchmarkWorkloadDefinitions.Phase phase, List<BenchmarkForkEnvironment.BatchResult> sourceBatches,
             BenchmarkWriteReturnCapture.Result capture) {
+        return record(workload, phase, sourceBatches, capture, null);
+    }
+
+    static Map<String, Object> record(BenchmarkWorkloadDefinitions.Workload workload,
+            BenchmarkWorkloadDefinitions.Phase phase, List<BenchmarkForkEnvironment.BatchResult> sourceBatches,
+            BenchmarkWriteReturnCapture.Result capture, BenchmarkNativeReturnClock nativeClock) {
         require(workload != null && phase != null && sourceBatches != null
                 && capture != null && capture.summary() != null, "actual capture or source registration is missing");
         var summary = capture.summary();
@@ -36,7 +42,9 @@ final class BenchmarkWriteReturnPhaseEvidence {
         require(cohort == expectedCohort, "fixed cohort is incomplete");
         require(!capture.samples().isEmpty(), "actual owned clock samples are missing");
         var owner = capture.samples().getFirst().identity();
-        var clock = new BenchmarkCausalClock(owner, capture.samples());
+        BenchmarkReturnPointClock clock = nativeClock == null ? new BenchmarkCausalClock(owner, capture.samples()) : nativeClock;
+        require(nativeClock == null || capture.clockMode() == BenchmarkReturnClockSampler.Mode.PERIODIC,
+                "common native counter diagnostics require the complete periodic sample roster");
         for (var call : capture.calls()) {
             clock.map(owner, call.beganNanos());
             clock.map(owner, call.lastCallbackExitNanos());
@@ -71,7 +79,9 @@ final class BenchmarkWriteReturnPhaseEvidence {
             }
         }
         Map<String, Object> evidence = new LinkedHashMap<>();
-        evidence.put("state", clockControl ? "RECORDED_CLOCK_COST_CONTROL" : "RECORDED_CAUSAL_RETURN_BOUNDS");
+        evidence.put("state", clockControl ? "RECORDED_CLOCK_COST_CONTROL" : nativeClock == null
+                ? "RECORDED_CAUSAL_RETURN_BOUNDS" : "CONDITIONAL_NATIVE_COUNTER_RETURN_BOUNDS");
+        if (nativeClock != null) { evidence.put("nativeCounterDomainMapping", nativeClock.evidence()); }
         evidence.put("clockSamplingMode", capture.clockMode().name());
         evidence.put("workload", workload.id()); evidence.put("phase", phase.id());
         evidence.put("endpoint", "ordinary nontransactional acknowledged writeRecord successful return");

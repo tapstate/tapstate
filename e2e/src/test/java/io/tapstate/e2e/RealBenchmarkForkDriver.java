@@ -31,6 +31,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
     static final String WRITE_RETURN_METHOD_CONTROL_PROPERTY = "tapstate.e2e.benchmark.write-return-method-control";
     static final String WRITE_RETURN_COST_STAGES_PROPERTY = "tapstate.e2e.benchmark.write-return-cost-stages";
     static final String NATIVE_CLOCK_LIBRARY_PROPERTY = "tapstate.benchmark.native-clock-library";
+    static final String NATIVE_COUNTER_DOMAIN_PROPERTY = "tapstate.e2e.benchmark.write-return-native-domain-diagnostics";
 
     /** Local observation intervals distinguish data arrival from subsequent proof reads. */
     record ConfirmationTiming(long sourceMarkerWaitStartedAtNanos, long sourceMarkerWaitCompletedAtNanos,
@@ -369,6 +370,16 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         return value;
     }
 
+    static boolean nativeCounterDomain(String value, String nativeLibrary, boolean diagnostics, boolean pilot,
+            BenchmarkReturnClockSampler.Mode clockMode, boolean conflictingDiagnostics) {
+        if (value == null || "false".equals(value)) { return false; }
+        if (!"true".equals(value) || nativeLibrary == null || !diagnostics || !pilot
+                || clockMode != BenchmarkReturnClockSampler.Mode.PERIODIC || conflictingDiagnostics) {
+            throw new AssertionError("common native counter diagnostics require the isolated original native-clock return pilot");
+        }
+        return true;
+    }
+
     static boolean admitWriteReturnMethodProtocol(String value, boolean diagnostics, boolean pilot,
             BenchmarkReturnClockSampler.Mode clockMode, boolean conflictingDiagnostics) {
         if (value == null) { return false; }
@@ -386,7 +397,7 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         Objects.requireNonNull(arm, "arm");
         var clockMode = writeReturnClockMode(System.getProperty(WRITE_RETURN_CLOCK_CONTROL_PROPERTY),
                 Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY), workload.pilotProfile());
-        nativeClockLibrary(System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY),
+        String selectedNativeLibrary = nativeClockLibrary(System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY),
                 Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY), workload.pilotProfile(), clockMode,
                 !"stateless".equals(workload.id()) || arm != PipelineBenchmarkComparison.Arm.B
                         || System.getProperty(WRITE_RETURN_METHOD_CONTROL_PROPERTY) != null
@@ -398,6 +409,8 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
                                 BenchmarkMongoDeliveryObserver.NATIVE_OPERATION_WALL_EVIDENCE_PROPERTY,
                                 "tapstate.e2e.benchmark-smoke.paced-calibration", "tapstate.e2e.benchmark-smoke.cdc-settling-calibration",
                                 "tapstate.e2e.benchmark-smoke.full-cdc-settling-calibration").stream().anyMatch(Boolean::getBoolean));
+        nativeCounterDomain(System.getProperty(NATIVE_COUNTER_DOMAIN_PROPERTY), selectedNativeLibrary,
+                Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY), workload.pilotProfile(), clockMode, false);
         writeReturnCostStages(System.getProperty(WRITE_RETURN_COST_STAGES_PROPERTY),
                 Boolean.getBoolean(WRITE_RETURN_DIAGNOSTICS_PROPERTY), workload.pilotProfile(), clockMode,
                 !"stateless".equals(workload.id()) || arm != PipelineBenchmarkComparison.Arm.B
@@ -923,14 +936,24 @@ final class RealBenchmarkForkDriver implements PipelineBenchmarkHarness.ForkDriv
         }
         if (writeReturns != null) {
             try {
+                BenchmarkNativeReturnClock nativeReturnClock = null;
+                if (Boolean.getBoolean(NATIVE_COUNTER_DOMAIN_PROPERTY)) {
+                    var owned = writeReturns.samples().getFirst().identity();
+                    var root = new BenchmarkCausalClock.Identity(ProcessHandle.current().pid(),
+                            java.lang.management.ManagementFactory.getRuntimeMXBean().getStartTime());
+                    nativeReturnClock = new BenchmarkNativeReturnClock(owned, root,
+                            System.getProperty(NATIVE_CLOCK_LIBRARY_PROPERTY), writeReturns.samples(),
+                            nativeClockBefore, nativeClockAfter);
+                }
                 Map<String, Object> returnEvidence = new LinkedHashMap<>(BenchmarkWriteReturnPhaseEvidence.record(
-                        workload, phase, issued.batches(), writeReturns));
+                        workload, phase, issued.batches(), writeReturns, nativeReturnClock));
                 if (writeReturns.clockMode() == BenchmarkReturnClockSampler.Mode.PERIODIC) {
                     var associations = BenchmarkWriteReturnExpectations.associate(
                             workload, phase, issued.batches(), writeReturns.calls());
                     var owner = writeReturns.samples().getFirst().identity();
-                    var causalClock = new BenchmarkCausalClock(owner, writeReturns.samples());
-                    var mappedReturns = BenchmarkReturnTimeBounds.map(associations, owner, causalClock);
+                    BenchmarkReturnPointClock returnClock = nativeReturnClock == null
+                            ? new BenchmarkCausalClock(owner, writeReturns.samples()) : nativeReturnClock;
+                    var mappedReturns = BenchmarkReturnTimeBounds.map(associations, owner, returnClock);
                     returnEvidence.put("resourceBounds", BenchmarkReturnResourceBounds.evidence(resources, mappedReturns));
                     returnEvidence.put("commonWindowCertificate", BenchmarkReturnCommonWindow.evidence(mappedReturns));
                 } else {
