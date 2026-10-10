@@ -2,6 +2,7 @@ package io.tapstate.runtime.engine.nest;
 
 import com.hazelcast.map.EntryProcessor;
 import com.hazelcast.map.IMap;
+import io.tapstate.runtime.engine.ProtectedMap;
 import java.io.Serializable;
 import java.util.Collection;
 import java.util.LinkedHashSet;
@@ -43,7 +44,8 @@ final class MapNestStore<S> implements NestStore<S> {
 
     private static final long serialVersionUID = 1L;
 
-    private final IMap<Object, S> map;
+    /** Waits out the cluster refusing an operation on it, one operation at a time, as every operator state does. */
+    private final ProtectedMap<Object, S> map;
     private final NestStateStats stats;
     private final NestStateGauge gauge;
 
@@ -52,7 +54,7 @@ final class MapNestStore<S> implements NestStore<S> {
     }
 
     MapNestStore(IMap<Object, S> map, NestStateStats stats, NestStateGauge gauge) {
-        this.map = Objects.requireNonNull(map, "map");
+        this.map = ProtectedMap.of(Objects.requireNonNull(map, "map"));
         this.stats = stats;
         this.gauge = Objects.requireNonNull(gauge, "gauge");
     }
