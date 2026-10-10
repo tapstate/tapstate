@@ -1,5 +1,7 @@
 package io.tapstate.runtime.scheduler;
 
+import java.util.Collection;
+
 /**
  * Whether a run that has died may be rebuilt, asked once per pipeline per pass while its recorded state
  * is failed and its intent is still to run.
@@ -24,6 +26,12 @@ public interface RebuildAdmission {
 
     /** Records failure context after the checkpoint first enters FAILED. */
     default void recordFailure(String pipelineId) {}
+
+    /**
+     * Forgets whatever is kept for pipelines outside {@code pipelineIds}, which are the pipelines still
+     * desired. Kept past a delete, what a pipeline spent would be handed to the next one created under its id.
+     */
+    default void retain(Collection<String> pipelineIds) {}
 
     /** The answer for a run nothing can rebuild: a single node, where no member left to change anything. */
     static RebuildAdmission never() {

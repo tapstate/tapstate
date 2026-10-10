@@ -131,8 +131,11 @@ class TheFileTargetIsNeverReadHalfWrittenIT {
         apply(theProductsWritePath(), pointedAt(target), theSettledRows(), table);
 
         assertThat(files.count(EndpointAddress.uri(target.toString()), name)).isEqualTo(ROWS);
+        Path lock = file.resolveSibling(CsvConnector.lockNameOf(file.getFileName().toString()));
         try (var entries = Files.list(target)) {
-            assertThat(entries).containsExactly(file);
+            assertThat(entries)
+                    .as("the table and the lock its writes meet on, and nothing staged left beside them")
+                    .containsExactlyInAnyOrder(file, lock);
         }
     }
 

@@ -27,4 +27,13 @@ class ClusterMembershipConfiguration {
     ClusterMembershipGate clusterMembershipGate(ClusterProperties properties) {
         return new ClusterMembershipGate(properties);
     }
+
+    /**
+     * This start of the process, which its member joins the cluster under and its store client is named for. Here
+     * rather than beside either of them because both need the same one, and neither needs the other to exist.
+     */
+    @Bean
+    BootId bootId() {
+        return BootId.fresh();
+    }
 }

@@ -1014,6 +1014,26 @@ class PdkCapturePortTest {
     }
 
     @Test
+    void aSnapshotOnlyReadSkipsTheStreamPositionAndStillYieldsTheRows(@TempDir Path dir) throws Exception {
+        Path jar = Synthetic.positionedSource(dir);
+        PdkCapturePort port = new PdkCapturePort(provisioner(jar, "synthetic.PositionedSource", null));
+        List<Envelope> rows = new ArrayList<>();
+
+        try (CaptureBatch batch = port.snapshotOnly(config("t1"))) {
+            assertThat(batch.seam()).isEmpty();
+            while (batch.hasNext()) {
+                rows.add(batch.next());
+            }
+        }
+
+        assertThat(rows).singleElement().satisfies(row -> {
+            assertThat(row.op()).isEqualTo(Op.READ);
+            assertThat(row.src()).isEqualTo("t1");
+            assertThat(row.after()).containsEntry("id", 1L);
+        });
+    }
+
+    @Test
     void aSnapshotBatchReportsNoSeamWhenTheConnectorNamesNoPosition(@TempDir Path dir) throws Exception {
         // Reporting none is the honest answer, and it is what makes a caller that needs a seam refuse.
         // The failure it replaces is a caller inventing one, which puts the tail somewhere the source

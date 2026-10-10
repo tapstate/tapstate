@@ -4,6 +4,7 @@ import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
@@ -63,6 +64,17 @@ final class ClusterWorkloadClaims {
 
     boolean release(WorkloadClaim expected) {
         return store.release(expected);
+    }
+
+    /**
+     * What the store holds for {@code key} now, or nothing while this member may not hold business claims:
+     * a member that lost the committed majority proves no claim, whatever the store still says it holds.
+     */
+    Optional<WorkloadClaimReading> read(WorkloadClaimKey key) {
+        if (key.type() != WorkloadClaimType.NODE_SESSION && !membership.businessEligible()) {
+            return Optional.empty();
+        }
+        return store.read(key);
     }
 
     Optional<WorkloadClaim> advanceExecution(

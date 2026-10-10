@@ -13,6 +13,7 @@ import io.tapstate.spi.capture.CaptureStart;
 import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
 import io.tapstate.spi.capture.SourcePosition;
+import io.tapstate.spi.capture.SnapshotOnlyCapture;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.SchemaVersion;
@@ -117,6 +118,49 @@ class SnapshotPhaseTest {
         SnapshotPhase.drain(new FakePort(batch), config(), 1L, e -> {});
 
         assertThat(batch.closed).isTrue();
+    }
+
+    @Test
+    void aChainlessLoadOwnsTheOptionalSnapshotOnlyBatchUntilItIsRead() {
+        FakeBatch batch = new FakeBatch(List.of(row(1)));
+        SnapshotOnlyPort port = new SnapshotOnlyPort(batch);
+        CaptureConfig config = multiTableConfig();
+        List<Envelope> sink = new ArrayList<>();
+        List<String> loaded = new ArrayList<>();
+
+        try (SnapshotPhase.Load load = SnapshotPhase.openChainless(port, config, 7L)) {
+            assertThat(port.configs).containsExactly(config);
+            assertThat(batch.closed).isFalse();
+            assertThat(load.tailSeam()).isNull();
+            assertThat(load.read(sink::add, loaded::add)).isEqualTo(1L);
+        }
+
+        assertThat(sink).containsExactly(row(1).withOrder(SourceOrder.snapshotRow(7L)));
+        assertThat(loaded).containsExactly("orders", "customers");
+        assertThat(batch.closed).isTrue();
+    }
+
+    @Test
+    void abandoningAChainlessLoadClosesTheOptionalBatchWithoutReadingIt() {
+        FakeBatch batch = new FakeBatch(List.of(row(1)));
+        SnapshotPhase.Load load = SnapshotPhase.openChainless(new SnapshotOnlyPort(batch), config(), 1L);
+
+        load.close();
+
+        assertThat(batch.closed).isTrue();
+        assertThat(batch.events.hasNext()).isTrue();
+        assertThatThrownBy(() -> load.read(e -> { }, table -> { })).isInstanceOf(CancellationException.class);
+    }
+
+    @Test
+    void aChainlessLoadClosesTheOptionalBatchWhenItsSinkFails() {
+        FakeBatch batch = new FakeBatch(List.of(row(1)));
+        IllegalStateException failure = new IllegalStateException("sink failed");
+
+        try (SnapshotPhase.Load load = SnapshotPhase.openChainless(new SnapshotOnlyPort(batch), config(), 1L)) {
+            assertThatThrownBy(() -> load.read(e -> { throw failure; }, table -> { })).isSameAs(failure);
+            assertThat(batch.closed).isTrue();
+        }
     }
 
     @Test
@@ -240,6 +284,60 @@ class SnapshotPhaseTest {
         // that starts after the delete. It stays in the target for good, with nothing thrown and nothing
         // logged. The seam and the generation are one recorded pair, and a resume reuses both or neither.
         assertThat(meta.cdcStart).isEqualTo("binlog.000042:1024");
+        assertThat(meta.pinnedEpoch).isEqualTo(1L);
+    }
+
+    @Test
+    void aLegacyPartialLoadKeepsItsRecordedSeamWithoutACheckpoint() {
+        SrsMeta legacy = new SrsMeta("chain", null,
+                List.of(new ConsumerOffset(PIPE, Map.of(), null, List.of("orders"), "first-seam", 0L)),
+                List.of(), null, 2L);
+        RecordingMeta meta = new RecordingMeta(new ArrayList<>(), legacy);
+        FakePort port = new FakePort(Map.of("customers", new FakeBatch(List.of(row("customers", 1)), "new-seam")));
+        List<Envelope> sink = new ArrayList<>();
+
+        SnapshotPhase.Outcome outcome = SnapshotPhase.run(
+                port, multiTableConfig(), "chain", PIPE, List.of("orders", "customers"), 2L, meta, sink::add);
+
+        assertThat(port.asked).containsExactly(List.of("customers"));
+        assertThat(outcome.tailSeam()).isEqualTo("first-seam");
+        assertThat(meta.cdcStart).isEqualTo("first-seam");
+        assertThat(meta.pinnedEpoch).isEqualTo(2L);
+        assertThat(sink).extracting(event -> event.position().order()).containsOnly(SourceOrder.snapshotRow(2L));
+    }
+
+    @Test
+    void aLegacyLoadOfEverySelectedTableSamplesANewSeam() {
+        ChainPosition checkpoint = new ChainPosition(new SourceOrder(1L, 7L), "prior-checkpoint");
+        SrsMeta legacy = new SrsMeta("chain", checkpoint,
+                List.of(new ConsumerOffset(PIPE, Map.of(), checkpoint, List.of("customers"), "first-seam", 0L)),
+                List.of(), null, 2L);
+        RecordingMeta meta = new RecordingMeta(new ArrayList<>(), legacy);
+
+        SnapshotPhase.Outcome outcome = SnapshotPhase.run(
+                new FakePort(new FakeBatch(List.of(row(1)), "new-seam")), config(), "chain", PIPE,
+                List.of("orders"), 2L, meta, event -> { });
+
+        assertThat(outcome.rows()).isEqualTo(1L);
+        assertThat(outcome.tailSeam()).isEqualTo("new-seam");
+        assertThat(meta.cdcStart).isEqualTo("new-seam");
+        assertThat(meta.pinnedEpoch).isEqualTo(2L);
+    }
+
+    @Test
+    void aPartialLoadWithARecordedGenerationKeepsItsEarlierSeam() {
+        ChainPosition checkpoint = new ChainPosition(new SourceOrder(1L, 7L), "later-checkpoint");
+        SrsMeta retained = new SrsMeta("chain", checkpoint,
+                List.of(new ConsumerOffset(PIPE, Map.of(), checkpoint, List.of("orders"), "first-seam", 1L)),
+                List.of(), null, 2L);
+        RecordingMeta meta = new RecordingMeta(new ArrayList<>(), retained);
+
+        SnapshotPhase.Outcome outcome = SnapshotPhase.run(
+                new FakePort(new FakeBatch(List.of(row("customers", 1)), "new-seam")), multiTableConfig(),
+                "chain", PIPE, List.of("orders", "customers"), 2L, meta, event -> { });
+
+        assertThat(outcome.tailSeam()).isEqualTo("first-seam");
+        assertThat(meta.cdcStart).isEqualTo("first-seam");
         assertThat(meta.pinnedEpoch).isEqualTo(1L);
     }
 
@@ -731,6 +829,26 @@ class SnapshotPhaseTest {
         @Override
         public void close() {
             closed = true;
+        }
+    }
+
+    private static final class SnapshotOnlyPort extends FakePort implements SnapshotOnlyCapture {
+        private final FakeBatch snapshotOnlyBatch;
+
+        SnapshotOnlyPort(FakeBatch batch) {
+            super(batch);
+            snapshotOnlyBatch = batch;
+        }
+
+        @Override
+        public CaptureBatch snapshot(CaptureConfig config) {
+            throw new AssertionError("a snapshot-only read must not request a seam for a change tail");
+        }
+
+        @Override
+        public CaptureBatch snapshotOnly(CaptureConfig config) {
+            configs.add(config);
+            return snapshotOnlyBatch;
         }
     }
 

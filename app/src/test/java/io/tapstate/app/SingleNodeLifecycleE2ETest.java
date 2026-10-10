@@ -75,9 +75,12 @@ class SingleNodeLifecycleE2ETest {
         Clock clock = Clock.fixed(T0, ZoneOffset.UTC);
         storePort = new InMemoryStorePort();
         Engine engine = new Engine(member);
+        // The plans a start records and a stop lets go of are kept on the member, as the server keeps them, so a
+        // verb that asks the member about them where it can no longer answer is caught here.
         EngineLifecycleActuator actuator =
                 new EngineLifecycleActuator(engine, new IdleDagSource(), new NoOpCaptureCoordinator(),
-                        new NestStateTeardown(member, storePort.keyedState(), storePort.nestDeadLetters()));
+                        new NestStateTeardown(member, storePort.keyedState(), storePort.nestDeadLetters()),
+                        PipelineActuationOwnership.single(), new HazelcastExecutionPlans(member), clock);
         PipelineConverger converger = new PipelineConverger(storePort.desired(), storePort.state(), actuator, clock);
         ObservationPublisher publisher = new ObservationPublisher(storePort.state(), storePort.observations());
         driver = new ConvergenceDriver(converger, storePort.desired(), publisher);

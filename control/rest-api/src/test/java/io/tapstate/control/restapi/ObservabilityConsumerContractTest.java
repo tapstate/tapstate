@@ -1,5 +1,7 @@
 package io.tapstate.control.restapi;
 
+import io.tapstate.control.core.ControlApiSchema;
+import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.EffectiveHistoryResolution;
 import io.tapstate.control.core.PipelineExplanation;
 import io.tapstate.control.core.PipelineMetricsHistory;
@@ -13,14 +15,17 @@ import io.tapstate.control.core.PipelineMetricsHistory.Segment;
 import io.tapstate.control.core.PipelineMetricsHistory.StartReason;
 import io.tapstate.control.core.PipelineMetricsHistory.Status;
 import io.tapstate.control.core.PipelineMetricsHistory.Unavailable;
+import io.tapstate.core.lifecycle.ExecutionPlan;
 import io.tapstate.core.lifecycle.PipelineState;
 import org.junit.jupiter.api.Test;
 import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -59,7 +64,8 @@ class ObservabilityConsumerContractTest {
                 "explain-frontier-stalled.golden.json",
                 "explain-no-match.golden.json",
                 "explain-unknown.golden.json",
-                "explain-start-pending.golden.json");
+                "explain-start-pending.golden.json",
+                "explain-with-plan.golden.json");
     }
 
     @Test
@@ -239,6 +245,152 @@ class ObservabilityConsumerContractTest {
         assertGolden(PipelineExplanationResponse.of(noMatch), "explain-no-match.golden.json");
         assertGolden(PipelineExplanationResponse.of(unknown), "explain-unknown.golden.json");
         assertGolden(PipelineExplanationResponse.of(pending), "explain-start-pending.golden.json");
+
+        // The plan the run was submitted on, beside the diagnosis: a source held to one processor for the
+        // cluster, which has no per-member count to send, and a sink worked out to three per member - rebuilt on
+        // three members after a run on four, so the sink's width moved and says what moved it, and a fifth member
+        // that joined since waits for a rebalance.
+        ExecutionPlan.Node source = new ExecutionPlan.Node("orders_src", 1, "node-default", "total-one", 3, null, 1,
+                List.of("requested-one", "source-reads-not-split"), 1024, 0L, List.of("orders_src"));
+        ExecutionPlan before = new ExecutionPlan("orders", 3L, 6L, 11L, List.of("m1", "m2", "m3", "m4"),
+                List.of(source, new ExecutionPlan.Node("orders_sink", 8, "explicit", "native", 4, 2, 8, List.of(),
+                        512, 50L, List.of("route.orders_sink", "orders_sink"))),
+                Instant.parse("2026-09-20T09:40:00Z"));
+        PipelineExplanation planned = noMatch.withPlan(new ExecutionPlan("orders", 3L, 7L, 11L,
+                List.of("m1", "m2", "m3"),
+                List.of(source,
+                        new ExecutionPlan.Node("orders_sink", 8, "explicit", "native", 3, 3, 9,
+                                List.of("rounded-up"), 512, 50L, List.of("route.orders_sink", "orders_sink"))
+                                .withResources(new ExecutionPlan.Resources(9, "isolated", 9, 9_216L, 175_104L))),
+                Instant.parse("2026-09-20T09:58:00Z")).replacing(before), List.of("m5"));
+        assertGolden(PipelineExplanationResponse.of(planned), "explain-with-plan.golden.json");
+    }
+
+    /**
+     * The explain result's published schema is closed, so a strict consumer refuses any field it does not name.
+     * Every explanation fixture is therefore held to it, key by key: a field added to the answer and not to the
+     * schema passes every other case here and is refused by exactly the consumer the schema was published for.
+     */
+    @Test
+    void everyExplanationFixtureIsAdmittedByThePublishedClosedSchema() throws Exception {
+        Map<?, ?> schema = ControlApiSchema.resolve(ControlOperations.PIPELINE_EXPLAIN.schema().result());
+
+        for (String fixture : List.of(
+                "explain-stale.golden.json",
+                "explain-coded-failure.golden.json",
+                "explain-reconcile-failures.golden.json",
+                "explain-no-movement.golden.json",
+                "explain-frontier-stalled.golden.json",
+                "explain-no-match.golden.json",
+                "explain-unknown.golden.json",
+                "explain-start-pending.golden.json",
+                "explain-with-plan.golden.json")) {
+            Object answer = JSON.readValue(golden(fixture), Object.class);
+
+            assertThat(refusals("$", answer, schema)).as(fixture).isEmpty();
+        }
+    }
+
+    /**
+     * A run on a single member is fenced by nothing, so its plan names no generations - and every fixture's plan
+     * names them. Held to the schema here as well: a schema that required them would refuse exactly the answer
+     * a server that is no cluster member sends, and no fixture would say so.
+     */
+    @Test
+    void aPlanNamingNoGenerationsIsAdmittedByThePublishedClosedSchema() throws Exception {
+        Map<?, ?> schema = ControlApiSchema.resolve(ControlOperations.PIPELINE_EXPLAIN.schema().result());
+        PipelineExplanation unfenced = new PipelineExplanation(
+                "orders", PipelineState.RUNNING, PipelineExplanation.Kind.NO_MATCH,
+                "No diagnostic rule matched.", FROM, 1_000L, PipelineExplanation.Freshness.FRESH, List.of(),
+                List.of("Whether the source has changes waiting is not measured."), null, null)
+                .withPlan(new ExecutionPlan("orders", null, null, null, List.of("local"),
+                        List.of(new ExecutionPlan.Node("orders_sink", 4, "node-default", "native", 1, 4, 4,
+                                List.of(), 1024, 0L, List.of("orders_sink"))),
+                        FROM.minusSeconds(60)));
+
+        Object answer = JSON.readValue(JSON.writeValueAsString(PipelineExplanationResponse.of(unfenced)),
+                Object.class);
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> plan = (Map<String, Object>) ((Map<String, Object>) answer).get("plan");
+        assertThat(plan).doesNotContainKey("claimGeneration").containsKey("nodes");
+        assertThat(refusals("$", answer, schema)).isEmpty();
+    }
+
+    /**
+     * Where {@code schema} refuses {@code value}, by path. A closed object admits only the properties it names and
+     * needs every one it requires; an array admits items its item schema admits; a one-of admits what any of its
+     * branches admits; a typed scalar admits a value of that type, within its enum and minimum where it has them;
+     * and a schema naming no type admits any value.
+     */
+    private static List<String> refusals(String path, Object value, Map<?, ?> schema) {
+        List<String> refused = new ArrayList<>();
+        if (schema.get("oneOf") instanceof List<?> branches) {
+            if (branches.stream().noneMatch(branch -> refusals(path, value, (Map<?, ?>) branch).isEmpty())) {
+                refused.add(path + ": no branch admits " + value);
+            }
+            return refused;
+        }
+        if (!(schema.get("type") instanceof String type)) {
+            return refused;
+        }
+        switch (type) {
+            case "null" -> {
+                if (value != null) {
+                    refused.add(path + ": not null");
+                }
+            }
+            case "boolean" -> {
+                if (!(value instanceof Boolean)) {
+                    refused.add(path + ": not a boolean");
+                }
+            }
+            case "string" -> {
+                if (!(value instanceof String text)) {
+                    refused.add(path + ": not a string");
+                } else if (schema.get("enum") instanceof List<?> allowed && !allowed.contains(text)) {
+                    refused.add(path + ": " + text + " is not one of " + allowed);
+                }
+            }
+            case "integer", "number" -> {
+                boolean integral = value instanceof Integer || value instanceof Long || value instanceof BigInteger;
+                if (!(value instanceof Number number) || "integer".equals(type) && !integral) {
+                    refused.add(path + ": not an " + type);
+                } else if (schema.get("minimum") instanceof Number minimum
+                        && number.doubleValue() < minimum.doubleValue()) {
+                    refused.add(path + ": below " + minimum);
+                }
+            }
+            case "array" -> {
+                if (!(value instanceof List<?> items)) {
+                    refused.add(path + ": not an array");
+                } else {
+                    for (int i = 0; i < items.size(); i++) {
+                        refused.addAll(refusals(path + "[" + i + "]", items.get(i), (Map<?, ?>) schema.get("items")));
+                    }
+                }
+            }
+            case "object" -> {
+                if (!(value instanceof Map<?, ?> object)) {
+                    refused.add(path + ": not an object");
+                    break;
+                }
+                Map<?, ?> properties = (Map<?, ?>) schema.get("properties");
+                if (schema.get("required") instanceof List<?> required) {
+                    required.stream().filter(key -> !object.containsKey(key))
+                            .forEach(key -> refused.add(path + "." + key + ": required and absent"));
+                }
+                object.forEach((key, field) -> {
+                    if (properties.get(key) instanceof Map<?, ?> property) {
+                        refused.addAll(refusals(path + "." + key, field, property));
+                    } else if (Boolean.FALSE.equals(schema.get("additionalProperties"))) {
+                        refused.add(path + "." + key + ": not a property this closed object names");
+                    }
+                });
+            }
+            default -> refused.add(path + ": no reading of schema type " + type);
+        }
+        return refused;
     }
 
     private static PipelineMetricsHistory history(

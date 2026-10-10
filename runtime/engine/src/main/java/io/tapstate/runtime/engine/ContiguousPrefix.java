@@ -144,6 +144,11 @@ final class ContiguousPrefix implements SinkFrontier {
         }
     }
 
+    @Override
+    public String chainOf(Watermark bound) {
+        return axes == null ? null : axes.chainOn(bound.key());
+    }
+
     /**
      * Reports no distance. A bound does run ahead of this frontier now, but only for as long as the writes
      * it covers take to settle - it is handed over once nothing is left in flight, and acted on there and

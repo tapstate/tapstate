@@ -12,6 +12,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -176,12 +178,9 @@ class ALargeRebuildIsVisibleWhileItRunsIT {
             // difference is the point: the size is read off the index as pages times a page, so a
             // reading written to report what the rebuild set out to do would say 12000 and be believed
             // whatever the rebuild actually managed.
-            Await.until("the rebuild to stop advancing", SETTLE,
-                    () -> {
-                        Long done = control.metricsNamed(PIPELINE_ID, DONE).get(DONE + subject);
-                        return done != null && done == mongo.count(
-                                target, TARGET, Map.of("customer_name", "adelaide"));
-                    },
+            awaitRebuildToStopAdvancing(
+                    () -> control.metricsNamed(PIPELINE_ID, DONE).get(DONE + subject),
+                    () -> mongo.count(target, TARGET, Map.of("customer_name", "adelaide")),
                     () -> rebuildReadings(control) + " against "
                             + mongo.count(target, TARGET, Map.of("customer_name", "adelaide"))
                             + " rows carrying the new name");
@@ -238,6 +237,17 @@ class ALargeRebuildIsVisibleWhileItRunsIT {
                     .as("and no fact carries the namespace, let alone a row's key, in its name")
                     .noneMatch(name -> name.contains(subject) || name.contains("/"));
         }
+    }
+
+    static void awaitRebuildToStopAdvancing(Supplier<Long> rowsSent, LongSupplier targetRows,
+            Supplier<String> lastReading) {
+        Await.until("all " + LOUD_ORDERS + " rebuilt rows to reach the target with matching progress", SETTLE,
+                () -> {
+                    Long done = rowsSent.get();
+                    // A partial delivery can agree with progress while the walk still owes rows.
+                    // The seeded fan-out is known exactly, independently of the index estimate.
+                    return done != null && done == LOUD_ORDERS && done == targetRows.getAsLong();
+                }, lastReading);
     }
 
     /**
