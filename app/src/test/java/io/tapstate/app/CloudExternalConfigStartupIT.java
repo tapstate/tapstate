@@ -5,7 +5,14 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mongodb.client.MongoClients;
 import com.sun.net.httpserver.HttpServer;
 import io.tapstate.adapters.mongostore.SystemCollections;
+import io.tapstate.adapters.mongostore.MongoConnection;
+import io.tapstate.adapters.mongostore.MongoConnectionSettings;
+import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.control.restapi.RuntimeVersion;
+import io.tapstate.core.model.Metadata;
+import io.tapstate.core.model.SourceResource;
+import io.tapstate.spi.store.ArtifactMutation;
+import io.tapstate.spi.store.ContentHash;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.AfterEach;
@@ -32,6 +39,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.EnumMap;
@@ -58,7 +66,7 @@ class CloudExternalConfigStartupIT {
     private static final String READY = "Tapstate application is ready";
     private static final String PASSWORD = "startup-onprem-password-sentinel";
     private static final Set<String> CONNECTORS = Set.of(
-            "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql");
+            "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2");
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final Pattern HTTP_PORT = Pattern.compile("Tomcat started on port (\\d+)");
     private static final HttpClient HTTP = HttpClient.newBuilder()
@@ -169,16 +177,29 @@ class CloudExternalConfigStartupIT {
         first.awaitReady();
         assertVersion(first);
         awaitStatusReport(0, first);
-        Document managedView;
+        Document storedWitness;
+        String keyring;
+        SourceResource witness = new SourceResource("restart_witness",
+                new Metadata(Map.of("fixture", "external-config-startup"), "restart witness", true, "fixture-user"),
+                "mongodb", Map.of("uri", MONGO.getReplicaSetUrl(selected + "_pipeline_input")),
+                null, null, null, null);
         try (var raw = MongoClients.create(MONGO.getReplicaSetUrl())) {
             var selectedDb = raw.getDatabase(selected);
             assertThat(selectedDb.listCollectionNames().into(new ArrayList<>()))
                     .contains(SystemCollections.ARTIFACTS.collectionName());
-            managedView = selectedDb.getCollection(SystemCollections.ARTIFACTS.collectionName())
-                    .find().first();
-            assertThat(managedView).isNotNull();
+            assertNoAutomaticCloudSource(selectedDb);
             assertConnectors(raw.getDatabase(selected), CONNECTORS);
             assertThat(raw.getDatabase(ignored).listCollectionNames().into(new ArrayList<>())).isEmpty();
+            try (var connection = metadataConnection(selected)) {
+                connection.verify();
+                var store = new MongoStorePort(connection, selected + "_operator");
+                assertThat(store.artifacts().create(witness)).isEqualTo(ArtifactMutation.CREATED);
+                assertThat(store.artifacts().get(witness.id())).contains(witness);
+            }
+            storedWitness = selectedDb.getCollection(SystemCollections.ARTIFACTS.collectionName())
+                    .find(new Document("_id", witness.id())).first();
+            assertThat(storedWitness).isNotNull();
+            keyring = keyringFingerprint(selectedDb);
         }
         first.close();
         int previousReports = statusReports.size();
@@ -187,9 +208,20 @@ class CloudExternalConfigStartupIT {
         assertVersion(restarted);
         try (var raw = MongoClients.create(MONGO.getReplicaSetUrl())) {
             assertThat(raw.getDatabase(selected).getCollection(SystemCollections.ARTIFACTS.collectionName())
-                    .find(new Document("_id", managedView.get("_id"))).first()).isEqualTo(managedView);
+                    .find(new Document("_id", witness.id())).first()).isEqualTo(storedWitness);
+            assertThat(raw.getDatabase(selected).getCollection(SystemCollections.ARTIFACTS.collectionName())
+                    .find(new Document("_id", ViewTargetResolver.STATE_STORE_SOURCE_ID)).first()).isNull();
+            assertThat(raw.getDatabase(selected).getCollection(SystemCollections.ARTIFACTS.collectionName())
+                    .find(new Document("kind", "source")).into(new ArrayList<>()))
+                    .extracting(document -> document.getString("_id")).containsExactly(witness.id());
+            assertThat(keyringFingerprint(raw.getDatabase(selected))).isEqualTo(keyring);
             assertThat(raw.getDatabase(ignored).listCollectionNames().into(new ArrayList<>())).isEmpty();
             assertConnectors(raw.getDatabase(selected), CONNECTORS);
+        }
+        try (var connection = metadataConnection(selected)) {
+            connection.verify();
+            assertThat(new MongoStorePort(connection, selected + "_operator").artifacts().get(witness.id()))
+                    .contains(witness);
         }
         awaitStatusReport(previousReports, restarted);
         assertSafeOutput(first, values.get("tapstate.cloud.atlas-uri"));
@@ -257,6 +289,8 @@ class CloudExternalConfigStartupIT {
                             .contains(SystemCollections.ARTIFACTS.collectionName());
                     assertConnectors(raw.getDatabase(database),
                             distribution == Distribution.CLOUD ? CONNECTORS : Set.of());
+                    if (distribution == Distribution.CLOUD) assertNoAutomaticCloudSource(raw.getDatabase(database));
+                    else assertDefaultOnPremSource(raw.getDatabase(database));
                 }
                 assertSafeOutput(running, uri);
                 assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(90));
@@ -319,9 +353,13 @@ class CloudExternalConfigStartupIT {
         assertThat(running.post("/auth/bootstrap", "{\"username\":\"startup-admin\",\"password\":\""
                 + PASSWORD + "\"}").statusCode()).isEqualTo(204);
         assertLocalLogin(running);
+        Document managedView;
+        String keyring;
         try (var raw = MongoClients.create(MONGO.getReplicaSetUrl())) {
             assertThat(raw.getDatabase(database).listCollectionNames().into(new ArrayList<>()))
                     .contains(SystemCollections.ARTIFACTS.collectionName());
+            managedView = assertDefaultOnPremSource(raw.getDatabase(database));
+            keyring = keyringFingerprint(raw.getDatabase(database));
             assertConnectors(raw.getDatabase(database), Set.of());
         }
         running.close();
@@ -329,6 +367,11 @@ class CloudExternalConfigStartupIT {
         restarted.awaitReady();
         assertVersion(restarted);
         assertLocalLogin(restarted);
+        try (var raw = MongoClients.create(MONGO.getReplicaSetUrl())) {
+            assertThat(assertDefaultOnPremSource(raw.getDatabase(database))).isEqualTo(managedView);
+            assertThat(keyringFingerprint(raw.getDatabase(database))).isEqualTo(keyring);
+            assertConnectors(raw.getDatabase(database), Set.of());
+        }
         assertThat(cloudRequests.get()).isZero();
         assertSafeOutput(running, null);
         assertSafeOutput(restarted, null);
@@ -496,6 +539,33 @@ class CloudExternalConfigStartupIT {
                 .find().into(new ArrayList<>()))
                 .extracting(document -> document.get("metadata", Document.class).getString("connectorId"))
                 .containsExactlyInAnyOrderElementsOf(expected);
+    }
+
+    private static void assertNoAutomaticCloudSource(com.mongodb.client.MongoDatabase database) {
+        var artifacts = database.getCollection(SystemCollections.ARTIFACTS.collectionName());
+        assertThat(artifacts.find(new Document("_id", ViewTargetResolver.STATE_STORE_SOURCE_ID)).first()).isNull();
+        assertThat(artifacts.countDocuments(new Document("kind", "source"))).isZero();
+    }
+
+    private static Document assertDefaultOnPremSource(com.mongodb.client.MongoDatabase database) {
+        Document source = database.getCollection(SystemCollections.ARTIFACTS.collectionName())
+                .find(new Document("_id", ViewTargetResolver.STATE_STORE_SOURCE_ID)).first();
+        assertThat(source).isNotNull();
+        assertThat(source.getString("kind")).isEqualTo("source");
+        assertThat(source.get("body", Document.class).getString("connector")).isEqualTo("mongodb");
+        return source;
+    }
+
+    private static String keyringFingerprint(com.mongodb.client.MongoDatabase database) {
+        Document keyring = database.getCollection(SystemCollections.SYSTEM_META.collectionName())
+                .find(new Document("_id", "source-config-keyring")).first();
+        assertThat(keyring).isNotNull();
+        return ContentHash.of(keyring.toJson().getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static MongoConnection metadataConnection(String database) {
+        return new MongoConnection(new MongoConnectionSettings(
+                MONGO.getReplicaSetUrl(database), null, Duration.ofSeconds(5)));
     }
 
     private static void assertAbsent(Running running, String... secrets) throws IOException {
