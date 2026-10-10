@@ -48,6 +48,15 @@ interface PipelineCaptureCoordinator {
     void stopCapture(String pipelineId, boolean purgeState);
 
     /**
+     * Whether a capture started for the pipeline is still open on this member: started, and not stopped since.
+     * The run it was opened for may be over all the same -- a job lost with a member ends with no stop -- so an
+     * open capture is not by itself a pipeline that is running. A coordinator that runs no capture holds none.
+     */
+    default boolean isCapturing(String pipelineId) {
+        return false;
+    }
+
+    /**
      * The failure a running pipeline's capture died with, or empty while it is healthy. The load and the cdc
      * stream both run on threads of their own feeding what the Jet job reads, so a read that dies leaves the
      * job running over a quiet hand-off or ring; this is how the actuator seam surfaces that death for the

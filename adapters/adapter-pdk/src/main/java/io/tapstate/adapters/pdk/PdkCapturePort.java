@@ -15,6 +15,7 @@ import io.tapstate.spi.capture.FieldSchema;
 import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.SharedNotes;
 import io.tapstate.spi.capture.SnapshotSession;
+import io.tapstate.spi.capture.SnapshotOnlyCapture;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.capture.TableSchema;
@@ -68,7 +69,7 @@ import java.util.function.LongSupplier;
  * stream failure reaches the caller and the backpressure that bounds the stream belong to the runtime that
  * owns stream execution, not to this port.
  */
-public final class PdkCapturePort implements CapturePort, SnapshotSession.Provider {
+public final class PdkCapturePort implements CapturePort, SnapshotSession.Provider, SnapshotOnlyCapture {
 
     private static final Logger LOG = LoggerFactory.getLogger(PdkCapturePort.class);
 
@@ -164,6 +165,15 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
 
     @Override
     public CaptureBatch snapshot(CaptureConfig config) {
+        return snapshot(config, true);
+    }
+
+    @Override
+    public CaptureBatch snapshotOnly(CaptureConfig config) {
+        return snapshot(config, false);
+    }
+
+    private CaptureBatch snapshot(CaptureConfig config, boolean sampleSeam) {
         PdkConnector connector = open(config);
         BatchReadFunction batch;
         try {
@@ -180,7 +190,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
         // on close afterwards.
         return PdkCaptureBatch.start(
                 connector,
-                reading -> read(connector, () -> batchRead(connector, config, batch, reading)),
+                reading -> read(connector, () -> batchRead(connector, config, batch, reading, sampleSeam)),
                 "tapstate-snapshot-" + connector.connectorId());
     }
 
@@ -221,7 +231,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
                     reading -> PdkCapturePort.read(connector, () -> {
                         PreparedSnapshot snapshot = prepared.get();
                         if (snapshot == null) {
-                            snapshot = prepareSnapshot(connector, config);
+                            snapshot = prepareSnapshot(connector, config, true);
                             prepared.set(snapshot);
                         }
                         reading.seamSampled(snapshot.seam());
@@ -693,8 +703,8 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
      * of the same kind and still land as text.
      */
     private Void batchRead(PdkConnector connector, CaptureConfig config, BatchReadFunction batch,
-            PdkCaptureBatch reading) throws Throwable {
-        PreparedSnapshot snapshot = prepareSnapshot(connector, config);
+            PdkCaptureBatch reading, boolean sampleSeam) throws Throwable {
+        PreparedSnapshot snapshot = prepareSnapshot(connector, config, sampleSeam);
         reading.seamSampled(snapshot.seam());
         List<String> streams = config.streams().isEmpty()
                 ? new ArrayList<>(snapshot.discovered().keySet()) : config.streams();
@@ -704,7 +714,8 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
         return null;
     }
 
-    private PreparedSnapshot prepareSnapshot(PdkConnector connector, CaptureConfig config) throws Throwable {
+    private PreparedSnapshot prepareSnapshot(PdkConnector connector, CaptureConfig config, boolean sampleSeam)
+            throws Throwable {
         connector.connector().init(connector.context());
         // A connector builds its read from the table's own columns, so it is handed the table as
         // discovered - with its fields - not a bare name. Discovery does not re-init: init has run.
@@ -713,8 +724,9 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
         connector.context().setTableMap(tableMap(discovered));
         // Position discovery may inspect the selected tables too. Populate their context first, while
         // still sampling before any snapshot row is read so the snapshot-to-stream transition has no gap.
+        // With no tail, skip position discovery: it may create a slot that nothing will consume or confirm.
         return new PreparedSnapshot(discovered, declaredTypes(discovered),
-                position(connector, startOffset(connector, null)));
+                sampleSeam ? position(connector, startOffset(connector, null)) : Optional.empty());
     }
 
     private void readTable(PdkConnector connector, PreparedSnapshot snapshot, String stream,

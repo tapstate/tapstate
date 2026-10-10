@@ -60,7 +60,7 @@ steps:
   - start
   - await: { count: { views.order_state: 5 } }
   - await: { doc: { views.order_state: { where: { id: 1 }, expect: { customer: alice }, size: { shipments: 2 } } } }
-  - assert: { doc: { views.order_state: { where: { id: 2 }, expect: { customer: bob }, size: { shipments: 2 } } } }
+  - await: { doc: { views.order_state: { where: { id: 2 }, expect: { customer: bob }, size: { shipments: 2 } } } }
 
   # Hold the second engine's stream. The database keeps accepting writes; they just cannot cross.
   - pause: fulfillment_db

@@ -96,6 +96,11 @@ public final class MongoObservationStore implements ObservationStore {
             if (progress.donePct() != null) {
                 cell.append("donePct", progress.donePct());
             }
+            if (progress.landed()) {
+                // Written only once true, so a table still landing is stored exactly as it was before the
+                // field existed, and an observation stored before it reads back as landing.
+                cell.append("landed", true);
+            }
             snapshot.append(table, cell);
         });
         Document positions = new Document();
@@ -379,7 +384,8 @@ public final class MongoObservationStore implements ObservationStore {
             long rowsDone = requireLong(cell.get("rowsDone"), id);
             Long rowsTotal = optionalLong(cell.get("rowsTotal"), id);
             Integer donePct = optionalInt(cell.get("donePct"), id);
-            out.put(entry.getKey(), new TableSnapshot(rowsDone, rowsTotal, donePct));
+            boolean landed = optionalTrue(cell.get("landed"), id);
+            out.put(entry.getKey(), new TableSnapshot(rowsDone, rowsTotal, donePct, landed));
         }
         return out;
     }
@@ -425,6 +431,16 @@ public final class MongoObservationStore implements ObservationStore {
             throw corrupt(id);
         }
         return number.longValue();
+    }
+
+    private static boolean optionalTrue(Object value, String id) {
+        if (value == null) {
+            return false;
+        }
+        if (!(value instanceof Boolean flag)) {
+            throw corrupt(id);
+        }
+        return flag;
     }
 
     private static Integer optionalInt(Object value, String id) {

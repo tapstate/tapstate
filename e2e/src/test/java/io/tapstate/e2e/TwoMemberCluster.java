@@ -1,5 +1,6 @@
 package io.tapstate.e2e;
 
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -85,6 +86,22 @@ final class TwoMemberCluster implements AutoCloseable {
      * @param nodeSessionTtl the lease each member's node session is taken under, or null for the default
      */
     static TwoMemberCluster start(String storeUri, String name, Duration nodeSessionTtl) {
+        return start(storeUri, name, nodeSessionTtl, Map.of());
+    }
+
+    /**
+     * The same, with the member carrying {@code nodeId} staging the connectors it resolves into
+     * {@code stagingDirectory}.
+     *
+     * <p>For a case whose subject is one member that cannot stage what a pipeline needs while the other can. Every
+     * other launch stages into a directory of its own, and this is the one place a case says where instead.
+     */
+    static TwoMemberCluster startStaging(String storeUri, String name, String nodeId, Path stagingDirectory) {
+        return start(storeUri, name, null, Map.of(requireKnown(nodeId), stagingDirectory));
+    }
+
+    private static TwoMemberCluster start(String storeUri, String name, Duration nodeSessionTtl,
+            Map<String, Path> stagingByNode) {
         String clusterId = name + "-" + UUID.randomUUID();
         String bindAddress = RoutableAddress.ofThisMachine();
         int memberPortA = RealProcessServer.reservePort();
@@ -94,10 +111,10 @@ final class TwoMemberCluster implements AutoCloseable {
         RealProcessServer first = null;
         RealProcessServer second;
         try {
-            first = RealProcessServer.start(storeUri, "0.0.0.0",
+            first = RealProcessServer.start(storeUri, "0.0.0.0", staging(NODE_A, stagingByNode),
                     httpPort -> arguments(
                             clusterId, NODE_A, memberPortA, seeds, httpPort, bindAddress, nodeSessionTtl));
-            second = RealProcessServer.start(storeUri, "0.0.0.0",
+            second = RealProcessServer.start(storeUri, "0.0.0.0", staging(NODE_B, stagingByNode),
                     httpPort -> arguments(
                             clusterId, NODE_B, memberPortB, seeds, httpPort, bindAddress, nodeSessionTtl));
         } catch (RuntimeException | Error failure) {
@@ -146,6 +163,11 @@ final class TwoMemberCluster implements AutoCloseable {
      */
     RealProcessServer processCarrying(String nodeId) {
         return NODE_A.equals(requireKnown(nodeId)) ? first : second;
+    }
+
+    /** The staging directory a witness named for the member, or null for one the member's launch makes and clears. */
+    private static Path staging(String nodeId, Map<String, Path> stagingByNode) {
+        return stagingByNode.get(nodeId);
     }
 
     private static String requireKnown(String nodeId) {

@@ -311,6 +311,7 @@ final class McpOperationExecutor {
                     source.mode(),
                     source.tables(),
                     source.srs(),
+                    source.execution(),
                     source.experimental());
             Map<String, Object> body = new LinkedHashMap<>(result.body());
             body.put("yaml", writer.write(redacted));

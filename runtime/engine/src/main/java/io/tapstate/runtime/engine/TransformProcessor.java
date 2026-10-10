@@ -26,7 +26,8 @@ import java.util.Objects;
  * port is a pure function that never sets a position, so the adapter stamps the inbound event's
  * position onto every event the port returns. A fan-out's several outputs all share the one inbound
  * position; its completion is the sink's concern (every output must settle before the position is
- * acked). An inbound event with no position stamps none.
+ * acked). A dropped event settles its positions with a marker on the same edge, behind earlier output.
+ * An inbound event with no position stamps none.
  *
  * <p>Emit-side backpressure is the adapter's concern too: the flat mapper resumes a partially emitted
  * event when the outbox is full, so the port stays a pure function that does not pace itself.
@@ -41,7 +42,7 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
         return Stage.TRANSFORM;
     }
 
-    private final FlatMapper<Envelope, Envelope> flatMapper;
+    private final FlatMapper<Envelope, Object> flatMapper;
     private final LevelBounds bounds;
     // Times each row through the port, which is this stage's unit of work. Counts for nobody until init
     // says whether there is a job to report into.
@@ -73,7 +74,12 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
             // the outbox's pace, which is the substrate's time and not this stage's.
             long started = timer.begin();
             try {
-                return Traversers.traverseIterable(port.transform(event))
+                List<Envelope> outputs = port.transform(event);
+                if (outputs.isEmpty() && !event.positions().isEmpty()) {
+                    // No record will carry this position to the sink, so settle it on the same ordered edge.
+                    return Traversers.singleton(new SettledPositions(event.positions()));
+                }
+                return Traversers.traverseIterable(outputs)
                         .map(out -> out.withPositions(event.positions()));
             } finally {
                 timer.end(started);
@@ -124,7 +130,30 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
                 // is exactly the lowest of what its edges promised.
                 : () -> new TransformProcessor(portFactory.get(),
                         new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING));
-        return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier), vertexName);
+        // Its stand-ins on the other members pass its bounds on as it does; see TotalOne.
+        return TotalOne.passingBounds(ProcessorSupplier.of(supplier), vertexName, axes, chainsByOrdinal);
+    }
+
+    /**
+     * A meta-supplier for a vertex that runs the same number of processors on every member, rather than one
+     * for the whole cluster. Every edge into it must route by the key of the rows it carries, so that each
+     * row's changes meet on one processor and keep the order they were read in; the per-member count itself
+     * is set on the vertex, not here.
+     *
+     * <p>Each processor works out its own promise from what reached it, exactly as the single processor
+     * does, and the engine combines the promises of all of them for whatever reads this vertex. Held to
+     * {@code plannedMembers}: see {@link PlannedMembersGuard}.
+     */
+    public static ProcessorMetaSupplier nativeMetaSupplier(String vertexName,
+            SupplierEx<? extends TransformPort> portFactory,
+            ChainAxes axes, Map<Integer, List<String>> chainsByOrdinal, int plannedMembers) {
+        Objects.requireNonNull(vertexName, "vertexName");
+        Objects.requireNonNull(portFactory, "portFactory");
+        SupplierEx<Processor> supplier = axes == null
+                ? () -> new TransformProcessor(portFactory.get())
+                : () -> new TransformProcessor(portFactory.get(),
+                        new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING));
+        return PlannedMembersGuard.of(ProcessorMetaSupplier.of(ProcessorSupplier.of(supplier)), plannedMembers);
     }
 
     /** What this stage has timed so far, for a witness driving it by hand. */

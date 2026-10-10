@@ -1,0 +1,6 @@
+version: tapstate/v1
+kind: view
+id: v_orders
+primary_key: order_id
+execution:
+  parallelism: 6

@@ -22,6 +22,7 @@ import com.hazelcast.function.FunctionEx;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
@@ -51,10 +52,6 @@ import org.junit.jupiter.api.Test;
 class PipelineDagBuilderAckTest {
 
     private static final String ACK_KEY = "test.sink.ack";
-    // Golden persisted keys: changing this encoding requires an explicit retained-state migration.
-    private static final String FIRST_WRITER_ID = "sink-c2VydmUuJGZpcnN0";
-    private static final String SECOND_WRITER_ID = "sink-c2VydmUuc2Vjb25k";
-    private static final String VIEW_WRITER_ID = "sink-dmlldy5vcmRlcnM";
 
     private static int suffix(String token) {
         return Integer.parseInt(token.replaceAll("\\D+", ""));
@@ -107,94 +104,77 @@ class PipelineDagBuilderAckTest {
         assertThat(ack.calls).containsExactly("orders=p1");
     }
 
+    /**
+     * Each chain is expected at exactly the writers the graph routes it to, and the execution writes that down
+     * before any of them exists: the first sink the graph draws starts the accounting as the execution starts.
+     *
+     * <p>Two tables and three sinks, and the shape is chosen to tell the wrong answers apart. The view reads
+     * one table and the two serve elements read both, so a set that named every sink for every table would
+     * wait on the view for a table it never receives - a table whose progress then never lands - and a set
+     * that named only the sinks one table reaches would leave a writer of the other out, so a faster writer
+     * could stand for it.
+     */
     @Test
-    void declaresEverySinkWriterForTheStreamsItReceivesBeforeTheDagRuns() {
-        PlanningAckFactory sinkAck = new PlanningAckFactory();
+    void theFirstSinkStartsARunExpectingEachChainAtTheWritersItReaches() throws Exception {
+        RunRecordingAcks sinkAck = new RunRecordingAcks();
         PipelineResource pipeline = new PipelineResource(
-                "p", null, List.of(SourceRef.bare("orders_src")), null, null,
-                new ServeBlock.Inline(null, FromRef.literal("orders_src"),
-                        List.of(
-                                new SyncElement("$first", "first_dest", null, null, null),
-                                new SyncElement("second", "second_dest", null, null, null)),
-                        null, null),
+                "p", null, List.of(SourceRef.bare("orders_src"), SourceRef.bare("items_src")), null,
+                new ViewBlock.Inline("v", FromRef.literal("orders_src"), "id", null),
+                new ServeBlock.Inline(null,
+                        new FromClause.Flow(List.of(FromRef.literal("orders_src"), FromRef.literal("items_src"))),
+                        List.of(new SyncElement("a", "dest_a", null, null, null),
+                                new SyncElement("b", "dest_b", null, null, null)), null, null),
                 null, null);
 
-        PipelineDagBuilder.build(
-                pipeline,
-                bindings(),
-                sinkAck,
-                new FrontierBinding(Map.of("orders_src", "orders")));
+        DAG dag = PipelineDagBuilder.build(pipeline, twoSourceBindings(), sinkAck,
+                new FrontierBinding(Map.of("orders_src", "orders", "items_src", "items")));
 
-        assertThat(sinkAck.preparedPlan.get("orders"))
-                .containsExactly(FIRST_WRITER_ID, SECOND_WRITER_ID);
-        assertThat(sinkAck.scopes).hasSize(2);
-        assertThat(sinkAck.scopes).allSatisfy(scope -> {
-            assertThat(scope.streams()).containsExactly("orders");
-            assertThat(scope.writerIdsByStream().get("orders"))
-                    .containsExactly(FIRST_WRITER_ID, SECOND_WRITER_ID);
-        });
+        ProcessorMetaSupplier first = dag.getVertex("view.v").getMetaSupplier();
+        assertThat(first).isInstanceOf(WriterRunStart.class);
+        assertThat(((WriterRunStart) first).writersByChain()).isEqualTo(Map.of(
+                "orders", List.of("view.v#0", "serve.a#0", "serve.b#0"),
+                "items", List.of("serve.a#0", "serve.b#0")));
+        assertThat(dag.getVertex("serve.a").getMetaSupplier())
+                .as("one vertex starts the run; a second would only write the same set again")
+                .isNotInstanceOf(WriterRunStart.class);
+        assertThat(dag.getVertex("serve.b").getMetaSupplier()).isNotInstanceOf(WriterRunStart.class);
+
+        first.init(new TestProcessorMetaSupplierContext()
+                .setHazelcastInstance(member).setTotalParallelism(1).setLocalParallelism(1));
+
+        assertThat(sinkAck.started).containsExactly(((WriterRunStart) first).writersByChain());
     }
 
-    @Test
-    void retainedWriterProgressFollowsNamedSinksAcrossReassemblyOrder() {
-        SyncElement first = new SyncElement("$first", "first_dest", null, null, null);
-        SyncElement second = new SyncElement("second", "second_dest", null, null, null);
-        PlanningAckFactory initial = buildPlan(List.of(first, second));
-        Map<String, Long> retainedProgress = Map.of(
-                initial.scopes.get(0).writerId(), 100L,
-                initial.scopes.get(1).writerId(), 50L);
+    /** Acks that record every run started through them; each resolves to an ack recording nothing. */
+    private static final class RunRecordingAcks implements SinkAckFactory {
 
-        PlanningAckFactory reordered = buildPlan(List.of(second, first));
+        private static final long serialVersionUID = 1L;
 
-        assertThat(reordered.scopes)
-                .extracting(scope -> retainedProgress.get(scope.writerId()))
-                .containsExactly(50L, 100L);
-        assertThat(reordered.preparedPlan.get("orders"))
-                .containsExactly(SECOND_WRITER_ID, FIRST_WRITER_ID);
+        private final List<Map<String, List<String>>> started = new ArrayList<>();
+
+        @Override
+        public SinkAck resolve(HazelcastInstance on) {
+            return new RecordingAck();
+        }
+
+        @Override
+        public void beginRun(HazelcastInstance coordinator, Map<String, List<String>> writersByChain) {
+            started.add(writersByChain);
+        }
     }
 
-    @Test
-    void addingAViewDoesNotMoveANamedServeSinkToAnotherPersistedSlot() {
-        SyncElement sink = new SyncElement("$first", "first_dest", null, null, null);
-        PlanningAckFactory initial = buildPlan(List.of(sink));
-        Map<String, Long> retainedProgress = Map.of(initial.scopes.get(0).writerId(), 100L);
-
-        PlanningAckFactory withView = buildPlanWithView(sink);
-
-        assertThat(withView.scopes)
-                .extracting(scope -> retainedProgress.get(scope.writerId()))
-                .containsExactly(null, 100L);
-        assertThat(withView.preparedPlan.get("orders"))
-                .containsExactly(VIEW_WRITER_ID, FIRST_WRITER_ID);
-    }
-
-    private static PlanningAckFactory buildPlan(List<SyncElement> sync) {
-        PlanningAckFactory sinkAck = new PlanningAckFactory();
-        PipelineResource pipeline = new PipelineResource(
-                "p", null, List.of(SourceRef.bare("orders_src")), null, null,
-                new ServeBlock.Inline(null, FromRef.literal("orders_src"), sync, null, null),
-                null, null);
-        PipelineDagBuilder.build(
-                pipeline,
-                bindings(),
-                sinkAck,
-                new FrontierBinding(Map.of("orders_src", "orders")));
-        return sinkAck;
-    }
-
-    private static PlanningAckFactory buildPlanWithView(SyncElement sync) {
-        PlanningAckFactory sinkAck = new PlanningAckFactory();
-        PipelineResource pipeline = new PipelineResource(
-                "p", null, List.of(SourceRef.bare("orders_src")), null,
-                new ViewBlock.Inline("orders", FromRef.literal("orders_src"), "id", null),
-                new ServeBlock.Inline(null, FromRef.literal("orders"), List.of(sync), null, null),
-                null, null);
-        PipelineDagBuilder.build(
-                pipeline,
-                bindings(),
-                sinkAck,
-                new FrontierBinding(Map.of("orders_src", "orders")));
-        return sinkAck;
+    /** Two sources, each its own vertex, with a view sink and a writer for every serve element. */
+    private static DagBindings twoSourceBindings() {
+        Map<FromRef, List<String>> upstreams = Map.of(
+                FromRef.literal("orders_src"), List.of("orders_src"),
+                FromRef.literal("items_src"), List.of("items_src"));
+        return new DagBindings(
+                srcId -> ProcessorMetaSupplier.of(Processors.mapP(FunctionEx.identity())),
+                step -> (SupplierEx<TransformPort>) () -> ev -> List.of(ev),
+                syncElement -> (SupplierEx<SinkWriter>) RecordingWriter::new,
+                ref -> upstreams.getOrDefault(ref, List.of()),
+                sourceId -> List.of(sourceId),
+                view -> (SupplierEx<SinkWriter>) RecordingWriter::new);
     }
 
     /** Structural stubs for the leaves; the serve sink is the only vertex this test drives. */
@@ -204,9 +184,7 @@ class PipelineDagBuilderAckTest {
                 step -> (SupplierEx<TransformPort>) () -> ev -> List.of(ev),
                 syncElement -> (SupplierEx<SinkWriter>) RecordingWriter::new,
                 Function.<FromRef>identity().andThen(ref ->
-                        Map.of(FromRef.literal("orders_src"), List.of("orders_src")).getOrDefault(ref, List.of())),
-                sourceId -> List.of(sourceId),
-                view -> (SupplierEx<SinkWriter>) RecordingWriter::new);
+                        Map.of(FromRef.literal("orders_src"), List.of("orders_src")).getOrDefault(ref, List.of())));
     }
 
     /**
@@ -259,33 +237,6 @@ class PipelineDagBuilderAckTest {
         public void advance(String chain, ChainPosition position) {
             calls.add(chain + "=" + position.token());
         }
-    }
-
-    private static final class PlanningAckFactory implements SinkAckFactory {
-        private final List<WriterScope> scopes = new ArrayList<>();
-        private Map<String, List<String>> preparedPlan = Map.of();
-
-        @Override
-        public SinkAck resolve(HazelcastInstance member) {
-            return (chain, position) -> { };
-        }
-
-        @Override
-        public void prepareWriterPlan(Map<String, List<String>> writerIdsByStream) {
-            preparedPlan = Map.copyOf(writerIdsByStream);
-        }
-
-        @Override
-        public SinkAckFactory forWriter(
-                String writerId, List<String> streams, Map<String, List<String>> writerIdsByStream) {
-            scopes.add(new WriterScope(writerId, List.copyOf(streams), Map.copyOf(writerIdsByStream)));
-            return this;
-        }
-    }
-
-    private record WriterScope(
-            String writerId, List<String> streams, Map<String, List<String>> writerIdsByStream)
-            implements java.io.Serializable {
     }
 
     private static final class RecordingWriter implements SinkWriter {
