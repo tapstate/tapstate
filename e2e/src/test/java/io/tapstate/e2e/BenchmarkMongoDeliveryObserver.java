@@ -33,7 +33,7 @@ import java.util.function.Supplier;
  * <p>Opening the database change-stream cursor is the readiness barrier: the aggregate has reached
  * Mongo before this method returns, so no startup sleep is needed. The cursor covers a collection that
  * might not exist yet and an observer-only barrier collection in the same database. The caller supplies
- * each source batch's {@link System#nanoTime()} reading immediately before executing that batch's SQL.
+ * each source batch's selected monotonic-counter reading immediately before executing that batch's SQL.
  * The resulting latency includes source execution, connector transit, target write and cursor delivery.
  * It does not isolate time spent in any one of those components.
  *
@@ -195,7 +195,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
         if (expected.isEmpty()) {
             throw new IllegalArgumentException("an issued batch must name target changes");
         }
-        if (System.nanoTime() - issuedAtNanos < 0) {
+        if (io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime() - issuedAtNanos < 0) {
             throw new IllegalArgumentException("source batch issue time is in the future");
         }
         register(phaseId, issuedAtNanos, expected, true);
@@ -292,11 +292,11 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
             }
         }
 
-        long deadline = System.nanoTime() + timeout.toNanos();
+        long deadline = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime() + timeout.toNanos();
         List<Delivery> phaseDeliveries;
         synchronized (lock) {
             while (failure == null && !barrierSeen) {
-                long remaining = deadline - System.nanoTime();
+                long remaining = deadline - io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
                 if (remaining <= 0) {
                     throw new AssertionError("target change-stream barrier did not arrive before " + timeout);
                 }
@@ -366,18 +366,18 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                         return;
                     }
                 }
-                long started = System.nanoTime();
+                long started = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
                 if (firstRead) {
                     if (!readGate.beforeFirstTryNext(started)) { return; }
                     firstRead = false;
                 }
                 long schedulingGap = previousIterationEnded == 0 ? 0 : started - previousIterationEnded;
                 ChangeStreamDocument<Document> change = cursor.tryNext();
-                long completed = System.nanoTime();
+                long completed = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
                 if (change != null) {
                     accept(change, started, completed);
                 }
-                long accepted = System.nanoTime();
+                long accepted = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
                 previousIterationEnded = accepted;
                 synchronized (lock) {
                     readCalls++; readNanos += completed - started; acceptNanos += accepted - completed;
@@ -519,7 +519,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
                 }
                 if (clockRejectionEvidence != null && clockRecordingFailure == null) {
                     clockRecordingFailure = recordAcceptedClockEvent(clockRejectionEvidence,
-                            () -> clockEvent(change, key, startedReadNanos, observedAtNanos, System.nanoTime()));
+                            () -> clockEvent(change, key, startedReadNanos, observedAtNanos, io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime()));
                 }
                 deliveries.add(new Delivery(key, actual, expected.issuedAtNanos(), observedAtNanos, duration, operationWall));
             }
@@ -626,7 +626,7 @@ final class BenchmarkMongoDeliveryObserver implements AutoCloseable {
             } else {
                 evidence = BenchmarkNativeOperationWallEvidence.lookup(snapshot,
                         new BenchmarkNativeOperationWallLookup(client, databaseName + "." + targetCollection),
-                        System::nanoTime, original);
+                        io.tapstate.adapters.pdk.PdkBenchmarkClock::nanoTime, original);
             }
             System.out.println("benchmark-native-operation-wall=" + JsonWriter.write(evidence));
         } catch (RuntimeException | Error recording) {

@@ -18,6 +18,66 @@ class BenchmarkWriteReturnReaderTest {
     private static final BenchmarkCausalClock.Identity OWNER = new BenchmarkCausalClock.Identity(17, 1_000);
     private static final String RETURN_FLAG = "-Dtapstate.benchmark.write-return=";
     private static final String COST_FLAG = "-Dtapstate.benchmark.write-return-cost-stages=";
+    private static final String NATIVE_FLAG = "-Dtapstate.benchmark.native-clock-library=";
+
+    @Test void native_metadata_uses_one_cold_getter_and_actual_root_and_owned_runtime_identities() {
+        var fixture = nativeFixture();
+        var evidence = fixture.reader().nativeClockEvidence(BenchmarkNativeClockEvidenceTest.LIBRARY, rootMetadata());
+        assertThat(evidence).containsEntry("state", "NATIVE_RECORDED").containsEntry("raw", fixture.clockResponse)
+                .containsEntry("matchedRuntimeFlag", RETURN_FLAG + "true")
+                .containsEntry("matchedNativeClockFlag", NATIVE_FLAG + BenchmarkNativeClockEvidenceTest.LIBRARY);
+        BenchmarkNativeClockEvidence.FLAGS.forEach(flag -> assertThat(evidence.get(flag)).isEqualTo(false));
+        assertThat(evidence.get("clockMetadataRead")).isEqualTo(Map.of("startedAtNanos", 103L, "completedAtNanos", 104L));
+        assertThat(fixture.operations).containsExactly("runtime", "clockMetadata", "runtime");
+        assertThat(io.tapstate.core.common.JsonWriter.write(evidence)).doesNotContain("controlled_runtime_secret", "InputArguments");
+    }
+
+    @Test void native_metadata_refusals_retain_bounded_child_and_root_facts_without_repeated_getters() {
+        var unknown = BenchmarkNativeClockEvidenceTest.metadataMap(OWNER);
+        unknown.put("state", "UNKNOWN"); unknown.put("reason", "NATIVE_READ_UNAVAILABLE");
+        unknown.put("failureType", "java.lang.IllegalStateException"); unknown.put("activeProvider", "SYSTEM_NANO_TIME");
+        unknown.put("mixedDomainPossible", true);
+        for (String response : List.of("{}", "x".repeat(8193),
+                BenchmarkNativeClockEvidenceTest.metadata(new BenchmarkCausalClock.Identity(18, 1_000)),
+                io.tapstate.core.common.JsonWriter.write(unknown))) {
+            var fixture = nativeFixture(); fixture.clockResponse = response;
+            var retained = nativeRefusal(fixture, rootMetadata()).retainedEvidence();
+            assertThat(retained).containsEntry("state", "UNKNOWN").containsKey("rootMetadata");
+            BenchmarkNativeClockEvidence.FLAGS.forEach(flag -> assertThat(retained.get(flag)).isEqualTo(false));
+            if (response.length() <= 8192) { assertThat(retained).containsEntry("raw", response); }
+            else { assertThat(retained).doesNotContainKey("raw").containsEntry("rawRetained", false); }
+            assertThat(fixture.operations).containsExactly("runtime", "clockMetadata", "runtime");
+        }
+        for (String root : List.of(BenchmarkNativeClockEvidenceTest.metadata(OWNER),
+                rootMetadata().replace("\"timebaseOffsetUnsigned\":\"17\"", "\"timebaseOffsetUnsigned\":\"18\""))) {
+            var fixture = nativeFixture();
+            assertThat(nativeRefusal(fixture, root).retainedEvidence()).containsEntry("raw", fixture.clockResponse);
+            assertThat(fixture.operations).containsExactly("runtime", "clockMetadata", "runtime");
+        }
+    }
+
+    @Test void native_metadata_requires_unique_exact_flags_and_stable_live_runtime_arguments() {
+        String library = NATIVE_FLAG + BenchmarkNativeClockEvidenceTest.LIBRARY;
+        for (String[] args : List.of(new String[]{RETURN_FLAG + "true"}, new String[]{RETURN_FLAG + "false", library},
+                new String[]{RETURN_FLAG + "true", library, library}, new String[]{RETURN_FLAG + "true", NATIVE_FLAG + "/other/library"})) {
+            var fixture = nativeFixture(); fixture.before = runtimeAttributes(17L, 1_000L, args);
+            nativeRefusal(fixture, rootMetadata()); assertThat(fixture.operations).containsExactly("runtime");
+        }
+        var changed = nativeFixture(); changed.after = runtimeAttributes(17L, 1_000L, new String[]{RETURN_FLAG + "true", library});
+        assertThat(nativeRefusal(changed, rootMetadata()).retainedEvidence()).containsEntry("raw", changed.clockResponse);
+        var reused = nativeFixture(); reused.after = runtimeAttributes(17L, 1_001L, nativeArguments());
+        assertThat(nativeRefusal(reused, rootMetadata()).retainedEvidence()).containsEntry("raw", reused.clockResponse);
+        var dead = nativeFixture(); dead.alive = () -> false;
+        nativeRefusal(dead, rootMetadata()); assertThat(dead.operations).isEmpty();
+    }
+
+    @Test void native_metadata_io_never_becomes_fallback_absence_or_a_second_read() {
+        for (String operation : List.of("runtime", "clockMetadata")) {
+            var fixture = nativeFixture(); fixture.failingOperation = operation;
+            assertThat(nativeRefusal(fixture, rootMetadata())).hasCause(fixture.readFailure);
+            assertThat(fixture.operations.stream().filter("clockMetadata"::equals).count()).isLessThanOrEqualTo(1);
+        }
+    }
 
     @Test void cost_stages_use_one_optional_getter_between_owned_runtime_reads_without_probe_clock_or_controls() {
         var fixture = costFixture();
@@ -290,6 +350,19 @@ class BenchmarkWriteReturnReaderTest {
     private static String[] costArguments() {
         return new String[]{RETURN_FLAG + "true", COST_FLAG + "true", "-Dpassword=controlled_runtime_secret"};
     }
+    private static String[] nativeArguments() {
+        return new String[]{RETURN_FLAG + "true", NATIVE_FLAG + BenchmarkNativeClockEvidenceTest.LIBRARY, "-Dpassword=controlled_runtime_secret"};
+    }
+    private static RegistrationFixture nativeFixture() {
+        var fixture = new RegistrationFixture(true); fixture.before = runtimeAttributes(17L, 1_000L, nativeArguments()); fixture.after = fixture.before;
+        fixture.clockResponse = BenchmarkNativeClockEvidenceTest.metadata(OWNER); return fixture;
+    }
+    private static String rootMetadata() { return BenchmarkNativeClockEvidenceTest.metadata(BenchmarkNativeClockEvidenceTest.rootOwner()); }
+    private static BenchmarkWriteReturnReader.NativeClockRefusal nativeRefusal(RegistrationFixture fixture, String root) {
+        try { fixture.reader().nativeClockEvidence(BenchmarkNativeClockEvidenceTest.LIBRARY, root); }
+        catch (BenchmarkWriteReturnReader.NativeClockRefusal refused) { return refused; }
+        throw new AssertionError("controlled native metadata unexpectedly succeeded");
+    }
     private static RegistrationFixture costFixture() {
         var fixture = new RegistrationFixture(true);
         fixture.before = runtimeAttributes(17L, 1_000L, costArguments()); fixture.after = fixture.before;
@@ -309,6 +382,7 @@ class BenchmarkWriteReturnReaderTest {
         final java.io.IOException readFailure = new java.io.IOException("controlled registration read failure");
         String failingOperation;
         Object costResponse;
+        Object clockResponse;
         RegistrationFixture(boolean enabled) {
             before = runtimeAttributes(17L, 1_000L, new String[]{RETURN_FLAG + enabled, "-Dpassword=controlled_runtime_secret"});
             after = before; registered = enabled;
@@ -335,6 +409,11 @@ class BenchmarkWriteReturnReaderTest {
                         }
                         if (method.getName().equals("getAttribute")) {
                             assertThat(arguments[0].toString()).isEqualTo("io.tapstate.benchmark:type=WriteReturn");
+                            if (arguments[1].equals("ClockMetadata")) {
+                                operations.add("clockMetadata");
+                                if ("clockMetadata".equals(failingOperation)) { throw readFailure; }
+                                return clockResponse;
+                            }
                             assertThat(arguments[1]).isEqualTo("CostStages");
                             operations.add("cost");
                             if ("cost".equals(failingOperation)) { throw readFailure; }

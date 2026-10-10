@@ -90,12 +90,12 @@ final class BenchmarkProcessProbe implements AutoCloseable {
             throw new AssertionError("owned return probe has no verified resource runtime");
         }
         return new BenchmarkWriteReturnReader(new BenchmarkCausalClock.Identity(ownedPid, start),
-                connection, child::isAlive, System::nanoTime);
+                connection, child::isAlive, io.tapstate.adapters.pdk.PdkBenchmarkClock::nanoTime);
     }
 
     /** Retains runtime identity through the existing resource connection before the measured window. */
     Map<String, Object> runtimeEvidence() {
-        long before = System.nanoTime();
+        long before = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
         boolean aliveBefore = child != null && child.isAlive();
         if (!aliveBefore || connection == null) {
             return Map.of("status", "UNKNOWN", "reason", "OWNED_RUNTIME_UNAVAILABLE", "ownedPid", ownedPid);
@@ -120,7 +120,7 @@ final class BenchmarkProcessProbe implements AutoCloseable {
             out.put("status", "COMPLETE"); out.put("scope", "EXISTING_OWNED_RESOURCE_JMX_PRE_WINDOW");
             out.put("ownedPid", ownedPid); out.put("actualPid", actualPid); out.put("jvmStartTimeMillis", startMillis);
             out.put("inputArguments", List.copyOf(arguments)); out.put("driverStartNanos", before);
-            out.put("driverEndNanos", System.nanoTime()); out.put("capturedAt", java.time.Instant.now().toString());
+            out.put("driverEndNanos", io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime()); out.put("capturedAt", java.time.Instant.now().toString());
             out.put("aliveBefore", aliveBefore); out.put("aliveAfter", aliveAfter);
             return Map.copyOf(out);
         } catch (IOException | RuntimeException failure) {

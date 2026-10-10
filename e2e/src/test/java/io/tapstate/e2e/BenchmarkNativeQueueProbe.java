@@ -82,7 +82,7 @@ final class BenchmarkNativeQueueProbe implements AutoCloseable {
         }
         long jobId = job.getId();
         String jobIdString = job.getIdString();
-        long started = System.nanoTime();
+        long started = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
         var metrics = job.getMetrics();
         Map<?, ?> topology = control.benchmarkPipelineTopology(pipeline);
         var current = client.getJet().getJob(pipeline);
@@ -91,7 +91,7 @@ final class BenchmarkNativeQueueProbe implements AutoCloseable {
                 || current.getStatus() != JobStatus.RUNNING || job.getStatus() != JobStatus.RUNNING) {
             throw new AssertionError("native delivery job changed during its snapshot");
         }
-        return deliverySnapshot(pipeline, jobIdString, owner.uuid(), metrics, topology, started, System.nanoTime());
+        return deliverySnapshot(pipeline, jobIdString, owner.uuid(), metrics, topology, started, io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime());
     }
 
     static BenchmarkNativeCounterBaseline.Snapshot deliverySnapshot(String pipeline, String jobId,
@@ -169,7 +169,7 @@ final class BenchmarkNativeQueueProbe implements AutoCloseable {
         requireOwner();
         var job = client.getJet().getJob(pipeline);
         if (job == null) { return Map.of("state", "UNKNOWN", "reason", "NO_JOB"); }
-        long started = System.nanoTime();
+        long started = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
         long utcBefore = System.currentTimeMillis();
         long jobId = job.getId();
         if (!pipeline.equals(job.getName())) { throw new AssertionError("native queue job name differs"); }
@@ -225,7 +225,7 @@ final class BenchmarkNativeQueueProbe implements AutoCloseable {
         var result = new java.util.LinkedHashMap<String, Object>();
         result.putAll(Map.of("state", readings.isEmpty() ? "UNKNOWN" : "RECORDED", "pipeline", pipeline,
                 "jobId", jobId, "memberUuid", owner.uuid(), "readStartedAtNanos", started,
-                "readCompletedAtNanos", System.nanoTime(), "scope", "NATIVE_JOB_INPUT_QUEUE_METRICS",
+                "readCompletedAtNanos", io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime(), "scope", "NATIVE_JOB_INPUT_QUEUE_METRICS",
                 "readings", List.copyOf(readings), "readUtcMillis", List.of(utcBefore, utcAfter)));
         result.put("declaredCollectionFrequencySeconds", collectionFrequencySeconds);
         Map<?, ?> topology = control.benchmarkPipelineTopology(pipeline);

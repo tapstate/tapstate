@@ -71,9 +71,9 @@ final class BenchmarkTargetClock {
     }
 
     static Reading read(com.mongodb.client.MongoDatabase admin) {
-            long utcBefore = System.currentTimeMillis(); long began = System.nanoTime();
+            long utcBefore = System.currentTimeMillis(); long began = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
             Document hello = admin.runCommand(new Document("hello", 1));
-            long ended = System.nanoTime(); long utcAfter = System.currentTimeMillis();
+            long ended = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime(); long utcAfter = System.currentTimeMillis();
             Document topology = hello.get("topologyVersion", Document.class);
             if (!(hello.get("localTime") instanceof Date date) || topology == null
                     || topology.get("processId") == null || !(hello.get("primary") instanceof String primary)) {

@@ -66,7 +66,7 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
     static synchronized Writer forWriter(PdkConnector connector) {
         if (!Boolean.getBoolean(PROPERTY)) { return null; }
         if (installed == null) {
-            PdkWriteReturnProbe probe = new PdkWriteReturnProbe(System::nanoTime, Boolean.getBoolean(COST_STAGES_PROPERTY));
+            PdkWriteReturnProbe probe = new PdkWriteReturnProbe(PdkBenchmarkClock.source(), Boolean.getBoolean(COST_STAGES_PROPERTY));
             try {
                 ManagementFactory.getPlatformMBeanServer().registerMBean(probe, new ObjectName(OBJECT_NAME));
             } catch (javax.management.JMException | SecurityException unavailable) {
@@ -456,6 +456,7 @@ public final class PdkWriteReturnProbe implements PdkWriteReturnProbeMBean {
     @Override public long getPid() { return pid; }
     @Override public long getJvmStartTimeMillis() { return startMillis; }
     @Override public long getNanoTime() { return clock.getAsLong(); }
+    @Override public String getClockMetadata() { return PdkBenchmarkClock.metadata(); }
     @Override public synchronized String getWindow() { return window; }
     @Override public synchronized String getState() { return state; }
     @Override public synchronized long getCompletedCalls() { return completedCalls; }

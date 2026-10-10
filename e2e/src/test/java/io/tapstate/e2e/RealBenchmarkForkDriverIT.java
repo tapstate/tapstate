@@ -91,6 +91,13 @@ class RealBenchmarkForkDriverIT {
                 conflictingReturnDiagnostics || jvmDiagnostics || !"stateless".equals(workloadId)
                         || arm != PipelineBenchmarkComparison.Arm.B || mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN
                         || forkOutput == null || System.getProperty(RealBenchmarkForkDriver.WRITE_RETURN_METHOD_CONTROL_PROPERTY) != null);
+        String nativeLibrary = RealBenchmarkForkDriver.nativeClockLibrary(
+                System.getProperty(RealBenchmarkForkDriver.NATIVE_CLOCK_LIBRARY_PROPERTY), writeReturnDiagnostics,
+                Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot"), returnClockMode,
+                conflictingReturnDiagnostics || jvmDiagnostics || !"stateless".equals(workloadId)
+                        || arm != PipelineBenchmarkComparison.Arm.B || mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN
+                        || forkOutput == null || costStages
+                        || System.getProperty(RealBenchmarkForkDriver.WRITE_RETURN_METHOD_CONTROL_PROPERTY) != null);
         if (writeReturnDiagnostics && (mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN || forkOutput == null
                 || !Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot")
                 || conflictingReturnDiagnostics)) {
@@ -175,7 +182,7 @@ class RealBenchmarkForkDriverIT {
                     : writeReturnDiagnostics
                     ? new RealBenchmarkForkDriver((store, operator, jar) -> new BenchmarkForkEnvironment.OwnedBoot(
                             RealProcessServer.start(store, operator, jar, "127.0.0.1",
-                                    port -> List.of(), RealBenchmarkForkDriver.returnJvmArguments(methodControl, costStages)), null))
+                                    port -> List.of(), returnArguments(methodControl, costStages, nativeLibrary)), null))
                     : dualGc != null
                     ? new RealBenchmarkForkDriver(dualGc::start)
                     : jvmDiagnostics ? new RealBenchmarkForkDriver(BenchmarkJvmDiagnostics::start)
@@ -336,6 +343,7 @@ class RealBenchmarkForkDriverIT {
                     output.put("writeReturnClockSamplingMode", returnClockMode.name());
                     output.put("writeReturnPerformanceAcceptanceEligible", false);
                     if (costStages) { output.put("writeReturnCostStages", true); }
+                    if (nativeLibrary != null) { output.put("nativeClockDiagnostic", true); }
                     output.put("retainedLegacyMeasurementEndpoint", "OPERATION_DATE_AND_OBSERVER_DIAGNOSTICS");
                 }
                 if (threadPointDiagnostics) {
@@ -356,6 +364,15 @@ class RealBenchmarkForkDriverIT {
                     .as("owned startup, namespace, JVM and exit facts are complete: %s", runtime.get("reasons"))
                     .isEqualTo("QUALIFIED");
         }
+    }
+
+    static List<String> returnArguments(boolean methodControl, boolean costStages, String nativeLibrary) {
+        var arguments = new java.util.ArrayList<>(RealBenchmarkForkDriver.returnJvmArguments(methodControl, costStages));
+        if (nativeLibrary != null) {
+            if (methodControl || costStages) { throw new AssertionError("native clock cannot mix other return controls"); }
+            arguments.add("-D" + RealBenchmarkForkDriver.NATIVE_CLOCK_LIBRARY_PROPERTY + "=" + nativeLibrary);
+        }
+        return List.copyOf(arguments);
     }
 
     private static Path forkOutput() throws Exception {

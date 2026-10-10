@@ -37,6 +37,9 @@ class PipelineBenchmarkLiveRunIT {
 
     @Test
     void interleavedRealForksWriteEvidenceAndEnforceTheSelectedGate() throws Exception {
+        if (System.getProperty(RealBenchmarkForkDriver.NATIVE_CLOCK_LIBRARY_PROPERTY) != null) {
+            throw new AssertionError("native clock diagnostic cannot establish a live performance gate");
+        }
         if (Boolean.getBoolean(RealBenchmarkForkDriver.WRITE_RETURN_COST_STAGES_PROPERTY)) {
             throw new AssertionError("producer cost-stage diagnostics cannot establish a live performance gate");
         }

@@ -75,7 +75,7 @@ final class BenchmarkMongoCommandSampler implements AutoCloseable {
             throw new IllegalStateException("Mongo command sampler can start only once");
         }
         beginning = read();
-        startedAtNanos = System.nanoTime();
+        startedAtNanos = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
     }
 
     /** Read the end counter after target ACK and its change-stream barrier. */
@@ -83,7 +83,7 @@ final class BenchmarkMongoCommandSampler implements AutoCloseable {
         if (beginning == null || finished || closed) {
             throw new IllegalStateException("Mongo command sampler has no open measured window");
         }
-        long endedAtNanos = System.nanoTime();
+        long endedAtNanos = io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
         long elapsedNanos = endedAtNanos - startedAtNanos;
         if (elapsedNanos < 0) {
             throw new AssertionError("Mongo command sample clock moved backward");

@@ -69,7 +69,7 @@ final class BenchmarkTableCaptureSet implements AutoCloseable {
                 await(chain, chain.id() + "/" + phase, deadline);
             }
         }
-        return System.nanoTime();
+        return io.tapstate.adapters.pdk.PdkBenchmarkClock.nanoTime();
     }
 
     BenchmarkAckOracle.TableConfirmationProof awaitTerminal(BenchmarkWorkloadDefinitions.SourceChain chain,

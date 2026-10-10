@@ -15,6 +15,7 @@ final class BenchmarkWriteReturnReader {
     private static final int MAX_PAGE_BYTES = 64 * 1024;
     private static final String ENABLED_PROPERTY = "-Dtapstate.benchmark.write-return";
     private static final String COST_STAGES_PROPERTY = "-Dtapstate.benchmark.write-return-cost-stages";
+    private static final String NATIVE_CLOCK_PROPERTY = "-Dtapstate.benchmark.native-clock-library";
     private static final int MAX_RUNTIME_ARGUMENTS = 128;
     private static final int MAX_RUNTIME_ARGUMENT_LENGTH = 16_384;
     private static final long MAX_RUNTIME_ARGUMENT_BYTES = 2L * 1024 * 1024 - 4096;
@@ -130,8 +131,65 @@ final class BenchmarkWriteReturnReader {
         Map<String, Object> retainedEvidence() { return retained; }
     }
 
+    /** Cold provenance reads never invoke the probe's counter or measurement controls. */
+    Map<String, Object> nativeClockEvidence(String expectedLibraryPath, String actualRootMetadata) {
+        var retained = new java.util.LinkedHashMap<String, Object>();
+        retained.put("state", "UNKNOWN"); retained.put("reason", "NATIVE_CLOCK_READ_REFUSED");
+        BenchmarkNativeClockEvidence.FLAGS.forEach(flag -> retained.put(flag, false));
+        retained.put("rootMetadata", BenchmarkWriteReturnCostStages.rawEvidence(actualRootMetadata));
+        retained.put("rawAvailable", false); retained.put("rawRetained", false);
+        retained.put("expectedPid", identity.pid()); retained.put("expectedJvmStartTimeMillis", identity.jvmStartTimeMillis());
+        try {
+            if (expectedLibraryPath == null || expectedLibraryPath.isEmpty()) { throw new AssertionError("native clock library path is missing"); }
+            var rootIdentity = new BenchmarkCausalClock.Identity(ProcessHandle.current().pid(),
+                    java.lang.management.ManagementFactory.getRuntimeMXBean().getStartTime());
+            retained.put("expectedRootPid", rootIdentity.pid()); retained.put("expectedRootJvmStartTimeMillis", rootIdentity.jvmStartTimeMillis());
+            RuntimeRead before = runtimeRead(true, false, retained, "beforeRuntimeRead", expectedLibraryPath);
+            requireAlive();
+            long started = clock.getAsLong(); retained.put("clockMetadataRead", Map.of("startedAtNanos", started));
+            Object value = connection.getAttribute(name, "ClockMetadata");
+            String raw = value instanceof String text ? text : null;
+            retained.putAll(BenchmarkWriteReturnCostStages.rawEvidence(raw));
+            if (value != null && raw == null) { retained.put("responseType", value.getClass().getName()); }
+            long completed = clock.getAsLong(); retained.put("clockMetadataRead", bracket(started, completed));
+            requireAlive();
+            RuntimeRead after = runtimeRead(true, false, retained, "afterRuntimeRead", expectedLibraryPath);
+            if (!before.arguments().equals(after.arguments())) { throw new AssertionError("native clock runtime arguments changed"); }
+            if (Math.subtractExact(started, before.completedAtNanos()) < 0 || Math.subtractExact(completed, started) < 0
+                    || Math.subtractExact(after.startedAtNanos(), completed) < 0) {
+                throw new AssertionError("native clock root reads are not serial");
+            }
+            var owned = BenchmarkNativeClockEvidence.parse(raw, identity, expectedLibraryPath);
+            retained.put("ownedMetadata", owned);
+            var root = BenchmarkNativeClockEvidence.parse(actualRootMetadata, rootIdentity, expectedLibraryPath);
+            retained.put("parsedRootMetadata", root);
+            BenchmarkNativeClockEvidence.requireMatchingNative(owned, root);
+            var result = new java.util.LinkedHashMap<>(retained); result.putAll(owned);
+            result.put("matchedRuntimeFlag", ENABLED_PROPERTY + "=true");
+            result.put("matchedNativeClockFlag", NATIVE_CLOCK_PROPERTY + "=" + expectedLibraryPath);
+            result.put("argumentCount", before.arguments().size());
+            result.put("transportScope", "EXISTING_OWNED_RESOURCE_JMX_COLD_METADATA_READ");
+            return Map.copyOf(result);
+        } catch (java.io.IOException | javax.management.JMException | RuntimeException | Error refusal) {
+            throw new NativeClockRefusal(refusal, retained);
+        }
+    }
+
+    static final class NativeClockRefusal extends AssertionError {
+        private final Map<String, Object> retained;
+        NativeClockRefusal(Throwable cause, Map<String, Object> evidence) {
+            super("owned native clock metadata were refused", cause); retained = Map.copyOf(evidence);
+        }
+        Map<String, Object> retainedEvidence() { return retained; }
+    }
+
     private RuntimeRead runtimeRead(boolean expectedEnabled, boolean costStages,
             Map<String, Object> retained, String evidenceField) throws java.io.IOException, javax.management.JMException {
+        return runtimeRead(expectedEnabled, costStages, retained, evidenceField, null);
+    }
+
+    private RuntimeRead runtimeRead(boolean expectedEnabled, boolean costStages,
+            Map<String, Object> retained, String evidenceField, String nativeLibrary) throws java.io.IOException, javax.management.JMException {
         requireAlive();
         long before = clock.getAsLong();
         if (retained != null) { retained.put(evidenceField, Map.of("startedAtNanos", before)); }
@@ -165,6 +223,7 @@ final class BenchmarkWriteReturnReader {
         long bytes = 0;
         int flags = 0;
         int costFlags = 0;
+        int nativeFlags = 0;
         String expected = ENABLED_PROPERTY + "=" + expectedEnabled;
         for (String argument : arguments) {
             if (argument == null || argument.length() > MAX_RUNTIME_ARGUMENT_LENGTH) {
@@ -182,9 +241,16 @@ final class BenchmarkWriteReturnReader {
                     throw new AssertionError("return cost stages runtime flag contradicts the declared mode");
                 }
             }
+            if (nativeLibrary != null && (argument.equals(NATIVE_CLOCK_PROPERTY) || argument.startsWith(NATIVE_CLOCK_PROPERTY + "="))) {
+                nativeFlags++;
+                if (!argument.equals(NATIVE_CLOCK_PROPERTY + "=" + nativeLibrary)) {
+                    throw new AssertionError("native clock runtime library flag contradicts the declared route");
+                }
+            }
         }
         if (flags != 1) { throw new AssertionError("return registration requires exactly one explicit runtime flag"); }
         if (costStages && costFlags != 1) { throw new AssertionError("return cost stages require exactly one explicit runtime flag"); }
+        if (nativeLibrary != null && nativeFlags != 1) { throw new AssertionError("native clock requires exactly one explicit runtime library flag"); }
         return new RuntimeRead(List.copyOf(java.util.Arrays.asList(arguments.clone())), before, after);
     }
 
