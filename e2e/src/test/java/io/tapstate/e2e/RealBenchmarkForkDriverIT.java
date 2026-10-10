@@ -25,6 +25,19 @@ class RealBenchmarkForkDriverIT {
     private static final String MODE_PROPERTY = "tapstate.e2e.benchmark-smoke.capture-mode";
     private static final String OUTPUT_PROPERTY = "tapstate.e2e.benchmark-smoke.fork-output";
 
+    record WriteReturnJfrScope(String workload, PipelineBenchmarkComparison.Arm arm,
+            BenchmarkCaptureCalibrationLiveRunIT.Mode captureMode, Path output, boolean pilot,
+            BenchmarkReturnClockSampler.Mode clockMode, boolean conflictingDiagnostics) { }
+
+    static void requireWriteReturnJfrScope(WriteReturnJfrScope scope) {
+        if (scope == null || !"stateless".equals(scope.workload()) || scope.arm() != PipelineBenchmarkComparison.Arm.B
+                || scope.captureMode() != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN || !scope.pilot()
+                || scope.output() == null || !scope.output().isAbsolute() || scope.output().getFileName() == null
+                || scope.clockMode() != BenchmarkReturnClockSampler.Mode.PERIODIC || scope.conflictingDiagnostics()) {
+            throw new AssertionError("return JFR diagnostics require one original plain stateless B pilot with periodic clocks and an explicit fork receipt");
+        }
+    }
+
     @BeforeAll
     static void requireServices() {
         DockerGate.require();
@@ -57,19 +70,23 @@ class RealBenchmarkForkDriverIT {
         var mode = BenchmarkCaptureCalibrationLiveRunIT.Mode.valueOf(System.getProperty(MODE_PROPERTY, "PLAIN"));
         Path applicationJar = Path.of(System.getProperty(BOOT_JAR_PROPERTY));
         boolean writeReturnDiagnostics = Boolean.getBoolean(RealBenchmarkForkDriver.WRITE_RETURN_DIAGNOSTICS_PROPERTY);
+        boolean jvmDiagnostics = Boolean.getBoolean("tapstate.e2e.benchmark-smoke.jvm-gap-diagnostics");
         var returnClockMode = RealBenchmarkForkDriver.writeReturnClockMode(
                 System.getProperty(RealBenchmarkForkDriver.WRITE_RETURN_CLOCK_CONTROL_PROPERTY),
                 writeReturnDiagnostics, Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot"));
+        boolean conflictingReturnDiagnostics = List.of("tapstate.e2e.benchmark.load-diagnostics", "tapstate.e2e.benchmark.compilation-diagnostics",
+                "tapstate.e2e.benchmark.thread-point-diagnostics", BenchmarkDualGcDiagnostics.ENABLED_PROPERTY, BenchmarkWitnessReadGate.PROPERTY,
+                BenchmarkMongoDeliveryObserver.CLOCK_REJECTION_EVIDENCE_PROPERTY, BenchmarkMongoDeliveryObserver.NATIVE_OPERATION_WALL_EVIDENCE_PROPERTY,
+                "tapstate.e2e.benchmark-smoke.paced-calibration", "tapstate.e2e.benchmark-smoke.cdc-settling-calibration",
+                "tapstate.e2e.benchmark-smoke.full-cdc-settling-calibration").stream().anyMatch(Boolean::getBoolean);
         if (writeReturnDiagnostics && (mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN || forkOutput == null
                 || !Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot")
-                || List.of("tapstate.e2e.benchmark.load-diagnostics", "tapstate.e2e.benchmark.compilation-diagnostics",
-                        "tapstate.e2e.benchmark.thread-point-diagnostics", "tapstate.e2e.benchmark-smoke.jvm-gap-diagnostics",
-                        BenchmarkDualGcDiagnostics.ENABLED_PROPERTY, BenchmarkWitnessReadGate.PROPERTY,
-                        BenchmarkMongoDeliveryObserver.CLOCK_REJECTION_EVIDENCE_PROPERTY,
-                        BenchmarkMongoDeliveryObserver.NATIVE_OPERATION_WALL_EVIDENCE_PROPERTY,
-                        "tapstate.e2e.benchmark-smoke.paced-calibration", "tapstate.e2e.benchmark-smoke.cdc-settling-calibration",
-                        "tapstate.e2e.benchmark-smoke.full-cdc-settling-calibration").stream().anyMatch(Boolean::getBoolean))) {
+                || conflictingReturnDiagnostics)) {
             throw new AssertionError("return diagnostics require an original plain pilot with an explicit fork receipt");
+        }
+        if (writeReturnDiagnostics && jvmDiagnostics) {
+            requireWriteReturnJfrScope(new WriteReturnJfrScope(workloadId, arm, mode, forkOutput,
+                    Boolean.getBoolean("tapstate.e2e.benchmark-smoke.steady-pilot"), returnClockMode, conflictingReturnDiagnostics));
         }
         if (Boolean.getBoolean(BenchmarkMongoDeliveryObserver.NATIVE_OPERATION_WALL_EVIDENCE_PROPERTY)
                 && !Boolean.getBoolean(BenchmarkMongoDeliveryObserver.CLOCK_REJECTION_EVIDENCE_PROPERTY)) {
@@ -119,7 +136,6 @@ class RealBenchmarkForkDriverIT {
                 applicationJar, arm == PipelineBenchmarkComparison.Arm.A ? BenchmarkJdiCostObserver.Arm.REFERENCE
                         : BenchmarkJdiCostObserver.Arm.OBSERVABILITY, BenchmarkJdiCostObserver.selectedArtifactSet());
         try (artifact) {
-            boolean jvmDiagnostics = Boolean.getBoolean("tapstate.e2e.benchmark-smoke.jvm-gap-diagnostics");
             if (jvmDiagnostics && mode != BenchmarkCaptureCalibrationLiveRunIT.Mode.PLAIN) {
                 throw new AssertionError("JVM gap diagnostics require an independent plain artifact run");
             }
@@ -142,7 +158,9 @@ class RealBenchmarkForkDriverIT {
             }
             BenchmarkDualGcDiagnostics.Session dualGc = dualGcDiagnostics
                     ? BenchmarkDualGcDiagnostics.open() : null;
-            RealBenchmarkForkDriver driver = writeReturnDiagnostics
+            RealBenchmarkForkDriver driver = writeReturnDiagnostics && jvmDiagnostics
+                    ? new RealBenchmarkForkDriver(BenchmarkJvmDiagnostics::startWithWriteReturns)
+                    : writeReturnDiagnostics
                     ? new RealBenchmarkForkDriver((store, operator, jar) -> new BenchmarkForkEnvironment.OwnedBoot(
                             RealProcessServer.start(store, operator, jar, "127.0.0.1",
                                     port -> List.of(), List.of("-Dtapstate.benchmark.write-return=true")), null))

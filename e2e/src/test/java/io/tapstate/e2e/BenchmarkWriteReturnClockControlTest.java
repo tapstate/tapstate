@@ -56,6 +56,20 @@ class BenchmarkWriteReturnClockControlTest {
         }
     }
 
+    @Test
+    void formalEntryRefusesOwnedJvmDiagnosticsBeforeConfigurationAndFixtureAccess() {
+        String property = "tapstate.e2e.benchmark-smoke.jvm-gap-diagnostics";
+        String configured = System.getProperty(property);
+        try {
+            System.setProperty(property, "true");
+            assertThatThrownBy(() -> new PipelineBenchmarkLiveRunIT()
+                    .interleavedRealForksWriteEvidenceAndEnforceTheSelectedGate())
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("owned JVM diagnostics cannot establish a live performance gate");
+        } finally {
+            restore(property, configured);
+        }
+    }
+
     private static void restore(String key, String value) {
         if (value == null) { System.clearProperty(key); } else { System.setProperty(key, value); }
     }
