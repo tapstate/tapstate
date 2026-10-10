@@ -66,13 +66,11 @@ final class SpecDrift {
         for (ConnectorCatalogEntry row : snapshot) {
             catalogued.add(row.id());
             String path = row.provenance() == null ? null : row.provenance().specPath();
-            if (path == null || path.isBlank()) {
-                continue; // registered at runtime; no upstream file stands behind it
-            }
             SpecRepository repository = SpecRepository.of(row);
             Map<String, String> fetched = fetchedByRepository.get(repository);
-            if (fetched == null) {
-                continue; // an unvisited repository has no deletion authority
+            if (path == null || path.isBlank() || fetched == null) {
+                // Runtime-only rows and unvisited repositories have no deletion authority.
+                continue;
             }
             // Newly catalogued enterprise rows can be found in the scanned checkout without adding
             // repository fields to the catalog. Absence from both scanned repositories is drift.
