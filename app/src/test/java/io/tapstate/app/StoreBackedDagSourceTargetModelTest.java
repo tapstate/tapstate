@@ -21,6 +21,8 @@ import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
+import io.tapstate.runtime.engine.PipelineDagBuilder;
+import io.tapstate.runtime.engine.SinkTarget;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.TargetField;
 import io.tapstate.spi.sink.TargetIndex;
@@ -415,6 +417,31 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThat(bound).containsOnlyKeys("AA_0716");
         assertThat(bound.get("AA_0716").name()).isEqualTo("k2");
+    }
+
+    @Test
+    void a_qualified_rename_routes_the_sink_by_the_collection_its_writers_bind() {
+        InMemoryStorePort store = new InMemoryStorePort();
+        store.artifacts().save(new SourceResource("mysql", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("AA_0716")), null, null));
+        store.artifacts().save(new SourceResource("mongo", null, "mongodb", Map.of("uri", "u"),
+                null, null, null, null));
+        SyncElement sync = new SyncElement("mongo_k2", "mongo", null,
+                new RenameSpec(Map.of("mysql.AA_0716", "k2"), null, null, null), null);
+        store.artifacts().save(new PipelineResource("k2", null, List.of(SourceRef.bare("mysql")), null,
+                null, new ServeBlock.Inline("target", FromRef.literal("mysql.AA_0716"), List.of(sync), null, null),
+                null, null));
+        store.schemas().save(discovered("mysql", "mysql", new SourceTable("AA_0716",
+                List.of(new SourceField("ID", "INT")), List.of("ID"), List.of())));
+        OpenRingGenerations.forSources(store, "mysql");
+
+        DagSource.PlannedDag planned = new StoreBackedDagSource(store).plannedDagFor("k2", null);
+
+        // A sink's writers share out its rows by the table each lands in and that table's key, so the plan has
+        // to name the table they are bound to: naming another would let two streams renamed into one collection
+        // be split across writers by the tables they started from.
+        assertThat(planned.shape().sinkTargetsOf(PipelineDagBuilder.serveVertex(sync, 0)))
+                .isEqualTo(Map.of("AA_0716", new SinkTarget("k2", List.of("ID"))));
     }
 
     @Test

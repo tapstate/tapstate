@@ -1,12 +1,16 @@
 package io.tapstate.app;
 
+import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.function.SupplierEx;
 import io.tapstate.adapters.pdk.ConnectorError;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.runtime.engine.EngineError;
+import io.tapstate.runtime.engine.PreparesTargets;
 import io.tapstate.runtime.engine.SinkAck;
+import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 import io.tapstate.spi.store.ClusterMembership;
@@ -20,6 +24,7 @@ import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -27,11 +32,15 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * What a member is allowed to send outside the cluster on a run's behalf, answered from that member's own
@@ -208,6 +217,82 @@ class ExecutionAuthorizationTest {
         assertThat(current.failureClaimGeneration()).isZero();
     }
 
+    /**
+     * A run taken down for something else - a member it ran on going away - closes its writers while a
+     * write is still under way, and a connector let go under a write ends it in its coded failure. That
+     * failure is the closing's doing, not the target refusing anything. Filed as the sink's own, it would
+     * outrank the departure that actually ended the run, and the run would stay failed instead of being
+     * rebuilt, with nothing in any log to say why.
+     */
+    @Test
+    void aWriteItsOwnClosingBreaksDoesNotMarkTheRun() {
+        ExecutionFence fence = submittedRun();
+        CompletableFuture<WriteResult> write = new CompletableFuture<>();
+        SinkWriter sink = new SinkWriter() {
+            @Override
+            public CompletionStage<WriteResult> write(List<Envelope> records) {
+                return write;
+            }
+
+            @Override
+            public void close() {
+                // What a connector let go under a write does with it.
+                write.completeExceptionally(new TapstateException(ConnectorError.WRITE_FAILED,
+                        Map.of("connector", "mongodb", "detail", "state should be: open"), null));
+            }
+        };
+        SinkWriter guarded = FencedSinkWriterFactory.guarded(sink, fence, guard(claims));
+        CompletionStage<WriteResult> underWay = guarded.write(List.of());
+
+        guarded.close();
+
+        assertThatThrownBy(() -> underWay.toCompletableFuture().join())
+                .as("the write still fails where it is reported: nothing it carried landed")
+                .isInstanceOf(CompletionException.class);
+        WorkloadClaim current = claims.read(new WorkloadClaimKey(
+                "cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders")).orElseThrow().claim();
+        assertThat(current.failureClaimGeneration())
+                .as("what ended the run is for its driver to judge; a write the run's own closing broke is "
+                        + "not the sink failing")
+                .isZero();
+    }
+
+    /**
+     * The same closing, seen from the member driving the run: one of the three members the run was planned
+     * over leaves, the run is taken down with a write still under way on a member that stayed, and that
+     * write fails as its connector is let go. The departure is what ended the run, so the run is rebuilt.
+     */
+    @Test
+    void aRunAMemberLeftIsRebuiltThoughItsClosingBrokeAWriteUnderWay() {
+        membership.canCommit(Set.of("node-a", "node-b", "node-c"));
+        PipelineActuationOwnership nodeA = ownership(NODE_A);
+        assertThat(nodeA.permit("orders").granted()).isTrue();
+        ExecutionFence fence = nodeA.beginExecution("orders").fence();
+        CompletableFuture<WriteResult> write = new CompletableFuture<>();
+        SinkWriter sink = new SinkWriter() {
+            @Override
+            public CompletionStage<WriteResult> write(List<Envelope> records) {
+                return write;
+            }
+
+            @Override
+            public void close() {
+                write.completeExceptionally(new TapstateException(ConnectorError.WRITE_FAILED,
+                        Map.of("connector", "mongodb", "detail", "state should be: open"), null));
+            }
+        };
+        SinkWriter guarded = FencedSinkWriterFactory.guarded(sink, fence, guard(claims));
+        guarded.write(List.of());
+
+        membership.canCommit(Set.of("node-a", "node-b"));
+        guarded.close();
+
+        assertThat(new ClusterRebuildAdmission(nodeA, TTL, Duration.ofSeconds(30), nanos::get).admits("orders"))
+                .as("node-c went away under the run; the write its closing broke on node-a says nothing "
+                        + "about the pipeline, so the run is rebuilt rather than left failed")
+                .isTrue();
+    }
+
     @Test
     void aSupersededRunStopsWritingAndAcknowledgingOnceItsOwnWindowIsOver() {
         ExecutionFence fence = submittedRun();
@@ -283,6 +368,140 @@ class ExecutionAuthorizationTest {
                 .as("no batch of the rebuilt-over run is sent after its local deadline").isZero();
         assertThat(acked)
                 .as("and no durable position is advanced by it either").hasValue(0);
+    }
+
+    /**
+     * A sink reports through the ack bound to it as a writer, and reports bounds as well as positions - so
+     * holding a run to its fence has to reach both, through the binding. The guard used to wrap the member's
+     * ack alone: binding a writer then answered with the guarded ack itself, the writer's progress went
+     * nowhere, and a bound was dropped without a word.
+     *
+     * <p>Starting the run's accounting is held the same way, on the member that starts it: a superseded run
+     * starting it again would take the accounting over from the run that replaced it.
+     */
+    @Test
+    void aRebuiltOverRunsWritersStopLandingAnythingAndItCannotStartItsAccountingAgain() {
+        PipelineActuationOwnership nodeA = ownership(NODE_A);
+        assertThat(nodeA.permit("orders").granted()).isTrue();
+        ExecutionFence fence = nodeA.beginExecution("orders").fence();
+        ExecutionAuthorization guard = guard(claims);
+        List<String> landed = new ArrayList<>();
+        SinkAck asTheWriter = new SinkAck() {
+            @Override
+            public void advance(String chain, ChainPosition position) {
+                landed.add("advance");
+            }
+
+            @Override
+            public void bounded(String chain, SourceOrder through) {
+                landed.add("bounded");
+            }
+        };
+        SinkAck onTheMember = new SinkAck() {
+            @Override
+            public void advance(String chain, ChainPosition position) {
+                landed.add("unbound");
+            }
+
+            @Override
+            public SinkAck forWriter(String writerId) {
+                landed.add("bound " + writerId);
+                return asTheWriter;
+            }
+        };
+        SinkAck writer = FencedSinkAckFactory.guarded(onTheMember, fence, guard).forWriter("serve.s#0");
+        HazelcastInstance coordinator = mock(HazelcastInstance.class);
+        ConcurrentMap<String, Object> context = new ConcurrentHashMap<>();
+        context.put(ExecutionAuthorization.USER_CONTEXT_KEY, guard);
+        when(coordinator.getUserContext()).thenReturn(context);
+        List<Map<String, List<String>>> started = new ArrayList<>();
+        SinkAckFactory accounting = new SinkAckFactory() {
+            @Override
+            public SinkAck resolve(HazelcastInstance member) {
+                return onTheMember;
+            }
+
+            @Override
+            public void beginRun(HazelcastInstance member, Map<String, List<String>> writersByChain) {
+                started.add(writersByChain);
+            }
+        };
+        SinkAckFactory fenced = FencedSinkAckFactory.heldTo(accounting, fence);
+
+        fenced.beginRun(coordinator, Map.of("orders", List.of("serve.s#0")));
+        writer.advance("orders", new ChainPosition(new SourceOrder(1, 1), "w1"));
+        writer.bounded("orders", new SourceOrder(1, 2));
+        assertThat(started).hasSize(1);
+        assertThat(landed).containsExactly("bound serve.s#0", "advance", "bounded");
+
+        nodeA.beginExecution("orders");
+        nanos.addAndGet(WINDOW.toNanos());
+
+        assertThatThrownBy(() -> writer.advance("orders", new ChainPosition(new SourceOrder(1, 3), "w3")))
+                .isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> writer.bounded("orders", new SourceOrder(1, 4)))
+                .isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> fenced.beginRun(coordinator, Map.of("orders", List.of("serve.s#0"))))
+                .isInstanceOf(TapstateException.class);
+        assertThat(landed)
+                .as("nothing the rebuilt-over run's writer says lands, positions and bounds alike")
+                .containsExactly("bound serve.s#0", "advance", "bounded");
+        assertThat(started).as("and it does not start its accounting over the run that replaced it").hasSize(1);
+    }
+
+    /**
+     * Preparing a run's target tables is held to the run like writing into them: a clear is a write, and a run
+     * that has been rebuilt over clearing a table after its replacement started writing into it would take the
+     * replacement's rows with it.
+     */
+    @Test
+    void aRebuiltOverRunCannotPrepareItsTargetsAgain() {
+        PipelineActuationOwnership nodeA = ownership(NODE_A);
+        assertThat(nodeA.permit("orders").granted()).isTrue();
+        ExecutionFence fence = nodeA.beginExecution("orders").fence();
+        ExecutionAuthorization guard = guard(claims);
+        HazelcastInstance coordinator = mock(HazelcastInstance.class);
+        ConcurrentMap<String, Object> context = new ConcurrentHashMap<>();
+        context.put(ExecutionAuthorization.USER_CONTEXT_KEY, guard);
+        when(coordinator.getUserContext()).thenReturn(context);
+        List<String> prepared = new ArrayList<>();
+        SupplierEx<? extends SinkWriter> fenced =
+                FencedSinkWriterFactory.heldTo(new PreparingWriters(prepared), fence);
+
+        assertThat(fenced).isInstanceOf(PreparesTargets.class);
+        ((PreparesTargets) fenced).prepareTargets(coordinator);
+        assertThat(prepared).hasSize(1);
+
+        nodeA.beginExecution("orders");
+        nanos.addAndGet(WINDOW.toNanos());
+
+        assertThatThrownBy(() -> ((PreparesTargets) fenced).prepareTargets(coordinator))
+                .isInstanceOf(TapstateException.class)
+                .extracting(thrown -> ((TapstateException) thrown).code())
+                .isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED);
+        assertThat(prepared).as("nothing prepared for the run that was rebuilt over").hasSize(1);
+    }
+
+    /** Writers of tables prepared for them, recording each preparing. */
+    private static final class PreparingWriters implements SupplierEx<SinkWriter>, PreparesTargets {
+
+        private static final long serialVersionUID = 1L;
+
+        private final transient List<String> prepared;
+
+        PreparingWriters(List<String> prepared) {
+            this.prepared = prepared;
+        }
+
+        @Override
+        public void prepareTargets(HazelcastInstance coordinator) {
+            prepared.add("prepared");
+        }
+
+        @Override
+        public SinkWriter getEx() {
+            return new CountingWriter();
+        }
     }
 
     @Test

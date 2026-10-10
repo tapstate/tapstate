@@ -87,6 +87,7 @@ public final class SourceRepresentation {
                 sourceMode(draft.mode()),
                 tableModels(draft.tables()),
                 srsModel(draft.srs()),
+                PipelineRepresentation.execution(draft.execution(), "execution"),
                 SourceDraft.copyJsonMap(draft.experimental(), true));
     }
 
@@ -115,6 +116,7 @@ public final class SourceRepresentation {
                 // change this slice has no business making.
                 Map.of(),
                 srsView(source.srs()),
+                PipelineRepresentation.executionValue(source.execution()),
                 source.experimental(),
                 contentHash);
     }
