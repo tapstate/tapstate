@@ -74,8 +74,9 @@ final class SpecDrift {
             }
             // Newly catalogued enterprise rows can be found in the scanned checkout without adding
             // repository fields to the catalog. Absence from both scanned repositories is drift.
+            // An OSS file at the same path takes priority only if it identifies the same connector.
             Map<String, String> enterprise = fetchedByRepository.get(SpecRepository.ENTERPRISE);
-            if (repository == SpecRepository.OSS && !fetched.containsKey(path)
+            if (repository == SpecRepository.OSS && !row.id().equals(connectorId(fetched.get(path)))
                     && enterprise != null && enterprise.containsKey(path)
                     && row.id().equals(connectorId(enterprise.get(path)))) {
                 repository = SpecRepository.ENTERPRISE;

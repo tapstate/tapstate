@@ -25,6 +25,8 @@ class SpecDriftTest {
     private static final String SQLSERVER_PATH = "connectors/mssql-connector/src/main/resources/mssql-spec.json";
     private static final String DB2_SPEC = "{\"properties\":{\"id\":\"db2\"}}";
     private static final String DB2_PATH = "connectors/db2-connector/src/main/resources/spec_db2.json";
+    private static final String HANA_SPEC = "{\"properties\":{\"id\":\"hana\"}}";
+    private static final String HANA_PATH = "connectors/hana-connector/src/main/resources/spec_hana.json";
 
     @Test
     void unchangedEnterpriseRowsLetUnsupportedOssDriftWaitForCompany() {
@@ -108,6 +110,50 @@ class SpecDriftTest {
         assertThat(SpecDrift.compareRepositories(snapshot, Map.of(
                 SpecRepository.OSS, Map.of(), SpecRepository.ENTERPRISE, Map.of())).vanishedIds())
                 .containsExactly("hana");
+    }
+
+    @Test
+    void anUnrelatedOssResourceDoesNotHideAnAdditionalEnterpriseConnectorAtTheSamePath() {
+        SpecDrift.Report report = SpecDrift.compareRepositories(List.of(row("hana", HANA_PATH, HANA_SPEC)),
+                Map.of(SpecRepository.OSS, Map.of(HANA_PATH, "{\"item\":[]}"),
+                        SpecRepository.ENTERPRISE, Map.of(HANA_PATH, HANA_SPEC)));
+
+        assertThat(report.allIds()).isEmpty();
+        assertThat(DriftTriage.decide(report.allIds(), 7, false)).isEqualTo(DriftTriage.Decision.NOTHING);
+    }
+
+    @Test
+    void anOssSpecificationForAnotherConnectorDoesNotHideAnAdditionalEnterpriseConnectorAtTheSamePath() {
+        SpecDrift.Report report = SpecDrift.compareRepositories(List.of(row("hana", HANA_PATH, HANA_SPEC)),
+                Map.of(SpecRepository.OSS, Map.of(HANA_PATH, MYSQL_SPEC),
+                        SpecRepository.ENTERPRISE, Map.of(HANA_PATH, HANA_SPEC)));
+
+        assertThat(report.changedIds()).isEmpty();
+        assertThat(report.vanishedIds()).isEmpty();
+        assertThat(report.newConnectorIds()).containsExactly("mysql");
+    }
+
+    @Test
+    void reportsAnAdditionalEnterpriseSpecificationChangeDespiteAnOssPathCollision() {
+        String changedSpec = "{\"properties\":{\"id\":\"hana\",\"name\":\"Changed\"}}";
+        SpecDrift.Report report = SpecDrift.compareRepositories(List.of(row("hana", HANA_PATH, HANA_SPEC)),
+                Map.of(SpecRepository.OSS, Map.of(HANA_PATH, "{\"item\":[]}"),
+                        SpecRepository.ENTERPRISE, Map.of(HANA_PATH, changedSpec)));
+
+        assertThat(report.changedIds()).containsExactly("hana");
+        assertThat(report.vanishedIds()).isEmpty();
+        assertThat(report.newConnectorIds()).isEmpty();
+        assertThat(DriftTriage.decide(report.allIds(), 7, false)).isEqualTo(DriftTriage.Decision.OPEN);
+    }
+
+    @Test
+    void aMatchingOssSpecificationKeepsPriorityOverEnterpriseContentAtTheSamePath() {
+        String changedSpec = "{\"properties\":{\"id\":\"hana\",\"name\":\"Changed\"}}";
+        SpecDrift.Report report = SpecDrift.compareRepositories(List.of(row("hana", HANA_PATH, HANA_SPEC)),
+                Map.of(SpecRepository.OSS, Map.of(HANA_PATH, HANA_SPEC),
+                        SpecRepository.ENTERPRISE, Map.of(HANA_PATH, changedSpec)));
+
+        assertThat(report.allIds()).isEmpty();
     }
 
     @Test
