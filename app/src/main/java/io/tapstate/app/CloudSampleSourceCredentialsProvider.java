@@ -13,6 +13,9 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 
@@ -66,6 +69,58 @@ final class CloudSampleSourceCredentialsProvider implements SampleSourceCredenti
             throw unavailable();
         } catch (RuntimeException e) {
             if (e instanceof TapstateException tapstateException) throw tapstateException;
+            throw unavailable();
+        }
+    }
+
+    @Override
+    public List<Definition> catalog() {
+        try {
+            HttpResponse<String> response = send("catalog", "GET");
+            if (response.statusCode() < 200 || response.statusCode() >= 300) return List.of();
+            JsonNode entries = data(response.body());
+            if (!entries.isArray()) return List.of();
+            List<Definition> definitions = new ArrayList<>();
+            boolean configured = available();
+            for (JsonNode entry : entries) {
+                definitions.add(new Definition(entry.path("id").asText(), entry.path("name").asText(),
+                        entry.path("description").asText(), entry.path("connector").asText(),
+                        entry.path("available").asBoolean(false) && configured,
+                        entry.path("guidedDemo").asBoolean(false), entry.path("rootTable").asText(null),
+                        entry.path("orderLineTable").asText(null), entry.path("customerTable").asText(null)));
+            }
+            return List.copyOf(definitions);
+        } catch (IOException e) {
+            return List.of();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return List.of();
+        }
+    }
+
+    @Override
+    public Map<String, Object> settingsFor(String id) {
+        try {
+            String sourceId = URLEncoder.encode(id, StandardCharsets.UTF_8);
+            HttpResponse<String> response = send("credentials/" + sourceId, "POST");
+            if (response.statusCode() < 200 || response.statusCode() >= 300) throw unavailable();
+            JsonNode data = data(response.body());
+            if (!data.isObject() || data.path("password").asText().isBlank()) throw unavailable();
+            Map<String, Object> config = new LinkedHashMap<>();
+            data.fields().forEachRemaining(field -> {
+                if (field.getValue().isNumber()) config.put(field.getKey(), field.getValue().intValue());
+                else config.put(field.getKey(), field.getValue().asText());
+            });
+            if ("postgres".equals(catalog().stream().filter(item -> item.id().equals(id))
+                    .map(Definition::connector).findFirst().orElse(""))) {
+                config.put("user", config.remove("username"));
+                config.put("globalPublicationName", "tapstate_sample_pub");
+            }
+            return config;
+        } catch (IOException e) {
+            throw unavailable();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
             throw unavailable();
         }
     }
